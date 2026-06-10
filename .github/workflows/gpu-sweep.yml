@@ -1,0 +1,52 @@
+# Manually-triggered GPU sweep on RunPod (CI).
+# Requires repo secret RUNPOD_API_KEY (Settings -> Secrets and variables -> Actions).
+# Results retrieval: this template uses the SSH/rsync launcher; for a fully headless CI
+# you'd instead push results to S3/R2 from inside the pod (see runpod/README.md) and pull
+# them here. The `if: always()` terminate step is the runaway-cost backstop.
+name: gpu-sweep
+on:
+  workflow_dispatch:
+    inputs:
+      gpu:    { description: "GPU type id", default: "NVIDIA GeForce RTX 4090" }
+      cloud:  { description: "COMMUNITY|SECURE", default: "COMMUNITY" }
+      seeds:  { description: "FER_SEEDS", default: "0,1,2,3,4" }
+      epochs: { description: "FER_EPOCHS", default: "20" }
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    defaults:
+      run: { working-directory: experiments/fer_relational }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Configure SSH (for rsync to the pod)
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.RUNPOD_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+        # NOTE: the matching PUBLIC key must be registered in RunPod account settings.
+
+      - name: Launch sweep on RunPod (auto-terminates)
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+        run: |
+          python runpod/launch.py --go \
+            --gpu "${{ inputs.gpu }}" --cloud "${{ inputs.cloud }}" \
+            --seeds "${{ inputs.seeds }}" --epochs "${{ inputs.epochs }}" \
+            --max-minutes 180
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fer-results
+          path: experiments/fer_relational/results_gpu/
+          if-no-files-found: warn
+
+      # launch.py already terminates in its finally-block; this is a documented backstop:
+      # if you switch to a detached launch, add an `if: always()` curl DELETE here.
