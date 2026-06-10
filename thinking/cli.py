@@ -265,11 +265,11 @@ def cmd_train(args):
         cfg.math_frac = cfg.def_frac = cfg.novel_frac = 0.0   # no curriculum, no exams
         cfg.curriculum = False
         cfg.lang_level = "canonical" if args.canon else "builtin"
-        cfg.deep_depth = 0
+        cfg.deep_depth = args.deep_depth                   # rung C: --simple + explicit deep
         if args.bank:                                      # RUNG B: + distilled surface bank
             cfg.lang_level = "mix"
-            cfg.curriculum = True
-            cfg.block = 1024                               # scholar register needs the room
+            cfg.curriculum = not args.no_curriculum
+            cfg.block = max(cfg.block, 1024)               # never shrink a deep-sized block
         if args.deep_depth:                                # DEEP regime: 50%-mix ancestor spines
             n = cfg.deep_depth = args.deep_depth
             cfg.test_hops = (2, 3, max(4, n // 2), n)
@@ -287,6 +287,8 @@ def cmd_train(args):
         cfg.n_examples = args.examples
     if args.loops:
         cfg.loops = args.loops
+    if args.deep_frac:
+        cfg.deep_frac = args.deep_frac
     if args.no_loop:
         cfg.loop = False
     t = Trainer(cfg)
@@ -383,6 +385,8 @@ def main(argv=None):
                    help="rung A0: canonical fact surfaces (chain-world conditions)")
     p.add_argument("--bank", action="store_true",
                    help="rung B: distilled 8-level surface bank + curriculum")
+    p.add_argument("--no-curriculum", action="store_true", dest="no_curriculum",
+                   help="bank without ladder phases (B6 showed fixed phase pools memorize)")
     p.add_argument("--sup", default="steps", choices=("steps", "path"))
     p.add_argument("--arch", default="standard")
     p.add_argument("--seed", type=int, default=0)
@@ -391,6 +395,7 @@ def main(argv=None):
     p.add_argument("--dim", type=int, default=0, help="model width (256 = the proven point)")
     p.add_argument("--examples", type=int, default=0)
     p.add_argument("--loops", type=int, default=0)
+    p.add_argument("--deep-frac", type=float, default=0.0, dest="deep_frac")
     p.add_argument("--no-loop", action="store_true", dest="no_loop")
     p.add_argument("--neg", action="store_true")
     p = sub.add_parser("ablate")

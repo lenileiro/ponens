@@ -194,10 +194,11 @@ class FlowRuntime:
                     if ps is not None and self.chk.step(st, *ps):
                         ok = True
                         break
-                if not ok:
-                    res.answer = self._root_answer(st)
-                    res.lines.append((words, "drop"))
-                    return res
+                if not ok:                                 # SKIP, don't die: advance context
+                    res.n_invalid += 1                     # uncommitted; later lines can recover
+                    res.lines.append((words, "skip"))
+                    ids += toks + [dot]
+                    continue
             if not ok:
                 res.n_invalid += 1
             res.lines.append((words, "ok" if ok else "invalid"))

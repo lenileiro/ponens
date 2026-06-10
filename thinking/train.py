@@ -53,7 +53,7 @@ class Trainer:
             wlevels = ([level] if level else bank_levels()) or ["mix"]
         for _ in range(n):
             k = self.cfg.train_hops[rng.integers(len(self.cfg.train_hops))]
-            if self.cfg.world == "kinship" and self.cfg.deep_depth and rng.random() < 0.5:
+            if (self.cfg.world == "kinship" and self.cfg.deep_depth and rng.random() < self.cfg.deep_frac):
                 k = 4 + int(rng.integers(self.cfg.deep_depth - 3))   # deep regime: depths 4..N
             u = rng.random()                               # task type fixed BEFORE fit-retries
             for _try in range(20):                         # resample until it fits the block

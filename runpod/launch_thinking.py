@@ -59,12 +59,18 @@ def payload(args):
                     f"--sample runs/verbalizer.pt")
     if args.stair:                                         # staircase: minimal world, decisive evals
         run = f"runs/stair_{args.stair_world}"
-        canon = (" --canon" if args.canon else "") + (" --bank" if args.bank else "")
+        canon = ((" --canon" if args.canon else "") + (" --bank" if args.bank else "") + (" --no-curriculum" if args.no_curriculum else ""))
         simple = " --simple" if args.stair_world == "kinship" else ""
-        hops = "2,3" if args.stair_world == "kinship" else "2,4,6"
+        if args.stair_world == "kinship" and args.deep_depth and args.stair:
+            simple += f" --deep-depth {args.deep_depth} --deep-frac 0.3"
+        sbatch = 8 if (args.deep_depth and args.stair_world == "kinship") else 32
+        hops = ("2,3" if not (args.deep_depth and args.stair_world == "kinship")
+                else f"2,3,{args.deep_depth // 2},{args.deep_depth}")
+        if args.stair_world == "chain":
+            hops = "2,4,6"
         return " && ".join([
             f"{PY} train --world {args.stair_world}{simple}{canon} --out {run} --seed 0 "
-            f"--batch 32 --steps {args.train_steps or 4000}"
+            f"--batch {sbatch} --steps {args.train_steps or 4000}"
             + (f" --dim {args.dim}" if args.dim else ""),
             f"{PY} eval {run} --mode verified --split iid --hops {hops} --n 20 --train-names",
             f"{PY} eval {run} --mode free --split iid --hops {hops} --n 20 --train-names",
@@ -134,6 +140,7 @@ def main():
                     help="rung A0: canonical fact surfaces (chain-world conditions)")
     ap.add_argument("--dim", type=int, default=0, help="model width override")
     ap.add_argument("--bank", action="store_true", help="rung B: surface bank + curriculum")
+    ap.add_argument("--no-curriculum", action="store_true", dest="no_curriculum")
     ap.add_argument("--stair-world", default="kinship", dest="stair_world",
                     choices=("kinship", "chain"),
                     help="rung 0 = chain (the legacy-validated task on the production trainer)")

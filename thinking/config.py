@@ -19,7 +19,8 @@ class Config:
     holdout_preds: tuple = ("great_grandfather", "father_in_law")   # kinship composition holdout:
     #                                   never queried in training; their COMPONENT rules are (via
     #                                   the gender-mirrored targets) -- tests unseen composition
-    deep_depth: int = 0               # kinship: >0 mixes 50%-deep ancestor spines, depths 4..N
+    deep_depth: int = 0               # kinship: >0 mixes deep spines, depths 4..N
+    deep_frac: float = 0.5            # deep share of QA examples (0.5 starved shallow at 15k -- C4)
     extract_frac: float = 0.25        # fraction of training examples that are READING tasks
     #                                   (NL surface -> exhaustive canonical fact list)
     lang_level: str = "mix"           # surface curriculum target: preschool..scholar|mix
@@ -67,7 +68,7 @@ class Config:
     neg_lr_scale: float = 0.3
     # ---- flow / evaluation ------------------------------------------------------------------------
     retry: int = 8                    # resamples per rejected line before trace-grounded repair
-    resample_temp: float = 1.0
+    resample_temp: float = 0.5    # gentle: perturb a strong greedy, not noise
     max_line_tokens: int = 18
     n_eval: int = 30                  # worlds per (depth, mode)
     eval_seed: int = 1000

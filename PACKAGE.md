@@ -149,11 +149,16 @@ Validated bottom-up, one variable per run, after a nine-run zero streak taught u
 | A | kinship, built-in NL, d=128 | reads + validates, think-grammar fails |
 | A-d256 | + capacity | **1.00 / 0.95 free k=3** |
 | B | + 8-register bank + curriculum (20k steps) | 0.45 trained / **0.40 held-out phrasings** |
-| B6 | + budget (50k steps) | in flight |
+| B6 | + budget (50k steps, fixed-phase curriculum) | 0.45 — UNCHANGED: phase pools memorize |
+| B7b | bank, NO curriculum, always-fresh pool | **0.75 trained / 0.90 held-out phrasings** |
+| C4 | + deep-20 trees, verified-decode fix | verified k=20 **0.45** (was ~0), free 0.50; shallow starved by 50% deep mix |
+| C5 | deep_frac 0.3 rebalance | in flight |
 
 Root causes found en route (now defaults/tests): unseen-name embeddings → anonymization;
 head-first lines → premises-first; fixed-pool epochs → rolling refresh; d=128 → d=256;
-mHC zero-init write gate (block got zero gradient); duplicate-line loops → checker dedup.
+mHC zero-init write gate (block got zero gradient); duplicate-line loops → checker dedup;
+fixed-phase curricula memorize → always-fresh mixed pools (`--no-curriculum`);
+verified-mode drops → skip-don't-die + temp-0.5 resampling.
 
 ## 8. Roadmap
 
