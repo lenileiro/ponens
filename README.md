@@ -1,4 +1,4 @@
-# Verified Thinking — tiny models that reason in checkable steps
+# Ponens — tiny models that reason in checkable steps
 
 An in-house research stack betting that **reasoning should be emitted, not latent**: a small
 language model *thinks out loud* in a typed trace language, and a Datalog engine **checks every
@@ -14,6 +14,9 @@ pearl is the mom of dina .  york is the dad of dina . ...   what is york to fega
   ...
   answer great_grandfather .
 ```
+
+*Named for* **modus ponens** *— the inference rule (B, B→H ⊢ H) that every line of the
+trace language literally executes.*
 
 ## Why
 

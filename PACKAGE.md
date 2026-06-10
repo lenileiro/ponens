@@ -1,4 +1,4 @@
-# The `thinking` package — verified thinking flows
+# Ponens — the `thinking` package reference
 
 A small LM reads natural-language facts, **thinks in a typed trace language**, and a Datalog
 checker validates **every emitted line** before it commits. This document is the package
