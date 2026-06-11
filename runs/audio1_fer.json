@@ -1,0 +1,124 @@
+{
+ "experiment": "audio1_three_arm",
+ "world": "8x4x3 combos, 12 held out",
+ "steps": 500,
+ "arms": {
+  "factored": {
+   "seeds": [
+    {
+     "seed": 0,
+     "seen_acc": 1.0,
+     "holdout_acc": 1.0,
+     "probe_pitch_holdout": 1.0,
+     "probe_timbre_holdout": 1.0,
+     "probe_env_holdout": 1.0,
+     "probe_holdout": 1.0
+    },
+    {
+     "seed": 1,
+     "seen_acc": 1.0,
+     "holdout_acc": 0.9958333333333333,
+     "probe_pitch_holdout": 1.0,
+     "probe_timbre_holdout": 1.0,
+     "probe_env_holdout": 0.987500011920929,
+     "probe_holdout": 0.9958333373069763
+    },
+    {
+     "seed": 2,
+     "seen_acc": 1.0,
+     "holdout_acc": 0.9916666666666667,
+     "probe_pitch_holdout": 1.0,
+     "probe_timbre_holdout": 1.0,
+     "probe_env_holdout": 1.0,
+     "probe_holdout": 1.0
+    }
+   ],
+   "seen_acc": 1.0,
+   "holdout_acc": 0.9958333333333332,
+   "probe_holdout": 0.9986111124356588
+  },
+  "swap": {
+   "seeds": [
+    {
+     "seed": 0,
+     "seen_acc": 1.0,
+     "holdout_acc": 1.0,
+     "probe_pitch_holdout": 1.0,
+     "probe_timbre_holdout": 1.0,
+     "probe_env_holdout": 1.0,
+     "probe_holdout": 1.0
+    },
+    {
+     "seed": 1,
+     "seen_acc": 1.0,
+     "holdout_acc": 1.0,
+     "probe_pitch_holdout": 1.0,
+     "probe_timbre_holdout": 1.0,
+     "probe_env_holdout": 1.0,
+     "probe_holdout": 1.0
+    },
+    {
+     "seed": 2,
+     "seen_acc": 1.0,
+     "holdout_acc": 1.0,
+     "probe_pitch_holdout": 1.0,
+     "probe_timbre_holdout": 1.0,
+     "probe_env_holdout": 1.0,
+     "probe_holdout": 1.0
+    }
+   ],
+   "seen_acc": 1.0,
+   "holdout_acc": 1.0,
+   "probe_holdout": 1.0
+  },
+  "subspace": {
+   "seeds": [
+    {
+     "seed": 0,
+     "seen_acc": 1.0,
+     "holdout_acc": 1.0,
+     "probe_pitch_holdout": 1.0,
+     "probe_timbre_holdout": 1.0,
+     "probe_env_holdout": 1.0,
+     "probe_holdout": 1.0
+    },
+    {
+     "seed": 1,
+     "seen_acc": 1.0,
+     "holdout_acc": 1.0,
+     "probe_pitch_holdout": 1.0,
+     "probe_timbre_holdout": 1.0,
+     "probe_env_holdout": 1.0,
+     "probe_holdout": 1.0
+    },
+    {
+     "seed": 2,
+     "seen_acc": 1.0,
+     "holdout_acc": 0.9958333333333333,
+     "probe_pitch_holdout": 1.0,
+     "probe_timbre_holdout": 1.0,
+     "probe_env_holdout": 1.0,
+     "probe_holdout": 1.0
+    }
+   ],
+   "seen_acc": 1.0,
+   "holdout_acc": 0.9986111111111112,
+   "probe_holdout": 1.0
+  }
+ },
+ "verdict": {
+  "behavior_ranking": [
+   "swap",
+   "subspace",
+   "factored"
+  ],
+  "probe_ranking": [
+   "swap",
+   "subspace",
+   "factored"
+  ],
+  "replicates_image2": false,
+  "best_holdout": 1.0,
+  "baseline_holdout": 0.9958333333333332
+ }
+}

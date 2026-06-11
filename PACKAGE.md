@@ -145,10 +145,13 @@ python -m thinking.image2 --steps 400 --seeds 0,1,2 --out runs/image2_bottleneck
 python -m thinking.image_flow --train --steps 400 --out runs/image_flow.pt
 python -m thinking.image_latent --train --ae-steps 400 --flow-steps 400 \
     --out runs/image_latent_flow.pt
+python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-steps 400 \
+    --out runs/image_latent_dit.pt
 python -m thinking.audio --steps 500 --seeds 0,1,2 --out runs/audio1_fer.json
 python -m thinking.multimodal --steps 400 --out runs/m0_multimodal.json
 RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --vision-arch bottleneck \
-    --image2 --image-flow --image-latent --audio --multimodal --fast --go
+    --image2 --image-flow --image-latent --image-latent-arch dit \
+    --audio --multimodal --fast --go
 ```
 
 `thinking.image2` is the head-aware FER experiment: shared factored heads vs explicit
@@ -204,11 +207,12 @@ factored, swap, and subspace arms, and the linear-decodability probe ranks the a
 order as behavior. Treat that as the next reproducibility target for the public command path.
 
 Image-3 GPU update (H100, 1000 AE steps + 1000 latent-flow steps): `thinking.image_latent`
-reaches `recon_mse=0.015`, latent color accuracy **1.00**, latent shape accuracy **0.86**,
-`latent_velocity_mse=1.05`, and center-target sample MSE **0.044**. This proves the semantic
-latent path can preserve canonical factors before moving transport training off pixels. It is
-still a toy conv latent flow; the next architecture step is replacing the conv velocity field
-with a patch-token DiT/MMDiT block over these semantic latents.
+with the conv velocity baseline reaches `recon_mse=0.015`, latent color accuracy **1.00**, latent
+shape accuracy **0.86**, `latent_velocity_mse=1.05`, and center-target sample MSE **0.044**. This
+proves the semantic latent path can preserve canonical factors before moving transport training
+off pixels. The module now also has `--flow-arch dit`, a tiny patch-token DiT velocity field over
+the same semantic latents. That is the toy-scale version of the architecture we need to scale:
+semantic image latents + fact/text conditioning + rectified-flow transformer.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

@@ -11,8 +11,8 @@ the latent, which keeps the compression aligned with the FER/UFR requirement: fa
 linearly usable after compression instead of becoming another entangled bottleneck.
 
   python -m thinking.image_latent --selftest
-  python -m thinking.image_latent --train --ae-steps 400 --flow-steps 400 \
-      --out runs/image_latent_flow.pt
+  python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-steps 400 \
+      --out runs/image_latent_dit.pt
 """
 import argparse
 import json
@@ -129,6 +129,68 @@ class LatentFlowNet(nn.Module):
         return self.net(torch.cat([z, tchan, c], dim=1))
 
 
+class LatentDiTFlowNet(nn.Module):
+    """Patch-token transformer velocity field over semantic image latents.
+
+    This is intentionally tiny, but it matches the scalable architecture shape: flatten the
+    autoencoder latent grid into tokens, condition every token on time + canonical facts, run
+    transformer blocks, then project token velocities back to the latent grid.
+    """
+
+    def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None, max_tokens=256):
+        super().__init__()
+        cond_dim = cond_dim or len(FACT_VOCAB)
+        self.latent_ch = int(latent_ch)
+        self.hidden = int(hidden)
+        self.max_tokens = int(max_tokens)
+        self.in_proj = nn.Linear(latent_ch, hidden)
+        self.pos = nn.Parameter(torch.zeros(1, max_tokens, hidden))
+        self.cond = nn.Sequential(
+            nn.Linear(cond_dim + 1, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+        )
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden,
+            nhead=heads,
+            dim_feedforward=hidden * 4,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.blocks = nn.TransformerEncoder(layer, num_layers=depth, enable_nested_tensor=False)
+        self.norm = nn.LayerNorm(hidden)
+        self.out_proj = nn.Linear(hidden, latent_ch)
+
+    def forward(self, z, t, cond):
+        if t.ndim > 2:
+            t = t.flatten(1)[:, :1]
+        elif t.ndim == 1:
+            t = t[:, None]
+        b, c, h, w = z.shape
+        n = h * w
+        if n > self.max_tokens:
+            raise ValueError(f"latent token count {n} exceeds max_tokens={self.max_tokens}")
+        toks = z.flatten(2).transpose(1, 2)                  # B,N,C
+        ctx = self.cond(torch.cat([cond, t.to(cond.dtype)], dim=1))[:, None, :]
+        x = self.in_proj(toks) + self.pos[:, :n] + ctx
+        x = self.blocks(x)
+        v = self.out_proj(self.norm(x))
+        return v.transpose(1, 2).reshape(b, c, h, w)
+
+
+def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4):
+    if flow_arch == "conv":
+        return LatentFlowNet(latent_ch=latent_ch, hidden=hidden)
+    if flow_arch == "dit":
+        heads = max(1, min(dit_heads, hidden // 16))
+        while hidden % heads:
+            heads -= 1
+        return LatentDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth, heads=heads)
+    raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
+
+
 def autoencoder_loss(out, x, yc, ys, fact_w=0.25):
     recon = F.mse_loss(out["recon"], x)
     facts = F.cross_entropy(out["color"], yc) + F.cross_entropy(out["shape"], ys)
@@ -206,11 +268,13 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV):
 
 
 def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidden=64,
-                      lr=2e-4, fact_w=1.0, seed=0, size=32, device=DEV):
+                      lr=2e-4, fact_w=1.0, seed=0, size=32, device=DEV, flow_arch="conv",
+                      dit_depth=3, dit_heads=4):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     ae = SemanticAutoencoder(latent_ch=latent_ch, hidden=hidden).to(device)
-    flow = LatentFlowNet(latent_ch=latent_ch, hidden=hidden).to(device)
+    flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
+                     dit_depth=dit_depth, dit_heads=dit_heads).to(device)
     opt_ae = torch.optim.AdamW(ae.parameters(), lr=lr, weight_decay=0.01)
     ae.train()
     last_ae = {}
@@ -245,6 +309,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "batch": int(batch),
         "latent_ch": int(latent_ch),
         "hidden": int(hidden),
+        "flow_arch": flow_arch,
+        "dit_depth": int(dit_depth) if flow_arch == "dit" else 0,
+        "dit_heads": int(dit_heads) if flow_arch == "dit" else 0,
         "fact_w": float(fact_w),
         "last_ae": last_ae,
         "last_flow_loss": last_flow,
@@ -262,6 +329,12 @@ def selftest():
     cond = fact_condition(object_facts(spec), device="cpu")[None]
     img = sample_images(ae, flow, cond, latent_shape=(4, 8, 8), steps=2, device="cpu", seed=0)
     assert img.shape == (1, 3, 32, 32)
+    ae2, flow2, report2 = train_latent_flow(ae_steps=1, flow_steps=1, batch=2, latent_ch=4,
+                                            hidden=32, flow_arch="dit", dit_depth=1,
+                                            dit_heads=2, seed=1, device="cpu")
+    assert report2["flow_arch"] == "dit"
+    img2 = sample_images(ae2, flow2, cond, latent_shape=(4, 8, 8), steps=1, device="cpu", seed=1)
+    assert img2.shape == (1, 3, 32, 32)
     print("image_latent selftest OK")
 
 
@@ -276,6 +349,9 @@ def main(argv=None):
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--fact-w", type=float, default=1.0, dest="fact_w")
+    ap.add_argument("--flow-arch", default="conv", choices=("conv", "dit"), dest="flow_arch")
+    ap.add_argument("--dit-depth", type=int, default=3, dest="dit_depth")
+    ap.add_argument("--dit-heads", type=int, default=4, dest="dit_heads")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="runs/image_latent_flow.pt")
     args = ap.parse_args(argv)
@@ -287,7 +363,8 @@ def main(argv=None):
     ae, flow, report = train_latent_flow(ae_steps=args.ae_steps, flow_steps=args.flow_steps,
                                          batch=args.batch, latent_ch=args.latent_ch,
                                          hidden=args.hidden, lr=args.lr, fact_w=args.fact_w,
-                                         seed=args.seed)
+                                         seed=args.seed, flow_arch=args.flow_arch,
+                                         dit_depth=args.dit_depth, dit_heads=args.dit_heads)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save({
         "autoencoder_state_dict": ae.state_dict(),
@@ -296,6 +373,7 @@ def main(argv=None):
         "fact_vocab": FACT_VOCAB,
         "latent_ch": args.latent_ch,
         "hidden": args.hidden,
+        "flow_arch": args.flow_arch,
     }, args.out)
     print(json.dumps(report, indent=1))
     print(f"saved -> {args.out}")

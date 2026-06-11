@@ -1,0 +1,27 @@
+{
+ "experiment": "m0_multimodal_bridge",
+ "steps": 400,
+ "value_w": 6.0,
+ "per_factor_acc": {
+  "color": 1.0,
+  "shape": 0.99,
+  "pitch": 0.88,
+  "timbre": 1.0,
+  "env": 0.985
+ },
+ "chance": {
+  "color": 0.2,
+  "shape": 0.3333333333333333,
+  "pitch": 0.125,
+  "timbre": 0.25,
+  "env": 0.3333333333333333
+ },
+ "gate_thresholds": {
+  "color": 0.52,
+  "shape": 0.6000000000000001,
+  "pitch": 0.47500000000000003,
+  "timbre": 0.55,
+  "env": 0.6000000000000001
+ },
+ "gate": true
+}

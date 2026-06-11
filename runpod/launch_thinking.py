@@ -94,7 +94,8 @@ def payload(args):
             IL = PY.replace("thinking.cli", "thinking.image_latent")
             cmds.append(f"{IL} --train --ae-steps {args.train_steps or 800} "
                         f"--flow-steps {args.train_steps or 800} --batch {args.batch} "
-                        f"--hidden {args.dim or 64} --out runs/image_latent_flow.pt")
+                        f"--hidden {args.dim or 64} --flow-arch {args.image_latent_arch} "
+                        f"--out runs/image_latent_{args.image_latent_arch}.pt")
         if args.audio:                                     # AUDIO-1: audio factors -> facts
             AU = PY.replace("thinking.cli", "thinking.audio")
             cmds.append(f"{AU} --steps {args.train_steps or 500} "
@@ -315,6 +316,8 @@ def main():
                     help="train the tiny fact-conditioned rectified-flow image generator")
     ap.add_argument("--image-latent", action="store_true", dest="image_latent",
                     help="IMAGE-3: train semantic autoencoder + latent fact-conditioned flow")
+    ap.add_argument("--image-latent-arch", default="conv", choices=("conv", "dit"),
+                    dest="image_latent_arch", help="latent velocity architecture")
     ap.add_argument("--audio", action="store_true",
                     help="AUDIO-1: train synthetic audio factor FER experiment")
     ap.add_argument("--multimodal", action="store_true",
