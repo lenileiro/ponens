@@ -118,6 +118,7 @@ def payload(args):
                      f"--ae-intervention-w {args.image_ae_intervention_w} "
                      f"--ae-factor-orth-w {args.image_ae_factor_orth_w} "
                      f"--flow-semantic-w {args.image_flow_semantic_w} "
+                     f"--flow-consistency-w {args.image_flow_consistency_w} "
                      f"--flow-ema-decay {args.image_flow_ema_decay} "
                      f"--ema-eval-mode {args.image_ema_eval_mode} "
                      f"--time-sampling {args.image_time_sampling} "
@@ -436,6 +437,9 @@ def main():
     ap.add_argument("--image-flow-semantic-w", type=float, default=0.0,
                     dest="image_flow_semantic_w",
                     help="semantic endpoint alignment weight for latent image flow training")
+    ap.add_argument("--image-flow-consistency-w", type=float, default=0.0,
+                    dest="image_flow_consistency_w",
+                    help="same-path endpoint consistency loss weight for latent image flow")
     ap.add_argument("--image-flow-ema-decay", type=float, default=0.0,
                     dest="image_flow_ema_decay",
                     help="EMA decay for latent image flow/conditioner weights")

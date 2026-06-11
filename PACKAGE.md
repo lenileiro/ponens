@@ -260,6 +260,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-cond-mode text --image-dit-head-width-mult 2 \
     --image-cond-drop 0.1 --image-cfg-scale 1.5 \
     --image-sample-steps 8 --image-flow-semantic-w 0.25 \
+    --image-flow-consistency-w 0.05 \
     --image-time-sampling logit-normal --image-flow-ema-decay 0.999 \
     --image-latent-normalize channel --image-latent-stat-samples 1024 \
     --image-cfg-interval 0.0,0.8 --image-semantic-guidance-interval 0.0,0.75 \
@@ -497,6 +498,13 @@ Image-27 adds guidance intervals (`--cfg-interval`, `--semantic-guidance-interva
 now be active over selected rectified-flow time ranges while defaults preserve old always-on
 behavior. This follows the REPA/guidance-interval direction: guidance becomes a measured sampler
 schedule rather than a hard-coded every-step push, and it stays generic over conditions.
+
+Image-28 adds an optional endpoint-consistency regularizer (`--flow-consistency-w`; RunPod:
+`--image-flow-consistency-w`) and eval metrics (`latent_endpoint_mse`,
+`latent_endpoint_consistency_mse`, `latent_endpoint_time_gap`). The loss asks two different flow
+times on the same noise/data path to predict the same clean latent endpoint. This targets the
+few-step image-generation bottleneck without adding renderer-specific grammar: if the path is
+more self-consistent, Euler/Heun sweeps should need fewer steps to preserve facts and pixels.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

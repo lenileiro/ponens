@@ -1058,7 +1058,7 @@ def latent_factor_orthogonality_loss(z, cond, eps=1.0e-6):
 
 def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
                        semantic_cond=None, time_sampling="uniform", time_logit_mean=0.0,
-                       time_logit_std=1.0, latent_stats=None):
+                       time_logit_std=1.0, latent_stats=None, consistency_w=0.0):
     latent_stats = flow_latent_stats(flow) if latent_stats is None else latent_stats
     z1_model = normalize_latent(z1, latent_stats)
     x0 = torch.randn_like(z1_model)
@@ -1075,6 +1075,19 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
         "time_mean": t.detach().mean(),
         "time_std": t.detach().std(unbiased=False),
     }
+    if consistency_w > 0.0:
+        t2 = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
+                               logit_mean=time_logit_mean, logit_std=time_logit_std)
+        zt2 = (1.0 - t2) * x0 + t2 * z1_model
+        pred2 = flow(zt2, t2, cond_model)
+        endpoint1 = zt + (1.0 - t) * pred
+        endpoint2 = zt2 + (1.0 - t2) * pred2
+        consistency = 0.5 * (
+            F.mse_loss(endpoint1, endpoint2.detach())
+            + F.mse_loss(endpoint2, endpoint1.detach())
+        )
+        total = total + float(consistency_w) * consistency
+        parts["endpoint_consistency_mse"] = consistency.detach()
     if ae is not None and semantic_w > 0.0:
         z_clean = denormalize_latent(zt + (1.0 - t) * pred, latent_stats)
         sem_cond = cond if semantic_cond is None else semantic_cond
@@ -1085,6 +1098,34 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
         parts["semantic_endpoint_ce"] = semantic.detach()
         parts.update(sem_parts)
     return total, parts
+
+
+@torch.no_grad()
+def flow_endpoint_metrics(flow, z1, cond, time_sampling="uniform", time_logit_mean=0.0,
+                          time_logit_std=1.0, latent_stats=None):
+    """Measure whether different times on the same path predict the same clean endpoint."""
+    latent_stats = flow_latent_stats(flow) if latent_stats is None else latent_stats
+    z1_model = normalize_latent(z1, latent_stats)
+    x0 = torch.randn_like(z1_model)
+    t1 = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
+                           logit_mean=time_logit_mean, logit_std=time_logit_std)
+    t2 = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
+                           logit_mean=time_logit_mean, logit_std=time_logit_std)
+
+    def endpoint_at(t):
+        zt = (1.0 - t) * x0 + t * z1_model
+        pred = flow(zt, t, cond)
+        return zt + (1.0 - t) * pred
+
+    endpoint1 = endpoint_at(t1)
+    endpoint2 = endpoint_at(t2)
+    return {
+        "latent_endpoint_mse": float(F.mse_loss(endpoint1, z1_model).detach().cpu()),
+        "latent_endpoint_consistency_mse": float(
+            F.mse_loss(endpoint1, endpoint2).detach().cpu()
+        ),
+        "latent_endpoint_time_gap": float((t1 - t2).abs().mean().detach().cpu()),
+    }
 
 
 def latent_flow_loss(flow, z1, cond, cond_drop=0.0, time_sampling="uniform",
@@ -1353,6 +1394,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
     ae.eval()
     flow.eval()
     recon_losses, flow_losses = [], []
+    endpoint_mses, endpoint_consistency_mses, endpoint_time_gaps = [], [], []
     factor_orth_losses, factor_orth_pairs, factor_orth_bases = [], [], []
     got_c = got_s = total = 0
     latent_means, latent_stds = [], []
@@ -1371,6 +1413,10 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
                                prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
                                rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
         flow_losses.append(float(latent_flow_loss(flow, z, cond).detach().cpu()))
+        endpoint_metrics = flow_endpoint_metrics(flow, z, cond)
+        endpoint_mses.append(endpoint_metrics["latent_endpoint_mse"])
+        endpoint_consistency_mses.append(endpoint_metrics["latent_endpoint_consistency_mse"])
+        endpoint_time_gaps.append(endpoint_metrics["latent_endpoint_time_gap"])
         got_c += int(out["color"].argmax(-1).eq(yc).sum())
         got_s += int(out["shape"].argmax(-1).eq(ys).sum())
         latent_means.append(float(z.mean().detach().cpu()))
@@ -1401,6 +1447,9 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
         "sample_min": float(sample.min().detach().cpu()),
         "sample_max": float(sample.max().detach().cpu()),
         "sample_center_target_mse": float(F.mse_loss(sample, target).detach().cpu()),
+        "latent_endpoint_mse": float(np.mean(endpoint_mses)),
+        "latent_endpoint_consistency_mse": float(np.mean(endpoint_consistency_mses)),
+        "latent_endpoint_time_gap": float(np.mean(endpoint_time_gaps)),
         "cfg_scale": float(cfg_scale),
         "cfg_interval": list(validate_guidance_interval(cfg_interval)),
         "sample_steps": int(sample_steps),
@@ -1533,6 +1582,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "ema_available": ema_available,
         "ema_loaded": ema_loaded,
         "flow_ema_decay": float(ckpt.get("flow_ema_decay", report.get("flow_ema_decay", 0.0))),
+        "flow_consistency_w": float(ckpt.get(
+            "flow_consistency_w", report.get("flow_consistency_w", 0.0))),
         "flow_ema_warmup": bool(ckpt.get("flow_ema_warmup",
                                          report.get("flow_ema_warmup", False))),
         "flow_ema_effective_decay": float(ckpt.get(
@@ -1588,6 +1639,9 @@ SWEEP_METRICS = (
     "conditional_sample_mse",
     "sample_center_target_mse",
     "latent_velocity_mse",
+    "latent_endpoint_mse",
+    "latent_endpoint_consistency_mse",
+    "latent_endpoint_time_gap",
 )
 
 
@@ -1603,6 +1657,7 @@ def report_selection_key(report):
         -float(report.get("conditional_sample_mse", inf)),
         -float(report.get("sample_center_target_mse", inf)),
         -float(report.get("latent_velocity_mse", inf)),
+        -float(report.get("latent_endpoint_consistency_mse", inf)),
     )
 
 
@@ -1615,6 +1670,7 @@ def aggregate_selection_key(report):
         -float(report.get("conditional_sample_mse_mean", inf)),
         -float(report.get("sample_center_target_mse_mean", inf)),
         -float(report.get("latent_velocity_mse_mean", inf)),
+        -float(report.get("latent_endpoint_consistency_mse_mean", inf)),
     )
 
 
@@ -1635,6 +1691,9 @@ def eval_report_summary(report):
         "conditional_sample_mse",
         "sample_center_target_mse",
         "latent_velocity_mse",
+        "latent_endpoint_mse",
+        "latent_endpoint_consistency_mse",
+        "latent_endpoint_time_gap",
         "latent_color_acc",
         "latent_shape_acc",
         "latent_intervention_n",
@@ -1803,6 +1862,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       dit_depth=3, dit_heads=4, cond_drop=0.0, cfg_scale=1.0,
                       dit_head_width_mult=1,
                       sample_steps=4, roundtrip_samples=1, flow_semantic_w=0.0,
+                      flow_consistency_w=0.0,
                       cond_mode="facts", text_cond_dim=0,
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0,
@@ -1829,6 +1889,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("ae_factor_orth_w must be non-negative")
     if semantic_guidance_w < 0.0:
         raise ValueError("semantic_guidance_w must be non-negative")
+    if flow_consistency_w < 0.0:
+        raise ValueError("flow_consistency_w must be non-negative")
     if semantic_guidance_mode not in ("latent", "decoded"):
         raise ValueError(f"unknown semantic guidance mode {semantic_guidance_mode!r}")
     if sample_method not in SAMPLE_METHODS:
@@ -1907,7 +1969,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                                          semantic_cond=fact_cond,
                                          time_sampling=time_sampling,
                                          time_logit_mean=time_logit_mean,
-                                         time_logit_std=time_logit_std)
+                                         time_logit_std=time_logit_std,
+                                         consistency_w=flow_consistency_w)
         opt_flow.zero_grad()
         loss.backward()
         opt_flow.step()
@@ -1986,6 +2049,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "semantic_guidance_mode": semantic_guidance_mode,
         "semantic_guidance_interval": list(semantic_guidance_interval),
         "flow_semantic_w": float(flow_semantic_w),
+        "flow_consistency_w": float(flow_consistency_w),
         "flow_ema_decay": float(flow_ema_decay),
         "flow_ema_warmup": bool(flow_ema_warmup),
         "flow_ema_updates": int(ema_updates),
@@ -2028,6 +2092,7 @@ def selftest():
     assert report["experiment"] == "image3_latent_fact_conditioned_rectified_flow"
     assert report["latent_color_acc"] >= 0.0 and report["latent_shape_acc"] >= 0.0
     assert "sample_roundtrip_both_acc" in report and report["sample_roundtrip_n"] == 15
+    assert "latent_endpoint_consistency_mse" in report
     assert "latent_intervention_score" in report and report["latent_intervention_n"] > 0
     assert "latent_factor_orth_loss" in report
     spec = ObjectSpec("p0", "blue", "triangle")
@@ -2052,6 +2117,7 @@ def selftest():
                                             cfg_scale=1.5, sample_steps=1,
                                             flow_semantic_w=0.25, ae_intervention_w=0.1,
                                             ae_factor_orth_w=0.05,
+                                            flow_consistency_w=0.1,
                                             latent_normalize="channel",
                                             latent_stat_samples=8,
                                             cfg_interval=(0.0, 0.5),
@@ -2059,6 +2125,7 @@ def selftest():
     assert report2["flow_arch"] == "dit"
     assert report2["cond_drop"] == 0.5 and report2["cfg_scale"] == 1.5
     assert report2["flow_semantic_w"] == 0.25
+    assert report2["flow_consistency_w"] == 0.1
     assert report2["ae_intervention_w"] == 0.1
     assert report2["ae_factor_orth_w"] == 0.05
     assert report2["latent_normalize"] == "channel" and report2["latent_norm_n"] == 8
@@ -2067,6 +2134,7 @@ def selftest():
     assert "latent_intervention_loss" in report2["last_ae"]
     assert "latent_factor_orth_loss" in report2["last_ae"]
     assert "semantic_endpoint_ce" in report2["last_flow"]
+    assert "endpoint_consistency_mse" in report2["last_flow"]
     img2 = sample_images(ae2, flow2, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
                          seed=1, cfg_scale=1.5)
     assert img2.shape == (1, 3, 32, 32)
@@ -2195,6 +2263,9 @@ def main(argv=None):
                     help="samples for latent fact intervention diagnostics; 0 disables")
     ap.add_argument("--flow-semantic-w", type=float, default=0.0, dest="flow_semantic_w",
                     help="semantic endpoint alignment weight for latent flow training")
+    ap.add_argument("--flow-consistency-w", type=float, default=0.0,
+                    dest="flow_consistency_w",
+                    help="same-path clean-endpoint consistency loss weight for latent flow")
     ap.add_argument("--flow-ema-decay", type=float, default=0.0, dest="flow_ema_decay",
                     help="EMA decay for flow/conditioner weights; 0 disables EMA")
     ap.add_argument("--no-ema-warmup", action="store_true", dest="no_ema_warmup",
@@ -2320,6 +2391,7 @@ def main(argv=None):
         dit_head_width_mult=args.dit_head_width_mult,
         sample_steps=args.sample_steps, roundtrip_samples=args.roundtrip_samples,
         flow_semantic_w=args.flow_semantic_w, cond_mode=args.cond_mode,
+        flow_consistency_w=args.flow_consistency_w,
         text_cond_dim=args.text_cond_dim, prompt_templates=templates,
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
         time_logit_std=args.time_logit_std,
@@ -2399,6 +2471,7 @@ def main(argv=None):
         "ae_intervention_w": args.ae_intervention_w,
         "ae_factor_orth_w": args.ae_factor_orth_w,
         "flow_semantic_w": args.flow_semantic_w,
+        "flow_consistency_w": args.flow_consistency_w,
         "flow_ema_decay": args.flow_ema_decay,
         "flow_ema_warmup": not args.no_ema_warmup,
         "flow_ema_effective_decay": report.get("flow_ema_effective_decay", 0.0),
