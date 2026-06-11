@@ -105,6 +105,7 @@ def payload(args):
                      f"--cond-drop {args.image_cond_drop} "
                      f"--cfg-scale {args.image_cfg_scale} "
                      f"--sample-steps {args.image_sample_steps} "
+                     f"--sample-method {args.image_sample_method} "
                      f"--semantic-guidance-w {args.image_semantic_guidance_w} "
                      f"--semantic-guidance-mode {args.image_semantic_guidance_mode} "
                      f"--roundtrip-samples {args.image_roundtrip_samples} "
@@ -127,6 +128,8 @@ def payload(args):
                           f"--checkpoint-weight-mode {args.image_checkpoint_weight_mode} "
                           f"--cfg-scales {shlex_quote(args.image_cfg_sweep)} "
                           f"--sample-steps-list {shlex_quote(args.image_sample_steps_sweep)} "
+                          f"--sample-method {args.image_sample_method} "
+                          f"--sample-methods {shlex_quote(args.image_sample_methods)} "
                           f"--semantic-guidance-w {args.image_semantic_guidance_w} "
                           f"--semantic-guidance-weights "
                           f"{shlex_quote(args.image_semantic_guidance_sweep)} "
@@ -372,7 +375,13 @@ def main():
     ap.add_argument("--image-cfg-scale", type=float, default=1.0, dest="image_cfg_scale",
                     help="classifier-free guidance scale for latent image sampling")
     ap.add_argument("--image-sample-steps", type=int, default=4, dest="image_sample_steps",
-                    help="Euler sampling steps for latent image evaluation")
+                    help="ODE sampling steps for latent image evaluation")
+    ap.add_argument("--image-sample-method", default="euler", choices=("euler", "heun"),
+                    dest="image_sample_method",
+                    help="latent image ODE sampler method")
+    ap.add_argument("--image-sample-methods", default="euler,heun",
+                    dest="image_sample_methods",
+                    help="comma-separated latent image sampler methods for sweeps")
     ap.add_argument("--image-semantic-guidance-w", type=float, default=0.0,
                     dest="image_semantic_guidance_w",
                     help="sampling-time semantic AE guidance weight for latent images")

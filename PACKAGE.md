@@ -170,6 +170,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-time-sampling logit-normal --image-flow-ema-decay 0.999 \
     --image-ae-intervention-w 0.1 --image-ae-factor-orth-w 0.05 \
     --image-semantic-guidance-w 2.0 --image-semantic-guidance-sweep 0.0,1.0,2.0 \
+    --image-sample-methods euler,heun \
     --image-eval-sweep --fast --go
 ```
 
@@ -368,6 +369,13 @@ the same three-seed sweep over `{0, 1, 2}` selects `sem=2`: both-fact accuracy m
 **0.800 -> 0.933 -> 0.978** as guidance increases, while conditional MSE moves
 **0.0509 -> 0.0522 -> 0.0562**. This turns semantic guidance into a Pareto selection problem beside
 CFG and sampler steps.
+
+Image-23 makes the rectified-flow ODE solver a measured sweep axis (`--sample-methods`; RunPod:
+`--image-sample-methods`) with Euler and Heun methods. On the fetched H100 checkpoint, the joint
+`{euler, heun} × {sem=0,1,2}` sweep still selects `euler;sem=2`: Heun reaches the same both-fact
+accuracy at each semantic-guidance level but has higher conditional MSE on this straightened toy
+flow. That keeps Euler as the current default while giving future less-straight flows a fair solver
+comparison.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

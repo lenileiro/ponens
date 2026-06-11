@@ -43,6 +43,7 @@ FACT_GROUPS = {
     pred: tuple(i for i, fact in enumerate(FACT_VOCAB) if fact[0] == pred)
     for pred in sorted({fact[0] for fact in FACT_VOCAB})
 }
+SAMPLE_METHODS = ("euler", "heun")
 
 
 def _batch(n, rng, size=32, device=DEV, return_specs=False):
@@ -510,6 +511,12 @@ def _parse_templates(s):
     return tuple(x.strip() for x in str(s).split(";") if x.strip())
 
 
+def _parse_string_list(s):
+    if isinstance(s, (tuple, list)):
+        return tuple(str(x).strip() for x in s if str(x).strip())
+    return tuple(x.strip() for x in str(s).split(",") if x.strip())
+
+
 def _seeded_randn(shape, device, seed):
     dev = torch.device(device)
     gen_device = "cpu" if dev.type == "mps" else dev.type
@@ -949,7 +956,7 @@ def guided_velocity(flow, z, t, cond, cfg_scale=1.0):
 @torch.no_grad()
 def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0,
                    cfg_scale=1.0, ae=None, semantic_cond=None, semantic_guidance_w=0.0,
-                   semantic_guidance_mode="decoded"):
+                   semantic_guidance_mode="decoded", sample_method="euler"):
     batch = condition_batch(cond)
     z = _seeded_randn((batch,) + tuple(latent_shape), device=device, seed=seed)
     flow.eval()
@@ -959,10 +966,19 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         semantic_cond = fact_condition_or_none(cond)
     if semantic_guidance_w > 0.0 and ae is None:
         raise ValueError("semantic guidance requires ae")
+    if sample_method not in SAMPLE_METHODS:
+        raise ValueError(f"unknown sample method {sample_method!r}")
     dt = 1.0 / max(1, steps)
     for i in range(steps):
         t = torch.full((batch, 1, 1, 1), i / max(1, steps), device=device)
-        z = z + dt * guided_velocity(flow, z, t, cond, cfg_scale=cfg_scale)
+        v0 = guided_velocity(flow, z, t, cond, cfg_scale=cfg_scale)
+        if sample_method == "euler":
+            z = z + dt * v0
+        else:
+            z_pred = z + dt * v0
+            t_next = torch.full((batch, 1, 1, 1), (i + 1) / max(1, steps), device=device)
+            v1 = guided_velocity(flow, z_pred, t_next, cond, cfg_scale=cfg_scale)
+            z = z + 0.5 * dt * (v0 + v1)
         if semantic_guidance_w > 0.0:
             z = semantic_guidance_step(ae, z, semantic_cond, weight=semantic_guidance_w,
                                        step_size=dt, mode=semantic_guidance_mode)
@@ -972,11 +988,12 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
 @torch.no_grad()
 def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0,
                   cfg_scale=1.0, semantic_cond=None, semantic_guidance_w=0.0,
-                  semantic_guidance_mode="decoded"):
+                  semantic_guidance_mode="decoded", sample_method="euler"):
     z = sample_latents(flow, cond, latent_shape=latent_shape, steps=steps, device=device,
                        seed=seed, cfg_scale=cfg_scale, ae=ae, semantic_cond=semantic_cond,
                        semantic_guidance_w=semantic_guidance_w,
-                       semantic_guidance_mode=semantic_guidance_mode)
+                       semantic_guidance_mode=semantic_guidance_mode,
+                       sample_method=sample_method)
     ae.eval()
     return ae.decode(z).clamp(-1.0, 1.0)
 
@@ -985,7 +1002,8 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
 def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_steps=4,
                           samples_per_combo=1, seed=20, cond_mode="facts", conditioner=None,
                           prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
-                          semantic_guidance_w=0.0, semantic_guidance_mode="decoded"):
+                          semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
+                          sample_method="euler"):
     """Generate from every canonical color/shape request and re-read facts from the image."""
     ae.eval()
     flow.eval()
@@ -1007,7 +1025,8 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_s
                                    device=device, seed=seed + ci * 101 + si * 17,
                                    cfg_scale=cfg_scale, semantic_cond=fact_cond,
                                    semantic_guidance_w=semantic_guidance_w,
-                                   semantic_guidance_mode=semantic_guidance_mode)
+                                   semantic_guidance_mode=semantic_guidance_mode,
+                                   sample_method=sample_method)
             out = ae(sample)
             pc = out["color"].argmax(-1)
             ps = out["shape"].argmax(-1)
@@ -1037,7 +1056,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
              sample_steps=4, roundtrip_samples=1, cond_mode="facts", conditioner=None,
              prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
              intervention_samples=0, semantic_guidance_w=0.0,
-             semantic_guidance_mode="decoded"):
+             semantic_guidance_mode="decoded", sample_method="euler"):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     ae.eval()
@@ -1075,7 +1094,8 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
     sample = sample_images(ae, flow, cond, latent_shape=(ae.latent_ch, size // 4, size // 4),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            semantic_cond=fact_cond, semantic_guidance_w=semantic_guidance_w,
-                           semantic_guidance_mode=semantic_guidance_mode)
+                           semantic_guidance_mode=semantic_guidance_mode,
+                           sample_method=sample_method)
     target = torch.tensor(render_object(spec, size=size) * 2.0 - 1.0,
                           dtype=torch.float32, device=device)[None]
     report = {
@@ -1091,6 +1111,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
         "sample_center_target_mse": float(F.mse_loss(sample, target).detach().cpu()),
         "cfg_scale": float(cfg_scale),
         "sample_steps": int(sample_steps),
+        "sample_method": sample_method,
         "semantic_guidance_w": float(semantic_guidance_w),
         "semantic_guidance_mode": semantic_guidance_mode,
     }
@@ -1107,7 +1128,8 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
                                         prompt_vocab=prompt_vocab,
                                         prompt_templates=prompt_templates,
                                         semantic_guidance_w=semantic_guidance_w,
-                                        semantic_guidance_mode=semantic_guidance_mode))
+                                        semantic_guidance_mode=semantic_guidance_mode,
+                                        sample_method=sample_method))
     if intervention_samples:
         report.update(latent_intervention_diagnostic(
             ae, n=intervention_samples, batch=batch, seed=seed + 31, size=size, device=device))
@@ -1218,25 +1240,30 @@ def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                   n=128, batch=64, seed=10, size=32, device=DEV, roundtrip_samples=1,
                   cond_mode="facts", conditioner=None, prompt_vocab=None,
                   prompt_templates=DEFAULT_PROMPT_TEMPLATES, semantic_guidance_w=0.0,
-                  semantic_guidance_weights=None, semantic_guidance_mode="decoded"):
+                  semantic_guidance_weights=None, semantic_guidance_mode="decoded",
+                  sample_method="euler", sample_methods=None):
     if semantic_guidance_weights is None:
         semantic_guidance_weights = (semantic_guidance_w,)
+    if sample_methods is None:
+        sample_methods = (sample_method,)
     rows = []
     for cfg_scale in cfg_scales:
         for sample_steps in sample_steps_list:
-            for guidance_w in semantic_guidance_weights:
-                row = evaluate(ae, flow, n=n, batch=batch, seed=seed, size=size, device=device,
-                               cfg_scale=float(cfg_scale), sample_steps=int(sample_steps),
-                               roundtrip_samples=roundtrip_samples, cond_mode=cond_mode,
-                               conditioner=conditioner, prompt_vocab=prompt_vocab,
-                               prompt_templates=prompt_templates,
-                               semantic_guidance_w=float(guidance_w),
-                               semantic_guidance_mode=semantic_guidance_mode)
-                row["sweep_key"] = (
-                    f"cfg={float(cfg_scale):g};steps={int(sample_steps)};"
-                    f"sem={float(guidance_w):g}"
-                )
-                rows.append(row)
+            for method in sample_methods:
+                for guidance_w in semantic_guidance_weights:
+                    row = evaluate(ae, flow, n=n, batch=batch, seed=seed, size=size,
+                                   device=device, cfg_scale=float(cfg_scale),
+                                   sample_steps=int(sample_steps), roundtrip_samples=roundtrip_samples,
+                                   cond_mode=cond_mode, conditioner=conditioner,
+                                   prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
+                                   semantic_guidance_w=float(guidance_w),
+                                   semantic_guidance_mode=semantic_guidance_mode,
+                                   sample_method=method)
+                    row["sweep_key"] = (
+                        f"cfg={float(cfg_scale):g};steps={int(sample_steps)};"
+                        f"method={method};sem={float(guidance_w):g}"
+                    )
+                    rows.append(row)
     return rows
 
 
@@ -1282,6 +1309,7 @@ def eval_report_summary(report):
         "eval_weight_mode",
         "cfg_scale",
         "sample_steps",
+        "sample_method",
         "semantic_guidance_w",
         "semantic_guidance_mode",
         "sample_roundtrip_n",
@@ -1309,18 +1337,21 @@ def aggregate_sweep_rows(rows):
     grouped = {}
     for row in rows:
         key = (float(row["cfg_scale"]), int(row["sample_steps"]),
+               str(row.get("sample_method", "euler")),
                float(row.get("semantic_guidance_w", 0.0)),
                str(row.get("semantic_guidance_mode", "decoded")))
         grouped.setdefault(key, []).append(row)
     out = []
-    for (cfg_scale, sample_steps, semantic_guidance_w, semantic_guidance_mode), group in sorted(
-            grouped.items()):
+    for (cfg_scale, sample_steps, sample_method, semantic_guidance_w,
+         semantic_guidance_mode), group in sorted(grouped.items()):
         agg = {
             "sweep_key": (
-                f"cfg={cfg_scale:g};steps={sample_steps};sem={semantic_guidance_w:g}"
+                f"cfg={cfg_scale:g};steps={sample_steps};method={sample_method};"
+                f"sem={semantic_guidance_w:g}"
             ),
             "cfg_scale": float(cfg_scale),
             "sample_steps": int(sample_steps),
+            "sample_method": sample_method,
             "semantic_guidance_w": float(semantic_guidance_w),
             "semantic_guidance_mode": semantic_guidance_mode,
             "runs": len(group),
@@ -1340,7 +1371,8 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         n=128, batch=64, seed=10, eval_seeds=None, size=32, device=DEV,
                         roundtrip_samples=1, prefer_ema=True, weight_mode=None,
                         intervention_samples=0, semantic_guidance_w=0.0,
-                        semantic_guidance_weights=None, semantic_guidance_mode="decoded"):
+                        semantic_guidance_weights=None, semantic_guidance_mode="decoded",
+                        sample_method="euler", sample_methods=None):
     if weight_mode is None:
         weight_mode = "ema" if prefer_ema else "raw"
     if weight_mode not in EVAL_WEIGHT_MODES:
@@ -1362,7 +1394,9 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                                      prompt_templates=prompt_templates,
                                      semantic_guidance_w=semantic_guidance_w,
                                      semantic_guidance_weights=semantic_guidance_weights,
-                                     semantic_guidance_mode=semantic_guidance_mode):
+                                     semantic_guidance_mode=semantic_guidance_mode,
+                                     sample_method=sample_method,
+                                     sample_methods=sample_methods):
                 row["eval_seed"] = int(eval_seed)
                 row["checkpoint_weight_mode"] = actual_mode
                 rows.append(row)
@@ -1376,6 +1410,8 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             "selected_checkpoint_weights": actual_mode,
             "n": int(n),
             "roundtrip_samples": int(roundtrip_samples),
+            "sample_method": sample_method,
+            "sample_methods": list(sample_methods or (sample_method,)),
             "semantic_guidance_w": float(semantic_guidance_w),
             "semantic_guidance_weights": [
                 float(w) for w in (semantic_guidance_weights or (semantic_guidance_w,))
@@ -1422,6 +1458,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       time_logit_mean=0.0, time_logit_std=1.0,
                       ae_intervention_w=0.0, ae_factor_orth_w=0.0,
                       semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
+                      sample_method="euler",
                       flow_ema_decay=0.0, flow_ema_warmup=True, eval_with_ema=True,
                       eval_weight_mode="auto", intervention_samples=32,
                       return_conditioner=False, return_ema=False):
@@ -1439,6 +1476,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("semantic_guidance_w must be non-negative")
     if semantic_guidance_mode not in ("latent", "decoded"):
         raise ValueError(f"unknown semantic guidance mode {semantic_guidance_mode!r}")
+    if sample_method not in SAMPLE_METHODS:
+        raise ValueError(f"unknown sample method {sample_method!r}")
     if flow_ema_decay < 0.0 or flow_ema_decay >= 1.0:
         raise ValueError("flow_ema_decay must be in [0, 1)")
     if eval_weight_mode not in EVAL_WEIGHT_MODES:
@@ -1545,7 +1584,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                              prompt_templates=prompt_templates,
                              intervention_samples=intervention_samples,
                              semantic_guidance_w=semantic_guidance_w,
-                             semantic_guidance_mode=semantic_guidance_mode)
+                             semantic_guidance_mode=semantic_guidance_mode,
+                             sample_method=sample_method)
         candidate["eval_weight_mode"] = mode
         candidate_reports[mode] = candidate
     selected_eval_weights = max(candidate_reports, key=lambda mode: report_selection_key(
@@ -1570,6 +1610,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "ae_intervention_w": float(ae_intervention_w),
         "ae_factor_orth_w": float(ae_factor_orth_w),
         "cond_drop": float(cond_drop),
+        "sample_method": sample_method,
         "semantic_guidance_w": float(semantic_guidance_w),
         "semantic_guidance_mode": semantic_guidance_mode,
         "flow_semantic_w": float(flow_semantic_w),
@@ -1643,11 +1684,12 @@ def selftest():
     assert img2.shape == (1, 3, 32, 32)
     sweep = sampler_sweep(ae2, flow2, cfg_scales=(1.0, 1.5), sample_steps_list=(1,),
                           semantic_guidance_weights=(0.0, 0.05),
+                          sample_methods=("euler", "heun"),
                           n=4, batch=2, seed=3, device="cpu")
-    assert len(sweep) == 4 and "sample_roundtrip_both_acc" in sweep[0]
+    assert len(sweep) == 8 and "sample_roundtrip_both_acc" in sweep[0]
     agg = aggregate_sweep_rows([dict(r, eval_seed=i) for i, r in enumerate(sweep)])
-    assert len(agg) == 4 and "sample_roundtrip_both_acc_mean" in agg[0]
-    assert "semantic_guidance_w" in agg[0]
+    assert len(agg) == 8 and "sample_roundtrip_both_acc_mean" in agg[0]
+    assert "semantic_guidance_w" in agg[0] and "sample_method" in agg[0]
     ae3, flow3, conditioner3, vocab3, report3 = train_latent_flow(
         ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="dit",
         dit_depth=1, dit_heads=2, seed=2, device="cpu", cond_mode="text",
@@ -1723,6 +1765,12 @@ def main(argv=None):
     ap.add_argument("--cond-drop", type=float, default=0.0, dest="cond_drop")
     ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
     ap.add_argument("--sample-steps", type=int, default=4, dest="sample_steps")
+    ap.add_argument("--sample-method", default="euler", choices=SAMPLE_METHODS,
+                    dest="sample_method",
+                    help="ODE sampler method for latent image generation")
+    ap.add_argument("--sample-methods", default="",
+                    dest="sample_methods",
+                    help="comma-separated sampler methods for --eval-checkpoint sweeps")
     ap.add_argument("--semantic-guidance-w", type=float, default=0.0,
                     dest="semantic_guidance_w",
                     help="sampling-time semantic AE guidance weight")
@@ -1796,6 +1844,10 @@ def main(argv=None):
                 if args.semantic_guidance_weights else None
             ),
             semantic_guidance_mode=args.semantic_guidance_mode,
+            sample_method=args.sample_method,
+            sample_methods=(
+                _parse_string_list(args.sample_methods) if args.sample_methods else None
+            ),
         )
         if args.eval_out:
             os.makedirs(os.path.dirname(args.eval_out) or ".", exist_ok=True)
@@ -1822,6 +1874,7 @@ def main(argv=None):
         ae_factor_orth_w=args.ae_factor_orth_w,
         semantic_guidance_w=args.semantic_guidance_w,
         semantic_guidance_mode=args.semantic_guidance_mode,
+        sample_method=args.sample_method,
         flow_ema_decay=args.flow_ema_decay,
         flow_ema_warmup=not args.no_ema_warmup,
         eval_with_ema=not args.no_ema_eval,
@@ -1844,6 +1897,7 @@ def main(argv=None):
         "cond_drop": args.cond_drop,
         "cfg_scale": args.cfg_scale,
         "sample_steps": args.sample_steps,
+        "sample_method": args.sample_method,
         "semantic_guidance_w": args.semantic_guidance_w,
         "semantic_guidance_mode": args.semantic_guidance_mode,
         "intervention_samples": args.intervention_samples,
