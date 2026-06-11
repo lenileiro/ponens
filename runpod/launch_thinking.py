@@ -280,8 +280,9 @@ def main():
         up = (f"COPYFILE_DISABLE=1 tar czf - --exclude './.venv*' --exclude '*/__pycache__' "
               f"--exclude './results_gpu' --exclude '*.zip' --exclude './data' --exclude '*.pt' "
               f"--exclude '*.log' --exclude './runs' --exclude './experiments' "
-              f"--exclude './tooling' --exclude './artifacts' --exclude '*.tgz' -C {HERE} . "
-              f"| {ssh} 'mkdir -p {REMOTE} && tar xzf - -C {REMOTE}'")
+              f"--exclude './tooling' --exclude './artifacts' --exclude './.git' "
+              f"--exclude '*.tgz' -C {HERE} . "
+              f"| {ssh} 'mkdir -p {REMOTE} && tar --no-same-owner -xzf - -C {REMOTE}'")
         sh(up)
         if args.eval_only_run:
             local_run = os.path.join(HERE, args.eval_only_run)
@@ -289,7 +290,7 @@ def main():
                 raise FileNotFoundError(f"--eval-only-run not found: {local_run}")
             up_run = (f"COPYFILE_DISABLE=1 tar czf - -C {shlex_quote(HERE)} "
                       f"{shlex_quote(args.eval_only_run)} "
-                      f"| {ssh} 'mkdir -p {REMOTE} && tar xzf - -C {REMOTE}'")
+                      f"| {ssh} 'mkdir -p {REMOTE} && tar --no-same-owner -xzf - -C {REMOTE}'")
             sh(up_run)
         # DETACHED execution: nohup on the pod + short-poll. A dropped SSH pipe killed three
         # healthy runs (B7/C6/L) when it took the cost-guard with it -- never hold a session.

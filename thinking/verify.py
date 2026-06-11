@@ -9,7 +9,8 @@ import os
 from itertools import permutations
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from datalog import _unify
+from datalog import _ground as _ground_sub
+from datalog import _rename, _unify, _unify2
 
 
 def _ground(atom):
@@ -91,26 +92,37 @@ class GoalChecker:
 
     def new_state(self, pair, edb, goal_pred=None, extra_rules=()):
         return {"known": set(), "edb": set(edb), "derived": [], "pair": tuple(pair),
-                "goal_pred": goal_pred, "extra_rules": list(extra_rules), "seen": set()}
+                "goal_pred": goal_pred, "extra_rules": list(extra_rules), "seen": set(),
+                "support_atoms": "pending", "support_ranks": {}}
 
     def valid_step_state(self, st, typ, head, body):
-        """Non-mutating version of step() for candidate generation."""
+        """Non-mutating version of step() for candidate generation. Rejections record their
+        cause in st['why'] (the taxonomy that tells us WHERE per-line error lives)."""
         body = tuple(body)
         if (typ, head, body) in st["seen"]:
+            st["why"] = "duplicate"
             return False
         if typ == "check":
-            return head in st["edb"]
+            if head in st["edb"]:
+                return True
+            st["why"] = "check-not-edb"
+            return False
         if typ != "think":
+            st["why"] = "bad-line-type"
             return False
         if not all(f in st["known"] for f in body):
+            st["why"] = "premise-unknown"
             return False
         if head[0] in self.builtins:
             if not self.builtins[head[0]](head, body, st["pair"]):
+                st["why"] = "builtin-reject"
                 return False
         elif not instantiates(self.rules + st["extra_rules"], head, body):
+            st["why"] = "no-rule"
             return False
         elif (head[0] in self.answer_preds and head[0] not in self.recursive
               and tuple(head[1]) != st["pair"]):
+            st["why"] = "goal-anchor"
             return False
         return True
 
@@ -144,18 +156,110 @@ class GoalChecker:
                         changed = True
         return rel
 
-    def candidate_steps(self, st, include_checks=True):
+    def support_atoms(self, st):
+        """Ground atoms on one lazy proof-support path for the current goal.
+
+        This is the proof analogue of a narrowed type environment: it does not know relation
+        names or trace grammar, but it uses the loaded Datalog rules lazily to remove atoms that
+        cannot contribute to the requested ground goal. Builtin predicates fall back to
+        unconstrained candidate generation because their dependencies are Python-side verifier
+        functions.
+        """
+        cached = st.get("support_atoms", "pending")
+        if cached != "pending":
+            return cached
+        if st["goal_pred"] in self.builtins:
+            st["support_atoms"] = None
+            return None
+        target = (st["goal_pred"], tuple(st["pair"]))
+        facts_by_pred = {}
+        for fact in st["edb"]:
+            facts_by_pred.setdefault(fact[0], []).append(fact)
+        for facts in facts_by_pred.values():
+            facts.sort()
+
+        self._support_rn = 0
+        proof = self._prove_support(
+            target, {}, facts_by_pred, self.rules + st["extra_rules"],
+            max(8, len(st["edb"]) + len(self.rules) + len(st["extra_rules"]) + 4),
+            frozenset())
+        if proof is None:
+            st["support_atoms"] = None
+            st["support_ranks"] = {}
+            return None
+        _fact, _subst, support, ranks = proof
+        st["support_atoms"] = support
+        st["support_ranks"] = ranks
+        return support
+
+    def _prove_support(self, goal, subst, facts_by_pred, rules, depth, path):
+        """Find one proof path lazily; return (ground_fact, subst, support_atoms, ranks)."""
+        g = _ground_sub(goal, subst)
+        for fact in facts_by_pred.get(g[0], ()):
+            s = _unify2(g, fact, subst)
+            if s is not None:
+                gf = _ground_sub(g, s)
+                if _ground(gf):
+                    return gf, s, {fact}, {fact: 0}
+        if depth <= 0:
+            return None
+        key = g
+        if key in path:
+            return None
+        for head, body in rules:
+            self._support_rn += 1
+            rn = self._support_rn
+            rhead = _rename(head, rn)
+            s = _unify2(rhead, g, subst)
+            if s is None:
+                continue
+            cur = s
+            support, ranks, body_facts = set(), {}, []
+            ok = True
+            for atom in tuple(_rename(a, rn) for a in body):
+                proof = self._prove_support(atom, cur, facts_by_pred, rules, depth - 1,
+                                            path | {key})
+                if proof is None:
+                    ok = False
+                    break
+                bf, cur, bs, br = proof
+                body_facts.append(bf)
+                support.update(bs)
+                ranks.update(br)
+            if not ok:
+                continue
+            hf = _ground_sub(rhead, cur)
+            if not _ground(hf):
+                continue
+            support.add(hf)
+            ranks[hf] = 1 + max((ranks.get(bf, 0) for bf in body_facts), default=0)
+            return hf, cur, support, ranks
+        return None
+
+    def candidate_rank(self, st, step):
+        """Generic proof-frontier rank: lower atoms are closer to checked evidence."""
+        return st.get("support_ranks", {}).get(step[1], 10 ** 9)
+
+    def candidate_steps(self, st, include_checks=True, goal_pruned=True,
+                        relevance_pruned=True):
         """Generic legal local proof steps from the current checker state.
 
         The generator is rule-driven: it enumerates unchecked EDB facts and ground instances of
         the loaded Datalog rules whose bodies are already known. It does not know about kinship,
         ancestor, or any task-specific grammar.
-        """
+
+        relevance_pruned=False enumerates by VALIDITY ONLY (no goal-dependency slice, no proof
+        support): the honest candidate set for masked decoding, where choosing the relevant
+        step among all legal ones must remain the model's job."""
         candidates = []
-        relevant = self.relevant_predicates(st)
+        relevant = self.relevant_predicates(st) if relevance_pruned else None
+        support = (self.support_atoms(st)
+                   if goal_pruned and relevance_pruned else None)
         if include_checks:
             for fact in sorted(st["edb"] - st["known"]):
                 if relevant is not None and fact[0] not in relevant:
+                    continue
+                if support is not None and fact not in support:
                     continue
                 body = ()
                 if self.valid_step_state(st, "check", fact, body):
@@ -175,9 +279,12 @@ class GoalChecker:
                 body = tuple(body)
                 if not _ground(head) or head in st["known"]:
                     continue
+                if support is not None and (head not in support
+                                            or any(f not in support for f in body)):
+                    continue
                 if self.valid_step_state(st, "think", head, body):
                     candidates.append(("think", head, body))
-        candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+        candidates.sort(key=lambda x: (self.candidate_rank(st, x), x[0], x[1], x[2]))
         return candidates
 
     def step(self, st, typ, head, body):

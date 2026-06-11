@@ -32,6 +32,7 @@ def evaluate(runtime: FlowRuntime, trainer, mode="verified", hops=None, n=None, 
     for k in (hops or cfg.test_hops):
         rng = np.random.default_rng(cfg.eval_seed + k)
         correct = inval = res = skipped = 0
+        causes = {}
         N = n or cfg.n_eval
         for _ in range(N):
             try:
@@ -102,8 +103,11 @@ def evaluate(runtime: FlowRuntime, trainer, mode="verified", hops=None, n=None, 
                 r = runtime.run_goal(p, TEMPLATES, QUESTION, verify=True, rng=rng, edb=facts)
                 pred, inval, res = r.answer, inval + r.n_invalid, res + r.n_resampled
             elif kin:
-                r = runtime.run_goal(p, TEMPLATES, QUESTION, verify=(mode == "verified"), rng=rng)
+                r = runtime.run_goal(p, TEMPLATES, QUESTION, verify=(mode != "free"), rng=rng,
+                                     decode="masked" if mode == "masked" else "sample")
                 pred, inval, res = r.answer, inval + r.n_invalid, res + r.n_resampled
+                for c, v in r.causes.items():
+                    causes[c] = causes.get(c, 0) + v
             else:
                 r = runtime.run(p, verify=(mode == "verified"))
                 pred, inval, res = r.answer, inval + r.n_invalid, res + r.n_resampled
@@ -117,9 +121,12 @@ def evaluate(runtime: FlowRuntime, trainer, mode="verified", hops=None, n=None, 
             continue
         out[k] = {"acc": correct / done, "invalid_per_ex": inval / done,
                   "resampled_per_ex": res / done, "n": done, "skipped": skipped}
-        log.info("k=%-3d %s/%s acc %.2f (inval/ex %.1f, resamp/ex %.1f, n=%d)",
+        if causes:
+            out[k]["reject_causes"] = dict(sorted(causes.items(), key=lambda x: -x[1]))
+        log.info("k=%-3d %s/%s acc %.2f (inval/ex %.1f, resamp/ex %.1f, n=%d)%s",
                  k, mode, split, out[k]["acc"], out[k]["invalid_per_ex"],
-                 out[k]["resampled_per_ex"], done)
+                 out[k]["resampled_per_ex"], done,
+                 f" causes {out[k]['reject_causes']}" if causes else "")
     return out
 
 

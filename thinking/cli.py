@@ -248,10 +248,24 @@ def cmd_selftest(_args):
     assert xb.shape == (1, len(ex.tokens) + 1)
     assert rt.ne(-100).any() and spans, "rule metadata must survive packing"
     stc = chk.new_state(kp.goal[1], kp.edb, goal_pred="ancestor")
+    support = chk.support_atoms(stc)
+    assert support is not None and kp.goal in support, "frontier support must include the goal"
+    checks0 = [ln for ln in chk.candidate_steps(stc) if ln[0] == "check"]
+    assert 0 < len(checks0) <= 30, "frontier should prune deep distractor facts"
+    assert all(ln[1] in support for ln in checks0), "frontier emitted unsupported checks"
     for ln in lines[:8]:
-        assert ln in chk.candidate_steps(stc), f"generic candidates missed gold line {ln}"
+        assert ln in chk.candidate_steps(stc, goal_pruned=False), \
+            f"generic candidates missed gold line {ln}"
         assert render_goal_line(*ln)                       # renderer owns line grammar
         assert chk.step(stc, *ln)
+    std = chk.new_state(kp.goal[1], kp.edb, goal_pred="ancestor")
+    for _ in range(len(lines) + 8):
+        if chk.valid_answer(std, "ancestor"):
+            break
+        cands = chk.candidate_steps(std)
+        assert cands, "frontier ran out before the answer"
+        assert chk.step(std, *cands[0])
+    assert chk.valid_answer(std, "ancestor"), "frontier proof did not reach the answer"
     # chronology is consistent: every child born after its parent, death after birth
     born = {a[1][0]: int(a[1][1]) for a in kp.edb if a[0] == "born"}
     died = {a[1][0]: int(a[1][1]) for a in kp.edb if a[0] == "died"}
@@ -259,6 +273,50 @@ def cmd_selftest(_args):
         if pred in ("mother", "father"):
             assert born[h] < born[t], "child born before parent"
     assert all(died[p] > born[p] for p in died), "death before birth"
+
+    # ---- MASKED decoding: eager validity pruning at the token level ------------------------
+    # 1) completeness: every gold line is in the validity-only candidate set at its state
+    from .trace import render_goal_line
+    for depth in (2, 3):
+        kp, lines = fw.sample(depth)
+        chk = GoalChecker(KR, ANSWER_PREDS)
+        st = chk.new_state(kp.goal[1], kp.edb, goal_pred=kp.goal[0])
+        for typ, head, body in lines:
+            cands = chk.candidate_steps(st, goal_pruned=False, relevance_pruned=False)
+            assert (typ, head, tuple(body)) in cands, f"gold step not in candidates: {typ} {head}"
+            assert chk.step(st, typ, head, body)
+        assert kp.answer in chk.answer_candidates(st)
+    # 2) rejection taxonomy: causes are recorded
+    st2 = chk.new_state(kp.goal[1], kp.edb, goal_pred=kp.goal[0])
+    assert not chk.step(st2, "check", kp.goal, ())
+    assert st2["why"] == "check-not-edb", st2["why"]
+    # 3) masked decode with an UNTRAINED model: every line checker-valid by construction
+    from .config import Config as _Cfg
+    from .flow import FlowRuntime
+    from .train import Trainer as _Tr
+    _cfg = _Cfg(world="kinship", train_hops=(2, 3), block=2048, anonymize=False)
+    _tr = _Tr(_cfg)
+    kp2, _ = _tr.world.sample(2, _np0.random.default_rng(5))
+    exs = _tr.build_examples(2, _np0.random.default_rng(5))
+    from .trace import Vocab
+    toks = [t for e in exs for t in e.tokens]
+    toks += [tok for f in kp2.edb for tok in (f[1][0], f[0], f[1][1])]
+    toks += [w for v, _ps in QUESTION for w in v if not w.startswith("{")]
+    toks += list(ANSWER_PREDS)
+    vv = Vocab(toks)
+    torch.manual_seed(0)
+    mm = ScratchpadLM(len(vv), d=32, layers=2, heads=4, max_len=2048, pad=vv.pad,
+                      pointer=True).eval()
+    rt = FlowRuntime(mm, vv, GoalChecker(KR, ANSWER_PREDS, builtins=AGE_BUILTINS), _cfg, "cpu")
+    rr = rt.run_goal(kp2, TEMPLATES, QUESTION, rng=_np0.random.default_rng(7),
+                     decode="masked-full")
+    assert rr.n_invalid == 0 and rr.n_resampled == 0, "pure masking must never reject"
+    assert all(s in ("ok", "answer", "repair") for _, s in rr.lines), rr.lines
+    # hybrid: model proposes freely; a rejected line is REPLACED by one masked line (no temp
+    # resampling, nothing rejected enters the context)
+    rr = rt.run_goal(kp2, TEMPLATES, QUESTION, rng=_np0.random.default_rng(7), decode="masked")
+    assert rr.n_resampled == 0, "masked repair replaces the resample loop"
+    assert all(s in ("ok", "masked", "answer", "repair") for _, s in rr.lines), rr.lines
     print("selftest OK")
 
 
@@ -532,8 +590,8 @@ def main(argv=None):
     p = sub.add_parser("eval")
     p.add_argument("run")
     p.add_argument("--mode",
-                   choices=("free", "verified", "path", "extract", "self", "write", "math",
-                            "define"))
+                   choices=("free", "verified", "masked", "path", "extract", "self", "write",
+                            "math", "define"))
     p.add_argument("--split", default="iid", choices=("iid", "holdout", "novel"))
     p.add_argument("--hops")
     p.add_argument("--n", type=int, default=0, help="examples per depth (default cfg.n_eval)")
@@ -553,9 +611,9 @@ def main(argv=None):
                    help="restrict deep query types, e.g. ancestor or ancestor,older_by")
     p.add_argument("--mode", default="verified", choices=("free", "verified"))
     p.add_argument("--decode", default="sample", choices=("sample", "hybrid", "constrained"),
-                   help="sample = token generation with verifier retries; constrained = score "
-                        "generic checker-generated legal proof lines; hybrid = sample until "
-                        "the verifier stalls, then score a generic legal line")
+                   help="sample = token generation with verifier retries; constrained = follow "
+                        "the generic checker frontier when available; hybrid = sample until "
+                        "the verifier stalls, then switch to that generic frontier")
     p.add_argument("--block", type=int, default=0, help="eval context override")
     p.add_argument("--phrasings", default="train", choices=("train", "eval"))
     p.add_argument("--train-names", action="store_true", dest="train_names",
