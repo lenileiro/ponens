@@ -139,6 +139,13 @@ This is deliberately not image generation yet. The first invariant is: images gr
 canonical facts; the existing verifier reasons over facts; a later latent-diffusion/DiT decoder
 can be conditioned on verified facts/traces for generation.
 
+Current finding: the H100 Image-1 baseline reaches **1.00 color / 1.00 shape accuracy** after
+2k steps, but the visual factor probe still reports `high_fer_risk` (`ufr_score=0.0`) because
+color and shape remain strongly entangled. A two-arm held-out-combo experiment also shows the
+factored head generalizes better than a joint color×shape classifier (≈0.30 vs 0.00 holdout),
+while the embedding-layer probe alone misses where that factorization lives. So for image, as
+for trace reasoning, label accuracy is not enough; probes must inspect the right layer/head.
+
 ## 4. Exams (the report card)
 
 | exam | command fragment | measures |
