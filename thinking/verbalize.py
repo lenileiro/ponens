@@ -140,6 +140,10 @@ def main():
     ap.add_argument("--pairs", type=int, default=3000)
     ap.add_argument("--corpus", default="tinystories")
     ap.add_argument("--corpus-mb", type=int, default=24, dest="corpus_mb")
+    ap.add_argument("--dim", type=int, default=256)
+    ap.add_argument("--hybrid", action="store_true",
+                    help="reserve canonical trace tokens as atomic ids (reasoning-compatible "
+                         "fluency model -- the Lang-0/Lang-1 bridge)")
     ap.add_argument("--sample", help="load a checkpoint and sample explanations")
     args = ap.parse_args()
     from model_io import BPEVocab
@@ -164,8 +168,14 @@ def main():
     corpus = build_corpus(args.corpus, args.corpus_mb)
     pairs = gen_pairs(args.pairs)
     print(f"corpus {len(corpus):,} chars | {len(pairs)} trace->explanation pairs")
-    V = BPEVocab(texts=[corpus] + [a + " " + b for a, b in pairs], vocab_size=6000)
-    m = ScratchpadLM(len(V), d=256, heads=8, pad=V.pad, max_len=512, loop=False,
+    specials = ()
+    if args.hybrid:
+        from .hybrid_vocab import canonical_specials
+        specials = canonical_specials()
+        print(f"hybrid vocab: {len(specials)} canonical tokens reserved atomic")
+    V = BPEVocab(texts=[corpus] + [a + " " + b for a, b in pairs], vocab_size=6000,
+                 specials=specials)
+    m = ScratchpadLM(len(V), d=args.dim, heads=8, pad=V.pad, max_len=512, loop=False,
                      pointer=True).to(DEV)
     opt = torch.optim.AdamW(m.parameters(), lr=3e-4, weight_decay=0.01)
     stream = torch.tensor(V.enc(corpus), dtype=torch.long)

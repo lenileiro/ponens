@@ -66,6 +66,12 @@ def payload(args):
                     f"--out runs/verbalizer.pt && "
                     f"{PY.replace('thinking.cli', 'thinking.verbalize')} "
                     f"--sample runs/verbalizer.pt")
+    if args.lang:                                          # LANG-1: hybrid-vocab fluency model
+        VB = PY.replace("thinking.cli", "thinking.verbalize")
+        cmds.append(f"{VB} --hybrid --dim {args.dim or 256} --corpus tinystories "
+                    f"--corpus-mb {args.lang_mb} --pre-steps {args.train_steps or 40000} "
+                    f"--steps {args.lang_ft or 6000} --out runs/lang1_fluency.pt && "
+                    f"{VB} --sample runs/lang1_fluency.pt")
     if args.eval_only_run:
         run = shlex_quote(args.eval_only_run)
         depths = ",".join(str(d) for d in args.eval_depths)
@@ -259,6 +265,10 @@ def main():
                     help="train non-looped (pending the loop-regression ablation verdict)")
     ap.add_argument("--ablate", action="store_true", help="run the loop ablation first")
     ap.add_argument("--verbalize", action="store_true", help="train+sample the verbalizer")
+    ap.add_argument("--lang", action="store_true",
+                    help="LANG-1: hybrid-vocab fluency pretraining (reasoning-compatible)")
+    ap.add_argument("--lang-mb", type=int, default=24, dest="lang_mb")
+    ap.add_argument("--lang-ft", type=int, default=6000, dest="lang_ft")
     ap.add_argument("--lengen", action="store_true", help="rung L: depth generalization")
     ap.add_argument("--deep-ancestor-rule-aux", action="store_true",
                     help="train the forward ancestor run with rule/action and contrastive losses")

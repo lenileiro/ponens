@@ -45,7 +45,10 @@ class BPEVocab:
     training (build from texts) and loading (rebuild from saved JSON). Same interface as the others."""
     token = "bpe"
 
-    def __init__(self, texts=None, json_str=None, vocab_size=4000):
+    def __init__(self, texts=None, json_str=None, vocab_size=4000, specials=()):
+        """specials: canonical-layer tokens (trace keywords, predicates, slot tokens, '.')
+        reserved as ATOMIC ids -- the checkable trace never fragments under BPE, free text
+        does. The hybrid-vocab contract for training language + reasoning in one model."""
         from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
         if json_str is not None:
             self.tk = Tokenizer.from_str(json_str)
@@ -53,11 +56,14 @@ class BPEVocab:
             self.tk = Tokenizer(models.BPE(unk_token=None))
             self.tk.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
             self.tk.decoder = decoders.ByteLevel()
-            self.tk.train_from_iterator(list(texts),
-                                        trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=["<pad>"]))
+            self.tk.train_from_iterator(
+                list(texts),
+                trainers.BpeTrainer(vocab_size=vocab_size,
+                                    special_tokens=["<pad>"] + list(specials)))
         self.pad = self.tk.token_to_id("<pad>") or 0
         self.unk = -1                                    # byte-level BPE has no OOV
         self.stoi = self.tk.get_vocab()
+        self.specials = list(specials)
 
     def __len__(self):
         return self.tk.get_vocab_size()

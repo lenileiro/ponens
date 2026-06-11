@@ -328,6 +328,29 @@ def cmd_selftest(_args):
     assert rr.n_resampled == 0, "ranker must not use text resampling"
     assert rr.rank_positions, "ranker should record oracle next-step ranks"
     assert all(s in ("ranked", "answer", "repair") for _, s in rr.lines), rr.lines
+
+    # ---- LANG-0: hybrid byte-BPE vocab keeps the canonical layer atomic --------------------
+    try:
+        from model_io import BPEVocab
+        from .hybrid_vocab import canonical_specials
+    except Exception:
+        BPEVocab = None
+    if BPEVocab is not None:
+        specials = canonical_specials()
+        corpus = ("the cat sat on the warm mat near the door . a small boy ran to the hill "
+                  "and laughed with his mother every bright morning by the river .") * 30
+        Vb = BPEVocab(texts=[corpus], vocab_size=1500, specials=specials)
+        frag = [s for s in specials
+                if len(Vb.enc(" " + s)) != 1 and len(Vb.enc(s)) != 1]
+        assert not frag, f"canonical tokens fragmented under BPE: {frag[:5]}"
+        from .world import anonymize
+        kp3, l3 = fw.sample(3)
+        kp3, l3 = anonymize(kp3, l3, _np0.random.default_rng(11))
+        ex3 = render_goal_example(kp3, l3, TEMPLATES, QUESTION, _np0.random.default_rng(11))
+        trace_toks = ex3.tokens[ex3.tokens.index("check"):]
+        back = [Vb.tk.id_to_token(Vb.enc(" " + t)[0] if len(Vb.enc(" " + t)) == 1
+                                  else Vb.enc(t)[0]).lstrip("Ġ") for t in trace_toks]
+        assert back == trace_toks, "trace must round-trip token-for-token under hybrid vocab"
     print("selftest OK")
 
 
