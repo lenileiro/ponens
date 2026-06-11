@@ -128,6 +128,8 @@ def payload(args):
                           f"--cfg-scales {shlex_quote(args.image_cfg_sweep)} "
                           f"--sample-steps-list {shlex_quote(args.image_sample_steps_sweep)} "
                           f"--semantic-guidance-w {args.image_semantic_guidance_w} "
+                          f"--semantic-guidance-weights "
+                          f"{shlex_quote(args.image_semantic_guidance_sweep)} "
                           f"--semantic-guidance-mode {args.image_semantic_guidance_mode} "
                           f"--eval-seeds {shlex_quote(args.image_eval_seeds)} "
                           f"--roundtrip-samples {args.image_roundtrip_samples} "
@@ -374,6 +376,9 @@ def main():
     ap.add_argument("--image-semantic-guidance-w", type=float, default=0.0,
                     dest="image_semantic_guidance_w",
                     help="sampling-time semantic AE guidance weight for latent images")
+    ap.add_argument("--image-semantic-guidance-sweep", default="0.0,1.0,2.0",
+                    dest="image_semantic_guidance_sweep",
+                    help="comma-separated semantic guidance weights for latent image sweeps")
     ap.add_argument("--image-semantic-guidance-mode", default="decoded",
                     choices=("latent", "decoded"), dest="image_semantic_guidance_mode",
                     help="latent image semantic guidance mode")

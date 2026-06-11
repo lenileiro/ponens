@@ -1218,19 +1218,25 @@ def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                   n=128, batch=64, seed=10, size=32, device=DEV, roundtrip_samples=1,
                   cond_mode="facts", conditioner=None, prompt_vocab=None,
                   prompt_templates=DEFAULT_PROMPT_TEMPLATES, semantic_guidance_w=0.0,
-                  semantic_guidance_mode="decoded"):
+                  semantic_guidance_weights=None, semantic_guidance_mode="decoded"):
+    if semantic_guidance_weights is None:
+        semantic_guidance_weights = (semantic_guidance_w,)
     rows = []
     for cfg_scale in cfg_scales:
         for sample_steps in sample_steps_list:
-            row = evaluate(ae, flow, n=n, batch=batch, seed=seed, size=size, device=device,
-                           cfg_scale=float(cfg_scale), sample_steps=int(sample_steps),
-                           roundtrip_samples=roundtrip_samples, cond_mode=cond_mode,
-                           conditioner=conditioner, prompt_vocab=prompt_vocab,
-                           prompt_templates=prompt_templates,
-                           semantic_guidance_w=semantic_guidance_w,
-                           semantic_guidance_mode=semantic_guidance_mode)
-            row["sweep_key"] = f"cfg={float(cfg_scale):g};steps={int(sample_steps)}"
-            rows.append(row)
+            for guidance_w in semantic_guidance_weights:
+                row = evaluate(ae, flow, n=n, batch=batch, seed=seed, size=size, device=device,
+                               cfg_scale=float(cfg_scale), sample_steps=int(sample_steps),
+                               roundtrip_samples=roundtrip_samples, cond_mode=cond_mode,
+                               conditioner=conditioner, prompt_vocab=prompt_vocab,
+                               prompt_templates=prompt_templates,
+                               semantic_guidance_w=float(guidance_w),
+                               semantic_guidance_mode=semantic_guidance_mode)
+                row["sweep_key"] = (
+                    f"cfg={float(cfg_scale):g};steps={int(sample_steps)};"
+                    f"sem={float(guidance_w):g}"
+                )
+                rows.append(row)
     return rows
 
 
@@ -1302,14 +1308,21 @@ def eval_report_summary(report):
 def aggregate_sweep_rows(rows):
     grouped = {}
     for row in rows:
-        key = (float(row["cfg_scale"]), int(row["sample_steps"]))
+        key = (float(row["cfg_scale"]), int(row["sample_steps"]),
+               float(row.get("semantic_guidance_w", 0.0)),
+               str(row.get("semantic_guidance_mode", "decoded")))
         grouped.setdefault(key, []).append(row)
     out = []
-    for (cfg_scale, sample_steps), group in sorted(grouped.items()):
+    for (cfg_scale, sample_steps, semantic_guidance_w, semantic_guidance_mode), group in sorted(
+            grouped.items()):
         agg = {
-            "sweep_key": f"cfg={cfg_scale:g};steps={sample_steps}",
+            "sweep_key": (
+                f"cfg={cfg_scale:g};steps={sample_steps};sem={semantic_guidance_w:g}"
+            ),
             "cfg_scale": float(cfg_scale),
             "sample_steps": int(sample_steps),
+            "semantic_guidance_w": float(semantic_guidance_w),
+            "semantic_guidance_mode": semantic_guidance_mode,
             "runs": len(group),
             "eval_seeds": [int(r["eval_seed"]) for r in group if "eval_seed" in r],
         }
@@ -1327,7 +1340,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         n=128, batch=64, seed=10, eval_seeds=None, size=32, device=DEV,
                         roundtrip_samples=1, prefer_ema=True, weight_mode=None,
                         intervention_samples=0, semantic_guidance_w=0.0,
-                        semantic_guidance_mode="decoded"):
+                        semantic_guidance_weights=None, semantic_guidance_mode="decoded"):
     if weight_mode is None:
         weight_mode = "ema" if prefer_ema else "raw"
     if weight_mode not in EVAL_WEIGHT_MODES:
@@ -1348,6 +1361,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                                      prompt_vocab=prompt_vocab,
                                      prompt_templates=prompt_templates,
                                      semantic_guidance_w=semantic_guidance_w,
+                                     semantic_guidance_weights=semantic_guidance_weights,
                                      semantic_guidance_mode=semantic_guidance_mode):
                 row["eval_seed"] = int(eval_seed)
                 row["checkpoint_weight_mode"] = actual_mode
@@ -1363,6 +1377,9 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             "n": int(n),
             "roundtrip_samples": int(roundtrip_samples),
             "semantic_guidance_w": float(semantic_guidance_w),
+            "semantic_guidance_weights": [
+                float(w) for w in (semantic_guidance_weights or (semantic_guidance_w,))
+            ],
             "semantic_guidance_mode": semantic_guidance_mode,
             "eval_seeds": [int(s) for s in eval_seeds],
             "rows": rows,
@@ -1625,10 +1642,12 @@ def selftest():
                          seed=1, cfg_scale=1.5)
     assert img2.shape == (1, 3, 32, 32)
     sweep = sampler_sweep(ae2, flow2, cfg_scales=(1.0, 1.5), sample_steps_list=(1,),
+                          semantic_guidance_weights=(0.0, 0.05),
                           n=4, batch=2, seed=3, device="cpu")
-    assert len(sweep) == 2 and "sample_roundtrip_both_acc" in sweep[0]
+    assert len(sweep) == 4 and "sample_roundtrip_both_acc" in sweep[0]
     agg = aggregate_sweep_rows([dict(r, eval_seed=i) for i, r in enumerate(sweep)])
-    assert len(agg) == 2 and "sample_roundtrip_both_acc_mean" in agg[0]
+    assert len(agg) == 4 and "sample_roundtrip_both_acc_mean" in agg[0]
+    assert "semantic_guidance_w" in agg[0]
     ae3, flow3, conditioner3, vocab3, report3 = train_latent_flow(
         ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="dit",
         dit_depth=1, dit_heads=2, seed=2, device="cpu", cond_mode="text",
@@ -1707,6 +1726,9 @@ def main(argv=None):
     ap.add_argument("--semantic-guidance-w", type=float, default=0.0,
                     dest="semantic_guidance_w",
                     help="sampling-time semantic AE guidance weight")
+    ap.add_argument("--semantic-guidance-weights", default="",
+                    dest="semantic_guidance_weights",
+                    help="comma-separated semantic guidance weights for --eval-checkpoint sweeps")
     ap.add_argument("--semantic-guidance-mode", default="decoded",
                     choices=("latent", "decoded"), dest="semantic_guidance_mode",
                     help="guide sampled latents using direct latent heads or decode/re-read heads")
@@ -1769,6 +1791,10 @@ def main(argv=None):
             weight_mode=("raw" if args.no_ema_checkpoint else args.checkpoint_weight_mode),
             intervention_samples=args.intervention_samples,
             semantic_guidance_w=args.semantic_guidance_w,
+            semantic_guidance_weights=(
+                _parse_number_list(args.semantic_guidance_weights, float)
+                if args.semantic_guidance_weights else None
+            ),
             semantic_guidance_mode=args.semantic_guidance_mode,
         )
         if args.eval_out:
