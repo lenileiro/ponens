@@ -228,6 +228,14 @@ and guided latent sampling (`--cond-drop`, `--cfg-scale`, `--sample-steps`), so 
 measure whether stronger conditioning improves generated-image facts rather than only lowering a
 single target-image MSE.
 
+Image-5 GPU update (H100, 1000 AE steps + 1000 DiT-flow steps, `cond_drop=0.1`,
+`cfg_scale=1.5`, 8 sample steps): guided latent DiT keeps the earlier reconstruction quality
+(`recon_mse=0.015`, color **1.00**, shape **0.86**) and center-target sample MSE remains strong
+at **0.0198**. The new round-trip metric is the important finding: generated samples decode back
+to the requested color **0.87**, shape **0.67**, and both facts **0.53** across all 15 color×shape
+conditions. That means the architecture is now measuring image fact-faithfulness, and the next
+image work should attack generated shape fidelity rather than only optimizing latent velocity MSE.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
