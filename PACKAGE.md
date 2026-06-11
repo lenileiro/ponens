@@ -126,18 +126,42 @@ without losing checkability. It generates small colored-shape scenes with exact 
 (`fact p0 color red .`, `fact p0 shape circle .`, `fact p0 left_of p1 .`), trains a compact
 vision encoder to recover color/shape factors, and reports visual FER/UFR probes:
 same-color reuse across shapes, same-shape reuse across colors, color-shape leakage, and a
-`ufr_score`/`verdict`.
+`ufr_score`/`verdict`. The encoder now has two architecture choices:
+
+- `shared`: one representation with separate color/shape heads, kept as the historical baseline.
+- `bottleneck`: explicit color and shape subspaces plus a decorrelation loss, so diagnostics can
+  inspect the actual spaces that feed the factor heads.
 
 ```bash
 python -m thinking.vision --selftest
 python -m thinking.vision --train --steps 2000 --batch 64 --dim 64 \
     --out runs/vision_object_encoder.pt
-RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --fast --go
+python -m thinking.vision --train --arch bottleneck --steps 2000 --batch 64 --dim 64 \
+    --out runs/vision_bottleneck.pt
+python -m thinking.image2 --steps 400 --seeds 0,1,2 --out runs/image2_bottleneck.json
+python -m thinking.image_flow --train --steps 400 --out runs/image_flow.pt
+RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --vision-arch bottleneck \
+    --image2 --image-flow --fast --go
 ```
 
-This is deliberately not image generation yet. The first invariant is: images ground into
-canonical facts; the existing verifier reasons over facts; a later latent-diffusion/DiT decoder
-can be conditioned on verified facts/traces for generation.
+`thinking.image2` is the head-aware FER experiment: shared factored heads vs explicit
+bottleneck vs one joint color×shape classifier on held-out color/shape combinations. It reports
+both the old embedding probe and the new factor-space probe, fixing the Image-1 blind spot where
+the embedding layer missed where factorization lived.
+
+`thinking.image_flow` is the first generation scaffold. It trains a small fact-conditioned
+rectified-flow model:
+
+```
+canonical visual facts -> condition vector -> velocity field -> image
+```
+
+This follows the direction used by modern image systems: latent diffusion reduces generation
+cost by operating in compressed spaces (LDM, arXiv:2112.10752), diffusion transformers replace
+the U-Net backbone at scale (DiT, arXiv:2212.09748), and current high-resolution systems use
+rectified-flow transformer variants (Stable Diffusion 3, arXiv:2403.03206) or linear-attention
+efficiency paths (Sana, arXiv:2410.10629). Our scaffold is still pixel-space and synthetic; the
+next scale step is to put the same canonical-fact conditioning behind a latent/DiT backbone.
 
 Current finding: the H100 Image-1 baseline reaches **1.00 color / 1.00 shape accuracy** after
 2k steps, but the visual factor probe still reports `high_fer_risk` (`ufr_score=0.0`) because
@@ -145,6 +169,20 @@ color and shape remain strongly entangled. A two-arm held-out-combo experiment a
 factored head generalizes better than a joint color×shape classifier (≈0.30 vs 0.00 holdout),
 while the embedding-layer probe alone misses where that factorization lives. So for image, as
 for trace reasoning, label accuracy is not enough; probes must inspect the right layer/head.
+
+Image-2 GPU update (H100, 1000 steps, seed 0): the explicit bottleneck keeps **1.00 seen
+accuracy**, reaches **0.84 held-out color/shape combo accuracy** vs **0.61** for shared factored
+heads and **0.00** for the joint classifier, and cuts factor-space leakage from **0.75 → 0.10**.
+The factor-space probe now tracks behavior (`best_factor_space_arm = bottleneck`), while the old
+shared embedding probe still reports `ufr_score=0.0` because the concatenated representation is
+still entangled. `thinking.image_flow` also trains the first fact-conditioned rectified-flow
+scaffold to `velocity_mse ≈ 0.29` after 1000 steps; this proves the generation path is wired, not
+that image quality is solved.
+
+A separate tracked Image-2 sweep (`runs/image2_fer.json`, 600 steps × 3 seeds) records the
+stronger intervention target: held-out combo accuracy moves **0.65 → 0.97 → 1.00** across
+factored, swap, and subspace arms, and the linear-decodability probe ranks the arms in the same
+order as behavior. Treat that as the next reproducibility target for the public command path.
 
 ## 4. Exams (the report card)
 
