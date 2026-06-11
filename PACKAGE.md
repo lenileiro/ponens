@@ -310,6 +310,11 @@ reports can evaluate the averaged weights, checkpoints save both raw and EMA sta
 `--eval-checkpoint` prefers EMA when available while keeping `--no-ema-checkpoint` for raw-weight
 comparisons.
 
+Image-15 fixes the short-run EMA failure found on the first MMDiT text GPU smoke: a target decay of
+0.999 made the averaged checkpoint lag raw weights badly at 400 steps. EMA now uses a generic warmup
+schedule that ramps toward the requested decay, records the effective decay in reports/checkpoints,
+and keeps `--no-ema-warmup` / `--image-no-ema-warmup` for exact-decay ablations.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered

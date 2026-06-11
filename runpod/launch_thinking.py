@@ -112,6 +112,8 @@ def payload(args):
                      f"--time-logit-mean {args.image_time_logit_mean} "
                      f"--time-logit-std {args.image_time_logit_std} "
                      f"--out {ckpt}")
+            if args.image_no_ema_warmup:
+                train += " --no-ema-warmup"
             if args.image_prompt_templates:
                 train += f" --prompt-templates {shlex_quote(args.image_prompt_templates)}"
             if args.image_eval_sweep:
@@ -368,6 +370,9 @@ def main():
     ap.add_argument("--image-flow-ema-decay", type=float, default=0.0,
                     dest="image_flow_ema_decay",
                     help="EMA decay for latent image flow/conditioner weights")
+    ap.add_argument("--image-no-ema-warmup", action="store_true",
+                    dest="image_no_ema_warmup",
+                    help="use exact image EMA decay from the first update")
     ap.add_argument("--image-time-sampling", default="uniform",
                     choices=("uniform", "logit-normal"), dest="image_time_sampling",
                     help="latent image flow timestep distribution")

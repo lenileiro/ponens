@@ -814,6 +814,17 @@ def clone_state_dict(module):
     return {k: v.detach().clone() for k, v in module.state_dict().items()}
 
 
+def ema_effective_decay(target_decay, step, warmup=True):
+    if target_decay <= 0.0:
+        return 0.0
+    if not warmup:
+        return float(target_decay)
+    # Use a generic warmup so high target decays do not average mostly initialization
+    # during short runs. This approaches the requested decay as training gets longer.
+    warm = (1.0 + float(step)) / (10.0 + float(step))
+    return float(min(target_decay, warm))
+
+
 @torch.no_grad()
 def update_ema_state(ema_state, module, decay):
     state = module.state_dict()
@@ -876,6 +887,11 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "flow_load": flow_load,
         "ema_available": ema_available,
         "ema_loaded": ema_loaded,
+        "flow_ema_decay": float(ckpt.get("flow_ema_decay", report.get("flow_ema_decay", 0.0))),
+        "flow_ema_warmup": bool(ckpt.get("flow_ema_warmup",
+                                         report.get("flow_ema_warmup", False))),
+        "flow_ema_effective_decay": float(ckpt.get(
+            "flow_ema_effective_decay", report.get("flow_ema_effective_decay", 0.0))),
         "cond_mode": cond_mode,
         "cond_dim": cond_dim,
     }
@@ -977,8 +993,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       cond_mode="facts", text_cond_dim=0,
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0,
-                      flow_ema_decay=0.0, eval_with_ema=True, return_conditioner=False,
-                      return_ema=False):
+                      flow_ema_decay=0.0, flow_ema_warmup=True, eval_with_ema=True,
+                      return_conditioner=False, return_ema=False):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     if cond_mode not in ("facts", "text"):
@@ -1022,6 +1038,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_ema = clone_state_dict(flow) if flow_ema_decay > 0.0 else None
     conditioner_ema = (clone_state_dict(conditioner)
                        if flow_ema_decay > 0.0 and conditioner is not None else None)
+    ema_updates = 0
+    last_ema_decay = 0.0
     for _ in range(flow_steps):
         x, fact_cond, _yc, _ys, specs = _batch(batch, rng, size=size, device=device,
                                                return_specs=True)
@@ -1040,9 +1058,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         loss.backward()
         opt_flow.step()
         if flow_ema is not None:
-            update_ema_state(flow_ema, flow, flow_ema_decay)
+            ema_updates += 1
+            last_ema_decay = ema_effective_decay(flow_ema_decay, ema_updates,
+                                                 warmup=flow_ema_warmup)
+            update_ema_state(flow_ema, flow, last_ema_decay)
             if conditioner is not None:
-                update_ema_state(conditioner_ema, conditioner, flow_ema_decay)
+                update_ema_state(conditioner_ema, conditioner, last_ema_decay)
         last_flow = {"total_loss": float(loss.detach().cpu())}
         last_flow.update({k: float(v.detach().cpu()) for k, v in parts.items()})
 
@@ -1080,6 +1101,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "cond_drop": float(cond_drop),
         "flow_semantic_w": float(flow_semantic_w),
         "flow_ema_decay": float(flow_ema_decay),
+        "flow_ema_warmup": bool(flow_ema_warmup),
+        "flow_ema_updates": int(ema_updates),
+        "flow_ema_effective_decay": float(last_ema_decay),
         "ema_available": flow_ema is not None,
         "eval_with_ema": eval_ema,
         "time_sampling": time_sampling,
@@ -1161,6 +1185,7 @@ def selftest():
     assert report5["adaptive_modulation"] is True
     assert report5["residual_gating"] is True
     assert report5["ema_available"] is True and report5["eval_with_ema"] is True
+    assert report5["flow_ema_warmup"] is True and report5["flow_ema_effective_decay"] < 0.5
     legacy_state = {k: v for k, v in flow5.state_dict().items() if ".gate." not in k}
     compat_flow = make_flow(flow_arch="mmdit", latent_ch=4, hidden=32, dit_depth=1,
                             dit_heads=2, cond_dim=8)
@@ -1205,6 +1230,8 @@ def main(argv=None):
                     help="semantic endpoint alignment weight for latent flow training")
     ap.add_argument("--flow-ema-decay", type=float, default=0.0, dest="flow_ema_decay",
                     help="EMA decay for flow/conditioner weights; 0 disables EMA")
+    ap.add_argument("--no-ema-warmup", action="store_true", dest="no_ema_warmup",
+                    help="use the exact EMA decay from the first update instead of ramping it")
     ap.add_argument("--no-ema-eval", action="store_true", dest="no_ema_eval",
                     help="do not swap EMA weights in for the final train report")
     ap.add_argument("--time-sampling", default="uniform", choices=("uniform", "logit-normal"),
@@ -1262,6 +1289,7 @@ def main(argv=None):
         text_cond_dim=args.text_cond_dim, prompt_templates=templates,
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
         time_logit_std=args.time_logit_std, flow_ema_decay=args.flow_ema_decay,
+        flow_ema_warmup=not args.no_ema_warmup,
         eval_with_ema=not args.no_ema_eval,
         return_conditioner=True, return_ema=True)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -1282,6 +1310,8 @@ def main(argv=None):
         "sample_steps": args.sample_steps,
         "flow_semantic_w": args.flow_semantic_w,
         "flow_ema_decay": args.flow_ema_decay,
+        "flow_ema_warmup": not args.no_ema_warmup,
+        "flow_ema_effective_decay": report.get("flow_ema_effective_decay", 0.0),
         "time_sampling": args.time_sampling,
         "time_logit_mean": args.time_logit_mean,
         "time_logit_std": args.time_logit_std,
