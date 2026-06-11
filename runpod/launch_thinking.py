@@ -72,7 +72,7 @@ def payload(args):
                     f"--corpus-mb {args.lang_mb} --pre-steps {args.train_steps or 40000} "
                     f"--steps {args.lang_ft} --out runs/lang1_fluency.pt && "
                     f"{VB} --sample runs/lang1_fluency.pt")
-    if args.vision or args.image2 or args.image_flow:
+    if args.vision or args.image2 or args.image_flow or args.image_latent:
         VI = PY.replace("thinking.cli", "thinking.vision")
         if args.vision:                                    # IMAGE-0/1: visual factors -> facts
             cmds.append(f"{VI} --train --steps {args.train_steps or 2000} "
@@ -89,6 +89,11 @@ def payload(args):
             cmds.append(f"{IF} --train --steps {args.train_steps or 800} "
                         f"--batch {args.batch} --dim {args.dim or 64} "
                         f"--out runs/image_flow.pt")
+        if args.image_latent:                              # IMAGE-3: latent flow generator
+            IL = PY.replace("thinking.cli", "thinking.image_latent")
+            cmds.append(f"{IL} --train --ae-steps {args.train_steps or 800} "
+                        f"--flow-steps {args.train_steps or 800} --batch {args.batch} "
+                        f"--hidden {args.dim or 64} --out runs/image_latent_flow.pt")
         return " && ".join(cmds)
     if args.eval_only_run:
         run = shlex_quote(args.eval_only_run)
@@ -297,6 +302,8 @@ def main():
                     help="IMAGE-2: compare shared, bottleneck, and joint visual FER arms")
     ap.add_argument("--image-flow", action="store_true", dest="image_flow",
                     help="train the tiny fact-conditioned rectified-flow image generator")
+    ap.add_argument("--image-latent", action="store_true", dest="image_latent",
+                    help="IMAGE-3: train semantic autoencoder + latent fact-conditioned flow")
     ap.add_argument("--lengen", action="store_true", help="rung L: depth generalization")
     ap.add_argument("--deep-ancestor-rule-aux", action="store_true",
                     help="train the forward ancestor run with rule/action and contrastive losses")
@@ -374,6 +381,7 @@ def main():
         (args.vision, "vision factor encoder"),
         (args.image2, "image2 FER arms"),
         (args.image_flow, "fact-conditioned flow"),
+        (args.image_latent, "latent fact-conditioned flow"),
     ) if enabled]
     job = " + ".join(image_jobs) if image_jobs else "kinship multi-seed"
     print("=== PLAN === thinking package on H100: " + job

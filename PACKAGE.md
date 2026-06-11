@@ -48,6 +48,9 @@ copying is architectural, and the dense aux supervision trains exactly that head
 (looped / HRM `hier` / TRM / mHC hyper-connections) and Ouro-style learned halting are
 implemented but **off by default** (ablation: shared-block recurrence loses 0.93-vs-2.1 to
 distinct layers on trace corpora at this scale). **Use `d=256` for multi-rule worlds.**
+For multimodal bridge runs, `ScratchpadLM.forward(..., prefix=embeddings)` can prepend continuous
+image/audio embeddings before the token stream on **non-pointer** models; pointer models reject
+prefixes because the copy distribution is defined over discrete context token ids.
 
 **Engine** (`datalog.py`): least-fixpoint closure with provenance (gold traces = linearized
 proof trees), entailment oracle, and SLD backward chaining (`prove`/`options`) for goal-directed
@@ -140,8 +143,10 @@ python -m thinking.vision --train --arch bottleneck --steps 2000 --batch 64 --di
     --out runs/vision_bottleneck.pt
 python -m thinking.image2 --steps 400 --seeds 0,1,2 --out runs/image2_bottleneck.json
 python -m thinking.image_flow --train --steps 400 --out runs/image_flow.pt
+python -m thinking.image_latent --train --ae-steps 400 --flow-steps 400 \
+    --out runs/image_latent_flow.pt
 RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --vision-arch bottleneck \
-    --image2 --image-flow --fast --go
+    --image2 --image-flow --image-latent --fast --go
 ```
 
 `thinking.image2` is the head-aware FER experiment: shared factored heads vs explicit
@@ -150,18 +155,30 @@ both the old embedding probe and the new factor-space probe, fixing the Image-1 
 the embedding layer missed where factorization lived.
 
 `thinking.image_flow` is the first generation scaffold. It trains a small fact-conditioned
-rectified-flow model:
+rectified-flow model in pixel space:
 
 ```
 canonical visual facts -> condition vector -> velocity field -> image
 ```
 
+`thinking.image_latent` is the next scale rung:
+
+```
+image -> semantic AE latent -> fact-conditioned latent velocity field -> decoder -> image
+```
+
+The autoencoder is deliberately semantic, not reconstruction-only: it predicts color/shape facts
+from the compressed latent while reconstructing the image. That keeps the latent aligned with the
+same factorization requirement as the FER probes and gives us the right insertion point for a
+future DiT/MMDiT backbone.
+
 This follows the direction used by modern image systems: latent diffusion reduces generation
 cost by operating in compressed spaces (LDM, arXiv:2112.10752), diffusion transformers replace
 the U-Net backbone at scale (DiT, arXiv:2212.09748), and current high-resolution systems use
 rectified-flow transformer variants (Stable Diffusion 3, arXiv:2403.03206) or linear-attention
-efficiency paths (Sana, arXiv:2410.10629). Our scaffold is still pixel-space and synthetic; the
-next scale step is to put the same canonical-fact conditioning behind a latent/DiT backbone.
+efficiency paths (Sana, arXiv:2410.10629). Newer RAE-style work pushes the same point harder:
+the autoencoder latent should be semantically rich enough for DiT training, not just a lossy
+pixel codec. Our implementation is still synthetic, but the path now matches that shape.
 
 Current finding: the H100 Image-1 baseline reaches **1.00 color / 1.00 shape accuracy** after
 2k steps, but the visual factor probe still reports `high_fer_risk` (`ufr_score=0.0`) because
@@ -183,6 +200,13 @@ A separate tracked Image-2 sweep (`runs/image2_fer.json`, 600 steps × 3 seeds) 
 stronger intervention target: held-out combo accuracy moves **0.65 → 0.97 → 1.00** across
 factored, swap, and subspace arms, and the linear-decodability probe ranks the arms in the same
 order as behavior. Treat that as the next reproducibility target for the public command path.
+
+Image-3 GPU update (H100, 1000 AE steps + 1000 latent-flow steps): `thinking.image_latent`
+reaches `recon_mse=0.015`, latent color accuracy **1.00**, latent shape accuracy **0.86**,
+`latent_velocity_mse=1.05`, and center-target sample MSE **0.044**. This proves the semantic
+latent path can preserve canonical factors before moving transport training off pixels. It is
+still a toy conv latent flow; the next architecture step is replacing the conv velocity field
+with a patch-token DiT/MMDiT block over these semantic latents.
 
 ## 4. Exams (the report card)
 

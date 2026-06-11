@@ -95,6 +95,18 @@ def cmd_selftest(_args):
             outs.append(logits)
         inc = torch.stack(outs, 1)
     assert torch.allclose(full, inc, atol=1e-5), "cached decode diverges from full forward"
+    torch.manual_seed(0)
+    mp = ScratchpadLM(len(vocab), d=32, layers=2, heads=4, max_len=64, pad=vocab.pad,
+                      pointer=False).eval()
+    prefix = torch.randn(1, 3, 32)
+    with torch.no_grad():
+        pref = mp(ids, prefix=prefix)
+    assert pref.shape == (1, ids.shape[1] + 3, len(vocab)), "continuous prefix shape mismatch"
+    try:
+        m(ids, prefix=prefix)
+        raise AssertionError("pointer model accepted continuous prefix")
+    except ValueError:
+        pass
 
     # backward chaining agrees with the forward oracle
     edb = set(p.edb)
@@ -386,6 +398,8 @@ def cmd_selftest(_args):
     # IMAGE-0: synthetic visual factors produce canonical facts and probeable embeddings.
     from .vision import selftest as vision_selftest
     vision_selftest()
+    from .image_latent import selftest as image_latent_selftest
+    image_latent_selftest()
     print("selftest OK")
 
 

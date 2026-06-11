@@ -379,14 +379,25 @@ class ScratchpadLM(nn.Module):
         halts.append(q)
         return auto and bool((torch.sigmoid(q) > 0.5).all())
 
-    def forward(self, ids, loops=None, return_per_loop=False, loop_noise=0.0):
+    def forward(self, ids, loops=None, return_per_loop=False, loop_noise=0.0, prefix=None):
+        """prefix: optional (B, P, d) continuous embeddings (image patches, audio frames)
+        prepended BEFORE the token stream -- the multimodal bridge. Logits are returned for
+        ALL positions; callers slice [:, P:] for the token part. Incompatible with the
+        pointer head (no token ids to scatter onto) -- use pointer=False models."""
         B, L = ids.shape
         if self.pointer:
+            if prefix is not None:
+                raise ValueError("prefix embeddings are incompatible with the pointer head")
             self.blocks[-1].store_attn = True                # pointer needs the weights every forward
         pad_mask = ids.eq(self.pad)
         x = self.tok(ids)
         if self.pos is not None:
             x = x + self.pos(torch.arange(L, device=ids.device)[None, :])
+        if prefix is not None:
+            x = torch.cat([prefix.to(x.dtype), x], dim=1)
+            pad_mask = F.pad(pad_mask, (prefix.shape[1], 0), value=False)
+            ids = F.pad(ids, (prefix.shape[1], 0), value=self.pad + 1 if self.pad == 0 else 0)
+            B, L = ids.shape
         per_loop, halts = [], []
         auto = loops == "auto"
         if auto:
