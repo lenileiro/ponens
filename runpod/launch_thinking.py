@@ -58,6 +58,18 @@ def payload(args):
                     f"--out runs/verbalizer.pt && "
                     f"{PY.replace('thinking.cli', 'thinking.verbalize')} "
                     f"--sample runs/verbalizer.pt")
+    if args.eval_only_run:
+        run = shlex_quote(args.eval_only_run)
+        depths = ",".join(str(d) for d in args.eval_depths)
+        eval_block = max(18432, 144 * max(args.eval_depths))
+        eval_cmds = []
+        for decode in args.eval_decodes:
+            out = os.path.join(args.eval_only_run, f"deep_eval_{decode}.json")
+            eval_cmds.append(
+                f"{PY} deep-eval {run} --depths {shlex_quote(depths)} "
+                f"--n {args.eval_n} --preds ancestor --block {eval_block} "
+                f"--decode {shlex_quote(decode)} --out {shlex_quote(out)}")
+        return " && ".join(eval_cmds)
     if args.lengen:                                        # RUNG L: train shallow-deep (<=6),
         cmds2 = []                                         # eval FAR deeper -- length-gen arms
         for pos in ("rope", "none"):
@@ -94,7 +106,8 @@ def payload(args):
         canon = ((" --canon" if args.canon else "") + (" --bank" if args.bank else "") + (" --no-curriculum" if args.no_curriculum else ""))
         simple = " --simple" if args.stair_world == "kinship" else ""
         if args.stair_world == "kinship" and args.deep_depth and args.stair:
-            simple += f" --deep-depth {args.deep_depth} --deep-frac 0.3 --contrastive 0.9"
+            stair_df = args.deep_frac if args.deep_frac != 0.6 else 0.3   # 0.6 = non-stair default
+            simple += f" --deep-depth {args.deep_depth} --deep-frac {stair_df} --contrastive 0.9"
         sbatch = 8 if (args.deep_depth and args.stair_world == "kinship") else 32
         hops = ("2,3" if not (args.deep_depth and args.stair_world == "kinship")
                 else f"2,3,{args.deep_depth // 2},{args.deep_depth}")
@@ -187,6 +200,10 @@ def main():
     ap.add_argument("--deep-ancestor-rule-aux", action="store_true",
                     help="train the forward ancestor run with rule/action and contrastive losses")
     ap.add_argument("--run-name", default="runs/deep_ancestor_rule_aux")
+    ap.add_argument("--eval-only-run", default="",
+                    help="skip training; upload this local run dir and run deep-eval only")
+    ap.add_argument("--eval-decodes", default="sample,hybrid",
+                    help="comma-separated deep-eval decoders for --eval-only-run")
     ap.add_argument("--examples", type=int, default=6000)
     ap.add_argument("--deep-frac", type=float, default=0.6, dest="deep_frac")
     ap.add_argument("--rule-w", type=float, default=0.1, dest="rule_w")
@@ -201,6 +218,11 @@ def main():
     args = ap.parse_args()
     if isinstance(args.eval_depths, str):
         args.eval_depths = [int(x.strip()) for x in args.eval_depths.split(",") if x.strip()]
+    if isinstance(args.eval_decodes, str):
+        args.eval_decodes = [x.strip() for x in args.eval_decodes.split(",") if x.strip()]
+    bad_decodes = sorted(set(args.eval_decodes) - {"sample", "hybrid", "constrained"})
+    if bad_decodes:
+        sys.exit(f"ERROR: unsupported --eval-decodes values: {','.join(bad_decodes)}")
 
     key = os.environ.get("RUNPOD_API_KEY")
     if not key and args.go:
@@ -261,6 +283,14 @@ def main():
               f"--exclude './tooling' --exclude './artifacts' --exclude '*.tgz' -C {HERE} . "
               f"| {ssh} 'mkdir -p {REMOTE} && tar xzf - -C {REMOTE}'")
         sh(up)
+        if args.eval_only_run:
+            local_run = os.path.join(HERE, args.eval_only_run)
+            if not os.path.isdir(local_run):
+                raise FileNotFoundError(f"--eval-only-run not found: {local_run}")
+            up_run = (f"COPYFILE_DISABLE=1 tar czf - -C {shlex_quote(HERE)} "
+                      f"{shlex_quote(args.eval_only_run)} "
+                      f"| {ssh} 'mkdir -p {REMOTE} && tar xzf - -C {REMOTE}'")
+            sh(up_run)
         # DETACHED execution: nohup on the pod + short-poll. A dropped SSH pipe killed three
         # healthy runs (B7/C6/L) when it took the cost-guard with it -- never hold a session.
         script = remote_cmd + "; touch /root/DONE\n"

@@ -127,6 +127,23 @@ class GoalChecker:
             return [v for v in vals if self.valid_answer(st, v)]
         return [a for a in sorted(self.answer_preds) if self.valid_answer(st, a)]
 
+    def relevant_predicates(self, st):
+        """Backward predicate dependency slice for the current goal predicate."""
+        if st["goal_pred"] in self.builtins:
+            return None                                    # builtin dependencies are opaque here
+        rel = {st["goal_pred"]}
+        changed = True
+        while changed:
+            changed = False
+            for hp, bps in self.rules + st["extra_rules"]:
+                if hp[0] not in rel:
+                    continue
+                for b in bps:
+                    if b[0] not in rel:
+                        rel.add(b[0])
+                        changed = True
+        return rel
+
     def candidate_steps(self, st, include_checks=True):
         """Generic legal local proof steps from the current checker state.
 
@@ -135,8 +152,11 @@ class GoalChecker:
         ancestor, or any task-specific grammar.
         """
         candidates = []
+        relevant = self.relevant_predicates(st)
         if include_checks:
             for fact in sorted(st["edb"] - st["known"]):
+                if relevant is not None and fact[0] not in relevant:
+                    continue
                 body = ()
                 if self.valid_step_state(st, "check", fact, body):
                     candidates.append(("check", fact, body))
@@ -148,6 +168,8 @@ class GoalChecker:
             facts.sort()
 
         for hp, bps in self.rules + st["extra_rules"]:
+            if relevant is not None and hp[0] not in relevant:
+                continue
             for subst, body in _body_instances(bps, facts_by_pred):
                 head = _subst(hp, subst)
                 body = tuple(body)

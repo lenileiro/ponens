@@ -552,9 +552,10 @@ def main(argv=None):
     p.add_argument("--preds", default="ancestor",
                    help="restrict deep query types, e.g. ancestor or ancestor,older_by")
     p.add_argument("--mode", default="verified", choices=("free", "verified"))
-    p.add_argument("--decode", default="sample", choices=("sample", "constrained"),
+    p.add_argument("--decode", default="sample", choices=("sample", "hybrid", "constrained"),
                    help="sample = token generation with verifier retries; constrained = score "
-                        "generic checker-generated legal proof lines")
+                        "generic checker-generated legal proof lines; hybrid = sample until "
+                        "the verifier stalls, then score a generic legal line")
     p.add_argument("--block", type=int, default=0, help="eval context override")
     p.add_argument("--phrasings", default="train", choices=("train", "eval"))
     p.add_argument("--train-names", action="store_true", dest="train_names",

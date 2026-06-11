@@ -113,6 +113,68 @@ class FlowRuntime:
             ctx.append(t)
         return score / max(1, len(toks)), toks[:-1], None
 
+    def _expand_state(self, state, n):
+        if state is None:
+            return None
+        layers = []
+        for k, v in state["cache"]["layers"]:
+            layers.append((k.repeat(n, 1, 1, 1), v.repeat(n, 1, 1, 1)))
+        return {
+            "cache": {"ids": state["cache"]["ids"].repeat(n, 1), "layers": layers},
+            "logits": state["logits"].repeat(n, 1),
+        }
+
+    @torch.no_grad()
+    def _score_choices(self, ids, choices, state=None, chunk=16):
+        """Score many candidate lines, using the prefix KV cache in small batches when possible."""
+        if state is None or not self._can_cache():
+            out = []
+            for words, step in choices:
+                score, toks, _ = self._score_line(ids, words, state=state)
+                out.append((score, words, toks, None, step))
+            return out
+
+        dot = self.v.stoi["."]
+        encoded = [(self.v.enc(words) + [dot], words, step) for words, step in choices]
+        by_len = {}
+        for toks, words, step in encoded:
+            by_len.setdefault(len(toks), []).append((toks, words, step))
+
+        scored = []
+        for _ln, group in by_len.items():
+            for off in range(0, len(group), chunk):
+                part = group[off:off + chunk]
+                cur = self._expand_state(state, len(part))
+                scores = torch.zeros(len(part), device=self.dev)
+                for j in range(len(part[0][0])):
+                    logits = cur["logits"].float()
+                    tok = torch.tensor([p[0][j] for p in part], device=self.dev)
+                    scores += torch.log_softmax(logits, -1).gather(1, tok[:, None]).squeeze(1)
+                    cur_logits, cur_cache = self.m.forward_step(tok[:, None], cur["cache"])
+                    cur = {"cache": cur_cache, "logits": cur_logits}
+                scores = scores / len(part[0][0])
+                for i, (_toks, words, step) in enumerate(part):
+                    scored.append((float(scores[i]), words, _toks[:-1], None, step))
+        return scored
+
+    def _best_goal_candidate(self, st, ids, state, preferred_kind=None):
+        from .trace import render_goal_line
+        choices = [(["answer", ans], None) for ans in self.chk.answer_candidates(st)]
+        if not choices:
+            steps = self.chk.candidate_steps(st)
+            if preferred_kind in ("check", "think"):
+                narrowed = [s for s in steps if s[0] == preferred_kind]
+                if narrowed:
+                    steps = narrowed
+            choices = [(render_goal_line(typ, head, body), (typ, head, body))
+                       for typ, head, body in steps]
+        if not choices:
+            return None
+        scored = self._score_choices(ids, choices, state=state)
+        _score, words, toks, _new_state, step = max(scored, key=lambda x: x[0])
+        _score, toks, new_state = self._score_line(ids, words, state=state)
+        return words, toks, new_state, step
+
     @torch.no_grad()
     def run(self, problem, verify=True):
         from .trace import parse_line, atom_tokens
@@ -233,7 +295,7 @@ class FlowRuntime:
         if decode == "constrained":
             return self.run_goal_constrained(problem, templates, question, rng=rng,
                                              prompt=prompt, edb=edb)
-        if decode != "sample":
+        if decode not in ("sample", "hybrid"):
             raise ValueError(f"unknown goal decode mode {decode!r}")
         res = FlowResult()
         question = problem.question or question            # in-question novel-relation surface
@@ -279,6 +341,23 @@ class FlowRuntime:
                         ok = True
                         break
                 if not ok:
+                    if decode == "hybrid":
+                        preferred = words[0] if words and words[0] in ("check", "think") else None
+                        best = self._best_goal_candidate(st, ids, state,
+                                                         preferred_kind=preferred)
+                        if best is not None:
+                            words, toks, state, step = best
+                            if step is None:
+                                ans = words[1] if len(words) > 1 else None
+                                res.answer = ans
+                                res.lines.append((words, "answer"))
+                                return res
+                            if self.chk.step(st, *step):
+                                ids += toks + [dot]
+                                stalls = 0
+                                res.n_invalid += 1
+                                res.lines.append((words, "constrained"))
+                                continue
                     # Verified mode must not poison the prompt with rejected text. A repeated
                     # invalid line stalls at this same clean prefix; repair after a small budget.
                     res.n_invalid += 1
@@ -308,7 +387,7 @@ class FlowRuntime:
         facts and rule instances from the loaded Datalog rules. The model only scores candidates;
         it no longer free-forms grammar or relation-specific rule structure.
         """
-        from .trace import render_goal_line, render_prompt
+        from .trace import render_prompt
         res = FlowResult()
         question = problem.question or question
         st = self.chk.new_state(problem.goal[1], edb if edb is not None else problem.edb,
@@ -320,20 +399,12 @@ class FlowRuntime:
         state = self._state_from_ids(ids)
 
         for _ in range(4 * problem.k + 8):
-            choices = [(["answer", ans], None) for ans in self.chk.answer_candidates(st)]
-            if not choices:
-                choices = [(render_goal_line(typ, head, body), (typ, head, body))
-                           for typ, head, body in self.chk.candidate_steps(st)]
-            if not choices:
+            best = self._best_goal_candidate(st, ids, state)
+            if best is None:
                 res.answer = self._root_answer(st)
                 res.lines.append((["answer", str(res.answer)], "repair"))
                 return res
-
-            scored = []
-            for words, step in choices:
-                score, toks, new_state = self._score_line(ids, words, state=state)
-                scored.append((score, words, toks, new_state, step))
-            _score, words, toks, new_state, step = max(scored, key=lambda x: x[0])
+            words, toks, new_state, step = best
 
             if step is None:
                 ans = words[1] if len(words) > 1 else None
