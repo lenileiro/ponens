@@ -245,6 +245,14 @@ alignment pressure from condition slots to the representation heads already used
 It follows the recent lesson that image generation quality depends on semantic representations
 inside the denoising/flow model, not only lower transport MSE.
 
+Image-6 GPU update (H100, same 1000+1000 DiT setup, `flow_semantic_w=0.25`): semantic endpoint
+alignment fixes the shape-fidelity bottleneck measured by Image-5. Round-trip generated samples
+now decode to color **0.87**, shape **1.00**, and both facts **0.87** across all 15 color×shape
+conditions, up from **0.87 / 0.67 / 0.53**. The tradeoff is small but real: latent velocity MSE
+is **0.78** vs **0.77**, center-target sample MSE moves **0.0198 → 0.0251**, and conditional
+sample MSE moves **0.0739 → 0.0848**. For this foundation, the result says representation
+alignment is buying semantic faithfulness at a modest pixel-MSE cost.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
