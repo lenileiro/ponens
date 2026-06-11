@@ -145,8 +145,10 @@ python -m thinking.image2 --steps 400 --seeds 0,1,2 --out runs/image2_bottleneck
 python -m thinking.image_flow --train --steps 400 --out runs/image_flow.pt
 python -m thinking.image_latent --train --ae-steps 400 --flow-steps 400 \
     --out runs/image_latent_flow.pt
+python -m thinking.audio --steps 500 --seeds 0,1,2 --out runs/audio1_fer.json
+python -m thinking.multimodal --steps 400 --out runs/m0_multimodal.json
 RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --vision-arch bottleneck \
-    --image2 --image-flow --image-latent --fast --go
+    --image2 --image-flow --image-latent --audio --multimodal --fast --go
 ```
 
 `thinking.image2` is the head-aware FER experiment: shared factored heads vs explicit
@@ -207,6 +209,27 @@ reaches `recon_mse=0.015`, latent color accuracy **1.00**, latent shape accuracy
 latent path can preserve canonical factors before moving transport training off pixels. It is
 still a toy conv latent flow; the next architecture step is replacing the conv velocity field
 with a patch-token DiT/MMDiT block over these semantic latents.
+
+## 3c. Multimodal bridge: image + audio into the same trace language
+
+`thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
+as waveforms and log-spectrograms, with held-out factor combinations and the same factored/swap/
+subspace intervention ladder. The target facts use the same h/pred/t convention:
+`fact a0 pitch n440 .`, `fact a0 timbre saw .`, `fact a0 env decay .`.
+
+`thinking.multimodal` is M-0: one non-pointer `ScratchpadLM` receives continuous image patch
+prefixes and audio spectrogram prefixes, then emits one canonical extraction trace:
+
+```
+[IMG prefix][AUD prefix] extract
+  fact p0 color red . fact p0 shape circle .
+  fact a0 pitch n440 . fact a0 timbre saw . fact a0 env decay . done .
+```
+
+This is the multimodal version of the project invariant: every modality grounds into canonical
+facts before the checker/reasoner sees it. Image generation stays connected through the same
+semantic latent path (`image -> latent -> facts/generation`) rather than becoming a detached
+pixel model.
 
 ## 4. Exams (the report card)
 

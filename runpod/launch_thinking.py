@@ -72,7 +72,8 @@ def payload(args):
                     f"--corpus-mb {args.lang_mb} --pre-steps {args.train_steps or 40000} "
                     f"--steps {args.lang_ft} --out runs/lang1_fluency.pt && "
                     f"{VB} --sample runs/lang1_fluency.pt")
-    if args.vision or args.image2 or args.image_flow or args.image_latent:
+    if (args.vision or args.image2 or args.image_flow or args.image_latent or args.audio
+            or args.multimodal):
         VI = PY.replace("thinking.cli", "thinking.vision")
         if args.vision:                                    # IMAGE-0/1: visual factors -> facts
             cmds.append(f"{VI} --train --steps {args.train_steps or 2000} "
@@ -94,6 +95,14 @@ def payload(args):
             cmds.append(f"{IL} --train --ae-steps {args.train_steps or 800} "
                         f"--flow-steps {args.train_steps or 800} --batch {args.batch} "
                         f"--hidden {args.dim or 64} --out runs/image_latent_flow.pt")
+        if args.audio:                                     # AUDIO-1: audio factors -> facts
+            AU = PY.replace("thinking.cli", "thinking.audio")
+            cmds.append(f"{AU} --steps {args.train_steps or 500} "
+                        f"--seeds {shlex_quote(args.seeds)} --out runs/audio1_fer.json")
+        if args.multimodal:                                # M-0: image+audio -> canonical facts
+            MM = PY.replace("thinking.cli", "thinking.multimodal")
+            cmds.append(f"{MM} --steps {args.train_steps or 400} "
+                        f"--out runs/m0_multimodal.json")
         return " && ".join(cmds)
     if args.eval_only_run:
         run = shlex_quote(args.eval_only_run)
@@ -294,6 +303,8 @@ def main():
                     help="LANG-1: hybrid-vocab fluency pretraining (reasoning-compatible)")
     ap.add_argument("--lang-mb", type=int, default=24, dest="lang_mb")
     ap.add_argument("--lang-ft", type=int, default=6000, dest="lang_ft")
+    ap.add_argument("--ref", default="HEAD",
+                    help="deploy this git ref (pinned commit); '' = live tree")
     ap.add_argument("--vision", action="store_true",
                     help="IMAGE-0/1: train visual factor encoder + FER probe report")
     ap.add_argument("--vision-arch", default="shared", choices=("shared", "factored", "bottleneck"),
@@ -304,6 +315,10 @@ def main():
                     help="train the tiny fact-conditioned rectified-flow image generator")
     ap.add_argument("--image-latent", action="store_true", dest="image_latent",
                     help="IMAGE-3: train semantic autoencoder + latent fact-conditioned flow")
+    ap.add_argument("--audio", action="store_true",
+                    help="AUDIO-1: train synthetic audio factor FER experiment")
+    ap.add_argument("--multimodal", action="store_true",
+                    help="M-0: train one prefix-conditioned LM on image+audio extraction")
     ap.add_argument("--lengen", action="store_true", help="rung L: depth generalization")
     ap.add_argument("--deep-ancestor-rule-aux", action="store_true",
                     help="train the forward ancestor run with rule/action and contrastive losses")
@@ -382,6 +397,8 @@ def main():
         (args.image2, "image2 FER arms"),
         (args.image_flow, "fact-conditioned flow"),
         (args.image_latent, "latent fact-conditioned flow"),
+        (args.audio, "audio FER arms"),
+        (args.multimodal, "multimodal bridge"),
     ) if enabled]
     job = " + ".join(image_jobs) if image_jobs else "kinship multi-seed"
     print("=== PLAN === thinking package on H100: " + job
@@ -417,12 +434,19 @@ def main():
             sys.exit("pod never exposed SSH within cap; terminating.")
         time.sleep(25)
         ssh = f"ssh -o StrictHostKeyChecking=no -p {port} root@{ip}"
-        up = (f"COPYFILE_DISABLE=1 tar czf - --exclude './.venv*' --exclude '*/__pycache__' "
-              f"--exclude './results_gpu' --exclude '*.zip' --exclude './data' --exclude '*.pt' "
-              f"--exclude '*.log' --exclude './runs' --exclude './experiments' "
-              f"--exclude './tooling' --exclude './artifacts' --exclude './.git' "
-              f"--exclude '*.tgz' -C {HERE} . "
-              f"| {ssh} 'mkdir -p {REMOTE} && tar --no-same-owner -xzf - -C {REMOTE}'")
+        if getattr(args, "ref", None):
+            # PINNED DEPLOY: ship exactly one committed tree (REBAL2 lesson: tar of the live
+            # working dir snapshots parallel mid-edits -> selftest passed locally but the pod
+            # ran different, broken code; its whole eval ladder was junk)
+            up = (f"git -C {shlex_quote(HERE)} archive --format=tar.gz {shlex_quote(args.ref)} "
+                  f"| {ssh} 'mkdir -p {REMOTE} && tar --no-same-owner -xzf - -C {REMOTE}'")
+        else:
+            up = (f"COPYFILE_DISABLE=1 tar czf - --exclude './.venv*' --exclude '*/__pycache__' "
+                  f"--exclude './results_gpu' --exclude '*.zip' --exclude './data' --exclude '*.pt' "
+                  f"--exclude '*.log' --exclude './runs' --exclude './experiments' "
+                  f"--exclude './tooling' --exclude './artifacts' --exclude './.git' "
+                  f"--exclude '*.tgz' -C {HERE} . "
+                  f"| {ssh} 'mkdir -p {REMOTE} && tar --no-same-owner -xzf - -C {REMOTE}'")
         sh(up)
         if args.eval_only_run:
             local_run = os.path.join(HERE, args.eval_only_run)

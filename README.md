@@ -37,6 +37,7 @@ memorization, and curriculum.
 | `surfaces.json` | frontier-distilled surface bank: 1,300+ validated English patterns across 8 education registers (preschool → scholar), with held-out splits |
 | `runpod/` | H100 launchers (tar-over-ssh, timeout-bounded, always-terminate) |
 | `thinking/vision.py`, `thinking/image2.py`, `thinking/image_flow.py`, `thinking/image_latent.py` | Image rungs: synthetic visual factors → canonical facts, head-aware FER probes, pixel flow, and semantic latent flow |
+| `thinking/audio.py`, `thinking/multimodal.py` | Audio factors and the M-0 multimodal bridge: image+audio prefixes → one canonical extraction trace |
 | `*.md` | research plans and theses (FER bet, reasoning design, training data, validated plan) |
 
 ## Headline results (staircase-validated, 2026-06)
@@ -81,6 +82,7 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
 .venv/bin/python -m thinking.image_flow --train --steps 40 --out runs/image_flow.pt
 .venv/bin/python -m thinking.image_latent --train --ae-steps 40 --flow-steps 40 \
     --out runs/image_latent_flow.pt
+.venv/bin/python -m thinking.multimodal --steps 40 --out runs/m0_multimodal.json
 ```
 
 GPU runs: `runpod/launch_thinking.py` (see the package docs).

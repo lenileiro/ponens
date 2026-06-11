@@ -400,6 +400,10 @@ def cmd_selftest(_args):
     vision_selftest()
     from .image_latent import selftest as image_latent_selftest
     image_latent_selftest()
+    from .audio import selftest as audio_selftest
+    audio_selftest()
+    from .multimodal import selftest as multimodal_selftest
+    multimodal_selftest()
     print("selftest OK")
 
 
