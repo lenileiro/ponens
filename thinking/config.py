@@ -58,6 +58,9 @@ class Config:
     weight_decay: float = 0.01
     aux_w: float = 0.5                # attention supervision on lookup positions
     aux_layers: int = 2               # ...applied to head 0 of the last N blocks
+    rule_w: float = 0.0               # auxiliary classifier on proof-line rule/action labels
+    rule_contrast_w: float = 0.0      # supervised contrastive alignment for same-rule line states
+    rule_contrast_temp: float = 0.1
     halt_w: float = 0.5               # weight on the Ouro-style expected-halt loss (looped models)
     ent_w: float = 0.01               # entropy bonus on the halting distribution
     n_examples: int = 6000

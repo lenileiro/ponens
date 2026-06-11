@@ -89,6 +89,31 @@ class FlowRuntime:
         return ans
 
     @torch.no_grad()
+    def _score_line(self, ids, words, state=None):
+        """Average log-probability of a complete candidate line, including final period."""
+        dot = self.v.stoi["."]
+        toks = self.v.enc(words) + [dot]
+        if state is not None:
+            cur, score = state, 0.0
+            for t in toks:
+                logits = cur["logits"][0].float()
+                score += float(torch.log_softmax(logits, -1)[t])
+                cur = self._state_append_raw(cur, [t])
+                if cur is None:
+                    return float("-inf"), toks[:-1], None
+            if cur["cache"]["ids"].shape[1] + self.cfg.max_line_tokens + 1 > self.cfg.block:
+                cur = None
+            return score / max(1, len(toks)), toks[:-1], cur
+
+        ctx, score = list(ids), 0.0
+        for t in toks:
+            x = torch.tensor([ctx[-self.cfg.block:]], device=self.dev)
+            logits = self.m(x)[0, -1].float()
+            score += float(torch.log_softmax(logits, -1)[t])
+            ctx.append(t)
+        return score / max(1, len(toks)), toks[:-1], None
+
+    @torch.no_grad()
     def run(self, problem, verify=True):
         from .trace import parse_line, atom_tokens
         res = FlowResult()
@@ -198,13 +223,18 @@ class FlowRuntime:
 
     @torch.no_grad()
     def run_goal(self, problem, templates, question, verify=True, rng=None, prompt=None,
-                 edb=None):
+                 edb=None, decode="sample"):
         """Goal-directed flow: NL facts + NL question prompt (synonym variants via rng, or a
         pre-rendered `prompt`); the model decomposes subgoals ('think H needs ...'), grounds
         leaves ('check F'), then names the relation ('answer p'). The GoalChecker's agenda gates
         every line when verify=True. edb overrides the checker's fact base (SELF mode: validate
         against the model's own extraction instead of the oracle's facts)."""
         from .trace import parse_goal_line, render_prompt
+        if decode == "constrained":
+            return self.run_goal_constrained(problem, templates, question, rng=rng,
+                                             prompt=prompt, edb=edb)
+        if decode != "sample":
+            raise ValueError(f"unknown goal decode mode {decode!r}")
         res = FlowResult()
         question = problem.question or question            # in-question novel-relation surface
         st = self.chk.new_state(problem.goal[1], edb if edb is not None else problem.edb,
@@ -214,6 +244,7 @@ class FlowRuntime:
         ids = self.v.enc(prompt)
         dot = self.v.stoi["."]
         state = self._state_from_ids(ids)
+        stalls = 0
         for _ in range(4 * problem.k + 8):                 # line budget (proof tree, not a walk)
             words, toks, line_state = self._line(ids, state=state, return_state=True)
             if words[:1] == ["answer"]:
@@ -247,18 +278,75 @@ class FlowRuntime:
                     if ps is not None and self.chk.step(st, *ps):
                         ok = True
                         break
-                if not ok:                                 # SKIP, don't die: advance context
-                    res.n_invalid += 1                     # uncommitted; later lines can recover
-                    res.lines.append((words, "skip"))
-                    ids += toks + [dot]
-                    state = self._state_append(line_state, [dot])
+                if not ok:
+                    # Verified mode must not poison the prompt with rejected text. A repeated
+                    # invalid line stalls at this same clean prefix; repair after a small budget.
+                    res.n_invalid += 1
+                    stalls += 1
+                    res.lines.append((words, "reject"))
+                    if stalls >= max(1, self.cfg.retry):
+                        res.answer = self._root_answer(st)
+                        res.lines.append((["answer", str(res.answer)], "repair"))
+                        return res
                     continue
             if not ok:
                 res.n_invalid += 1
             res.lines.append((words, "ok" if ok else "invalid"))
             if ok or not verify:
+                stalls = 0
                 ids += toks + [dot]
                 state = self._state_append(line_state, [dot])
+        res.answer = self._root_answer(st)
+        return res
+
+    @torch.no_grad()
+    def run_goal_constrained(self, problem, templates, question, rng=None, prompt=None,
+                             edb=None):
+        """Verifier-guided decoding over generic legal local proof actions.
+
+        Candidate steps come from GoalChecker.candidate_steps(), which enumerates unchecked EDB
+        facts and rule instances from the loaded Datalog rules. The model only scores candidates;
+        it no longer free-forms grammar or relation-specific rule structure.
+        """
+        from .trace import render_goal_line, render_prompt
+        res = FlowResult()
+        question = problem.question or question
+        st = self.chk.new_state(problem.goal[1], edb if edb is not None else problem.edb,
+                                goal_pred=problem.goal[0], extra_rules=problem.extra_rules)
+        if prompt is None:
+            prompt, _, _ = render_prompt(problem, templates, question, rng)
+        ids = self.v.enc(prompt)
+        dot = self.v.stoi["."]
+        state = self._state_from_ids(ids)
+
+        for _ in range(4 * problem.k + 8):
+            choices = [(["answer", ans], None) for ans in self.chk.answer_candidates(st)]
+            if not choices:
+                choices = [(render_goal_line(typ, head, body), (typ, head, body))
+                           for typ, head, body in self.chk.candidate_steps(st)]
+            if not choices:
+                res.answer = self._root_answer(st)
+                res.lines.append((["answer", str(res.answer)], "repair"))
+                return res
+
+            scored = []
+            for words, step in choices:
+                score, toks, new_state = self._score_line(ids, words, state=state)
+                scored.append((score, words, toks, new_state, step))
+            _score, words, toks, new_state, step = max(scored, key=lambda x: x[0])
+
+            if step is None:
+                ans = words[1] if len(words) > 1 else None
+                res.answer = ans
+                res.lines.append((words, "answer" if self.chk.valid_answer(st, ans) else "repair"))
+                return res
+            if not self.chk.step(st, *step):
+                res.n_invalid += 1
+                res.lines.append((words, "invalid"))
+                continue
+            res.lines.append((words, "ok"))
+            ids += toks + [dot]
+            state = new_state
         res.answer = self._root_answer(st)
         return res
 

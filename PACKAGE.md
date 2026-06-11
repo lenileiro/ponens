@@ -155,6 +155,7 @@ Validated bottom-up, one variable per run, after a nine-run zero streak taught u
 | C6d | + contrastive questions (3/tree) + goal anchor | k=2 OFF ZERO (0.10-0.20); verified k=3 **0.75** |
 | L (rope) | trained depth<=6, eval 6/10/20/40 | 0.70/0.40/0.17/0.00 — no cliff; per-line error compounds |
 | L (nope) | same, no positions | 0.40/0.60/0.00/0.00 — position mode not decisive |
+| CONS | contrastive 0.9, 36k steps (2x C6d) | k=2 **0.45-0.55**, verified k=3 **0.95** / free **1.00**; deep dipped (k=20 free 0.45) — trio inflation diluted effective deep share to ~0.20 |
 | C5 | deep_frac 0.3 rebalance (18k) | **verified k=3 0.60 > free 0.55**; deep k=20 0.40-0.45; held-out phrasings ≈ trained |
 
 Root causes found en route (now defaults/tests): unseen-name embeddings → anonymization;

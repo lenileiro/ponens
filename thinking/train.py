@@ -18,7 +18,8 @@ from device import get_device
 
 from .config import Config
 from .world import ChainWorld, RULES, entity_pools
-from .trace import Vocab, render_example, build_vocab, pack_batch
+from .trace import (Vocab, render_example, build_vocab, pack_batch, build_rule_vocab,
+                    pack_batch_with_meta)
 from .verify import StepChecker
 from .flow import FlowRuntime
 
@@ -29,6 +30,38 @@ DEV = get_device()
 def set_seed(s):
     np.random.seed(s)
     torch.manual_seed(s)
+
+
+def _encode_examples(examples, vocab, with_meta=False):
+    if with_meta:
+        return [(vocab.enc(ex.tokens), ex.aux, ex.meta) for ex in examples]
+    return [(vocab.enc(ex.tokens), ex.aux) for ex in examples]
+
+
+def _rule_contrastive_loss(hidden, spans, temp=0.1):
+    """Supervised contrastive loss over proof-line embeddings."""
+    if len(spans) < 2:
+        return None
+    embs, labels = [], []
+    for r, s, e, label in spans:
+        if e <= s:
+            continue
+        embs.append(hidden[r, s:e].mean(0))
+        labels.append(label)
+    if len(embs) < 2:
+        return None
+    z = F.normalize(torch.stack(embs), dim=-1)
+    y = torch.tensor(labels, device=hidden.device)
+    sim = z @ z.t() / max(temp, 1e-6)
+    eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+    pos = y[:, None].eq(y[None, :]) & ~eye
+    has_pos = pos.any(1)
+    if not bool(has_pos.any()):
+        return None
+    sim = sim.masked_fill(eye, -1e9)
+    logp = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+    per_anchor = -(logp.masked_fill(~pos, 0.0).sum(1) / pos.sum(1).clamp(min=1))
+    return per_anchor[has_pos].mean()
 
 
 class Trainer:
@@ -185,17 +218,31 @@ class Trainer:
             extra += [w for v, _ in QUESTION for w in v if "{" not in w]
             extra += [str(y) for y in range(1400, 3001)]   # stable vocab across pool refreshes
             extra += [str(a) for a in range(0, 701)]
-        vocab = build_vocab(examples + [e for s in lvl_sets for e in s], extra_tokens=extra)
-        seqs = [(vocab.enc(ex.tokens), ex.aux) for ex in examples]
+        all_examples = examples + [e for s in lvl_sets for e in s]
+        vocab = build_vocab(all_examples, extra_tokens=extra)
+        use_rule_meta = cfg.rule_w > 0 or cfg.rule_contrast_w > 0
+        rule_stoi = build_rule_vocab(all_examples) if use_rule_meta else {}
+        self.rule_stoi = rule_stoi
+        use_rule_meta = use_rule_meta and bool(rule_stoi)
+        if cfg.rule_w > 0 and not rule_stoi:
+            log.info("rule auxiliary loss requested, but no trace metadata labels were found")
+        if cfg.rule_contrast_w > 0 and not rule_stoi:
+            log.info("rule contrastive loss requested, but no trace metadata labels were found")
+        if use_rule_meta:
+            log.info("rule labels: %d (%s)", len(rule_stoi), ", ".join(sorted(rule_stoi)[:8]))
+        seqs = _encode_examples(examples, vocab, with_meta=use_rule_meta)
         cum_seqs, acc = [], []
         for s in lvl_sets:                                 # cum_seqs[i] = ladder levels 0..i
-            acc = acc + [(vocab.enc(ex.tokens), ex.aux) for ex in s]
+            acc = acc + _encode_examples(s, vocab, with_meta=use_rule_meta)
             cum_seqs.append(list(acc))
         m = self.build_model(vocab)
+        rule_head = (torch.nn.Linear(cfg.d, len(rule_stoi)).to(DEV)
+                     if cfg.rule_w > 0 and rule_stoi else None)
         if cfg.aux_w > 0:
             for blk in m.blocks[-cfg.aux_layers:]:
                 blk.store_attn = True
-        opt = torch.optim.AdamW(m.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        opt_params = list(m.parameters()) + (list(rule_head.parameters()) if rule_head else [])
+        opt = torch.optim.AdamW(opt_params, lr=cfg.lr, weight_decay=cfg.weight_decay)
         m.train()
         import time
         t0 = time.time()
@@ -203,7 +250,7 @@ class Trainer:
             if (cfg.refresh_every and st and st % cfg.refresh_every == 0
                     and (not cum_seqs or st * (len(cum_seqs) + 1) // cfg.steps >= len(cum_seqs))):
                 fresh = self.build_examples(max(1000, cfg.n_examples // 2), rng)
-                fseqs = [(vocab.enc(ex.tokens), ex.aux) for ex in fresh]
+                fseqs = _encode_examples(fresh, vocab, with_meta=use_rule_meta)
                 seqs = seqs[len(fseqs):] + fseqs           # rolling pool: replace the oldest half
                 log.info("refreshed %d/%d pool examples at step %d", len(fseqs), len(seqs), st)
             if cum_seqs:                                   # ladder phases, final phase = full mix
@@ -211,7 +258,12 @@ class Trainer:
                 cur = cum_seqs[ph] if ph < len(cum_seqs) else seqs
             else:
                 cur = seqs
-            x, sup = pack_batch(cur, cfg.block, cfg.batch, vocab.pad, rng)
+            rule_targets, spans = None, []
+            if use_rule_meta:
+                x, sup, rule_targets, spans = pack_batch_with_meta(
+                    cur, cfg.block, cfg.batch, vocab.pad, rng, rule_stoi)
+            else:
+                x, sup = pack_batch(cur, cfg.block, cfg.batch, vocab.pad, rng)
             x = x.to(DEV)
             amp = torch.autocast("cuda", torch.bfloat16) if DEV == "cuda" else _nullctx()
             with amp:
@@ -230,6 +282,19 @@ class Trainer:
                 for blk in m.blocks[-cfg.aux_layers:]:
                     loss = loss + (cfg.aux_w / cfg.aux_layers) * \
                         (-torch.log(blk._attn[ri, 0, pi, ci] + 1e-9)).mean()
+            if use_rule_meta and hasattr(m, "_last_hidden"):
+                hidden = m._last_hidden.float()
+                if rule_head is not None and rule_targets is not None:
+                    rt = rule_targets.to(DEV)
+                    if bool(rt.ne(-100).any()):
+                        rlogits = rule_head(hidden)
+                        loss = loss + cfg.rule_w * F.cross_entropy(
+                            rlogits.reshape(-1, rlogits.shape[-1]), rt.reshape(-1),
+                            ignore_index=-100)
+                if cfg.rule_contrast_w > 0 and spans:
+                    closs = _rule_contrastive_loss(hidden, spans, cfg.rule_contrast_temp)
+                    if closs is not None:
+                        loss = loss + cfg.rule_contrast_w * closs
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -303,6 +368,9 @@ class Trainer:
         self.cfg.save(os.path.join(out_dir, "config.json"))
         torch.save({"state_dict": m.state_dict(), "config": m.config, "itos": vocab.itos},
                    os.path.join(out_dir, "model.pt"))
+        if getattr(self, "rule_stoi", None):
+            with open(os.path.join(out_dir, "rule_vocab.json"), "w") as f:
+                json.dump(self.rule_stoi, f, indent=1)
         log.info("saved run -> %s", out_dir)
 
 

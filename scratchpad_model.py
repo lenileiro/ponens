@@ -468,7 +468,9 @@ class ScratchpadLM(nn.Module):
             self._halt_p = p
         if self.entmem is not None:                        # explicit entity-binding memory
             x = self.entmem(x)
-        out = self.head(self.lnf(x))
+        hidden = self.lnf(x)
+        self._last_hidden = hidden
+        out = self.head(hidden)
         if self.pointer:
             if self.blocks[-1]._attn is None:                # seen once: CUDA+autocast LOOPED path
                 raise RuntimeError("pointer: blocks[-1]._attn is None despite store_attn -- "
@@ -508,7 +510,9 @@ class ScratchpadLM(nn.Module):
         for blk, layer_cache in zip(self.blocks, layers):
             x, new_cache = blk.forward_step(x, ids, ids_all, layer_cache, pad=self.pad)
             new_layers.append(new_cache)
-        out = self.head(self.lnf(x))
+        hidden = self.lnf(x)
+        self._last_hidden = hidden
+        out = self.head(hidden)
         if self.pointer:
             a0 = self.blocks[-1]._attn[:, 0]                 # (B,1,S)
             ptr = torch.zeros(out.shape, device=out.device, dtype=a0.dtype) \

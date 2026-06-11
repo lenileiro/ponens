@@ -72,6 +72,23 @@ def payload(args):
                          f"--steps {args.train_steps or 15000} --dim 256 && "
                          + " ; ".join(evs))                # evals NON-FATAL: one bad cell
         return " && ".join(cmds2).replace(" && python3 -u -m thinking.cli eval", " ; python3 -u -m thinking.cli eval")
+    if args.deep_ancestor_rule_aux:
+        run = args.run_name
+        eval_block = max(18432, 144 * max(args.eval_depths))
+        train = (f"{PY} train --world kinship --simple --canon "
+                 f"--deep-depth {args.deep_depth} --deep-preds ancestor "
+                 f"--deep-frac {args.deep_frac} --dim {args.dim or 256} "
+                 f"--steps {args.train_steps or 8000} --examples {args.examples} "
+                 f"--batch {args.batch} --rule-w {args.rule_w} "
+                 f"--rule-contrast-w {args.rule_contrast_w} --out {run}")
+        depths = ",".join(str(d) for d in args.eval_depths)
+        return " && ".join([
+            train,
+            f"{PY} deep-eval {run} --depths {depths} --n {args.eval_n} "
+            f"--preds ancestor --block {eval_block}",
+            f"{PY} probe {run} --depths {depths} --n {args.probe_n} "
+            f"--preds ancestor --block {eval_block}",
+        ])
     if args.stair:                                         # staircase: minimal world, decisive evals
         run = f"runs/stair_{args.stair_world}"
         canon = ((" --canon" if args.canon else "") + (" --bank" if args.bank else "") + (" --no-curriculum" if args.no_curriculum else ""))
@@ -83,18 +100,21 @@ def payload(args):
                 else f"2,3,{args.deep_depth // 2},{args.deep_depth}")
         if args.stair_world == "chain":
             hops = "2,4,6"
-        return " && ".join([
-            f"{PY} train --world {args.stair_world}{simple}{canon} --out {run} --seed 0 "
-            f"--batch {sbatch} --steps {args.train_steps or 4000}"
-            + (f" --dim {args.dim}" if args.dim else ""),
-            f"{PY} eval {run} --mode verified --split iid --hops {hops} --n 20 --train-names",
-            f"{PY} eval {run} --mode free --split iid --hops {hops} --n 20 --train-names",
-            f"{PY} eval {run} --mode verified --split iid --hops {hops} --n 20",
+        # training must succeed (&&); evals are non-fatal and CHEAP-FIRST (free before
+        # verified -- verified deep evals can run 14+ min/depth and hit the pod cap)
+        evals = "; ".join([
             f"{PY} eval {run} --mode free --split iid --hops {hops} --n 20",
-            f"{PY} eval {run} --mode verified --split iid --hops {hops} --n 20 --phrasings eval",
+            f"{PY} eval {run} --mode free --split iid --hops {hops} --n 20 --train-names",
             f"{PY} eval {run} --mode free --split iid --hops {hops} --n 20 --phrasings eval",
+            f"{PY} eval {run} --mode verified --split iid --hops {hops} --n 20",
+            f"{PY} eval {run} --mode verified --split iid --hops {hops} --n 20 --train-names",
+            f"{PY} eval {run} --mode verified --split iid --hops {hops} --n 20 --phrasings eval",
             f"{PY} demo {run} --k 2",
         ])
+        return (f"{PY} train --world {args.stair_world}{simple}{canon} --out {run} --seed 0 "
+                f"--batch {sbatch} --steps {args.train_steps or 4000}"
+                + (f" --dim {args.dim}" if args.dim else "")
+                + " && { " + evals + "; }")
     neg = " --neg" if args.neg else ""
     loops = f" --loops {args.loops}" if args.loops else ""
     noloop = " --no-loop" if args.no_loop else ""
@@ -164,10 +184,23 @@ def main():
     ap.add_argument("--ablate", action="store_true", help="run the loop ablation first")
     ap.add_argument("--verbalize", action="store_true", help="train+sample the verbalizer")
     ap.add_argument("--lengen", action="store_true", help="rung L: depth generalization")
+    ap.add_argument("--deep-ancestor-rule-aux", action="store_true",
+                    help="train the forward ancestor run with rule/action and contrastive losses")
+    ap.add_argument("--run-name", default="runs/deep_ancestor_rule_aux")
+    ap.add_argument("--examples", type=int, default=6000)
+    ap.add_argument("--deep-frac", type=float, default=0.6, dest="deep_frac")
+    ap.add_argument("--rule-w", type=float, default=0.1, dest="rule_w")
+    ap.add_argument("--rule-contrast-w", type=float, default=0.05, dest="rule_contrast_w")
+    ap.add_argument("--eval-depths", default="4,8,16,30,64",
+                    help="comma-separated depths for deep-eval/probe in rule-aux mode")
+    ap.add_argument("--eval-n", type=int, default=20)
+    ap.add_argument("--probe-n", type=int, default=4)
     ap.add_argument("--sweep", action="store_true", help="also run the chain-world grid")
     ap.add_argument("--max-minutes", type=int, default=150)
     ap.add_argument("--go", action="store_true", help="actually create the pod (spends money)")
     args = ap.parse_args()
+    if isinstance(args.eval_depths, str):
+        args.eval_depths = [int(x.strip()) for x in args.eval_depths.split(",") if x.strip()]
 
     key = os.environ.get("RUNPOD_API_KEY")
     if not key and args.go:

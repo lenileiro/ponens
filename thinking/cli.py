@@ -19,7 +19,8 @@ log = logging.getLogger("thinking")
 def cmd_selftest(_args):
     import numpy as np
     from .world import ChainWorld, RULES, ENGINE, entity_pools
-    from .trace import render_example, parse_line, build_vocab, pack_batch
+    from .trace import (render_example, parse_line, build_vocab, pack_batch,
+                        build_rule_vocab, pack_batch_with_meta, render_goal_line)
     from .verify import StepChecker
 
     # entity pools: disjoint + deterministic
@@ -231,6 +232,26 @@ def cmd_selftest(_args):
         "ancestor trace must be forward-recursive: ancestor(x,y) + parent(y,z)"
     ex = render_goal_example(kp, lines, TEMPLATES, QUESTION, _np.random.default_rng(9))
     assert len(ex.tokens) <= 96 * 30, f"depth-30 example {len(ex.tokens)} tokens > block budget"
+    meta = ex.meta.get("lines", [])
+    proof_meta = [m for m in meta if m["kind"] != "answer"]
+    assert len(proof_meta) == len(lines), "trace metadata must cover every proof line"
+    assert [m["rule_id"] for m in proof_meta if m["rule_id"].startswith("ancestor")] == \
+        ["ancestor_base"] + ["ancestor_forward"] * 29
+    assert [m["depth_index"] for m in proof_meta if m["rule_id"] == "ancestor_forward"] == \
+        list(range(1, 30)), "ancestor_forward metadata must preserve step index"
+    rv = build_rule_vocab([ex])
+    assert {"ancestor_base", "ancestor_forward"} <= set(rv)
+    mv = build_vocab([ex])
+    xb, _, rt, spans = pack_batch_with_meta(
+        [(mv.enc(ex.tokens), ex.aux, ex.meta)], len(ex.tokens), 1, mv.pad,
+        _np.random.default_rng(0), rv)
+    assert xb.shape == (1, len(ex.tokens) + 1)
+    assert rt.ne(-100).any() and spans, "rule metadata must survive packing"
+    stc = chk.new_state(kp.goal[1], kp.edb, goal_pred="ancestor")
+    for ln in lines[:8]:
+        assert ln in chk.candidate_steps(stc), f"generic candidates missed gold line {ln}"
+        assert render_goal_line(*ln)                       # renderer owns line grammar
+        assert chk.step(stc, *ln)
     # chronology is consistent: every child born after its parent, death after birth
     born = {a[1][0]: int(a[1][1]) for a in kp.edb if a[0] == "born"}
     died = {a[1][0]: int(a[1][1]) for a in kp.edb if a[0] == "died"}
@@ -316,6 +337,12 @@ def cmd_train(args):
         cfg.deep_frac = args.deep_frac
     if args.contrastive:
         cfg.contrastive_frac = args.contrastive
+    if args.rule_w:
+        cfg.rule_w = args.rule_w
+    if args.rule_contrast_w:
+        cfg.rule_contrast_w = args.rule_contrast_w
+    if args.rule_contrast_temp:
+        cfg.rule_contrast_temp = args.rule_contrast_temp
     cfg.deep_preds = tuple(p.strip() for p in args.deep_preds.split(",") if p.strip()) \
         if args.deep_preds else ()
     if args.pos:
@@ -346,9 +373,63 @@ def cmd_eval(args):
                    preds=preds, phrasings=args.phrasings, lang_level=level, entities=ents)
     tag = f"{mode}/{args.split}" + (f"/{args.preds}" if args.preds else "") + \
           (f"/k{args.hops}" if args.hops else "") + \
+          ("/train-names" if args.train_names else "") + \
           (f"/{args.phrasings}-phrasings" if args.phrasings != "train" else "") + \
           (f"/{args.level}" if args.level != "mix" else "")
     save_results(args.run, {tag: res})
+
+
+def cmd_deep_eval(args):
+    import json
+    from .train import load_run
+    from .deep_eval import deep_eval, parse_ints, save_deep_report
+    cfg, _m, _vocab, trainer, runtime = load_run(args.run)
+    if args.block:
+        cfg.block = runtime.cfg.block = args.block
+    depths = parse_ints(args.depths, default=(4, 8, 16, 32, 64))
+    preds = tuple(p.strip() for p in args.preds.split(",") if p.strip())
+    level = args.level if args.level != "mix" else cfg.lang_level
+    report = deep_eval(runtime, trainer, depths=depths, n=args.n or None, preds=preds,
+                       mode=args.mode, phrasings=args.phrasings, lang_level=level,
+                       train_names=args.train_names, decode=args.decode)
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(report, f, indent=1)
+        path = args.out
+    else:
+        path = save_deep_report(args.run, report)
+    print(json.dumps(report["by_depth"], indent=1))
+    log.info("deep-eval -> %s", path)
+
+
+def cmd_probe(args):
+    import json
+    from .train import load_run
+    from .deep_eval import parse_ints
+    from .probes import probe_report, save_probe_report
+    cfg, _m, _vocab, trainer, runtime = load_run(args.run)
+    if args.block:
+        cfg.block = runtime.cfg.block = args.block
+    depths = parse_ints(args.depths, default=(4, 8, 16, 32))
+    preds = tuple(p.strip() for p in args.preds.split(",") if p.strip())
+    level = args.level if args.level != "mix" else cfg.lang_level
+    report = probe_report(runtime, trainer, depths=depths, n=args.n, preds=preds,
+                          layer=args.layer, phrasings=args.phrasings, lang_level=level,
+                          train_names=args.train_names)
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(report, f, indent=1)
+        path = args.out
+    else:
+        path = save_probe_report(args.run, report)
+    print(json.dumps({
+        "n_vectors": report["n_vectors"],
+        "same_rule_cos": report["same_rule_cos"],
+        "different_rule_cos": report["different_rule_cos"],
+        "rule_reuse_margin": report["rule_reuse_margin"],
+        "risk_flags": report["risk_flags"],
+    }, indent=1))
+    log.info("probe -> %s", path)
 
 
 def cmd_demo(args):
@@ -433,6 +514,12 @@ def main(argv=None):
     p.add_argument("--loops", type=int, default=0)
     p.add_argument("--deep-frac", type=float, default=0.0, dest="deep_frac")
     p.add_argument("--contrastive", type=float, default=0.0, help="contrastive triplet share")
+    p.add_argument("--rule-w", type=float, default=0.0, dest="rule_w",
+                   help="auxiliary rule/action classifier weight")
+    p.add_argument("--rule-contrast-w", type=float, default=0.0, dest="rule_contrast_w",
+                   help="same-rule contrastive alignment weight")
+    p.add_argument("--rule-contrast-temp", type=float, default=0.1,
+                   dest="rule_contrast_temp", help="contrastive temperature override")
     p.add_argument("--deep-preds", default="", dest="deep_preds",
                    help="restrict DEEP-regime query types, e.g. ancestor or ancestor,older_by")
     p.add_argument("--pos", choices=("rope", "none"), help="position mode (none = NoPE)")
@@ -457,6 +544,35 @@ def main(argv=None):
     p.add_argument("--train-names", action="store_true", dest="train_names",
                    help="evaluate on TRAINING-pool names (harness/generalization discriminator)")
     p.add_argument("--level", default="mix", help="education register: preschool..scholar|mix")
+    p = sub.add_parser("deep-eval")
+    p.add_argument("run")
+    p.add_argument("--depths", default="4,8,16,32,64",
+                   help="comma-separated deep depths to test")
+    p.add_argument("--n", type=int, default=0, help="examples per depth (default cfg.n_eval)")
+    p.add_argument("--preds", default="ancestor",
+                   help="restrict deep query types, e.g. ancestor or ancestor,older_by")
+    p.add_argument("--mode", default="verified", choices=("free", "verified"))
+    p.add_argument("--decode", default="sample", choices=("sample", "constrained"),
+                   help="sample = token generation with verifier retries; constrained = score "
+                        "generic checker-generated legal proof lines")
+    p.add_argument("--block", type=int, default=0, help="eval context override")
+    p.add_argument("--phrasings", default="train", choices=("train", "eval"))
+    p.add_argument("--train-names", action="store_true", dest="train_names",
+                   help="use training names instead of held-out/depth-sized eval names")
+    p.add_argument("--level", default="mix", help="education register: preschool..scholar|mix")
+    p.add_argument("--out", default="", help="write report to this JSON file")
+    p = sub.add_parser("probe")
+    p.add_argument("run")
+    p.add_argument("--depths", default="4,8,16,32",
+                   help="comma-separated deep depths to probe")
+    p.add_argument("--n", type=int, default=4, help="teacher-forced examples per depth")
+    p.add_argument("--preds", default="ancestor")
+    p.add_argument("--layer", type=int, default=-1, help="transformer block to capture")
+    p.add_argument("--block", type=int, default=0, help="context override for fit checks")
+    p.add_argument("--phrasings", default="train", choices=("train", "eval"))
+    p.add_argument("--train-names", action="store_true", dest="train_names")
+    p.add_argument("--level", default="mix", help="education register: preschool..scholar|mix")
+    p.add_argument("--out", default="", help="write report to this JSON file")
     p = sub.add_parser("demo")
     p.add_argument("run")
     p.add_argument("--k", type=int, default=6)
@@ -468,7 +584,8 @@ def main(argv=None):
     p.add_argument("--neg", action="store_true", default=True)
     args = ap.parse_args(argv)
     {"selftest": cmd_selftest, "induce": cmd_induce, "train": cmd_train, "eval": cmd_eval,
-     "demo": cmd_demo, "sweep": cmd_sweep, "ablate": cmd_ablate}[args.cmd](args)
+     "deep-eval": cmd_deep_eval, "probe": cmd_probe, "demo": cmd_demo, "sweep": cmd_sweep,
+     "ablate": cmd_ablate}[args.cmd](args)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,9 @@ from .verify import StepChecker
 from .flow import FlowRuntime
 from .train import Trainer, load_run
 from .evaluate import evaluate
+from .deep_eval import deep_eval
+from .probes import probe_report
 
 __all__ = ["Config", "ChainWorld", "RULES", "entity_pools", "Vocab", "render_example",
            "parse_line", "build_vocab", "pack_batch", "StepChecker", "FlowRuntime",
-           "Trainer", "load_run", "evaluate"]
+           "Trainer", "load_run", "evaluate", "deep_eval", "probe_report"]

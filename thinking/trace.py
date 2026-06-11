@@ -10,7 +10,7 @@ induction lookup):
   step    'think a far b and b r c so a far c .'
   answer  'answer c .'
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
 import torch
 
@@ -48,6 +48,58 @@ def parse_atom(toks):
 class Example:
     tokens: list                      # full supervised sequence
     aux: list                         # [(predictor_pos, gold_ctx_pos)] lookup supervision targets
+    meta: dict = field(default_factory=dict)
+
+
+def atom_text(atom):
+    return f"{atom[0]}({atom[1][0]},{atom[1][1]})"
+
+
+def line_rule_id(typ, head, body):
+    """Stable semantic label for a proof line, used by FER/UFR probes."""
+    if typ == "check":
+        return f"check:{head[0]}"
+    if typ != "think":
+        return typ
+    bpreds = tuple(b[0] for b in body)
+    if head[0] == "ancestor":
+        if bpreds == ("parent",):
+            return "ancestor_base"
+        if bpreds == ("ancestor", "parent"):
+            return "ancestor_forward"
+        if bpreds == ("parent", "ancestor"):
+            return "ancestor_backward"
+    return f"{head[0]}<-{'+'.join(bpreds)}"
+
+
+def line_meta(typ, head, body, start, end, depth_index=None):
+    return {
+        "kind": typ,
+        "rule_id": line_rule_id(typ, head, body),
+        "pred": head[0],
+        "head": atom_text(head),
+        "body": [atom_text(b) for b in body],
+        "start": start,
+        "end": end,
+        "depth_index": depth_index,
+    }
+
+
+def render_goal_line(typ, head, body=()):
+    """Render one canonical proof line, without the final period.
+
+    Keeping this in the trace module avoids scattering grammar assumptions through decoders.
+    """
+    if typ == "check":
+        return ["check"] + atom_tokens(head)
+    if typ != "think":
+        raise ValueError(f"unknown goal line type {typ!r}")
+    toks = ["think"]
+    for i, b in enumerate(body):
+        if i:
+            toks.append("and")
+        toks += atom_tokens(b)
+    return toks + ["so"] + atom_tokens(head)
 
 
 def render_example(problem, steps, sup="steps"):
@@ -127,6 +179,7 @@ def render_goal_example(problem, lines, templates, question, rng=None):
     toks, slot, first_pos = render_prompt(problem, templates, question, rng)
     x, y = problem.goal[1]
     aux = []
+    metas = []
     last_pos = dict(first_pos)                             # nearest antecedent of every entity
     for i, tk in enumerate(toks):                          # question mentions update antecedents
         if tk in last_pos:
@@ -142,7 +195,11 @@ def render_goal_example(problem, lines, templates, question, rng=None):
                 last_pos[tk] = len(toks)
             toks.append(tk)
 
+    rule_counts = {}
     for typ, head, body in lines:
+        line_start = len(toks)
+        rid = line_rule_id(typ, head, body)
+        rule_counts[rid] = rule_counts.get(rid, 0) + 1
         if typ == "think":                                 # PREMISES-FIRST WITHIN THE LINE (the
             toks.append("think")                           # chain world's decisive format): body
             for j, b in enumerate(body):                   # atoms echo known facts, THEN 'so',
@@ -156,8 +213,20 @@ def render_goal_example(problem, lines, templates, question, rng=None):
             toks.append("check")
             emit_atom(head)
             toks.append(".")
+        metas.append(line_meta(typ, head, body, line_start, len(toks), rule_counts[rid]))
+    answer_start = len(toks)
     toks += ["answer", problem.answer, "."]
-    return Example(tokens=toks, aux=aux)
+    metas.append({
+        "kind": "answer",
+        "rule_id": "answer",
+        "pred": problem.goal[0],
+        "head": str(problem.answer),
+        "body": [],
+        "start": answer_start,
+        "end": len(toks),
+        "depth_index": None,
+    })
+    return Example(tokens=toks, aux=aux, meta={"lines": metas})
 
 
 def render_extraction_example(problem, templates, question, rng=None):
@@ -281,3 +350,48 @@ def pack_batch(seqs, block, batch, pad, rng):
             sup += [(r, o + p, o + c) for p, c in aux if o + p < block]
             o += len(ids)
     return x, sup
+
+
+def build_rule_vocab(examples, kinds=("think", "check")):
+    """Stable rule/action label map from rendered trace metadata."""
+    labels = set()
+    for ex in examples:
+        for m in ex.meta.get("lines", []):
+            if m.get("kind") in kinds:
+                labels.add(m["rule_id"])
+    return {r: i for i, r in enumerate(sorted(labels))}
+
+
+def pack_batch_with_meta(seqs, block, batch, pad, rng, rule_stoi=None,
+                         kinds=("think", "check")):
+    """Pack examples plus optional rule labels and line spans.
+
+    seqs entries are (ids, aux, meta). rule_targets is aligned to model input positions
+    x[:, :-1], therefore its second dimension is `block`.
+    """
+    x = torch.full((batch, block + 1), pad, dtype=torch.long)
+    sup, spans = [], []
+    rule_targets = torch.full((batch, block), -100, dtype=torch.long) if rule_stoi else None
+    kinds = set(kinds)
+    for r in range(batch):
+        o = 0
+        while True:
+            ids, aux, meta = seqs[int(rng.integers(0, len(seqs)))]
+            if o + len(ids) > block + 1:
+                break
+            x[r, o:o + len(ids)] = torch.tensor(ids)
+            sup += [(r, o + p, o + c) for p, c in aux if o + p < block]
+            if rule_stoi:
+                for m in meta.get("lines", []):
+                    rid = m.get("rule_id")
+                    if m.get("kind") not in kinds or rid not in rule_stoi:
+                        continue
+                    s, e = o + int(m["start"]), min(o + int(m["end"]), block)
+                    if e <= s or s >= block:
+                        continue
+                    s = max(0, s)
+                    label = rule_stoi[rid]
+                    rule_targets[r, s:e] = label
+                    spans.append((r, s, e, label))
+            o += len(ids)
+    return x, sup, rule_targets, spans
