@@ -349,6 +349,107 @@ class LatentCrossDiTFlowNet(nn.Module):
         return v.transpose(1, 2).reshape(b, c, h, w)
 
 
+class MMDiTBlock(nn.Module):
+    """Tiny dual-stream block with separate image/text projections and joint attention."""
+
+    def __init__(self, hidden=96, heads=4):
+        super().__init__()
+        if hidden % heads:
+            raise ValueError(f"hidden={hidden} must be divisible by heads={heads}")
+        self.heads = int(heads)
+        self.head_dim = hidden // heads
+        self.scale = self.head_dim ** -0.5
+        self.img_norm = nn.LayerNorm(hidden)
+        self.ctx_norm = nn.LayerNorm(hidden)
+        self.img_qkv = nn.Linear(hidden, hidden * 3)
+        self.ctx_qkv = nn.Linear(hidden, hidden * 3)
+        self.img_out = nn.Linear(hidden, hidden)
+        self.ctx_out = nn.Linear(hidden, hidden)
+        self.img_ff_norm = nn.LayerNorm(hidden)
+        self.ctx_ff_norm = nn.LayerNorm(hidden)
+        self.img_ff = nn.Sequential(nn.Linear(hidden, hidden * 4), nn.GELU(),
+                                    nn.Linear(hidden * 4, hidden))
+        self.ctx_ff = nn.Sequential(nn.Linear(hidden, hidden * 4), nn.GELU(),
+                                    nn.Linear(hidden * 4, hidden))
+
+    def _qkv(self, proj, x):
+        b, n, h = x.shape
+        q, k, v = proj(x).view(b, n, 3, self.heads, self.head_dim).unbind(dim=2)
+        return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+    def forward(self, img, ctx, ctx_mask=None):
+        b, n_img, h = img.shape
+        n_ctx = ctx.shape[1]
+        qi, ki, vi = self._qkv(self.img_qkv, self.img_norm(img))
+        qc, kc, vc = self._qkv(self.ctx_qkv, self.ctx_norm(ctx))
+        q = torch.cat([qi, qc], dim=2)
+        k = torch.cat([ki, kc], dim=2)
+        v = torch.cat([vi, vc], dim=2)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        if ctx_mask is not None:
+            img_mask = torch.zeros((b, n_img), dtype=torch.bool, device=ctx_mask.device)
+            key_mask = torch.cat([img_mask, ctx_mask], dim=1)
+            attn = attn.masked_fill(key_mask[:, None, None, :], torch.finfo(attn.dtype).min)
+        mixed = torch.softmax(attn, dim=-1).matmul(v).transpose(1, 2).reshape(b, n_img + n_ctx, h)
+        img_delta, ctx_delta = mixed[:, :n_img], mixed[:, n_img:]
+        img = img + self.img_out(img_delta)
+        ctx = ctx + self.ctx_out(ctx_delta)
+        img = img + self.img_ff(self.img_ff_norm(img))
+        ctx = ctx + self.ctx_ff(self.ctx_ff_norm(ctx))
+        if ctx_mask is not None:
+            ctx = ctx.masked_fill(ctx_mask[:, :, None], 0.0)
+        return img, ctx
+
+
+class LatentMMDiTFlowNet(nn.Module):
+    """Toy MM-DiT latent flow with bidirectional image/condition token mixing."""
+
+    uses_cond_tokens = True
+
+    def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
+                 max_tokens=256):
+        super().__init__()
+        cond_dim = cond_dim or len(FACT_VOCAB)
+        self.latent_ch = int(latent_ch)
+        self.hidden = int(hidden)
+        self.max_tokens = int(max_tokens)
+        self.in_proj = nn.Linear(latent_ch, hidden)
+        self.pos = nn.Parameter(torch.zeros(1, max_tokens, hidden))
+        self.time = nn.Sequential(nn.Linear(cond_dim + 1, hidden), nn.GELU(),
+                                  nn.Linear(hidden, hidden))
+        self.ctx_proj = nn.Linear(cond_dim, hidden)
+        self.blocks = nn.ModuleList([MMDiTBlock(hidden, heads) for _ in range(depth)])
+        self.norm = nn.LayerNorm(hidden)
+        self.out_proj = nn.Linear(hidden, latent_ch)
+
+    def _context(self, cond):
+        if isinstance(cond, dict):
+            tokens = cond["tokens"]
+            mask = cond.get("mask")
+        else:
+            tokens = cond[:, None, :]
+            mask = None
+        return self.ctx_proj(tokens), mask
+
+    def forward(self, z, t, cond):
+        cond_vec = condition_vector(cond)
+        if t.ndim > 2:
+            t = t.flatten(1)[:, :1]
+        elif t.ndim == 1:
+            t = t[:, None]
+        b, c, h, w = z.shape
+        n = h * w
+        if n > self.max_tokens:
+            raise ValueError(f"latent token count {n} exceeds max_tokens={self.max_tokens}")
+        img = self.in_proj(z.flatten(2).transpose(1, 2)) + self.pos[:, :n]
+        img = img + self.time(torch.cat([cond_vec, t.to(cond_vec.dtype)], dim=1))[:, None, :]
+        ctx, ctx_mask = self._context(cond)
+        for block in self.blocks:
+            img, ctx = block(img, ctx, ctx_mask=ctx_mask)
+        v = self.out_proj(self.norm(img))
+        return v.transpose(1, 2).reshape(b, c, h, w)
+
+
 def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4, cond_dim=None):
     if flow_arch == "conv":
         return LatentFlowNet(latent_ch=latent_ch, hidden=hidden, cond_dim=cond_dim)
@@ -364,6 +465,12 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
             heads -= 1
         return LatentCrossDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth,
                                      heads=heads, cond_dim=cond_dim)
+    if flow_arch == "mmdit":
+        heads = max(1, min(dit_heads, hidden // 16))
+        while hidden % heads:
+            heads -= 1
+        return LatentMMDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth,
+                                  heads=heads, cond_dim=cond_dim)
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
@@ -704,8 +811,8 @@ def load_checkpoint(path, device=DEV):
         "latent_ch": latent_ch,
         "hidden": hidden,
         "flow_arch": flow_arch,
-        "dit_depth": dit_depth if flow_arch in ("dit", "crossdit") else 0,
-        "dit_heads": dit_heads if flow_arch in ("dit", "crossdit") else 0,
+        "dit_depth": dit_depth if flow_arch in ("dit", "crossdit", "mmdit") else 0,
+        "dit_heads": dit_heads if flow_arch in ("dit", "crossdit", "mmdit") else 0,
         "cond_mode": cond_mode,
         "cond_dim": cond_dim,
     }
@@ -879,8 +986,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "latent_ch": int(latent_ch),
         "hidden": int(hidden),
         "flow_arch": flow_arch,
-        "dit_depth": int(dit_depth) if flow_arch in ("dit", "crossdit") else 0,
-        "dit_heads": int(dit_heads) if flow_arch in ("dit", "crossdit") else 0,
+        "dit_depth": int(dit_depth) if flow_arch in ("dit", "crossdit", "mmdit") else 0,
+        "dit_heads": int(dit_heads) if flow_arch in ("dit", "crossdit", "mmdit") else 0,
         "fact_w": float(fact_w),
         "cond_drop": float(cond_drop),
         "flow_semantic_w": float(flow_semantic_w),
@@ -949,6 +1056,16 @@ def selftest():
                                 batch=2, seed=6, device="cpu", cond_mode="text",
                                 conditioner=conditioner4, prompt_vocab=vocab4)
     assert len(cross_sweep) == 1 and cross_sweep[0]["cond_mode"] == "text"
+    ae5, flow5, conditioner5, vocab5, report5 = train_latent_flow(
+        ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="mmdit",
+        dit_depth=1, dit_heads=2, seed=7, device="cpu", cond_mode="text",
+        text_cond_dim=8, sample_steps=1, time_sampling="logit-normal",
+        return_conditioner=True)
+    assert report5["flow_arch"] == "mmdit" and flow_uses_cond_tokens(flow5)
+    mm_sweep = sampler_sweep(ae5, flow5, cfg_scales=(1.0,), sample_steps_list=(1,), n=4,
+                             batch=2, seed=8, device="cpu", cond_mode="text",
+                             conditioner=conditioner5, prompt_vocab=vocab5)
+    assert len(mm_sweep) == 1 and mm_sweep[0]["cond_mode"] == "text"
     print("image_latent selftest OK")
 
 
@@ -965,7 +1082,7 @@ def main(argv=None):
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--fact-w", type=float, default=1.0, dest="fact_w")
-    ap.add_argument("--flow-arch", default="conv", choices=("conv", "dit", "crossdit"),
+    ap.add_argument("--flow-arch", default="conv", choices=("conv", "dit", "crossdit", "mmdit"),
                     dest="flow_arch")
     ap.add_argument("--dit-depth", type=int, default=3, dest="dit_depth")
     ap.add_argument("--dit-heads", type=int, default=4, dest="dit_heads")

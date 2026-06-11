@@ -342,7 +342,8 @@ def main():
                     help="train the tiny fact-conditioned rectified-flow image generator")
     ap.add_argument("--image-latent", action="store_true", dest="image_latent",
                     help="IMAGE-3: train semantic autoencoder + latent image flow")
-    ap.add_argument("--image-latent-arch", default="conv", choices=("conv", "dit", "crossdit"),
+    ap.add_argument("--image-latent-arch", default="conv",
+                    choices=("conv", "dit", "crossdit", "mmdit"),
                     dest="image_latent_arch", help="latent velocity architecture")
     ap.add_argument("--image-cond-mode", default="facts", choices=("facts", "text"),
                     dest="image_cond_mode",

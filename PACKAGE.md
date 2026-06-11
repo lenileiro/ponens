@@ -148,10 +148,10 @@ python -m thinking.image_latent --train --ae-steps 400 --flow-steps 400 \
 python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-steps 400 \
     --cond-drop 0.1 --cfg-scale 1.5 --sample-steps 8 --flow-semantic-w 0.25 \
     --out runs/image_latent_dit.pt
-python -m thinking.image_latent --train --cond-mode text --flow-arch crossdit \
+python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --ae-steps 400 --flow-steps 400 --cond-drop 0.1 --cfg-scale 1.5 \
     --sample-steps 8 --flow-semantic-w 0.25 --time-sampling logit-normal \
-    --out runs/image_latent_crossdit_text.pt
+    --out runs/image_latent_mmdit_text.pt
 python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
     --eval-seeds 1,2,3 --roundtrip-samples 2 --eval-out runs/image_latent_dit_sweep.json
@@ -162,7 +162,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --vision-arch bottl
     --image-cond-drop 0.1 --image-cfg-scale 1.5 --image-sample-steps 8 \
     --image-flow-semantic-w 0.25 --image-eval-sweep \
     --audio --multimodal --fast --go
-RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-latent-arch crossdit \
+RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-latent-arch mmdit \
     --image-cond-mode text --image-cond-drop 0.1 --image-cfg-scale 1.5 \
     --image-sample-steps 8 --image-flow-semantic-w 0.25 \
     --image-time-sampling logit-normal --image-eval-sweep --fast --go
@@ -288,6 +288,11 @@ Image-10 adds paper-aligned timestep sampling for rectified-flow training: `--ti
 logit-normal` biases interpolation times toward intermediate noise scales while keeping `uniform`
 available as the baseline. The report records the sampled time mean/std in `last_flow`, so GPU
 sweeps can compare schedule effects against sampler/CFG effects.
+
+Image-11 adds `--flow-arch mmdit`: a tiny dual-stream multimodal DiT flow with separate image and
+condition-token projections, joint attention, and modality-specific feed-forwards. Unlike the
+one-way `crossdit` scaffold, prompt/fact tokens can also absorb image-token state inside each block,
+matching the bidirectional multimodal token-mixing direction of modern rectified-flow T2I systems.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
