@@ -372,8 +372,11 @@ class MMDiTBlock(nn.Module):
         self.ctx_ff = nn.Sequential(nn.Linear(hidden, hidden * 4), nn.GELU(),
                                     nn.Linear(hidden * 4, hidden))
         self.ada = nn.Sequential(nn.SiLU(), nn.Linear(hidden, hidden * 8))
+        self.gate = nn.Sequential(nn.SiLU(), nn.Linear(hidden, hidden * 4))
         nn.init.zeros_(self.ada[-1].weight)
         nn.init.zeros_(self.ada[-1].bias)
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.zeros_(self.gate[-1].bias)
 
     def _qkv(self, proj, x):
         b, n, h = x.shape
@@ -390,6 +393,8 @@ class MMDiTBlock(nn.Module):
         (img_attn_shift, img_attn_scale, ctx_attn_shift, ctx_attn_scale,
          img_ff_shift, img_ff_scale, ctx_ff_shift, ctx_ff_scale) = self.ada(cond_ctx).chunk(
              8, dim=-1)
+        img_attn_gate, ctx_attn_gate, img_ff_gate, ctx_ff_gate = self.gate(cond_ctx).chunk(
+            4, dim=-1)
         img_attn = self._modulate(self.img_norm(img), img_attn_shift, img_attn_scale)
         ctx_attn = self._modulate(self.ctx_norm(ctx), ctx_attn_shift, ctx_attn_scale)
         qi, ki, vi = self._qkv(self.img_qkv, img_attn)
@@ -404,12 +409,12 @@ class MMDiTBlock(nn.Module):
             attn = attn.masked_fill(key_mask[:, None, None, :], torch.finfo(attn.dtype).min)
         mixed = torch.softmax(attn, dim=-1).matmul(v).transpose(1, 2).reshape(b, n_img + n_ctx, h)
         img_delta, ctx_delta = mixed[:, :n_img], mixed[:, n_img:]
-        img = img + self.img_out(img_delta)
-        ctx = ctx + self.ctx_out(ctx_delta)
+        img = img + (1.0 + img_attn_gate[:, None, :]) * self.img_out(img_delta)
+        ctx = ctx + (1.0 + ctx_attn_gate[:, None, :]) * self.ctx_out(ctx_delta)
         img_ff = self._modulate(self.img_ff_norm(img), img_ff_shift, img_ff_scale)
         ctx_ff = self._modulate(self.ctx_ff_norm(ctx), ctx_ff_shift, ctx_ff_scale)
-        img = img + self.img_ff(img_ff)
-        ctx = ctx + self.ctx_ff(ctx_ff)
+        img = img + (1.0 + img_ff_gate[:, None, :]) * self.img_ff(img_ff)
+        ctx = ctx + (1.0 + ctx_ff_gate[:, None, :]) * self.ctx_ff(ctx_ff)
         if ctx_mask is not None:
             ctx = ctx.masked_fill(ctx_mask[:, :, None], 0.0)
         return img, ctx
@@ -420,6 +425,7 @@ class LatentMMDiTFlowNet(nn.Module):
 
     uses_cond_tokens = True
     uses_adaptive_modulation = True
+    uses_residual_gating = True
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256):
@@ -793,6 +799,17 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
     return report
 
 
+def load_flow_state(flow, state_dict):
+    missing, unexpected = flow.load_state_dict(state_dict, strict=False)
+    tolerated_missing = [k for k in missing if ".gate." in k]
+    bad_missing = sorted(set(missing) - set(tolerated_missing))
+    if bad_missing or unexpected:
+        raise RuntimeError(
+            f"flow checkpoint mismatch: missing={bad_missing}, unexpected={list(unexpected)}"
+        )
+    return {"missing": list(missing), "tolerated_missing": tolerated_missing}
+
+
 def load_checkpoint(path, device=DEV):
     ckpt = torch.load(path, map_location=device)
     report = ckpt.get("report", {})
@@ -818,7 +835,7 @@ def load_checkpoint(path, device=DEV):
     flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
                      dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim).to(device)
     ae.load_state_dict(ckpt["autoencoder_state_dict"])
-    flow.load_state_dict(ckpt["flow_state_dict"])
+    flow_load = load_flow_state(flow, ckpt["flow_state_dict"])
     ae.eval()
     flow.eval()
     return ae, flow, conditioner, prompt_vocab, prompt_templates, {
@@ -830,6 +847,8 @@ def load_checkpoint(path, device=DEV):
         "dit_depth": dit_depth if flow_arch in ("dit", "crossdit", "mmdit") else 0,
         "dit_heads": dit_heads if flow_arch in ("dit", "crossdit", "mmdit") else 0,
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
+        "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
+        "flow_load": flow_load,
         "cond_mode": cond_mode,
         "cond_dim": cond_dim,
     }
@@ -1006,6 +1025,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "dit_depth": int(dit_depth) if flow_arch in ("dit", "crossdit", "mmdit") else 0,
         "dit_heads": int(dit_heads) if flow_arch in ("dit", "crossdit", "mmdit") else 0,
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
+        "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "fact_w": float(fact_w),
         "cond_drop": float(cond_drop),
         "flow_semantic_w": float(flow_semantic_w),
@@ -1081,6 +1101,13 @@ def selftest():
         return_conditioner=True)
     assert report5["flow_arch"] == "mmdit" and flow_uses_cond_tokens(flow5)
     assert report5["adaptive_modulation"] is True
+    assert report5["residual_gating"] is True
+    legacy_state = {k: v for k, v in flow5.state_dict().items() if ".gate." not in k}
+    compat_flow = make_flow(flow_arch="mmdit", latent_ch=4, hidden=32, dit_depth=1,
+                            dit_heads=2, cond_dim=8)
+    compat_load = load_flow_state(compat_flow, legacy_state)
+    assert compat_load["tolerated_missing"] and all(
+        ".gate." in k for k in compat_load["tolerated_missing"])
     mm_sweep = sampler_sweep(ae5, flow5, cfg_scales=(1.0,), sample_steps_list=(1,), n=4,
                              batch=2, seed=8, device="cpu", cond_mode="text",
                              conditioner=conditioner5, prompt_vocab=vocab5)

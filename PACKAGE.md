@@ -299,6 +299,10 @@ modulates the attention and feed-forward normalizations for both image and condi
 adapter is zero-initialized, so it starts as the previous MM-DiT block and learns stronger
 conditioning without destabilizing checkpoint-smoke training.
 
+Image-13 adds AdaLN-style residual gates to the adaptive MM-DiT branches. Attention and feed-forward
+updates in both streams now have condition-dependent gates, and old MM-DiT checkpoints without gate
+weights are tolerated by the loader with zero-initialized identity-centered gates.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
