@@ -262,6 +262,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-sample-steps 8 --image-flow-semantic-w 0.25 \
     --image-time-sampling logit-normal --image-flow-ema-decay 0.999 \
     --image-latent-normalize channel --image-latent-stat-samples 1024 \
+    --image-cfg-interval 0.0,0.8 --image-semantic-guidance-interval 0.0,0.75 \
     --image-ae-intervention-w 0.1 --image-ae-factor-orth-w 0.05 \
     --image-semantic-guidance-w 2.0 --image-semantic-guidance-sweep 0.0,1.0,2.0 \
     --image-sample-methods euler,heun \
@@ -490,6 +491,12 @@ coordinates while semantic losses, guidance, decoding, and visual grids still op
 latent space. This is a generic scale fix for semantically rich/high-dimensional latents: it
 stabilizes coordinate scale without hard-coding visual factors or renderer rules, and old
 checkpoints default to `none`.
+
+Image-27 adds guidance intervals (`--cfg-interval`, `--semantic-guidance-interval`; RunPod:
+`--image-cfg-interval`, `--image-semantic-guidance-interval`). CFG and semantic AE guidance can
+now be active over selected rectified-flow time ranges while defaults preserve old always-on
+behavior. This follows the REPA/guidance-interval direction: guidance becomes a measured sampler
+schedule rather than a hard-coded every-step push, and it stays generic over conditions.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
