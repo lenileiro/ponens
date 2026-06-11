@@ -50,6 +50,14 @@ def payload(args):
     tokens through the 8-loop model, so n is small there)."""
     PY = ("python3 -u -m thinking.cli" if args.fast
           else "/root/fer-venv/bin/python -u -m thinking.cli")
+    trace_rank = (
+        (f" --trace-rank-w {args.trace_rank_w}" if args.trace_rank_w else "") +
+        (f" --trace-rank-batch {args.trace_rank_batch}" if args.trace_rank_batch else "") +
+        (f" --trace-rank-candidates {args.trace_rank_candidates}"
+         if args.trace_rank_candidates else "") +
+        (f" --trace-rank-states {args.trace_rank_states}" if args.trace_rank_states else "") +
+        (f" --trace-dagger-frac {args.trace_dagger_frac}"
+         if args.trace_dagger_frac is not None else ""))
     cmds = []
     if args.ablate:
         cmds.append(f"{PY} ablate --steps 800")
@@ -89,7 +97,7 @@ def payload(args):
                          f"--deep-depth {args.deep_depth} --deep-preds ancestor "
                          f"--deep-frac {args.deep_frac} --dim {args.dim or 256} "
                          f"--steps {steps} --examples {args.examples} --batch {args.batch} "
-                         f"--rule-w {rw} --rule-contrast-w {rcw} --out {run}")
+                         f"--rule-w {rw} --rule-contrast-w {rcw}{trace_rank} --out {run}")
                 evals = []
                 for decode in args.eval_decodes:
                     out = f"{run}/deep_eval_{decode}.json"
@@ -145,7 +153,7 @@ def payload(args):
                  f"--deep-frac {args.deep_frac} --dim {args.dim or 256} "
                  f"--steps {args.train_steps or 8000} --examples {args.examples} "
                  f"--batch {args.batch} --rule-w {args.rule_w} "
-                 f"--rule-contrast-w {args.rule_contrast_w} --out {run}")
+                 f"--rule-contrast-w {args.rule_contrast_w}{trace_rank} --out {run}")
         depths = ",".join(str(d) for d in args.eval_depths)
         return " && ".join([
             train,
@@ -180,6 +188,7 @@ def payload(args):
         return (f"{PY} train --world {args.stair_world}{simple}{canon} --out {run} --seed 0 "
                 f"--batch {sbatch} --steps {args.train_steps or 4000}"
                 + (f" --dim {args.dim}" if args.dim else "")
+                + trace_rank
                 + " && { " + evals + "; }")
     neg = " --neg" if args.neg else ""
     loops = f" --loops {args.loops}" if args.loops else ""
@@ -189,7 +198,8 @@ def payload(args):
     for s in args.seeds.split(","):
         run = f"runs/kin_s{s}"
         cmds.append(f"{PY} train --world kinship --deep-depth {args.deep_depth} --out {run} "
-                    f"--seed {s} --batch {args.batch}{steps}{loops}{noloop}{neg}")
+                    f"--seed {s} --batch {args.batch}{steps}{loops}{noloop}{neg}"
+                    f"{trace_rank}")
         if args.fast:
             d = args.deep_depth
             cmds += [
@@ -267,6 +277,16 @@ def main():
     ap.add_argument("--deep-frac", type=float, default=0.6, dest="deep_frac")
     ap.add_argument("--rule-w", type=float, default=0.1, dest="rule_w")
     ap.add_argument("--rule-contrast-w", type=float, default=0.05, dest="rule_contrast_w")
+    ap.add_argument("--trace-rank-w", type=float, default=0.0, dest="trace_rank_w",
+                    help="next verifier-action ranking loss weight")
+    ap.add_argument("--trace-rank-batch", type=int, default=0, dest="trace_rank_batch",
+                    help="ranking states per optimizer step")
+    ap.add_argument("--trace-rank-candidates", type=int, default=0,
+                    dest="trace_rank_candidates", help="candidate cap for rank loss/decode")
+    ap.add_argument("--trace-rank-states", type=int, default=0, dest="trace_rank_states",
+                    help="max support/on-policy steps before a rank target")
+    ap.add_argument("--trace-dagger-frac", type=float, default=None, dest="trace_dagger_frac",
+                    help="fraction of rank states reached by model-ranked rollout")
     ap.add_argument("--eval-depths", default="4,8,16,30,64",
                     help="comma-separated depths for deep-eval/probe in rule-aux mode")
     ap.add_argument("--eval-n", type=int, default=20)
@@ -283,7 +303,7 @@ def main():
         args.curve_steps = [int(x.strip()) for x in args.curve_steps.split(",") if x.strip()]
     if isinstance(args.curve_arms, str):
         args.curve_arms = [x.strip() for x in args.curve_arms.split(",") if x.strip()]
-    bad_decodes = sorted(set(args.eval_decodes) - {"sample", "hybrid", "constrained"})
+    bad_decodes = sorted(set(args.eval_decodes) - {"sample", "hybrid", "constrained", "ranker"})
     if bad_decodes:
         sys.exit(f"ERROR: unsupported --eval-decodes values: {','.join(bad_decodes)}")
     bad_arms = sorted(set(args.curve_arms) - {"aux", "noaux"})

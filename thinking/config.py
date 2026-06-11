@@ -61,6 +61,11 @@ class Config:
     rule_w: float = 0.0               # auxiliary classifier on proof-line rule/action labels
     rule_contrast_w: float = 0.0      # supervised contrastive alignment for same-rule line states
     rule_contrast_temp: float = 0.1
+    trace_rank_w: float = 0.0         # rank the next verifier action among legal candidates
+    trace_rank_batch: int = 2         # ranking states sampled per optimizer step when enabled
+    trace_rank_candidates: int = 64   # cap legal action candidates; oracle action is retained
+    trace_rank_states: int = 3        # max gold/on-policy steps before a sampled rank target
+    trace_dagger_frac: float = 0.0    # fraction of rank states reached by model-ranked rollout
     halt_w: float = 0.5               # weight on the Ouro-style expected-halt loss (looped models)
     ent_w: float = 0.01               # entropy bonus on the halting distribution
     n_examples: int = 6000

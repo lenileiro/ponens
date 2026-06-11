@@ -322,6 +322,12 @@ def cmd_selftest(_args):
     rr = rt.run_goal(kp2, TEMPLATES, QUESTION, rng=_np0.random.default_rng(7), decode="masked")
     assert rr.n_resampled == 0, "masked repair replaces the resample loop"
     assert all(s in ("ok", "masked", "answer", "repair") for _, s in rr.lines), rr.lines
+    # ranked action decode: the model may choose irrelevant legal actions, but syntax and local
+    # verifier validity are deterministic, and oracle candidate ranks are recorded.
+    rr = rt.run_goal(kp2, TEMPLATES, QUESTION, rng=_np0.random.default_rng(7), decode="ranker")
+    assert rr.n_resampled == 0, "ranker must not use text resampling"
+    assert rr.rank_positions, "ranker should record oracle next-step ranks"
+    assert all(s in ("ranked", "answer", "repair") for _, s in rr.lines), rr.lines
     print("selftest OK")
 
 
@@ -406,6 +412,16 @@ def cmd_train(args):
         cfg.rule_contrast_w = args.rule_contrast_w
     if args.rule_contrast_temp:
         cfg.rule_contrast_temp = args.rule_contrast_temp
+    if args.trace_rank_w:
+        cfg.trace_rank_w = args.trace_rank_w
+    if args.trace_rank_batch:
+        cfg.trace_rank_batch = args.trace_rank_batch
+    if args.trace_rank_candidates:
+        cfg.trace_rank_candidates = args.trace_rank_candidates
+    if args.trace_rank_states:
+        cfg.trace_rank_states = args.trace_rank_states
+    if args.trace_dagger_frac is not None:
+        cfg.trace_dagger_frac = args.trace_dagger_frac
     cfg.deep_preds = tuple(p.strip() for p in args.deep_preds.split(",") if p.strip()) \
         if args.deep_preds else ()
     if args.pos:
@@ -583,6 +599,16 @@ def main(argv=None):
                    help="same-rule contrastive alignment weight")
     p.add_argument("--rule-contrast-temp", type=float, default=0.1,
                    dest="rule_contrast_temp", help="contrastive temperature override")
+    p.add_argument("--trace-rank-w", type=float, default=0.0, dest="trace_rank_w",
+                   help="next verifier-action ranking loss weight")
+    p.add_argument("--trace-rank-batch", type=int, default=0, dest="trace_rank_batch",
+                   help="ranking states per optimizer step")
+    p.add_argument("--trace-rank-candidates", type=int, default=0,
+                   dest="trace_rank_candidates", help="candidate cap for rank loss/decode")
+    p.add_argument("--trace-rank-states", type=int, default=0, dest="trace_rank_states",
+                   help="max support/on-policy steps before a rank target")
+    p.add_argument("--trace-dagger-frac", type=float, default=None, dest="trace_dagger_frac",
+                   help="fraction of rank states reached by model-ranked rollout")
     p.add_argument("--deep-preds", default="", dest="deep_preds",
                    help="restrict DEEP-regime query types, e.g. ancestor or ancestor,older_by")
     p.add_argument("--pos", choices=("rope", "none"), help="position mode (none = NoPE)")
@@ -615,10 +641,12 @@ def main(argv=None):
     p.add_argument("--preds", default="ancestor",
                    help="restrict deep query types, e.g. ancestor or ancestor,older_by")
     p.add_argument("--mode", default="verified", choices=("free", "verified"))
-    p.add_argument("--decode", default="sample", choices=("sample", "hybrid", "constrained"),
+    p.add_argument("--decode", default="sample",
+                   choices=("sample", "hybrid", "constrained", "ranker"),
                    help="sample = token generation with verifier retries; constrained = follow "
-                        "the generic checker frontier when available; hybrid = sample until "
-                        "the verifier stalls, then switch to that generic frontier")
+                        "the generic checker frontier when available; ranker = model-rank legal "
+                        "verifier actions; hybrid = sample until the verifier stalls, then "
+                        "switch to that generic frontier")
     p.add_argument("--block", type=int, default=0, help="eval context override")
     p.add_argument("--phrasings", default="train", choices=("train", "eval"))
     p.add_argument("--train-names", action="store_true", dest="train_names",

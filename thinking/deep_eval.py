@@ -49,6 +49,28 @@ def _line_tokens(lines):
     return sum((len(words) if words else 0) + 1 for words, _status in lines)
 
 
+def _rank_metrics(result):
+    ranks = list(getattr(result, "rank_positions", []) or [])
+    counts = list(getattr(result, "rank_candidate_counts", []) or [])
+    if not ranks:
+        return {
+            "rank_steps": 0,
+            "candidate_top1": None,
+            "candidate_top5": None,
+            "candidate_mrr": None,
+            "avg_candidates": None,
+            "oracle_missing": int(getattr(result, "rank_oracle_missing", 0) or 0),
+        }
+    return {
+        "rank_steps": len(ranks),
+        "candidate_top1": sum(r == 1 for r in ranks) / len(ranks),
+        "candidate_top5": sum(r <= 5 for r in ranks) / len(ranks),
+        "candidate_mrr": sum(1.0 / r for r in ranks) / len(ranks),
+        "avg_candidates": (sum(counts) / len(counts)) if counts else None,
+        "oracle_missing": int(getattr(result, "rank_oracle_missing", 0) or 0),
+    }
+
+
 def deep_eval(runtime, trainer, depths=(4, 8, 16, 32, 64), n=None, preds=("ancestor",),
               mode="verified", phrasings="train", lang_level=None, entities=None,
               train_names=False, decode="sample"):
@@ -110,6 +132,7 @@ def deep_eval(runtime, trainer, depths=(4, 8, 16, 32, 64), n=None, preds=("ances
                 decode=decode)
             elapsed = time.perf_counter() - t0
             first_bad = _first_bad(result.lines)
+            rankm = _rank_metrics(result)
             rows.append({
                 "correct": result.answer == problem.answer,
                 "answer": result.answer,
@@ -122,6 +145,7 @@ def deep_eval(runtime, trainer, depths=(4, 8, 16, 32, 64), n=None, preds=("ances
                 "n_tokens": _line_tokens(result.lines),
                 "latency_ms": elapsed * 1000.0,
                 "statuses": _status_counts(result.lines),
+                **rankm,
             })
 
         done = len(rows)
@@ -139,6 +163,12 @@ def deep_eval(runtime, trainer, depths=(4, 8, 16, 32, 64), n=None, preds=("ances
                 "first_invalid_mean": None,
                 "first_invalid_hist": {},
                 "status_counts": {},
+                "rank_steps_per_ex": 0.0,
+                "candidate_top1": None,
+                "candidate_top5": None,
+                "candidate_mrr": None,
+                "avg_candidates": None,
+                "oracle_missing_per_ex": 0.0,
             }
             continue
 
@@ -147,6 +177,8 @@ def deep_eval(runtime, trainer, depths=(4, 8, 16, 32, 64), n=None, preds=("ances
         statuses = Counter()
         for r in rows:
             statuses.update(r["statuses"])
+        rank_rows = [r for r in rows if r["rank_steps"]]
+        rank_steps = sum(r["rank_steps"] for r in rows)
         report["by_depth"][str(depth)] = {
             "n": int(done),
             "skipped": int(skipped),
@@ -160,6 +192,20 @@ def deep_eval(runtime, trainer, depths=(4, 8, 16, 32, 64), n=None, preds=("ances
             "first_invalid_mean": (sum(firsts) / len(firsts)) if firsts else None,
             "first_invalid_hist": {k: int(v) for k, v in sorted(first_hist.items())},
             "status_counts": {k: int(statuses[k]) for k in sorted(statuses)},
+            "rank_steps_per_ex": rank_steps / done,
+            "candidate_top1": (
+                sum(r["candidate_top1"] * r["rank_steps"] for r in rank_rows) / rank_steps
+                if rank_steps else None),
+            "candidate_top5": (
+                sum(r["candidate_top5"] * r["rank_steps"] for r in rank_rows) / rank_steps
+                if rank_steps else None),
+            "candidate_mrr": (
+                sum(r["candidate_mrr"] * r["rank_steps"] for r in rank_rows) / rank_steps
+                if rank_steps else None),
+            "avg_candidates": (
+                sum(r["avg_candidates"] * r["rank_steps"] for r in rank_rows) / rank_steps
+                if rank_steps else None),
+            "oracle_missing_per_ex": sum(r["oracle_missing"] for r in rows) / done,
         }
     return report
 

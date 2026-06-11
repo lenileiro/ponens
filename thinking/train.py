@@ -64,6 +64,41 @@ def _rule_contrastive_loss(hidden, spans, temp=0.1):
     return per_anchor[has_pos].mean()
 
 
+def _model_logits(model, x):
+    out = model(x)
+    return out[0] if isinstance(out, tuple) else out
+
+
+def _candidate_line_score(model, vocab, cfg, prefix_ids, words):
+    """Differentiable normalized log-probability of one rendered action line."""
+    dot = vocab.stoi["."]
+    cand = vocab.enc(words) + [dot]
+    seq = list(prefix_ids) + cand
+    begin = max(0, len(seq) - (cfg.block + 1))
+    window = seq[begin:]
+    if len(window) < 2:
+        return None
+    x = torch.tensor([window[:-1]], device=DEV)
+    logits = _model_logits(model, x)[0].float()
+    pieces = []
+    start = len(prefix_ids)
+    for orig in range(start, len(seq)):
+        wi = orig - begin
+        if 1 <= wi < len(window):
+            pieces.append(torch.log_softmax(logits[wi - 1], -1)[window[wi]])
+    if not pieces:
+        return None
+    return torch.stack(pieces).mean()
+
+
+def _choice_key(step):
+    if step is None:
+        return None
+    if step[0] == "answer":
+        return ("answer", step[1])
+    return (step[0], step[1], tuple(step[2]))
+
+
 class Trainer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -185,6 +220,133 @@ class Trainer:
                                self.cfg, DEV)
         return FlowRuntime(m, vocab, StepChecker(RULES), self.cfg, DEV)
 
+    def _sample_trace_rank_problem(self, rng):
+        """Sample a QA problem for verifier-action ranking."""
+        cfg = self.cfg
+        if cfg.world != "kinship":
+            return None
+        from .kinship import surfaces
+        from .trace import render_prompt
+        from .world import anonymize
+        templates, question = surfaces(cfg.lang_level, "train")
+        deep = cfg.deep_depth and rng.random() < max(cfg.deep_frac, 0.0)
+        if deep:
+            k = 4 + int(rng.integers(max(1, cfg.deep_depth - 3)))
+            include = cfg.deep_preds or None
+        else:
+            k = cfg.train_hops[int(rng.integers(len(cfg.train_hops)))]
+            include = None
+        try:
+            problem, lines = self.world.sample(k, rng, include=include,
+                                               exclude=cfg.holdout_preds)
+        except (AssertionError, RuntimeError):
+            return None
+        if cfg.anonymize:
+            problem, lines = anonymize(problem, lines, rng)
+        prompt, _, _ = render_prompt(problem, templates, problem.question or question, rng)
+        return problem, prompt
+
+    def _trace_rank_item(self, model, vocab, runtime, rng):
+        """One prefix, candidate set, and oracle target for next-action ranking."""
+        cfg = self.cfg
+        sampled = self._sample_trace_rank_problem(rng)
+        if sampled is None:
+            return None
+        problem, prompt = sampled
+        if any(tok not in vocab.stoi for tok in prompt):
+            return None
+        dot = vocab.stoi["."]
+        ids = vocab.enc(prompt)
+        st = runtime.chk.new_state(problem.goal[1], problem.edb, goal_pred=problem.goal[0],
+                                   extra_rules=problem.extra_rules)
+        if runtime.chk.support_atoms(st) is None:
+            return None
+        plan = list(st.get("support_plan") or ())
+        if not plan:
+            return None
+
+        use_dagger = rng.random() < cfg.trace_dagger_frac
+        if use_dagger:
+            # Reach a training state through the model's current ranked policy.  The checker still
+            # supplies the oracle support frontier at that visited state.
+            steps = int(rng.integers(max(1, cfg.trace_rank_states)))
+            was_training = model.training
+            model.eval()
+            with torch.no_grad():
+                for _ in range(steps):
+                    ranked, _target = runtime._rank_goal_choices(
+                        st, ids, None, max_choices=cfg.trace_rank_candidates,
+                        goal_pruned=False, relevance_pruned=False)
+                    if not ranked:
+                        break
+                    _score, words, toks, _state, step = ranked[0]
+                    if step[0] == "answer" or not runtime.chk.step(st, *step):
+                        break
+                    ids += toks + [dot]
+            if was_training:
+                model.train()
+        else:
+            # Teacher-forced state sampling across the support plan.
+            upto = min(len(plan), max(1, cfg.trace_rank_states))
+            advance = int(rng.integers(upto))
+            from .trace import render_goal_line
+            for step in plan[:advance]:
+                if not runtime.chk.step(st, *step):
+                    return None
+                ids += vocab.enc(render_goal_line(*step)) + [dot]
+
+        target = runtime._target_goal_choice(st)
+        if target is None:
+            return None
+        choices = runtime._goal_choices(
+            st, target=target, max_choices=cfg.trace_rank_candidates,
+            goal_pruned=False, relevance_pruned=False)
+        if len(choices) < 2:
+            return None
+        target_key = _choice_key(target[1])
+        target_idx = None
+        kept = []
+        for words, step in choices:
+            if any(tok not in vocab.stoi for tok in words):
+                continue
+            idx = len(kept)
+            kept.append((words, step))
+            if _choice_key(step) == target_key:
+                target_idx = idx
+        if target_idx is None or len(kept) < 2:
+            return None
+        return ids, kept, target_idx
+
+    def _trace_rank_loss(self, model, vocab, rng):
+        cfg = self.cfg
+        if cfg.world != "kinship" or cfg.trace_rank_w <= 0 or cfg.trace_rank_batch <= 0:
+            return None
+        runtime = self.runtime(model, vocab)
+        losses = []
+        attempts = 0
+        while len(losses) < cfg.trace_rank_batch and attempts < cfg.trace_rank_batch * 8:
+            attempts += 1
+            item = self._trace_rank_item(model, vocab, runtime, rng)
+            if item is None:
+                continue
+            prefix, choices, target_idx = item
+            scores, live_target = [], None
+            for i, (words, _step) in enumerate(choices):
+                score = _candidate_line_score(model, vocab, cfg, prefix, words)
+                if score is None:
+                    continue
+                if i == target_idx:
+                    live_target = len(scores)
+                scores.append(score)
+            if live_target is None or len(scores) < 2:
+                continue
+            logits = torch.stack(scores)[None, :]
+            target = torch.tensor([live_target], device=DEV)
+            losses.append(F.cross_entropy(logits, target))
+        if not losses:
+            return None
+        return torch.stack(losses).mean()
+
     def build_model(self, vocab):
         set_seed(self.cfg.seed)
         m = ScratchpadLM(len(vocab), d=self.cfg.d, layers=self.cfg.layers, heads=self.cfg.heads,
@@ -295,6 +457,12 @@ class Trainer:
                     closs = _rule_contrastive_loss(hidden, spans, cfg.rule_contrast_temp)
                     if closs is not None:
                         loss = loss + cfg.rule_contrast_w * closs
+            if cfg.trace_rank_w > 0:
+                rank_amp = torch.autocast("cuda", torch.bfloat16) if DEV == "cuda" else _nullctx()
+                with rank_amp:
+                    rloss = self._trace_rank_loss(m, vocab, rng)
+                if rloss is not None:
+                    loss = loss + cfg.trace_rank_w * rloss
             opt.zero_grad()
             loss.backward()
             opt.step()

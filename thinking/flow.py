@@ -16,6 +16,9 @@ class FlowResult:
     n_resampled: int = 0
     rejected: list = field(default_factory=list)   # (prefix_ids, line_ids) labeled negatives
     causes: dict = field(default_factory=dict)     # rejection taxonomy: cause -> count
+    rank_positions: list = field(default_factory=list)       # 1-based oracle next-step ranks
+    rank_candidate_counts: list = field(default_factory=list)
+    rank_oracle_missing: int = 0
 
     def _blame(self, st, parsed):
         c = "syntax" if parsed is None else st.get("why", "unknown")
@@ -163,6 +166,74 @@ class FlowRuntime:
                 for i, (_toks, words, step) in enumerate(part):
                     scored.append((float(scores[i]), words, _toks[:-1], None, step))
         return scored
+
+    def _choice_key(self, step):
+        if step is None:
+            return None
+        typ = step[0]
+        if typ == "answer":
+            return ("answer", step[1])
+        return (typ, step[1], tuple(step[2]))
+
+    def _target_goal_choice(self, st):
+        """Oracle next action for ranking metrics/training, derived from the generic support plan."""
+        answers = self.chk.answer_candidates(st)
+        if answers:
+            return ["answer", answers[0]], ("answer", answers[0])
+        steps = self.chk.candidate_steps(st, goal_pruned=True, relevance_pruned=True)
+        if not steps:
+            return None
+        from .trace import render_goal_line
+        typ, head, body = steps[0]
+        return render_goal_line(typ, head, body), (typ, head, tuple(body))
+
+    def _goal_choices(self, st, target=None, preferred_kind=None, max_choices=None,
+                      goal_pruned=False, relevance_pruned=False):
+        """Renderable legal local proof actions.
+
+        The candidate source is the checker, not task-specific grammar.  `target` is optionally
+        forced into a capped candidate set so rank metrics/losses never drop the oracle label.
+        """
+        from .trace import render_goal_line
+        choices = [(["answer", ans], ("answer", ans)) for ans in self.chk.answer_candidates(st)]
+        steps = self.chk.candidate_steps(
+            st, goal_pruned=goal_pruned, relevance_pruned=relevance_pruned)
+        if preferred_kind in ("check", "think"):
+            narrowed = [s for s in steps if s[0] == preferred_kind]
+            if narrowed:
+                steps = narrowed
+        choices += [(render_goal_line(typ, head, body), (typ, head, tuple(body)))
+                    for typ, head, body in steps]
+        choices = [(w, s) for w, s in choices if all(tok in self.v.stoi for tok in w)]
+        if target is not None:
+            tw, ts = target
+            tkey = self._choice_key(ts)
+            if all(tok in self.v.stoi for tok in tw) and all(
+                    self._choice_key(s) != tkey for _w, s in choices):
+                choices.append((tw, ts))
+        if not max_choices or len(choices) <= max_choices:
+            return choices
+        tkey = self._choice_key(target[1]) if target is not None else None
+        kept, rest = [], []
+        for w, s in choices:
+            (kept if self._choice_key(s) == tkey else rest).append((w, s))
+        rest.sort(key=lambda ws: (
+            0 if ws[1][0] == "answer" else self.chk.candidate_rank(st, ws[1]),
+            ws[1][0], ws[1][1] if ws[1][0] == "answer" else ws[1][1],
+            () if ws[1][0] == "answer" else ws[1][2]))
+        return (kept + rest)[:max_choices]
+
+    def _rank_goal_choices(self, st, ids, state, preferred_kind=None, max_choices=None,
+                           goal_pruned=False, relevance_pruned=False):
+        target = self._target_goal_choice(st)
+        choices = self._goal_choices(
+            st, target=target, preferred_kind=preferred_kind, max_choices=max_choices,
+            goal_pruned=goal_pruned, relevance_pruned=relevance_pruned)
+        if not choices:
+            return None, target
+        scored = self._score_choices(ids, choices, state=state)
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored, target
 
     def _best_goal_candidate(self, st, ids, state, preferred_kind=None):
         from .trace import render_goal_line
@@ -332,6 +403,9 @@ class FlowRuntime:
         if decode == "constrained":
             return self.run_goal_constrained(problem, templates, question, rng=rng,
                                              prompt=prompt, edb=edb)
+        if decode == "ranker":
+            return self.run_goal_ranked(problem, templates, question, rng=rng,
+                                        prompt=prompt, edb=edb)
         # builtin-headed goals need compute/extract lines we cannot enumerate (you cannot
         # invert a verifier) -- gate masking to relational goals, like eager literal
         # intersections gate to closed maps
@@ -676,6 +750,68 @@ class FlowRuntime:
                 res.lines.append((words, "invalid"))
                 continue
             res.lines.append((words, "ok"))
+            ids += toks + [dot]
+            state = new_state
+        return self._finish_goal(st, res)
+
+    @torch.no_grad()
+    def run_goal_ranked(self, problem, templates, question, rng=None, prompt=None, edb=None,
+                        max_choices=None):
+        """Model-ranked verifier actions with deterministic trace rendering.
+
+        Unlike `constrained`, this does not follow the cached support plan directly.  It scores the
+        broader legal action frontier and records where the oracle support action ranked, so evals
+        can measure trace-policy learning without conflating it with free-form syntax failures.
+        """
+        from .trace import render_prompt
+        res = FlowResult()
+        question = problem.question or question
+        st = self.chk.new_state(problem.goal[1], edb if edb is not None else problem.edb,
+                                goal_pred=problem.goal[0], extra_rules=problem.extra_rules)
+        if prompt is None:
+            prompt, _, _ = render_prompt(problem, templates, question, rng)
+        ids = self.v.enc(prompt)
+        dot = self.v.stoi["."]
+        state = self._state_from_ids(ids)
+        max_choices = max_choices or getattr(self.cfg, "trace_rank_candidates", 0) or None
+        # Fill support metadata once. Builtin-only goals may not have a symbolic support plan; in
+        # that case we still rank legal verifier actions, but oracle-rank metrics are absent.
+        self.chk.support_atoms(st)
+
+        for _ in range(4 * problem.k + 8):
+            scored, target = self._rank_goal_choices(
+                st, ids, state, max_choices=max_choices,
+                goal_pruned=False, relevance_pruned=False)
+            if not scored:
+                return self._finish_goal(st, res)
+
+            if target is not None:
+                tkey = self._choice_key(target[1])
+                rank = None
+                for i, (_score, _words, _toks, _new_state, step) in enumerate(scored, 1):
+                    if self._choice_key(step) == tkey:
+                        rank = i
+                        break
+                if rank is None:
+                    res.rank_oracle_missing += 1
+                else:
+                    res.rank_positions.append(rank)
+                    res.rank_candidate_counts.append(len(scored))
+
+            _score, words, toks, new_state, step = scored[0]
+            if step is None:
+                return self._finish_goal(st, res)
+            if step[0] == "answer":
+                ans = step[1]
+                res.answer = ans
+                res.lines.append((words, "answer" if self.chk.valid_answer(st, ans) else "repair"))
+                return res
+            if not self.chk.step(st, *step):
+                res.n_invalid += 1
+                res._blame(st, step)
+                res.lines.append((words, "invalid"))
+                continue
+            res.lines.append((words, "ranked"))
             ids += toks + [dot]
             state = new_state
         return self._finish_goal(st, res)
