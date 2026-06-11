@@ -148,9 +148,9 @@ python -m thinking.image_latent --train --ae-steps 400 --flow-steps 400 \
 python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-steps 400 \
     --cond-drop 0.1 --cfg-scale 1.5 --sample-steps 8 --flow-semantic-w 0.25 \
     --out runs/image_latent_dit.pt
-python -m thinking.image_latent --train --cond-mode text --flow-arch dit \
+python -m thinking.image_latent --train --cond-mode text --flow-arch crossdit \
     --ae-steps 400 --flow-steps 400 --cond-drop 0.1 --cfg-scale 1.5 \
-    --sample-steps 8 --flow-semantic-w 0.25 --out runs/image_latent_dit_text.pt
+    --sample-steps 8 --flow-semantic-w 0.25 --out runs/image_latent_crossdit_text.pt
 python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
     --eval-seeds 1,2,3 --roundtrip-samples 2 --eval-out runs/image_latent_dit_sweep.json
@@ -161,7 +161,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --vision-arch bottl
     --image-cond-drop 0.1 --image-cfg-scale 1.5 --image-sample-steps 8 \
     --image-flow-semantic-w 0.25 --image-eval-sweep \
     --audio --multimodal --fast --go
-RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-latent-arch dit \
+RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-latent-arch crossdit \
     --image-cond-mode text --image-cond-drop 0.1 --image-cfg-scale 1.5 \
     --image-sample-steps 8 --image-flow-semantic-w 0.25 --image-eval-sweep --fast --go
 ```
@@ -276,6 +276,11 @@ now take `--cond-mode text`, where a learned prompt encoder maps prompt tokens i
 condition vector consumed by the DiT velocity field. Canonical facts still supervise semantic
 endpoint alignment during training, but checkpoint save/load and sampler sweeps now preserve the
 prompt vocabulary and text encoder, so inference no longer needs a hand-built fact vector.
+
+Image-9 adds `--flow-arch crossdit`: image latent tokens now cross-attend to prompt/fact condition
+tokens instead of receiving only one pooled condition vector. This is still toy-scale, but it moves
+the scaffold toward the token-to-token conditioning pattern used by modern rectified-flow T2I
+transformers and gives us a concrete place to plug in richer text encoders later.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

@@ -148,7 +148,7 @@ class SemanticAutoencoder(nn.Module):
 
 
 class PromptConditioner(nn.Module):
-    """Small learned text encoder that maps prompt tokens to a continuous condition vector."""
+    """Small learned text encoder that maps prompt tokens to continuous conditions."""
 
     def __init__(self, vocab_size, cond_dim=64, hidden=64, heads=4, max_len=32, pad=0):
         super().__init__()
@@ -171,7 +171,7 @@ class PromptConditioner(nn.Module):
         self.enc = nn.TransformerEncoder(layer, num_layers=1, enable_nested_tensor=False)
         self.out = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, cond_dim))
 
-    def forward(self, ids):
+    def forward(self, ids, return_tokens=False):
         b, l = ids.shape
         pos = torch.arange(l, device=ids.device).clamp_max(self.pos.num_embeddings - 1)
         mask = ids.eq(self.pad)
@@ -179,7 +179,10 @@ class PromptConditioner(nn.Module):
         h = self.enc(h, src_key_padding_mask=mask)
         keep = (~mask).to(h.dtype).unsqueeze(-1)
         pooled = (h * keep).sum(dim=1) / keep.sum(dim=1).clamp_min(1.0)
-        return self.out(pooled)
+        vec = self.out(pooled)
+        if return_tokens:
+            return {"vec": vec, "tokens": self.out(h), "mask": mask}
+        return vec
 
 
 class LatentFlowNet(nn.Module):
@@ -205,6 +208,7 @@ class LatentFlowNet(nn.Module):
         )
 
     def forward(self, z, t, cond):
+        cond = condition_vector(cond)
         if t.ndim == 1:
             t = t[:, None, None, None]
         if t.ndim == 2:
@@ -250,6 +254,7 @@ class LatentDiTFlowNet(nn.Module):
         self.out_proj = nn.Linear(hidden, latent_ch)
 
     def forward(self, z, t, cond):
+        cond = condition_vector(cond)
         if t.ndim > 2:
             t = t.flatten(1)[:, :1]
         elif t.ndim == 1:
@@ -266,6 +271,84 @@ class LatentDiTFlowNet(nn.Module):
         return v.transpose(1, 2).reshape(b, c, h, w)
 
 
+class CrossDiTBlock(nn.Module):
+    """Tiny image-token block with prompt-token cross-attention."""
+
+    def __init__(self, hidden=96, heads=4):
+        super().__init__()
+        self.self_norm = nn.LayerNorm(hidden)
+        self.self_attn = nn.MultiheadAttention(hidden, heads, batch_first=True, dropout=0.0)
+        self.cross_norm = nn.LayerNorm(hidden)
+        self.ctx_norm = nn.LayerNorm(hidden)
+        self.cross_attn = nn.MultiheadAttention(hidden, heads, batch_first=True, dropout=0.0)
+        self.ff_norm = nn.LayerNorm(hidden)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden, hidden * 4),
+            nn.GELU(),
+            nn.Linear(hidden * 4, hidden),
+        )
+
+    def forward(self, x, ctx, ctx_mask=None):
+        q = self.self_norm(x)
+        x = x + self.self_attn(q, q, q, need_weights=False)[0]
+        x = x + self.cross_attn(self.cross_norm(x), self.ctx_norm(ctx), self.ctx_norm(ctx),
+                                key_padding_mask=ctx_mask, need_weights=False)[0]
+        return x + self.ff(self.ff_norm(x))
+
+
+class LatentCrossDiTFlowNet(nn.Module):
+    """Latent DiT that lets image tokens attend to prompt/fact condition tokens."""
+
+    uses_cond_tokens = True
+
+    def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
+                 max_tokens=256):
+        super().__init__()
+        cond_dim = cond_dim or len(FACT_VOCAB)
+        self.latent_ch = int(latent_ch)
+        self.hidden = int(hidden)
+        self.max_tokens = int(max_tokens)
+        self.in_proj = nn.Linear(latent_ch, hidden)
+        self.pos = nn.Parameter(torch.zeros(1, max_tokens, hidden))
+        self.cond = nn.Sequential(
+            nn.Linear(cond_dim + 1, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+        )
+        self.ctx_proj = nn.Linear(cond_dim, hidden)
+        self.blocks = nn.ModuleList([CrossDiTBlock(hidden, heads) for _ in range(depth)])
+        self.norm = nn.LayerNorm(hidden)
+        self.out_proj = nn.Linear(hidden, latent_ch)
+
+    def _context(self, cond):
+        if isinstance(cond, dict):
+            tokens = cond["tokens"]
+            mask = cond.get("mask")
+        else:
+            tokens = cond[:, None, :]
+            mask = None
+        return self.ctx_proj(tokens), mask
+
+    def forward(self, z, t, cond):
+        cond_vec = condition_vector(cond)
+        if t.ndim > 2:
+            t = t.flatten(1)[:, :1]
+        elif t.ndim == 1:
+            t = t[:, None]
+        b, c, h, w = z.shape
+        n = h * w
+        if n > self.max_tokens:
+            raise ValueError(f"latent token count {n} exceeds max_tokens={self.max_tokens}")
+        toks = z.flatten(2).transpose(1, 2)
+        global_ctx = self.cond(torch.cat([cond_vec, t.to(cond_vec.dtype)], dim=1))[:, None, :]
+        ctx, ctx_mask = self._context(cond)
+        x = self.in_proj(toks) + self.pos[:, :n] + global_ctx
+        for block in self.blocks:
+            x = block(x, ctx, ctx_mask=ctx_mask)
+        v = self.out_proj(self.norm(x))
+        return v.transpose(1, 2).reshape(b, c, h, w)
+
+
 def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4, cond_dim=None):
     if flow_arch == "conv":
         return LatentFlowNet(latent_ch=latent_ch, hidden=hidden, cond_dim=cond_dim)
@@ -275,6 +358,12 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
             heads -= 1
         return LatentDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth, heads=heads,
                                 cond_dim=cond_dim)
+    if flow_arch == "crossdit":
+        heads = max(1, min(dit_heads, hidden // 16))
+        while hidden % heads:
+            heads -= 1
+        return LatentCrossDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth,
+                                     heads=heads, cond_dim=cond_dim)
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
@@ -310,14 +399,41 @@ def autoencoder_loss(out, x, yc, ys, fact_w=0.25):
     return recon + fact_w * facts, {"recon_mse": recon.detach(), "fact_ce": facts.detach()}
 
 
+def flow_uses_cond_tokens(flow):
+    return bool(getattr(flow, "uses_cond_tokens", False))
+
+
+def condition_vector(cond):
+    return cond["vec"] if isinstance(cond, dict) else cond
+
+
+def condition_batch(cond):
+    return int(condition_vector(cond).shape[0])
+
+
+def zero_condition(cond):
+    if not isinstance(cond, dict):
+        return torch.zeros_like(cond)
+    out = dict(cond)
+    out["vec"] = torch.zeros_like(cond["vec"])
+    out["tokens"] = torch.zeros_like(cond["tokens"])
+    return out
+
+
 def condition_dropout(cond, p=0.0):
     """Classifier-free condition dropout: zero whole condition rows during training."""
     if p <= 0.0:
         return cond
+    vec = condition_vector(cond)
     if p >= 1.0:
-        return torch.zeros_like(cond)
-    keep = (torch.rand(cond.shape[0], 1, device=cond.device) >= p).to(cond.dtype)
-    return cond * keep
+        return zero_condition(cond)
+    keep = (torch.rand(vec.shape[0], 1, device=vec.device) >= p).to(vec.dtype)
+    if not isinstance(cond, dict):
+        return cond * keep
+    out = dict(cond)
+    out["vec"] = cond["vec"] * keep
+    out["tokens"] = cond["tokens"] * keep[:, None, :]
+    return out
 
 
 def semantic_endpoint_loss(ae, z_clean, cond):
@@ -359,7 +475,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
     if ae is not None and semantic_w > 0.0:
         z_clean = zt + (1.0 - t) * pred
         sem_cond = cond if semantic_cond is None else semantic_cond
-        keep = cond_model.detach().abs().sum(dim=1, keepdim=True).gt(0).to(sem_cond.dtype)
+        cond_vec = condition_vector(cond_model)
+        keep = cond_vec.detach().abs().sum(dim=1, keepdim=True).gt(0).to(sem_cond.dtype)
         semantic, sem_parts = semantic_endpoint_loss(ae, z_clean, sem_cond * keep)
         total = total + semantic_w * semantic
         parts["semantic_endpoint_ce"] = semantic.detach()
@@ -373,14 +490,18 @@ def latent_flow_loss(flow, z1, cond, cond_drop=0.0):
 
 
 def model_condition(specs, fact_cond, cond_mode="facts", conditioner=None, prompt_vocab=None,
-                    prompt_templates=DEFAULT_PROMPT_TEMPLATES, rng=None, device=DEV):
+                    prompt_templates=DEFAULT_PROMPT_TEMPLATES, rng=None, device=DEV,
+                    return_tokens=False):
     if cond_mode == "facts":
+        if return_tokens:
+            mask = torch.zeros((fact_cond.shape[0], 1), dtype=torch.bool, device=fact_cond.device)
+            return {"vec": fact_cond, "tokens": fact_cond[:, None, :], "mask": mask}
         return fact_cond
     if cond_mode == "text":
         if conditioner is None or prompt_vocab is None:
             raise ValueError("text conditioning requires conditioner and prompt_vocab")
         ids = prompt_ids(specs, prompt_vocab, rng=rng, templates=prompt_templates, device=device)
-        return conditioner(ids)
+        return conditioner(ids, return_tokens=return_tokens)
     raise ValueError(f"unknown condition mode {cond_mode!r}")
 
 
@@ -389,7 +510,7 @@ def guided_velocity(flow, z, t, cond, cfg_scale=1.0):
     """Classifier-free guidance in latent velocity space."""
     if cfg_scale == 1.0:
         return flow(z, t, cond)
-    uncond = torch.zeros_like(cond)
+    uncond = zero_condition(cond)
     v_uncond = flow(z, t, uncond)
     v_cond = flow(z, t, cond)
     return v_uncond + cfg_scale * (v_cond - v_uncond)
@@ -398,11 +519,12 @@ def guided_velocity(flow, z, t, cond, cfg_scale=1.0):
 @torch.no_grad()
 def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0,
                    cfg_scale=1.0):
-    z = _seeded_randn((cond.shape[0],) + tuple(latent_shape), device=device, seed=seed)
+    batch = condition_batch(cond)
+    z = _seeded_randn((batch,) + tuple(latent_shape), device=device, seed=seed)
     flow.eval()
     dt = 1.0 / max(1, steps)
     for i in range(steps):
-        t = torch.full((cond.shape[0], 1, 1, 1), i / max(1, steps), device=device)
+        t = torch.full((batch, 1, 1, 1), i / max(1, steps), device=device)
         z = z + dt * guided_velocity(flow, z, t, cond, cfg_scale=cfg_scale)
     return z
 
@@ -435,7 +557,8 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_s
             rng = np.random.default_rng(seed + ci * 101 + si * 17)
             cond = model_condition(specs, fact_cond, cond_mode=cond_mode,
                                    conditioner=conditioner, prompt_vocab=prompt_vocab,
-                                   prompt_templates=prompt_templates, rng=rng, device=device)
+                                   prompt_templates=prompt_templates, rng=rng, device=device,
+                                   return_tokens=flow_uses_cond_tokens(flow))
             sample = sample_images(ae, flow, cond, latent_shape=latent_shape, steps=sample_steps,
                                    device=device, seed=seed + ci * 101 + si * 17,
                                    cfg_scale=cfg_scale)
@@ -482,7 +605,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
         recon_losses.append(float(F.mse_loss(out["recon"], x).detach().cpu()))
         cond = model_condition(specs, fact_cond, cond_mode=cond_mode, conditioner=conditioner,
                                prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
-                               rng=rng, device=device)
+                               rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
         flow_losses.append(float(latent_flow_loss(flow, z, cond).detach().cpu()))
         got_c += int(out["color"].argmax(-1).eq(yc).sum())
         got_s += int(out["shape"].argmax(-1).eq(ys).sum())
@@ -494,7 +617,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
     fact_cond = fact_condition(object_facts(spec), device=device)[None]
     cond = model_condition([spec], fact_cond, cond_mode=cond_mode, conditioner=conditioner,
                            prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
-                           rng=rng, device=device)
+                           rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
     sample = sample_images(ae, flow, cond, latent_shape=(ae.latent_ch, size // 4, size // 4),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale)
     target = torch.tensor(render_object(spec, size=size) * 2.0 - 1.0,
@@ -557,8 +680,8 @@ def load_checkpoint(path, device=DEV):
         "latent_ch": latent_ch,
         "hidden": hidden,
         "flow_arch": flow_arch,
-        "dit_depth": dit_depth if flow_arch == "dit" else 0,
-        "dit_heads": dit_heads if flow_arch == "dit" else 0,
+        "dit_depth": dit_depth if flow_arch in ("dit", "crossdit") else 0,
+        "dit_heads": dit_heads if flow_arch in ("dit", "crossdit") else 0,
         "cond_mode": cond_mode,
         "cond_dim": cond_dim,
     }
@@ -701,7 +824,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             z1 = ae.encode(x)
         cond = model_condition(specs, fact_cond, cond_mode=cond_mode, conditioner=conditioner,
                                prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
-                               rng=rng, device=device)
+                               rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
         loss, parts = latent_flow_losses(flow, z1, cond, cond_drop=cond_drop, ae=ae,
                                          semantic_w=flow_semantic_w,
                                          semantic_cond=fact_cond)
@@ -725,8 +848,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "latent_ch": int(latent_ch),
         "hidden": int(hidden),
         "flow_arch": flow_arch,
-        "dit_depth": int(dit_depth) if flow_arch == "dit" else 0,
-        "dit_heads": int(dit_heads) if flow_arch == "dit" else 0,
+        "dit_depth": int(dit_depth) if flow_arch in ("dit", "crossdit") else 0,
+        "dit_heads": int(dit_heads) if flow_arch in ("dit", "crossdit") else 0,
         "fact_w": float(fact_w),
         "cond_drop": float(cond_drop),
         "flow_semantic_w": float(flow_semantic_w),
@@ -781,6 +904,15 @@ def selftest():
                                batch=2, seed=4, device="cpu", cond_mode="text",
                                conditioner=conditioner3, prompt_vocab=vocab3)
     assert len(text_sweep) == 1 and text_sweep[0]["cond_mode"] == "text"
+    ae4, flow4, conditioner4, vocab4, report4 = train_latent_flow(
+        ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="crossdit",
+        dit_depth=1, dit_heads=2, seed=5, device="cpu", cond_mode="text",
+        text_cond_dim=8, sample_steps=1, return_conditioner=True)
+    assert report4["flow_arch"] == "crossdit" and flow_uses_cond_tokens(flow4)
+    cross_sweep = sampler_sweep(ae4, flow4, cfg_scales=(1.0,), sample_steps_list=(1,), n=4,
+                                batch=2, seed=6, device="cpu", cond_mode="text",
+                                conditioner=conditioner4, prompt_vocab=vocab4)
+    assert len(cross_sweep) == 1 and cross_sweep[0]["cond_mode"] == "text"
     print("image_latent selftest OK")
 
 
@@ -797,7 +929,8 @@ def main(argv=None):
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--fact-w", type=float, default=1.0, dest="fact_w")
-    ap.add_argument("--flow-arch", default="conv", choices=("conv", "dit"), dest="flow_arch")
+    ap.add_argument("--flow-arch", default="conv", choices=("conv", "dit", "crossdit"),
+                    dest="flow_arch")
     ap.add_argument("--dit-depth", type=int, default=3, dest="dit_depth")
     ap.add_argument("--dit-heads", type=int, default=4, dest="dit_heads")
     ap.add_argument("--cond-drop", type=float, default=0.0, dest="cond_drop")
