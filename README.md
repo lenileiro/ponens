@@ -91,7 +91,7 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --out runs/image_latent_dit.pt
 .venv/bin/python -m thinking.image_latent --train --cond-mode text --flow-arch crossdit \
     --ae-steps 40 --flow-steps 40 --cond-drop 0.1 --cfg-scale 1.5 \
-    --sample-steps 4 --flow-semantic-w 0.25 \
+    --sample-steps 4 --flow-semantic-w 0.25 --time-sampling logit-normal \
     --out runs/image_latent_crossdit_text.pt
 .venv/bin/python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.5 --sample-steps-list 4,8 --eval-seeds 1,2,3 \

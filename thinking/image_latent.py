@@ -393,6 +393,20 @@ def _seeded_randn(shape, device, seed):
         return torch.randn(shape, device=device)
 
 
+def sample_flow_times(batch, device=DEV, mode="uniform", logit_mean=0.0, logit_std=1.0):
+    """Sample rectified-flow interpolation times.
+
+    Uniform is the original rectified-flow baseline.  Logit-normal follows the SD3-style
+    direction of spending more training mass on perceptually useful intermediate noise scales.
+    """
+    if mode == "uniform":
+        return torch.rand(batch, 1, 1, 1, device=device)
+    if mode == "logit-normal":
+        eps = torch.randn(batch, 1, 1, 1, device=device) * float(logit_std) + float(logit_mean)
+        return torch.sigmoid(eps)
+    raise ValueError(f"unknown time sampling mode {mode!r}")
+
+
 def autoencoder_loss(out, x, yc, ys, fact_w=0.25):
     recon = F.mse_loss(out["recon"], x)
     facts = F.cross_entropy(out["color"], yc) + F.cross_entropy(out["shape"], ys)
@@ -462,16 +476,22 @@ def semantic_endpoint_loss(ae, z_clean, cond):
 
 
 def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
-                       semantic_cond=None):
+                       semantic_cond=None, time_sampling="uniform", time_logit_mean=0.0,
+                       time_logit_std=1.0):
     x0 = torch.randn_like(z1)
-    t = torch.rand(z1.shape[0], 1, 1, 1, device=z1.device)
+    t = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
+                          logit_mean=time_logit_mean, logit_std=time_logit_std)
     zt = (1.0 - t) * x0 + t * z1
     target = z1 - x0
     cond_model = condition_dropout(cond, cond_drop)
     pred = flow(zt, t, cond_model)
     velocity = F.mse_loss(pred, target)
     total = velocity
-    parts = {"velocity_mse": velocity.detach()}
+    parts = {
+        "velocity_mse": velocity.detach(),
+        "time_mean": t.detach().mean(),
+        "time_std": t.detach().std(unbiased=False),
+    }
     if ae is not None and semantic_w > 0.0:
         z_clean = zt + (1.0 - t) * pred
         sem_cond = cond if semantic_cond is None else semantic_cond
@@ -484,8 +504,12 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
     return total, parts
 
 
-def latent_flow_loss(flow, z1, cond, cond_drop=0.0):
-    loss, _parts = latent_flow_losses(flow, z1, cond, cond_drop=cond_drop)
+def latent_flow_loss(flow, z1, cond, cond_drop=0.0, time_sampling="uniform",
+                     time_logit_mean=0.0, time_logit_std=1.0):
+    loss, _parts = latent_flow_losses(flow, z1, cond, cond_drop=cond_drop,
+                                      time_sampling=time_sampling,
+                                      time_logit_mean=time_logit_mean,
+                                      time_logit_std=time_logit_std)
     return loss
 
 
@@ -780,11 +804,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       dit_depth=3, dit_heads=4, cond_drop=0.0, cfg_scale=1.0,
                       sample_steps=4, roundtrip_samples=1, flow_semantic_w=0.0,
                       cond_mode="facts", text_cond_dim=0,
-                      prompt_templates=DEFAULT_PROMPT_TEMPLATES, return_conditioner=False):
+                      prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
+                      time_logit_mean=0.0, time_logit_std=1.0,
+                      return_conditioner=False):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     if cond_mode not in ("facts", "text"):
         raise ValueError(f"unknown condition mode {cond_mode!r}")
+    if time_sampling not in ("uniform", "logit-normal"):
+        raise ValueError(f"unknown time sampling mode {time_sampling!r}")
     prompt_vocab = build_prompt_vocab(prompt_templates) if cond_mode == "text" else None
     cond_dim = len(FACT_VOCAB)
     conditioner = None
@@ -827,7 +855,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                                rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
         loss, parts = latent_flow_losses(flow, z1, cond, cond_drop=cond_drop, ae=ae,
                                          semantic_w=flow_semantic_w,
-                                         semantic_cond=fact_cond)
+                                         semantic_cond=fact_cond,
+                                         time_sampling=time_sampling,
+                                         time_logit_mean=time_logit_mean,
+                                         time_logit_std=time_logit_std)
         opt_flow.zero_grad()
         loss.backward()
         opt_flow.step()
@@ -853,6 +884,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "fact_w": float(fact_w),
         "cond_drop": float(cond_drop),
         "flow_semantic_w": float(flow_semantic_w),
+        "time_sampling": time_sampling,
+        "time_logit_mean": float(time_logit_mean),
+        "time_logit_std": float(time_logit_std),
         "cond_mode": cond_mode,
         "cond_dim": int(cond_dim),
         "prompt_templates": list(prompt_templates) if cond_mode == "text" else [],
@@ -907,8 +941,10 @@ def selftest():
     ae4, flow4, conditioner4, vocab4, report4 = train_latent_flow(
         ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="crossdit",
         dit_depth=1, dit_heads=2, seed=5, device="cpu", cond_mode="text",
-        text_cond_dim=8, sample_steps=1, return_conditioner=True)
+        text_cond_dim=8, sample_steps=1, time_sampling="logit-normal",
+        return_conditioner=True)
     assert report4["flow_arch"] == "crossdit" and flow_uses_cond_tokens(flow4)
+    assert report4["time_sampling"] == "logit-normal" and "time_mean" in report4["last_flow"]
     cross_sweep = sampler_sweep(ae4, flow4, cfg_scales=(1.0,), sample_steps_list=(1,), n=4,
                                 batch=2, seed=6, device="cpu", cond_mode="text",
                                 conditioner=conditioner4, prompt_vocab=vocab4)
@@ -945,6 +981,13 @@ def main(argv=None):
     ap.add_argument("--roundtrip-samples", type=int, default=1, dest="roundtrip_samples")
     ap.add_argument("--flow-semantic-w", type=float, default=0.0, dest="flow_semantic_w",
                     help="semantic endpoint alignment weight for latent flow training")
+    ap.add_argument("--time-sampling", default="uniform", choices=("uniform", "logit-normal"),
+                    dest="time_sampling",
+                    help="rectified-flow training timestep distribution")
+    ap.add_argument("--time-logit-mean", type=float, default=0.0, dest="time_logit_mean",
+                    help="mean for --time-sampling logit-normal")
+    ap.add_argument("--time-logit-std", type=float, default=1.0, dest="time_logit_std",
+                    help="stddev for --time-sampling logit-normal")
     ap.add_argument("--cond-mode", default="facts", choices=("facts", "text"), dest="cond_mode",
                     help="conditioning source for latent flow")
     ap.add_argument("--text-cond-dim", type=int, default=0, dest="text_cond_dim",
@@ -988,6 +1031,8 @@ def main(argv=None):
         sample_steps=args.sample_steps, roundtrip_samples=args.roundtrip_samples,
         flow_semantic_w=args.flow_semantic_w, cond_mode=args.cond_mode,
         text_cond_dim=args.text_cond_dim, prompt_templates=templates,
+        time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
+        time_logit_std=args.time_logit_std,
         return_conditioner=True)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save({
@@ -1006,6 +1051,9 @@ def main(argv=None):
         "cfg_scale": args.cfg_scale,
         "sample_steps": args.sample_steps,
         "flow_semantic_w": args.flow_semantic_w,
+        "time_sampling": args.time_sampling,
+        "time_logit_mean": args.time_logit_mean,
+        "time_logit_std": args.time_logit_std,
         "prompt_templates": list(templates) if args.cond_mode == "text" else [],
         "prompt_vocab": prompt_vocab if prompt_vocab is not None else {},
         "conditioner_state_dict": (conditioner.state_dict() if conditioner is not None else {}),

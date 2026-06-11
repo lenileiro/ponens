@@ -107,6 +107,9 @@ def payload(args):
                      f"--sample-steps {args.image_sample_steps} "
                      f"--roundtrip-samples {args.image_roundtrip_samples} "
                      f"--flow-semantic-w {args.image_flow_semantic_w} "
+                     f"--time-sampling {args.image_time_sampling} "
+                     f"--time-logit-mean {args.image_time_logit_mean} "
+                     f"--time-logit-std {args.image_time_logit_std} "
                      f"--out {ckpt}")
             if args.image_prompt_templates:
                 train += f" --prompt-templates {shlex_quote(args.image_prompt_templates)}"
@@ -360,6 +363,15 @@ def main():
     ap.add_argument("--image-flow-semantic-w", type=float, default=0.0,
                     dest="image_flow_semantic_w",
                     help="semantic endpoint alignment weight for latent image flow training")
+    ap.add_argument("--image-time-sampling", default="uniform",
+                    choices=("uniform", "logit-normal"), dest="image_time_sampling",
+                    help="latent image flow timestep distribution")
+    ap.add_argument("--image-time-logit-mean", type=float, default=0.0,
+                    dest="image_time_logit_mean",
+                    help="mean for --image-time-sampling logit-normal")
+    ap.add_argument("--image-time-logit-std", type=float, default=1.0,
+                    dest="image_time_logit_std",
+                    help="stddev for --image-time-sampling logit-normal")
     ap.add_argument("--image-eval-sweep", action="store_true", dest="image_eval_sweep",
                     help="after latent training, sweep CFG and sampler steps from the checkpoint")
     ap.add_argument("--image-cfg-sweep", default="1.0,1.25,1.5,2.0",
