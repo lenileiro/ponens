@@ -231,6 +231,12 @@ facts before the checker/reasoner sees it. Image generation stays connected thro
 semantic latent path (`image -> latent -> facts/generation`) rather than becoming a detached
 pixel model.
 
+M-0 local update (400 steps, value-token weighted loss): image color **1.00**, image shape
+**0.99**, audio pitch **0.88**, audio timbre **1.00**, audio envelope **0.985**. The first
+30-step smoke exposed a real issue: trace grammar dominated the loss while value tokens lagged;
+the current trainer upweights only the factor value positions, so the shared decoder learns the
+canonical values instead of just the fixed `extract fact ... done` skeleton.
+
 ## 4. Exams (the report card)
 
 | exam | command fragment | measures |
