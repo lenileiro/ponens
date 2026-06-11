@@ -314,6 +314,8 @@ def cmd_train(args):
         cfg.loops = args.loops
     if args.deep_frac:
         cfg.deep_frac = args.deep_frac
+    if args.contrastive:
+        cfg.contrastive_frac = args.contrastive
     cfg.deep_preds = tuple(p.strip() for p in args.deep_preds.split(",") if p.strip()) \
         if args.deep_preds else ()
     if args.pos:
@@ -430,6 +432,7 @@ def main(argv=None):
     p.add_argument("--examples", type=int, default=0)
     p.add_argument("--loops", type=int, default=0)
     p.add_argument("--deep-frac", type=float, default=0.0, dest="deep_frac")
+    p.add_argument("--contrastive", type=float, default=0.0, help="contrastive triplet share")
     p.add_argument("--deep-preds", default="", dest="deep_preds",
                    help="restrict DEEP-regime query types, e.g. ancestor or ancestor,older_by")
     p.add_argument("--pos", choices=("rope", "none"), help="position mode (none = NoPE)")

@@ -102,6 +102,26 @@ class Trainer:
                               + self.cfg.write_frac + self.cfg.extract_frac):   # READING task
                         ex = render_extraction_example(p, TPL, QS, rng)
                     else:
+                        if (not deep and k < 4
+                                and rng.random() < self.cfg.contrastive_frac):
+                            # CONTRASTIVE: 3 questions about ONE tree -- question-reading
+                            # becomes load-bearing instead of ignorable (the k=2 fix)
+                            trio = self.world.sample_contrastive(
+                                k, rng, exclude=self.cfg.holdout_preds)
+                            # one rng seed for the whole trio: identical slot mapping and
+                            # surface phrasing, so ONLY the question differs across members
+                            seed = int(rng.integers(2 ** 31))
+                            exs = []
+                            for tp, tl in trio:
+                                rr = np.random.default_rng(seed)
+                                if self.cfg.anonymize:
+                                    tp, tl = anonymize(tp, tl, rr)
+                                exs.append(render_goal_example(tp, tl, TPL, QS, rr))
+                            if all(len(e.tokens) <= self.cfg.block + 1 for e in exs):
+                                out.extend(exs)
+                                break
+                            dropped += 1
+                            continue
                         ex = render_goal_example(p, lines, TPL, QS, rng)
                 else:
                     p = self.world.sample(k, rng)

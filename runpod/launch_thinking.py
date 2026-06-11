@@ -77,7 +77,7 @@ def payload(args):
         canon = ((" --canon" if args.canon else "") + (" --bank" if args.bank else "") + (" --no-curriculum" if args.no_curriculum else ""))
         simple = " --simple" if args.stair_world == "kinship" else ""
         if args.stair_world == "kinship" and args.deep_depth and args.stair:
-            simple += f" --deep-depth {args.deep_depth} --deep-frac 0.3"
+            simple += f" --deep-depth {args.deep_depth} --deep-frac 0.3 --contrastive 0.9"
         sbatch = 8 if (args.deep_depth and args.stair_world == "kinship") else 32
         hops = ("2,3" if not (args.deep_depth and args.stair_world == "kinship")
                 else f"2,3,{args.deep_depth // 2},{args.deep_depth}")

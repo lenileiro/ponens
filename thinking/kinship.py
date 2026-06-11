@@ -247,7 +247,8 @@ def definitions(level="mix", split="train"):
     out = {}
     for lv in levels:
         for w, vs in sec.get(lv, {}).items():
-            out.setdefault(w, []).extend(tuple(v) for v in vs)
+            if vs:                                         # tolerate empty bank cells
+                out.setdefault(w, []).extend(tuple(v) for v in vs)
     return out
 
 

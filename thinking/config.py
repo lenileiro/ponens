@@ -24,6 +24,8 @@ class Config:
     #                                   0.3 kept shallow alive while preserving deep signal -- C5)
     deep_preds: tuple = ()            # restrict DEEP-regime query types, e.g. ('ancestor',) for
     #                                   pure recursive length-generalization training
+    contrastive_frac: float = 0.5     # shallow QA share arriving as same-tree question TRIPLETS
+    #                                   (question-conditioning: the k=2 fix -- C6d)
     extract_frac: float = 0.25        # fraction of training examples that are READING tasks
     #                                   (NL surface -> exhaustive canonical fact list)
     lang_level: str = "mix"           # surface curriculum target: preschool..scholar|mix
