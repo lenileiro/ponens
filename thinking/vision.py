@@ -270,7 +270,9 @@ def factor_probe(model, repeats=4, size=32, device=DEV):
     leak = max([x for x in (color_leakage, shape_leakage) if x is not None] or [0.0])
     reuse = float(np.mean([max(0.0, min(1.0, m / 0.25)) for m in margins])) if margins else None
     penalty = max(0.0, min(1.0, leak / 0.25))
-    ufr_score = None if reuse is None else max(0.0, min(1.0, 0.85 * reuse + 0.15 * (1 - penalty)))
+    # Factored representations need both reuse and independence.  A high-accuracy classifier can
+    # still be FER if same-color/same-shape clusters collapse into full color-shape combinations.
+    ufr_score = None if reuse is None else max(0.0, min(1.0, reuse * (1.0 - penalty)))
     flags = []
     if color_margin is not None and color_margin < 0.05:
         flags.append("weak_color_reuse")
