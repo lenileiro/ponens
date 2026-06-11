@@ -146,12 +146,14 @@ python -m thinking.image_flow --train --steps 400 --out runs/image_flow.pt
 python -m thinking.image_latent --train --ae-steps 400 --flow-steps 400 \
     --out runs/image_latent_flow.pt
 python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-steps 400 \
-    --cond-drop 0.1 --cfg-scale 1.5 --sample-steps 8 --out runs/image_latent_dit.pt
+    --cond-drop 0.1 --cfg-scale 1.5 --sample-steps 8 --flow-semantic-w 0.25 \
+    --out runs/image_latent_dit.pt
 python -m thinking.audio --steps 500 --seeds 0,1,2 --out runs/audio1_fer.json
 python -m thinking.multimodal --steps 400 --out runs/m0_multimodal.json
 RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --vision-arch bottleneck \
     --image2 --image-flow --image-latent --image-latent-arch dit \
     --image-cond-drop 0.1 --image-cfg-scale 1.5 --image-sample-steps 8 \
+    --image-flow-semantic-w 0.25 \
     --audio --multimodal --fast --go
 ```
 
@@ -235,6 +237,13 @@ at **0.0198**. The new round-trip metric is the important finding: generated sam
 to the requested color **0.87**, shape **0.67**, and both facts **0.53** across all 15 color×shape
 conditions. That means the architecture is now measuring image fact-faithfulness, and the next
 image work should attack generated shape fidelity rather than only optimizing latent velocity MSE.
+
+The next image intervention is a REPA-style semantic endpoint loss for the flow: the predicted
+clean latent endpoint is read by the frozen semantic AE fact heads and optimized against the
+conditioning facts (`--flow-semantic-w`). This is not a hard-coded shape rule; it is a generic
+alignment pressure from condition slots to the representation heads already used for evaluation.
+It follows the recent lesson that image generation quality depends on semantic representations
+inside the denoising/flow model, not only lower transport MSE.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

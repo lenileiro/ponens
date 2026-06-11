@@ -11,6 +11,8 @@ __pycache__/
 *.log
 *.tgz
 data/
+!data/
+data/*
 runs/
 artifacts/
 results_gpu/
@@ -19,6 +21,7 @@ corpus_*.jsonl
 nohup.out
 *.json
 !surfaces.json
+!data/multimodal_transcripts.json
 !**/config.json
 
 # legacy archive (pre-production experiments; on disk, not in the repo)
@@ -30,3 +33,4 @@ runpod/launch_beam.py
 runpod/launch_learn.py
 runpod/launch_solver.py
 runpod/launch_v6.py
+data/speech/

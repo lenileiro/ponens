@@ -12,7 +12,8 @@ linearly usable after compression instead of becoming another entangled bottlene
 
   python -m thinking.image_latent --selftest
   python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-steps 400 \
-      --cond-drop 0.1 --cfg-scale 1.5 --sample-steps 8 --out runs/image_latent_dit.pt
+      --cond-drop 0.1 --cfg-scale 1.5 --sample-steps 8 --flow-semantic-w 0.25 \
+      --out runs/image_latent_dit.pt
 """
 import argparse
 import json
@@ -27,6 +28,10 @@ from .image_flow import FACT_VOCAB, fact_condition
 from .vision import COLORS, SHAPES, DEV, ObjectSpec, object_facts, render_object, sample_object
 
 COLOR_NAMES = tuple(COLORS)
+FACT_GROUPS = {
+    pred: tuple(i for i, fact in enumerate(FACT_VOCAB) if fact[0] == pred)
+    for pred in sorted({fact[0] for fact in FACT_VOCAB})
+}
 
 
 def _batch(n, rng, size=32, device=DEV):
@@ -207,13 +212,53 @@ def condition_dropout(cond, p=0.0):
     return cond * keep
 
 
-def latent_flow_loss(flow, z1, cond, cond_drop=0.0):
+def semantic_endpoint_loss(ae, z_clean, cond):
+    """REPA-style endpoint alignment: clean latent should decode to conditioned facts."""
+    logits = ae.fact_logits(z_clean)
+    losses = {}
+    for pred, idxs in FACT_GROUPS.items():
+        if pred not in logits:
+            continue
+        if logits[pred].shape[-1] != len(idxs):
+            raise ValueError(
+                f"fact head {pred!r} has {logits[pred].shape[-1]} classes, "
+                f"but FACT_VOCAB has {len(idxs)}"
+            )
+        group = cond[:, list(idxs)]
+        active = group.sum(dim=1) > 0
+        if not bool(active.any()):
+            continue
+        target = group[active].argmax(dim=1)
+        losses[pred] = F.cross_entropy(logits[pred][active], target)
+    if not losses:
+        return z_clean.sum() * 0.0, {}
+    loss = sum(losses.values()) / len(losses)
+    parts = {f"{pred}_endpoint_ce": val.detach() for pred, val in losses.items()}
+    return loss, parts
+
+
+def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0):
     x0 = torch.randn_like(z1)
     t = torch.rand(z1.shape[0], 1, 1, 1, device=z1.device)
     zt = (1.0 - t) * x0 + t * z1
     target = z1 - x0
-    pred = flow(zt, t, condition_dropout(cond, cond_drop))
-    return F.mse_loss(pred, target)
+    cond_model = condition_dropout(cond, cond_drop)
+    pred = flow(zt, t, cond_model)
+    velocity = F.mse_loss(pred, target)
+    total = velocity
+    parts = {"velocity_mse": velocity.detach()}
+    if ae is not None and semantic_w > 0.0:
+        z_clean = zt + (1.0 - t) * pred
+        semantic, sem_parts = semantic_endpoint_loss(ae, z_clean, cond_model)
+        total = total + semantic_w * semantic
+        parts["semantic_endpoint_ce"] = semantic.detach()
+        parts.update(sem_parts)
+    return total, parts
+
+
+def latent_flow_loss(flow, z1, cond, cond_drop=0.0):
+    loss, _parts = latent_flow_losses(flow, z1, cond, cond_drop=cond_drop)
+    return loss
 
 
 @torch.no_grad()
@@ -340,7 +385,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
 def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidden=64,
                       lr=2e-4, fact_w=1.0, seed=0, size=32, device=DEV, flow_arch="conv",
                       dit_depth=3, dit_heads=4, cond_drop=0.0, cfg_scale=1.0,
-                      sample_steps=4, roundtrip_samples=1):
+                      sample_steps=4, roundtrip_samples=1, flow_semantic_w=0.0):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     ae = SemanticAutoencoder(latent_ch=latent_ch, hidden=hidden).to(device)
@@ -360,17 +405,21 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
 
     opt_flow = torch.optim.AdamW(flow.parameters(), lr=lr, weight_decay=0.01)
     ae.eval()
+    for p in ae.parameters():
+        p.requires_grad_(False)
     flow.train()
-    last_flow = None
+    last_flow = {}
     for _ in range(flow_steps):
         x, cond, _yc, _ys = _batch(batch, rng, size=size, device=device)
         with torch.no_grad():
             z1 = ae.encode(x)
-        loss = latent_flow_loss(flow, z1, cond, cond_drop=cond_drop)
+        loss, parts = latent_flow_losses(flow, z1, cond, cond_drop=cond_drop, ae=ae,
+                                         semantic_w=flow_semantic_w)
         opt_flow.zero_grad()
         loss.backward()
         opt_flow.step()
-        last_flow = float(loss.detach().cpu())
+        last_flow = {"total_loss": float(loss.detach().cpu())}
+        last_flow.update({k: float(v.detach().cpu()) for k, v in parts.items()})
 
     report = evaluate(ae, flow, seed=seed + 1, size=size, device=device, cfg_scale=cfg_scale,
                       sample_steps=sample_steps, roundtrip_samples=roundtrip_samples)
@@ -386,8 +435,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "dit_heads": int(dit_heads) if flow_arch == "dit" else 0,
         "fact_w": float(fact_w),
         "cond_drop": float(cond_drop),
+        "flow_semantic_w": float(flow_semantic_w),
         "last_ae": last_ae,
-        "last_flow_loss": last_flow,
+        "last_flow": last_flow,
+        "last_flow_loss": last_flow.get("velocity_mse"),
         "fact_vocab": [list(f) for f in FACT_VOCAB],
     })
     return ae, flow, report
@@ -407,9 +458,12 @@ def selftest():
     ae2, flow2, report2 = train_latent_flow(ae_steps=1, flow_steps=1, batch=2, latent_ch=4,
                                             hidden=32, flow_arch="dit", dit_depth=1,
                                             dit_heads=2, seed=1, device="cpu", cond_drop=0.5,
-                                            cfg_scale=1.5, sample_steps=1)
+                                            cfg_scale=1.5, sample_steps=1,
+                                            flow_semantic_w=0.25)
     assert report2["flow_arch"] == "dit"
     assert report2["cond_drop"] == 0.5 and report2["cfg_scale"] == 1.5
+    assert report2["flow_semantic_w"] == 0.25
+    assert "semantic_endpoint_ce" in report2["last_flow"]
     img2 = sample_images(ae2, flow2, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
                          seed=1, cfg_scale=1.5)
     assert img2.shape == (1, 3, 32, 32)
@@ -434,6 +488,8 @@ def main(argv=None):
     ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
     ap.add_argument("--sample-steps", type=int, default=4, dest="sample_steps")
     ap.add_argument("--roundtrip-samples", type=int, default=1, dest="roundtrip_samples")
+    ap.add_argument("--flow-semantic-w", type=float, default=0.0, dest="flow_semantic_w",
+                    help="semantic endpoint alignment weight for latent flow training")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="runs/image_latent_flow.pt")
     args = ap.parse_args(argv)
@@ -449,7 +505,8 @@ def main(argv=None):
                                          dit_depth=args.dit_depth, dit_heads=args.dit_heads,
                                          cond_drop=args.cond_drop, cfg_scale=args.cfg_scale,
                                          sample_steps=args.sample_steps,
-                                         roundtrip_samples=args.roundtrip_samples)
+                                         roundtrip_samples=args.roundtrip_samples,
+                                         flow_semantic_w=args.flow_semantic_w)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save({
         "autoencoder_state_dict": ae.state_dict(),
@@ -462,6 +519,7 @@ def main(argv=None):
         "cond_drop": args.cond_drop,
         "cfg_scale": args.cfg_scale,
         "sample_steps": args.sample_steps,
+        "flow_semantic_w": args.flow_semantic_w,
     }, args.out)
     print(json.dumps(report, indent=1))
     print(f"saved -> {args.out}")

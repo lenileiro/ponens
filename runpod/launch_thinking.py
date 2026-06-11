@@ -101,6 +101,7 @@ def payload(args):
                         f"--cond-drop {args.image_cond_drop} "
                         f"--cfg-scale {args.image_cfg_scale} "
                         f"--sample-steps {args.image_sample_steps} "
+                        f"--flow-semantic-w {args.image_flow_semantic_w} "
                         f"--out runs/image_latent_{args.image_latent_arch}.pt")
         if args.audio:                                     # AUDIO-1: audio factors -> facts
             AU = PY.replace("thinking.cli", "thinking.audio")
@@ -330,6 +331,9 @@ def main():
                     help="classifier-free guidance scale for latent image sampling")
     ap.add_argument("--image-sample-steps", type=int, default=4, dest="image_sample_steps",
                     help="Euler sampling steps for latent image evaluation")
+    ap.add_argument("--image-flow-semantic-w", type=float, default=0.0,
+                    dest="image_flow_semantic_w",
+                    help="semantic endpoint alignment weight for latent image flow training")
     ap.add_argument("--audio", action="store_true",
                     help="AUDIO-1: train synthetic audio factor FER experiment")
     ap.add_argument("--multimodal", action="store_true",
