@@ -795,6 +795,57 @@ def latent_intervention_training_loss(ae, z, cond, strength=1.0, decoded_w=1.0,
     }
 
 
+def latent_factor_orthogonality_loss(z, cond, eps=1.0e-6):
+    """Penalize overlap between data-derived latent fact subspaces.
+
+    FER shows up when factors are accurate but internally tangled.  This loss estimates one latent
+    prototype per fact value from the current batch, centers those prototypes within each predicate,
+    and discourages different predicate subspaces from pointing in the same latent directions.  It
+    is generic over FACT_VOCAB predicate groups; no color/shape-specific rule is injected.
+    """
+    targets, active = fact_targets_from_condition(cond)
+    bases = {}
+    basis_count = 0
+    for pred, idxs in FACT_GROUPS.items():
+        present = [val for val in range(len(idxs))
+                   if bool((active[pred] & targets[pred].eq(val)).any())]
+        if len(present) < 2:
+            continue
+        protos = []
+        for val in present:
+            mask = active[pred] & targets[pred].eq(val)
+            protos.append(z[mask].mean(dim=0))
+        flat = torch.stack(protos).flatten(1)
+        flat = flat - flat.mean(dim=0, keepdim=True)
+        norms = flat.norm(dim=1)
+        keep = norms > float(eps)
+        if not bool(keep.any()):
+            continue
+        basis = flat[keep] / norms[keep, None].clamp_min(float(eps))
+        bases[pred] = basis
+        basis_count += int(basis.shape[0])
+
+    preds = sorted(bases)
+    losses = []
+    for i, pred_a in enumerate(preds):
+        for pred_b in preds[i + 1:]:
+            sim = bases[pred_a].matmul(bases[pred_b].transpose(0, 1))
+            losses.append(sim.pow(2).mean())
+    if not losses:
+        zero = z.sum() * 0.0
+        return zero, {
+            "factor_orth_loss": zero.detach(),
+            "factor_orth_pairs": torch.tensor(0.0, device=z.device),
+            "factor_orth_bases": torch.tensor(float(basis_count), device=z.device),
+        }
+    total = sum(losses) / len(losses)
+    return total, {
+        "factor_orth_loss": total.detach(),
+        "factor_orth_pairs": torch.tensor(float(len(losses)), device=z.device),
+        "factor_orth_bases": torch.tensor(float(basis_count), device=z.device),
+    }
+
+
 def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
                        semantic_cond=None, time_sampling="uniform", time_logit_mean=0.0,
                        time_logit_std=1.0):
@@ -940,6 +991,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
     ae.eval()
     flow.eval()
     recon_losses, flow_losses = [], []
+    factor_orth_losses, factor_orth_pairs, factor_orth_bases = [], [], []
     got_c = got_s = total = 0
     latent_means, latent_stds = [], []
     while total < n:
@@ -948,6 +1000,11 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
         out = ae(x)
         z = out["latent"]
         recon_losses.append(float(F.mse_loss(out["recon"], x).detach().cpu()))
+        factor_orth, factor_parts = latent_factor_orthogonality_loss(z, fact_cond)
+        if float(factor_parts["factor_orth_pairs"].detach().cpu()) > 0.0:
+            factor_orth_losses.append(float(factor_orth.detach().cpu()))
+            factor_orth_pairs.append(float(factor_parts["factor_orth_pairs"].detach().cpu()))
+            factor_orth_bases.append(float(factor_parts["factor_orth_bases"].detach().cpu()))
         cond = model_condition(specs, fact_cond, cond_mode=cond_mode, conditioner=conditioner,
                                prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
                                rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
@@ -981,6 +1038,12 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
         "cfg_scale": float(cfg_scale),
         "sample_steps": int(sample_steps),
     }
+    if factor_orth_losses:
+        report.update({
+            "latent_factor_orth_loss": float(np.mean(factor_orth_losses)),
+            "latent_factor_orth_pairs": float(np.mean(factor_orth_pairs)),
+            "latent_factor_orth_bases": float(np.mean(factor_orth_bases)),
+        })
     report.update(conditional_roundtrip(ae, flow, size=size, device=device, cfg_scale=cfg_scale,
                                         sample_steps=sample_steps,
                                         samples_per_combo=roundtrip_samples, seed=seed + 17,
@@ -1166,6 +1229,9 @@ def eval_report_summary(report):
         "latent_intervention_image_target_acc",
         "latent_intervention_collateral_acc",
         "latent_intervention_score",
+        "latent_factor_orth_loss",
+        "latent_factor_orth_pairs",
+        "latent_factor_orth_bases",
     )
     return {k: report[k] for k in keys if k in report}
 
@@ -1269,7 +1335,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       cond_mode="facts", text_cond_dim=0,
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0,
-                      ae_intervention_w=0.0,
+                      ae_intervention_w=0.0, ae_factor_orth_w=0.0,
                       flow_ema_decay=0.0, flow_ema_warmup=True, eval_with_ema=True,
                       eval_weight_mode="auto", intervention_samples=32,
                       return_conditioner=False, return_ema=False):
@@ -1281,6 +1347,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
     if ae_intervention_w < 0.0:
         raise ValueError("ae_intervention_w must be non-negative")
+    if ae_factor_orth_w < 0.0:
+        raise ValueError("ae_factor_orth_w must be non-negative")
     if flow_ema_decay < 0.0 or flow_ema_decay >= 1.0:
         raise ValueError("flow_ema_decay must be in [0, 1)")
     if eval_weight_mode not in EVAL_WEIGHT_MODES:
@@ -1307,6 +1375,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 ae, out["latent"], fact_cond)
             loss = loss + float(ae_intervention_w) * intervention
             parts.update({f"latent_{k}": v for k, v in intervention_parts.items()})
+        if ae_factor_orth_w > 0.0:
+            factor_orth, factor_orth_parts = latent_factor_orthogonality_loss(
+                out["latent"], fact_cond)
+            loss = loss + float(ae_factor_orth_w) * factor_orth
+            parts.update({f"latent_{k}": v for k, v in factor_orth_parts.items()})
         opt_ae.zero_grad()
         loss.backward()
         opt_ae.step()
@@ -1403,6 +1476,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "fact_w": float(fact_w),
         "ae_intervention_w": float(ae_intervention_w),
+        "ae_factor_orth_w": float(ae_factor_orth_w),
         "cond_drop": float(cond_drop),
         "flow_semantic_w": float(flow_semantic_w),
         "flow_ema_decay": float(flow_ema_decay),
@@ -1446,6 +1520,7 @@ def selftest():
     assert report["latent_color_acc"] >= 0.0 and report["latent_shape_acc"] >= 0.0
     assert "sample_roundtrip_both_acc" in report and report["sample_roundtrip_n"] == 15
     assert "latent_intervention_score" in report and report["latent_intervention_n"] > 0
+    assert "latent_factor_orth_loss" in report
     spec = ObjectSpec("p0", "blue", "triangle")
     cond = fact_condition(object_facts(spec), device="cpu")[None]
     img = sample_images(ae, flow, cond, latent_shape=(4, 8, 8), steps=2, device="cpu", seed=0,
@@ -1455,12 +1530,15 @@ def selftest():
                                             hidden=32, flow_arch="dit", dit_depth=1,
                                             dit_heads=2, seed=1, device="cpu", cond_drop=0.5,
                                             cfg_scale=1.5, sample_steps=1,
-                                            flow_semantic_w=0.25, ae_intervention_w=0.1)
+                                            flow_semantic_w=0.25, ae_intervention_w=0.1,
+                                            ae_factor_orth_w=0.05)
     assert report2["flow_arch"] == "dit"
     assert report2["cond_drop"] == 0.5 and report2["cfg_scale"] == 1.5
     assert report2["flow_semantic_w"] == 0.25
     assert report2["ae_intervention_w"] == 0.1
+    assert report2["ae_factor_orth_w"] == 0.05
     assert "latent_intervention_loss" in report2["last_ae"]
+    assert "latent_factor_orth_loss" in report2["last_ae"]
     assert "semantic_endpoint_ce" in report2["last_flow"]
     img2 = sample_images(ae2, flow2, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
                          seed=1, cfg_scale=1.5)
@@ -1535,6 +1613,9 @@ def main(argv=None):
     ap.add_argument("--ae-intervention-w", type=float, default=0.0,
                     dest="ae_intervention_w",
                     help="semantic AE latent fact-intervention loss weight")
+    ap.add_argument("--ae-factor-orth-w", type=float, default=0.0,
+                    dest="ae_factor_orth_w",
+                    help="semantic AE cross-factor latent orthogonality loss weight")
     ap.add_argument("--flow-arch", default="conv", choices=("conv", "dit", "crossdit", "mmdit"),
                     dest="flow_arch")
     ap.add_argument("--dit-depth", type=int, default=3, dest="dit_depth")
@@ -1623,6 +1704,7 @@ def main(argv=None):
         text_cond_dim=args.text_cond_dim, prompt_templates=templates,
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
         time_logit_std=args.time_logit_std, ae_intervention_w=args.ae_intervention_w,
+        ae_factor_orth_w=args.ae_factor_orth_w,
         flow_ema_decay=args.flow_ema_decay,
         flow_ema_warmup=not args.no_ema_warmup,
         eval_with_ema=not args.no_ema_eval,
@@ -1647,6 +1729,7 @@ def main(argv=None):
         "sample_steps": args.sample_steps,
         "intervention_samples": args.intervention_samples,
         "ae_intervention_w": args.ae_intervention_w,
+        "ae_factor_orth_w": args.ae_factor_orth_w,
         "flow_semantic_w": args.flow_semantic_w,
         "flow_ema_decay": args.flow_ema_decay,
         "flow_ema_warmup": not args.no_ema_warmup,

@@ -151,7 +151,7 @@ python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-st
 python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --ae-steps 400 --flow-steps 400 --cond-drop 0.1 --cfg-scale 1.5 \
     --sample-steps 8 --flow-semantic-w 0.25 --time-sampling logit-normal \
-    --flow-ema-decay 0.999 --ae-intervention-w 0.1 \
+    --flow-ema-decay 0.999 --ae-intervention-w 0.1 --ae-factor-orth-w 0.05 \
     --out runs/image_latent_mmdit_text.pt
 python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
@@ -167,7 +167,8 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-cond-mode text --image-cond-drop 0.1 --image-cfg-scale 1.5 \
     --image-sample-steps 8 --image-flow-semantic-w 0.25 \
     --image-time-sampling logit-normal --image-flow-ema-decay 0.999 \
-    --image-ae-intervention-w 0.1 --image-eval-sweep --fast --go
+    --image-ae-intervention-w 0.1 --image-ae-factor-orth-w 0.05 \
+    --image-eval-sweep --fast --go
 ```
 
 `thinking.image2` is the head-aware FER experiment: shared factored heads vs explicit
@@ -341,6 +342,14 @@ fetched 400-step diagnostic score **0.408**. The checkpoint sweep selects EMA at
 and reports color **1.00**, shape/both **0.778 ± 0.137**, and conditional sample MSE **0.056**.
 Shape edits are still the weak axis, but the image stack now has a generic learned pressure that
 improves editable semantic latents rather than only lowering reconstruction or flow MSE.
+
+Image-20 adds a generic latent factor-orthogonality diagnostic and optional training loss
+(`--ae-factor-orth-w`; RunPod: `--image-ae-factor-orth-w`). It estimates fact-value prototype
+subspaces from the batch and penalizes squared cosine overlap between different fact predicates, so
+the pressure is over `FACT_VOCAB` groups rather than color/shape rules. A 60/10-step local smoke
+reduced eval `latent_factor_orth_loss` from **0.156 -> 0.131** with comparable reconstruction MSE;
+the tiny intervention score did not move, so this is a representation-health knob to combine with
+the intervention loss on the next H100 run, not yet a standalone quality claim.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
