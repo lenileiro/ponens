@@ -171,6 +171,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-ae-intervention-w 0.1 --image-ae-factor-orth-w 0.05 \
     --image-semantic-guidance-w 2.0 --image-semantic-guidance-sweep 0.0,1.0,2.0 \
     --image-sample-methods euler,heun \
+    --image-sample-grid \
     --image-eval-sweep --fast --go
 ```
 
@@ -376,6 +377,12 @@ Image-23 makes the rectified-flow ODE solver a measured sweep axis (`--sample-me
 accuracy at each semantic-guidance level but has higher conditional MSE on this straightened toy
 flow. That keeps Euler as the current default while giving future less-straight flows a fair solver
 comparison.
+
+Image-24 adds dependency-free PPM sample-grid export (`--sample-grid-out`; RunPod:
+`--image-sample-grid`). The grid uses the same selected sampler/guidance settings as checkpoint
+evaluation, so fact metrics and visual artifacts can be audited together. This is necessary for
+image-generation work: the fact heads can say shape is correct, but the artifact makes pixel-level
+failures visible.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

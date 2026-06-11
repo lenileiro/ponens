@@ -97,6 +97,7 @@ def payload(args):
             IL = PY.replace("thinking.cli", "thinking.image_latent")
             cond_suffix = "" if args.image_cond_mode == "facts" else f"_{args.image_cond_mode}"
             ckpt = f"runs/image_latent_{args.image_latent_arch}{cond_suffix}.pt"
+            grid = f"runs/image_latent_{args.image_latent_arch}{cond_suffix}_grid.ppm"
             train = (f"{IL} --train --ae-steps {args.train_steps or 800} "
                      f"--flow-steps {args.train_steps or 800} --batch {args.batch} "
                      f"--hidden {args.dim or 64} --flow-arch {args.image_latent_arch} "
@@ -119,6 +120,9 @@ def payload(args):
                      f"--time-logit-mean {args.image_time_logit_mean} "
                      f"--time-logit-std {args.image_time_logit_std} "
                      f"--out {ckpt}")
+            if args.image_sample_grid:
+                train += (f" --sample-grid-out {grid} "
+                          f"--sample-grid-samples {args.image_sample_grid_samples}")
             if args.image_no_ema_warmup:
                 train += " --no-ema-warmup"
             if args.image_prompt_templates:
@@ -139,6 +143,9 @@ def payload(args):
                           f"--intervention-samples {args.image_intervention_samples} "
                           f"--eval-out runs/image_latent_{args.image_latent_arch}"
                           f"{cond_suffix}_sweep.json")
+                if args.image_sample_grid:
+                    train += (f" --sample-grid-out {grid} "
+                              f"--sample-grid-samples {args.image_sample_grid_samples}")
             cmds.append(train)
         if args.audio:                                     # AUDIO-1: audio factors -> facts
             AU = PY.replace("thinking.cli", "thinking.audio")
@@ -382,6 +389,12 @@ def main():
     ap.add_argument("--image-sample-methods", default="euler,heun",
                     dest="image_sample_methods",
                     help="comma-separated latent image sampler methods for sweeps")
+    ap.add_argument("--image-sample-grid", action="store_true",
+                    dest="image_sample_grid",
+                    help="save a generated color x shape PPM grid for latent image jobs")
+    ap.add_argument("--image-sample-grid-samples", type=int, default=1,
+                    dest="image_sample_grid_samples",
+                    help="generated samples per color/shape condition in the image PPM grid")
     ap.add_argument("--image-semantic-guidance-w", type=float, default=0.0,
                     dest="image_semantic_guidance_w",
                     help="sampling-time semantic AE guidance weight for latent images")

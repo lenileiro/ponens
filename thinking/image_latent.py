@@ -998,6 +998,99 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
     return ae.decode(z).clamp(-1.0, 1.0)
 
 
+def _rgb8_from_samples(samples):
+    if samples.ndim != 4 or samples.shape[1] != 3:
+        raise ValueError(f"expected BCHW RGB samples, got shape {tuple(samples.shape)}")
+    arr = samples.detach().cpu().float().clamp(-1.0, 1.0)
+    arr = ((arr + 1.0) * 127.5).round().to(torch.uint8)
+    return arr.permute(0, 2, 3, 1).contiguous().numpy()
+
+
+def write_ppm_grid(samples, path, rows, cols, pad=2, bg=32):
+    """Write a binary PPM grid without image-library dependencies."""
+    arr = _rgb8_from_samples(samples)
+    n, h, w, c = arr.shape
+    if c != 3:
+        raise ValueError(f"expected RGB samples, got {c} channels")
+    rows, cols = int(rows), int(cols)
+    if rows <= 0 or cols <= 0:
+        raise ValueError("grid rows/cols must be positive")
+    if rows * cols < n:
+        raise ValueError(f"grid {rows}x{cols} cannot fit {n} samples")
+    pad = max(0, int(pad))
+    out_h = rows * h + max(0, rows - 1) * pad
+    out_w = cols * w + max(0, cols - 1) * pad
+    grid = np.full((out_h, out_w, 3), int(bg), dtype=np.uint8)
+    for idx in range(n):
+        r = idx // cols
+        col = idx % cols
+        y0 = r * (h + pad)
+        x0 = col * (w + pad)
+        grid[y0:y0 + h, x0:x0 + w] = arr[idx]
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(f"P6\n{out_w} {out_h}\n255\n".encode("ascii"))
+        f.write(grid.tobytes())
+    return {
+        "sample_grid": path,
+        "sample_grid_rows": rows,
+        "sample_grid_cols": cols,
+        "sample_grid_n": int(n),
+        "sample_grid_tile_h": int(h),
+        "sample_grid_tile_w": int(w),
+        "sample_grid_pad": pad,
+        "sample_grid_format": "ppm",
+    }
+
+
+def make_condition_grid_specs(samples_per_combo=1):
+    samples_per_combo = int(samples_per_combo)
+    if samples_per_combo <= 0:
+        raise ValueError("samples_per_combo must be positive")
+    specs = []
+    for color in COLORS:
+        for shape in SHAPES:
+            specs.extend(ObjectSpec("p0", color, shape) for _ in range(samples_per_combo))
+    return specs, len(COLORS), len(SHAPES) * samples_per_combo
+
+
+@torch.no_grad()
+def save_sample_grid(ae, flow, path, size=32, device=DEV, cond_mode="facts", conditioner=None,
+                     prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
+                     cfg_scale=1.0, sample_steps=4, sample_method="euler",
+                     semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
+                     samples_per_combo=1, seed=0):
+    ae.eval()
+    flow.eval()
+    specs, rows, cols = make_condition_grid_specs(samples_per_combo=samples_per_combo)
+    fact_rows = [
+        fact_condition(object_facts(spec), device=device).detach().cpu().numpy()
+        for spec in specs
+    ]
+    fact_cond = torch.tensor(np.stack(fact_rows), dtype=torch.float32, device=device)
+    rng = np.random.default_rng(seed)
+    cond = model_condition(specs, fact_cond, cond_mode=cond_mode, conditioner=conditioner,
+                           prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
+                           rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
+    sample = sample_images(ae, flow, cond, latent_shape=(ae.latent_ch, size // 4, size // 4),
+                           steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
+                           semantic_cond=fact_cond, semantic_guidance_w=semantic_guidance_w,
+                           semantic_guidance_mode=semantic_guidance_mode,
+                           sample_method=sample_method)
+    meta = write_ppm_grid(sample, path, rows=rows, cols=cols)
+    meta.update({
+        "sample_grid_cfg_scale": float(cfg_scale),
+        "sample_grid_sample_steps": int(sample_steps),
+        "sample_grid_sample_method": sample_method,
+        "sample_grid_semantic_guidance_w": float(semantic_guidance_w),
+        "sample_grid_semantic_guidance_mode": semantic_guidance_mode,
+        "sample_grid_cond_mode": cond_mode,
+        "sample_grid_seed": int(seed),
+        "sample_grid_samples_per_combo": int(samples_per_combo),
+    })
+    return meta
+
+
 @torch.no_grad()
 def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_steps=4,
                           samples_per_combo=1, seed=20, cond_mode="facts", conditioner=None,
@@ -1449,6 +1542,20 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
     return report
 
 
+def selected_grid_settings(report, fallback_cfg=1.0, fallback_steps=4,
+                           fallback_method="euler", fallback_semantic_w=0.0,
+                           fallback_semantic_mode="decoded"):
+    best = report.get("best") or report
+    return {
+        "cfg_scale": float(best.get("cfg_scale", fallback_cfg)),
+        "sample_steps": int(best.get("sample_steps", fallback_steps)),
+        "sample_method": str(best.get("sample_method", fallback_method)),
+        "semantic_guidance_w": float(best.get("semantic_guidance_w", fallback_semantic_w)),
+        "semantic_guidance_mode": str(best.get("semantic_guidance_mode",
+                                               fallback_semantic_mode)),
+    }
+
+
 def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidden=64,
                       lr=2e-4, fact_w=1.0, seed=0, size=32, device=DEV, flow_arch="conv",
                       dit_depth=3, dit_heads=4, cond_drop=0.0, cfg_scale=1.0,
@@ -1665,6 +1772,12 @@ def selftest():
                                seed=0, cfg_scale=1.0, semantic_cond=cond,
                                semantic_guidance_w=0.05)
     assert guided_img.shape == (1, 3, 32, 32)
+    grid_path = "/tmp/image_latent_selftest_grid.ppm"
+    grid_meta = save_sample_grid(ae, flow, grid_path, size=32, device="cpu",
+                                 sample_steps=1, samples_per_combo=1, seed=9)
+    assert grid_meta["sample_grid_n"] == len(COLORS) * len(SHAPES)
+    with open(grid_path, "rb") as f:
+        assert f.read(2) == b"P6"
     ae2, flow2, report2 = train_latent_flow(ae_steps=1, flow_steps=1, batch=2, latent_ch=4,
                                             hidden=32, flow_arch="dit", dit_depth=1,
                                             dit_heads=2, seed=1, device="cpu", cond_drop=0.5,
@@ -1699,6 +1812,12 @@ def selftest():
                                batch=2, seed=4, device="cpu", cond_mode="text",
                                conditioner=conditioner3, prompt_vocab=vocab3)
     assert len(text_sweep) == 1 and text_sweep[0]["cond_mode"] == "text"
+    text_grid_path = "/tmp/image_latent_selftest_text_grid.ppm"
+    text_grid_meta = save_sample_grid(
+        ae3, flow3, text_grid_path, size=32, device="cpu", cond_mode="text",
+        conditioner=conditioner3, prompt_vocab=vocab3, sample_steps=1, samples_per_combo=1,
+        seed=10)
+    assert text_grid_meta["sample_grid_cond_mode"] == "text"
     ae4, flow4, conditioner4, vocab4, report4 = train_latent_flow(
         ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="crossdit",
         dit_depth=1, dit_heads=2, seed=5, device="cpu", cond_mode="text",
@@ -1818,6 +1937,11 @@ def main(argv=None):
     ap.add_argument("--out", default="runs/image_latent_flow.pt")
     ap.add_argument("--eval-out", default="", dest="eval_out",
                     help="JSON path for --eval-checkpoint report")
+    ap.add_argument("--sample-grid-out", default="", dest="sample_grid_out",
+                    help="optional PPM path for a color x shape generated sample grid")
+    ap.add_argument("--sample-grid-samples", type=int, default=1,
+                    dest="sample_grid_samples",
+                    help="generated samples per color/shape condition in --sample-grid-out")
     ap.add_argument("--checkpoint-weight-mode", default="auto", choices=EVAL_WEIGHT_MODES,
                     dest="checkpoint_weight_mode",
                     help="which checkpoint weights to sweep: raw, ema, or measured auto-select")
@@ -1849,6 +1973,32 @@ def main(argv=None):
                 _parse_string_list(args.sample_methods) if args.sample_methods else None
             ),
         )
+        if args.sample_grid_out:
+            selected_weights = report.get("selected_checkpoint_weights",
+                                          report.get("checkpoint_weight_mode", "ema"))
+            ae, flow, conditioner, prompt_vocab, prompt_templates, meta = load_checkpoint(
+                args.eval_checkpoint, prefer_ema=(selected_weights == "ema"))
+            settings = selected_grid_settings(
+                report,
+                fallback_cfg=args.cfg_scale,
+                fallback_steps=args.sample_steps,
+                fallback_method=args.sample_method,
+                fallback_semantic_w=args.semantic_guidance_w,
+                fallback_semantic_mode=args.semantic_guidance_mode)
+            grid_meta = save_sample_grid(
+                ae, flow, args.sample_grid_out, cond_mode=meta["cond_mode"],
+                conditioner=conditioner, prompt_vocab=prompt_vocab,
+                prompt_templates=prompt_templates,
+                cfg_scale=settings["cfg_scale"],
+                sample_steps=settings["sample_steps"],
+                sample_method=settings["sample_method"],
+                semantic_guidance_w=settings["semantic_guidance_w"],
+                semantic_guidance_mode=settings["semantic_guidance_mode"],
+                samples_per_combo=args.sample_grid_samples,
+                seed=args.seed + 991)
+            grid_meta["sample_grid_checkpoint_weight_mode"] = (
+                "ema" if meta["ema_loaded"] else "raw")
+            report.update(grid_meta)
         if args.eval_out:
             os.makedirs(os.path.dirname(args.eval_out) or ".", exist_ok=True)
             with open(args.eval_out, "w") as f:
@@ -1881,6 +2031,37 @@ def main(argv=None):
         eval_weight_mode=("raw" if args.no_ema_eval else args.ema_eval_mode),
         intervention_samples=args.intervention_samples,
         return_conditioner=True, return_ema=True)
+    if args.sample_grid_out:
+        raw_flow = clone_state_dict(flow)
+        raw_conditioner = clone_state_dict(conditioner) if conditioner is not None else None
+        grid_weight_mode = "raw"
+        if report.get("selected_eval_weights") == "ema" and flow_ema is not None:
+            load_flow_state(flow, flow_ema)
+            if conditioner is not None and conditioner_ema:
+                conditioner.load_state_dict(conditioner_ema)
+            grid_weight_mode = "ema"
+        settings = selected_grid_settings(
+            report,
+            fallback_cfg=args.cfg_scale,
+            fallback_steps=args.sample_steps,
+            fallback_method=args.sample_method,
+            fallback_semantic_w=args.semantic_guidance_w,
+            fallback_semantic_mode=args.semantic_guidance_mode)
+        grid_meta = save_sample_grid(
+            ae, flow, args.sample_grid_out, cond_mode=args.cond_mode, conditioner=conditioner,
+            prompt_vocab=prompt_vocab, prompt_templates=templates,
+            cfg_scale=settings["cfg_scale"],
+            sample_steps=settings["sample_steps"],
+            sample_method=settings["sample_method"],
+            semantic_guidance_w=settings["semantic_guidance_w"],
+            semantic_guidance_mode=settings["semantic_guidance_mode"],
+            samples_per_combo=args.sample_grid_samples,
+            seed=args.seed + 991)
+        grid_meta["sample_grid_checkpoint_weight_mode"] = grid_weight_mode
+        report.update(grid_meta)
+        load_flow_state(flow, raw_flow)
+        if conditioner is not None and raw_conditioner is not None:
+            conditioner.load_state_dict(raw_conditioner)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save({
         "autoencoder_state_dict": ae.state_dict(),
