@@ -22,10 +22,60 @@ class FlowRuntime:
         self.m, self.v, self.chk, self.cfg, self.dev = model, vocab, checker, cfg, device
 
     @torch.no_grad()
-    def _line(self, ids, temp=0.0):
+    def _can_cache(self):
+        return hasattr(self.m, "supports_kv_cache") and self.m.supports_kv_cache()
+
+    def _state_from_ids(self, ids):
+        if not self._can_cache() or not ids or len(ids) + self.cfg.max_line_tokens + 1 > self.cfg.block:
+            return None
+        cache = logits = None
+        for t in ids:
+            tok = torch.tensor([[t]], device=self.dev)
+            logits, cache = self.m.forward_step(tok, cache)
+        return {"cache": cache, "logits": logits}
+
+    def _state_append_raw(self, state, toks):
+        if state is None:
+            return None
+        if state["cache"]["ids"].shape[1] + len(toks) > self.cfg.block:
+            return None
+        cache, logits = state["cache"], state["logits"]
+        for t in toks:
+            tok = torch.tensor([[t]], device=self.dev)
+            logits, cache = self.m.forward_step(tok, cache)
+        return {"cache": cache, "logits": logits}
+
+    def _state_append(self, state, toks):
+        state = self._state_append_raw(state, toks)
+        if state is None:
+            return None
+        if state["cache"]["ids"].shape[1] + self.cfg.max_line_tokens + 1 > self.cfg.block:
+            return None
+        return state
+
+    @torch.no_grad()
+    def _line(self, ids, temp=0.0, state=None, return_state=False, max_tokens=None):
         """Generate tokens until '.' (exclusive); returns (words, token_ids)."""
         out, dot = [], self.v.stoi["."]
-        for _ in range(self.cfg.max_line_tokens):
+        limit = max_tokens or self.cfg.max_line_tokens
+        state = state or self._state_from_ids(ids)
+        if state is not None:
+            cur = state
+            for _ in range(limit):
+                logits = cur["logits"][0]
+                if temp <= 0:
+                    t = int(logits.argmax())
+                else:
+                    t = int(torch.multinomial(torch.softmax(logits / temp, -1), 1))
+                if t == dot:
+                    break
+                out.append(t)
+                cur = self._state_append_raw(cur, [t])
+                if cur is None:
+                    break
+            ans = (self.v.dec(out), out, cur) if return_state else (self.v.dec(out), out)
+            return ans
+        for _ in range(limit):
             ctx = torch.tensor([(ids + out)[-self.cfg.block:]], device=self.dev)
             logits = self.m(ctx)[0, -1]
             if temp <= 0:
@@ -35,7 +85,8 @@ class FlowRuntime:
             if t == dot:
                 break
             out.append(t)
-        return self.v.dec(out), out
+        ans = (self.v.dec(out), out, None) if return_state else (self.v.dec(out), out)
+        return ans
 
     @torch.no_grad()
     def run(self, problem, verify=True):
@@ -134,7 +185,7 @@ class FlowRuntime:
     def define(self, word, level):
         """VOCABULARY exam: define a word at an education level. Returns the words."""
         ids = self.v.enc(["define", level, word, ":"])
-        words, _ = self._line(ids, maxtok=34)
+        words, _ = self._line(ids, max_tokens=34)
         return words
 
     @torch.no_grad()
@@ -162,8 +213,9 @@ class FlowRuntime:
             prompt, _, _ = render_prompt(problem, templates, question, rng)
         ids = self.v.enc(prompt)
         dot = self.v.stoi["."]
+        state = self._state_from_ids(ids)
         for _ in range(4 * problem.k + 8):                 # line budget (proof tree, not a walk)
-            words, toks = self._line(ids)
+            words, toks, line_state = self._line(ids, state=state, return_state=True)
             if words[:1] == ["answer"]:
                 ans = words[1] if len(words) > 1 else None
                 if not verify or self.chk.valid_answer(st, ans):
@@ -189,7 +241,8 @@ class FlowRuntime:
             if verify and not ok:
                 for _ in range(self.cfg.retry):
                     res.n_resampled += 1
-                    words, toks = self._line(ids, temp=self.cfg.resample_temp)
+                    words, toks, line_state = self._line(ids, temp=self.cfg.resample_temp,
+                                                         state=state, return_state=True)
                     ps = parse_goal_line(words)
                     if ps is not None and self.chk.step(st, *ps):
                         ok = True
@@ -198,12 +251,14 @@ class FlowRuntime:
                     res.n_invalid += 1                     # uncommitted; later lines can recover
                     res.lines.append((words, "skip"))
                     ids += toks + [dot]
+                    state = self._state_append(line_state, [dot])
                     continue
             if not ok:
                 res.n_invalid += 1
             res.lines.append((words, "ok" if ok else "invalid"))
             if ok or not verify:
                 ids += toks + [dot]
+                state = self._state_append(line_state, [dot])
         res.answer = self._root_answer(st)
         return res
 

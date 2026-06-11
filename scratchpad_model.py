@@ -86,6 +86,14 @@ def _rope_cos_sin(L, hd, device, base=10000.0):
     return emb.cos()[None, None], emb.sin()[None, None]   # 1,1,L,hd
 
 
+def _rope_cos_sin_pos(pos, hd, device, base=10000.0):
+    inv_freq = 1.0 / (base ** (torch.arange(0, hd, 2, device=device).float() / hd))
+    t = torch.tensor([pos], device=device).float()
+    freqs = torch.outer(t, inv_freq)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    return emb.cos()[None, None], emb.sin()[None, None]
+
+
 def _rotate_half(x):
     h = x.shape[-1] // 2
     return torch.cat([-x[..., h:], x[..., :h]], dim=-1)
@@ -209,6 +217,49 @@ class CausalBlock(nn.Module):
         x = x + self.proj(o)
         x = x + self.ff(self.norm2(x))
         return x
+
+    def forward_step(self, x, ids, ids_all, cache=None, pad=0):
+        """One-token causal decode with KV cache. Training still uses forward(); this path exists
+        so very deep proof traces do not rerun the whole prefix for every generated token."""
+        B, L, D = x.shape
+        assert L == 1, "forward_step expects exactly one token"
+        pos = ids_all.shape[1] - 1
+        h = self.norm1(x)
+        q, k, v = self.qkv(h).view(B, L, 3, self.h, self.hd).permute(2, 0, 3, 1, 4)
+        q, k = self.qnorm(q), self.knorm(k)
+        if self.pos_mode == "rope":
+            cos, sin = _rope_cos_sin_pos(pos, self.hd, x.device)
+            q = q * cos + _rotate_half(q) * sin
+            k = k * cos + _rotate_half(k) * sin
+        if cache is None:
+            k_all, v_all = k, v
+        else:
+            pk, pv = cache
+            k_all, v_all = torch.cat([pk, k], 2), torch.cat([pv, v], 2)
+        scores = (q @ k_all.transpose(-2, -1)) * self.logit_scale.view(1, self.h, 1, 1)
+        if self.attn_window is not None:
+            key_pos = torch.arange(k_all.shape[2], device=x.device)
+            scores = scores.masked_fill((key_pos <= pos - self.attn_window)[None, None, None],
+                                        float("-inf"))
+        pad_mask = ids_all.eq(pad)
+        if pad_mask.any():
+            scores = scores.masked_fill(pad_mask[:, None, None, :], float("-inf"))
+        a = scores.softmax(-1)
+        if self.store_attn:
+            self._attn = a
+        if self.rh > 0:
+            sens_h = self.h - self.rh
+            sym = self.symbols(ids_all).view(B, ids_all.shape[1], self.rh, self.hd).transpose(1, 2)
+            parts = []
+            if sens_h > 0:
+                parts.append(a[:, :sens_h] @ v_all[:, :sens_h])
+            parts.append(a[:, sens_h:] @ sym)
+            o = torch.cat(parts, dim=1).transpose(1, 2).reshape(B, L, D)
+        else:
+            o = (a @ v_all).transpose(1, 2).reshape(B, L, D)
+        x = x + self.proj(o)
+        x = x + self.ff(self.norm2(x))
+        return x, (k_all, v_all)
 
 
 class ScratchpadLM(nn.Module):
@@ -433,6 +484,39 @@ class ScratchpadLM(nn.Module):
             # argmax/temperature decoding unchanged.
             out = torch.log((1 - g) * out.softmax(-1) + g * ptr + 1e-9)
         return (out, per_loop) if return_per_loop else out
+
+    def supports_kv_cache(self):
+        return (self.causal and not self.loop and self.mem is None and self.entmem is None)
+
+    @torch.no_grad()
+    def forward_step(self, ids, cache=None):
+        """One-token inference step. Returns logits for the next token after `ids` and a cache.
+        Supported for the standard non-recurrent decoder path; callers should fall back to
+        forward() when supports_kv_cache() is false."""
+        if not self.supports_kv_cache():
+            raise RuntimeError("forward_step is only supported for non-loop causal decoder inference")
+        assert ids.ndim == 2 and ids.shape[1] == 1, "forward_step expects shape (B, 1)"
+        layers = [None] * len(self.blocks) if cache is None else cache["layers"]
+        ids_all = ids if cache is None else torch.cat([cache["ids"], ids], 1)
+        pos = ids_all.shape[1] - 1
+        x = self.tok(ids)
+        if self.pos is not None:
+            x = x + self.pos(torch.tensor([[pos]], device=ids.device))
+        if self.pointer:
+            self.blocks[-1].store_attn = True
+        new_layers = []
+        for blk, layer_cache in zip(self.blocks, layers):
+            x, new_cache = blk.forward_step(x, ids, ids_all, layer_cache, pad=self.pad)
+            new_layers.append(new_cache)
+        out = self.head(self.lnf(x))
+        if self.pointer:
+            a0 = self.blocks[-1]._attn[:, 0]                 # (B,1,S)
+            ptr = torch.zeros(out.shape, device=out.device, dtype=a0.dtype) \
+                       .scatter_add_(2, ids_all.unsqueeze(1), a0)
+            ptr[..., self.pad] = 0.0
+            g = torch.sigmoid(self.ptr_gate)
+            out = torch.log((1 - g) * out.softmax(-1) + g * ptr + 1e-9)
+        return out[:, -1], {"layers": new_layers, "ids": ids_all}
 
 
 def expected_halt_loss(per_loop, halt_p, targets, ignore_index=-100, ent_w=0.01):

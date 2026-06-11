@@ -51,7 +51,7 @@ class StepChecker:
 class GoalChecker:
     """FORWARD (evidence-first) checker for kinship traces.
 
-    State: the KNOWN set (EDB facts + derived atoms). 'check F' grounds an EDB fact; 'think H
+    State: the KNOWN set (checked EDB facts + derived atoms). 'check F' grounds an EDB fact; 'think H
     needs B' derives H when every body atom is already known and (H <- B) instantiates a rule
     (or an arithmetic builtin verifies the value). The answer is valid only when a matching fact
     about the question pair has been DERIVED -- conclusions come LAST (the goal-directed/
@@ -66,7 +66,7 @@ class GoalChecker:
         self.recursive = {h[0] for h, b in rules if any(a[0] == h[0] for a in b)}
 
     def new_state(self, pair, edb, goal_pred=None, extra_rules=()):
-        return {"known": set(edb), "edb": set(edb), "derived": [], "pair": tuple(pair),
+        return {"known": set(), "edb": set(edb), "derived": [], "pair": tuple(pair),
                 "goal_pred": goal_pred, "extra_rules": list(extra_rules), "seen": set()}
 
     def step(self, st, typ, head, body):
@@ -77,6 +77,7 @@ class GoalChecker:
             return False
         if typ == "check":
             if head in st["edb"]:
+                st["known"].add(head)
                 st["seen"].add((typ, head, body))
                 return True
             return False

@@ -53,7 +53,9 @@ class Trainer:
             wlevels = ([level] if level else bank_levels()) or ["mix"]
         for _ in range(n):
             k = self.cfg.train_hops[rng.integers(len(self.cfg.train_hops))]
-            if (self.cfg.world == "kinship" and self.cfg.deep_depth and rng.random() < self.cfg.deep_frac):
+            deep = (self.cfg.world == "kinship" and self.cfg.deep_depth and
+                    rng.random() < self.cfg.deep_frac)
+            if deep:
                 k = 4 + int(rng.integers(self.cfg.deep_depth - 3))   # deep regime: depths 4..N
             u = rng.random()                               # task type fixed BEFORE fit-retries
             for _try in range(20):                         # resample until it fits the block
@@ -61,7 +63,9 @@ class Trainer:
                     from .trace import (render_goal_example, render_extraction_example,
                                         render_write_example)
                     from .world import anonymize
-                    p, lines = self.world.sample(k, rng, exclude=self.cfg.holdout_preds)
+                    include = (self.cfg.deep_preds or None) if deep else None
+                    p, lines = self.world.sample(k, rng, include=include,
+                                                 exclude=self.cfg.holdout_preds)
                     if self.cfg.anonymize:
                         p, lines = anonymize(p, lines, rng)
                     if u < self.cfg.math_frac:                 # MATH drill (compute a - b)

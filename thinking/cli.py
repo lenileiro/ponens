@@ -79,6 +79,22 @@ def cmd_selftest(_args):
     for r, pp, cc in sup:
         assert x[r, pp + 1] == x[r, cc], "aux misaligned after packing"
 
+    # cached inference must be numerically equivalent to full-prefix inference
+    import torch
+    from scratchpad_model import ScratchpadLM
+    torch.manual_seed(0)
+    m = ScratchpadLM(len(vocab), d=32, layers=2, heads=4, max_len=64, pad=vocab.pad,
+                     pointer=True).eval()
+    ids = torch.tensor([vocab.enc(ex.tokens[:20])])
+    with torch.no_grad():
+        full = m(ids)
+        cache, outs = None, []
+        for j in range(ids.shape[1]):
+            logits, cache = m.forward_step(ids[:, j:j + 1], cache)
+            outs.append(logits)
+        inc = torch.stack(outs, 1)
+    assert torch.allclose(full, inc, atol=1e-5), "cached decode diverges from full forward"
+
     # backward chaining agrees with the forward oracle
     edb = set(p.edb)
     fwd = {f[1][1] for f in ENGINE.closure(edb)[0] if f[0] == "far" and f[1][0] == p.head}
@@ -106,6 +122,8 @@ def cmd_selftest(_args):
         # rejects: checking a non-fact, deriving from unknown bodies, answering with no derivation
         st2 = chk.new_state(kp.goal[1], kp.edb, goal_pred=kp.goal[0])
         assert not chk.step(st2, "check", kp.goal, ())              # the goal is not an EDB fact
+        first_think = next(ln for ln in lines if ln[0] == "think")
+        assert not chk.step(st2, *first_think), "think before check must not see oracle facts"
         assert not chk.step(st2, *lines[-1])                        # conclusion before its premises
         assert not chk.valid_answer(st2, kp.answer)                 # nothing derived yet
         # render/parse roundtrip incl. aux alignment under the NL surface
@@ -296,6 +314,8 @@ def cmd_train(args):
         cfg.loops = args.loops
     if args.deep_frac:
         cfg.deep_frac = args.deep_frac
+    cfg.deep_preds = tuple(p.strip() for p in args.deep_preds.split(",") if p.strip()) \
+        if args.deep_preds else ()
     if args.pos:
         cfg.pos_mode = args.pos
     if args.test_names_n:
@@ -410,6 +430,8 @@ def main(argv=None):
     p.add_argument("--examples", type=int, default=0)
     p.add_argument("--loops", type=int, default=0)
     p.add_argument("--deep-frac", type=float, default=0.0, dest="deep_frac")
+    p.add_argument("--deep-preds", default="", dest="deep_preds",
+                   help="restrict DEEP-regime query types, e.g. ancestor or ancestor,older_by")
     p.add_argument("--pos", choices=("rope", "none"), help="position mode (none = NoPE)")
     p.add_argument("--test-names", type=int, default=0, dest="test_names_n",
                    help="test name-pool size (length-gen: must cover EVAL depth, 2k+16)")

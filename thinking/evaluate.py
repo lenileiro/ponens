@@ -44,6 +44,9 @@ def evaluate(runtime: FlowRuntime, trainer, mode="verified", hops=None, n=None, 
                         budget = cfg.block - (26 * k + 96 if k >= 4 else 96)   # room for the trace
                         if plen <= budget:
                             break
+                    else:
+                        skipped += 1
+                        continue
                 else:
                     p = world.sample(k, rng)
             except RuntimeError:                       # no problem at this depth/split
@@ -105,9 +108,15 @@ def evaluate(runtime: FlowRuntime, trainer, mode="verified", hops=None, n=None, 
                 r = runtime.run(p, verify=(mode == "verified"))
                 pred, inval, res = r.answer, inval + r.n_invalid, res + r.n_resampled
             correct += (pred == p.answer)
-        done = max(1, N - skipped)
+        done = N - skipped
+        if done == 0:
+            out[k] = {"acc": 0.0, "invalid_per_ex": 0.0, "resampled_per_ex": 0.0,
+                      "n": 0, "skipped": skipped}
+            log.info("k=%-3d %s/%s skipped all %d examples (context budget too small)",
+                     k, mode, split, skipped)
+            continue
         out[k] = {"acc": correct / done, "invalid_per_ex": inval / done,
-                  "resampled_per_ex": res / done, "n": done}
+                  "resampled_per_ex": res / done, "n": done, "skipped": skipped}
         log.info("k=%-3d %s/%s acc %.2f (inval/ex %.1f, resamp/ex %.1f, n=%d)",
                  k, mode, split, out[k]["acc"], out[k]["invalid_per_ex"],
                  out[k]["resampled_per_ex"], done)
