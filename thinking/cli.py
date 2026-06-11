@@ -204,6 +204,13 @@ def cmd_selftest(_args):
     for ln in lines:
         assert chk.step(st, *ln)
     assert chk.valid_answer(st, "ancestor")
+    anc = [ln for ln in lines if ln[0] == "think" and ln[1][0] == "ancestor"]
+    assert len(anc) == 30 and anc[-1][1] == kp.goal, "ancestor trace must reach target linearly"
+    assert all(ln[1][1][0] == kp.goal[1][0] for ln in anc), \
+        "ancestor trace must keep the question head as the forward frontier anchor"
+    assert anc[0][2][0][0] == "parent" and all(ln[2][0][0] == "ancestor" and
+                                                ln[2][1][0] == "parent" for ln in anc[1:]), \
+        "ancestor trace must be forward-recursive: ancestor(x,y) + parent(y,z)"
     ex = render_goal_example(kp, lines, TEMPLATES, QUESTION, _np.random.default_rng(9))
     assert len(ex.tokens) <= 96 * 30, f"depth-30 example {len(ex.tokens)} tokens > block budget"
     # chronology is consistent: every child born after its parent, death after birth

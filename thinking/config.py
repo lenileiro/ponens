@@ -20,7 +20,8 @@ class Config:
     #                                   never queried in training; their COMPONENT rules are (via
     #                                   the gender-mirrored targets) -- tests unseen composition
     deep_depth: int = 0               # kinship: >0 mixes deep spines, depths 4..N
-    deep_frac: float = 0.5            # deep share of QA examples (0.5 starved shallow at 15k -- C4)
+    deep_frac: float = 0.3            # deep share of QA examples (0.5 starved shallow at 15k -- C4;
+    #                                   0.3 kept shallow alive while preserving deep signal -- C5)
     extract_frac: float = 0.25        # fraction of training examples that are READING tasks
     #                                   (NL surface -> exhaustive canonical fact list)
     lang_level: str = "mix"           # surface curriculum target: preschool..scholar|mix

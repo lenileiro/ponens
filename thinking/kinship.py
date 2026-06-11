@@ -40,11 +40,13 @@ RULES = [
                                 ("sibling", ("?p", "?z"))]),
     (("niece", ("?x", "?z")), [("sister", ("?x", "?w")), ("parent", ("?p", "?x")),
                                ("sibling", ("?p", "?z"))]),
-    # DEEP recursion: the relation that spans arbitrarily many generations. Right-recursive so the
-    # goal-directed decomposition walks DOWN one generation per think-line (the new person first
-    # appears in the parent body atom -- a context lookup).
+    # DEEP recursion: the relation that spans arbitrarily many generations. Keep both recursive
+    # directions valid, but train the deep generator on the forward rule below. The forward form is
+    # the length-generalizing one for evidence-first traces: start at the question head, extend the
+    # verified frontier by one parent edge, repeat.
     (("ancestor", ("?x", "?y")), [("parent", ("?x", "?y"))]),
     (("ancestor", ("?x", "?z")), [("parent", ("?x", "?y")), ("ancestor", ("?y", "?z"))]),
+    (("ancestor", ("?x", "?z")), [("ancestor", ("?x", "?y")), ("parent", ("?y", "?z"))]),
 ]
 ENGINE = Datalog(RULES)
 
@@ -455,14 +457,16 @@ class FamilyWorld:
         lines = []
         if q == "ancestor":
             x, z = spine[0], spine[-1]
-            for i in range(depth - 1, -1, -1):           # EVIDENCE-FIRST: derive upward
+            frontier = None
+            for i in range(depth):                       # EVIDENCE-FIRST: walk forward
                 pl, par = dparent(i)
                 lines += pl
-                anc = ("ancestor", (spine[i], z))
-                if i < depth - 1:
-                    lines.append(("think", anc, (par, ("ancestor", (spine[i + 1], z)))))
-                else:
+                anc = ("ancestor", (x, spine[i + 1]))
+                if frontier is None:
                     lines.append(("think", anc, (par,)))
+                else:
+                    lines.append(("think", anc, (frontier, par)))
+                frontier = anc
         elif q in ("grandmother", "grandfather"):
             x, z = spine[site], spine[site + 2]
             f = (P(site), (spine[site], spine[site + 1]))
