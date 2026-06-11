@@ -108,6 +108,7 @@ def payload(args):
                      f"--roundtrip-samples {args.image_roundtrip_samples} "
                      f"--flow-semantic-w {args.image_flow_semantic_w} "
                      f"--flow-ema-decay {args.image_flow_ema_decay} "
+                     f"--ema-eval-mode {args.image_ema_eval_mode} "
                      f"--time-sampling {args.image_time_sampling} "
                      f"--time-logit-mean {args.image_time_logit_mean} "
                      f"--time-logit-std {args.image_time_logit_std} "
@@ -118,6 +119,7 @@ def payload(args):
                 train += f" --prompt-templates {shlex_quote(args.image_prompt_templates)}"
             if args.image_eval_sweep:
                 train += (f" && {IL} --eval-checkpoint {ckpt} "
+                          f"--checkpoint-weight-mode {args.image_checkpoint_weight_mode} "
                           f"--cfg-scales {shlex_quote(args.image_cfg_sweep)} "
                           f"--sample-steps-list {shlex_quote(args.image_sample_steps_sweep)} "
                           f"--eval-seeds {shlex_quote(args.image_eval_seeds)} "
@@ -370,6 +372,9 @@ def main():
     ap.add_argument("--image-flow-ema-decay", type=float, default=0.0,
                     dest="image_flow_ema_decay",
                     help="EMA decay for latent image flow/conditioner weights")
+    ap.add_argument("--image-ema-eval-mode", default="auto",
+                    choices=("raw", "ema", "auto"), dest="image_ema_eval_mode",
+                    help="latent image train-report weight mode")
     ap.add_argument("--image-no-ema-warmup", action="store_true",
                     dest="image_no_ema_warmup",
                     help="use exact image EMA decay from the first update")
@@ -384,6 +389,9 @@ def main():
                     help="stddev for --image-time-sampling logit-normal")
     ap.add_argument("--image-eval-sweep", action="store_true", dest="image_eval_sweep",
                     help="after latent training, sweep CFG and sampler steps from the checkpoint")
+    ap.add_argument("--image-checkpoint-weight-mode", default="auto",
+                    choices=("raw", "ema", "auto"), dest="image_checkpoint_weight_mode",
+                    help="latent image checkpoint sweep weight mode")
     ap.add_argument("--image-cfg-sweep", default="1.0,1.25,1.5,2.0",
                     dest="image_cfg_sweep",
                     help="comma-separated CFG scales for --image-eval-sweep")

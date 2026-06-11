@@ -925,6 +925,51 @@ SWEEP_METRICS = (
 )
 
 
+EVAL_WEIGHT_MODES = ("raw", "ema", "auto")
+
+
+def report_selection_key(report):
+    inf = 1.0e30
+    return (
+        float(report.get("sample_roundtrip_both_acc", 0.0)),
+        float(report.get("sample_roundtrip_shape_acc", 0.0)),
+        float(report.get("sample_roundtrip_color_acc", 0.0)),
+        -float(report.get("conditional_sample_mse", inf)),
+        -float(report.get("sample_center_target_mse", inf)),
+        -float(report.get("latent_velocity_mse", inf)),
+    )
+
+
+def aggregate_selection_key(report):
+    inf = 1.0e30
+    return (
+        float(report.get("sample_roundtrip_both_acc_mean", 0.0)),
+        float(report.get("sample_roundtrip_shape_acc_mean", 0.0)),
+        float(report.get("sample_roundtrip_color_acc_mean", 0.0)),
+        -float(report.get("conditional_sample_mse_mean", inf)),
+        -float(report.get("sample_center_target_mse_mean", inf)),
+        -float(report.get("latent_velocity_mse_mean", inf)),
+    )
+
+
+def eval_report_summary(report):
+    keys = (
+        "eval_weight_mode",
+        "cfg_scale",
+        "sample_steps",
+        "sample_roundtrip_n",
+        "sample_roundtrip_color_acc",
+        "sample_roundtrip_shape_acc",
+        "sample_roundtrip_both_acc",
+        "conditional_sample_mse",
+        "sample_center_target_mse",
+        "latent_velocity_mse",
+        "latent_color_acc",
+        "latent_shape_acc",
+    )
+    return {k: report[k] for k in keys if k in report}
+
+
 def aggregate_sweep_rows(rows):
     grouped = {}
     for row in rows:
@@ -951,39 +996,64 @@ def aggregate_sweep_rows(rows):
 
 def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         n=128, batch=64, seed=10, eval_seeds=None, size=32, device=DEV,
-                        roundtrip_samples=1, prefer_ema=True):
-    ae, flow, conditioner, prompt_vocab, prompt_templates, meta = load_checkpoint(path,
-                                                                                  device=device,
-                                                                                  prefer_ema=prefer_ema)
+                        roundtrip_samples=1, prefer_ema=True, weight_mode=None):
+    if weight_mode is None:
+        weight_mode = "ema" if prefer_ema else "raw"
+    if weight_mode not in EVAL_WEIGHT_MODES:
+        raise ValueError(f"unknown checkpoint weight mode {weight_mode!r}")
     eval_seeds = tuple(eval_seeds) if eval_seeds is not None else (seed,)
-    rows = []
-    for eval_seed in eval_seeds:
-        for row in sampler_sweep(ae, flow, cfg_scales=cfg_scales,
-                                 sample_steps_list=sample_steps_list, n=n, batch=batch,
-                                 seed=int(eval_seed), size=size, device=device,
-                                 roundtrip_samples=roundtrip_samples,
-                                 cond_mode=meta["cond_mode"], conditioner=conditioner,
-                                 prompt_vocab=prompt_vocab,
-                                 prompt_templates=prompt_templates):
-            row["eval_seed"] = int(eval_seed)
-            rows.append(row)
-    aggregate = aggregate_sweep_rows(rows)
-    best = max(aggregate, key=lambda r: (
-        r["sample_roundtrip_both_acc_mean"],
-        r["sample_roundtrip_shape_acc_mean"],
-        r["sample_roundtrip_color_acc_mean"],
-        -r["conditional_sample_mse_mean"],
-    ))
-    return {
-        "experiment": "image_latent_sampler_sweep",
-        **meta,
-        "n": int(n),
-        "roundtrip_samples": int(roundtrip_samples),
-        "eval_seeds": [int(s) for s in eval_seeds],
-        "rows": rows,
-        "aggregate": aggregate,
-        "best": best,
+
+    def run_mode(mode):
+        ae, flow, conditioner, prompt_vocab, prompt_templates, meta = load_checkpoint(
+            path, device=device, prefer_ema=(mode == "ema"))
+        actual_mode = "ema" if meta["ema_loaded"] else "raw"
+        rows = []
+        for eval_seed in eval_seeds:
+            for row in sampler_sweep(ae, flow, cfg_scales=cfg_scales,
+                                     sample_steps_list=sample_steps_list, n=n, batch=batch,
+                                     seed=int(eval_seed), size=size, device=device,
+                                     roundtrip_samples=roundtrip_samples,
+                                     cond_mode=meta["cond_mode"], conditioner=conditioner,
+                                     prompt_vocab=prompt_vocab,
+                                     prompt_templates=prompt_templates):
+                row["eval_seed"] = int(eval_seed)
+                row["checkpoint_weight_mode"] = actual_mode
+                rows.append(row)
+        aggregate = aggregate_sweep_rows(rows)
+        best = max(aggregate, key=aggregate_selection_key)
+        return {
+            "experiment": "image_latent_sampler_sweep",
+            **meta,
+            "checkpoint_weight_mode": actual_mode,
+            "requested_checkpoint_weight_mode": weight_mode,
+            "selected_checkpoint_weights": actual_mode,
+            "n": int(n),
+            "roundtrip_samples": int(roundtrip_samples),
+            "eval_seeds": [int(s) for s in eval_seeds],
+            "rows": rows,
+            "aggregate": aggregate,
+            "best": best,
+        }
+
+    if weight_mode != "auto":
+        return run_mode(weight_mode)
+
+    candidates = {"raw": run_mode("raw")}
+    if candidates["raw"]["ema_available"]:
+        candidates["ema"] = run_mode("ema")
+    selected = max(candidates, key=lambda mode: aggregate_selection_key(candidates[mode]["best"]))
+    report = candidates[selected]
+    report["requested_checkpoint_weight_mode"] = "auto"
+    report["selected_checkpoint_weights"] = selected
+    report["weight_eval_candidates"] = {
+        mode: {
+            "checkpoint_weight_mode": candidate["checkpoint_weight_mode"],
+            "ema_loaded": candidate["ema_loaded"],
+            "best": candidate["best"],
+        }
+        for mode, candidate in candidates.items()
     }
+    return report
 
 
 def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidden=64,
@@ -994,7 +1064,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0,
                       flow_ema_decay=0.0, flow_ema_warmup=True, eval_with_ema=True,
-                      return_conditioner=False, return_ema=False):
+                      eval_weight_mode="auto", return_conditioner=False, return_ema=False):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     if cond_mode not in ("facts", "text"):
@@ -1003,6 +1073,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
     if flow_ema_decay < 0.0 or flow_ema_decay >= 1.0:
         raise ValueError("flow_ema_decay must be in [0, 1)")
+    if eval_weight_mode not in EVAL_WEIGHT_MODES:
+        raise ValueError(f"unknown eval weight mode {eval_weight_mode!r}")
     prompt_vocab = build_prompt_vocab(prompt_templates) if cond_mode == "text" else None
     cond_dim = len(FACT_VOCAB)
     conditioner = None
@@ -1069,22 +1141,38 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
 
     if conditioner is not None:
         conditioner.eval()
-    eval_ema = bool(flow_ema is not None and eval_with_ema)
-    raw_flow = raw_conditioner = None
-    if eval_ema:
-        raw_flow = clone_state_dict(flow)
-        load_flow_state(flow, flow_ema)
-        if conditioner is not None:
-            raw_conditioner = clone_state_dict(conditioner)
-            conditioner.load_state_dict(conditioner_ema)
-    report = evaluate(ae, flow, seed=seed + 1, size=size, device=device, cfg_scale=cfg_scale,
-                      sample_steps=sample_steps, roundtrip_samples=roundtrip_samples,
-                      cond_mode=cond_mode, conditioner=conditioner, prompt_vocab=prompt_vocab,
-                      prompt_templates=prompt_templates)
-    if eval_ema:
-        load_flow_state(flow, raw_flow)
-        if conditioner is not None:
-            conditioner.load_state_dict(raw_conditioner)
+    raw_flow = clone_state_dict(flow)
+    raw_conditioner = clone_state_dict(conditioner) if conditioner is not None else None
+    requested_eval_weight_mode = "raw" if not eval_with_ema else eval_weight_mode
+    if requested_eval_weight_mode == "auto":
+        candidate_modes = ["raw"] + (["ema"] if flow_ema is not None else [])
+    elif requested_eval_weight_mode == "ema" and flow_ema is None:
+        candidate_modes = ["raw"]
+    else:
+        candidate_modes = [requested_eval_weight_mode]
+    candidate_reports = {}
+    for mode in candidate_modes:
+        if mode == "ema":
+            load_flow_state(flow, flow_ema)
+            if conditioner is not None:
+                conditioner.load_state_dict(conditioner_ema)
+        else:
+            load_flow_state(flow, raw_flow)
+            if conditioner is not None:
+                conditioner.load_state_dict(raw_conditioner)
+        candidate = evaluate(ae, flow, seed=seed + 1, size=size, device=device,
+                             cfg_scale=cfg_scale, sample_steps=sample_steps,
+                             roundtrip_samples=roundtrip_samples, cond_mode=cond_mode,
+                             conditioner=conditioner, prompt_vocab=prompt_vocab,
+                             prompt_templates=prompt_templates)
+        candidate["eval_weight_mode"] = mode
+        candidate_reports[mode] = candidate
+    selected_eval_weights = max(candidate_reports, key=lambda mode: report_selection_key(
+        candidate_reports[mode]))
+    report = dict(candidate_reports[selected_eval_weights])
+    load_flow_state(flow, raw_flow)
+    if conditioner is not None:
+        conditioner.load_state_dict(raw_conditioner)
     report.update({
         "experiment": "image3_latent_fact_conditioned_rectified_flow",
         "ae_steps": int(ae_steps),
@@ -1105,7 +1193,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_ema_updates": int(ema_updates),
         "flow_ema_effective_decay": float(last_ema_decay),
         "ema_available": flow_ema is not None,
-        "eval_with_ema": eval_ema,
+        "eval_weight_mode": requested_eval_weight_mode,
+        "selected_eval_weights": selected_eval_weights,
+        "eval_with_ema": selected_eval_weights == "ema",
+        "weight_eval_candidates": {
+            mode: eval_report_summary(candidate)
+            for mode, candidate in candidate_reports.items()
+        },
         "time_sampling": time_sampling,
         "time_logit_mean": float(time_logit_mean),
         "time_logit_std": float(time_logit_std),
@@ -1184,7 +1278,11 @@ def selftest():
     assert report5["flow_arch"] == "mmdit" and flow_uses_cond_tokens(flow5)
     assert report5["adaptive_modulation"] is True
     assert report5["residual_gating"] is True
-    assert report5["ema_available"] is True and report5["eval_with_ema"] is True
+    assert report5["ema_available"] is True
+    assert report5["eval_weight_mode"] == "auto"
+    assert report5["selected_eval_weights"] in ("raw", "ema")
+    assert report5["eval_with_ema"] == (report5["selected_eval_weights"] == "ema")
+    assert set(report5["weight_eval_candidates"]) == {"raw", "ema"}
     assert report5["flow_ema_warmup"] is True and report5["flow_ema_effective_decay"] < 0.5
     legacy_state = {k: v for k, v in flow5.state_dict().items() if ".gate." not in k}
     compat_flow = make_flow(flow_arch="mmdit", latent_ch=4, hidden=32, dit_depth=1,
@@ -1232,8 +1330,11 @@ def main(argv=None):
                     help="EMA decay for flow/conditioner weights; 0 disables EMA")
     ap.add_argument("--no-ema-warmup", action="store_true", dest="no_ema_warmup",
                     help="use the exact EMA decay from the first update instead of ramping it")
+    ap.add_argument("--ema-eval-mode", default="auto", choices=EVAL_WEIGHT_MODES,
+                    dest="ema_eval_mode",
+                    help="which weights to use for the final train report")
     ap.add_argument("--no-ema-eval", action="store_true", dest="no_ema_eval",
-                    help="do not swap EMA weights in for the final train report")
+                    help="compatibility alias for --ema-eval-mode raw")
     ap.add_argument("--time-sampling", default="uniform", choices=("uniform", "logit-normal"),
                     dest="time_sampling",
                     help="rectified-flow training timestep distribution")
@@ -1251,8 +1352,11 @@ def main(argv=None):
     ap.add_argument("--out", default="runs/image_latent_flow.pt")
     ap.add_argument("--eval-out", default="", dest="eval_out",
                     help="JSON path for --eval-checkpoint report")
+    ap.add_argument("--checkpoint-weight-mode", default="auto", choices=EVAL_WEIGHT_MODES,
+                    dest="checkpoint_weight_mode",
+                    help="which checkpoint weights to sweep: raw, ema, or measured auto-select")
     ap.add_argument("--no-ema-checkpoint", action="store_true", dest="no_ema_checkpoint",
-                    help="for --eval-checkpoint, evaluate raw checkpoint weights even if EMA exists")
+                    help="compatibility alias for --checkpoint-weight-mode raw")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest()
@@ -1266,6 +1370,7 @@ def main(argv=None):
             eval_seeds=(_parse_number_list(args.eval_seeds, int) if args.eval_seeds else None),
             roundtrip_samples=args.roundtrip_samples,
             prefer_ema=not args.no_ema_checkpoint,
+            weight_mode=("raw" if args.no_ema_checkpoint else args.checkpoint_weight_mode),
         )
         if args.eval_out:
             os.makedirs(os.path.dirname(args.eval_out) or ".", exist_ok=True)
@@ -1291,6 +1396,7 @@ def main(argv=None):
         time_logit_std=args.time_logit_std, flow_ema_decay=args.flow_ema_decay,
         flow_ema_warmup=not args.no_ema_warmup,
         eval_with_ema=not args.no_ema_eval,
+        eval_weight_mode=("raw" if args.no_ema_eval else args.ema_eval_mode),
         return_conditioner=True, return_ema=True)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save({
@@ -1312,6 +1418,8 @@ def main(argv=None):
         "flow_ema_decay": args.flow_ema_decay,
         "flow_ema_warmup": not args.no_ema_warmup,
         "flow_ema_effective_decay": report.get("flow_ema_effective_decay", 0.0),
+        "eval_weight_mode": report.get("eval_weight_mode", "raw"),
+        "selected_eval_weights": report.get("selected_eval_weights", "raw"),
         "time_sampling": args.time_sampling,
         "time_logit_mean": args.time_logit_mean,
         "time_logit_std": args.time_logit_std,

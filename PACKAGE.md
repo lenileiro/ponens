@@ -315,6 +315,12 @@ Image-15 fixes the short-run EMA failure found on the first MMDiT text GPU smoke
 schedule that ramps toward the requested decay, records the effective decay in reports/checkpoints,
 and keeps `--no-ema-warmup` / `--image-no-ema-warmup` for exact-decay ablations.
 
+Image-16 makes raw-vs-EMA evaluation measured instead of assumed. Train reports and
+`--eval-checkpoint` now support `raw`, `ema`, and `auto` weight modes; `auto` evaluates the available
+weight candidates and selects by the existing semantic round-trip / MSE sweep score. This prevents a
+short-run EMA checkpoint from hiding a faster-learning raw model while still allowing EMA to win when
+the metrics support it.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
