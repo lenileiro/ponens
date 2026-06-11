@@ -152,6 +152,7 @@ python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --ae-steps 400 --flow-steps 400 --cond-drop 0.1 --cfg-scale 1.5 \
     --sample-steps 8 --flow-semantic-w 0.25 --time-sampling logit-normal \
     --flow-ema-decay 0.999 --ae-intervention-w 0.1 --ae-factor-orth-w 0.05 \
+    --semantic-guidance-w 2.0 \
     --out runs/image_latent_mmdit_text.pt
 python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
@@ -168,7 +169,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-sample-steps 8 --image-flow-semantic-w 0.25 \
     --image-time-sampling logit-normal --image-flow-ema-decay 0.999 \
     --image-ae-intervention-w 0.1 --image-ae-factor-orth-w 0.05 \
-    --image-eval-sweep --fast --go
+    --image-semantic-guidance-w 2.0 --image-eval-sweep --fast --go
 ```
 
 `thinking.image2` is the head-aware FER experiment: shared factored heads vs explicit
@@ -350,6 +351,15 @@ the pressure is over `FACT_VOCAB` groups rather than color/shape rules. A 60/10-
 reduced eval `latent_factor_orth_loss` from **0.156 -> 0.131** with comparable reconstruction MSE;
 the tiny intervention score did not move, so this is a representation-health knob to combine with
 the intervention loss on the next H100 run, not yet a standalone quality claim.
+
+Image-21 adds sampling-time semantic guidance (`--semantic-guidance-w`; RunPod:
+`--image-semantic-guidance-w`). It is classifier-style guidance, but the classifier is the learned
+semantic AE itself: each Euler step can take a normalized gradient through either latent heads or
+decode/re-read heads toward the requested canonical facts. On the fetched H100 MMDiT text checkpoint,
+decoded guidance at `w=2.0`, `cfg=1.5`, `steps=4`, seeds `{1,2,3}` moves generated shape/both
+round-trip accuracy from **0.800 -> 0.978** while color stays **1.00**; conditional sample MSE moves
+from **0.0509 -> 0.0562**. This directly attacks the remaining shape-fidelity gap without adding
+renderer rules.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

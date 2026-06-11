@@ -105,6 +105,8 @@ def payload(args):
                      f"--cond-drop {args.image_cond_drop} "
                      f"--cfg-scale {args.image_cfg_scale} "
                      f"--sample-steps {args.image_sample_steps} "
+                     f"--semantic-guidance-w {args.image_semantic_guidance_w} "
+                     f"--semantic-guidance-mode {args.image_semantic_guidance_mode} "
                      f"--roundtrip-samples {args.image_roundtrip_samples} "
                      f"--intervention-samples {args.image_intervention_samples} "
                      f"--ae-intervention-w {args.image_ae_intervention_w} "
@@ -125,6 +127,8 @@ def payload(args):
                           f"--checkpoint-weight-mode {args.image_checkpoint_weight_mode} "
                           f"--cfg-scales {shlex_quote(args.image_cfg_sweep)} "
                           f"--sample-steps-list {shlex_quote(args.image_sample_steps_sweep)} "
+                          f"--semantic-guidance-w {args.image_semantic_guidance_w} "
+                          f"--semantic-guidance-mode {args.image_semantic_guidance_mode} "
                           f"--eval-seeds {shlex_quote(args.image_eval_seeds)} "
                           f"--roundtrip-samples {args.image_roundtrip_samples} "
                           f"--intervention-samples {args.image_intervention_samples} "
@@ -367,6 +371,12 @@ def main():
                     help="classifier-free guidance scale for latent image sampling")
     ap.add_argument("--image-sample-steps", type=int, default=4, dest="image_sample_steps",
                     help="Euler sampling steps for latent image evaluation")
+    ap.add_argument("--image-semantic-guidance-w", type=float, default=0.0,
+                    dest="image_semantic_guidance_w",
+                    help="sampling-time semantic AE guidance weight for latent images")
+    ap.add_argument("--image-semantic-guidance-mode", default="decoded",
+                    choices=("latent", "decoded"), dest="image_semantic_guidance_mode",
+                    help="latent image semantic guidance mode")
     ap.add_argument("--image-roundtrip-samples", type=int, default=1,
                     dest="image_roundtrip_samples",
                     help="generated samples per color/shape condition during image eval")

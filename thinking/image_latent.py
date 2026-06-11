@@ -554,6 +554,13 @@ def condition_batch(cond):
     return int(condition_vector(cond).shape[0])
 
 
+def fact_condition_or_none(cond):
+    vec = condition_vector(cond)
+    if vec.ndim == 2 and vec.shape[1] == len(FACT_VOCAB):
+        return vec
+    return None
+
+
 def zero_condition(cond):
     if not isinstance(cond, dict):
         return torch.zeros_like(cond)
@@ -579,9 +586,31 @@ def condition_dropout(cond, p=0.0):
     return out
 
 
-def semantic_endpoint_loss(ae, z_clean, cond):
-    """REPA-style endpoint alignment: clean latent should decode to conditioned facts."""
-    logits = ae.fact_logits(z_clean)
+def semantic_guidance_step(ae, z, fact_cond, weight=0.0, step_size=1.0, mode="decoded",
+                           eps=1.0e-6):
+    """Classifier-style latent guidance using the learned semantic AE heads."""
+    if weight <= 0.0:
+        return z
+    if fact_cond is None:
+        raise ValueError("semantic guidance requires canonical fact conditions")
+    if mode not in ("latent", "decoded"):
+        raise ValueError(f"unknown semantic guidance mode {mode!r}")
+    z_var = z.detach().requires_grad_(True)
+    with torch.enable_grad():
+        if mode == "latent":
+            logits = ae.fact_logits(z_var)
+        else:
+            logits = ae(ae.decode(z_var))                  # decode/re-read, matching eval
+        loss, _parts = semantic_fact_loss_from_logits(logits, fact_cond,
+                                                      suffix="_guidance_ce")
+        grad = torch.autograd.grad(loss, z_var, allow_unused=False)[0]
+    flat = grad.flatten(1)
+    denom = flat.norm(dim=1).view((-1,) + (1,) * (grad.ndim - 1)).clamp_min(float(eps))
+    guided = z_var - float(weight) * float(step_size) * grad / denom
+    return guided.detach()
+
+
+def semantic_fact_loss_from_logits(logits, cond, suffix="_endpoint_ce"):
     losses = {}
     for pred, idxs in FACT_GROUPS.items():
         if pred not in logits:
@@ -598,10 +627,16 @@ def semantic_endpoint_loss(ae, z_clean, cond):
         target = group[active].argmax(dim=1)
         losses[pred] = F.cross_entropy(logits[pred][active], target)
     if not losses:
-        return z_clean.sum() * 0.0, {}
+        zero = sum(v.sum() for v in logits.values()) * 0.0
+        return zero, {}
     loss = sum(losses.values()) / len(losses)
-    parts = {f"{pred}_endpoint_ce": val.detach() for pred, val in losses.items()}
+    parts = {f"{pred}{suffix}": val.detach() for pred, val in losses.items()}
     return loss, parts
+
+
+def semantic_endpoint_loss(ae, z_clean, cond):
+    """REPA-style endpoint alignment: clean latent should decode to conditioned facts."""
+    return semantic_fact_loss_from_logits(ae.fact_logits(z_clean), cond)
 
 
 def fact_targets_from_condition(cond):
@@ -913,22 +948,35 @@ def guided_velocity(flow, z, t, cond, cfg_scale=1.0):
 
 @torch.no_grad()
 def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0,
-                   cfg_scale=1.0):
+                   cfg_scale=1.0, ae=None, semantic_cond=None, semantic_guidance_w=0.0,
+                   semantic_guidance_mode="decoded"):
     batch = condition_batch(cond)
     z = _seeded_randn((batch,) + tuple(latent_shape), device=device, seed=seed)
     flow.eval()
+    if ae is not None:
+        ae.eval()
+    if semantic_cond is None:
+        semantic_cond = fact_condition_or_none(cond)
+    if semantic_guidance_w > 0.0 and ae is None:
+        raise ValueError("semantic guidance requires ae")
     dt = 1.0 / max(1, steps)
     for i in range(steps):
         t = torch.full((batch, 1, 1, 1), i / max(1, steps), device=device)
         z = z + dt * guided_velocity(flow, z, t, cond, cfg_scale=cfg_scale)
+        if semantic_guidance_w > 0.0:
+            z = semantic_guidance_step(ae, z, semantic_cond, weight=semantic_guidance_w,
+                                       step_size=dt, mode=semantic_guidance_mode)
     return z
 
 
 @torch.no_grad()
 def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0,
-                  cfg_scale=1.0):
+                  cfg_scale=1.0, semantic_cond=None, semantic_guidance_w=0.0,
+                  semantic_guidance_mode="decoded"):
     z = sample_latents(flow, cond, latent_shape=latent_shape, steps=steps, device=device,
-                       seed=seed, cfg_scale=cfg_scale)
+                       seed=seed, cfg_scale=cfg_scale, ae=ae, semantic_cond=semantic_cond,
+                       semantic_guidance_w=semantic_guidance_w,
+                       semantic_guidance_mode=semantic_guidance_mode)
     ae.eval()
     return ae.decode(z).clamp(-1.0, 1.0)
 
@@ -936,7 +984,8 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
 @torch.no_grad()
 def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_steps=4,
                           samples_per_combo=1, seed=20, cond_mode="facts", conditioner=None,
-                          prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES):
+                          prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
+                          semantic_guidance_w=0.0, semantic_guidance_mode="decoded"):
     """Generate from every canonical color/shape request and re-read facts from the image."""
     ae.eval()
     flow.eval()
@@ -956,7 +1005,9 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_s
                                    return_tokens=flow_uses_cond_tokens(flow))
             sample = sample_images(ae, flow, cond, latent_shape=latent_shape, steps=sample_steps,
                                    device=device, seed=seed + ci * 101 + si * 17,
-                                   cfg_scale=cfg_scale)
+                                   cfg_scale=cfg_scale, semantic_cond=fact_cond,
+                                   semantic_guidance_w=semantic_guidance_w,
+                                   semantic_guidance_mode=semantic_guidance_mode)
             out = ae(sample)
             pc = out["color"].argmax(-1)
             ps = out["shape"].argmax(-1)
@@ -985,7 +1036,8 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_s
 def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=1.0,
              sample_steps=4, roundtrip_samples=1, cond_mode="facts", conditioner=None,
              prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
-             intervention_samples=0):
+             intervention_samples=0, semantic_guidance_w=0.0,
+             semantic_guidance_mode="decoded"):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     ae.eval()
@@ -1021,7 +1073,9 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
                            prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
                            rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
     sample = sample_images(ae, flow, cond, latent_shape=(ae.latent_ch, size // 4, size // 4),
-                           steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale)
+                           steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
+                           semantic_cond=fact_cond, semantic_guidance_w=semantic_guidance_w,
+                           semantic_guidance_mode=semantic_guidance_mode)
     target = torch.tensor(render_object(spec, size=size) * 2.0 - 1.0,
                           dtype=torch.float32, device=device)[None]
     report = {
@@ -1037,6 +1091,8 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
         "sample_center_target_mse": float(F.mse_loss(sample, target).detach().cpu()),
         "cfg_scale": float(cfg_scale),
         "sample_steps": int(sample_steps),
+        "semantic_guidance_w": float(semantic_guidance_w),
+        "semantic_guidance_mode": semantic_guidance_mode,
     }
     if factor_orth_losses:
         report.update({
@@ -1049,7 +1105,9 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
                                         samples_per_combo=roundtrip_samples, seed=seed + 17,
                                         cond_mode=cond_mode, conditioner=conditioner,
                                         prompt_vocab=prompt_vocab,
-                                        prompt_templates=prompt_templates))
+                                        prompt_templates=prompt_templates,
+                                        semantic_guidance_w=semantic_guidance_w,
+                                        semantic_guidance_mode=semantic_guidance_mode))
     if intervention_samples:
         report.update(latent_intervention_diagnostic(
             ae, n=intervention_samples, batch=batch, seed=seed + 31, size=size, device=device))
@@ -1159,7 +1217,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
 def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                   n=128, batch=64, seed=10, size=32, device=DEV, roundtrip_samples=1,
                   cond_mode="facts", conditioner=None, prompt_vocab=None,
-                  prompt_templates=DEFAULT_PROMPT_TEMPLATES):
+                  prompt_templates=DEFAULT_PROMPT_TEMPLATES, semantic_guidance_w=0.0,
+                  semantic_guidance_mode="decoded"):
     rows = []
     for cfg_scale in cfg_scales:
         for sample_steps in sample_steps_list:
@@ -1167,7 +1226,9 @@ def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                            cfg_scale=float(cfg_scale), sample_steps=int(sample_steps),
                            roundtrip_samples=roundtrip_samples, cond_mode=cond_mode,
                            conditioner=conditioner, prompt_vocab=prompt_vocab,
-                           prompt_templates=prompt_templates)
+                           prompt_templates=prompt_templates,
+                           semantic_guidance_w=semantic_guidance_w,
+                           semantic_guidance_mode=semantic_guidance_mode)
             row["sweep_key"] = f"cfg={float(cfg_scale):g};steps={int(sample_steps)}"
             rows.append(row)
     return rows
@@ -1215,6 +1276,8 @@ def eval_report_summary(report):
         "eval_weight_mode",
         "cfg_scale",
         "sample_steps",
+        "semantic_guidance_w",
+        "semantic_guidance_mode",
         "sample_roundtrip_n",
         "sample_roundtrip_color_acc",
         "sample_roundtrip_shape_acc",
@@ -1263,7 +1326,8 @@ def aggregate_sweep_rows(rows):
 def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         n=128, batch=64, seed=10, eval_seeds=None, size=32, device=DEV,
                         roundtrip_samples=1, prefer_ema=True, weight_mode=None,
-                        intervention_samples=0):
+                        intervention_samples=0, semantic_guidance_w=0.0,
+                        semantic_guidance_mode="decoded"):
     if weight_mode is None:
         weight_mode = "ema" if prefer_ema else "raw"
     if weight_mode not in EVAL_WEIGHT_MODES:
@@ -1282,7 +1346,9 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                                      roundtrip_samples=roundtrip_samples,
                                      cond_mode=meta["cond_mode"], conditioner=conditioner,
                                      prompt_vocab=prompt_vocab,
-                                     prompt_templates=prompt_templates):
+                                     prompt_templates=prompt_templates,
+                                     semantic_guidance_w=semantic_guidance_w,
+                                     semantic_guidance_mode=semantic_guidance_mode):
                 row["eval_seed"] = int(eval_seed)
                 row["checkpoint_weight_mode"] = actual_mode
                 rows.append(row)
@@ -1296,6 +1362,8 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             "selected_checkpoint_weights": actual_mode,
             "n": int(n),
             "roundtrip_samples": int(roundtrip_samples),
+            "semantic_guidance_w": float(semantic_guidance_w),
+            "semantic_guidance_mode": semantic_guidance_mode,
             "eval_seeds": [int(s) for s in eval_seeds],
             "rows": rows,
             "aggregate": aggregate,
@@ -1336,6 +1404,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0,
                       ae_intervention_w=0.0, ae_factor_orth_w=0.0,
+                      semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
                       flow_ema_decay=0.0, flow_ema_warmup=True, eval_with_ema=True,
                       eval_weight_mode="auto", intervention_samples=32,
                       return_conditioner=False, return_ema=False):
@@ -1349,6 +1418,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("ae_intervention_w must be non-negative")
     if ae_factor_orth_w < 0.0:
         raise ValueError("ae_factor_orth_w must be non-negative")
+    if semantic_guidance_w < 0.0:
+        raise ValueError("semantic_guidance_w must be non-negative")
+    if semantic_guidance_mode not in ("latent", "decoded"):
+        raise ValueError(f"unknown semantic guidance mode {semantic_guidance_mode!r}")
     if flow_ema_decay < 0.0 or flow_ema_decay >= 1.0:
         raise ValueError("flow_ema_decay must be in [0, 1)")
     if eval_weight_mode not in EVAL_WEIGHT_MODES:
@@ -1453,7 +1526,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                              roundtrip_samples=roundtrip_samples, cond_mode=cond_mode,
                              conditioner=conditioner, prompt_vocab=prompt_vocab,
                              prompt_templates=prompt_templates,
-                             intervention_samples=intervention_samples)
+                             intervention_samples=intervention_samples,
+                             semantic_guidance_w=semantic_guidance_w,
+                             semantic_guidance_mode=semantic_guidance_mode)
         candidate["eval_weight_mode"] = mode
         candidate_reports[mode] = candidate
     selected_eval_weights = max(candidate_reports, key=lambda mode: report_selection_key(
@@ -1478,6 +1553,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "ae_intervention_w": float(ae_intervention_w),
         "ae_factor_orth_w": float(ae_factor_orth_w),
         "cond_drop": float(cond_drop),
+        "semantic_guidance_w": float(semantic_guidance_w),
+        "semantic_guidance_mode": semantic_guidance_mode,
         "flow_semantic_w": float(flow_semantic_w),
         "flow_ema_decay": float(flow_ema_decay),
         "flow_ema_warmup": bool(flow_ema_warmup),
@@ -1526,6 +1603,10 @@ def selftest():
     img = sample_images(ae, flow, cond, latent_shape=(4, 8, 8), steps=2, device="cpu", seed=0,
                         cfg_scale=1.5)
     assert img.shape == (1, 3, 32, 32)
+    guided_img = sample_images(ae, flow, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
+                               seed=0, cfg_scale=1.0, semantic_cond=cond,
+                               semantic_guidance_w=0.05)
+    assert guided_img.shape == (1, 3, 32, 32)
     ae2, flow2, report2 = train_latent_flow(ae_steps=1, flow_steps=1, batch=2, latent_ch=4,
                                             hidden=32, flow_arch="dit", dit_depth=1,
                                             dit_heads=2, seed=1, device="cpu", cond_drop=0.5,
@@ -1623,6 +1704,12 @@ def main(argv=None):
     ap.add_argument("--cond-drop", type=float, default=0.0, dest="cond_drop")
     ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
     ap.add_argument("--sample-steps", type=int, default=4, dest="sample_steps")
+    ap.add_argument("--semantic-guidance-w", type=float, default=0.0,
+                    dest="semantic_guidance_w",
+                    help="sampling-time semantic AE guidance weight")
+    ap.add_argument("--semantic-guidance-mode", default="decoded",
+                    choices=("latent", "decoded"), dest="semantic_guidance_mode",
+                    help="guide sampled latents using direct latent heads or decode/re-read heads")
     ap.add_argument("--cfg-scales", default="1.0,1.25,1.5,2.0", dest="cfg_scales",
                     help="comma-separated CFG scales for --eval-checkpoint")
     ap.add_argument("--sample-steps-list", default="4,8,16", dest="sample_steps_list",
@@ -1681,6 +1768,8 @@ def main(argv=None):
             prefer_ema=not args.no_ema_checkpoint,
             weight_mode=("raw" if args.no_ema_checkpoint else args.checkpoint_weight_mode),
             intervention_samples=args.intervention_samples,
+            semantic_guidance_w=args.semantic_guidance_w,
+            semantic_guidance_mode=args.semantic_guidance_mode,
         )
         if args.eval_out:
             os.makedirs(os.path.dirname(args.eval_out) or ".", exist_ok=True)
@@ -1705,6 +1794,8 @@ def main(argv=None):
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
         time_logit_std=args.time_logit_std, ae_intervention_w=args.ae_intervention_w,
         ae_factor_orth_w=args.ae_factor_orth_w,
+        semantic_guidance_w=args.semantic_guidance_w,
+        semantic_guidance_mode=args.semantic_guidance_mode,
         flow_ema_decay=args.flow_ema_decay,
         flow_ema_warmup=not args.no_ema_warmup,
         eval_with_ema=not args.no_ema_eval,
@@ -1727,6 +1818,8 @@ def main(argv=None):
         "cond_drop": args.cond_drop,
         "cfg_scale": args.cfg_scale,
         "sample_steps": args.sample_steps,
+        "semantic_guidance_w": args.semantic_guidance_w,
+        "semantic_guidance_mode": args.semantic_guidance_mode,
         "intervention_samples": args.intervention_samples,
         "ae_intervention_w": args.ae_intervention_w,
         "ae_factor_orth_w": args.ae_factor_orth_w,
