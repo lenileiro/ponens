@@ -1,0 +1,68 @@
+{
+ "experiment": "realspeech_gsc",
+ "steps": 1500,
+ "words": [
+  "bed",
+  "bird",
+  "cat",
+  "dog",
+  "down",
+  "eight",
+  "five",
+  "go",
+  "happy",
+  "house"
+ ],
+ "n_clips": 960,
+ "n_speakers": 322,
+ "arms": {
+  "factored": {
+   "seeds": [
+    {
+     "seed": 0,
+     "seen": 0.9541029207232267,
+     "holdout_speaker": 0.5311203319502075
+    },
+    {
+     "seed": 1,
+     "seen": 0.9845938375350141,
+     "holdout_speaker": 0.5894308943089431
+    },
+    {
+     "seed": 2,
+     "seen": 0.9634146341463414,
+     "holdout_speaker": 0.581081081081081
+    }
+   ],
+   "seen": 0.9673704641348607,
+   "holdout_speaker": 0.5672107691134105
+  },
+  "swap": {
+   "seeds": [
+    {
+     "seed": 0,
+     "seen": 0.9666203059805285,
+     "holdout_speaker": 0.5726141078838174
+    },
+    {
+     "seed": 1,
+     "seen": 0.9929971988795518,
+     "holdout_speaker": 0.6951219512195121
+    },
+    {
+     "seed": 2,
+     "seen": 0.967479674796748,
+     "holdout_speaker": 0.6171171171171171
+    }
+   ],
+   "seen": 0.9756990598856095,
+   "holdout_speaker": 0.6282843920734823
+  }
+ },
+ "verdict": {
+  "chance": 0.1,
+  "swap_gain": 0.061073622960071794,
+  "fer_law_holds_on_real_speech": true,
+  "generalizes_to_unseen_speakers": true
+ }
+}

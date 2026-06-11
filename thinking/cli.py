@@ -402,6 +402,8 @@ def cmd_selftest(_args):
     image_latent_selftest()
     from .audio import selftest as audio_selftest
     audio_selftest()
+    from .text import selftest as text_selftest
+    text_selftest()
     from .multimodal import selftest as multimodal_selftest
     multimodal_selftest()
     print("selftest OK")

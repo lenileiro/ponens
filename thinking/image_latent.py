@@ -44,6 +44,7 @@ FACT_GROUPS = {
     for pred in sorted({fact[0] for fact in FACT_VOCAB})
 }
 SAMPLE_METHODS = ("euler", "heun")
+DEFAULT_GUIDANCE_INTERVAL = (0.0, 1.0)
 
 
 def _batch(n, rng, size=32, device=DEV, return_specs=False):
@@ -540,6 +541,31 @@ def _parse_string_list(s):
     if isinstance(s, (tuple, list)):
         return tuple(str(x).strip() for x in s if str(x).strip())
     return tuple(x.strip() for x in str(s).split(",") if x.strip())
+
+
+def _parse_interval(s):
+    vals = _parse_number_list(s, float)
+    if len(vals) != 2:
+        raise ValueError(f"expected interval start,end, got {s!r}")
+    return validate_guidance_interval(vals)
+
+
+def validate_guidance_interval(interval, name="guidance interval"):
+    start, end = (float(interval[0]), float(interval[1]))
+    if start < 0.0 or end > 1.0 or start > end:
+        raise ValueError(f"{name} must satisfy 0 <= start <= end <= 1")
+    return (start, end)
+
+
+def interval_active(t, interval):
+    start, end = validate_guidance_interval(interval)
+    t = float(t)
+    return start <= t <= end
+
+
+def format_interval(interval):
+    start, end = validate_guidance_interval(interval)
+    return f"{start:g},{end:g}"
 
 
 def _seeded_randn(shape, device, seed):
@@ -1101,7 +1127,9 @@ def guided_velocity(flow, z, t, cond, cfg_scale=1.0):
 @torch.no_grad()
 def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0,
                    cfg_scale=1.0, ae=None, semantic_cond=None, semantic_guidance_w=0.0,
-                   semantic_guidance_mode="decoded", sample_method="euler"):
+                   semantic_guidance_mode="decoded", sample_method="euler",
+                   cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
+                   semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     batch = condition_batch(cond)
     latent_stats = flow_latent_stats(flow)
     z = _seeded_randn((batch,) + tuple(latent_shape), device=device, seed=seed)
@@ -1114,18 +1142,26 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         raise ValueError("semantic guidance requires ae")
     if sample_method not in SAMPLE_METHODS:
         raise ValueError(f"unknown sample method {sample_method!r}")
+    cfg_interval = validate_guidance_interval(cfg_interval, name="cfg_interval")
+    semantic_guidance_interval = validate_guidance_interval(
+        semantic_guidance_interval, name="semantic_guidance_interval")
     dt = 1.0 / max(1, steps)
     for i in range(steps):
-        t = torch.full((batch, 1, 1, 1), i / max(1, steps), device=device)
-        v0 = guided_velocity(flow, z, t, cond, cfg_scale=cfg_scale)
+        t_scalar = i / max(1, steps)
+        t = torch.full((batch, 1, 1, 1), t_scalar, device=device)
+        step_cfg = cfg_scale if interval_active(t_scalar, cfg_interval) else 1.0
+        v0 = guided_velocity(flow, z, t, cond, cfg_scale=step_cfg)
         if sample_method == "euler":
             z = z + dt * v0
         else:
             z_pred = z + dt * v0
-            t_next = torch.full((batch, 1, 1, 1), (i + 1) / max(1, steps), device=device)
-            v1 = guided_velocity(flow, z_pred, t_next, cond, cfg_scale=cfg_scale)
+            t_next_scalar = (i + 1) / max(1, steps)
+            t_next = torch.full((batch, 1, 1, 1), t_next_scalar, device=device)
+            next_cfg = cfg_scale if interval_active(t_next_scalar, cfg_interval) else 1.0
+            v1 = guided_velocity(flow, z_pred, t_next, cond, cfg_scale=next_cfg)
             z = z + 0.5 * dt * (v0 + v1)
-        if semantic_guidance_w > 0.0:
+        if (semantic_guidance_w > 0.0
+                and interval_active(t_scalar, semantic_guidance_interval)):
             z_raw = denormalize_latent(z, latent_stats)
             z_raw = semantic_guidance_step(ae, z_raw, semantic_cond,
                                            weight=semantic_guidance_w,
@@ -1137,12 +1173,15 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
 @torch.no_grad()
 def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0,
                   cfg_scale=1.0, semantic_cond=None, semantic_guidance_w=0.0,
-                  semantic_guidance_mode="decoded", sample_method="euler"):
+                  semantic_guidance_mode="decoded", sample_method="euler",
+                  cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
+                  semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     z = sample_latents(flow, cond, latent_shape=latent_shape, steps=steps, device=device,
                        seed=seed, cfg_scale=cfg_scale, ae=ae, semantic_cond=semantic_cond,
                        semantic_guidance_w=semantic_guidance_w,
                        semantic_guidance_mode=semantic_guidance_mode,
-                       sample_method=sample_method)
+                       sample_method=sample_method, cfg_interval=cfg_interval,
+                       semantic_guidance_interval=semantic_guidance_interval)
     ae.eval()
     return ae.decode(z).clamp(-1.0, 1.0)
 
@@ -1208,6 +1247,8 @@ def save_sample_grid(ae, flow, path, size=32, device=DEV, cond_mode="facts", con
                      prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
                      cfg_scale=1.0, sample_steps=4, sample_method="euler",
                      semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
+                     cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
+                     semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                      samples_per_combo=1, seed=0):
     ae.eval()
     flow.eval()
@@ -1225,14 +1266,18 @@ def save_sample_grid(ae, flow, path, size=32, device=DEV, cond_mode="facts", con
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            semantic_cond=fact_cond, semantic_guidance_w=semantic_guidance_w,
                            semantic_guidance_mode=semantic_guidance_mode,
-                           sample_method=sample_method)
+                           sample_method=sample_method, cfg_interval=cfg_interval,
+                           semantic_guidance_interval=semantic_guidance_interval)
     meta = write_ppm_grid(sample, path, rows=rows, cols=cols)
     meta.update({
         "sample_grid_cfg_scale": float(cfg_scale),
         "sample_grid_sample_steps": int(sample_steps),
         "sample_grid_sample_method": sample_method,
+        "sample_grid_cfg_interval": list(validate_guidance_interval(cfg_interval)),
         "sample_grid_semantic_guidance_w": float(semantic_guidance_w),
         "sample_grid_semantic_guidance_mode": semantic_guidance_mode,
+        "sample_grid_semantic_guidance_interval": list(validate_guidance_interval(
+            semantic_guidance_interval)),
         "sample_grid_cond_mode": cond_mode,
         "sample_grid_seed": int(seed),
         "sample_grid_samples_per_combo": int(samples_per_combo),
@@ -1245,7 +1290,8 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_s
                           samples_per_combo=1, seed=20, cond_mode="facts", conditioner=None,
                           prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
                           semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
-                          sample_method="euler"):
+                          sample_method="euler", cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
+                          semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     """Generate from every canonical color/shape request and re-read facts from the image."""
     ae.eval()
     flow.eval()
@@ -1268,7 +1314,8 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_s
                                    cfg_scale=cfg_scale, semantic_cond=fact_cond,
                                    semantic_guidance_w=semantic_guidance_w,
                                    semantic_guidance_mode=semantic_guidance_mode,
-                                   sample_method=sample_method)
+                                   sample_method=sample_method, cfg_interval=cfg_interval,
+                                   semantic_guidance_interval=semantic_guidance_interval)
             out = ae(sample)
             pc = out["color"].argmax(-1)
             ps = out["shape"].argmax(-1)
@@ -1298,7 +1345,9 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
              sample_steps=4, roundtrip_samples=1, cond_mode="facts", conditioner=None,
              prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
              intervention_samples=0, semantic_guidance_w=0.0,
-             semantic_guidance_mode="decoded", sample_method="euler"):
+             semantic_guidance_mode="decoded", sample_method="euler",
+             cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
+             semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     ae.eval()
@@ -1337,7 +1386,8 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            semantic_cond=fact_cond, semantic_guidance_w=semantic_guidance_w,
                            semantic_guidance_mode=semantic_guidance_mode,
-                           sample_method=sample_method)
+                           sample_method=sample_method, cfg_interval=cfg_interval,
+                           semantic_guidance_interval=semantic_guidance_interval)
     target = torch.tensor(render_object(spec, size=size) * 2.0 - 1.0,
                           dtype=torch.float32, device=device)[None]
     report = {
@@ -1352,10 +1402,13 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
         "sample_max": float(sample.max().detach().cpu()),
         "sample_center_target_mse": float(F.mse_loss(sample, target).detach().cpu()),
         "cfg_scale": float(cfg_scale),
+        "cfg_interval": list(validate_guidance_interval(cfg_interval)),
         "sample_steps": int(sample_steps),
         "sample_method": sample_method,
         "semantic_guidance_w": float(semantic_guidance_w),
         "semantic_guidance_mode": semantic_guidance_mode,
+        "semantic_guidance_interval": list(validate_guidance_interval(
+            semantic_guidance_interval)),
     }
     if factor_orth_losses:
         report.update({
@@ -1371,7 +1424,9 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
                                         prompt_templates=prompt_templates,
                                         semantic_guidance_w=semantic_guidance_w,
                                         semantic_guidance_mode=semantic_guidance_mode,
-                                        sample_method=sample_method))
+                                        sample_method=sample_method,
+                                        cfg_interval=cfg_interval,
+                                        semantic_guidance_interval=semantic_guidance_interval))
     if intervention_samples:
         report.update(latent_intervention_diagnostic(
             ae, n=intervention_samples, batch=batch, seed=seed + 31, size=size, device=device))
@@ -1494,7 +1549,9 @@ def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                   cond_mode="facts", conditioner=None, prompt_vocab=None,
                   prompt_templates=DEFAULT_PROMPT_TEMPLATES, semantic_guidance_w=0.0,
                   semantic_guidance_weights=None, semantic_guidance_mode="decoded",
-                  sample_method="euler", sample_methods=None):
+                  sample_method="euler", sample_methods=None,
+                  cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
+                  semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     if semantic_guidance_weights is None:
         semantic_guidance_weights = (semantic_guidance_w,)
     if sample_methods is None:
@@ -1511,10 +1568,14 @@ def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                                    prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
                                    semantic_guidance_w=float(guidance_w),
                                    semantic_guidance_mode=semantic_guidance_mode,
-                                   sample_method=method)
+                                   sample_method=method,
+                                   cfg_interval=cfg_interval,
+                                   semantic_guidance_interval=semantic_guidance_interval)
                     row["sweep_key"] = (
                         f"cfg={float(cfg_scale):g};steps={int(sample_steps)};"
-                        f"method={method};sem={float(guidance_w):g}"
+                        f"method={method};sem={float(guidance_w):g};"
+                        f"cfgint={format_interval(cfg_interval)};"
+                        f"semint={format_interval(semantic_guidance_interval)}"
                     )
                     rows.append(row)
     return rows
@@ -1561,10 +1622,12 @@ def eval_report_summary(report):
     keys = (
         "eval_weight_mode",
         "cfg_scale",
+        "cfg_interval",
         "sample_steps",
         "sample_method",
         "semantic_guidance_w",
         "semantic_guidance_mode",
+        "semantic_guidance_interval",
         "sample_roundtrip_n",
         "sample_roundtrip_color_acc",
         "sample_roundtrip_shape_acc",
@@ -1592,21 +1655,28 @@ def aggregate_sweep_rows(rows):
         key = (float(row["cfg_scale"]), int(row["sample_steps"]),
                str(row.get("sample_method", "euler")),
                float(row.get("semantic_guidance_w", 0.0)),
-               str(row.get("semantic_guidance_mode", "decoded")))
+               str(row.get("semantic_guidance_mode", "decoded")),
+               tuple(float(x) for x in row.get("cfg_interval", DEFAULT_GUIDANCE_INTERVAL)),
+               tuple(float(x) for x in row.get("semantic_guidance_interval",
+                                                DEFAULT_GUIDANCE_INTERVAL)))
         grouped.setdefault(key, []).append(row)
     out = []
     for (cfg_scale, sample_steps, sample_method, semantic_guidance_w,
-         semantic_guidance_mode), group in sorted(grouped.items()):
+         semantic_guidance_mode, cfg_interval, semantic_guidance_interval), group in sorted(
+             grouped.items()):
         agg = {
             "sweep_key": (
                 f"cfg={cfg_scale:g};steps={sample_steps};method={sample_method};"
-                f"sem={semantic_guidance_w:g}"
+                f"sem={semantic_guidance_w:g};cfgint={format_interval(cfg_interval)};"
+                f"semint={format_interval(semantic_guidance_interval)}"
             ),
             "cfg_scale": float(cfg_scale),
+            "cfg_interval": list(cfg_interval),
             "sample_steps": int(sample_steps),
             "sample_method": sample_method,
             "semantic_guidance_w": float(semantic_guidance_w),
             "semantic_guidance_mode": semantic_guidance_mode,
+            "semantic_guidance_interval": list(semantic_guidance_interval),
             "runs": len(group),
             "eval_seeds": [int(r["eval_seed"]) for r in group if "eval_seed" in r],
         }
@@ -1625,7 +1695,9 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         roundtrip_samples=1, prefer_ema=True, weight_mode=None,
                         intervention_samples=0, semantic_guidance_w=0.0,
                         semantic_guidance_weights=None, semantic_guidance_mode="decoded",
-                        sample_method="euler", sample_methods=None):
+                        sample_method="euler", sample_methods=None,
+                        cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
+                        semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     if weight_mode is None:
         weight_mode = "ema" if prefer_ema else "raw"
     if weight_mode not in EVAL_WEIGHT_MODES:
@@ -1649,7 +1721,9 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                                      semantic_guidance_weights=semantic_guidance_weights,
                                      semantic_guidance_mode=semantic_guidance_mode,
                                      sample_method=sample_method,
-                                     sample_methods=sample_methods):
+                                     sample_methods=sample_methods,
+                                     cfg_interval=cfg_interval,
+                                     semantic_guidance_interval=semantic_guidance_interval):
                 row["eval_seed"] = int(eval_seed)
                 row["checkpoint_weight_mode"] = actual_mode
                 rows.append(row)
@@ -1665,11 +1739,14 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             "roundtrip_samples": int(roundtrip_samples),
             "sample_method": sample_method,
             "sample_methods": list(sample_methods or (sample_method,)),
+            "cfg_interval": list(validate_guidance_interval(cfg_interval)),
             "semantic_guidance_w": float(semantic_guidance_w),
             "semantic_guidance_weights": [
                 float(w) for w in (semantic_guidance_weights or (semantic_guidance_w,))
             ],
             "semantic_guidance_mode": semantic_guidance_mode,
+            "semantic_guidance_interval": list(validate_guidance_interval(
+                semantic_guidance_interval)),
             "eval_seeds": [int(s) for s in eval_seeds],
             "rows": rows,
             "aggregate": aggregate,
@@ -1704,15 +1781,20 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
 
 def selected_grid_settings(report, fallback_cfg=1.0, fallback_steps=4,
                            fallback_method="euler", fallback_semantic_w=0.0,
-                           fallback_semantic_mode="decoded"):
+                           fallback_semantic_mode="decoded",
+                           fallback_cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
+                           fallback_semantic_interval=DEFAULT_GUIDANCE_INTERVAL):
     best = report.get("best") or report
     return {
         "cfg_scale": float(best.get("cfg_scale", fallback_cfg)),
+        "cfg_interval": tuple(best.get("cfg_interval", fallback_cfg_interval)),
         "sample_steps": int(best.get("sample_steps", fallback_steps)),
         "sample_method": str(best.get("sample_method", fallback_method)),
         "semantic_guidance_w": float(best.get("semantic_guidance_w", fallback_semantic_w)),
         "semantic_guidance_mode": str(best.get("semantic_guidance_mode",
                                                fallback_semantic_mode)),
+        "semantic_guidance_interval": tuple(best.get(
+            "semantic_guidance_interval", fallback_semantic_interval)),
     }
 
 
@@ -1727,6 +1809,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       latent_normalize="none", latent_stat_samples=512,
                       ae_intervention_w=0.0, ae_factor_orth_w=0.0,
                       semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
+                      cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
+                      semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                       sample_method="euler",
                       flow_ema_decay=0.0, flow_ema_warmup=True, eval_with_ema=True,
                       eval_weight_mode="auto", intervention_samples=32,
@@ -1749,6 +1833,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError(f"unknown semantic guidance mode {semantic_guidance_mode!r}")
     if sample_method not in SAMPLE_METHODS:
         raise ValueError(f"unknown sample method {sample_method!r}")
+    cfg_interval = validate_guidance_interval(cfg_interval, name="cfg_interval")
+    semantic_guidance_interval = validate_guidance_interval(
+        semantic_guidance_interval, name="semantic_guidance_interval")
     if dit_head_width_mult <= 0:
         raise ValueError("dit_head_width_mult must be positive")
     if flow_ema_decay < 0.0 or flow_ema_decay >= 1.0:
@@ -1863,7 +1950,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                              intervention_samples=intervention_samples,
                              semantic_guidance_w=semantic_guidance_w,
                              semantic_guidance_mode=semantic_guidance_mode,
-                             sample_method=sample_method)
+                             sample_method=sample_method,
+                             cfg_interval=cfg_interval,
+                             semantic_guidance_interval=semantic_guidance_interval)
         candidate["eval_weight_mode"] = mode
         candidate_reports[mode] = candidate
     selected_eval_weights = max(candidate_reports, key=lambda mode: report_selection_key(
@@ -1891,9 +1980,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "ae_intervention_w": float(ae_intervention_w),
         "ae_factor_orth_w": float(ae_factor_orth_w),
         "cond_drop": float(cond_drop),
+        "cfg_interval": list(cfg_interval),
         "sample_method": sample_method,
         "semantic_guidance_w": float(semantic_guidance_w),
         "semantic_guidance_mode": semantic_guidance_mode,
+        "semantic_guidance_interval": list(semantic_guidance_interval),
         "flow_semantic_w": float(flow_semantic_w),
         "flow_ema_decay": float(flow_ema_decay),
         "flow_ema_warmup": bool(flow_ema_warmup),
@@ -1946,7 +2037,8 @@ def selftest():
     assert img.shape == (1, 3, 32, 32)
     guided_img = sample_images(ae, flow, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
                                seed=0, cfg_scale=1.0, semantic_cond=cond,
-                               semantic_guidance_w=0.05)
+                               semantic_guidance_w=0.05,
+                               semantic_guidance_interval=(0.0, 0.5))
     assert guided_img.shape == (1, 3, 32, 32)
     grid_path = "/tmp/image_latent_selftest_grid.ppm"
     grid_meta = save_sample_grid(ae, flow, grid_path, size=32, device="cpu",
@@ -1961,13 +2053,17 @@ def selftest():
                                             flow_semantic_w=0.25, ae_intervention_w=0.1,
                                             ae_factor_orth_w=0.05,
                                             latent_normalize="channel",
-                                            latent_stat_samples=8)
+                                            latent_stat_samples=8,
+                                            cfg_interval=(0.0, 0.5),
+                                            semantic_guidance_interval=(0.0, 0.5))
     assert report2["flow_arch"] == "dit"
     assert report2["cond_drop"] == 0.5 and report2["cfg_scale"] == 1.5
     assert report2["flow_semantic_w"] == 0.25
     assert report2["ae_intervention_w"] == 0.1
     assert report2["ae_factor_orth_w"] == 0.05
     assert report2["latent_normalize"] == "channel" and report2["latent_norm_n"] == 8
+    assert report2["cfg_interval"] == [0.0, 0.5]
+    assert report2["semantic_guidance_interval"] == [0.0, 0.5]
     assert "latent_intervention_loss" in report2["last_ae"]
     assert "latent_factor_orth_loss" in report2["last_ae"]
     assert "semantic_endpoint_ce" in report2["last_flow"]
@@ -2066,6 +2162,8 @@ def main(argv=None):
                     help="width multiplier for the DiT/MM-DiT latent velocity head")
     ap.add_argument("--cond-drop", type=float, default=0.0, dest="cond_drop")
     ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
+    ap.add_argument("--cfg-interval", default="0.0,1.0", dest="cfg_interval",
+                    help="CFG active interval over rectified-flow time, formatted start,end")
     ap.add_argument("--sample-steps", type=int, default=4, dest="sample_steps")
     ap.add_argument("--sample-method", default="euler", choices=SAMPLE_METHODS,
                     dest="sample_method",
@@ -2082,6 +2180,9 @@ def main(argv=None):
     ap.add_argument("--semantic-guidance-mode", default="decoded",
                     choices=("latent", "decoded"), dest="semantic_guidance_mode",
                     help="guide sampled latents using direct latent heads or decode/re-read heads")
+    ap.add_argument("--semantic-guidance-interval", default="0.0,1.0",
+                    dest="semantic_guidance_interval",
+                    help="semantic guidance active interval over flow time, formatted start,end")
     ap.add_argument("--cfg-scales", default="1.0,1.25,1.5,2.0", dest="cfg_scales",
                     help="comma-separated CFG scales for --eval-checkpoint")
     ap.add_argument("--sample-steps-list", default="4,8,16", dest="sample_steps_list",
@@ -2137,6 +2238,11 @@ def main(argv=None):
     ap.add_argument("--no-ema-checkpoint", action="store_true", dest="no_ema_checkpoint",
                     help="compatibility alias for --checkpoint-weight-mode raw")
     args = ap.parse_args(argv)
+    try:
+        cfg_interval = _parse_interval(args.cfg_interval)
+        semantic_guidance_interval = _parse_interval(args.semantic_guidance_interval)
+    except ValueError as e:
+        ap.error(str(e))
     if args.selftest:
         selftest()
         return
@@ -2161,6 +2267,8 @@ def main(argv=None):
             sample_methods=(
                 _parse_string_list(args.sample_methods) if args.sample_methods else None
             ),
+            cfg_interval=cfg_interval,
+            semantic_guidance_interval=semantic_guidance_interval,
         )
         if args.sample_grid_out:
             selected_weights = report.get("selected_checkpoint_weights",
@@ -2173,16 +2281,20 @@ def main(argv=None):
                 fallback_steps=args.sample_steps,
                 fallback_method=args.sample_method,
                 fallback_semantic_w=args.semantic_guidance_w,
-                fallback_semantic_mode=args.semantic_guidance_mode)
+                fallback_semantic_mode=args.semantic_guidance_mode,
+                fallback_cfg_interval=cfg_interval,
+                fallback_semantic_interval=semantic_guidance_interval)
             grid_meta = save_sample_grid(
                 ae, flow, args.sample_grid_out, cond_mode=meta["cond_mode"],
                 conditioner=conditioner, prompt_vocab=prompt_vocab,
                 prompt_templates=prompt_templates,
                 cfg_scale=settings["cfg_scale"],
+                cfg_interval=settings["cfg_interval"],
                 sample_steps=settings["sample_steps"],
                 sample_method=settings["sample_method"],
                 semantic_guidance_w=settings["semantic_guidance_w"],
                 semantic_guidance_mode=settings["semantic_guidance_mode"],
+                semantic_guidance_interval=settings["semantic_guidance_interval"],
                 samples_per_combo=args.sample_grid_samples,
                 seed=args.seed + 991)
             grid_meta["sample_grid_checkpoint_weight_mode"] = (
@@ -2217,6 +2329,8 @@ def main(argv=None):
         ae_factor_orth_w=args.ae_factor_orth_w,
         semantic_guidance_w=args.semantic_guidance_w,
         semantic_guidance_mode=args.semantic_guidance_mode,
+        cfg_interval=cfg_interval,
+        semantic_guidance_interval=semantic_guidance_interval,
         sample_method=args.sample_method,
         flow_ema_decay=args.flow_ema_decay,
         flow_ema_warmup=not args.no_ema_warmup,
@@ -2239,15 +2353,19 @@ def main(argv=None):
             fallback_steps=args.sample_steps,
             fallback_method=args.sample_method,
             fallback_semantic_w=args.semantic_guidance_w,
-            fallback_semantic_mode=args.semantic_guidance_mode)
+            fallback_semantic_mode=args.semantic_guidance_mode,
+            fallback_cfg_interval=cfg_interval,
+            fallback_semantic_interval=semantic_guidance_interval)
         grid_meta = save_sample_grid(
             ae, flow, args.sample_grid_out, cond_mode=args.cond_mode, conditioner=conditioner,
             prompt_vocab=prompt_vocab, prompt_templates=templates,
             cfg_scale=settings["cfg_scale"],
+            cfg_interval=settings["cfg_interval"],
             sample_steps=settings["sample_steps"],
             sample_method=settings["sample_method"],
             semantic_guidance_w=settings["semantic_guidance_w"],
             semantic_guidance_mode=settings["semantic_guidance_mode"],
+            semantic_guidance_interval=settings["semantic_guidance_interval"],
             samples_per_combo=args.sample_grid_samples,
             seed=args.seed + 991)
         grid_meta["sample_grid_checkpoint_weight_mode"] = grid_weight_mode
@@ -2271,10 +2389,12 @@ def main(argv=None):
         "cond_dim": report["cond_dim"],
         "cond_drop": args.cond_drop,
         "cfg_scale": args.cfg_scale,
+        "cfg_interval": list(cfg_interval),
         "sample_steps": args.sample_steps,
         "sample_method": args.sample_method,
         "semantic_guidance_w": args.semantic_guidance_w,
         "semantic_guidance_mode": args.semantic_guidance_mode,
+        "semantic_guidance_interval": list(semantic_guidance_interval),
         "intervention_samples": args.intervention_samples,
         "ae_intervention_w": args.ae_intervention_w,
         "ae_factor_orth_w": args.ae_factor_orth_w,

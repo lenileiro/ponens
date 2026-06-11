@@ -122,6 +122,98 @@ python -m thinking.distill --go            # regenerate the bank (frontier calls
 python -m thinking.distill --definitions   # add/refresh leveled definitions
 ```
 
+`thinking.text` is the separate Text-0 rung for language understanding beyond the local kinship
+surface bank. It consumes web-backed semantic records, not next-token corpora: each example pairs
+natural language with a canonical meaning target, and the model must decode `extract fact ...`
+traces. The first importer is SNLI premise/hypothesis inference; the target is the human label
+(`entailment`, `contradiction`, or `neutral`) rendered as a canonical `nli` fact. The HANS
+importer adds controlled adversarial NLI examples for lexical-overlap, subsequence, and
+constituent heuristics; HANS `non-entailment` maps to SNLI-compatible `neutral` by default so
+checkpoints can be scored across both datasets. The grounded importer samples transcript-only
+descriptions from `thinking.multimodal` and asks that module to render the canonical multimodal
+trace; `thinking.text` parses that trace into target facts, so the text rung does not duplicate
+or hard-code the image/audio fact schema. The evaluator reports teacher-forced fact accuracy,
+direct semantic-head fact accuracy, free decoded fact F1/exact match, per-dataset and
+per-heuristic buckets, paraphrase groups when the dataset supplies them, explicit counterfactual
+records when supplied, and an NLI artifact control that scores hypothesis-only and premise-only
+ablations.
+
+```bash
+python -m thinking.text --selftest
+python -m thinking.text --import-snli --snli-zip /private/tmp/snli_1.0.zip \
+    --snli-train 20000 --snli-eval 1000 --seed 11 --out data/text_snli.jsonl
+python -m thinking.text --data data/text_snli.jsonl --steps 1500 --batch 64 --d 192 \
+    --layers 4 --heads 6 --semantic-w 0.75 --free-n 200 --max-new 20 \
+    --out runs/text_snli.json --checkpoint runs/text_snli.pt
+python -m thinking.text --import-hans --hans-train 6000 --hans-eval 3000 \
+    --seed 13 --out data/text_hans.jsonl
+python -m thinking.text --data data/text_hans.jsonl --eval-checkpoint runs/text_snli.pt \
+    --free-n 200 --max-new 20 --out runs/text_snli_on_hans.json
+python -m thinking.text --data data/text_snli.jsonl --data data/text_hans.jsonl \
+    --steps 1500 --batch 64 --d 192 --layers 4 --heads 6 --semantic-w 0.75 \
+    --free-n 200 --max-new 20 \
+    --out runs/text_snli_hans.json --checkpoint runs/text_snli_hans.pt
+python -m thinking.text --import-grounded --grounded-train 8000 \
+    --grounded-eval 1500 --grounded-counterfactual 100 --seed 17 \
+    --out data/text_grounded.jsonl
+python -m thinking.text --data data/text_grounded.jsonl --steps 600 --batch 64 --d 192 \
+    --layers 4 --heads 6 --semantic-w 0.75 \
+    --free-n 100 --paraphrase-n 50 --counterfactual-n 50 --max-new 32 \
+    --out runs/text_grounded.json --checkpoint runs/text_grounded.pt
+python -m thinking.text --data data/text_snli.jsonl --data data/text_hans.jsonl \
+    --data data/text_grounded.jsonl --steps 1200 --batch 64 --d 192 \
+    --layers 4 --heads 6 --semantic-w 0.75 \
+    --free-n 100 --paraphrase-n 30 --counterfactual-n 30 --max-new 32 \
+    --out runs/text_snli_hans_grounded.json --checkpoint runs/text_snli_hans_grounded.pt
+python -m thinking.text --data data/text_snli.jsonl --data data/text_hans.jsonl \
+    --data data/text_grounded.jsonl --steps 1200 --batch 64 --d 192 \
+    --layers 4 --heads 6 --semantic-w 0.75 --balance-by kind \
+    --free-n 80 --kind-free-n 5 --paraphrase-n 20 --counterfactual-n 20 --max-new 32 \
+    --out runs/text_snli_hans_grounded_balanced.json \
+    --checkpoint runs/text_snli_hans_grounded_balanced.pt
+```
+
+Current local Text-0 SNLI baseline (20k train / 1k dev, 1.5k steps, d=192, 4 layers, 6 heads,
+semantic auxiliary classification weight 0.75, learned attention readout per canonical fact key)
+does **not** gate: free decoded exact/F1 is **0.515** on a 200-example free-decode sample,
+teacher-forced fact-value accuracy is **0.519**, and the direct semantic head is **0.519**.
+The artifact control is now more meaningful: hypothesis-only decoded accuracy is **0.408**
+(`full - hypothesis_only = 0.111`), while hypothesis-only semantic-head accuracy is **0.401**
+(`semantic full - hypothesis_only = 0.118`). This is useful as a measurement floor and shows the
+model is extracting some premise-hypothesis signal, not a language-mastery claim.
+
+HANS now makes that failure explicit. The SNLI checkpoint scored on HANS without retraining gets
+only **0.423** teacher-forced fact accuracy, **0.429** semantic-head accuracy, and **0.430** free
+decoded F1 on a 200-example sample; hypothesis-only accuracy is higher than full-input accuracy,
+so this checkpoint is still shortcut-sensitive. A HANS-only control run (6k train / 3k eval,
+1k steps) does gate at **0.911** teacher-forced, **0.909** semantic-head, and **0.905** sampled
+free decoded F1, with lexical-overlap the weakest bucket (**0.812** teacher-forced). The mixed
+SNLI+HANS run (26k train / 4k eval, 1.5k steps) is the current honest language-rung baseline:
+it improves overall semantic-head accuracy to **0.722** and keeps constituent/subsequence HANS
+strong, but it still fails the gate (**0.625** sampled free decoded F1, SNLI dev **0.486**
+semantic-head, lexical-overlap HANS **0.595** semantic-head). This is progress toward
+shortcut-resistant language understanding, not mastery.
+
+Grounded transcript language is now a separate text target tied to the existing image/audio
+world rather than another NLI label. The grounded-only run (8k train / 1.6k eval, 600 steps)
+gates: **0.9895** teacher-forced fact accuracy, **0.9968** semantic-head accuracy, **0.996**
+sampled free decoded F1, **0.88** sampled paraphrase consistency, and **0.996** sampled
+counterfactual F1. The unified SNLI+HANS+grounded run (34k train / 5.6k eval, 1.2k steps)
+improves global teacher-forced/semantic accuracy to **0.874 / 0.894** and keeps grounded
+semantic accuracy high (**0.981**), but it still fails the gate: sampled free F1 is **0.742**,
+sampled paraphrase consistency is **0.467**, SNLI dev semantic-head is **0.522**, and HANS
+lexical-overlap semantic-head remains **0.594**. The next text rung should scale shortcut-
+resistant web data and add richer semantic datasets (e.g. MultiNLI/CFQ/GeoQuery/SQuAD-style
+answer facts) plus stronger paraphrase and counterfactual splits.
+
+Kind-balanced mixed training is a useful curriculum control, not a rulebook. With
+`--balance-by kind`, the mixed SNLI+HANS+grounded run improves global sampled free F1 to
+**0.8125** and lifts HANS lexical-overlap semantic-head accuracy to **0.786**, while keeping
+grounded semantic accuracy high (**0.975**). It still fails the language gate: SNLI dev
+semantic-head accuracy drops to **0.413** and sampled paraphrase consistency is only **0.65**.
+This says the next step is broader language supervision and better paraphrase/counterfactual
+coverage, not hand-coded English rules.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels

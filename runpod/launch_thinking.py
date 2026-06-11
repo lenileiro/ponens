@@ -106,10 +106,13 @@ def payload(args):
                      f"--text-cond-dim {args.image_text_cond_dim} "
                      f"--cond-drop {args.image_cond_drop} "
                      f"--cfg-scale {args.image_cfg_scale} "
+                     f"--cfg-interval {shlex_quote(args.image_cfg_interval)} "
                      f"--sample-steps {args.image_sample_steps} "
                      f"--sample-method {args.image_sample_method} "
                      f"--semantic-guidance-w {args.image_semantic_guidance_w} "
                      f"--semantic-guidance-mode {args.image_semantic_guidance_mode} "
+                     f"--semantic-guidance-interval "
+                     f"{shlex_quote(args.image_semantic_guidance_interval)} "
                      f"--roundtrip-samples {args.image_roundtrip_samples} "
                      f"--intervention-samples {args.image_intervention_samples} "
                      f"--ae-intervention-w {args.image_ae_intervention_w} "
@@ -135,12 +138,15 @@ def payload(args):
                           f"--checkpoint-weight-mode {args.image_checkpoint_weight_mode} "
                           f"--cfg-scales {shlex_quote(args.image_cfg_sweep)} "
                           f"--sample-steps-list {shlex_quote(args.image_sample_steps_sweep)} "
+                          f"--cfg-interval {shlex_quote(args.image_cfg_interval)} "
                           f"--sample-method {args.image_sample_method} "
                           f"--sample-methods {shlex_quote(args.image_sample_methods)} "
                           f"--semantic-guidance-w {args.image_semantic_guidance_w} "
                           f"--semantic-guidance-weights "
                           f"{shlex_quote(args.image_semantic_guidance_sweep)} "
                           f"--semantic-guidance-mode {args.image_semantic_guidance_mode} "
+                          f"--semantic-guidance-interval "
+                          f"{shlex_quote(args.image_semantic_guidance_interval)} "
                           f"--eval-seeds {shlex_quote(args.image_eval_seeds)} "
                           f"--roundtrip-samples {args.image_roundtrip_samples} "
                           f"--intervention-samples {args.image_intervention_samples} "
@@ -387,6 +393,8 @@ def main():
                     help="condition dropout for classifier-free latent image guidance")
     ap.add_argument("--image-cfg-scale", type=float, default=1.0, dest="image_cfg_scale",
                     help="classifier-free guidance scale for latent image sampling")
+    ap.add_argument("--image-cfg-interval", default="0.0,1.0", dest="image_cfg_interval",
+                    help="latent image CFG active interval formatted start,end")
     ap.add_argument("--image-sample-steps", type=int, default=4, dest="image_sample_steps",
                     help="ODE sampling steps for latent image evaluation")
     ap.add_argument("--image-sample-method", default="euler", choices=("euler", "heun"),
@@ -410,6 +418,9 @@ def main():
     ap.add_argument("--image-semantic-guidance-mode", default="decoded",
                     choices=("latent", "decoded"), dest="image_semantic_guidance_mode",
                     help="latent image semantic guidance mode")
+    ap.add_argument("--image-semantic-guidance-interval", default="0.0,1.0",
+                    dest="image_semantic_guidance_interval",
+                    help="semantic guidance active interval formatted start,end")
     ap.add_argument("--image-roundtrip-samples", type=int, default=1,
                     dest="image_roundtrip_samples",
                     help="generated samples per color/shape condition during image eval")

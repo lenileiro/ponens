@@ -37,6 +37,7 @@ memorization, and curriculum.
 | `surfaces.json` | frontier-distilled surface bank: 1,300+ validated English patterns across 8 education registers (preschool → scholar), with held-out splits |
 | `runpod/` | H100 launchers (tar-over-ssh, timeout-bounded, always-terminate) |
 | `thinking/vision.py`, `thinking/image2.py`, `thinking/image_flow.py`, `thinking/image_latent.py` | Image rungs: synthetic visual factors → canonical facts, head-aware FER probes, pixel flow, and semantic latent flow |
+| `thinking/text.py` | Text-0 semantic understanding rung: web-imported English records → canonical facts, with artifact controls |
 | `thinking/audio.py`, `thinking/multimodal.py` | Audio factors and the M-0 multimodal bridge: image+audio+transcript prefixes → one canonical extraction trace |
 | `thinking/listen.py`, `thinking/speak.py` | speech: **listen** (transcribe real synthesized speech, speaker-invariant), **speak** (emit audio tokens *verified by round-trip* through the frozen listener — the checker, applied to generation) |
 | `thinking/crossmodal.py` | cross-modal FER probe: does a concept *heard* align with the same concept *seen*? (retrieval 0.92 — unified, not fractured) |
@@ -97,6 +98,39 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
 .venv/bin/python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.5 --sample-steps-list 4,8 --eval-seeds 1,2,3 \
     --eval-out runs/image_latent_dit_sweep.json
+.venv/bin/python -m thinking.text --import-snli --snli-zip /private/tmp/snli_1.0.zip \
+    --snli-train 20000 --snli-eval 1000 --seed 11 --out data/text_snli.jsonl
+.venv/bin/python -m thinking.text --data data/text_snli.jsonl --steps 1500 \
+    --batch 64 --d 192 --layers 4 --heads 6 --semantic-w 0.75 \
+    --free-n 200 --max-new 20 \
+    --out runs/text_snli.json --checkpoint runs/text_snli.pt
+.venv/bin/python -m thinking.text --import-hans --hans-train 6000 --hans-eval 3000 \
+    --seed 13 --out data/text_hans.jsonl
+.venv/bin/python -m thinking.text --data data/text_hans.jsonl \
+    --eval-checkpoint runs/text_snli.pt --free-n 200 --max-new 20 \
+    --out runs/text_snli_on_hans.json
+.venv/bin/python -m thinking.text --data data/text_snli.jsonl --data data/text_hans.jsonl \
+    --steps 1500 --batch 64 --d 192 --layers 4 --heads 6 --semantic-w 0.75 \
+    --free-n 200 --max-new 20 \
+    --out runs/text_snli_hans.json --checkpoint runs/text_snli_hans.pt
+.venv/bin/python -m thinking.text --import-grounded --grounded-train 8000 \
+    --grounded-eval 1500 --grounded-counterfactual 100 --seed 17 \
+    --out data/text_grounded.jsonl
+.venv/bin/python -m thinking.text --data data/text_grounded.jsonl --steps 600 \
+    --batch 64 --d 192 --layers 4 --heads 6 --semantic-w 0.75 \
+    --free-n 100 --paraphrase-n 50 --counterfactual-n 50 --max-new 32 \
+    --out runs/text_grounded.json --checkpoint runs/text_grounded.pt
+.venv/bin/python -m thinking.text --data data/text_snli.jsonl --data data/text_hans.jsonl \
+    --data data/text_grounded.jsonl --steps 1200 --batch 64 --d 192 \
+    --layers 4 --heads 6 --semantic-w 0.75 \
+    --free-n 100 --paraphrase-n 30 --counterfactual-n 30 --max-new 32 \
+    --out runs/text_snli_hans_grounded.json --checkpoint runs/text_snli_hans_grounded.pt
+.venv/bin/python -m thinking.text --data data/text_snli.jsonl --data data/text_hans.jsonl \
+    --data data/text_grounded.jsonl --steps 1200 --batch 64 --d 192 \
+    --layers 4 --heads 6 --semantic-w 0.75 --balance-by kind \
+    --free-n 80 --kind-free-n 5 --paraphrase-n 20 --counterfactual-n 20 --max-new 32 \
+    --out runs/text_snli_hans_grounded_balanced.json \
+    --checkpoint runs/text_snli_hans_grounded_balanced.pt
 .venv/bin/python -m thinking.multimodal --steps 240 --eval-n 120 --free-n 20 \
     --counterfactual-n 40 --free-counterfactual-n 20 \
     --out runs/m0_multimodal.json --checkpoint runs/m0_multimodal.pt
