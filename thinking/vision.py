@@ -163,6 +163,51 @@ class ObjectEncoder(nn.Module):
         return out
 
 
+class FactorBottleneckEncoder(nn.Module):
+    """Object encoder with explicit color and shape representation spaces.
+
+    This does not hard-code visual rules into the classifier.  It gives the optimizer separate
+    low-dimensional channels for independently supervised canonical factors, so the probe can
+    measure whether "red" and "circle" are reused in the spaces that feed their heads.
+    """
+
+    def __init__(self, dim=64, factor_dim=None, n_colors=None, n_shapes=None):
+        super().__init__()
+        n_colors = n_colors or len(COLORS)
+        n_shapes = n_shapes or len(SHAPES)
+        factor_dim = factor_dim or max(8, dim // 2)
+        self.dim = int(dim)
+        self.factor_dim = int(factor_dim)
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 24, 3, padding=1),
+            nn.GELU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(24, 48, 3, padding=1),
+            nn.GELU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(48, 64, 3, padding=1),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.color_proj = nn.Sequential(nn.Flatten(), nn.Linear(64, factor_dim),
+                                        nn.LayerNorm(factor_dim))
+        self.shape_proj = nn.Sequential(nn.Flatten(), nn.Linear(64, factor_dim),
+                                        nn.LayerNorm(factor_dim))
+        self.color = nn.Linear(factor_dim, n_colors)
+        self.shape = nn.Linear(factor_dim, n_shapes)
+
+    def forward(self, x, return_embedding=False):
+        h = self.conv(x)
+        zc = self.color_proj(h)
+        zs = self.shape_proj(h)
+        out = {"color": self.color(zc), "shape": self.shape(zs)}
+        if return_embedding:
+            out["color_embedding"] = zc
+            out["shape_embedding"] = zs
+            out["embedding"] = torch.cat([zc, zs], dim=-1)
+        return out
+
+
 def _batch(batch, rng, size=32, device=DEV):
     imgs, colors, shapes = [], [], []
     color_names = tuple(COLORS)
@@ -307,24 +352,171 @@ def factor_probe(model, repeats=4, size=32, device=DEV):
     }
 
 
-def train_object_encoder(steps=200, batch=64, dim=64, lr=1e-3, seed=0, size=32, device=DEV):
+def _space_metrics(rows, vector_key, primary, nuisance):
+    same_primary, diff_primary = [], []
+    same_nuisance, diff_nuisance = [], []
+    same_combo, same_primary_other_nuisance = [], []
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            a, b = rows[i], rows[j]
+            c = _cos(a[vector_key], b[vector_key])
+            primary_same = a[primary] == b[primary]
+            nuisance_same = a[nuisance] == b[nuisance]
+            if primary_same:
+                same_primary.append(c)
+            else:
+                diff_primary.append(c)
+            if nuisance_same:
+                same_nuisance.append(c)
+            else:
+                diff_nuisance.append(c)
+            if primary_same and nuisance_same:
+                same_combo.append(c)
+            elif primary_same:
+                same_primary_other_nuisance.append(c)
+    reuse_margin = (_mean(same_primary) - _mean(diff_primary)
+                    if same_primary and diff_primary else None)
+    nuisance_leakage = (_mean(same_nuisance) - _mean(diff_nuisance)
+                        if same_nuisance and diff_nuisance else None)
+    combo_leakage = (_mean(same_combo) - _mean(same_primary_other_nuisance)
+                     if same_combo and same_primary_other_nuisance else None)
+    return {
+        f"same_{primary}_cos": _mean(same_primary),
+        f"different_{primary}_cos": _mean(diff_primary),
+        "reuse_margin": reuse_margin,
+        f"same_{nuisance}_cos": _mean(same_nuisance),
+        f"different_{nuisance}_cos": _mean(diff_nuisance),
+        "nuisance_leakage": nuisance_leakage,
+        "combo_leakage": combo_leakage,
+    }
+
+
+def factor_space_probe(model, repeats=4, size=32, device=DEV):
+    """Probe the spaces that feed the factor heads.
+
+    Shared encoders fall back to the shared embedding for both spaces.  Bottleneck encoders expose
+    `color_embedding` and `shape_embedding`, which prevents the old embedding-only probe from
+    missing factorization that lives immediately before the heads.
+    """
+    rows = []
+    model.eval()
+    with torch.no_grad():
+        for color in COLORS:
+            for shape in SHAPES:
+                for rep in range(repeats):
+                    rng = np.random.default_rng(20_000 + 97 * rep + 19 * list(COLORS).index(color)
+                                                + SHAPES.index(shape))
+                    spec = sample_object(rng, slot="p0")
+                    spec = ObjectSpec("p0", color, shape, spec.x, spec.y, spec.scale)
+                    x = torch.tensor(render_object(spec, size=size)[None], dtype=torch.float32,
+                                     device=device)
+                    out = model(x, return_embedding=True)
+                    color_vec = out.get("color_embedding", out["embedding"])[0].detach().cpu().numpy()
+                    shape_vec = out.get("shape_embedding", out["embedding"])[0].detach().cpu().numpy()
+                    rows.append({
+                        "color": color,
+                        "shape": shape,
+                        "color_vector": color_vec,
+                        "shape_vector": shape_vec,
+                    })
+    color_space = _space_metrics(rows, "color_vector", "color", "shape")
+    shape_space = _space_metrics(rows, "shape_vector", "shape", "color")
+    margins = [m for m in (color_space["reuse_margin"], shape_space["reuse_margin"])
+               if m is not None]
+    leakages = [
+        color_space.get("nuisance_leakage"),
+        shape_space.get("nuisance_leakage"),
+        color_space.get("combo_leakage"),
+        shape_space.get("combo_leakage"),
+    ]
+    leak = max([max(0.0, x) for x in leakages if x is not None] or [0.0])
+    reuse = float(np.mean([max(0.0, min(1.0, m / 0.25)) for m in margins])) if margins else None
+    penalty = max(0.0, min(1.0, leak / 0.20))
+    ufr_score = None if reuse is None else max(0.0, min(1.0, reuse * (1.0 - penalty)))
+    flags = []
+    if color_space["reuse_margin"] is not None and color_space["reuse_margin"] < 0.05:
+        flags.append("weak_color_space_reuse")
+    if shape_space["reuse_margin"] is not None and shape_space["reuse_margin"] < 0.05:
+        flags.append("weak_shape_space_reuse")
+    if color_space["nuisance_leakage"] is not None and color_space["nuisance_leakage"] > 0.12:
+        flags.append("color_space_shape_leakage")
+    if shape_space["nuisance_leakage"] is not None and shape_space["nuisance_leakage"] > 0.12:
+        flags.append("shape_space_color_leakage")
+    if color_space["combo_leakage"] is not None and color_space["combo_leakage"] > 0.20:
+        flags.append("color_space_combo_entanglement")
+    if shape_space["combo_leakage"] is not None and shape_space["combo_leakage"] > 0.20:
+        flags.append("shape_space_combo_entanglement")
+    if ufr_score is None:
+        verdict = "unknown"
+    elif ufr_score < 0.35:
+        verdict = "high_fer_risk"
+    elif ufr_score < 0.55:
+        verdict = "medium_fer_risk"
+    else:
+        verdict = "low_fer_risk"
+    return {
+        "probe": "visual_factor_spaces",
+        "n_vectors": len(rows),
+        "color_space": color_space,
+        "shape_space": shape_space,
+        "ufr_score": ufr_score,
+        "max_leakage": leak,
+        "verdict": verdict,
+        "risk_flags": flags,
+    }
+
+
+def independence_loss(out):
+    """Decorrelate explicit factor spaces when they are present."""
+    zc, zs = out.get("color_embedding"), out.get("shape_embedding")
+    if zc is None or zs is None:
+        ref = next(v for v in out.values() if torch.is_tensor(v))
+        return ref.new_tensor(0.0)
+    zc = zc.float() - zc.float().mean(dim=0, keepdim=True)
+    zs = zs.float() - zs.float().mean(dim=0, keepdim=True)
+    zc = zc / zc.std(dim=0, keepdim=True).clamp_min(1e-4)
+    zs = zs / zs.std(dim=0, keepdim=True).clamp_min(1e-4)
+    cross = zc.T @ zs / max(1, zc.shape[0])
+    return cross.pow(2).mean()
+
+
+def make_object_encoder(arch="shared", dim=64):
+    if arch in ("shared", "factored"):
+        return ObjectEncoder(dim=dim)
+    if arch in ("bottleneck", "factor_bottleneck"):
+        return FactorBottleneckEncoder(dim=dim)
+    raise ValueError(f"unknown vision encoder arch {arch!r}")
+
+
+def train_object_encoder(steps=200, batch=64, dim=64, lr=1e-3, seed=0, size=32, device=DEV,
+                         arch="shared", independence_w=0.05):
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
-    model = ObjectEncoder(dim=dim).to(device)
+    model = make_object_encoder(arch=arch, dim=dim).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     model.train()
     for st in range(steps):
         x, yc, ys = _batch(batch, rng, size=size, device=device)
-        out = model(x)
+        out = model(x, return_embedding=independence_w > 0.0)
         loss = F.cross_entropy(out["color"], yc) + F.cross_entropy(out["shape"], ys)
+        if independence_w > 0.0:
+            loss = loss + independence_w * independence_loss(out)
         opt.zero_grad()
         loss.backward()
         opt.step()
     report = evaluate(model, seed=seed + 1, size=size, device=device)
-    report.update(factor_probe(model, size=size, device=device))
+    embedding_probe = factor_probe(model, size=size, device=device)
+    space_probe = factor_space_probe(model, size=size, device=device)
+    report.update(embedding_probe)
+    report["embedding_probe"] = embedding_probe
+    report["factor_space_probe"] = space_probe
+    report["factor_space_ufr_score"] = space_probe["ufr_score"]
+    report["factor_space_verdict"] = space_probe["verdict"]
     report["steps"] = int(steps)
     report["batch"] = int(batch)
     report["dim"] = int(dim)
+    report["arch"] = arch
+    report["independence_w"] = float(independence_w)
     return model, report
 
 
@@ -341,7 +533,11 @@ def selftest():
     assert ("left_of", ("p0", "p1")) in scene.facts
     m, report = train_object_encoder(steps=2, batch=4, dim=16, seed=0, device="cpu")
     assert isinstance(m, ObjectEncoder)
-    assert report["n"] == 256 and "ufr_score" in report
+    assert report["n"] == 256 and "ufr_score" in report and "factor_space_probe" in report
+    mb, report_b = train_object_encoder(steps=2, batch=4, dim=16, seed=0, device="cpu",
+                                        arch="bottleneck")
+    assert isinstance(mb, FactorBottleneckEncoder)
+    assert report_b["factor_space_probe"]["probe"] == "visual_factor_spaces"
     pfacts = predict_object_facts(m, img, slot="p0", device="cpu")
     assert len(pfacts) == 2 and pfacts[0][0] == "color" and pfacts[1][0] == "shape"
     print("vision selftest OK")
@@ -354,6 +550,8 @@ def main(argv=None):
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--dim", type=int, default=64)
+    ap.add_argument("--arch", default="shared", choices=("shared", "factored", "bottleneck"))
+    ap.add_argument("--independence-w", type=float, default=0.05, dest="independence_w")
     ap.add_argument("--out", default="runs/vision_object_encoder.pt")
     args = ap.parse_args(argv)
     if args.selftest:
@@ -361,10 +559,11 @@ def main(argv=None):
         return
     if not args.train:
         ap.error("use --selftest or --train")
-    model, report = train_object_encoder(steps=args.steps, batch=args.batch, dim=args.dim)
+    model, report = train_object_encoder(steps=args.steps, batch=args.batch, dim=args.dim,
+                                         arch=args.arch, independence_w=args.independence_w)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save({"state_dict": model.state_dict(), "report": report, "colors": list(COLORS),
-                "shapes": list(SHAPES), "dim": args.dim}, args.out)
+                "shapes": list(SHAPES), "dim": args.dim, "arch": args.arch}, args.out)
     print(json.dumps(report, indent=1))
     print(f"saved -> {args.out}")
 

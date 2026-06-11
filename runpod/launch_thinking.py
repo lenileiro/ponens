@@ -70,13 +70,25 @@ def payload(args):
         VB = PY.replace("thinking.cli", "thinking.verbalize")
         cmds.append(f"{VB} --hybrid --dim {args.dim or 256} --corpus tinystories "
                     f"--corpus-mb {args.lang_mb} --pre-steps {args.train_steps or 40000} "
-                    f"--steps {args.lang_ft or 6000} --out runs/lang1_fluency.pt && "
+                    f"--steps {args.lang_ft} --out runs/lang1_fluency.pt && "
                     f"{VB} --sample runs/lang1_fluency.pt")
-    if args.vision:                                        # IMAGE-0/1: visual factors -> facts
+    if args.vision or args.image2 or args.image_flow:
         VI = PY.replace("thinking.cli", "thinking.vision")
-        cmds.append(f"{VI} --train --steps {args.train_steps or 2000} "
-                    f"--batch {args.batch} --dim {args.dim or 64} "
-                    f"--out runs/vision_object_encoder.pt")
+        if args.vision:                                    # IMAGE-0/1: visual factors -> facts
+            cmds.append(f"{VI} --train --steps {args.train_steps or 2000} "
+                        f"--batch {args.batch} --dim {args.dim or 64} "
+                        f"--arch {args.vision_arch} "
+                        f"--out runs/vision_object_encoder.pt")
+        if args.image2:                                    # IMAGE-2: head-aware FER experiment
+            I2 = PY.replace("thinking.cli", "thinking.image2")
+            cmds.append(f"{I2} --steps {args.train_steps or 800} "
+                        f"--seeds {shlex_quote(args.seeds)} --dim {args.dim or 64} "
+                        f"--out runs/image2_bottleneck.json")
+        if args.image_flow:                                # first fact-conditioned generator
+            IF = PY.replace("thinking.cli", "thinking.image_flow")
+            cmds.append(f"{IF} --train --steps {args.train_steps or 800} "
+                        f"--batch {args.batch} --dim {args.dim or 64} "
+                        f"--out runs/image_flow.pt")
         return " && ".join(cmds)
     if args.eval_only_run:
         run = shlex_quote(args.eval_only_run)
@@ -279,6 +291,12 @@ def main():
     ap.add_argument("--lang-ft", type=int, default=6000, dest="lang_ft")
     ap.add_argument("--vision", action="store_true",
                     help="IMAGE-0/1: train visual factor encoder + FER probe report")
+    ap.add_argument("--vision-arch", default="shared", choices=("shared", "factored", "bottleneck"),
+                    help="vision encoder architecture for --vision")
+    ap.add_argument("--image2", action="store_true",
+                    help="IMAGE-2: compare shared, bottleneck, and joint visual FER arms")
+    ap.add_argument("--image-flow", action="store_true", dest="image_flow",
+                    help="train the tiny fact-conditioned rectified-flow image generator")
     ap.add_argument("--lengen", action="store_true", help="rung L: depth generalization")
     ap.add_argument("--deep-ancestor-rule-aux", action="store_true",
                     help="train the forward ancestor run with rule/action and contrastive losses")
@@ -352,7 +370,12 @@ def main():
         f"2>&1 | tee /root/thinking.log; "
         f"cp /root/thinking.log {REMOTE}/thinking.log 2>/dev/null; true")
 
-    job = "vision factor encoder" if args.vision else "kinship multi-seed"
+    image_jobs = [name for enabled, name in (
+        (args.vision, "vision factor encoder"),
+        (args.image2, "image2 FER arms"),
+        (args.image_flow, "fact-conditioned flow"),
+    ) if enabled]
+    job = " + ".join(image_jobs) if image_jobs else "kinship multi-seed"
     print("=== PLAN === thinking package on H100: " + job
           + (" + chain grid" if args.sweep and not args.vision else ""))
     print(f"gpu/cloud : {args.gpu} / {args.cloud}")
