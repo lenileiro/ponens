@@ -106,6 +106,7 @@ def payload(args):
                      f"--cfg-scale {args.image_cfg_scale} "
                      f"--sample-steps {args.image_sample_steps} "
                      f"--roundtrip-samples {args.image_roundtrip_samples} "
+                     f"--intervention-samples {args.image_intervention_samples} "
                      f"--flow-semantic-w {args.image_flow_semantic_w} "
                      f"--flow-ema-decay {args.image_flow_ema_decay} "
                      f"--ema-eval-mode {args.image_ema_eval_mode} "
@@ -124,6 +125,7 @@ def payload(args):
                           f"--sample-steps-list {shlex_quote(args.image_sample_steps_sweep)} "
                           f"--eval-seeds {shlex_quote(args.image_eval_seeds)} "
                           f"--roundtrip-samples {args.image_roundtrip_samples} "
+                          f"--intervention-samples {args.image_intervention_samples} "
                           f"--eval-out runs/image_latent_{args.image_latent_arch}"
                           f"{cond_suffix}_sweep.json")
             cmds.append(train)
@@ -366,6 +368,9 @@ def main():
     ap.add_argument("--image-roundtrip-samples", type=int, default=1,
                     dest="image_roundtrip_samples",
                     help="generated samples per color/shape condition during image eval")
+    ap.add_argument("--image-intervention-samples", type=int, default=32,
+                    dest="image_intervention_samples",
+                    help="samples for latent image fact-intervention diagnostics")
     ap.add_argument("--image-flow-semantic-w", type=float, default=0.0,
                     dest="image_flow_semantic_w",
                     help="semantic endpoint alignment weight for latent image flow training")

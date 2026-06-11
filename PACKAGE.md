@@ -321,6 +321,13 @@ weight candidates and selects by the existing semantic round-trip / MSE sweep sc
 short-run EMA checkpoint from hiding a faster-learning raw model while still allowing EMA to win when
 the metrics support it.
 
+Image-17 adds a FER/UFR latent intervention diagnostic. The probe learns fact-value prototype
+directions from encoded examples, edits one requested fact in latent space, decodes/re-reads the
+image, and reports target-change accuracy plus collateral stability. It is data-derived rather than
+a renderer rule. On the fetched 400-step MMDiT text H100 checkpoint, a 16-sample smoke reports
+`latent_intervention_score=0.408`: color directions are strong, while shape edits still disturb color
+too often. That gives the next representation-quality target beyond output MSE and round-trip score.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered

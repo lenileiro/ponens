@@ -604,6 +604,129 @@ def semantic_endpoint_loss(ae, z_clean, cond):
     return loss, parts
 
 
+def fact_targets_from_condition(cond):
+    targets = {}
+    active = {}
+    for pred, idxs in FACT_GROUPS.items():
+        group = cond[:, list(idxs)]
+        targets[pred] = group.argmax(dim=1)
+        active[pred] = group.sum(dim=1) > 0
+    return targets, active
+
+
+@torch.no_grad()
+def latent_intervention_diagnostic(ae, n=64, batch=64, seed=123, size=32, device=DEV,
+                                   strength=1.0):
+    """Probe whether latent fact directions are reusable and minimally entangled.
+
+    The probe is intentionally data-derived: it estimates one prototype latent per fact value,
+    edits held-out latents with prototype differences, then asks whether only the requested fact
+    changes after decoding/re-encoding. This measures the FER/UFR property without injecting
+    symbolic rendering rules into the model.
+    """
+    n = int(n)
+    if n <= 0:
+        return {}
+    ae.eval()
+    rng = np.random.default_rng(seed)
+    proto_n = max(n, sum(len(idxs) for idxs in FACT_GROUPS.values()) * 4)
+    sums = counts = None
+    total = 0
+    while total < proto_n:
+        b = min(batch, proto_n - total)
+        x, cond, _yc, _ys = _batch(b, rng, size=size, device=device)
+        z = ae.encode(x)
+        targets, active = fact_targets_from_condition(cond)
+        if sums is None:
+            sums = {
+                pred: torch.zeros((len(idxs),) + tuple(z.shape[1:]), device=device)
+                for pred, idxs in FACT_GROUPS.items()
+            }
+            counts = {
+                pred: torch.zeros((len(idxs),), dtype=torch.long, device=device)
+                for pred, idxs in FACT_GROUPS.items()
+            }
+        for pred, idxs in FACT_GROUPS.items():
+            for val in range(len(idxs)):
+                mask = active[pred] & targets[pred].eq(val)
+                if bool(mask.any()):
+                    sums[pred][val] += z[mask].sum(dim=0)
+                    counts[pred][val] += int(mask.sum())
+        total += b
+
+    prototypes = {}
+    for pred, vals in sums.items():
+        valid = counts[pred] > 0
+        if int(valid.sum()) < 2:
+            continue
+        denom = counts[pred].clamp_min(1).to(vals.dtype).view((-1,) + (1,) * (vals.ndim - 1))
+        prototypes[pred] = vals / denom
+
+    latent_target_ok = image_target_ok = target_total = 0
+    collateral_ok = collateral_total = 0
+    pred_target = {pred: [0, 0] for pred in prototypes}
+    pred_collateral = {pred: [0, 0] for pred in prototypes}
+    total = 0
+    while total < n:
+        b = min(batch, n - total)
+        x, cond, _yc, _ys = _batch(b, rng, size=size, device=device)
+        z = ae.encode(x)
+        targets, active = fact_targets_from_condition(cond)
+        for pred, proto in prototypes.items():
+            classes = proto.shape[0]
+            mask = active[pred]
+            if not bool(mask.any()) or classes < 2:
+                continue
+            z_src = z[mask]
+            src = targets[pred][mask]
+            target = (src + 1) % classes
+            delta = proto[target] - proto[src]
+            z_edit = z_src + float(strength) * delta
+            latent_logits = ae.fact_logits(z_edit)
+            image = ae.decode(z_edit).clamp(-1.0, 1.0)
+            image_logits = ae(image)
+            latent_pred = latent_logits[pred].argmax(dim=1)
+            image_pred = image_logits[pred].argmax(dim=1)
+            ok_latent = int(latent_pred.eq(target).sum())
+            ok_image = int(image_pred.eq(target).sum())
+            count = int(target.numel())
+            latent_target_ok += ok_latent
+            image_target_ok += ok_image
+            target_total += count
+            pred_target[pred][0] += ok_image
+            pred_target[pred][1] += count
+            for other in prototypes:
+                if other == pred or other not in image_logits:
+                    continue
+                other_src = targets[other][mask]
+                other_ok = int(image_logits[other].argmax(dim=1).eq(other_src).sum())
+                collateral_ok += other_ok
+                collateral_total += count
+                pred_collateral[other][0] += other_ok
+                pred_collateral[other][1] += count
+        total += b
+
+    def div(num, den):
+        return float(num / den) if den else 0.0
+
+    target_acc = div(image_target_ok, target_total)
+    collateral_acc = div(collateral_ok, collateral_total)
+    return {
+        "latent_intervention_n": int(target_total),
+        "latent_intervention_strength": float(strength),
+        "latent_intervention_direct_target_acc": div(latent_target_ok, target_total),
+        "latent_intervention_image_target_acc": target_acc,
+        "latent_intervention_collateral_acc": collateral_acc,
+        "latent_intervention_score": float(target_acc * collateral_acc),
+        "latent_intervention_target_by_fact": {
+            pred: div(ok, total) for pred, (ok, total) in pred_target.items() if total
+        },
+        "latent_intervention_collateral_by_fact": {
+            pred: div(ok, total) for pred, (ok, total) in pred_collateral.items() if total
+        },
+    }
+
+
 def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
                        semantic_cond=None, time_sampling="uniform", time_logit_mean=0.0,
                        time_logit_std=1.0):
@@ -742,7 +865,8 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_s
 @torch.no_grad()
 def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=1.0,
              sample_steps=4, roundtrip_samples=1, cond_mode="facts", conditioner=None,
-             prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES):
+             prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
+             intervention_samples=0):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     ae.eval()
@@ -795,6 +919,9 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
                                         cond_mode=cond_mode, conditioner=conditioner,
                                         prompt_vocab=prompt_vocab,
                                         prompt_templates=prompt_templates))
+    if intervention_samples:
+        report.update(latent_intervention_diagnostic(
+            ae, n=intervention_samples, batch=batch, seed=seed + 31, size=size, device=device))
     report["cond_mode"] = cond_mode
     return report
 
@@ -966,6 +1093,11 @@ def eval_report_summary(report):
         "latent_velocity_mse",
         "latent_color_acc",
         "latent_shape_acc",
+        "latent_intervention_n",
+        "latent_intervention_direct_target_acc",
+        "latent_intervention_image_target_acc",
+        "latent_intervention_collateral_acc",
+        "latent_intervention_score",
     )
     return {k: report[k] for k in keys if k in report}
 
@@ -996,7 +1128,8 @@ def aggregate_sweep_rows(rows):
 
 def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         n=128, batch=64, seed=10, eval_seeds=None, size=32, device=DEV,
-                        roundtrip_samples=1, prefer_ema=True, weight_mode=None):
+                        roundtrip_samples=1, prefer_ema=True, weight_mode=None,
+                        intervention_samples=0):
     if weight_mode is None:
         weight_mode = "ema" if prefer_ema else "raw"
     if weight_mode not in EVAL_WEIGHT_MODES:
@@ -1021,7 +1154,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                 rows.append(row)
         aggregate = aggregate_sweep_rows(rows)
         best = max(aggregate, key=aggregate_selection_key)
-        return {
+        report = {
             "experiment": "image_latent_sampler_sweep",
             **meta,
             "checkpoint_weight_mode": actual_mode,
@@ -1034,6 +1167,11 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             "aggregate": aggregate,
             "best": best,
         }
+        if intervention_samples:
+            report.update(latent_intervention_diagnostic(
+                ae, n=intervention_samples, batch=batch, seed=seed + 31, size=size,
+                device=device))
+        return report
 
     if weight_mode != "auto":
         return run_mode(weight_mode)
@@ -1064,7 +1202,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0,
                       flow_ema_decay=0.0, flow_ema_warmup=True, eval_with_ema=True,
-                      eval_weight_mode="auto", return_conditioner=False, return_ema=False):
+                      eval_weight_mode="auto", intervention_samples=32,
+                      return_conditioner=False, return_ema=False):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     if cond_mode not in ("facts", "text"):
@@ -1164,7 +1303,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                              cfg_scale=cfg_scale, sample_steps=sample_steps,
                              roundtrip_samples=roundtrip_samples, cond_mode=cond_mode,
                              conditioner=conditioner, prompt_vocab=prompt_vocab,
-                             prompt_templates=prompt_templates)
+                             prompt_templates=prompt_templates,
+                             intervention_samples=intervention_samples)
         candidate["eval_weight_mode"] = mode
         candidate_reports[mode] = candidate
     selected_eval_weights = max(candidate_reports, key=lambda mode: report_selection_key(
@@ -1196,6 +1336,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "eval_weight_mode": requested_eval_weight_mode,
         "selected_eval_weights": selected_eval_weights,
         "eval_with_ema": selected_eval_weights == "ema",
+        "intervention_samples": int(intervention_samples),
         "weight_eval_candidates": {
             mode: eval_report_summary(candidate)
             for mode, candidate in candidate_reports.items()
@@ -1227,6 +1368,7 @@ def selftest():
     assert report["experiment"] == "image3_latent_fact_conditioned_rectified_flow"
     assert report["latent_color_acc"] >= 0.0 and report["latent_shape_acc"] >= 0.0
     assert "sample_roundtrip_both_acc" in report and report["sample_roundtrip_n"] == 15
+    assert "latent_intervention_score" in report and report["latent_intervention_n"] > 0
     spec = ObjectSpec("p0", "blue", "triangle")
     cond = fact_condition(object_facts(spec), device="cpu")[None]
     img = sample_images(ae, flow, cond, latent_shape=(4, 8, 8), steps=2, device="cpu", seed=0,
@@ -1283,6 +1425,7 @@ def selftest():
     assert report5["selected_eval_weights"] in ("raw", "ema")
     assert report5["eval_with_ema"] == (report5["selected_eval_weights"] == "ema")
     assert set(report5["weight_eval_candidates"]) == {"raw", "ema"}
+    assert "latent_intervention_score" in report5["weight_eval_candidates"]["raw"]
     assert report5["flow_ema_warmup"] is True and report5["flow_ema_effective_decay"] < 0.5
     legacy_state = {k: v for k, v in flow5.state_dict().items() if ".gate." not in k}
     compat_flow = make_flow(flow_arch="mmdit", latent_ch=4, hidden=32, dit_depth=1,
@@ -1324,6 +1467,9 @@ def main(argv=None):
     ap.add_argument("--eval-seeds", default="", dest="eval_seeds",
                     help="comma-separated eval seeds for --eval-checkpoint; default uses --seed")
     ap.add_argument("--roundtrip-samples", type=int, default=1, dest="roundtrip_samples")
+    ap.add_argument("--intervention-samples", type=int, default=32,
+                    dest="intervention_samples",
+                    help="samples for latent fact intervention diagnostics; 0 disables")
     ap.add_argument("--flow-semantic-w", type=float, default=0.0, dest="flow_semantic_w",
                     help="semantic endpoint alignment weight for latent flow training")
     ap.add_argument("--flow-ema-decay", type=float, default=0.0, dest="flow_ema_decay",
@@ -1371,6 +1517,7 @@ def main(argv=None):
             roundtrip_samples=args.roundtrip_samples,
             prefer_ema=not args.no_ema_checkpoint,
             weight_mode=("raw" if args.no_ema_checkpoint else args.checkpoint_weight_mode),
+            intervention_samples=args.intervention_samples,
         )
         if args.eval_out:
             os.makedirs(os.path.dirname(args.eval_out) or ".", exist_ok=True)
@@ -1397,6 +1544,7 @@ def main(argv=None):
         flow_ema_warmup=not args.no_ema_warmup,
         eval_with_ema=not args.no_ema_eval,
         eval_weight_mode=("raw" if args.no_ema_eval else args.ema_eval_mode),
+        intervention_samples=args.intervention_samples,
         return_conditioner=True, return_ema=True)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save({
@@ -1414,6 +1562,7 @@ def main(argv=None):
         "cond_drop": args.cond_drop,
         "cfg_scale": args.cfg_scale,
         "sample_steps": args.sample_steps,
+        "intervention_samples": args.intervention_samples,
         "flow_semantic_w": args.flow_semantic_w,
         "flow_ema_decay": args.flow_ema_decay,
         "flow_ema_warmup": not args.no_ema_warmup,
