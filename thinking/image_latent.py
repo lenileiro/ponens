@@ -491,7 +491,10 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
         total += b
 
     spec = ObjectSpec("p0", "red", "circle")
-    cond = fact_condition(object_facts(spec), device=device)[None]
+    fact_cond = fact_condition(object_facts(spec), device=device)[None]
+    cond = model_condition([spec], fact_cond, cond_mode=cond_mode, conditioner=conditioner,
+                           prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
+                           rng=rng, device=device)
     sample = sample_images(ae, flow, cond, latent_shape=(ae.latent_ch, size // 4, size // 4),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale)
     target = torch.tensor(render_object(spec, size=size) * 2.0 - 1.0,

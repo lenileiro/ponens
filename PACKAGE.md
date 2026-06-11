@@ -148,6 +148,9 @@ python -m thinking.image_latent --train --ae-steps 400 --flow-steps 400 \
 python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-steps 400 \
     --cond-drop 0.1 --cfg-scale 1.5 --sample-steps 8 --flow-semantic-w 0.25 \
     --out runs/image_latent_dit.pt
+python -m thinking.image_latent --train --cond-mode text --flow-arch dit \
+    --ae-steps 400 --flow-steps 400 --cond-drop 0.1 --cfg-scale 1.5 \
+    --sample-steps 8 --flow-semantic-w 0.25 --out runs/image_latent_dit_text.pt
 python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
     --eval-seeds 1,2,3 --roundtrip-samples 2 --eval-out runs/image_latent_dit_sweep.json
@@ -158,6 +161,9 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --vision-arch bottl
     --image-cond-drop 0.1 --image-cfg-scale 1.5 --image-sample-steps 8 \
     --image-flow-semantic-w 0.25 --image-eval-sweep \
     --audio --multimodal --fast --go
+RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-latent-arch dit \
+    --image-cond-mode text --image-cond-drop 0.1 --image-cfg-scale 1.5 \
+    --image-sample-steps 8 --image-flow-semantic-w 0.25 --image-eval-sweep --fast --go
 ```
 
 `thinking.image2` is the head-aware FER experiment: shared factored heads vs explicit
@@ -264,6 +270,12 @@ condition finds the best aggregate fact-faithfulness at `cfg=1.5, steps=4`: colo
 **0.065**. Higher guidance (`cfg=2.0, steps=4`) slightly improves shape mean (**0.944**) but
 hurts color and pixel distance (`both=0.900`, MSE **0.095**). The earlier one-seed `cfg=2.0`
 winner was therefore too brittle; robust selection points to moderate CFG plus few Euler steps.
+
+Image-8 starts the language-to-image path without hard-coding generator rules: the latent flow can
+now take `--cond-mode text`, where a learned prompt encoder maps prompt tokens into the continuous
+condition vector consumed by the DiT velocity field. Canonical facts still supervise semantic
+endpoint alignment during training, but checkpoint save/load and sampler sweeps now preserve the
+prompt vocabulary and text encoder, so inference no longer needs a hand-built fact vector.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

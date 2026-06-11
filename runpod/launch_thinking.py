@@ -95,23 +95,29 @@ def payload(args):
                         f"--out runs/image_flow.pt")
         if args.image_latent:                              # IMAGE-3: latent flow generator
             IL = PY.replace("thinking.cli", "thinking.image_latent")
-            ckpt = f"runs/image_latent_{args.image_latent_arch}.pt"
+            cond_suffix = "" if args.image_cond_mode == "facts" else f"_{args.image_cond_mode}"
+            ckpt = f"runs/image_latent_{args.image_latent_arch}{cond_suffix}.pt"
             train = (f"{IL} --train --ae-steps {args.train_steps or 800} "
                      f"--flow-steps {args.train_steps or 800} --batch {args.batch} "
                      f"--hidden {args.dim or 64} --flow-arch {args.image_latent_arch} "
+                     f"--cond-mode {args.image_cond_mode} "
+                     f"--text-cond-dim {args.image_text_cond_dim} "
                      f"--cond-drop {args.image_cond_drop} "
                      f"--cfg-scale {args.image_cfg_scale} "
                      f"--sample-steps {args.image_sample_steps} "
                      f"--roundtrip-samples {args.image_roundtrip_samples} "
                      f"--flow-semantic-w {args.image_flow_semantic_w} "
                      f"--out {ckpt}")
+            if args.image_prompt_templates:
+                train += f" --prompt-templates {shlex_quote(args.image_prompt_templates)}"
             if args.image_eval_sweep:
                 train += (f" && {IL} --eval-checkpoint {ckpt} "
                           f"--cfg-scales {shlex_quote(args.image_cfg_sweep)} "
                           f"--sample-steps-list {shlex_quote(args.image_sample_steps_sweep)} "
                           f"--eval-seeds {shlex_quote(args.image_eval_seeds)} "
                           f"--roundtrip-samples {args.image_roundtrip_samples} "
-                          f"--eval-out runs/image_latent_{args.image_latent_arch}_sweep.json")
+                          f"--eval-out runs/image_latent_{args.image_latent_arch}"
+                          f"{cond_suffix}_sweep.json")
             cmds.append(train)
         if args.audio:                                     # AUDIO-1: audio factors -> facts
             AU = PY.replace("thinking.cli", "thinking.audio")
@@ -335,6 +341,13 @@ def main():
                     help="IMAGE-3: train semantic autoencoder + latent fact-conditioned flow")
     ap.add_argument("--image-latent-arch", default="conv", choices=("conv", "dit"),
                     dest="image_latent_arch", help="latent velocity architecture")
+    ap.add_argument("--image-cond-mode", default="facts", choices=("facts", "text"),
+                    dest="image_cond_mode",
+                    help="latent image conditioning source: canonical facts or learned text prompts")
+    ap.add_argument("--image-text-cond-dim", type=int, default=0, dest="image_text_cond_dim",
+                    help="text condition vector width; default uses --dim/hidden")
+    ap.add_argument("--image-prompt-templates", default="", dest="image_prompt_templates",
+                    help="semicolon-separated prompt templates using {color} and {shape}")
     ap.add_argument("--image-cond-drop", type=float, default=0.0, dest="image_cond_drop",
                     help="condition dropout for classifier-free latent image guidance")
     ap.add_argument("--image-cfg-scale", type=float, default=1.0, dest="image_cfg_scale",
