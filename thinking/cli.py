@@ -351,6 +351,37 @@ def cmd_selftest(_args):
         back = [Vb.tk.id_to_token(Vb.enc(" " + t)[0] if len(Vb.enc(" " + t)) == 1
                                   else Vb.enc(t)[0]).lstrip("Ġ") for t in trace_toks]
         assert back == trace_toks, "trace must round-trip token-for-token under hybrid vocab"
+
+    # FER/UFR probe scoring: reusable same-rule vectors should score better than fractured ones.
+    from .probes import pairwise_probe_metrics, score_probe_metrics
+    good = [
+        {"rule_id": "r1", "problem_depth": 4, "depth_index": 0,
+         "vector": _np0.array([1.0, 0.0, 0.0])},
+        {"rule_id": "r1", "problem_depth": 8, "depth_index": 1,
+         "vector": _np0.array([0.98, 0.05, 0.0])},
+        {"rule_id": "r2", "problem_depth": 4, "depth_index": 0,
+         "vector": _np0.array([0.0, 1.0, 0.0])},
+        {"rule_id": "r2", "problem_depth": 8, "depth_index": 1,
+         "vector": _np0.array([0.0, 0.98, 0.05])},
+    ]
+    gm = pairwise_probe_metrics(good)
+    gs = score_probe_metrics(gm, n_vectors=len(good))
+    assert gm["rule_reuse_margin"] > 0.8
+    assert gs["verdict"] in ("low_fer_risk", "medium_fer_risk")
+    bad = [
+        {"rule_id": "r1", "problem_depth": 4, "depth_index": 0,
+         "vector": _np0.array([1.0, 0.0])},
+        {"rule_id": "r1", "problem_depth": 8, "depth_index": 1,
+         "vector": _np0.array([0.0, 1.0])},
+        {"rule_id": "r2", "problem_depth": 4, "depth_index": 0,
+         "vector": _np0.array([0.9, 0.1])},
+        {"rule_id": "r2", "problem_depth": 8, "depth_index": 1,
+         "vector": _np0.array([0.1, 0.9])},
+    ]
+    bm = pairwise_probe_metrics(bad)
+    bs = score_probe_metrics(bm, n_vectors=len(bad))
+    assert bm["rule_reuse_margin"] < 0.1
+    assert "low_same_vs_different_rule_margin" in bs["risk_flags"]
     print("selftest OK")
 
 
@@ -529,6 +560,13 @@ def cmd_probe(args):
         "same_rule_cos": report["same_rule_cos"],
         "different_rule_cos": report["different_rule_cos"],
         "rule_reuse_margin": report["rule_reuse_margin"],
+        "same_rule_cross_depth_cos": report["same_rule_cross_depth_cos"],
+        "cross_depth_reuse_margin": report["cross_depth_reuse_margin"],
+        "cross_depth_reuse_gap": report["cross_depth_reuse_gap"],
+        "depth_index_leakage": report["depth_index_leakage"],
+        "ufr_score": report["ufr_score"],
+        "verdict": report["verdict"],
+        "weak_rules": report["weak_rules"],
         "risk_flags": report["risk_flags"],
     }, indent=1))
     log.info("probe -> %s", path)

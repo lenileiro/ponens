@@ -77,6 +77,13 @@ the damage compounds): `--mode masked` (masked repair of rejected lines, 0.50) a
 as diagnostics. `decode="ranker"` scores the full legal-action frontier and records the oracle
 action's rank — measures trace-policy quality in isolation from syntax failures.
 
+**Representation probes** (`thinking probe`) are the FER/UFR guardrail from arXiv:2505.11581:
+they are separate from answer accuracy. The probe teacher-forces verified traces, captures
+proof-line hidden states, and reports same-rule reuse, cross-depth reuse, depth-index leakage,
+and a heuristic `ufr_score`/`verdict`. A run can solve depth-30 rollout while still being
+fractured if rule reuse is weak or tied to line position; the GPU learning-curve summary now
+keeps those fields beside `deep_eval_*` accuracy.
+
 ## 2. Worlds
 
 - **`chain`** — linear `r`-chains, transitive `far` closure. The minimal benchmark; rung 0.
