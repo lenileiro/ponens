@@ -148,12 +148,15 @@ python -m thinking.image_latent --train --ae-steps 400 --flow-steps 400 \
 python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-steps 400 \
     --cond-drop 0.1 --cfg-scale 1.5 --sample-steps 8 --flow-semantic-w 0.25 \
     --out runs/image_latent_dit.pt
+python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
+    --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
+    --eval-out runs/image_latent_dit_sweep.json
 python -m thinking.audio --steps 500 --seeds 0,1,2 --out runs/audio1_fer.json
 python -m thinking.multimodal --steps 400 --out runs/m0_multimodal.json
 RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --vision-arch bottleneck \
     --image2 --image-flow --image-latent --image-latent-arch dit \
     --image-cond-drop 0.1 --image-cfg-scale 1.5 --image-sample-steps 8 \
-    --image-flow-semantic-w 0.25 \
+    --image-flow-semantic-w 0.25 --image-eval-sweep \
     --audio --multimodal --fast --go
 ```
 
@@ -252,6 +255,13 @@ conditions, up from **0.87 / 0.67 / 0.53**. The tradeoff is small but real: late
 is **0.78** vs **0.77**, center-target sample MSE moves **0.0198 → 0.0251**, and conditional
 sample MSE moves **0.0739 → 0.0848**. For this foundation, the result says representation
 alignment is buying semantic faithfulness at a modest pixel-MSE cost.
+
+Image-7 local checkpoint sweep (`--eval-checkpoint`, no retraining): sampler choice is now
+measurable as a Pareto problem. On the Image-6 checkpoint, sweeping CFG `{1.0,1.25,1.5,2.0}` and
+steps `{4,8,16}` finds best fact-faithfulness at `cfg=2.0, steps=4`: color **1.00**, shape
+**0.93**, both facts **0.93**, with conditional sample MSE **0.075**. Lower guidance
+(`cfg=1.25, steps=4`) keeps conditional MSE lower at **0.051** but both-fact accuracy falls to
+**0.80**. This gives us a cheap checkpoint-time way to tune generation without retraining.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

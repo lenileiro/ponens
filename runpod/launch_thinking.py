@@ -95,14 +95,23 @@ def payload(args):
                         f"--out runs/image_flow.pt")
         if args.image_latent:                              # IMAGE-3: latent flow generator
             IL = PY.replace("thinking.cli", "thinking.image_latent")
-            cmds.append(f"{IL} --train --ae-steps {args.train_steps or 800} "
-                        f"--flow-steps {args.train_steps or 800} --batch {args.batch} "
-                        f"--hidden {args.dim or 64} --flow-arch {args.image_latent_arch} "
-                        f"--cond-drop {args.image_cond_drop} "
-                        f"--cfg-scale {args.image_cfg_scale} "
-                        f"--sample-steps {args.image_sample_steps} "
-                        f"--flow-semantic-w {args.image_flow_semantic_w} "
-                        f"--out runs/image_latent_{args.image_latent_arch}.pt")
+            ckpt = f"runs/image_latent_{args.image_latent_arch}.pt"
+            train = (f"{IL} --train --ae-steps {args.train_steps or 800} "
+                     f"--flow-steps {args.train_steps or 800} --batch {args.batch} "
+                     f"--hidden {args.dim or 64} --flow-arch {args.image_latent_arch} "
+                     f"--cond-drop {args.image_cond_drop} "
+                     f"--cfg-scale {args.image_cfg_scale} "
+                     f"--sample-steps {args.image_sample_steps} "
+                     f"--roundtrip-samples {args.image_roundtrip_samples} "
+                     f"--flow-semantic-w {args.image_flow_semantic_w} "
+                     f"--out {ckpt}")
+            if args.image_eval_sweep:
+                train += (f" && {IL} --eval-checkpoint {ckpt} "
+                          f"--cfg-scales {shlex_quote(args.image_cfg_sweep)} "
+                          f"--sample-steps-list {shlex_quote(args.image_sample_steps_sweep)} "
+                          f"--roundtrip-samples {args.image_roundtrip_samples} "
+                          f"--eval-out runs/image_latent_{args.image_latent_arch}_sweep.json")
+            cmds.append(train)
         if args.audio:                                     # AUDIO-1: audio factors -> facts
             AU = PY.replace("thinking.cli", "thinking.audio")
             cmds.append(f"{AU} --steps {args.train_steps or 500} "
@@ -331,9 +340,20 @@ def main():
                     help="classifier-free guidance scale for latent image sampling")
     ap.add_argument("--image-sample-steps", type=int, default=4, dest="image_sample_steps",
                     help="Euler sampling steps for latent image evaluation")
+    ap.add_argument("--image-roundtrip-samples", type=int, default=1,
+                    dest="image_roundtrip_samples",
+                    help="generated samples per color/shape condition during image eval")
     ap.add_argument("--image-flow-semantic-w", type=float, default=0.0,
                     dest="image_flow_semantic_w",
                     help="semantic endpoint alignment weight for latent image flow training")
+    ap.add_argument("--image-eval-sweep", action="store_true", dest="image_eval_sweep",
+                    help="after latent training, sweep CFG and sampler steps from the checkpoint")
+    ap.add_argument("--image-cfg-sweep", default="1.0,1.25,1.5,2.0",
+                    dest="image_cfg_sweep",
+                    help="comma-separated CFG scales for --image-eval-sweep")
+    ap.add_argument("--image-sample-steps-sweep", default="4,8,16",
+                    dest="image_sample_steps_sweep",
+                    help="comma-separated sampler step counts for --image-eval-sweep")
     ap.add_argument("--audio", action="store_true",
                     help="AUDIO-1: train synthetic audio factor FER experiment")
     ap.add_argument("--multimodal", action="store_true",

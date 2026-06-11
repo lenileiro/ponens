@@ -87,6 +87,9 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --flow-steps 40 --cond-drop 0.1 --cfg-scale 1.5 --sample-steps 4 \
     --flow-semantic-w 0.25 \
     --out runs/image_latent_dit.pt
+.venv/bin/python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
+    --cfg-scales 1.0,1.5 --sample-steps-list 4,8 \
+    --eval-out runs/image_latent_dit_sweep.json
 .venv/bin/python -m thinking.multimodal --steps 240 --eval-n 120 --free-n 20 \
     --counterfactual-n 40 \
     --out runs/m0_multimodal.json --checkpoint runs/m0_multimodal.pt

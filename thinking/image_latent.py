@@ -14,6 +14,9 @@ linearly usable after compression instead of becoming another entangled bottlene
   python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-steps 400 \
       --cond-drop 0.1 --cfg-scale 1.5 --sample-steps 8 --flow-semantic-w 0.25 \
       --out runs/image_latent_dit.pt
+  python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
+      --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
+      --eval-out runs/image_latent_dit_sweep.json
 """
 import argparse
 import json
@@ -196,6 +199,24 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
+def _parse_number_list(s, cast=float):
+    if isinstance(s, (tuple, list)):
+        return tuple(cast(x) for x in s)
+    return tuple(cast(x.strip()) for x in str(s).split(",") if x.strip())
+
+
+def _seeded_randn(shape, device, seed):
+    dev = torch.device(device)
+    gen_device = "cpu" if dev.type == "mps" else dev.type
+    try:
+        gen = torch.Generator(device=gen_device)
+        gen.manual_seed(int(seed))
+        return torch.randn(shape, generator=gen, device=device)
+    except (RuntimeError, TypeError):
+        torch.manual_seed(int(seed))
+        return torch.randn(shape, device=device)
+
+
 def autoencoder_loss(out, x, yc, ys, fact_w=0.25):
     recon = F.mse_loss(out["recon"], x)
     facts = F.cross_entropy(out["color"], yc) + F.cross_entropy(out["shape"], ys)
@@ -275,8 +296,7 @@ def guided_velocity(flow, z, t, cond, cfg_scale=1.0):
 @torch.no_grad()
 def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0,
                    cfg_scale=1.0):
-    torch.manual_seed(seed)
-    z = torch.randn((cond.shape[0],) + tuple(latent_shape), device=device)
+    z = _seeded_randn((cond.shape[0],) + tuple(latent_shape), device=device, seed=seed)
     flow.eval()
     dt = 1.0 / max(1, steps)
     for i in range(steps):
@@ -337,6 +357,7 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_s
 @torch.no_grad()
 def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=1.0,
              sample_steps=4, roundtrip_samples=1):
+    torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     ae.eval()
     flow.eval()
@@ -380,6 +401,68 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
                                         sample_steps=sample_steps,
                                         samples_per_combo=roundtrip_samples, seed=seed + 17))
     return report
+
+
+def load_checkpoint(path, device=DEV):
+    ckpt = torch.load(path, map_location=device)
+    report = ckpt.get("report", {})
+    latent_ch = int(ckpt.get("latent_ch", report.get("latent_ch", 16)))
+    hidden = int(ckpt.get("hidden", report.get("hidden", 64)))
+    flow_arch = ckpt.get("flow_arch", report.get("flow_arch", "conv"))
+    dit_depth = int(ckpt.get("dit_depth", report.get("dit_depth", 3)))
+    dit_heads = int(ckpt.get("dit_heads", report.get("dit_heads", 4)))
+    ae = SemanticAutoencoder(latent_ch=latent_ch, hidden=hidden).to(device)
+    flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
+                     dit_depth=dit_depth, dit_heads=dit_heads).to(device)
+    ae.load_state_dict(ckpt["autoencoder_state_dict"])
+    flow.load_state_dict(ckpt["flow_state_dict"])
+    ae.eval()
+    flow.eval()
+    return ae, flow, {
+        "checkpoint": path,
+        "checkpoint_report": report,
+        "latent_ch": latent_ch,
+        "hidden": hidden,
+        "flow_arch": flow_arch,
+        "dit_depth": dit_depth if flow_arch == "dit" else 0,
+        "dit_heads": dit_heads if flow_arch == "dit" else 0,
+    }
+
+
+@torch.no_grad()
+def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
+                  n=128, batch=64, seed=10, size=32, device=DEV, roundtrip_samples=1):
+    rows = []
+    for cfg_scale in cfg_scales:
+        for sample_steps in sample_steps_list:
+            row = evaluate(ae, flow, n=n, batch=batch, seed=seed, size=size, device=device,
+                           cfg_scale=float(cfg_scale), sample_steps=int(sample_steps),
+                           roundtrip_samples=roundtrip_samples)
+            row["sweep_key"] = f"cfg={float(cfg_scale):g};steps={int(sample_steps)}"
+            rows.append(row)
+    return rows
+
+
+def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
+                        n=128, batch=64, seed=10, size=32, device=DEV, roundtrip_samples=1):
+    ae, flow, meta = load_checkpoint(path, device=device)
+    rows = sampler_sweep(ae, flow, cfg_scales=cfg_scales, sample_steps_list=sample_steps_list,
+                         n=n, batch=batch, seed=seed, size=size, device=device,
+                         roundtrip_samples=roundtrip_samples)
+    best = max(rows, key=lambda r: (
+        r["sample_roundtrip_both_acc"],
+        r["sample_roundtrip_shape_acc"],
+        r["sample_roundtrip_color_acc"],
+        -r["conditional_sample_mse"],
+    ))
+    return {
+        "experiment": "image_latent_sampler_sweep",
+        **meta,
+        "n": int(n),
+        "roundtrip_samples": int(roundtrip_samples),
+        "rows": rows,
+        "best": best,
+    }
 
 
 def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidden=64,
@@ -467,6 +550,9 @@ def selftest():
     img2 = sample_images(ae2, flow2, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
                          seed=1, cfg_scale=1.5)
     assert img2.shape == (1, 3, 32, 32)
+    sweep = sampler_sweep(ae2, flow2, cfg_scales=(1.0, 1.5), sample_steps_list=(1,),
+                          n=4, batch=2, seed=3, device="cpu")
+    assert len(sweep) == 2 and "sample_roundtrip_both_acc" in sweep[0]
     print("image_latent selftest OK")
 
 
@@ -474,6 +560,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--train", action="store_true")
+    ap.add_argument("--eval-checkpoint", default="", dest="eval_checkpoint",
+                    help="load a saved image_latent checkpoint and run a sampler sweep")
     ap.add_argument("--ae-steps", type=int, default=200, dest="ae_steps")
     ap.add_argument("--flow-steps", type=int, default=200, dest="flow_steps")
     ap.add_argument("--batch", type=int, default=64)
@@ -487,17 +575,40 @@ def main(argv=None):
     ap.add_argument("--cond-drop", type=float, default=0.0, dest="cond_drop")
     ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
     ap.add_argument("--sample-steps", type=int, default=4, dest="sample_steps")
+    ap.add_argument("--cfg-scales", default="1.0,1.25,1.5,2.0", dest="cfg_scales",
+                    help="comma-separated CFG scales for --eval-checkpoint")
+    ap.add_argument("--sample-steps-list", default="4,8,16", dest="sample_steps_list",
+                    help="comma-separated sampler step counts for --eval-checkpoint")
     ap.add_argument("--roundtrip-samples", type=int, default=1, dest="roundtrip_samples")
     ap.add_argument("--flow-semantic-w", type=float, default=0.0, dest="flow_semantic_w",
                     help="semantic endpoint alignment weight for latent flow training")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="runs/image_latent_flow.pt")
+    ap.add_argument("--eval-out", default="", dest="eval_out",
+                    help="JSON path for --eval-checkpoint report")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest()
         return
+    if args.eval_checkpoint:
+        report = evaluate_checkpoint(
+            args.eval_checkpoint,
+            cfg_scales=_parse_number_list(args.cfg_scales, float),
+            sample_steps_list=_parse_number_list(args.sample_steps_list, int),
+            seed=args.seed,
+            roundtrip_samples=args.roundtrip_samples,
+        )
+        if args.eval_out:
+            os.makedirs(os.path.dirname(args.eval_out) or ".", exist_ok=True)
+            with open(args.eval_out, "w") as f:
+                json.dump(report, f, indent=1)
+            print(json.dumps(report, indent=1))
+            print(f"saved -> {args.eval_out}")
+        else:
+            print(json.dumps(report, indent=1))
+        return
     if not args.train:
-        ap.error("use --selftest or --train")
+        ap.error("use --selftest, --train, or --eval-checkpoint")
     ae, flow, report = train_latent_flow(ae_steps=args.ae_steps, flow_steps=args.flow_steps,
                                          batch=args.batch, latent_ch=args.latent_ch,
                                          hidden=args.hidden, lr=args.lr, fact_w=args.fact_w,
@@ -516,6 +627,8 @@ def main(argv=None):
         "latent_ch": args.latent_ch,
         "hidden": args.hidden,
         "flow_arch": args.flow_arch,
+        "dit_depth": args.dit_depth,
+        "dit_heads": args.dit_heads,
         "cond_drop": args.cond_drop,
         "cfg_scale": args.cfg_scale,
         "sample_steps": args.sample_steps,
