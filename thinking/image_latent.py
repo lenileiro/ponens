@@ -371,17 +371,29 @@ class MMDiTBlock(nn.Module):
                                     nn.Linear(hidden * 4, hidden))
         self.ctx_ff = nn.Sequential(nn.Linear(hidden, hidden * 4), nn.GELU(),
                                     nn.Linear(hidden * 4, hidden))
+        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(hidden, hidden * 8))
+        nn.init.zeros_(self.ada[-1].weight)
+        nn.init.zeros_(self.ada[-1].bias)
 
     def _qkv(self, proj, x):
         b, n, h = x.shape
         q, k, v = proj(x).view(b, n, 3, self.heads, self.head_dim).unbind(dim=2)
         return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-    def forward(self, img, ctx, ctx_mask=None):
+    @staticmethod
+    def _modulate(x, shift, scale):
+        return x * (1.0 + scale[:, None, :]) + shift[:, None, :]
+
+    def forward(self, img, ctx, cond_ctx, ctx_mask=None):
         b, n_img, h = img.shape
         n_ctx = ctx.shape[1]
-        qi, ki, vi = self._qkv(self.img_qkv, self.img_norm(img))
-        qc, kc, vc = self._qkv(self.ctx_qkv, self.ctx_norm(ctx))
+        (img_attn_shift, img_attn_scale, ctx_attn_shift, ctx_attn_scale,
+         img_ff_shift, img_ff_scale, ctx_ff_shift, ctx_ff_scale) = self.ada(cond_ctx).chunk(
+             8, dim=-1)
+        img_attn = self._modulate(self.img_norm(img), img_attn_shift, img_attn_scale)
+        ctx_attn = self._modulate(self.ctx_norm(ctx), ctx_attn_shift, ctx_attn_scale)
+        qi, ki, vi = self._qkv(self.img_qkv, img_attn)
+        qc, kc, vc = self._qkv(self.ctx_qkv, ctx_attn)
         q = torch.cat([qi, qc], dim=2)
         k = torch.cat([ki, kc], dim=2)
         v = torch.cat([vi, vc], dim=2)
@@ -394,8 +406,10 @@ class MMDiTBlock(nn.Module):
         img_delta, ctx_delta = mixed[:, :n_img], mixed[:, n_img:]
         img = img + self.img_out(img_delta)
         ctx = ctx + self.ctx_out(ctx_delta)
-        img = img + self.img_ff(self.img_ff_norm(img))
-        ctx = ctx + self.ctx_ff(self.ctx_ff_norm(ctx))
+        img_ff = self._modulate(self.img_ff_norm(img), img_ff_shift, img_ff_scale)
+        ctx_ff = self._modulate(self.ctx_ff_norm(ctx), ctx_ff_shift, ctx_ff_scale)
+        img = img + self.img_ff(img_ff)
+        ctx = ctx + self.ctx_ff(ctx_ff)
         if ctx_mask is not None:
             ctx = ctx.masked_fill(ctx_mask[:, :, None], 0.0)
         return img, ctx
@@ -405,6 +419,7 @@ class LatentMMDiTFlowNet(nn.Module):
     """Toy MM-DiT latent flow with bidirectional image/condition token mixing."""
 
     uses_cond_tokens = True
+    uses_adaptive_modulation = True
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256):
@@ -441,11 +456,12 @@ class LatentMMDiTFlowNet(nn.Module):
         n = h * w
         if n > self.max_tokens:
             raise ValueError(f"latent token count {n} exceeds max_tokens={self.max_tokens}")
+        cond_ctx = self.time(torch.cat([cond_vec, t.to(cond_vec.dtype)], dim=1))
         img = self.in_proj(z.flatten(2).transpose(1, 2)) + self.pos[:, :n]
-        img = img + self.time(torch.cat([cond_vec, t.to(cond_vec.dtype)], dim=1))[:, None, :]
+        img = img + cond_ctx[:, None, :]
         ctx, ctx_mask = self._context(cond)
         for block in self.blocks:
-            img, ctx = block(img, ctx, ctx_mask=ctx_mask)
+            img, ctx = block(img, ctx, cond_ctx, ctx_mask=ctx_mask)
         v = self.out_proj(self.norm(img))
         return v.transpose(1, 2).reshape(b, c, h, w)
 
@@ -813,6 +829,7 @@ def load_checkpoint(path, device=DEV):
         "flow_arch": flow_arch,
         "dit_depth": dit_depth if flow_arch in ("dit", "crossdit", "mmdit") else 0,
         "dit_heads": dit_heads if flow_arch in ("dit", "crossdit", "mmdit") else 0,
+        "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "cond_mode": cond_mode,
         "cond_dim": cond_dim,
     }
@@ -988,6 +1005,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_arch": flow_arch,
         "dit_depth": int(dit_depth) if flow_arch in ("dit", "crossdit", "mmdit") else 0,
         "dit_heads": int(dit_heads) if flow_arch in ("dit", "crossdit", "mmdit") else 0,
+        "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "fact_w": float(fact_w),
         "cond_drop": float(cond_drop),
         "flow_semantic_w": float(flow_semantic_w),
@@ -1062,6 +1080,7 @@ def selftest():
         text_cond_dim=8, sample_steps=1, time_sampling="logit-normal",
         return_conditioner=True)
     assert report5["flow_arch"] == "mmdit" and flow_uses_cond_tokens(flow5)
+    assert report5["adaptive_modulation"] is True
     mm_sweep = sampler_sweep(ae5, flow5, cfg_scales=(1.0,), sample_steps_list=(1,), n=4,
                              batch=2, seed=8, device="cpu", cond_mode="text",
                              conditioner=conditioner5, prompt_vocab=vocab5)

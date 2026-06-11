@@ -294,6 +294,11 @@ condition-token projections, joint attention, and modality-specific feed-forward
 one-way `crossdit` scaffold, prompt/fact tokens can also absorb image-token state inside each block,
 matching the bidirectional multimodal token-mixing direction of modern rectified-flow T2I systems.
 
+Image-12 adds condition-adaptive modulation to MM-DiT blocks: the time/text condition vector now
+modulates the attention and feed-forward normalizations for both image and condition streams. The
+adapter is zero-initialized, so it starts as the previous MM-DiT block and learns stronger
+conditioning without destabilizing checkpoint-smoke training.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
