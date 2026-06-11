@@ -151,6 +151,7 @@ python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-st
 python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --ae-steps 400 --flow-steps 400 --cond-drop 0.1 --cfg-scale 1.5 \
     --sample-steps 8 --flow-semantic-w 0.25 --time-sampling logit-normal \
+    --flow-ema-decay 0.999 \
     --out runs/image_latent_mmdit_text.pt
 python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
@@ -165,7 +166,8 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --vision-arch bottl
 RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-latent-arch mmdit \
     --image-cond-mode text --image-cond-drop 0.1 --image-cfg-scale 1.5 \
     --image-sample-steps 8 --image-flow-semantic-w 0.25 \
-    --image-time-sampling logit-normal --image-eval-sweep --fast --go
+    --image-time-sampling logit-normal --image-flow-ema-decay 0.999 \
+    --image-eval-sweep --fast --go
 ```
 
 `thinking.image2` is the head-aware FER experiment: shared factored heads vs explicit
@@ -302,6 +304,11 @@ conditioning without destabilizing checkpoint-smoke training.
 Image-13 adds AdaLN-style residual gates to the adaptive MM-DiT branches. Attention and feed-forward
 updates in both streams now have condition-dependent gates, and old MM-DiT checkpoints without gate
 weights are tolerated by the loader with zero-initialized identity-centered gates.
+
+Image-14 adds EMA checkpointing/evaluation for the latent flow and learned text conditioner. Train
+reports can evaluate the averaged weights, checkpoints save both raw and EMA states, and
+`--eval-checkpoint` prefers EMA when available while keeping `--no-ema-checkpoint` for raw-weight
+comparisons.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

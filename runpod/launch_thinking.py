@@ -107,6 +107,7 @@ def payload(args):
                      f"--sample-steps {args.image_sample_steps} "
                      f"--roundtrip-samples {args.image_roundtrip_samples} "
                      f"--flow-semantic-w {args.image_flow_semantic_w} "
+                     f"--flow-ema-decay {args.image_flow_ema_decay} "
                      f"--time-sampling {args.image_time_sampling} "
                      f"--time-logit-mean {args.image_time_logit_mean} "
                      f"--time-logit-std {args.image_time_logit_std} "
@@ -364,6 +365,9 @@ def main():
     ap.add_argument("--image-flow-semantic-w", type=float, default=0.0,
                     dest="image_flow_semantic_w",
                     help="semantic endpoint alignment weight for latent image flow training")
+    ap.add_argument("--image-flow-ema-decay", type=float, default=0.0,
+                    dest="image_flow_ema_decay",
+                    help="EMA decay for latent image flow/conditioner weights")
     ap.add_argument("--image-time-sampling", default="uniform",
                     choices=("uniform", "logit-normal"), dest="image_time_sampling",
                     help="latent image flow timestep distribution")

@@ -810,7 +810,24 @@ def load_flow_state(flow, state_dict):
     return {"missing": list(missing), "tolerated_missing": tolerated_missing}
 
 
-def load_checkpoint(path, device=DEV):
+def clone_state_dict(module):
+    return {k: v.detach().clone() for k, v in module.state_dict().items()}
+
+
+@torch.no_grad()
+def update_ema_state(ema_state, module, decay):
+    state = module.state_dict()
+    for key, val in state.items():
+        cur = val.detach()
+        if key not in ema_state:
+            ema_state[key] = cur.clone()
+        elif torch.is_floating_point(ema_state[key]):
+            ema_state[key].mul_(decay).add_(cur, alpha=1.0 - decay)
+        else:
+            ema_state[key].copy_(cur)
+
+
+def load_checkpoint(path, device=DEV, prefer_ema=True):
     ckpt = torch.load(path, map_location=device)
     report = ckpt.get("report", {})
     latent_ch = int(ckpt.get("latent_ch", report.get("latent_ch", 16)))
@@ -829,13 +846,21 @@ def load_checkpoint(path, device=DEV):
             prompt_vocab = build_prompt_vocab(prompt_templates)
         conditioner = PromptConditioner(len(prompt_vocab), cond_dim=cond_dim,
                                         hidden=hidden).to(device)
-        conditioner.load_state_dict(ckpt["conditioner_state_dict"])
+        cond_state = ckpt["conditioner_state_dict"]
+        if prefer_ema and ckpt.get("conditioner_ema_state_dict"):
+            cond_state = ckpt["conditioner_ema_state_dict"]
+        conditioner.load_state_dict(cond_state)
         conditioner.eval()
     ae = SemanticAutoencoder(latent_ch=latent_ch, hidden=hidden).to(device)
     flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
                      dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim).to(device)
     ae.load_state_dict(ckpt["autoencoder_state_dict"])
-    flow_load = load_flow_state(flow, ckpt["flow_state_dict"])
+    flow_state = ckpt["flow_state_dict"]
+    ema_available = bool(ckpt.get("flow_ema_state_dict"))
+    ema_loaded = bool(prefer_ema and ema_available)
+    if ema_loaded:
+        flow_state = ckpt["flow_ema_state_dict"]
+    flow_load = load_flow_state(flow, flow_state)
     ae.eval()
     flow.eval()
     return ae, flow, conditioner, prompt_vocab, prompt_templates, {
@@ -849,6 +874,8 @@ def load_checkpoint(path, device=DEV):
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "flow_load": flow_load,
+        "ema_available": ema_available,
+        "ema_loaded": ema_loaded,
         "cond_mode": cond_mode,
         "cond_dim": cond_dim,
     }
@@ -908,9 +935,10 @@ def aggregate_sweep_rows(rows):
 
 def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         n=128, batch=64, seed=10, eval_seeds=None, size=32, device=DEV,
-                        roundtrip_samples=1):
+                        roundtrip_samples=1, prefer_ema=True):
     ae, flow, conditioner, prompt_vocab, prompt_templates, meta = load_checkpoint(path,
-                                                                                  device=device)
+                                                                                  device=device,
+                                                                                  prefer_ema=prefer_ema)
     eval_seeds = tuple(eval_seeds) if eval_seeds is not None else (seed,)
     rows = []
     for eval_seed in eval_seeds:
@@ -949,13 +977,16 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       cond_mode="facts", text_cond_dim=0,
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0,
-                      return_conditioner=False):
+                      flow_ema_decay=0.0, eval_with_ema=True, return_conditioner=False,
+                      return_ema=False):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     if cond_mode not in ("facts", "text"):
         raise ValueError(f"unknown condition mode {cond_mode!r}")
     if time_sampling not in ("uniform", "logit-normal"):
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
+    if flow_ema_decay < 0.0 or flow_ema_decay >= 1.0:
+        raise ValueError("flow_ema_decay must be in [0, 1)")
     prompt_vocab = build_prompt_vocab(prompt_templates) if cond_mode == "text" else None
     cond_dim = len(FACT_VOCAB)
     conditioner = None
@@ -988,6 +1019,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     if conditioner is not None:
         conditioner.train()
     last_flow = {}
+    flow_ema = clone_state_dict(flow) if flow_ema_decay > 0.0 else None
+    conditioner_ema = (clone_state_dict(conditioner)
+                       if flow_ema_decay > 0.0 and conditioner is not None else None)
     for _ in range(flow_steps):
         x, fact_cond, _yc, _ys, specs = _batch(batch, rng, size=size, device=device,
                                                return_specs=True)
@@ -1005,15 +1039,31 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         opt_flow.zero_grad()
         loss.backward()
         opt_flow.step()
+        if flow_ema is not None:
+            update_ema_state(flow_ema, flow, flow_ema_decay)
+            if conditioner is not None:
+                update_ema_state(conditioner_ema, conditioner, flow_ema_decay)
         last_flow = {"total_loss": float(loss.detach().cpu())}
         last_flow.update({k: float(v.detach().cpu()) for k, v in parts.items()})
 
     if conditioner is not None:
         conditioner.eval()
+    eval_ema = bool(flow_ema is not None and eval_with_ema)
+    raw_flow = raw_conditioner = None
+    if eval_ema:
+        raw_flow = clone_state_dict(flow)
+        load_flow_state(flow, flow_ema)
+        if conditioner is not None:
+            raw_conditioner = clone_state_dict(conditioner)
+            conditioner.load_state_dict(conditioner_ema)
     report = evaluate(ae, flow, seed=seed + 1, size=size, device=device, cfg_scale=cfg_scale,
                       sample_steps=sample_steps, roundtrip_samples=roundtrip_samples,
                       cond_mode=cond_mode, conditioner=conditioner, prompt_vocab=prompt_vocab,
                       prompt_templates=prompt_templates)
+    if eval_ema:
+        load_flow_state(flow, raw_flow)
+        if conditioner is not None:
+            conditioner.load_state_dict(raw_conditioner)
     report.update({
         "experiment": "image3_latent_fact_conditioned_rectified_flow",
         "ae_steps": int(ae_steps),
@@ -1029,6 +1079,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "fact_w": float(fact_w),
         "cond_drop": float(cond_drop),
         "flow_semantic_w": float(flow_semantic_w),
+        "flow_ema_decay": float(flow_ema_decay),
+        "ema_available": flow_ema is not None,
+        "eval_with_ema": eval_ema,
         "time_sampling": time_sampling,
         "time_logit_mean": float(time_logit_mean),
         "time_logit_std": float(time_logit_std),
@@ -1041,6 +1094,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "last_flow_loss": last_flow.get("velocity_mse"),
         "fact_vocab": [list(f) for f in FACT_VOCAB],
     })
+    if return_ema:
+        if return_conditioner:
+            return ae, flow, conditioner, prompt_vocab, report, flow_ema, conditioner_ema
+        return ae, flow, report, flow_ema
     if return_conditioner:
         return ae, flow, conditioner, prompt_vocab, report
     return ae, flow, report
@@ -1098,10 +1155,12 @@ def selftest():
         ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="mmdit",
         dit_depth=1, dit_heads=2, seed=7, device="cpu", cond_mode="text",
         text_cond_dim=8, sample_steps=1, time_sampling="logit-normal",
+        flow_ema_decay=0.5,
         return_conditioner=True)
     assert report5["flow_arch"] == "mmdit" and flow_uses_cond_tokens(flow5)
     assert report5["adaptive_modulation"] is True
     assert report5["residual_gating"] is True
+    assert report5["ema_available"] is True and report5["eval_with_ema"] is True
     legacy_state = {k: v for k, v in flow5.state_dict().items() if ".gate." not in k}
     compat_flow = make_flow(flow_arch="mmdit", latent_ch=4, hidden=32, dit_depth=1,
                             dit_heads=2, cond_dim=8)
@@ -1144,6 +1203,10 @@ def main(argv=None):
     ap.add_argument("--roundtrip-samples", type=int, default=1, dest="roundtrip_samples")
     ap.add_argument("--flow-semantic-w", type=float, default=0.0, dest="flow_semantic_w",
                     help="semantic endpoint alignment weight for latent flow training")
+    ap.add_argument("--flow-ema-decay", type=float, default=0.0, dest="flow_ema_decay",
+                    help="EMA decay for flow/conditioner weights; 0 disables EMA")
+    ap.add_argument("--no-ema-eval", action="store_true", dest="no_ema_eval",
+                    help="do not swap EMA weights in for the final train report")
     ap.add_argument("--time-sampling", default="uniform", choices=("uniform", "logit-normal"),
                     dest="time_sampling",
                     help="rectified-flow training timestep distribution")
@@ -1161,6 +1224,8 @@ def main(argv=None):
     ap.add_argument("--out", default="runs/image_latent_flow.pt")
     ap.add_argument("--eval-out", default="", dest="eval_out",
                     help="JSON path for --eval-checkpoint report")
+    ap.add_argument("--no-ema-checkpoint", action="store_true", dest="no_ema_checkpoint",
+                    help="for --eval-checkpoint, evaluate raw checkpoint weights even if EMA exists")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest()
@@ -1173,6 +1238,7 @@ def main(argv=None):
             seed=args.seed,
             eval_seeds=(_parse_number_list(args.eval_seeds, int) if args.eval_seeds else None),
             roundtrip_samples=args.roundtrip_samples,
+            prefer_ema=not args.no_ema_checkpoint,
         )
         if args.eval_out:
             os.makedirs(os.path.dirname(args.eval_out) or ".", exist_ok=True)
@@ -1186,7 +1252,7 @@ def main(argv=None):
     if not args.train:
         ap.error("use --selftest, --train, or --eval-checkpoint")
     templates = _parse_templates(args.prompt_templates)
-    ae, flow, conditioner, prompt_vocab, report = train_latent_flow(
+    ae, flow, conditioner, prompt_vocab, report, flow_ema, conditioner_ema = train_latent_flow(
         ae_steps=args.ae_steps, flow_steps=args.flow_steps, batch=args.batch,
         latent_ch=args.latent_ch, hidden=args.hidden, lr=args.lr, fact_w=args.fact_w,
         seed=args.seed, flow_arch=args.flow_arch, dit_depth=args.dit_depth,
@@ -1195,8 +1261,9 @@ def main(argv=None):
         flow_semantic_w=args.flow_semantic_w, cond_mode=args.cond_mode,
         text_cond_dim=args.text_cond_dim, prompt_templates=templates,
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
-        time_logit_std=args.time_logit_std,
-        return_conditioner=True)
+        time_logit_std=args.time_logit_std, flow_ema_decay=args.flow_ema_decay,
+        eval_with_ema=not args.no_ema_eval,
+        return_conditioner=True, return_ema=True)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save({
         "autoencoder_state_dict": ae.state_dict(),
@@ -1214,12 +1281,15 @@ def main(argv=None):
         "cfg_scale": args.cfg_scale,
         "sample_steps": args.sample_steps,
         "flow_semantic_w": args.flow_semantic_w,
+        "flow_ema_decay": args.flow_ema_decay,
         "time_sampling": args.time_sampling,
         "time_logit_mean": args.time_logit_mean,
         "time_logit_std": args.time_logit_std,
         "prompt_templates": list(templates) if args.cond_mode == "text" else [],
         "prompt_vocab": prompt_vocab if prompt_vocab is not None else {},
         "conditioner_state_dict": (conditioner.state_dict() if conditioner is not None else {}),
+        "flow_ema_state_dict": flow_ema if flow_ema is not None else {},
+        "conditioner_ema_state_dict": (conditioner_ema if conditioner_ema is not None else {}),
     }, args.out)
     print(json.dumps(report, indent=1))
     print(f"saved -> {args.out}")
