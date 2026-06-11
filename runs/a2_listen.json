@@ -1,0 +1,97 @@
+{
+ "experiment": "a2_listen",
+ "steps": 600,
+ "bank": "12 words x 4 voices x 3 rates; 8 held-out cells",
+ "arms": {
+  "factored": {
+   "seeds": [
+    {
+     "seed": 0,
+     "seen_word": 1.0,
+     "holdout_word": 0.1875,
+     "seen_voice": 1.0,
+     "holdout_voice": 1.0
+    },
+    {
+     "seed": 1,
+     "seen_word": 1.0,
+     "holdout_word": 0.2916666666666667,
+     "seen_voice": 1.0,
+     "holdout_voice": 1.0
+    },
+    {
+     "seed": 2,
+     "seen_word": 1.0,
+     "holdout_word": 0.25,
+     "seen_voice": 1.0,
+     "holdout_voice": 1.0
+    }
+   ],
+   "seen_word": 1.0,
+   "holdout_word": 0.24305555555555558,
+   "holdout_voice": 1.0
+  },
+  "swap": {
+   "seeds": [
+    {
+     "seed": 0,
+     "seen_word": 1.0,
+     "holdout_word": 0.3541666666666667,
+     "seen_voice": 1.0,
+     "holdout_voice": 1.0
+    },
+    {
+     "seed": 1,
+     "seen_word": 1.0,
+     "holdout_word": 0.3333333333333333,
+     "seen_voice": 1.0,
+     "holdout_voice": 1.0
+    },
+    {
+     "seed": 2,
+     "seen_word": 1.0,
+     "holdout_word": 0.5625,
+     "seen_voice": 1.0,
+     "holdout_voice": 1.0
+    }
+   ],
+   "seen_word": 1.0,
+   "holdout_word": 0.4166666666666667,
+   "holdout_voice": 1.0
+  },
+  "subspace": {
+   "seeds": [
+    {
+     "seed": 0,
+     "seen_word": 1.0,
+     "holdout_word": 0.375,
+     "seen_voice": 1.0,
+     "holdout_voice": 1.0
+    },
+    {
+     "seed": 1,
+     "seen_word": 1.0,
+     "holdout_word": 0.375,
+     "seen_voice": 1.0,
+     "holdout_voice": 1.0
+    },
+    {
+     "seed": 2,
+     "seen_word": 1.0,
+     "holdout_word": 0.5,
+     "seen_voice": 1.0,
+     "holdout_voice": 1.0
+    }
+   ],
+   "seen_word": 1.0,
+   "holdout_word": 0.4166666666666667,
+   "holdout_voice": 1.0
+  }
+ },
+ "verdict": {
+  "best_arm": "swap",
+  "best_holdout_word": 0.4166666666666667,
+  "baseline_holdout_word": 0.24305555555555558,
+  "speaker_invariant_listening": false
+ }
+}

@@ -1,0 +1,17 @@
+{
+  "train": [
+    "the picture shows p0 as a {color} {shape} . the sound from a0 has pitch {pitch} timbre {timbre} and envelope {env} .",
+    "p0 appears {color} and {shape} . a0 plays a {timbre} tone at {pitch} with {env} envelope .",
+    "visual p0 color {color} shape {shape} . audio a0 pitch {pitch} timbre {timbre} env {env} .",
+    "in the image p0 is colored {color} and shaped as a {shape} . in the audio a0 has {pitch} pitch {timbre} timbre and {env} dynamics .",
+    "seen p0 is a {shape} object with {color} color . heard a0 uses {timbre} timbre at {pitch} with {env} envelope .",
+    "the object p0 has shape like a {shape} plus color {color} . the clip a0 carries {pitch} pitch with {timbre} sound and {env} dynamics .",
+    "p0 is seen as {color} in color and {shape} in shape . a0 is heard as {pitch} pitch {timbre} timbre {env} envelope .",
+    "image p0 has {color} color plus {shape} shape . audio a0 uses {pitch} pitch and {timbre} timbre with {env} dynamics ."
+  ],
+  "eval": [
+    "in the image p0 is shaped like a {shape} and colored {color} . in the audio a0 uses {timbre} at {pitch} with {env} dynamics .",
+    "seen object p0 has {shape} shape plus {color} color . heard clip a0 carries {pitch} pitch {timbre} timbre {env} envelope .",
+    "a0 is heard as {timbre} {pitch} {env} . p0 is seen as {shape} in {color} ."
+  ]
+}

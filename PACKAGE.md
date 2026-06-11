@@ -253,10 +253,11 @@ subspace intervention ladder. The target facts use the same h/pred/t convention:
 `fact a0 pitch n440 .`, `fact a0 timbre saw .`, `fact a0 env decay .`.
 
 `thinking.multimodal` is M-0: one non-pointer `ScratchpadLM` receives continuous image patch
-prefixes and audio spectrogram prefixes, then emits one canonical extraction trace:
+prefixes, audio spectrogram prefixes, and transcript prefixes from
+`data/multimodal_transcripts.json`, then emits one canonical extraction trace:
 
 ```
-[IMG prefix][AUD prefix] extract
+[IMG prefix][AUD prefix][TXT prefix] extract
   fact p0 color red . fact p0 shape circle .
   fact a0 pitch n440 . fact a0 timbre saw . fact a0 env decay . done .
 ```
@@ -266,11 +267,18 @@ facts before the checker/reasoner sees it. Image generation stays connected thro
 semantic latent path (`image -> latent -> facts/generation`) rather than becoming a detached
 pixel model.
 
-M-0 local update (400 steps, value-token weighted loss): image color **1.00**, image shape
-**0.99**, audio pitch **0.88**, audio timbre **1.00**, audio envelope **0.985**. The first
-30-step smoke exposed a real issue: trace grammar dominated the loss while value tokens lagged;
-the current trainer upweights only the factor value positions, so the shared decoder learns the
-canonical values instead of just the fixed `extract fact ... done` skeleton.
+M-0 local update (240 steps, value-token weighted loss, all-mode ablations every step): the
+tracked run now gates three paths separately. Teacher-forced full multimodal accuracy is color
+**1.00**, shape **1.00**, pitch **0.79**, timbre **0.94**, envelope **1.00**. Text-only held-out
+transcript phrasings, with image/audio zeroed, score **0.92 / 0.97 / 0.48 / 0.91 / 0.95**. Free
+greedy text-only extraction reaches **0.80 exact trace-fact match** over the small eval sample.
+The stronger semantic gate is counterfactual text intervention: edit exactly one described factor
+in a held-out transcript, keep image/audio zeroed, and require only the matching canonical fact to
+move. Mean target accuracy is **0.92**, mean collateral stability is **0.93**, and the hardest
+edited factor (pitch) is **0.65** vs a **0.475** gate. This does not prove broad natural-language
+understanding; it proves that the bridge can learn a configurable transcript surface bank as a
+sensory input and bind edited words to canonical facts rather than merely predicting the next
+caption token.
 
 ## 4. Exams (the report card)
 

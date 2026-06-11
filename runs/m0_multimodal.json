@@ -1,13 +1,79 @@
 {
  "experiment": "m0_multimodal_bridge",
- "steps": 400,
+ "steps": 240,
  "value_w": 6.0,
- "per_factor_acc": {
-  "color": 1.0,
-  "shape": 0.99,
-  "pitch": 0.88,
-  "timbre": 1.0,
-  "env": 0.985
+ "eval_n": 120,
+ "free_n": 20,
+ "counterfactual_n": 40,
+ "text_surfaces": {
+  "path": "/Users/leiro/workspace/llm/data/multimodal_transcripts.json",
+  "train": 8,
+  "eval": 3
+ },
+ "teacher_forced": {
+  "full": {
+   "color": 1.0,
+   "shape": 1.0,
+   "pitch": 0.7916666666666666,
+   "timbre": 0.9416666666666667,
+   "env": 1.0
+  },
+  "text_only_eval_phrasings": {
+   "color": 0.9166666666666666,
+   "shape": 0.9666666666666667,
+   "pitch": 0.48333333333333334,
+   "timbre": 0.9083333333333333,
+   "env": 0.95
+  },
+  "sensor_only": {
+   "color": 1.0,
+   "shape": 0.6083333333333333,
+   "pitch": 0.95,
+   "timbre": 0.7666666666666667,
+   "env": 0.9916666666666667
+  }
+ },
+ "free_text_only_eval_phrasings": {
+  "color": 0.95,
+  "shape": 1.0,
+  "pitch": 0.95,
+  "timbre": 0.9,
+  "env": 1.0,
+  "exact": 0.8
+ },
+ "counterfactual_text_only_eval_phrasings": {
+  "by_factor": {
+   "color": {
+    "target_acc": 0.95,
+    "collateral_acc": 0.9375,
+    "exact": 0.725
+   },
+   "shape": {
+    "target_acc": 1.0,
+    "collateral_acc": 0.9125,
+    "exact": 0.675
+   },
+   "pitch": {
+    "target_acc": 0.65,
+    "collateral_acc": 0.9625,
+    "exact": 0.6
+   },
+   "timbre": {
+    "target_acc": 1.0,
+    "collateral_acc": 0.93125,
+    "exact": 0.775
+   },
+   "env": {
+    "target_acc": 1.0,
+    "collateral_acc": 0.925,
+    "exact": 0.7
+   }
+  },
+  "mean": {
+   "target_acc": 0.9199999999999999,
+   "collateral_acc": 0.9337500000000001,
+   "exact": 0.695
+  }
  },
  "chance": {
   "color": 0.2,
@@ -23,5 +89,6 @@
   "timbre": 0.55,
   "env": 0.6000000000000001
  },
- "gate": true
+ "gate": true,
+ "checkpoint": "runs/m0_multimodal.pt"
 }
