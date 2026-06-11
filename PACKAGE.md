@@ -214,6 +214,12 @@ off pixels. The module now also has `--flow-arch dit`, a tiny patch-token DiT ve
 the same semantic latents. That is the toy-scale version of the architecture we need to scale:
 semantic image latents + fact/text conditioning + rectified-flow transformer.
 
+Image-4 GPU update (H100, 1000 AE steps + 1000 DiT-flow steps): the patch-token DiT flow keeps the
+same semantic AE quality (`recon_mse=0.015`, color **1.00**, shape **0.86**) and improves the
+transport objective vs the conv baseline: `latent_velocity_mse` **1.05 → 0.75** and center-target
+sample MSE **0.044 → 0.020**. This makes DiT the default scale direction; the conv flow remains a
+small baseline.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
