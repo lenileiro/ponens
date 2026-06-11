@@ -53,6 +53,30 @@ distinct layers on trace corpora at this scale). **Use `d=256` for multi-rule wo
 proof trees), entailment oracle, and SLD backward chaining (`prove`/`options`) for goal-directed
 worlds with distractors.
 
+**Verified decode** (`flow.py`), in the order things happen:
+
+1. The model emits a greedy line; the checker validates it.
+2. A rejected line is **resampled at temp 0.5** from the model's own distribution. Resampling is
+   **prefix-pruned**: a trie over all checker-valid lines (every premise order — the checker
+   accepts any body permutation, and a stricter trie silently collapses acceptance) aborts an
+   attempt at the first token that cannot extend to a valid line. Identical acceptance set to
+   full-line propose-then-reject; failure costs ~2 tokens instead of 18, which funds a 4× retry
+   budget.
+3. If every retry fails, **skip-don't-die**: the model's own rejected line advances the
+   *context* (uncommitted to the checker) and decoding continues. This is load-bearing —
+   regenerating from the same clean prefix just reproduces the same line until the budget dies
+   (removing it collapsed verified k=3 from 0.95 to 0.10; restored in `13c5bc3`).
+4. Every rejection is classified (`reject_causes` in eval output: syntax / check-not-edb /
+   premise-unknown / no-rule / goal-anchor / duplicate / builtin-reject) — the taxonomy says
+   where per-line error actually lives before you optimize it.
+
+Two stronger interventions were built and measured, and both **lose** to rejection sampling on
+a gold-trace-trained policy (forced valid-but-foreign lines push generation off-distribution and
+the damage compounds): `--mode masked` (masked repair of rejected lines, 0.50) and
+`decode="masked-full"` (every token masked to valid prefixes, 0.40) vs verified 0.80–0.95. Kept
+as diagnostics. `decode="ranker"` scores the full legal-action frontier and records the oracle
+action's rank — measures trace-policy quality in isolation from syntax failures.
+
 ## 2. Worlds
 
 - **`chain`** — linear `r`-chains, transitive `far` closure. The minimal benchmark; rung 0.
@@ -110,7 +134,8 @@ python -m thinking.cli selftest      # the correctness core: checker, parsers, a
                                      # bank coverage, gold traces for every query type
 python -m thinking.cli train  --world kinship [--simple|--bank|--canon] [--deep-depth N]
                               [--dim 256] [--steps N] [--batch N] [--no-loop] [--neg] --out RUN
-python -m thinking.cli eval   RUN [--mode ...] [--split iid|holdout|novel] [--hops 2,3]
+python -m thinking.cli eval   RUN [--mode free|verified|masked|path|extract|self|write|math|
+                              define] [--split iid|holdout|novel] [--hops 2,3]
                               [--phrasings train|eval] [--level preschool..scholar|mix] [--n N]
 python -m thinking.cli demo   RUN [--k N]
 python -m thinking.cli induce [--out rules.json]    # discover the rules from raw observations

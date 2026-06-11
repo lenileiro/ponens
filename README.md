@@ -41,10 +41,14 @@ memorization, and curriculum.
 ## Headline results (staircase-validated, 2026-06)
 
 - **Chain world**: 1.00 verified accuracy at trained depths (held-out entities, zero resamples).
-- **Kinship world** (16 interacting rules, templated NL): **1.00 free-decode accuracy** at k=3
-  (d=256).
+- **Kinship world** (20 interacting rules, natural-language surface): **verified 0.95 / free
+  1.00** at k=3 (d=256, contrastive question training) — the checker now *adds* accuracy over
+  free decoding instead of taxing it.
 - **Language understanding**: trained on 8 education registers, the model scores within
   **5 points** of its trained-phrasing accuracy on *held-out phrasings it never saw*.
+- **Depth generalization**: trained only on derivations ≤6 deep, accuracy decays *smoothly* with
+  depth (0.70/0.40/0.17 at k=6/10/20) — **no cliff at the training boundary**. The rules
+  transfer; the limiter is constant per-line error compounding, which ordinary training reduces.
 - **Rule induction**: a Popper-style generate-test learner recovers the kinship rule system and
   all arithmetic concepts (age = death − birth, hypothetical ages, relativity comparisons) from
   raw (facts, question, answer) observations at **0.99 held-out accuracy** — no hand-coded rules
@@ -54,7 +58,13 @@ Hard-won lessons (each cost a debugging arc, all encoded in defaults now): unsee
 embeddings silently destroy structural processing (→ entity anonymization); conclusion-first
 formats are answer-only supervision in disguise (→ premises-first everywhere); fixed example
 pools memorize (→ rolling refresh from the infinite generator); capacity thresholds are real
-(d=256 for multi-rule worlds); weight-shared recurrence loses to distinct layers at tiny scale.
+(d=256 for multi-rule worlds); weight-shared recurrence loses to distinct layers at tiny scale;
+a rejected line must still advance the *context* — skip-don't-die — or the model stalls
+regenerating the same line from the same prefix (removing it collapsed verified accuracy
+0.95 → 0.10); constraint-masked decoding *loses* to rejection sampling on a gold-trace policy
+(forced valid-but-foreign lines push generation off-distribution), but prefix-pruned resampling
+— abort a resample at the first token that can't extend to any valid line — is free: identical
+acceptance distribution, 4× the retries for the same budget.
 
 ## Quickstart
 
