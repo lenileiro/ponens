@@ -182,6 +182,13 @@ Validated bottom-up, one variable per run, after a nine-run zero streak taught u
 | L (nope) | same, no positions | 0.40/0.60/0.00/0.00 — position mode not decisive |
 | CONS | contrastive 0.9, 36k steps (2x C6d) | k=2 **0.45-0.55**, verified k=3 **0.95** / free **1.00**; deep dipped (k=20 free 0.45) — trio inflation diluted effective deep share to ~0.20 |
 | C5 | deep_frac 0.3 rebalance (18k) | **verified k=3 0.60 > free 0.55**; deep k=20 0.40-0.45; held-out phrasings ≈ trained |
+| TR1 | trace-rank objective, depth-16 train -> depth-30 eval | constrained decode **1.00 acc / 1.00 valid**; ranker top1 0.61, top5 0.80, MRR 0.70 over 16 candidates; decode ~4.2 ms/example |
+| LC1 | 500/1000-step learning curve, aux vs noaux, eval depth-30 | all arms reached **1.00 acc / 1.00 valid**; aux@1000 hit top1/MRR **1.00/1.00**; noaux solved rollout but had weak rule geometry (FER margin 0.02-0.06 vs aux 0.62-0.68) |
+
+Latest finding: trace-rank improves usable trace execution before we add any hand-coded
+domain rules. The model is learning to select legal next actions from a generic frontier
+more reliably; the auxiliary rule losses are not needed for this small depth-30 accuracy
+check, but they keep the internal rule space separated enough to support scaling.
 
 Root causes found en route (now defaults/tests): unseen-name embeddings → anonymization;
 head-first lines → premises-first; fixed-pool epochs → rolling refresh; d=128 → d=256;
