@@ -334,6 +334,14 @@ facts, and penalizes collateral drift after decode/re-encode. A local 60/10-step
 `latent_intervention_score` from **0.079 -> 0.102** with similar reconstruction MSE, so this is now
 the recommended next H100 knob while remaining opt-in for ablations.
 
+Image-19 H100 update (800 AE + 800 MMDiT text-flow steps, `ae_intervention_w=0.1`): the intervention
+regularizer is a real representation win. The train report reaches `latent_intervention_score=0.705`
+with target image-edit accuracy **0.820** and collateral stability **0.859**, up from the previous
+fetched 400-step diagnostic score **0.408**. The checkpoint sweep selects EMA at `cfg=1.5, steps=4`
+and reports color **1.00**, shape/both **0.778 ± 0.137**, and conditional sample MSE **0.056**.
+Shape edits are still the weak axis, but the image stack now has a generic learned pressure that
+improves editable semantic latents rather than only lowering reconstruction or flow MSE.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
