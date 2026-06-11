@@ -150,7 +150,7 @@ python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-st
     --out runs/image_latent_dit.pt
 python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
-    --eval-out runs/image_latent_dit_sweep.json
+    --eval-seeds 1,2,3 --roundtrip-samples 2 --eval-out runs/image_latent_dit_sweep.json
 python -m thinking.audio --steps 500 --seeds 0,1,2 --out runs/audio1_fer.json
 python -m thinking.multimodal --steps 400 --out runs/m0_multimodal.json
 RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --vision-arch bottleneck \
@@ -256,12 +256,14 @@ is **0.78** vs **0.77**, center-target sample MSE moves **0.0198 → 0.0251**, a
 sample MSE moves **0.0739 → 0.0848**. For this foundation, the result says representation
 alignment is buying semantic faithfulness at a modest pixel-MSE cost.
 
-Image-7 local checkpoint sweep (`--eval-checkpoint`, no retraining): sampler choice is now
-measurable as a Pareto problem. On the Image-6 checkpoint, sweeping CFG `{1.0,1.25,1.5,2.0}` and
-steps `{4,8,16}` finds best fact-faithfulness at `cfg=2.0, steps=4`: color **1.00**, shape
-**0.93**, both facts **0.93**, with conditional sample MSE **0.075**. Lower guidance
-(`cfg=1.25, steps=4`) keeps conditional MSE lower at **0.051** but both-fact accuracy falls to
-**0.80**. This gives us a cheap checkpoint-time way to tune generation without retraining.
+Image-7 robust checkpoint sweep (`--eval-checkpoint`, no retraining): sampler choice is now
+measurable as a Pareto problem without rerunning training. On the Image-6 checkpoint, sweeping
+CFG `{1.0,1.25,1.5,2.0}` and steps `{4,8,16}` across eval seeds `{1,2,3}` with two samples per
+condition finds the best aggregate fact-faithfulness at `cfg=1.5, steps=4`: color **0.967 ±
+0.027**, shape **0.944 ± 0.016**, both facts **0.911 ± 0.031**, and conditional sample MSE
+**0.065**. Higher guidance (`cfg=2.0, steps=4`) slightly improves shape mean (**0.944**) but
+hurts color and pixel distance (`both=0.900`, MSE **0.095**). The earlier one-seed `cfg=2.0`
+winner was therefore too brittle; robust selection points to moderate CFG plus few Euler steps.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

@@ -109,6 +109,7 @@ def payload(args):
                 train += (f" && {IL} --eval-checkpoint {ckpt} "
                           f"--cfg-scales {shlex_quote(args.image_cfg_sweep)} "
                           f"--sample-steps-list {shlex_quote(args.image_sample_steps_sweep)} "
+                          f"--eval-seeds {shlex_quote(args.image_eval_seeds)} "
                           f"--roundtrip-samples {args.image_roundtrip_samples} "
                           f"--eval-out runs/image_latent_{args.image_latent_arch}_sweep.json")
             cmds.append(train)
@@ -354,6 +355,8 @@ def main():
     ap.add_argument("--image-sample-steps-sweep", default="4,8,16",
                     dest="image_sample_steps_sweep",
                     help="comma-separated sampler step counts for --image-eval-sweep")
+    ap.add_argument("--image-eval-seeds", default="1,2,3", dest="image_eval_seeds",
+                    help="comma-separated eval seeds for --image-eval-sweep")
     ap.add_argument("--audio", action="store_true",
                     help="AUDIO-1: train synthetic audio factor FER experiment")
     ap.add_argument("--multimodal", action="store_true",

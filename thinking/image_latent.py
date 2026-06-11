@@ -16,7 +16,7 @@ linearly usable after compression instead of becoming another entangled bottlene
       --out runs/image_latent_dit.pt
   python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
       --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
-      --eval-out runs/image_latent_dit_sweep.json
+      --eval-seeds 1,2,3 --roundtrip-samples 2 --eval-out runs/image_latent_dit_sweep.json
 """
 import argparse
 import json
@@ -443,24 +443,68 @@ def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
     return rows
 
 
+SWEEP_METRICS = (
+    "sample_roundtrip_color_acc",
+    "sample_roundtrip_shape_acc",
+    "sample_roundtrip_both_acc",
+    "conditional_sample_mse",
+    "sample_center_target_mse",
+    "latent_velocity_mse",
+)
+
+
+def aggregate_sweep_rows(rows):
+    grouped = {}
+    for row in rows:
+        key = (float(row["cfg_scale"]), int(row["sample_steps"]))
+        grouped.setdefault(key, []).append(row)
+    out = []
+    for (cfg_scale, sample_steps), group in sorted(grouped.items()):
+        agg = {
+            "sweep_key": f"cfg={cfg_scale:g};steps={sample_steps}",
+            "cfg_scale": float(cfg_scale),
+            "sample_steps": int(sample_steps),
+            "runs": len(group),
+            "eval_seeds": [int(r["eval_seed"]) for r in group if "eval_seed" in r],
+        }
+        for metric in SWEEP_METRICS:
+            vals = np.asarray([float(r[metric]) for r in group], dtype=np.float64)
+            agg[f"{metric}_mean"] = float(vals.mean())
+            agg[f"{metric}_std"] = float(vals.std())
+            agg[f"{metric}_min"] = float(vals.min())
+            agg[f"{metric}_max"] = float(vals.max())
+        out.append(agg)
+    return out
+
+
 def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
-                        n=128, batch=64, seed=10, size=32, device=DEV, roundtrip_samples=1):
+                        n=128, batch=64, seed=10, eval_seeds=None, size=32, device=DEV,
+                        roundtrip_samples=1):
     ae, flow, meta = load_checkpoint(path, device=device)
-    rows = sampler_sweep(ae, flow, cfg_scales=cfg_scales, sample_steps_list=sample_steps_list,
-                         n=n, batch=batch, seed=seed, size=size, device=device,
-                         roundtrip_samples=roundtrip_samples)
-    best = max(rows, key=lambda r: (
-        r["sample_roundtrip_both_acc"],
-        r["sample_roundtrip_shape_acc"],
-        r["sample_roundtrip_color_acc"],
-        -r["conditional_sample_mse"],
+    eval_seeds = tuple(eval_seeds) if eval_seeds is not None else (seed,)
+    rows = []
+    for eval_seed in eval_seeds:
+        for row in sampler_sweep(ae, flow, cfg_scales=cfg_scales,
+                                 sample_steps_list=sample_steps_list, n=n, batch=batch,
+                                 seed=int(eval_seed), size=size, device=device,
+                                 roundtrip_samples=roundtrip_samples):
+            row["eval_seed"] = int(eval_seed)
+            rows.append(row)
+    aggregate = aggregate_sweep_rows(rows)
+    best = max(aggregate, key=lambda r: (
+        r["sample_roundtrip_both_acc_mean"],
+        r["sample_roundtrip_shape_acc_mean"],
+        r["sample_roundtrip_color_acc_mean"],
+        -r["conditional_sample_mse_mean"],
     ))
     return {
         "experiment": "image_latent_sampler_sweep",
         **meta,
         "n": int(n),
         "roundtrip_samples": int(roundtrip_samples),
+        "eval_seeds": [int(s) for s in eval_seeds],
         "rows": rows,
+        "aggregate": aggregate,
         "best": best,
     }
 
@@ -553,6 +597,8 @@ def selftest():
     sweep = sampler_sweep(ae2, flow2, cfg_scales=(1.0, 1.5), sample_steps_list=(1,),
                           n=4, batch=2, seed=3, device="cpu")
     assert len(sweep) == 2 and "sample_roundtrip_both_acc" in sweep[0]
+    agg = aggregate_sweep_rows([dict(r, eval_seed=i) for i, r in enumerate(sweep)])
+    assert len(agg) == 2 and "sample_roundtrip_both_acc_mean" in agg[0]
     print("image_latent selftest OK")
 
 
@@ -579,6 +625,8 @@ def main(argv=None):
                     help="comma-separated CFG scales for --eval-checkpoint")
     ap.add_argument("--sample-steps-list", default="4,8,16", dest="sample_steps_list",
                     help="comma-separated sampler step counts for --eval-checkpoint")
+    ap.add_argument("--eval-seeds", default="", dest="eval_seeds",
+                    help="comma-separated eval seeds for --eval-checkpoint; default uses --seed")
     ap.add_argument("--roundtrip-samples", type=int, default=1, dest="roundtrip_samples")
     ap.add_argument("--flow-semantic-w", type=float, default=0.0, dest="flow_semantic_w",
                     help="semantic endpoint alignment weight for latent flow training")
@@ -596,6 +644,7 @@ def main(argv=None):
             cfg_scales=_parse_number_list(args.cfg_scales, float),
             sample_steps_list=_parse_number_list(args.sample_steps_list, int),
             seed=args.seed,
+            eval_seeds=(_parse_number_list(args.eval_seeds, int) if args.eval_seeds else None),
             roundtrip_samples=args.roundtrip_samples,
         )
         if args.eval_out:
