@@ -1,0 +1,36 @@
+{
+ "experiment": "m1_crossmodal",
+ "steps": 600,
+ "concepts": [
+  "red",
+  "green",
+  "blue",
+  "yellow",
+  "white",
+  "square",
+  "circle",
+  "triangle"
+ ],
+ "arms": {
+  "separate": {
+   "crossmodal_same_cos": 0.7198878054817518,
+   "crossmodal_diff_cos": -0.10922608884894068,
+   "alignment_margin": 0.8291138943306925,
+   "retrieval_acc": 0.9166666666666666,
+   "modality_leakage": 0.16590992106302152
+  },
+  "shared": {
+   "crossmodal_same_cos": 0.4432356382409732,
+   "crossmodal_diff_cos": -0.035400909172104936,
+   "alignment_margin": 0.4786365474130781,
+   "retrieval_acc": 0.9166666666666666,
+   "modality_leakage": 0.15609430918647418
+  }
+ },
+ "verdict": {
+  "shared_aligns_modalities": true,
+  "alignment_gain": -0.3504773469176144,
+  "retrieval_gain": 0.0,
+  "unified_not_fractured": true
+ }
+}

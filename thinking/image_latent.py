@@ -17,6 +17,8 @@ linearly usable after compression instead of becoming another entangled bottlene
   python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
       --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
       --eval-seeds 1,2,3 --roundtrip-samples 2 --eval-out runs/image_latent_dit_sweep.json
+  python -m thinking.image_latent --train --cond-mode text --flow-arch dit \
+      --ae-steps 400 --flow-steps 400 --flow-semantic-w 0.25
 """
 import argparse
 import json
@@ -31,16 +33,23 @@ from .image_flow import FACT_VOCAB, fact_condition
 from .vision import COLORS, SHAPES, DEV, ObjectSpec, object_facts, render_object, sample_object
 
 COLOR_NAMES = tuple(COLORS)
+DEFAULT_PROMPT_TEMPLATES = (
+    "a {color} {shape}",
+    "the object is {color} and {shape}",
+    "{color} object with {shape} shape",
+    "render p0 as a {shape} colored {color}",
+)
 FACT_GROUPS = {
     pred: tuple(i for i, fact in enumerate(FACT_VOCAB) if fact[0] == pred)
     for pred in sorted({fact[0] for fact in FACT_VOCAB})
 }
 
 
-def _batch(n, rng, size=32, device=DEV):
-    imgs, conds, yc, ys = [], [], [], []
+def _batch(n, rng, size=32, device=DEV, return_specs=False):
+    imgs, conds, yc, ys, specs = [], [], [], [], []
     for _ in range(n):
         spec = sample_object(rng)
+        specs.append(spec)
         imgs.append(render_object(spec, size=size) * 2.0 - 1.0)
         conds.append(fact_condition(object_facts(spec), device="cpu").numpy())
         yc.append(COLOR_NAMES.index(spec.color))
@@ -49,7 +58,41 @@ def _batch(n, rng, size=32, device=DEV):
     cond = torch.tensor(np.stack(conds), dtype=torch.float32, device=device)
     yc = torch.tensor(yc, dtype=torch.long, device=device)
     ys = torch.tensor(ys, dtype=torch.long, device=device)
+    if return_specs:
+        return x, cond, yc, ys, specs
     return x, cond, yc, ys
+
+
+def split_prompt(s):
+    return str(s).lower().replace(".", " .").replace(",", " ,").split()
+
+
+def render_prompt(spec, rng=None, templates=DEFAULT_PROMPT_TEMPLATES, index=None):
+    if index is None:
+        index = 0 if rng is None else int(rng.integers(len(templates)))
+    tpl = templates[index % len(templates)]
+    return split_prompt(tpl.format(color=spec.color, shape=spec.shape, slot=spec.slot))
+
+
+def build_prompt_vocab(templates=DEFAULT_PROMPT_TEMPLATES):
+    toks = ["<pad>"]
+    for color in COLORS:
+        for shape in SHAPES:
+            spec = ObjectSpec("p0", color, shape)
+            for i in range(len(templates)):
+                toks.extend(render_prompt(spec, templates=templates, index=i))
+    return {tok: i for i, tok in enumerate(dict.fromkeys(toks))}
+
+
+def prompt_ids(specs, vocab, rng=None, templates=DEFAULT_PROMPT_TEMPLATES, device=DEV):
+    rows = [render_prompt(spec, rng=rng, templates=templates) for spec in specs]
+    max_len = max(len(r) for r in rows)
+    ids = torch.zeros((len(rows), max_len), dtype=torch.long, device=device)
+    unk = 0
+    for i, row in enumerate(rows):
+        ids[i, :len(row)] = torch.tensor([vocab.get(tok, unk) for tok in row],
+                                         dtype=torch.long, device=device)
+    return ids
 
 
 class SemanticAutoencoder(nn.Module):
@@ -102,6 +145,41 @@ class SemanticAutoencoder(nn.Module):
         out["latent"] = z
         out["recon"] = self.decode(z)
         return out
+
+
+class PromptConditioner(nn.Module):
+    """Small learned text encoder that maps prompt tokens to a continuous condition vector."""
+
+    def __init__(self, vocab_size, cond_dim=64, hidden=64, heads=4, max_len=32, pad=0):
+        super().__init__()
+        self.cond_dim = int(cond_dim)
+        self.pad = int(pad)
+        self.emb = nn.Embedding(vocab_size, hidden, padding_idx=pad)
+        self.pos = nn.Embedding(max_len, hidden)
+        heads = max(1, min(heads, hidden))
+        while hidden % heads:
+            heads -= 1
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden,
+            nhead=heads,
+            dim_feedforward=hidden * 4,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.enc = nn.TransformerEncoder(layer, num_layers=1, enable_nested_tensor=False)
+        self.out = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, cond_dim))
+
+    def forward(self, ids):
+        b, l = ids.shape
+        pos = torch.arange(l, device=ids.device).clamp_max(self.pos.num_embeddings - 1)
+        mask = ids.eq(self.pad)
+        h = self.emb(ids) + self.pos(pos)[None]
+        h = self.enc(h, src_key_padding_mask=mask)
+        keep = (~mask).to(h.dtype).unsqueeze(-1)
+        pooled = (h * keep).sum(dim=1) / keep.sum(dim=1).clamp_min(1.0)
+        return self.out(pooled)
 
 
 class LatentFlowNet(nn.Module):
@@ -188,14 +266,15 @@ class LatentDiTFlowNet(nn.Module):
         return v.transpose(1, 2).reshape(b, c, h, w)
 
 
-def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4):
+def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4, cond_dim=None):
     if flow_arch == "conv":
-        return LatentFlowNet(latent_ch=latent_ch, hidden=hidden)
+        return LatentFlowNet(latent_ch=latent_ch, hidden=hidden, cond_dim=cond_dim)
     if flow_arch == "dit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
             heads -= 1
-        return LatentDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth, heads=heads)
+        return LatentDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth, heads=heads,
+                                cond_dim=cond_dim)
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
@@ -203,6 +282,14 @@ def _parse_number_list(s, cast=float):
     if isinstance(s, (tuple, list)):
         return tuple(cast(x) for x in s)
     return tuple(cast(x.strip()) for x in str(s).split(",") if x.strip())
+
+
+def _parse_templates(s):
+    if not s:
+        return DEFAULT_PROMPT_TEMPLATES
+    if isinstance(s, (tuple, list)):
+        return tuple(str(x) for x in s if str(x).strip())
+    return tuple(x.strip() for x in str(s).split(";") if x.strip())
 
 
 def _seeded_randn(shape, device, seed):
@@ -258,7 +345,8 @@ def semantic_endpoint_loss(ae, z_clean, cond):
     return loss, parts
 
 
-def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0):
+def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
+                       semantic_cond=None):
     x0 = torch.randn_like(z1)
     t = torch.rand(z1.shape[0], 1, 1, 1, device=z1.device)
     zt = (1.0 - t) * x0 + t * z1
@@ -270,7 +358,9 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0):
     parts = {"velocity_mse": velocity.detach()}
     if ae is not None and semantic_w > 0.0:
         z_clean = zt + (1.0 - t) * pred
-        semantic, sem_parts = semantic_endpoint_loss(ae, z_clean, cond_model)
+        sem_cond = cond if semantic_cond is None else semantic_cond
+        keep = cond_model.detach().abs().sum(dim=1, keepdim=True).gt(0).to(sem_cond.dtype)
+        semantic, sem_parts = semantic_endpoint_loss(ae, z_clean, sem_cond * keep)
         total = total + semantic_w * semantic
         parts["semantic_endpoint_ce"] = semantic.detach()
         parts.update(sem_parts)
@@ -280,6 +370,18 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0):
 def latent_flow_loss(flow, z1, cond, cond_drop=0.0):
     loss, _parts = latent_flow_losses(flow, z1, cond, cond_drop=cond_drop)
     return loss
+
+
+def model_condition(specs, fact_cond, cond_mode="facts", conditioner=None, prompt_vocab=None,
+                    prompt_templates=DEFAULT_PROMPT_TEMPLATES, rng=None, device=DEV):
+    if cond_mode == "facts":
+        return fact_cond
+    if cond_mode == "text":
+        if conditioner is None or prompt_vocab is None:
+            raise ValueError("text conditioning requires conditioner and prompt_vocab")
+        ids = prompt_ids(specs, prompt_vocab, rng=rng, templates=prompt_templates, device=device)
+        return conditioner(ids)
+    raise ValueError(f"unknown condition mode {cond_mode!r}")
 
 
 @torch.no_grad()
@@ -316,7 +418,8 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
 
 @torch.no_grad()
 def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_steps=4,
-                          samples_per_combo=1, seed=20):
+                          samples_per_combo=1, seed=20, cond_mode="facts", conditioner=None,
+                          prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES):
     """Generate from every canonical color/shape request and re-read facts from the image."""
     ae.eval()
     flow.eval()
@@ -326,7 +429,13 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_s
     for ci, color in enumerate(COLORS):
         for si, shape in enumerate(SHAPES):
             spec = ObjectSpec("p0", color, shape)
-            cond = fact_condition(object_facts(spec), device=device)[None].repeat(samples_per_combo, 1)
+            fact_cond = fact_condition(object_facts(spec), device=device)[None].repeat(
+                samples_per_combo, 1)
+            specs = [spec] * samples_per_combo
+            rng = np.random.default_rng(seed + ci * 101 + si * 17)
+            cond = model_condition(specs, fact_cond, cond_mode=cond_mode,
+                                   conditioner=conditioner, prompt_vocab=prompt_vocab,
+                                   prompt_templates=prompt_templates, rng=rng, device=device)
             sample = sample_images(ae, flow, cond, latent_shape=latent_shape, steps=sample_steps,
                                    device=device, seed=seed + ci * 101 + si * 17,
                                    cfg_scale=cfg_scale)
@@ -356,7 +465,8 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_s
 
 @torch.no_grad()
 def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=1.0,
-             sample_steps=4, roundtrip_samples=1):
+             sample_steps=4, roundtrip_samples=1, cond_mode="facts", conditioner=None,
+             prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     ae.eval()
@@ -366,10 +476,13 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
     latent_means, latent_stds = [], []
     while total < n:
         b = min(batch, n - total)
-        x, cond, yc, ys = _batch(b, rng, size=size, device=device)
+        x, fact_cond, yc, ys, specs = _batch(b, rng, size=size, device=device, return_specs=True)
         out = ae(x)
         z = out["latent"]
         recon_losses.append(float(F.mse_loss(out["recon"], x).detach().cpu()))
+        cond = model_condition(specs, fact_cond, cond_mode=cond_mode, conditioner=conditioner,
+                               prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
+                               rng=rng, device=device)
         flow_losses.append(float(latent_flow_loss(flow, z, cond).detach().cpu()))
         got_c += int(out["color"].argmax(-1).eq(yc).sum())
         got_s += int(out["shape"].argmax(-1).eq(ys).sum())
@@ -399,7 +512,11 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
     }
     report.update(conditional_roundtrip(ae, flow, size=size, device=device, cfg_scale=cfg_scale,
                                         sample_steps=sample_steps,
-                                        samples_per_combo=roundtrip_samples, seed=seed + 17))
+                                        samples_per_combo=roundtrip_samples, seed=seed + 17,
+                                        cond_mode=cond_mode, conditioner=conditioner,
+                                        prompt_vocab=prompt_vocab,
+                                        prompt_templates=prompt_templates))
+    report["cond_mode"] = cond_mode
     return report
 
 
@@ -411,14 +528,27 @@ def load_checkpoint(path, device=DEV):
     flow_arch = ckpt.get("flow_arch", report.get("flow_arch", "conv"))
     dit_depth = int(ckpt.get("dit_depth", report.get("dit_depth", 3)))
     dit_heads = int(ckpt.get("dit_heads", report.get("dit_heads", 4)))
+    cond_mode = ckpt.get("cond_mode", report.get("cond_mode", "facts"))
+    cond_dim = int(ckpt.get("cond_dim", report.get("cond_dim", len(FACT_VOCAB))))
+    prompt_templates = tuple(ckpt.get("prompt_templates", report.get("prompt_templates", []))
+                             or DEFAULT_PROMPT_TEMPLATES)
+    prompt_vocab = ckpt.get("prompt_vocab") or None
+    conditioner = None
+    if cond_mode == "text":
+        if prompt_vocab is None:
+            prompt_vocab = build_prompt_vocab(prompt_templates)
+        conditioner = PromptConditioner(len(prompt_vocab), cond_dim=cond_dim,
+                                        hidden=hidden).to(device)
+        conditioner.load_state_dict(ckpt["conditioner_state_dict"])
+        conditioner.eval()
     ae = SemanticAutoencoder(latent_ch=latent_ch, hidden=hidden).to(device)
     flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
-                     dit_depth=dit_depth, dit_heads=dit_heads).to(device)
+                     dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim).to(device)
     ae.load_state_dict(ckpt["autoencoder_state_dict"])
     flow.load_state_dict(ckpt["flow_state_dict"])
     ae.eval()
     flow.eval()
-    return ae, flow, {
+    return ae, flow, conditioner, prompt_vocab, prompt_templates, {
         "checkpoint": path,
         "checkpoint_report": report,
         "latent_ch": latent_ch,
@@ -426,18 +556,24 @@ def load_checkpoint(path, device=DEV):
         "flow_arch": flow_arch,
         "dit_depth": dit_depth if flow_arch == "dit" else 0,
         "dit_heads": dit_heads if flow_arch == "dit" else 0,
+        "cond_mode": cond_mode,
+        "cond_dim": cond_dim,
     }
 
 
 @torch.no_grad()
 def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
-                  n=128, batch=64, seed=10, size=32, device=DEV, roundtrip_samples=1):
+                  n=128, batch=64, seed=10, size=32, device=DEV, roundtrip_samples=1,
+                  cond_mode="facts", conditioner=None, prompt_vocab=None,
+                  prompt_templates=DEFAULT_PROMPT_TEMPLATES):
     rows = []
     for cfg_scale in cfg_scales:
         for sample_steps in sample_steps_list:
             row = evaluate(ae, flow, n=n, batch=batch, seed=seed, size=size, device=device,
                            cfg_scale=float(cfg_scale), sample_steps=int(sample_steps),
-                           roundtrip_samples=roundtrip_samples)
+                           roundtrip_samples=roundtrip_samples, cond_mode=cond_mode,
+                           conditioner=conditioner, prompt_vocab=prompt_vocab,
+                           prompt_templates=prompt_templates)
             row["sweep_key"] = f"cfg={float(cfg_scale):g};steps={int(sample_steps)}"
             rows.append(row)
     return rows
@@ -480,14 +616,18 @@ def aggregate_sweep_rows(rows):
 def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         n=128, batch=64, seed=10, eval_seeds=None, size=32, device=DEV,
                         roundtrip_samples=1):
-    ae, flow, meta = load_checkpoint(path, device=device)
+    ae, flow, conditioner, prompt_vocab, prompt_templates, meta = load_checkpoint(path,
+                                                                                  device=device)
     eval_seeds = tuple(eval_seeds) if eval_seeds is not None else (seed,)
     rows = []
     for eval_seed in eval_seeds:
         for row in sampler_sweep(ae, flow, cfg_scales=cfg_scales,
                                  sample_steps_list=sample_steps_list, n=n, batch=batch,
                                  seed=int(eval_seed), size=size, device=device,
-                                 roundtrip_samples=roundtrip_samples):
+                                 roundtrip_samples=roundtrip_samples,
+                                 cond_mode=meta["cond_mode"], conditioner=conditioner,
+                                 prompt_vocab=prompt_vocab,
+                                 prompt_templates=prompt_templates):
             row["eval_seed"] = int(eval_seed)
             rows.append(row)
     aggregate = aggregate_sweep_rows(rows)
@@ -512,12 +652,23 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
 def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidden=64,
                       lr=2e-4, fact_w=1.0, seed=0, size=32, device=DEV, flow_arch="conv",
                       dit_depth=3, dit_heads=4, cond_drop=0.0, cfg_scale=1.0,
-                      sample_steps=4, roundtrip_samples=1, flow_semantic_w=0.0):
+                      sample_steps=4, roundtrip_samples=1, flow_semantic_w=0.0,
+                      cond_mode="facts", text_cond_dim=0,
+                      prompt_templates=DEFAULT_PROMPT_TEMPLATES, return_conditioner=False):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
+    if cond_mode not in ("facts", "text"):
+        raise ValueError(f"unknown condition mode {cond_mode!r}")
+    prompt_vocab = build_prompt_vocab(prompt_templates) if cond_mode == "text" else None
+    cond_dim = len(FACT_VOCAB)
+    conditioner = None
+    if cond_mode == "text":
+        cond_dim = int(text_cond_dim or hidden)
+        conditioner = PromptConditioner(len(prompt_vocab), cond_dim=cond_dim,
+                                        hidden=hidden).to(device)
     ae = SemanticAutoencoder(latent_ch=latent_ch, hidden=hidden).to(device)
     flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
-                     dit_depth=dit_depth, dit_heads=dit_heads).to(device)
+                     dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim).to(device)
     opt_ae = torch.optim.AdamW(ae.parameters(), lr=lr, weight_decay=0.01)
     ae.train()
     last_ae = {}
@@ -530,26 +681,39 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         opt_ae.step()
         last_ae = {k: float(v.detach().cpu()) for k, v in parts.items()}
 
-    opt_flow = torch.optim.AdamW(flow.parameters(), lr=lr, weight_decay=0.01)
+    flow_params = list(flow.parameters()) + ([] if conditioner is None
+                                             else list(conditioner.parameters()))
+    opt_flow = torch.optim.AdamW(flow_params, lr=lr, weight_decay=0.01)
     ae.eval()
     for p in ae.parameters():
         p.requires_grad_(False)
     flow.train()
+    if conditioner is not None:
+        conditioner.train()
     last_flow = {}
     for _ in range(flow_steps):
-        x, cond, _yc, _ys = _batch(batch, rng, size=size, device=device)
+        x, fact_cond, _yc, _ys, specs = _batch(batch, rng, size=size, device=device,
+                                               return_specs=True)
         with torch.no_grad():
             z1 = ae.encode(x)
+        cond = model_condition(specs, fact_cond, cond_mode=cond_mode, conditioner=conditioner,
+                               prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
+                               rng=rng, device=device)
         loss, parts = latent_flow_losses(flow, z1, cond, cond_drop=cond_drop, ae=ae,
-                                         semantic_w=flow_semantic_w)
+                                         semantic_w=flow_semantic_w,
+                                         semantic_cond=fact_cond)
         opt_flow.zero_grad()
         loss.backward()
         opt_flow.step()
         last_flow = {"total_loss": float(loss.detach().cpu())}
         last_flow.update({k: float(v.detach().cpu()) for k, v in parts.items()})
 
+    if conditioner is not None:
+        conditioner.eval()
     report = evaluate(ae, flow, seed=seed + 1, size=size, device=device, cfg_scale=cfg_scale,
-                      sample_steps=sample_steps, roundtrip_samples=roundtrip_samples)
+                      sample_steps=sample_steps, roundtrip_samples=roundtrip_samples,
+                      cond_mode=cond_mode, conditioner=conditioner, prompt_vocab=prompt_vocab,
+                      prompt_templates=prompt_templates)
     report.update({
         "experiment": "image3_latent_fact_conditioned_rectified_flow",
         "ae_steps": int(ae_steps),
@@ -563,11 +727,17 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "fact_w": float(fact_w),
         "cond_drop": float(cond_drop),
         "flow_semantic_w": float(flow_semantic_w),
+        "cond_mode": cond_mode,
+        "cond_dim": int(cond_dim),
+        "prompt_templates": list(prompt_templates) if cond_mode == "text" else [],
+        "prompt_vocab_size": len(prompt_vocab) if prompt_vocab is not None else 0,
         "last_ae": last_ae,
         "last_flow": last_flow,
         "last_flow_loss": last_flow.get("velocity_mse"),
         "fact_vocab": [list(f) for f in FACT_VOCAB],
     })
+    if return_conditioner:
+        return ae, flow, conditioner, prompt_vocab, report
     return ae, flow, report
 
 
@@ -599,6 +769,15 @@ def selftest():
     assert len(sweep) == 2 and "sample_roundtrip_both_acc" in sweep[0]
     agg = aggregate_sweep_rows([dict(r, eval_seed=i) for i, r in enumerate(sweep)])
     assert len(agg) == 2 and "sample_roundtrip_both_acc_mean" in agg[0]
+    ae3, flow3, conditioner3, vocab3, report3 = train_latent_flow(
+        ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="dit",
+        dit_depth=1, dit_heads=2, seed=2, device="cpu", cond_mode="text",
+        text_cond_dim=8, flow_semantic_w=0.1, sample_steps=1, return_conditioner=True)
+    assert report3["cond_mode"] == "text" and report3["prompt_vocab_size"] > 0
+    text_sweep = sampler_sweep(ae3, flow3, cfg_scales=(1.0,), sample_steps_list=(1,), n=4,
+                               batch=2, seed=4, device="cpu", cond_mode="text",
+                               conditioner=conditioner3, prompt_vocab=vocab3)
+    assert len(text_sweep) == 1 and text_sweep[0]["cond_mode"] == "text"
     print("image_latent selftest OK")
 
 
@@ -630,6 +809,12 @@ def main(argv=None):
     ap.add_argument("--roundtrip-samples", type=int, default=1, dest="roundtrip_samples")
     ap.add_argument("--flow-semantic-w", type=float, default=0.0, dest="flow_semantic_w",
                     help="semantic endpoint alignment weight for latent flow training")
+    ap.add_argument("--cond-mode", default="facts", choices=("facts", "text"), dest="cond_mode",
+                    help="conditioning source for latent flow")
+    ap.add_argument("--text-cond-dim", type=int, default=0, dest="text_cond_dim",
+                    help="text condition vector width; default uses --hidden")
+    ap.add_argument("--prompt-templates", default="", dest="prompt_templates",
+                    help="semicolon-separated prompt templates using {color} and {shape}")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="runs/image_latent_flow.pt")
     ap.add_argument("--eval-out", default="", dest="eval_out",
@@ -658,15 +843,16 @@ def main(argv=None):
         return
     if not args.train:
         ap.error("use --selftest, --train, or --eval-checkpoint")
-    ae, flow, report = train_latent_flow(ae_steps=args.ae_steps, flow_steps=args.flow_steps,
-                                         batch=args.batch, latent_ch=args.latent_ch,
-                                         hidden=args.hidden, lr=args.lr, fact_w=args.fact_w,
-                                         seed=args.seed, flow_arch=args.flow_arch,
-                                         dit_depth=args.dit_depth, dit_heads=args.dit_heads,
-                                         cond_drop=args.cond_drop, cfg_scale=args.cfg_scale,
-                                         sample_steps=args.sample_steps,
-                                         roundtrip_samples=args.roundtrip_samples,
-                                         flow_semantic_w=args.flow_semantic_w)
+    templates = _parse_templates(args.prompt_templates)
+    ae, flow, conditioner, prompt_vocab, report = train_latent_flow(
+        ae_steps=args.ae_steps, flow_steps=args.flow_steps, batch=args.batch,
+        latent_ch=args.latent_ch, hidden=args.hidden, lr=args.lr, fact_w=args.fact_w,
+        seed=args.seed, flow_arch=args.flow_arch, dit_depth=args.dit_depth,
+        dit_heads=args.dit_heads, cond_drop=args.cond_drop, cfg_scale=args.cfg_scale,
+        sample_steps=args.sample_steps, roundtrip_samples=args.roundtrip_samples,
+        flow_semantic_w=args.flow_semantic_w, cond_mode=args.cond_mode,
+        text_cond_dim=args.text_cond_dim, prompt_templates=templates,
+        return_conditioner=True)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save({
         "autoencoder_state_dict": ae.state_dict(),
@@ -678,10 +864,15 @@ def main(argv=None):
         "flow_arch": args.flow_arch,
         "dit_depth": args.dit_depth,
         "dit_heads": args.dit_heads,
+        "cond_mode": args.cond_mode,
+        "cond_dim": report["cond_dim"],
         "cond_drop": args.cond_drop,
         "cfg_scale": args.cfg_scale,
         "sample_steps": args.sample_steps,
         "flow_semantic_w": args.flow_semantic_w,
+        "prompt_templates": list(templates) if args.cond_mode == "text" else [],
+        "prompt_vocab": prompt_vocab if prompt_vocab is not None else {},
+        "conditioner_state_dict": (conditioner.state_dict() if conditioner is not None else {}),
     }, args.out)
     print(json.dumps(report, indent=1))
     print(f"saved -> {args.out}")

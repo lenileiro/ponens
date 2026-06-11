@@ -31,6 +31,8 @@ Example:
 import argparse
 import json
 import os
+import urllib.request
+import zipfile
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -45,6 +47,8 @@ from .trace import Vocab
 
 DEV = get_device()
 KEYWORDS = ("extract", "fact", "done", ".")
+SCAN_URL = "https://raw.githubusercontent.com/brendenlake/SCAN/master/tasks.txt"
+SNLI_URL = "https://nlp.stanford.edu/projects/snli/snli_1.0.zip"
 
 
 @dataclass(frozen=True)
@@ -125,6 +129,109 @@ def load_records(path):
     if not any(r.split == "eval" for r in records):
         raise ValueError(f"{path} has no eval records")
     return records
+
+
+def parse_scan_line(line):
+    line = line.strip()
+    if not line or not line.startswith("IN: ") or " OUT: " not in line:
+        return None
+    left, right = line.split(" OUT: ", 1)
+    command = left[len("IN: "):].strip()
+    actions = right.strip().split()
+    if not command or not actions:
+        return None
+    facts = [[f"s{i:03d}", "action", action] for i, action in enumerate(actions)]
+    return command, facts
+
+
+def scan_records(text, max_records=2000, eval_frac=0.10, seed=0):
+    pairs = [p for p in (parse_scan_line(line) for line in text.splitlines()) if p is not None]
+    if max_records:
+        pairs = pairs[:max_records]
+    if not pairs:
+        raise ValueError("SCAN import found no command/action pairs")
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(pairs))
+    eval_n = max(1, int(round(len(pairs) * eval_frac)))
+    eval_ids = set(int(i) for i in order[:eval_n])
+    records = []
+    for i, (command, facts) in enumerate(pairs):
+        split = "eval" if i in eval_ids else "train"
+        records.append({"split": split, "id": f"scan-{i}", "text": command, "facts": facts,
+                        "kind": "scan_command"})
+    return records
+
+
+def write_jsonl(records, path):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        for rec in records:
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
+
+
+def import_scan(out, url=SCAN_URL, max_records=2000, eval_frac=0.10, seed=0):
+    req = urllib.request.Request(url, headers={"User-Agent": "ponens-text"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        text = r.read().decode("utf-8")
+    records = scan_records(text, max_records=max_records, eval_frac=eval_frac, seed=seed)
+    write_jsonl(records, out)
+    report = {"source": url, "out": out, "records": len(records),
+              "train_records": sum(r["split"] == "train" for r in records),
+              "eval_records": sum(r["split"] == "eval" for r in records),
+              "representation": "SCAN OUT actions -> ordered canonical action facts"}
+    print(json.dumps(report, indent=1), flush=True)
+    return report
+
+
+def _snli_records_from_member(zf, member, split, limit):
+    records = []
+    with zf.open(member) as f:
+        for line in f:
+            if limit and len(records) >= limit:
+                break
+            row = json.loads(line.decode("utf-8"))
+            label = row.get("gold_label")
+            if label not in ("entailment", "contradiction", "neutral"):
+                continue
+            premise = split_words(row.get("sentence1", ""))
+            hypothesis = split_words(row.get("sentence2", ""))
+            if not premise or not hypothesis:
+                continue
+            rec_id = row.get("pairID") or f"snli-{split}-{len(records)}"
+            text = ["premise", ":"] + premise + ["hypothesis", ":"] + hypothesis
+            records.append({"split": split, "id": rec_id, "tokens": text,
+                            "facts": [["pair0", "nli", label]],
+                            "kind": "natural_language_inference"})
+    return records
+
+
+def import_snli(out, zip_path=None, url=SNLI_URL, max_train=5000, max_eval=1000):
+    """Import SNLI as natural-English semantic labels.
+
+    The target is not the next token in either sentence; it is the human-labeled inference
+    relation between the premise and hypothesis.
+    """
+    if zip_path is None:
+        cache = os.path.join(os.path.dirname(out) or ".", "snli_1.0.zip")
+        if not os.path.exists(cache):
+            req = urllib.request.Request(url, headers={"User-Agent": "ponens-text"})
+            with urllib.request.urlopen(req, timeout=300) as r, open(cache, "wb") as f:
+                f.write(r.read())
+        zip_path = cache
+    with zipfile.ZipFile(zip_path) as zf:
+        train = _snli_records_from_member(
+            zf, "snli_1.0/snli_1.0_train.jsonl", "train", max_train)
+        evals = _snli_records_from_member(
+            zf, "snli_1.0/snli_1.0_dev.jsonl", "eval", max_eval)
+    records = train + evals
+    write_jsonl(records, out)
+    report = {"source": url if zip_path is None else zip_path, "out": out,
+              "records": len(records), "train_records": len(train),
+              "eval_records": len(evals),
+              "representation": "SNLI premise+hypothesis -> canonical nli relation fact",
+              "labels": ["entailment", "contradiction", "neutral"]}
+    print(json.dumps(report, indent=1), flush=True)
+    return report
 
 
 def trace_tokens(facts):
@@ -231,8 +338,8 @@ def train_model(records, steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV,
     train_records = [r for r in records if r.split == "train"]
     for st in range(1, steps + 1):
         model.train()
-        batch = batch_records(train_records, rng, batch)
-        txt, ids = pack(batch, vocab, device)
+        rec_batch = batch_records(train_records, rng, batch)
+        txt, ids = pack(rec_batch, vocab, device)
         loss = token_loss(model(txt, ids), ids, pad=vocab.pad)
         opt.zero_grad()
         loss.backward()
@@ -269,6 +376,49 @@ def teacher_forced_eval(model, vocab, records, device=DEV):
                     total += 1
                     pos += 5
     return {"fact_value_acc": correct / max(1, total), "n_facts": total}
+
+
+def _nli_side_record(rec, side):
+    toks = list(rec.tokens)
+    try:
+        h_at = toks.index("hypothesis")
+    except ValueError:
+        return None
+    if side == "hypothesis":
+        ntoks = tuple(toks[h_at:])
+    elif side == "premise":
+        ntoks = tuple(toks[:h_at])
+    else:
+        raise ValueError(side)
+    if not ntoks:
+        return None
+    return TextRecord(rec_id=f"{rec.rec_id}:{side}", split=rec.split, tokens=ntoks,
+                      facts=rec.facts, group=rec.group, kind=f"{rec.kind}:{side}",
+                      base_id=rec.rec_id, changed=rec.changed)
+
+
+def nli_artifact_eval(model, vocab, records, full_fact_value_acc, device=DEV):
+    """Hypothesis-only / premise-only controls for SNLI-style records.
+
+    Gururangan et al. showed that NLI datasets can contain annotation artifacts where the
+    hypothesis alone predicts the label surprisingly well.  A text-understanding gate should
+    surface that shortcut instead of counting it as premise-hypothesis reasoning.
+    """
+    eval_records = [r for r in records if r.split == "eval"
+                    and r.kind == "natural_language_inference"]
+    if not eval_records:
+        return {"n": 0}
+    hypo = [r for r in (_nli_side_record(rec, "hypothesis") for rec in eval_records)
+            if r is not None]
+    prem = [r for r in (_nli_side_record(rec, "premise") for rec in eval_records)
+            if r is not None]
+    h_acc = teacher_forced_eval(model, vocab, hypo, device=device)["fact_value_acc"] if hypo else 0.0
+    p_acc = teacher_forced_eval(model, vocab, prem, device=device)["fact_value_acc"] if prem else 0.0
+    return {"n": len(eval_records),
+            "hypothesis_only_fact_value_acc": h_acc,
+            "premise_only_fact_value_acc": p_acc,
+            "full_minus_hypothesis_only": full_fact_value_acc - h_acc,
+            "full_minus_premise_only": full_fact_value_acc - p_acc}
 
 
 @torch.no_grad()
@@ -333,25 +483,31 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80):
     free = free_eval(model, vocab, records, device=device, max_new=max_new)
     para = paraphrase_eval(model, vocab, records, device=device, max_new=max_new)
     cf = counterfactual_eval(model, vocab, records, device=device, max_new=max_new)
+    artifact = nli_artifact_eval(model, vocab, records, teacher["fact_value_acc"],
+                                 device=device)
     gate = (teacher["fact_value_acc"] >= 0.80 and free["f1"] >= 0.80
             and (para["n_groups"] == 0 or para["consistent"] >= 0.80)
-            and (cf["n"] == 0 or cf["f1"] >= 0.80))
+            and (cf["n"] == 0 or cf["f1"] >= 0.80)
+            and (artifact["n"] == 0 or artifact["full_minus_hypothesis_only"] >= 0.05))
     return {"teacher_forced": teacher, "free_decode": free,
             "paraphrase_consistency": para, "counterfactual": cf,
+            "nli_artifact_control": artifact,
             "gate_thresholds": {"fact_value_acc": 0.80, "free_f1": 0.80,
                                 "paraphrase_consistent": 0.80,
-                                "counterfactual_f1": 0.80},
+                                "counterfactual_f1": 0.80,
+                                "nli_full_minus_hypothesis_only": 0.05},
             "gate": gate}
 
 
-def run(data, steps=400, batch=32, d=96, seed=0, device=DEV, out=None, checkpoint=None):
+def run(data, steps=400, batch=32, d=96, seed=0, device=DEV, out=None, checkpoint=None,
+        max_new=160):
     records = load_records(data)
     model, vocab = train_model(records, steps=steps, batch=batch, d=d, seed=seed,
                                device=device)
     report = {"experiment": "text0_semantic_extraction", "data": data, "steps": steps,
               "train_records": sum(r.split == "train" for r in records),
               "eval_records": sum(r.split == "eval" for r in records)}
-    report.update(evaluate_all(model, vocab, records, device=device))
+    report.update(evaluate_all(model, vocab, records, device=device, max_new=max_new))
     if checkpoint:
         os.makedirs(os.path.dirname(checkpoint) or ".", exist_ok=True)
         torch.save({"state_dict": model.state_dict(), "vocab": vocab.itos,
@@ -383,6 +539,10 @@ def selftest():
          "changed": [["p0", "color", "blue"]]},
     ]
     records = [normalize_record(r, idx=i) for i, r in enumerate(raw)]
+    scan = scan_records("IN: jump twice OUT: I_JUMP I_JUMP\n"
+                        "IN: walk left OUT: I_TURN_LEFT I_WALK\n",
+                        max_records=2, eval_frac=0.5, seed=0)
+    assert scan[0]["facts"][0] == ["s000", "action", "I_JUMP"]
     vocab = build_vocab(records)
     assert parse_facts(trace_tokens(records[0].facts)) == records[0].facts
     txt, ids = pack(records[:2], vocab, "cpu")
@@ -401,21 +561,41 @@ def selftest():
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--import-scan", action="store_true",
+                    help="download SCAN commands and write JSONL semantic records")
+    ap.add_argument("--import-snli", action="store_true",
+                    help="import SNLI premise/hypothesis pairs as semantic NLI records")
+    ap.add_argument("--scan-url", default=SCAN_URL)
+    ap.add_argument("--scan-max", type=int, default=2000)
+    ap.add_argument("--scan-eval-frac", type=float, default=0.10)
+    ap.add_argument("--snli-url", default=SNLI_URL)
+    ap.add_argument("--snli-zip", default=None)
+    ap.add_argument("--snli-train", type=int, default=5000)
+    ap.add_argument("--snli-eval", type=int, default=1000)
     ap.add_argument("--data", help="JSON/JSONL semantic text records")
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--d", type=int, default=96)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--max-new", type=int, default=160, dest="max_new")
     ap.add_argument("--out", default="runs/text0.json")
     ap.add_argument("--checkpoint", default=None)
     args = ap.parse_args(argv)
     if args.selftest:
         selftest()
         return
+    if args.import_scan:
+        import_scan(args.out, url=args.scan_url, max_records=args.scan_max,
+                    eval_frac=args.scan_eval_frac, seed=args.seed)
+        return
+    if args.import_snli:
+        import_snli(args.out, zip_path=args.snli_zip, url=args.snli_url,
+                    max_train=args.snli_train, max_eval=args.snli_eval)
+        return
     if not args.data:
         raise SystemExit("--data is required unless --selftest is set")
     run(args.data, steps=args.steps, batch=args.batch, d=args.d, seed=args.seed,
-        out=args.out, checkpoint=args.checkpoint)
+        out=args.out, checkpoint=args.checkpoint, max_new=args.max_new)
 
 
 if __name__ == "__main__":
