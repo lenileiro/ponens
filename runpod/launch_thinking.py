@@ -107,6 +107,7 @@ def payload(args):
                      f"--sample-steps {args.image_sample_steps} "
                      f"--roundtrip-samples {args.image_roundtrip_samples} "
                      f"--intervention-samples {args.image_intervention_samples} "
+                     f"--ae-intervention-w {args.image_ae_intervention_w} "
                      f"--flow-semantic-w {args.image_flow_semantic_w} "
                      f"--flow-ema-decay {args.image_flow_ema_decay} "
                      f"--ema-eval-mode {args.image_ema_eval_mode} "
@@ -371,6 +372,9 @@ def main():
     ap.add_argument("--image-intervention-samples", type=int, default=32,
                     dest="image_intervention_samples",
                     help="samples for latent image fact-intervention diagnostics")
+    ap.add_argument("--image-ae-intervention-w", type=float, default=0.0,
+                    dest="image_ae_intervention_w",
+                    help="semantic AE latent fact-intervention loss weight")
     ap.add_argument("--image-flow-semantic-w", type=float, default=0.0,
                     dest="image_flow_semantic_w",
                     help="semantic endpoint alignment weight for latent image flow training")

@@ -151,7 +151,7 @@ python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-st
 python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --ae-steps 400 --flow-steps 400 --cond-drop 0.1 --cfg-scale 1.5 \
     --sample-steps 8 --flow-semantic-w 0.25 --time-sampling logit-normal \
-    --flow-ema-decay 0.999 \
+    --flow-ema-decay 0.999 --ae-intervention-w 0.1 \
     --out runs/image_latent_mmdit_text.pt
 python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
@@ -167,7 +167,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-cond-mode text --image-cond-drop 0.1 --image-cfg-scale 1.5 \
     --image-sample-steps 8 --image-flow-semantic-w 0.25 \
     --image-time-sampling logit-normal --image-flow-ema-decay 0.999 \
-    --image-eval-sweep --fast --go
+    --image-ae-intervention-w 0.1 --image-eval-sweep --fast --go
 ```
 
 `thinking.image2` is the head-aware FER experiment: shared factored heads vs explicit
@@ -327,6 +327,12 @@ image, and reports target-change accuracy plus collateral stability. It is data-
 a renderer rule. On the fetched 400-step MMDiT text H100 checkpoint, a 16-sample smoke reports
 `latent_intervention_score=0.408`: color directions are strong, while shape edits still disturb color
 too often. That gives the next representation-quality target beyond output MSE and round-trip score.
+
+Image-18 adds an optional semantic-AE intervention training loss (`--ae-intervention-w`; RunPod:
+`--image-ae-intervention-w`). It uses batch-derived fact prototype deltas, supervises edited target
+facts, and penalizes collateral drift after decode/re-encode. A local 60/10-step smoke moved
+`latent_intervention_score` from **0.079 -> 0.102** with similar reconstruction MSE, so this is now
+the recommended next H100 knob while remaining opt-in for ablations.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

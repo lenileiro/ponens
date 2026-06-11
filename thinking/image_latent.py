@@ -727,6 +727,74 @@ def latent_intervention_diagnostic(ae, n=64, batch=64, seed=123, size=32, device
     }
 
 
+def latent_intervention_training_loss(ae, z, cond, strength=1.0, decoded_w=1.0,
+                                      collateral_w=1.0):
+    """Differentiable version of the intervention probe for semantic AE training.
+
+    Prototypes are estimated from the current batch and detached. The optimizer therefore learns
+    to make fact directions usable without being allowed to satisfy the loss by moving the
+    prototype targets themselves inside the same step.
+    """
+    targets, active = fact_targets_from_condition(cond)
+    available_logits = ae.fact_logits(z)
+    losses = []
+    direct_losses, decoded_losses, collateral_losses = [], [], []
+    n_edits = 0
+    for pred, idxs in FACT_GROUPS.items():
+        if pred not in available_logits:
+            continue
+        present = [val for val in range(len(idxs))
+                   if bool((active[pred] & targets[pred].eq(val)).any())]
+        if len(present) < 2:
+            continue
+        prototypes = {}
+        for val in present:
+            mask = active[pred] & targets[pred].eq(val)
+            prototypes[val] = z[mask].detach().mean(dim=0)
+        for pos, src_val in enumerate(present):
+            mask = active[pred] & targets[pred].eq(src_val)
+            if not bool(mask.any()):
+                continue
+            tgt_val = present[(pos + 1) % len(present)]
+            z_edit = z[mask] + float(strength) * (prototypes[tgt_val] - prototypes[src_val])
+            tgt = torch.full((z_edit.shape[0],), tgt_val, dtype=torch.long, device=z.device)
+            direct_logits = ae.fact_logits(z_edit)
+            decoded = ae.decode(z_edit)
+            decoded_logits = ae(decoded)
+            direct = F.cross_entropy(direct_logits[pred], tgt)
+            decoded_target = F.cross_entropy(decoded_logits[pred], tgt)
+            step_losses = [direct, decoded_w * decoded_target]
+            direct_losses.append(direct)
+            decoded_losses.append(decoded_target)
+            n_edits += int(z_edit.shape[0])
+            for other, _other_idxs in FACT_GROUPS.items():
+                if other == pred or other not in decoded_logits:
+                    continue
+                other_tgt = targets[other][mask]
+                other_loss = F.cross_entropy(decoded_logits[other], other_tgt)
+                step_losses.append(collateral_w * other_loss)
+                collateral_losses.append(other_loss)
+            losses.append(sum(step_losses) / len(step_losses))
+    if not losses:
+        zero = z.sum() * 0.0
+        return zero, {
+            "intervention_loss": zero.detach(),
+            "intervention_edits": torch.tensor(0.0, device=z.device),
+        }
+    total = sum(losses) / len(losses)
+
+    def mean_or_zero(vals):
+        return (sum(vals) / len(vals)).detach() if vals else total.detach() * 0.0
+
+    return total, {
+        "intervention_loss": total.detach(),
+        "intervention_direct_ce": mean_or_zero(direct_losses),
+        "intervention_decoded_ce": mean_or_zero(decoded_losses),
+        "intervention_collateral_ce": mean_or_zero(collateral_losses),
+        "intervention_edits": torch.tensor(float(n_edits), device=z.device),
+    }
+
+
 def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
                        semantic_cond=None, time_sampling="uniform", time_logit_mean=0.0,
                        time_logit_std=1.0):
@@ -1201,6 +1269,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       cond_mode="facts", text_cond_dim=0,
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0,
+                      ae_intervention_w=0.0,
                       flow_ema_decay=0.0, flow_ema_warmup=True, eval_with_ema=True,
                       eval_weight_mode="auto", intervention_samples=32,
                       return_conditioner=False, return_ema=False):
@@ -1210,6 +1279,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError(f"unknown condition mode {cond_mode!r}")
     if time_sampling not in ("uniform", "logit-normal"):
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
+    if ae_intervention_w < 0.0:
+        raise ValueError("ae_intervention_w must be non-negative")
     if flow_ema_decay < 0.0 or flow_ema_decay >= 1.0:
         raise ValueError("flow_ema_decay must be in [0, 1)")
     if eval_weight_mode not in EVAL_WEIGHT_MODES:
@@ -1228,9 +1299,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     ae.train()
     last_ae = {}
     for _ in range(ae_steps):
-        x, _cond, yc, ys = _batch(batch, rng, size=size, device=device)
+        x, fact_cond, yc, ys = _batch(batch, rng, size=size, device=device)
         out = ae(x)
         loss, parts = autoencoder_loss(out, x, yc, ys, fact_w=fact_w)
+        if ae_intervention_w > 0.0:
+            intervention, intervention_parts = latent_intervention_training_loss(
+                ae, out["latent"], fact_cond)
+            loss = loss + float(ae_intervention_w) * intervention
+            parts.update({f"latent_{k}": v for k, v in intervention_parts.items()})
         opt_ae.zero_grad()
         loss.backward()
         opt_ae.step()
@@ -1326,6 +1402,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "fact_w": float(fact_w),
+        "ae_intervention_w": float(ae_intervention_w),
         "cond_drop": float(cond_drop),
         "flow_semantic_w": float(flow_semantic_w),
         "flow_ema_decay": float(flow_ema_decay),
@@ -1378,10 +1455,12 @@ def selftest():
                                             hidden=32, flow_arch="dit", dit_depth=1,
                                             dit_heads=2, seed=1, device="cpu", cond_drop=0.5,
                                             cfg_scale=1.5, sample_steps=1,
-                                            flow_semantic_w=0.25)
+                                            flow_semantic_w=0.25, ae_intervention_w=0.1)
     assert report2["flow_arch"] == "dit"
     assert report2["cond_drop"] == 0.5 and report2["cfg_scale"] == 1.5
     assert report2["flow_semantic_w"] == 0.25
+    assert report2["ae_intervention_w"] == 0.1
+    assert "latent_intervention_loss" in report2["last_ae"]
     assert "semantic_endpoint_ce" in report2["last_flow"]
     img2 = sample_images(ae2, flow2, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
                          seed=1, cfg_scale=1.5)
@@ -1453,6 +1532,9 @@ def main(argv=None):
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--fact-w", type=float, default=1.0, dest="fact_w")
+    ap.add_argument("--ae-intervention-w", type=float, default=0.0,
+                    dest="ae_intervention_w",
+                    help="semantic AE latent fact-intervention loss weight")
     ap.add_argument("--flow-arch", default="conv", choices=("conv", "dit", "crossdit", "mmdit"),
                     dest="flow_arch")
     ap.add_argument("--dit-depth", type=int, default=3, dest="dit_depth")
@@ -1540,7 +1622,8 @@ def main(argv=None):
         flow_semantic_w=args.flow_semantic_w, cond_mode=args.cond_mode,
         text_cond_dim=args.text_cond_dim, prompt_templates=templates,
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
-        time_logit_std=args.time_logit_std, flow_ema_decay=args.flow_ema_decay,
+        time_logit_std=args.time_logit_std, ae_intervention_w=args.ae_intervention_w,
+        flow_ema_decay=args.flow_ema_decay,
         flow_ema_warmup=not args.no_ema_warmup,
         eval_with_ema=not args.no_ema_eval,
         eval_weight_mode=("raw" if args.no_ema_eval else args.ema_eval_mode),
@@ -1563,6 +1646,7 @@ def main(argv=None):
         "cfg_scale": args.cfg_scale,
         "sample_steps": args.sample_steps,
         "intervention_samples": args.intervention_samples,
+        "ae_intervention_w": args.ae_intervention_w,
         "flow_semantic_w": args.flow_semantic_w,
         "flow_ema_decay": args.flow_ema_decay,
         "flow_ema_warmup": not args.no_ema_warmup,
