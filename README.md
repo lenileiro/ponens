@@ -38,7 +38,7 @@ memorization, and curriculum.
 | `runpod/` | H100 launchers (tar-over-ssh, timeout-bounded, always-terminate) |
 | `thinking/vision.py`, `thinking/image2.py`, `thinking/image_flow.py`, `thinking/image_latent.py` | Image rungs: synthetic visual factors → canonical facts, head-aware FER probes, pixel flow, and semantic latent flow |
 | `thinking/audio.py`, `thinking/multimodal.py` | Audio factors and the M-0 multimodal bridge: image+audio+transcript prefixes → one canonical extraction trace |
-| `data/multimodal_transcripts.json` | Configurable train/eval transcript surface bank for M-0 text grounding |
+| `data/multimodal_transcripts.json` | Configurable M-0 language data: template smoke bank plus optional explicit `(text, facts)` examples |
 | `*.md` | research plans and theses (FER bet, reasoning design, training data, validated plan) |
 
 ## Headline results (staircase-validated, 2026-06)
@@ -91,7 +91,7 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --cfg-scales 1.0,1.5 --sample-steps-list 4,8 \
     --eval-out runs/image_latent_dit_sweep.json
 .venv/bin/python -m thinking.multimodal --steps 240 --eval-n 120 --free-n 20 \
-    --counterfactual-n 40 \
+    --counterfactual-n 40 --free-counterfactual-n 20 \
     --out runs/m0_multimodal.json --checkpoint runs/m0_multimodal.pt
 ```
 

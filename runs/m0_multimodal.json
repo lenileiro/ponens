@@ -5,74 +5,111 @@
  "eval_n": 120,
  "free_n": 20,
  "counterfactual_n": 40,
+ "free_counterfactual_n": 20,
  "text_surfaces": {
   "path": "/Users/leiro/workspace/llm/data/multimodal_transcripts.json",
-  "train": 8,
-  "eval": 3
+  "train_templates": 8,
+  "eval_templates": 3,
+  "train_examples": 0,
+  "eval_examples": 0
  },
  "teacher_forced": {
   "full": {
    "color": 1.0,
-   "shape": 1.0,
-   "pitch": 0.7916666666666666,
-   "timbre": 0.9416666666666667,
+   "shape": 0.9666666666666667,
+   "pitch": 0.8666666666666667,
+   "timbre": 0.85,
    "env": 1.0
   },
   "text_only_eval_phrasings": {
-   "color": 0.9166666666666666,
+   "color": 0.925,
    "shape": 0.9666666666666667,
-   "pitch": 0.48333333333333334,
-   "timbre": 0.9083333333333333,
-   "env": 0.95
+   "pitch": 0.525,
+   "timbre": 0.8083333333333333,
+   "env": 0.9833333333333333
   },
   "sensor_only": {
    "color": 1.0,
    "shape": 0.6083333333333333,
-   "pitch": 0.95,
-   "timbre": 0.7666666666666667,
-   "env": 0.9916666666666667
+   "pitch": 0.8333333333333334,
+   "timbre": 0.7583333333333333,
+   "env": 0.9
   }
  },
  "free_text_only_eval_phrasings": {
-  "color": 0.95,
-  "shape": 1.0,
-  "pitch": 0.95,
+  "color": 0.9,
+  "shape": 0.95,
+  "pitch": 0.7,
   "timbre": 0.9,
   "env": 1.0,
-  "exact": 0.8
+  "exact": 0.55
  },
  "counterfactual_text_only_eval_phrasings": {
   "by_factor": {
    "color": {
-    "target_acc": 0.95,
-    "collateral_acc": 0.9375,
-    "exact": 0.725
-   },
-   "shape": {
-    "target_acc": 1.0,
-    "collateral_acc": 0.9125,
+    "target_acc": 0.975,
+    "collateral_acc": 0.925,
     "exact": 0.675
    },
+   "shape": {
+    "target_acc": 0.9,
+    "collateral_acc": 0.94375,
+    "exact": 0.7
+   },
    "pitch": {
-    "target_acc": 0.65,
-    "collateral_acc": 0.9625,
-    "exact": 0.6
+    "target_acc": 0.8,
+    "collateral_acc": 0.96875,
+    "exact": 0.7
    },
    "timbre": {
-    "target_acc": 1.0,
-    "collateral_acc": 0.93125,
-    "exact": 0.775
+    "target_acc": 0.9,
+    "collateral_acc": 0.86875,
+    "exact": 0.4
    },
    "env": {
     "target_acc": 1.0,
-    "collateral_acc": 0.925,
-    "exact": 0.7
+    "collateral_acc": 0.89375,
+    "exact": 0.6
    }
   },
   "mean": {
-   "target_acc": 0.9199999999999999,
-   "collateral_acc": 0.9337500000000001,
-   "exact": 0.695
+   "target_acc": 0.9149999999999998,
+   "collateral_acc": 0.9199999999999999,
+   "exact": 0.615
+  }
+ },
+ "free_counterfactual_text_only_eval_phrasings": {
+  "by_factor": {
+   "color": {
+    "target_acc": 0.95,
+    "collateral_acc": 0.95,
+    "exact": 0.8
+   },
+   "shape": {
+    "target_acc": 0.9,
+    "collateral_acc": 0.9,
+    "exact": 0.55
+   },
+   "pitch": {
+    "target_acc": 0.8,
+    "collateral_acc": 0.95,
+    "exact": 0.6
+   },
+   "timbre": {
+    "target_acc": 0.7,
+    "collateral_acc": 0.8875,
+    "exact": 0.3
+   },
+   "env": {
+    "target_acc": 1.0,
+    "collateral_acc": 0.9125,
+    "exact": 0.65
+   }
+  },
+  "mean": {
+   "target_acc": 0.8700000000000001,
+   "collateral_acc": 0.9199999999999999,
+   "exact": 0.58
   }
  },
  "chance": {

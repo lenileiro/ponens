@@ -19,6 +19,7 @@ prefix and must map to the same canonical facts with image/audio zeroed.
 import argparse
 import json
 import os
+import string
 
 import numpy as np
 import torch
@@ -29,7 +30,7 @@ from device import get_device
 from scratchpad_model import ScratchpadLM
 
 from .audio import (ENVELOPES, PITCH_NAMES, TIMBRES, render_tone, sample_clip, spectrogram)
-from .vision import COLORS, SHAPES, render_object, sample_object
+from .vision import COLORS, SHAPES, ObjectSpec, render_object, sample_object
 from .trace import Vocab
 
 DEV = get_device()
@@ -44,25 +45,81 @@ FACTOR_VALUES = {
     "timbre": TIMBRES,
     "env": ENVELOPES,
 }
+FORMATTER = string.Formatter()
 
 
 def _split_words(s):
     return s.split()
 
 
+def _template_fields(tpl):
+    fields = []
+    for _literal, field, _format_spec, _conversion in FORMATTER.parse(tpl):
+        if field is not None:
+            fields.append(field)
+    return fields
+
+
+def _check_template_fields(path, split, tpl):
+    required = set(FACTOR_VALUES)
+    fields = set(_template_fields(tpl))
+    missing = sorted(required - fields)
+    if missing:
+        raise ValueError(f"{path}:{split} template missing placeholders {missing}: {tpl}")
+    unsupported = sorted(fields - required)
+    if unsupported:
+        raise ValueError(f"{path}:{split} template has unsupported placeholders "
+                         f"{sorted(unsupported)}: {tpl}")
+
+
+def _check_gold(path, split, facts):
+    missing = sorted(set(FACTOR_VALUES) - set(facts))
+    if missing:
+        raise ValueError(f"{path}:{split} example missing facts {missing}")
+    gold = {k: facts[k] for k in FACTOR_VALUES}
+    bad = {k: v for k, v in gold.items() if v not in FACTOR_VALUES[k]}
+    if bad:
+        raise ValueError(f"{path}:{split} example has invalid fact values {bad}")
+    return gold
+
+
+def _normalize_text_example(path, split, idx, rec):
+    if not isinstance(rec, dict):
+        raise ValueError(f"{path}:{split}_examples[{idx}] must be an object")
+    if "tokens" in rec:
+        tokens = list(rec["tokens"])
+    elif "text" in rec:
+        tokens = _split_words(rec["text"])
+    else:
+        raise ValueError(f"{path}:{split}_examples[{idx}] must contain text or tokens")
+    if not tokens or not all(isinstance(t, str) for t in tokens):
+        raise ValueError(f"{path}:{split}_examples[{idx}] has empty or non-string tokens")
+    facts = rec.get("facts")
+    if not isinstance(facts, dict):
+        raise ValueError(f"{path}:{split}_examples[{idx}] must contain a facts object")
+    return {"tokens": tokens, "facts": _check_gold(path, split, facts)}
+
+
+def _load_examples(data, path, split):
+    raw = data.get(f"{split}_examples", data.get("examples", {}).get(split, []))
+    return [_normalize_text_example(path, split, i, rec) for i, rec in enumerate(raw)]
+
+
 def load_text_surfaces(path=None):
     path = path or DEFAULT_SURFACES
     with open(path) as f:
         data = json.load(f)
-    out = {"train": list(data.get("train", [])), "eval": list(data.get("eval", []))}
-    if not out["train"] or not out["eval"]:
-        raise ValueError(f"{path} must contain non-empty train/eval transcript templates")
-    required = {"color", "shape", "pitch", "timbre", "env"}
+    out = {"train": list(data.get("train", [])), "eval": list(data.get("eval", [])),
+           "train_examples": _load_examples(data, path, "train"),
+           "eval_examples": _load_examples(data, path, "eval")}
+    for split in ("train", "eval"):
+        if not out[split] and not out[f"{split}_examples"]:
+            raise ValueError(f"{path} must contain {split} templates or {split}_examples")
     for split, bank in out.items():
+        if split.endswith("_examples"):
+            continue
         for tpl in bank:
-            missing = [k for k in required if "{" + k + "}" not in tpl]
-            if missing:
-                raise ValueError(f"{path}:{split} template missing placeholders {missing}: {tpl}")
+            _check_template_fields(path, split, tpl)
     return out
 
 
@@ -70,6 +127,35 @@ def render_transcript(gold, rng, surfaces, split="train"):
     bank = surfaces[split]
     tpl = bank[int(rng.integers(len(bank)))]
     return _split_words(tpl.format(**gold))
+
+
+def sample_gold(rng):
+    obj = sample_object(rng, slot="p0")
+    clip = sample_clip(rng)
+    return {"color": obj.color, "shape": obj.shape, "pitch": clip["pitch"],
+            "timbre": clip["timbre"], "env": clip["envelope"]}
+
+
+def sample_text_and_gold(rng, surfaces, split="train"):
+    templates = surfaces[split]
+    examples = surfaces.get(f"{split}_examples", [])
+    pick = int(rng.integers(len(templates) + len(examples)))
+    if pick < len(examples):
+        ex = examples[pick]
+        return list(ex["tokens"]), dict(ex["facts"])
+    gold = sample_gold(rng)
+    tpl = templates[pick - len(examples)]
+    return _split_words(tpl.format(**gold)), gold
+
+
+def render_modalities(gold, rng):
+    base = sample_object(rng, slot="p0")
+    obj = ObjectSpec("p0", gold["color"], gold["shape"], x=base.x, y=base.y, scale=base.scale)
+    clip = sample_clip(rng)
+    img = render_object(obj, size=32)
+    aud = spectrogram(render_tone(gold["pitch"], gold["timbre"], gold["env"],
+                                  clip["detune"], clip["amp"], clip["phase"], rng=rng))
+    return img, aud
 
 
 def trace_tokens(gold):
@@ -171,19 +257,16 @@ def build_vocab(surfaces=None):
     for tpl in surfaces["train"] + surfaces["eval"]:
         toks += [w for w in _split_words(tpl)
                  if not (w.startswith("{") and w.endswith("}"))]
+    for split in ("train_examples", "eval_examples"):
+        for ex in surfaces.get(split, []):
+            toks += list(ex["tokens"])
     return Vocab(toks)
 
 
 def sample_example(rng, surfaces, text_split="train"):
-    obj = sample_object(rng, slot="p0")
-    clip = sample_clip(rng)
-    img = render_object(obj, size=32)
-    aud = spectrogram(render_tone(clip["pitch"], clip["timbre"], clip["envelope"],
-                                  clip["detune"], clip["amp"], clip["phase"], rng=rng))
-    gold = {"color": obj.color, "shape": obj.shape, "pitch": clip["pitch"],
-            "timbre": clip["timbre"], "env": clip["envelope"]}
+    txt, gold = sample_text_and_gold(rng, surfaces, split=text_split)
+    img, aud = render_modalities(gold, rng)
     toks = trace_tokens(gold)
-    txt = render_transcript(gold, rng, surfaces, split=text_split)
     return img, aud, txt, toks, gold
 
 
@@ -293,6 +376,8 @@ def counterfactual_text_evaluate(model, vocab, surfaces, n=40, seed=3, device=DE
     while all unedited factors should remain stable.  This is a semantic binding check, not a
     caption next-token task.
     """
+    if not surfaces.get("eval"):
+        return {}
     rng = np.random.default_rng(seed)
     model.eval()
     by_factor = {}
@@ -334,6 +419,8 @@ def counterfactual_text_evaluate(model, vocab, surfaces, n=40, seed=3, device=DE
 def free_counterfactual_text_evaluate(model, vocab, surfaces, n=20, seed=4, device=DEV,
                                       max_new=40):
     """Free decode version of the text intervention test."""
+    if not surfaces.get("eval"):
+        return {}
     rng = np.random.default_rng(seed)
     model.eval()
     by_factor = {}
@@ -438,8 +525,10 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
               "counterfactual_n": int(counterfactual_n),
               "free_counterfactual_n": int(free_counterfactual_n),
               "text_surfaces": {"path": surfaces_path or DEFAULT_SURFACES,
-                                "train": len(surfaces["train"]),
-                                "eval": len(surfaces["eval"])},
+                                "train_templates": len(surfaces["train"]),
+                                "eval_templates": len(surfaces["eval"]),
+                                "train_examples": len(surfaces.get("train_examples", [])),
+                                "eval_examples": len(surfaces.get("eval_examples", []))},
               "teacher_forced": {"full": full, "text_only_eval_phrasings": text,
                                  "sensor_only": sensor},
               "free_text_only_eval_phrasings": free_text,
@@ -472,7 +561,23 @@ def selftest():
     img, aud, txt, toks, gold = sample_example(rng, surfaces)
     txt_eval = render_transcript(gold, rng, surfaces, split="eval")
     assert toks[VALUE_POS["color"]] == gold["color"] and toks[VALUE_POS["env"]] == gold["env"]
-    assert all(t in vocab.stoi for t in toks + txt + txt_eval), "grammar/text token missing from vocab"
+    assert all(t in vocab.stoi for t in toks + txt + txt_eval), \
+        "grammar/text token missing from vocab"
+    example_surfaces = {
+        "train": [],
+        "eval": [],
+        "train_examples": [{"tokens": ["external", "sentence", "says", "red", "circle"],
+                            "facts": {"color": "red", "shape": "circle", "pitch": "n440",
+                                      "timbre": "saw", "env": "decay"}}],
+        "eval_examples": [{"tokens": ["external", "sentence", "says", "blue", "square"],
+                           "facts": {"color": "blue", "shape": "square", "pitch": "n262",
+                                     "timbre": "sine", "env": "flat"}}],
+    }
+    ex_vocab = build_vocab(example_surfaces)
+    _img2, _aud2, ex_txt, ex_toks, ex_gold = sample_example(
+        np.random.default_rng(1), example_surfaces)
+    assert ex_gold["color"] == "red" and ex_txt[0] == "external"
+    assert all(t in ex_vocab.stoi for t in ex_txt + ex_toks)
     model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad).to("cpu")
     x, a, tt, ids, _ = _batch(2, rng, vocab, "cpu", surfaces)
     logits = model(x, a, tt, ids)

@@ -1,0 +1,8 @@
+{
+ "experiment": "a3_speak",
+ "steps": 1200,
+ "n_codes": 128,
+ "roundtrip_acc": 0.5,
+ "chance": 0.08333333333333333,
+ "gate": true
+}

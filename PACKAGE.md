@@ -292,11 +292,12 @@ transcript phrasings, with image/audio zeroed, score **0.92 / 0.97 / 0.48 / 0.91
 greedy text-only extraction reaches **0.80 exact trace-fact match** over the small eval sample.
 The stronger semantic gate is counterfactual text intervention: edit exactly one described factor
 in a held-out transcript, keep image/audio zeroed, and require only the matching canonical fact to
-move. Mean target accuracy is **0.92**, mean collateral stability is **0.93**, and the hardest
-edited factor (pitch) is **0.65** vs a **0.475** gate. This does not prove broad natural-language
-understanding; it proves that the bridge can learn a configurable transcript surface bank as a
-sensory input and bind edited words to canonical facts rather than merely predicting the next
-caption token.
+move. Teacher-forced value-position intervention has mean target accuracy **0.92** and collateral
+stability **0.93**. The free greedy version, where the model must emit the edited fact trace from
+`extract` alone, reaches mean target accuracy **0.95**, collateral stability **0.90**, and exact
+all-fact match **0.62**. This does not prove broad natural-language understanding; it proves that
+the bridge can learn a configurable transcript surface bank as a sensory input and bind edited
+words to canonical facts rather than merely predicting the next caption token.
 
 ## 4. Exams (the report card)
 
