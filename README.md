@@ -36,6 +36,7 @@ memorization, and curriculum.
 | `datalog.py` | minimal Datalog: least-fixpoint closure with provenance, entailment oracle, proof trees, SLD backward chaining |
 | `surfaces.json` | frontier-distilled surface bank: 1,300+ validated English patterns across 8 education registers (preschool → scholar), with held-out splits |
 | `runpod/` | H100 launchers (tar-over-ssh, timeout-bounded, always-terminate) |
+| `thinking/vision.py` | Image-0/Image-1 scaffold: synthetic visual factors → canonical facts, with FER/UFR visual factor probes |
 | `*.md` | research plans and theses (FER bet, reasoning design, training data, validated plan) |
 
 ## Headline results (staircase-validated, 2026-06)
@@ -75,6 +76,7 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --steps 8000 --out runs/demo
 .venv/bin/python -m thinking.cli eval runs/demo --mode verified
 .venv/bin/python -m thinking.cli demo runs/demo --k 3
+.venv/bin/python -m thinking.vision --train --steps 200 --out runs/vision_object_encoder.pt
 ```
 
 GPU runs: `runpod/launch_thinking.py` (see the package docs).

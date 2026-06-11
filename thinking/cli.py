@@ -382,6 +382,10 @@ def cmd_selftest(_args):
     bs = score_probe_metrics(bm, n_vectors=len(bad))
     assert bm["rule_reuse_margin"] < 0.1
     assert "low_same_vs_different_rule_margin" in bs["risk_flags"]
+
+    # IMAGE-0: synthetic visual factors produce canonical facts and probeable embeddings.
+    from .vision import selftest as vision_selftest
+    vision_selftest()
     print("selftest OK")
 
 

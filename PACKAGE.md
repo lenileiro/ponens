@@ -119,6 +119,26 @@ python -m thinking.distill --go            # regenerate the bank (frontier calls
 python -m thinking.distill --definitions   # add/refresh leveled definitions
 ```
 
+## 3b. Image grounding: synthetic visual factors first
+
+`thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
+without losing checkability. It generates small colored-shape scenes with exact canonical facts
+(`fact p0 color red .`, `fact p0 shape circle .`, `fact p0 left_of p1 .`), trains a compact
+vision encoder to recover color/shape factors, and reports visual FER/UFR probes:
+same-color reuse across shapes, same-shape reuse across colors, color-shape leakage, and a
+`ufr_score`/`verdict`.
+
+```bash
+python -m thinking.vision --selftest
+python -m thinking.vision --train --steps 2000 --batch 64 --dim 64 \
+    --out runs/vision_object_encoder.pt
+RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --fast --go
+```
+
+This is deliberately not image generation yet. The first invariant is: images ground into
+canonical facts; the existing verifier reasons over facts; a later latent-diffusion/DiT decoder
+can be conditioned on verified facts/traces for generation.
+
 ## 4. Exams (the report card)
 
 | exam | command fragment | measures |

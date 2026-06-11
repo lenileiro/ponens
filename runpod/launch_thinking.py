@@ -72,6 +72,12 @@ def payload(args):
                     f"--corpus-mb {args.lang_mb} --pre-steps {args.train_steps or 40000} "
                     f"--steps {args.lang_ft or 6000} --out runs/lang1_fluency.pt && "
                     f"{VB} --sample runs/lang1_fluency.pt")
+    if args.vision:                                        # IMAGE-0/1: visual factors -> facts
+        VI = PY.replace("thinking.cli", "thinking.vision")
+        cmds.append(f"{VI} --train --steps {args.train_steps or 2000} "
+                    f"--batch {args.batch} --dim {args.dim or 64} "
+                    f"--out runs/vision_object_encoder.pt")
+        return " && ".join(cmds)
     if args.eval_only_run:
         run = shlex_quote(args.eval_only_run)
         depths = ",".join(str(d) for d in args.eval_depths)
@@ -271,6 +277,8 @@ def main():
                     help="LANG-1: hybrid-vocab fluency pretraining (reasoning-compatible)")
     ap.add_argument("--lang-mb", type=int, default=24, dest="lang_mb")
     ap.add_argument("--lang-ft", type=int, default=6000, dest="lang_ft")
+    ap.add_argument("--vision", action="store_true",
+                    help="IMAGE-0/1: train visual factor encoder + FER probe report")
     ap.add_argument("--lengen", action="store_true", help="rung L: depth generalization")
     ap.add_argument("--deep-ancestor-rule-aux", action="store_true",
                     help="train the forward ancestor run with rule/action and contrastive losses")
@@ -344,8 +352,9 @@ def main():
         f"2>&1 | tee /root/thinking.log; "
         f"cp /root/thinking.log {REMOTE}/thinking.log 2>/dev/null; true")
 
-    print("=== PLAN === thinking package on H100: kinship multi-seed"
-          + (" + chain grid" if args.sweep else ""))
+    job = "vision factor encoder" if args.vision else "kinship multi-seed"
+    print("=== PLAN === thinking package on H100: " + job
+          + (" + chain grid" if args.sweep and not args.vision else ""))
     print(f"gpu/cloud : {args.gpu} / {args.cloud}")
     print(f"seeds     : {args.seeds}")
     print(f"sync up   : {HERE}/ -> pod:{REMOTE}")
