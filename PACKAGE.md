@@ -169,6 +169,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-cond-drop 0.1 --image-cfg-scale 1.5 \
     --image-sample-steps 8 --image-flow-semantic-w 0.25 \
     --image-time-sampling logit-normal --image-flow-ema-decay 0.999 \
+    --image-latent-normalize channel --image-latent-stat-samples 1024 \
     --image-ae-intervention-w 0.1 --image-ae-factor-orth-w 0.05 \
     --image-semantic-guidance-w 2.0 --image-semantic-guidance-sweep 0.0,1.0,2.0 \
     --image-sample-methods euler,heun \
@@ -390,6 +391,13 @@ Image-25 adds a lightweight wide DiT velocity head (`--dit-head-width-mult`; Run
 old linear head for checkpoint compatibility; setting the multiplier above 1 gives the transformer
 a wider projection head for semantically rich latents. This follows the RAE/REPA direction: improve
 the model's capacity to operate in representation space without adding renderer-specific rules.
+
+Image-26 adds checkpointed latent normalization (`--latent-normalize none|global|channel`;
+RunPod: `--image-latent-normalize`). The flow can now train and sample in normalized AE latent
+coordinates while semantic losses, guidance, decoding, and visual grids still operate in raw AE
+latent space. This is a generic scale fix for semantically rich/high-dimensional latents: it
+stabilizes coordinate scale without hard-coding visual factors or renderer rules, and old
+checkpoints default to `none`.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

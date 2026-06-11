@@ -568,6 +568,123 @@ def sample_flow_times(batch, device=DEV, mode="uniform", logit_mean=0.0, logit_s
     raise ValueError(f"unknown time sampling mode {mode!r}")
 
 
+def latent_stats_enabled(stats):
+    return bool(stats and stats.get("mode", "none") != "none"
+                and stats.get("mean") is not None and stats.get("std") is not None)
+
+
+def latent_stats_to_device(stats, device):
+    if not latent_stats_enabled(stats):
+        return {"mode": "none", "n": int((stats or {}).get("n", 0))}
+    return {
+        "mode": stats.get("mode", "channel"),
+        "n": int(stats.get("n", 0)),
+        "mean": stats["mean"].to(device=device),
+        "std": stats["std"].to(device=device),
+    }
+
+
+def attach_latent_stats(flow, stats):
+    flow.latent_stats = latent_stats_to_device(stats, next(flow.parameters()).device)
+    return flow
+
+
+def flow_latent_stats(flow):
+    return getattr(flow, "latent_stats", {"mode": "none", "n": 0})
+
+
+def normalize_latent(z, stats):
+    if not latent_stats_enabled(stats):
+        return z
+    mean = stats["mean"].to(device=z.device, dtype=z.dtype)
+    std = stats["std"].to(device=z.device, dtype=z.dtype)
+    return (z - mean) / std
+
+
+def denormalize_latent(z, stats):
+    if not latent_stats_enabled(stats):
+        return z
+    mean = stats["mean"].to(device=z.device, dtype=z.dtype)
+    std = stats["std"].to(device=z.device, dtype=z.dtype)
+    return z * std + mean
+
+
+@torch.no_grad()
+def estimate_latent_stats(ae, n=512, batch=64, seed=123, size=32, device=DEV,
+                          mode="none", eps=1.0e-6):
+    mode = str(mode)
+    if mode == "none":
+        return {"mode": "none", "n": 0}
+    if mode not in ("global", "channel"):
+        raise ValueError(f"unknown latent normalization mode {mode!r}")
+    n = max(1, int(n))
+    rng = np.random.default_rng(seed)
+    ae.eval()
+    count = 0
+    seen = 0
+    sums = sums2 = None
+    while seen < n:
+        b = min(batch, n - seen)
+        x, _cond, _yc, _ys = _batch(b, rng, size=size, device=device)
+        z = ae.encode(x).detach().float().cpu().double()
+        if mode == "global":
+            cur_sum = z.sum()
+            cur_sum2 = z.pow(2).sum()
+            cur_count = z.numel()
+        else:
+            cur_sum = z.sum(dim=(0, 2, 3))
+            cur_sum2 = z.pow(2).sum(dim=(0, 2, 3))
+            cur_count = z.shape[0] * z.shape[2] * z.shape[3]
+        if sums is None:
+            sums = torch.zeros_like(cur_sum)
+            sums2 = torch.zeros_like(cur_sum2)
+        sums += cur_sum
+        sums2 += cur_sum2
+        count += int(cur_count)
+        seen += b
+    mean = sums / max(1, count)
+    var = (sums2 / max(1, count) - mean.pow(2)).clamp_min(float(eps) ** 2)
+    std = var.sqrt()
+    if mode == "global":
+        mean = mean.view(1, 1, 1, 1)
+        std = std.view(1, 1, 1, 1)
+    else:
+        mean = mean.view(1, -1, 1, 1)
+        std = std.view(1, -1, 1, 1)
+    return {
+        "mode": mode,
+        "n": int(seen),
+        "mean": mean.float(),
+        "std": std.float(),
+    }
+
+
+def latent_stats_state(stats):
+    if not latent_stats_enabled(stats):
+        return {"mode": "none", "n": int((stats or {}).get("n", 0))}
+    return {
+        "mode": stats.get("mode", "channel"),
+        "n": int(stats.get("n", 0)),
+        "mean": stats["mean"].detach().cpu(),
+        "std": stats["std"].detach().cpu(),
+    }
+
+
+def latent_stats_report(stats):
+    if not latent_stats_enabled(stats):
+        return {"latent_normalize": "none", "latent_norm_n": 0}
+    mean = stats["mean"].detach().float().cpu()
+    std = stats["std"].detach().float().cpu()
+    return {
+        "latent_normalize": stats.get("mode", "channel"),
+        "latent_norm_n": int(stats.get("n", 0)),
+        "latent_norm_mean_abs": float(mean.abs().mean()),
+        "latent_norm_std_mean": float(std.mean()),
+        "latent_norm_std_min": float(std.min()),
+        "latent_norm_std_max": float(std.max()),
+    }
+
+
 def autoencoder_loss(out, x, yc, ys, fact_w=0.25):
     recon = F.mse_loss(out["recon"], x)
     facts = F.cross_entropy(out["color"], yc) + F.cross_entropy(out["shape"], ys)
@@ -915,12 +1032,14 @@ def latent_factor_orthogonality_loss(z, cond, eps=1.0e-6):
 
 def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
                        semantic_cond=None, time_sampling="uniform", time_logit_mean=0.0,
-                       time_logit_std=1.0):
-    x0 = torch.randn_like(z1)
+                       time_logit_std=1.0, latent_stats=None):
+    latent_stats = flow_latent_stats(flow) if latent_stats is None else latent_stats
+    z1_model = normalize_latent(z1, latent_stats)
+    x0 = torch.randn_like(z1_model)
     t = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                           logit_mean=time_logit_mean, logit_std=time_logit_std)
-    zt = (1.0 - t) * x0 + t * z1
-    target = z1 - x0
+    zt = (1.0 - t) * x0 + t * z1_model
+    target = z1_model - x0
     cond_model = condition_dropout(cond, cond_drop)
     pred = flow(zt, t, cond_model)
     velocity = F.mse_loss(pred, target)
@@ -931,7 +1050,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
         "time_std": t.detach().std(unbiased=False),
     }
     if ae is not None and semantic_w > 0.0:
-        z_clean = zt + (1.0 - t) * pred
+        z_clean = denormalize_latent(zt + (1.0 - t) * pred, latent_stats)
         sem_cond = cond if semantic_cond is None else semantic_cond
         cond_vec = condition_vector(cond_model)
         keep = cond_vec.detach().abs().sum(dim=1, keepdim=True).gt(0).to(sem_cond.dtype)
@@ -943,11 +1062,12 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
 
 
 def latent_flow_loss(flow, z1, cond, cond_drop=0.0, time_sampling="uniform",
-                     time_logit_mean=0.0, time_logit_std=1.0):
+                     time_logit_mean=0.0, time_logit_std=1.0, latent_stats=None):
     loss, _parts = latent_flow_losses(flow, z1, cond, cond_drop=cond_drop,
                                       time_sampling=time_sampling,
                                       time_logit_mean=time_logit_mean,
-                                      time_logit_std=time_logit_std)
+                                      time_logit_std=time_logit_std,
+                                      latent_stats=latent_stats)
     return loss
 
 
@@ -983,6 +1103,7 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                    cfg_scale=1.0, ae=None, semantic_cond=None, semantic_guidance_w=0.0,
                    semantic_guidance_mode="decoded", sample_method="euler"):
     batch = condition_batch(cond)
+    latent_stats = flow_latent_stats(flow)
     z = _seeded_randn((batch,) + tuple(latent_shape), device=device, seed=seed)
     flow.eval()
     if ae is not None:
@@ -1005,9 +1126,12 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
             v1 = guided_velocity(flow, z_pred, t_next, cond, cfg_scale=cfg_scale)
             z = z + 0.5 * dt * (v0 + v1)
         if semantic_guidance_w > 0.0:
-            z = semantic_guidance_step(ae, z, semantic_cond, weight=semantic_guidance_w,
-                                       step_size=dt, mode=semantic_guidance_mode)
-    return z
+            z_raw = denormalize_latent(z, latent_stats)
+            z_raw = semantic_guidance_step(ae, z_raw, semantic_cond,
+                                           weight=semantic_guidance_w,
+                                           step_size=dt, mode=semantic_guidance_mode)
+            z = normalize_latent(z_raw, latent_stats)
+    return denormalize_latent(z, latent_stats)
 
 
 @torch.no_grad()
@@ -1324,6 +1448,10 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
                      dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim,
                      dit_head_width_mult=dit_head_width_mult).to(device)
+    latent_stats = latent_stats_to_device(
+        ckpt.get("latent_stats", {"mode": ckpt.get("latent_normalize", "none")}),
+        device)
+    attach_latent_stats(flow, latent_stats)
     ae.load_state_dict(ckpt["autoencoder_state_dict"])
     flow_state = ckpt["flow_state_dict"]
     ema_available = bool(ckpt.get("flow_ema_state_dict"))
@@ -1354,6 +1482,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                                          report.get("flow_ema_warmup", False))),
         "flow_ema_effective_decay": float(ckpt.get(
             "flow_ema_effective_decay", report.get("flow_ema_effective_decay", 0.0))),
+        **latent_stats_report(latent_stats),
         "cond_mode": cond_mode,
         "cond_dim": cond_dim,
     }
@@ -1595,6 +1724,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       cond_mode="facts", text_cond_dim=0,
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0,
+                      latent_normalize="none", latent_stat_samples=512,
                       ae_intervention_w=0.0, ae_factor_orth_w=0.0,
                       semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
                       sample_method="euler",
@@ -1607,6 +1737,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError(f"unknown condition mode {cond_mode!r}")
     if time_sampling not in ("uniform", "logit-normal"):
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
+    if latent_normalize not in ("none", "global", "channel"):
+        raise ValueError(f"unknown latent normalization mode {latent_normalize!r}")
     if ae_intervention_w < 0.0:
         raise ValueError("ae_intervention_w must be non-negative")
     if ae_factor_orth_w < 0.0:
@@ -1662,6 +1794,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     ae.eval()
     for p in ae.parameters():
         p.requires_grad_(False)
+    latent_stats = estimate_latent_stats(
+        ae, n=latent_stat_samples, batch=batch, seed=seed + 97, size=size, device=device,
+        mode=latent_normalize)
+    attach_latent_stats(flow, latent_stats)
     flow.train()
     if conditioner is not None:
         conditioner.train()
@@ -1775,6 +1911,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "time_sampling": time_sampling,
         "time_logit_mean": float(time_logit_mean),
         "time_logit_std": float(time_logit_std),
+        "latent_stat_samples": int(latent_stat_samples),
+        **latent_stats_report(latent_stats),
         "cond_mode": cond_mode,
         "cond_dim": int(cond_dim),
         "prompt_templates": list(prompt_templates) if cond_mode == "text" else [],
@@ -1821,12 +1959,15 @@ def selftest():
                                             dit_heads=2, seed=1, device="cpu", cond_drop=0.5,
                                             cfg_scale=1.5, sample_steps=1,
                                             flow_semantic_w=0.25, ae_intervention_w=0.1,
-                                            ae_factor_orth_w=0.05)
+                                            ae_factor_orth_w=0.05,
+                                            latent_normalize="channel",
+                                            latent_stat_samples=8)
     assert report2["flow_arch"] == "dit"
     assert report2["cond_drop"] == 0.5 and report2["cfg_scale"] == 1.5
     assert report2["flow_semantic_w"] == 0.25
     assert report2["ae_intervention_w"] == 0.1
     assert report2["ae_factor_orth_w"] == 0.05
+    assert report2["latent_normalize"] == "channel" and report2["latent_norm_n"] == 8
     assert "latent_intervention_loss" in report2["last_ae"]
     assert "latent_factor_orth_loss" in report2["last_ae"]
     assert "semantic_endpoint_ce" in report2["last_flow"]
@@ -1969,6 +2110,12 @@ def main(argv=None):
                     help="mean for --time-sampling logit-normal")
     ap.add_argument("--time-logit-std", type=float, default=1.0, dest="time_logit_std",
                     help="stddev for --time-sampling logit-normal")
+    ap.add_argument("--latent-normalize", default="none",
+                    choices=("none", "global", "channel"), dest="latent_normalize",
+                    help="normalize AE latents before flow training/sampling")
+    ap.add_argument("--latent-stat-samples", type=int, default=512,
+                    dest="latent_stat_samples",
+                    help="number of AE samples used to estimate latent normalization stats")
     ap.add_argument("--cond-mode", default="facts", choices=("facts", "text"), dest="cond_mode",
                     help="conditioning source for latent flow")
     ap.add_argument("--text-cond-dim", type=int, default=0, dest="text_cond_dim",
@@ -2063,7 +2210,10 @@ def main(argv=None):
         flow_semantic_w=args.flow_semantic_w, cond_mode=args.cond_mode,
         text_cond_dim=args.text_cond_dim, prompt_templates=templates,
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
-        time_logit_std=args.time_logit_std, ae_intervention_w=args.ae_intervention_w,
+        time_logit_std=args.time_logit_std,
+        latent_normalize=args.latent_normalize,
+        latent_stat_samples=args.latent_stat_samples,
+        ae_intervention_w=args.ae_intervention_w,
         ae_factor_orth_w=args.ae_factor_orth_w,
         semantic_guidance_w=args.semantic_guidance_w,
         semantic_guidance_mode=args.semantic_guidance_mode,
@@ -2137,6 +2287,9 @@ def main(argv=None):
         "time_sampling": args.time_sampling,
         "time_logit_mean": args.time_logit_mean,
         "time_logit_std": args.time_logit_std,
+        "latent_normalize": args.latent_normalize,
+        "latent_stat_samples": args.latent_stat_samples,
+        "latent_stats": latent_stats_state(flow_latent_stats(flow)),
         "prompt_templates": list(templates) if args.cond_mode == "text" else [],
         "prompt_vocab": prompt_vocab if prompt_vocab is not None else {},
         "conditioner_state_dict": (conditioner.state_dict() if conditioner is not None else {}),

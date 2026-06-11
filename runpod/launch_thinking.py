@@ -120,6 +120,8 @@ def payload(args):
                      f"--time-sampling {args.image_time_sampling} "
                      f"--time-logit-mean {args.image_time_logit_mean} "
                      f"--time-logit-std {args.image_time_logit_std} "
+                     f"--latent-normalize {args.image_latent_normalize} "
+                     f"--latent-stat-samples {args.image_latent_stat_samples} "
                      f"--out {ckpt}")
             if args.image_sample_grid:
                 train += (f" --sample-grid-out {grid} "
@@ -441,6 +443,12 @@ def main():
     ap.add_argument("--image-time-logit-std", type=float, default=1.0,
                     dest="image_time_logit_std",
                     help="stddev for --image-time-sampling logit-normal")
+    ap.add_argument("--image-latent-normalize", default="none",
+                    choices=("none", "global", "channel"), dest="image_latent_normalize",
+                    help="normalize semantic AE latents before latent image flow training")
+    ap.add_argument("--image-latent-stat-samples", type=int, default=512,
+                    dest="image_latent_stat_samples",
+                    help="samples used to estimate latent image normalization stats")
     ap.add_argument("--image-eval-sweep", action="store_true", dest="image_eval_sweep",
                     help="after latent training, sweep CFG and sampler steps from the checkpoint")
     ap.add_argument("--image-checkpoint-weight-mode", default="auto",
