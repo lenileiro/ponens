@@ -165,7 +165,8 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --vision-arch bottl
     --image-flow-semantic-w 0.25 --image-eval-sweep \
     --audio --multimodal --fast --go
 RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-latent-arch mmdit \
-    --image-cond-mode text --image-cond-drop 0.1 --image-cfg-scale 1.5 \
+    --image-cond-mode text --image-dit-head-width-mult 2 \
+    --image-cond-drop 0.1 --image-cfg-scale 1.5 \
     --image-sample-steps 8 --image-flow-semantic-w 0.25 \
     --image-time-sampling logit-normal --image-flow-ema-decay 0.999 \
     --image-ae-intervention-w 0.1 --image-ae-factor-orth-w 0.05 \
@@ -383,6 +384,12 @@ Image-24 adds dependency-free PPM sample-grid export (`--sample-grid-out`; RunPo
 evaluation, so fact metrics and visual artifacts can be audited together. This is necessary for
 image-generation work: the fact heads can say shape is correct, but the artifact makes pixel-level
 failures visible.
+
+Image-25 adds a lightweight wide DiT velocity head (`--dit-head-width-mult`; RunPod:
+`--image-dit-head-width-mult`) for DiT, Cross-DiT, and MM-DiT flows. The default remains the
+old linear head for checkpoint compatibility; setting the multiplier above 1 gives the transformer
+a wider projection head for semantically rich latents. This follows the RAE/REPA direction: improve
+the model's capacity to operate in representation space without adding renderer-specific rules.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

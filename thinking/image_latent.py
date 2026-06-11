@@ -220,6 +220,20 @@ class LatentFlowNet(nn.Module):
         return self.net(torch.cat([z, tchan, c], dim=1))
 
 
+def make_velocity_head(hidden, latent_ch, width_mult=1):
+    width_mult = int(width_mult)
+    if width_mult <= 1:
+        return nn.Linear(hidden, latent_ch)
+    width = int(hidden) * width_mult
+    return nn.Sequential(
+        nn.Linear(hidden, width),
+        nn.GELU(),
+        nn.Linear(width, width),
+        nn.GELU(),
+        nn.Linear(width, latent_ch),
+    )
+
+
 class LatentDiTFlowNet(nn.Module):
     """Patch-token transformer velocity field over semantic image latents.
 
@@ -228,12 +242,14 @@ class LatentDiTFlowNet(nn.Module):
     transformer blocks, then project token velocities back to the latent grid.
     """
 
-    def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None, max_tokens=256):
+    def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
+                 max_tokens=256, head_width_mult=1):
         super().__init__()
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
         self.hidden = int(hidden)
         self.max_tokens = int(max_tokens)
+        self.head_width_mult = int(head_width_mult)
         self.in_proj = nn.Linear(latent_ch, hidden)
         self.pos = nn.Parameter(torch.zeros(1, max_tokens, hidden))
         self.cond = nn.Sequential(
@@ -252,7 +268,7 @@ class LatentDiTFlowNet(nn.Module):
         )
         self.blocks = nn.TransformerEncoder(layer, num_layers=depth, enable_nested_tensor=False)
         self.norm = nn.LayerNorm(hidden)
-        self.out_proj = nn.Linear(hidden, latent_ch)
+        self.out_proj = make_velocity_head(hidden, latent_ch, self.head_width_mult)
 
     def forward(self, z, t, cond):
         cond = condition_vector(cond)
@@ -303,12 +319,13 @@ class LatentCrossDiTFlowNet(nn.Module):
     uses_cond_tokens = True
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
-                 max_tokens=256):
+                 max_tokens=256, head_width_mult=1):
         super().__init__()
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
         self.hidden = int(hidden)
         self.max_tokens = int(max_tokens)
+        self.head_width_mult = int(head_width_mult)
         self.in_proj = nn.Linear(latent_ch, hidden)
         self.pos = nn.Parameter(torch.zeros(1, max_tokens, hidden))
         self.cond = nn.Sequential(
@@ -319,7 +336,7 @@ class LatentCrossDiTFlowNet(nn.Module):
         self.ctx_proj = nn.Linear(cond_dim, hidden)
         self.blocks = nn.ModuleList([CrossDiTBlock(hidden, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(hidden)
-        self.out_proj = nn.Linear(hidden, latent_ch)
+        self.out_proj = make_velocity_head(hidden, latent_ch, self.head_width_mult)
 
     def _context(self, cond):
         if isinstance(cond, dict):
@@ -429,12 +446,13 @@ class LatentMMDiTFlowNet(nn.Module):
     uses_residual_gating = True
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
-                 max_tokens=256):
+                 max_tokens=256, head_width_mult=1):
         super().__init__()
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
         self.hidden = int(hidden)
         self.max_tokens = int(max_tokens)
+        self.head_width_mult = int(head_width_mult)
         self.in_proj = nn.Linear(latent_ch, hidden)
         self.pos = nn.Parameter(torch.zeros(1, max_tokens, hidden))
         self.time = nn.Sequential(nn.Linear(cond_dim + 1, hidden), nn.GELU(),
@@ -442,7 +460,7 @@ class LatentMMDiTFlowNet(nn.Module):
         self.ctx_proj = nn.Linear(cond_dim, hidden)
         self.blocks = nn.ModuleList([MMDiTBlock(hidden, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(hidden)
-        self.out_proj = nn.Linear(hidden, latent_ch)
+        self.out_proj = make_velocity_head(hidden, latent_ch, self.head_width_mult)
 
     def _context(self, cond):
         if isinstance(cond, dict):
@@ -473,27 +491,34 @@ class LatentMMDiTFlowNet(nn.Module):
         return v.transpose(1, 2).reshape(b, c, h, w)
 
 
-def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4, cond_dim=None):
+def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4,
+              cond_dim=None, dit_head_width_mult=1):
     if flow_arch == "conv":
         return LatentFlowNet(latent_ch=latent_ch, hidden=hidden, cond_dim=cond_dim)
+    dit_head_width_mult = int(dit_head_width_mult)
+    if dit_head_width_mult <= 0:
+        raise ValueError("dit_head_width_mult must be positive")
     if flow_arch == "dit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
             heads -= 1
         return LatentDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth, heads=heads,
-                                cond_dim=cond_dim)
+                                cond_dim=cond_dim,
+                                head_width_mult=dit_head_width_mult)
     if flow_arch == "crossdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
             heads -= 1
         return LatentCrossDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth,
-                                     heads=heads, cond_dim=cond_dim)
+                                     heads=heads, cond_dim=cond_dim,
+                                     head_width_mult=dit_head_width_mult)
     if flow_arch == "mmdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
             heads -= 1
         return LatentMMDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth,
-                                  heads=heads, cond_dim=cond_dim)
+                                  heads=heads, cond_dim=cond_dim,
+                                  head_width_mult=dit_head_width_mult)
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
@@ -1277,6 +1302,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     flow_arch = ckpt.get("flow_arch", report.get("flow_arch", "conv"))
     dit_depth = int(ckpt.get("dit_depth", report.get("dit_depth", 3)))
     dit_heads = int(ckpt.get("dit_heads", report.get("dit_heads", 4)))
+    dit_head_width_mult = int(ckpt.get("dit_head_width_mult",
+                                       report.get("dit_head_width_mult", 1)))
     cond_mode = ckpt.get("cond_mode", report.get("cond_mode", "facts"))
     cond_dim = int(ckpt.get("cond_dim", report.get("cond_dim", len(FACT_VOCAB))))
     prompt_templates = tuple(ckpt.get("prompt_templates", report.get("prompt_templates", []))
@@ -1295,7 +1322,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         conditioner.eval()
     ae = SemanticAutoencoder(latent_ch=latent_ch, hidden=hidden).to(device)
     flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
-                     dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim).to(device)
+                     dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim,
+                     dit_head_width_mult=dit_head_width_mult).to(device)
     ae.load_state_dict(ckpt["autoencoder_state_dict"])
     flow_state = ckpt["flow_state_dict"]
     ema_available = bool(ckpt.get("flow_ema_state_dict"))
@@ -1313,6 +1341,9 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "flow_arch": flow_arch,
         "dit_depth": dit_depth if flow_arch in ("dit", "crossdit", "mmdit") else 0,
         "dit_heads": dit_heads if flow_arch in ("dit", "crossdit", "mmdit") else 0,
+        "dit_head_width_mult": (
+            dit_head_width_mult if flow_arch in ("dit", "crossdit", "mmdit") else 1
+        ),
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "flow_load": flow_load,
@@ -1559,6 +1590,7 @@ def selected_grid_settings(report, fallback_cfg=1.0, fallback_steps=4,
 def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidden=64,
                       lr=2e-4, fact_w=1.0, seed=0, size=32, device=DEV, flow_arch="conv",
                       dit_depth=3, dit_heads=4, cond_drop=0.0, cfg_scale=1.0,
+                      dit_head_width_mult=1,
                       sample_steps=4, roundtrip_samples=1, flow_semantic_w=0.0,
                       cond_mode="facts", text_cond_dim=0,
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
@@ -1585,6 +1617,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError(f"unknown semantic guidance mode {semantic_guidance_mode!r}")
     if sample_method not in SAMPLE_METHODS:
         raise ValueError(f"unknown sample method {sample_method!r}")
+    if dit_head_width_mult <= 0:
+        raise ValueError("dit_head_width_mult must be positive")
     if flow_ema_decay < 0.0 or flow_ema_decay >= 1.0:
         raise ValueError("flow_ema_decay must be in [0, 1)")
     if eval_weight_mode not in EVAL_WEIGHT_MODES:
@@ -1598,7 +1632,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                                         hidden=hidden).to(device)
     ae = SemanticAutoencoder(latent_ch=latent_ch, hidden=hidden).to(device)
     flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
-                     dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim).to(device)
+                     dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim,
+                     dit_head_width_mult=dit_head_width_mult).to(device)
     opt_ae = torch.optim.AdamW(ae.parameters(), lr=lr, weight_decay=0.01)
     ae.train()
     last_ae = {}
@@ -1711,6 +1746,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_arch": flow_arch,
         "dit_depth": int(dit_depth) if flow_arch in ("dit", "crossdit", "mmdit") else 0,
         "dit_heads": int(dit_heads) if flow_arch in ("dit", "crossdit", "mmdit") else 0,
+        "dit_head_width_mult": (
+            int(dit_head_width_mult) if flow_arch in ("dit", "crossdit", "mmdit") else 1
+        ),
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "fact_w": float(fact_w),
@@ -1833,9 +1871,10 @@ def selftest():
         ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="mmdit",
         dit_depth=1, dit_heads=2, seed=7, device="cpu", cond_mode="text",
         text_cond_dim=8, sample_steps=1, time_sampling="logit-normal",
-        flow_ema_decay=0.5,
+        flow_ema_decay=0.5, dit_head_width_mult=2,
         return_conditioner=True)
     assert report5["flow_arch"] == "mmdit" and flow_uses_cond_tokens(flow5)
+    assert report5["dit_head_width_mult"] == 2
     assert report5["adaptive_modulation"] is True
     assert report5["residual_gating"] is True
     assert report5["ema_available"] is True
@@ -1847,7 +1886,7 @@ def selftest():
     assert report5["flow_ema_warmup"] is True and report5["flow_ema_effective_decay"] < 0.5
     legacy_state = {k: v for k, v in flow5.state_dict().items() if ".gate." not in k}
     compat_flow = make_flow(flow_arch="mmdit", latent_ch=4, hidden=32, dit_depth=1,
-                            dit_heads=2, cond_dim=8)
+                            dit_heads=2, cond_dim=8, dit_head_width_mult=2)
     compat_load = load_flow_state(compat_flow, legacy_state)
     assert compat_load["tolerated_missing"] and all(
         ".gate." in k for k in compat_load["tolerated_missing"])
@@ -1881,6 +1920,9 @@ def main(argv=None):
                     dest="flow_arch")
     ap.add_argument("--dit-depth", type=int, default=3, dest="dit_depth")
     ap.add_argument("--dit-heads", type=int, default=4, dest="dit_heads")
+    ap.add_argument("--dit-head-width-mult", type=int, default=1,
+                    dest="dit_head_width_mult",
+                    help="width multiplier for the DiT/MM-DiT latent velocity head")
     ap.add_argument("--cond-drop", type=float, default=0.0, dest="cond_drop")
     ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
     ap.add_argument("--sample-steps", type=int, default=4, dest="sample_steps")
@@ -2016,6 +2058,7 @@ def main(argv=None):
         latent_ch=args.latent_ch, hidden=args.hidden, lr=args.lr, fact_w=args.fact_w,
         seed=args.seed, flow_arch=args.flow_arch, dit_depth=args.dit_depth,
         dit_heads=args.dit_heads, cond_drop=args.cond_drop, cfg_scale=args.cfg_scale,
+        dit_head_width_mult=args.dit_head_width_mult,
         sample_steps=args.sample_steps, roundtrip_samples=args.roundtrip_samples,
         flow_semantic_w=args.flow_semantic_w, cond_mode=args.cond_mode,
         text_cond_dim=args.text_cond_dim, prompt_templates=templates,
@@ -2073,6 +2116,7 @@ def main(argv=None):
         "flow_arch": args.flow_arch,
         "dit_depth": args.dit_depth,
         "dit_heads": args.dit_heads,
+        "dit_head_width_mult": args.dit_head_width_mult,
         "cond_mode": args.cond_mode,
         "cond_dim": report["cond_dim"],
         "cond_drop": args.cond_drop,

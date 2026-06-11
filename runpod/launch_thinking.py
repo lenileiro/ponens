@@ -101,6 +101,7 @@ def payload(args):
             train = (f"{IL} --train --ae-steps {args.train_steps or 800} "
                      f"--flow-steps {args.train_steps or 800} --batch {args.batch} "
                      f"--hidden {args.dim or 64} --flow-arch {args.image_latent_arch} "
+                     f"--dit-head-width-mult {args.image_dit_head_width_mult} "
                      f"--cond-mode {args.image_cond_mode} "
                      f"--text-cond-dim {args.image_text_cond_dim} "
                      f"--cond-drop {args.image_cond_drop} "
@@ -370,6 +371,9 @@ def main():
     ap.add_argument("--image-latent-arch", default="conv",
                     choices=("conv", "dit", "crossdit", "mmdit"),
                     dest="image_latent_arch", help="latent velocity architecture")
+    ap.add_argument("--image-dit-head-width-mult", type=int, default=1,
+                    dest="image_dit_head_width_mult",
+                    help="width multiplier for the latent DiT/MM-DiT velocity head")
     ap.add_argument("--image-cond-mode", default="facts", choices=("facts", "text"),
                     dest="image_cond_mode",
                     help="latent image conditioning source: canonical facts or learned text prompts")
