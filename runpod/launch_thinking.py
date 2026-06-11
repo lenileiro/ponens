@@ -338,7 +338,7 @@ def main():
     ap.add_argument("--image-flow", action="store_true", dest="image_flow",
                     help="train the tiny fact-conditioned rectified-flow image generator")
     ap.add_argument("--image-latent", action="store_true", dest="image_latent",
-                    help="IMAGE-3: train semantic autoencoder + latent fact-conditioned flow")
+                    help="IMAGE-3: train semantic autoencoder + latent image flow")
     ap.add_argument("--image-latent-arch", default="conv", choices=("conv", "dit"),
                     dest="image_latent_arch", help="latent velocity architecture")
     ap.add_argument("--image-cond-mode", default="facts", choices=("facts", "text"),
@@ -451,7 +451,7 @@ def main():
         (args.vision, "vision factor encoder"),
         (args.image2, "image2 FER arms"),
         (args.image_flow, "fact-conditioned flow"),
-        (args.image_latent, "latent fact-conditioned flow"),
+        (args.image_latent, f"latent {args.image_cond_mode}-conditioned flow"),
         (args.audio, "audio FER arms"),
         (args.multimodal, "multimodal bridge"),
     ) if enabled]
