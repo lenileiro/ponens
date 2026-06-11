@@ -12,7 +12,7 @@ linearly usable after compression instead of becoming another entangled bottlene
 
   python -m thinking.image_latent --selftest
   python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-steps 400 \
-      --out runs/image_latent_dit.pt
+      --cond-drop 0.1 --cfg-scale 1.5 --sample-steps 8 --out runs/image_latent_dit.pt
 """
 import argparse
 import json
@@ -197,37 +197,101 @@ def autoencoder_loss(out, x, yc, ys, fact_w=0.25):
     return recon + fact_w * facts, {"recon_mse": recon.detach(), "fact_ce": facts.detach()}
 
 
-def latent_flow_loss(flow, z1, cond):
+def condition_dropout(cond, p=0.0):
+    """Classifier-free condition dropout: zero whole condition rows during training."""
+    if p <= 0.0:
+        return cond
+    if p >= 1.0:
+        return torch.zeros_like(cond)
+    keep = (torch.rand(cond.shape[0], 1, device=cond.device) >= p).to(cond.dtype)
+    return cond * keep
+
+
+def latent_flow_loss(flow, z1, cond, cond_drop=0.0):
     x0 = torch.randn_like(z1)
     t = torch.rand(z1.shape[0], 1, 1, 1, device=z1.device)
     zt = (1.0 - t) * x0 + t * z1
     target = z1 - x0
-    pred = flow(zt, t, cond)
+    pred = flow(zt, t, condition_dropout(cond, cond_drop))
     return F.mse_loss(pred, target)
 
 
 @torch.no_grad()
-def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0):
+def guided_velocity(flow, z, t, cond, cfg_scale=1.0):
+    """Classifier-free guidance in latent velocity space."""
+    if cfg_scale == 1.0:
+        return flow(z, t, cond)
+    uncond = torch.zeros_like(cond)
+    v_uncond = flow(z, t, uncond)
+    v_cond = flow(z, t, cond)
+    return v_uncond + cfg_scale * (v_cond - v_uncond)
+
+
+@torch.no_grad()
+def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0,
+                   cfg_scale=1.0):
     torch.manual_seed(seed)
     z = torch.randn((cond.shape[0],) + tuple(latent_shape), device=device)
     flow.eval()
     dt = 1.0 / max(1, steps)
     for i in range(steps):
         t = torch.full((cond.shape[0], 1, 1, 1), i / max(1, steps), device=device)
-        z = z + dt * flow(z, t, cond)
+        z = z + dt * guided_velocity(flow, z, t, cond, cfg_scale=cfg_scale)
     return z
 
 
 @torch.no_grad()
-def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0):
+def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0,
+                  cfg_scale=1.0):
     z = sample_latents(flow, cond, latent_shape=latent_shape, steps=steps, device=device,
-                       seed=seed)
+                       seed=seed, cfg_scale=cfg_scale)
     ae.eval()
     return ae.decode(z).clamp(-1.0, 1.0)
 
 
 @torch.no_grad()
-def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV):
+def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_steps=4,
+                          samples_per_combo=1, seed=20):
+    """Generate from every canonical color/shape request and re-read facts from the image."""
+    ae.eval()
+    flow.eval()
+    got_c = got_s = got_both = total = 0
+    mses = []
+    latent_shape = (ae.latent_ch, size // 4, size // 4)
+    for ci, color in enumerate(COLORS):
+        for si, shape in enumerate(SHAPES):
+            spec = ObjectSpec("p0", color, shape)
+            cond = fact_condition(object_facts(spec), device=device)[None].repeat(samples_per_combo, 1)
+            sample = sample_images(ae, flow, cond, latent_shape=latent_shape, steps=sample_steps,
+                                   device=device, seed=seed + ci * 101 + si * 17,
+                                   cfg_scale=cfg_scale)
+            out = ae(sample)
+            pc = out["color"].argmax(-1)
+            ps = out["shape"].argmax(-1)
+            target_c = torch.full((samples_per_combo,), ci, dtype=torch.long, device=device)
+            target_s = torch.full((samples_per_combo,), si, dtype=torch.long, device=device)
+            ok_c = pc.eq(target_c)
+            ok_s = ps.eq(target_s)
+            got_c += int(ok_c.sum())
+            got_s += int(ok_s.sum())
+            got_both += int((ok_c & ok_s).sum())
+            total += samples_per_combo
+            target = torch.tensor(render_object(spec, size=size) * 2.0 - 1.0,
+                                  dtype=torch.float32, device=device)[None]
+            target = target.expand_as(sample)
+            mses.append(float(F.mse_loss(sample, target).detach().cpu()))
+    return {
+        "sample_roundtrip_n": int(total),
+        "sample_roundtrip_color_acc": got_c / total,
+        "sample_roundtrip_shape_acc": got_s / total,
+        "sample_roundtrip_both_acc": got_both / total,
+        "conditional_sample_mse": float(np.mean(mses)),
+    }
+
+
+@torch.no_grad()
+def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=1.0,
+             sample_steps=4, roundtrip_samples=1):
     rng = np.random.default_rng(seed)
     ae.eval()
     flow.eval()
@@ -250,10 +314,10 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV):
     spec = ObjectSpec("p0", "red", "circle")
     cond = fact_condition(object_facts(spec), device=device)[None]
     sample = sample_images(ae, flow, cond, latent_shape=(ae.latent_ch, size // 4, size // 4),
-                           steps=4, device=device, seed=seed)
+                           steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale)
     target = torch.tensor(render_object(spec, size=size) * 2.0 - 1.0,
                           dtype=torch.float32, device=device)[None]
-    return {
+    report = {
         "n": int(total),
         "recon_mse": float(np.mean(recon_losses)),
         "latent_velocity_mse": float(np.mean(flow_losses)),
@@ -264,12 +328,19 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV):
         "sample_min": float(sample.min().detach().cpu()),
         "sample_max": float(sample.max().detach().cpu()),
         "sample_center_target_mse": float(F.mse_loss(sample, target).detach().cpu()),
+        "cfg_scale": float(cfg_scale),
+        "sample_steps": int(sample_steps),
     }
+    report.update(conditional_roundtrip(ae, flow, size=size, device=device, cfg_scale=cfg_scale,
+                                        sample_steps=sample_steps,
+                                        samples_per_combo=roundtrip_samples, seed=seed + 17))
+    return report
 
 
 def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidden=64,
                       lr=2e-4, fact_w=1.0, seed=0, size=32, device=DEV, flow_arch="conv",
-                      dit_depth=3, dit_heads=4):
+                      dit_depth=3, dit_heads=4, cond_drop=0.0, cfg_scale=1.0,
+                      sample_steps=4, roundtrip_samples=1):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     ae = SemanticAutoencoder(latent_ch=latent_ch, hidden=hidden).to(device)
@@ -295,13 +366,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         x, cond, _yc, _ys = _batch(batch, rng, size=size, device=device)
         with torch.no_grad():
             z1 = ae.encode(x)
-        loss = latent_flow_loss(flow, z1, cond)
+        loss = latent_flow_loss(flow, z1, cond, cond_drop=cond_drop)
         opt_flow.zero_grad()
         loss.backward()
         opt_flow.step()
         last_flow = float(loss.detach().cpu())
 
-    report = evaluate(ae, flow, seed=seed + 1, size=size, device=device)
+    report = evaluate(ae, flow, seed=seed + 1, size=size, device=device, cfg_scale=cfg_scale,
+                      sample_steps=sample_steps, roundtrip_samples=roundtrip_samples)
     report.update({
         "experiment": "image3_latent_fact_conditioned_rectified_flow",
         "ae_steps": int(ae_steps),
@@ -313,6 +385,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "dit_depth": int(dit_depth) if flow_arch == "dit" else 0,
         "dit_heads": int(dit_heads) if flow_arch == "dit" else 0,
         "fact_w": float(fact_w),
+        "cond_drop": float(cond_drop),
         "last_ae": last_ae,
         "last_flow_loss": last_flow,
         "fact_vocab": [list(f) for f in FACT_VOCAB],
@@ -322,18 +395,23 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
 
 def selftest():
     ae, flow, report = train_latent_flow(ae_steps=2, flow_steps=2, batch=4, latent_ch=4,
-                                         hidden=16, seed=0, device="cpu")
+                                         hidden=16, seed=0, device="cpu", sample_steps=2)
     assert report["experiment"] == "image3_latent_fact_conditioned_rectified_flow"
     assert report["latent_color_acc"] >= 0.0 and report["latent_shape_acc"] >= 0.0
+    assert "sample_roundtrip_both_acc" in report and report["sample_roundtrip_n"] == 15
     spec = ObjectSpec("p0", "blue", "triangle")
     cond = fact_condition(object_facts(spec), device="cpu")[None]
-    img = sample_images(ae, flow, cond, latent_shape=(4, 8, 8), steps=2, device="cpu", seed=0)
+    img = sample_images(ae, flow, cond, latent_shape=(4, 8, 8), steps=2, device="cpu", seed=0,
+                        cfg_scale=1.5)
     assert img.shape == (1, 3, 32, 32)
     ae2, flow2, report2 = train_latent_flow(ae_steps=1, flow_steps=1, batch=2, latent_ch=4,
                                             hidden=32, flow_arch="dit", dit_depth=1,
-                                            dit_heads=2, seed=1, device="cpu")
+                                            dit_heads=2, seed=1, device="cpu", cond_drop=0.5,
+                                            cfg_scale=1.5, sample_steps=1)
     assert report2["flow_arch"] == "dit"
-    img2 = sample_images(ae2, flow2, cond, latent_shape=(4, 8, 8), steps=1, device="cpu", seed=1)
+    assert report2["cond_drop"] == 0.5 and report2["cfg_scale"] == 1.5
+    img2 = sample_images(ae2, flow2, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
+                         seed=1, cfg_scale=1.5)
     assert img2.shape == (1, 3, 32, 32)
     print("image_latent selftest OK")
 
@@ -352,6 +430,10 @@ def main(argv=None):
     ap.add_argument("--flow-arch", default="conv", choices=("conv", "dit"), dest="flow_arch")
     ap.add_argument("--dit-depth", type=int, default=3, dest="dit_depth")
     ap.add_argument("--dit-heads", type=int, default=4, dest="dit_heads")
+    ap.add_argument("--cond-drop", type=float, default=0.0, dest="cond_drop")
+    ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
+    ap.add_argument("--sample-steps", type=int, default=4, dest="sample_steps")
+    ap.add_argument("--roundtrip-samples", type=int, default=1, dest="roundtrip_samples")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="runs/image_latent_flow.pt")
     args = ap.parse_args(argv)
@@ -364,7 +446,10 @@ def main(argv=None):
                                          batch=args.batch, latent_ch=args.latent_ch,
                                          hidden=args.hidden, lr=args.lr, fact_w=args.fact_w,
                                          seed=args.seed, flow_arch=args.flow_arch,
-                                         dit_depth=args.dit_depth, dit_heads=args.dit_heads)
+                                         dit_depth=args.dit_depth, dit_heads=args.dit_heads,
+                                         cond_drop=args.cond_drop, cfg_scale=args.cfg_scale,
+                                         sample_steps=args.sample_steps,
+                                         roundtrip_samples=args.roundtrip_samples)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save({
         "autoencoder_state_dict": ae.state_dict(),
@@ -374,6 +459,9 @@ def main(argv=None):
         "latent_ch": args.latent_ch,
         "hidden": args.hidden,
         "flow_arch": args.flow_arch,
+        "cond_drop": args.cond_drop,
+        "cfg_scale": args.cfg_scale,
+        "sample_steps": args.sample_steps,
     }, args.out)
     print(json.dumps(report, indent=1))
     print(f"saved -> {args.out}")

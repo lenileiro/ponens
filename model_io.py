@@ -75,7 +75,11 @@ class BPEVocab:
         return self.tk.encode(s).tokens
 
     def decode(self, ids):
-        return self.tk.decode([int(i) for i in ids if int(i) != self.pad])
+        # skip_special_tokens=False: canonical specials ('so', 'and', 'mother', ...) are REAL
+        # words in the hybrid vocab -- the default silently deleted them from decoded text,
+        # making fluent samples look broken ('soft' -> 'ft', 'sorry' -> 'rry')
+        return self.tk.decode([int(i) for i in ids if int(i) != self.pad],
+                              skip_special_tokens=False)
 
     def to_json(self):
         return self.tk.to_str()

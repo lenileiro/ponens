@@ -72,6 +72,9 @@ def payload(args):
                     f"--corpus-mb {args.lang_mb} --pre-steps {args.train_steps or 40000} "
                     f"--steps {args.lang_ft} --out runs/lang1_fluency.pt && "
                     f"{VB} --sample runs/lang1_fluency.pt")
+        return " && ".join(cmds)                           # lang is a COMPLETE payload: without
+        #                                                    this return the default kinship
+        #                                                    multi-seed run was appended after it
     if (args.vision or args.image2 or args.image_flow or args.image_latent or args.audio
             or args.multimodal):
         VI = PY.replace("thinking.cli", "thinking.vision")
@@ -95,6 +98,9 @@ def payload(args):
             cmds.append(f"{IL} --train --ae-steps {args.train_steps or 800} "
                         f"--flow-steps {args.train_steps or 800} --batch {args.batch} "
                         f"--hidden {args.dim or 64} --flow-arch {args.image_latent_arch} "
+                        f"--cond-drop {args.image_cond_drop} "
+                        f"--cfg-scale {args.image_cfg_scale} "
+                        f"--sample-steps {args.image_sample_steps} "
                         f"--out runs/image_latent_{args.image_latent_arch}.pt")
         if args.audio:                                     # AUDIO-1: audio factors -> facts
             AU = PY.replace("thinking.cli", "thinking.audio")
@@ -318,6 +324,12 @@ def main():
                     help="IMAGE-3: train semantic autoencoder + latent fact-conditioned flow")
     ap.add_argument("--image-latent-arch", default="conv", choices=("conv", "dit"),
                     dest="image_latent_arch", help="latent velocity architecture")
+    ap.add_argument("--image-cond-drop", type=float, default=0.0, dest="image_cond_drop",
+                    help="condition dropout for classifier-free latent image guidance")
+    ap.add_argument("--image-cfg-scale", type=float, default=1.0, dest="image_cfg_scale",
+                    help="classifier-free guidance scale for latent image sampling")
+    ap.add_argument("--image-sample-steps", type=int, default=4, dest="image_sample_steps",
+                    help="Euler sampling steps for latent image evaluation")
     ap.add_argument("--audio", action="store_true",
                     help="AUDIO-1: train synthetic audio factor FER experiment")
     ap.add_argument("--multimodal", action="store_true",

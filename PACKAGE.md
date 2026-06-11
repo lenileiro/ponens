@@ -146,11 +146,12 @@ python -m thinking.image_flow --train --steps 400 --out runs/image_flow.pt
 python -m thinking.image_latent --train --ae-steps 400 --flow-steps 400 \
     --out runs/image_latent_flow.pt
 python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-steps 400 \
-    --out runs/image_latent_dit.pt
+    --cond-drop 0.1 --cfg-scale 1.5 --sample-steps 8 --out runs/image_latent_dit.pt
 python -m thinking.audio --steps 500 --seeds 0,1,2 --out runs/audio1_fer.json
 python -m thinking.multimodal --steps 400 --out runs/m0_multimodal.json
 RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --vision-arch bottleneck \
     --image2 --image-flow --image-latent --image-latent-arch dit \
+    --image-cond-drop 0.1 --image-cfg-scale 1.5 --image-sample-steps 8 \
     --audio --multimodal --fast --go
 ```
 
@@ -219,6 +220,13 @@ same semantic AE quality (`recon_mse=0.015`, color **1.00**, shape **0.86**) and
 transport objective vs the conv baseline: `latent_velocity_mse` **1.05 → 0.75** and center-target
 sample MSE **0.044 → 0.020**. This makes DiT the default scale direction; the conv flow remains a
 small baseline.
+
+The image generator now also has the first generation-faithfulness check: every color×shape
+condition is sampled, decoded back to pixels, re-encoded by the semantic AE, and scored for
+round-trip color/shape accuracy. The same code path supports classifier-free condition dropout
+and guided latent sampling (`--cond-drop`, `--cfg-scale`, `--sample-steps`), so the GPU rung can
+measure whether stronger conditioning improves generated-image facts rather than only lowering a
+single target-image MSE.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
