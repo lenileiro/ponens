@@ -1,0 +1,316 @@
+{
+ "experiment": "image2_three_arm",
+ "steps": 600,
+ "world": "8x5 combos, 8 held out",
+ "arms": {
+  "factored": {
+   "seeds": [
+    {
+     "seed": 0,
+     "seen_acc": 1.0,
+     "holdout_acc": 0.5375,
+     "probe_holdout": 0.9166666567325592,
+     "leakage": 0.6257517088411584,
+     "trajectory": [
+      {
+       "step": 200,
+       "probe_color_holdout": 0.9958333373069763,
+       "probe_shape_holdout": 0.6541666388511658,
+       "probe_holdout": 0.824999988079071,
+       "leakage": 0.692258797794403
+      },
+      {
+       "step": 400,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.862500011920929,
+       "probe_holdout": 0.9312500059604645,
+       "leakage": 0.593236525420798
+      },
+      {
+       "step": 600,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.8333333134651184,
+       "probe_holdout": 0.9166666567325592,
+       "leakage": 0.6257517088411584
+      }
+     ]
+    },
+    {
+     "seed": 1,
+     "seen_acc": 1.0,
+     "holdout_acc": 0.7041666666666667,
+     "probe_holdout": 0.9375,
+     "leakage": 0.6478481566662797,
+     "trajectory": [
+      {
+       "step": 200,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.3125,
+       "probe_holdout": 0.65625,
+       "leakage": 0.7171565683558583
+      },
+      {
+       "step": 400,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.7791666388511658,
+       "probe_holdout": 0.8895833194255829,
+       "leakage": 0.5756897459686217
+      },
+      {
+       "step": 600,
+       "probe_color_holdout": 0.9958333373069763,
+       "probe_shape_holdout": 0.8791666626930237,
+       "probe_holdout": 0.9375,
+       "leakage": 0.6478481566662797
+      }
+     ]
+    },
+    {
+     "seed": 2,
+     "seen_acc": 0.9958333333333333,
+     "holdout_acc": 0.7166666666666667,
+     "probe_holdout": 0.9020833373069763,
+     "leakage": 0.6559910405867009,
+     "trajectory": [
+      {
+       "step": 200,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.42916667461395264,
+       "probe_holdout": 0.7145833373069763,
+       "leakage": 0.6935003655083063
+      },
+      {
+       "step": 400,
+       "probe_color_holdout": 0.9916666746139526,
+       "probe_shape_holdout": 0.6833333373069763,
+       "probe_holdout": 0.8375000059604645,
+       "leakage": 0.5686113579224588
+      },
+      {
+       "step": 600,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.8041666746139526,
+       "probe_holdout": 0.9020833373069763,
+       "leakage": 0.6559910405867009
+      }
+     ]
+    }
+   ],
+   "seen_acc": 0.9986111111111112,
+   "holdout_acc": 0.6527777777777778,
+   "probe_holdout": 0.9187499980131785,
+   "leakage": 0.6431969686980463
+  },
+  "swap": {
+   "seeds": [
+    {
+     "seed": 0,
+     "seen_acc": 0.9875,
+     "holdout_acc": 0.9791666666666666,
+     "probe_holdout": 0.981249988079071,
+     "leakage": 0.512470452723995,
+     "trajectory": [
+      {
+       "step": 200,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.4791666567325592,
+       "probe_holdout": 0.7395833283662796,
+       "leakage": 0.8476463039294773
+      },
+      {
+       "step": 400,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.8500000238418579,
+       "probe_holdout": 0.925000011920929,
+       "leakage": 0.545578514843706
+      },
+      {
+       "step": 600,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.9624999761581421,
+       "probe_holdout": 0.981249988079071,
+       "leakage": 0.512470452723995
+      }
+     ]
+    },
+    {
+     "seed": 1,
+     "seen_acc": 0.9958333333333333,
+     "holdout_acc": 0.9916666666666667,
+     "probe_holdout": 0.9645833373069763,
+     "leakage": 0.49327091154538927,
+     "trajectory": [
+      {
+       "step": 200,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.49166667461395264,
+       "probe_holdout": 0.7458333373069763,
+       "leakage": 0.8411630128761606
+      },
+      {
+       "step": 400,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.5833333134651184,
+       "probe_holdout": 0.7916666567325592,
+       "leakage": 0.5399924166500569
+      },
+      {
+       "step": 600,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.9291666746139526,
+       "probe_holdout": 0.9645833373069763,
+       "leakage": 0.49327091154538927
+      }
+     ]
+    },
+    {
+     "seed": 2,
+     "seen_acc": 0.9875,
+     "holdout_acc": 0.9375,
+     "probe_holdout": 0.875,
+     "leakage": 0.5809694786984769,
+     "trajectory": [
+      {
+       "step": 200,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.40416666865348816,
+       "probe_holdout": 0.7020833343267441,
+       "leakage": 0.8913127746196493
+      },
+      {
+       "step": 400,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.6458333134651184,
+       "probe_holdout": 0.8229166567325592,
+       "leakage": 0.6146460909071185
+      },
+      {
+       "step": 600,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.75,
+       "probe_holdout": 0.875,
+       "leakage": 0.5809694786984769
+      }
+     ]
+    }
+   ],
+   "seen_acc": 0.9902777777777777,
+   "holdout_acc": 0.9694444444444444,
+   "probe_holdout": 0.9402777751286825,
+   "leakage": 0.5289036143226205
+  },
+  "subspace": {
+   "seeds": [
+    {
+     "seed": 0,
+     "seen_acc": 1.0,
+     "holdout_acc": 0.9958333333333333,
+     "probe_holdout": 0.9541666805744171,
+     "leakage": 0.5259177330312216,
+     "trajectory": [
+      {
+       "step": 200,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.4833333194255829,
+       "probe_holdout": 0.7416666597127914,
+       "leakage": 0.8007171531621782
+      },
+      {
+       "step": 400,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.612500011920929,
+       "probe_holdout": 0.8062500059604645,
+       "leakage": 0.4910552704026775
+      },
+      {
+       "step": 600,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.9083333611488342,
+       "probe_holdout": 0.9541666805744171,
+       "leakage": 0.5259177330312216
+      }
+     ]
+    },
+    {
+     "seed": 1,
+     "seen_acc": 0.9958333333333333,
+     "holdout_acc": 0.9958333333333333,
+     "probe_holdout": 0.9833333194255829,
+     "leakage": 0.5051748213875624,
+     "trajectory": [
+      {
+       "step": 200,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.5958333611488342,
+       "probe_holdout": 0.7979166805744171,
+       "leakage": 0.8099666964676644
+      },
+      {
+       "step": 400,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.9416666626930237,
+       "probe_holdout": 0.9708333313465118,
+       "leakage": 0.5094179650591243
+      },
+      {
+       "step": 600,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.9666666388511658,
+       "probe_holdout": 0.9833333194255829,
+       "leakage": 0.5051748213875624
+      }
+     ]
+    },
+    {
+     "seed": 2,
+     "seen_acc": 1.0,
+     "holdout_acc": 1.0,
+     "probe_holdout": 0.949999988079071,
+     "leakage": 0.520929606773314,
+     "trajectory": [
+      {
+       "step": 200,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.4625000059604645,
+       "probe_holdout": 0.7312500029802322,
+       "leakage": 0.8637242459451839
+      },
+      {
+       "step": 400,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.7041666507720947,
+       "probe_holdout": 0.8520833253860474,
+       "leakage": 0.5900924621711647
+      },
+      {
+       "step": 600,
+       "probe_color_holdout": 1.0,
+       "probe_shape_holdout": 0.8999999761581421,
+       "probe_holdout": 0.949999988079071,
+       "leakage": 0.520929606773314
+      }
+     ]
+    }
+   ],
+   "seen_acc": 0.9986111111111112,
+   "holdout_acc": 0.9972222222222222,
+   "probe_holdout": 0.962499996026357,
+   "leakage": 0.517340720397366
+  }
+ },
+ "verdict": {
+  "behavior_ranking": [
+   "subspace",
+   "swap",
+   "factored"
+  ],
+  "probe_ranking": [
+   "subspace",
+   "swap",
+   "factored"
+  ],
+  "probe_predicts_behavior": true,
+  "best_holdout": 0.9972222222222222,
+  "baseline_holdout": 0.6527777777777778
+ }
+}
