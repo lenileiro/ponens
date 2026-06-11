@@ -38,6 +38,8 @@ memorization, and curriculum.
 | `runpod/` | H100 launchers (tar-over-ssh, timeout-bounded, always-terminate) |
 | `thinking/vision.py`, `thinking/image2.py`, `thinking/image_flow.py`, `thinking/image_latent.py` | Image rungs: synthetic visual factors → canonical facts, head-aware FER probes, pixel flow, and semantic latent flow |
 | `thinking/audio.py`, `thinking/multimodal.py` | Audio factors and the M-0 multimodal bridge: image+audio+transcript prefixes → one canonical extraction trace |
+| `thinking/listen.py`, `thinking/speak.py` | speech: **listen** (transcribe real synthesized speech, speaker-invariant), **speak** (emit audio tokens *verified by round-trip* through the frozen listener — the checker, applied to generation) |
+| `thinking/crossmodal.py` | cross-modal FER probe: does a concept *heard* align with the same concept *seen*? (retrieval 0.92 — unified, not fractured) |
 | `data/multimodal_transcripts.json` | Configurable M-0 language data: template smoke bank plus optional explicit `(text, facts)` examples |
 | `*.md` | research plans and theses (FER bet, reasoning design, training data, validated plan) |
 
