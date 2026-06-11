@@ -216,6 +216,9 @@ def cmd_selftest(_args):
         assert exx.tokens[pp + 1] == exx.tokens[cc]
 
     # deep ancestor at depth 30: checker-valid + fits the scaling assumptions
+    train_names, test_names = name_pools(1500, 3216, seed=2)
+    assert len(train_names) == 1500 and len(test_names) == 3216
+    assert len(set(train_names) | set(test_names)) == 4716
     big = FamilyWorld(name_pools(120, 80, seed=2)[0], seed=0)
     kp, lines = big.sample_deep(30, _np.random.default_rng(5), include=("ancestor",))
     chk = GoalChecker(KR, ANSWER_PREDS, builtins=AGE_BUILTINS)
@@ -250,6 +253,8 @@ def cmd_selftest(_args):
     stc = chk.new_state(kp.goal[1], kp.edb, goal_pred="ancestor")
     support = chk.support_atoms(stc)
     assert support is not None and kp.goal in support, "frontier support must include the goal"
+    assert stc["support_plan"] and len(stc["support_plan"]) <= len(lines), \
+        "frontier should cache a compact executable proof plan"
     checks0 = [ln for ln in chk.candidate_steps(stc) if ln[0] == "check"]
     assert 0 < len(checks0) <= 30, "frontier should prune deep distractor facts"
     assert all(ln[1] in support for ln in checks0), "frontier emitted unsupported checks"

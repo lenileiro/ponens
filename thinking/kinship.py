@@ -8,6 +8,7 @@ kinship), so proofs are trees, not walks: this is the nested-thinking testbed.
 Base EDB predicates: mother, father, sister, brother, spouse (one direction; symmetry is a rule).
 """
 from dataclasses import dataclass
+from itertools import product
 import sys
 import os
 import numpy as np
@@ -306,12 +307,22 @@ def name_pools(n_train, n_test, seed):
     need = n_train + n_test
     if need > len(names):
         c, v = "bdfgklmnprstv", "aeiou"
-        extra = set()
+        syllables = [a + b for a in c for b in v]
+        existing = set(names)
+        extra = []
+        width = 2
         while len(names) + len(extra) < need:
-            w = (c[rng.integers(13)] + v[rng.integers(5)] + c[rng.integers(13)] + v[rng.integers(5)])
-            if w not in names:
-                extra.add(w)
-        names = names + sorted(extra)
+            tier = ["".join(parts) for parts in product(syllables, repeat=width)]
+            rng.shuffle(tier)
+            for w in tier:
+                if w in existing:
+                    continue
+                existing.add(w)
+                extra.append(w)
+                if len(names) + len(extra) >= need:
+                    break
+            width += 1
+        names = names + extra
     rng.shuffle(names)
     return names[:n_train], names[n_train:n_train + n_test]
 

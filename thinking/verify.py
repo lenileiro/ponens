@@ -17,6 +17,10 @@ def _ground(atom):
     return not any(str(a).startswith("?") for a in atom[1])
 
 
+def _is_var_term(term):
+    return isinstance(term, str) and term.startswith("?")
+
+
 def _subst(atom, subst):
     return (atom[0], tuple(subst.get(a, a) for a in atom[1]))
 
@@ -93,7 +97,8 @@ class GoalChecker:
     def new_state(self, pair, edb, goal_pred=None, extra_rules=()):
         return {"known": set(), "edb": set(edb), "derived": [], "pair": tuple(pair),
                 "goal_pred": goal_pred, "extra_rules": list(extra_rules), "seen": set(),
-                "support_atoms": "pending", "support_ranks": {}}
+                "support_atoms": "pending", "support_ranks": {},
+                "support_plan": None, "support_pos": 0}
 
     def valid_step_state(self, st, typ, head, body):
         """Non-mutating version of step() for candidate generation. Rejections record their
@@ -177,30 +182,65 @@ class GoalChecker:
             facts_by_pred.setdefault(fact[0], []).append(fact)
         for facts in facts_by_pred.values():
             facts.sort()
+        fact_index = self._fact_index(facts_by_pred)
 
         self._support_rn = 0
-        proof = self._prove_support(
-            target, {}, facts_by_pred, self.rules + st["extra_rules"],
-            max(8, len(st["edb"]) + len(self.rules) + len(st["extra_rules"]) + 4),
-            frozenset())
+        max_depth = max(8, len(st["edb"]) + len(self.rules) + len(st["extra_rules"]) + 4)
+        old_recursion_limit = sys.getrecursionlimit()
+        if old_recursion_limit < max_depth * 4 + 100:
+            sys.setrecursionlimit(max_depth * 4 + 100)
+        try:
+            proof = self._prove_support(
+                target, {}, facts_by_pred, fact_index, self.rules + st["extra_rules"],
+                max_depth, frozenset())
+        finally:
+            if sys.getrecursionlimit() != old_recursion_limit:
+                sys.setrecursionlimit(old_recursion_limit)
         if proof is None:
             st["support_atoms"] = None
             st["support_ranks"] = {}
             return None
-        _fact, _subst, support, ranks = proof
+        _fact, _subst, support, ranks, plan = proof
         st["support_atoms"] = support
         st["support_ranks"] = ranks
+        st["support_plan"] = self._dedupe_support_plan(plan)
         return support
 
-    def _prove_support(self, goal, subst, facts_by_pred, rules, depth, path):
-        """Find one proof path lazily; return (ground_fact, subst, support_atoms, ranks)."""
+    def _fact_index(self, facts_by_pred):
+        """Predicate-local inverted index for generic fact lookup during proof search."""
+        out = {}
+        for pred, facts in facts_by_pred.items():
+            by_pos = {}
+            for fact in facts:
+                for i, term in enumerate(fact[1]):
+                    by_pos.setdefault(i, {}).setdefault(term, []).append(fact)
+            out[pred] = by_pos
+        return out
+
+    def _fact_candidates(self, atom, facts_by_pred, fact_index):
+        """Facts that can still unify with atom, using the narrowest bound argument index."""
+        facts = facts_by_pred.get(atom[0], ())
+        by_pos = fact_index.get(atom[0], {})
+        narrowed = None
+        for i, term in enumerate(atom[1]):
+            if _is_var_term(term):
+                continue
+            cur = by_pos.get(i, {}).get(term, ())
+            if narrowed is None or len(cur) < len(narrowed):
+                narrowed = cur
+                if not narrowed:
+                    break
+        return narrowed if narrowed is not None else facts
+
+    def _prove_support(self, goal, subst, facts_by_pred, fact_index, rules, depth, path):
+        """Find one proof path lazily; return (ground_fact, subst, support_atoms, ranks, plan)."""
         g = _ground_sub(goal, subst)
-        for fact in facts_by_pred.get(g[0], ()):
+        for fact in self._fact_candidates(g, facts_by_pred, fact_index):
             s = _unify2(g, fact, subst)
             if s is not None:
                 gf = _ground_sub(g, s)
                 if _ground(gf):
-                    return gf, s, {fact}, {fact: 0}
+                    return gf, s, {fact}, {fact: 0}, [("check", fact, ())]
         if depth <= 0:
             return None
         key = g
@@ -214,18 +254,20 @@ class GoalChecker:
             if s is None:
                 continue
             cur = s
-            support, ranks, body_facts = set(), {}, []
+            support, ranks, body_facts, plan = set(), {}, [], []
             ok = True
             for atom in tuple(_rename(a, rn) for a in body):
-                proof = self._prove_support(atom, cur, facts_by_pred, rules, depth - 1,
+                proof = self._prove_support(atom, cur, facts_by_pred, fact_index,
+                                            rules, depth - 1,
                                             path | {key})
                 if proof is None:
                     ok = False
                     break
-                bf, cur, bs, br = proof
+                bf, cur, bs, br, bp = proof
                 body_facts.append(bf)
                 support.update(bs)
                 ranks.update(br)
+                plan.extend(bp)
             if not ok:
                 continue
             hf = _ground_sub(rhead, cur)
@@ -233,8 +275,45 @@ class GoalChecker:
                 continue
             support.add(hf)
             ranks[hf] = 1 + max((ranks.get(bf, 0) for bf in body_facts), default=0)
-            return hf, cur, support, ranks
+            plan.append(("think", hf, tuple(body_facts)))
+            return hf, cur, support, ranks, plan
         return None
+
+    def _dedupe_support_plan(self, plan):
+        """Remove repeated proof obligations while preserving the forward proof order."""
+        out, seen = [], set()
+        for typ, head, body in plan:
+            step = (typ, head, tuple(body))
+            if step in seen:
+                continue
+            seen.add(step)
+            out.append(step)
+        return out
+
+    def _support_frontier(self, st):
+        """Next executable steps from the cached support proof, if a proof plan exists."""
+        if self.support_atoms(st) is None:
+            return None
+        plan = st.get("support_plan") or ()
+        pos = st.get("support_pos", 0)
+        while pos < len(plan):
+            typ, head, body = plan[pos]
+            if (typ, head, body) in st["seen"] or head in st["known"]:
+                pos += 1
+                continue
+            break
+        st["support_pos"] = pos
+
+        out = []
+        for typ, head, body in plan[pos:]:
+            if (typ, head, body) in st["seen"] or head in st["known"]:
+                continue
+            if typ == "think" and not all(f in st["known"] for f in body):
+                break
+            if self.valid_step_state(st, typ, head, body):
+                out.append((typ, head, body))
+            break
+        return out
 
     def candidate_rank(self, st, step):
         """Generic proof-frontier rank: lower atoms are closer to checked evidence."""
@@ -251,6 +330,11 @@ class GoalChecker:
         relevance_pruned=False enumerates by VALIDITY ONLY (no goal-dependency slice, no proof
         support): the honest candidate set for masked decoding, where choosing the relevant
         step among all legal ones must remain the model's job."""
+        if goal_pruned and relevance_pruned:
+            frontier = self._support_frontier(st)
+            if frontier is not None:
+                return frontier
+
         candidates = []
         relevant = self.relevant_predicates(st) if relevance_pruned else None
         support = (self.support_atoms(st)

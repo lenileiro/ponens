@@ -70,6 +70,59 @@ def payload(args):
                 f"--n {args.eval_n} --preds ancestor --block {eval_block} "
                 f"--decode {shlex_quote(decode)} --out {shlex_quote(out)}")
         return " && ".join(eval_cmds)
+    if args.learning_curve:
+        eval_block = max(18432, 144 * max(args.eval_depths))
+        depths = ",".join(str(d) for d in args.eval_depths)
+        curve_cmds = ["rm -rf runs/learn_* runs/learning_curve_summary.json && mkdir -p runs"]
+        runs = []
+        for arm in args.curve_arms:
+            if arm == "aux":
+                rw, rcw = args.rule_w, args.rule_contrast_w
+            elif arm == "noaux":
+                rw, rcw = 0.0, 0.0
+            else:
+                raise ValueError(f"unknown learning-curve arm: {arm}")
+            for steps in args.curve_steps:
+                run = f"runs/learn_{arm}_{steps}"
+                runs.append(run)
+                train = (f"{PY} train --world kinship --simple --canon "
+                         f"--deep-depth {args.deep_depth} --deep-preds ancestor "
+                         f"--deep-frac {args.deep_frac} --dim {args.dim or 256} "
+                         f"--steps {steps} --examples {args.examples} --batch {args.batch} "
+                         f"--rule-w {rw} --rule-contrast-w {rcw} --out {run}")
+                evals = []
+                for decode in args.eval_decodes:
+                    out = f"{run}/deep_eval_{decode}.json"
+                    evals.append(
+                        f"{PY} deep-eval {run} --depths {depths} --n {args.eval_n} "
+                        f"--preds ancestor --block {eval_block} --decode {decode} "
+                        f"--out {out}")
+                probe = (f"{PY} probe {run} --depths {depths} --n {args.probe_n} "
+                         f"--preds ancestor --block {eval_block} --out {run}/fer_probe.json")
+                curve_cmds.append(" && ".join([train] + evals + [probe]))
+        summary_code = (
+            "import json, pathlib\n"
+            "rows=[]\n"
+            f"runs={runs!r}\n"
+            "for run in runs:\n"
+            "    p=pathlib.Path(run)\n"
+            "    arm, steps = p.name.split('_')[1], int(p.name.split('_')[2])\n"
+            "    row={'run':run,'arm':arm,'steps':steps}\n"
+            "    for ep in p.glob('deep_eval_*.json'):\n"
+            "        data=json.loads(ep.read_text())\n"
+            "        dec=data.get('decode', ep.stem.replace('deep_eval_',''))\n"
+            "        row[f'{dec}_by_depth']=data.get('by_depth',{})\n"
+            "    fp=p/'fer_probe.json'\n"
+            "    if fp.exists():\n"
+            "        pr=json.loads(fp.read_text())\n"
+            "        row['fer']={k:pr.get(k) for k in ['same_rule_cos','different_rule_cos',"
+            "'rule_reuse_margin','risk_flags','n_vectors']}\n"
+            "    rows.append(row)\n"
+            "out=pathlib.Path('runs/learning_curve_summary.json')\n"
+            "out.write_text(json.dumps(rows, indent=1))\n"
+            "print(out.read_text())\n")
+        summary = f"python3 -c {shlex_quote(summary_code)}"
+        return " && ".join(curve_cmds + [summary])
     if args.lengen:                                        # RUNG L: train shallow-deep (<=6),
         cmds2 = []                                         # eval FAR deeper -- length-gen arms
         for pos in ("rope", "none"):
@@ -204,6 +257,12 @@ def main():
                     help="skip training; upload this local run dir and run deep-eval only")
     ap.add_argument("--eval-decodes", default="sample,hybrid",
                     help="comma-separated deep-eval decoders for --eval-only-run")
+    ap.add_argument("--learning-curve", action="store_true",
+                    help="train fresh rule-aux/no-aux runs at several step budgets")
+    ap.add_argument("--curve-steps", default="1000,2000,4000",
+                    help="comma-separated train step budgets for --learning-curve")
+    ap.add_argument("--curve-arms", default="aux,noaux",
+                    help="comma-separated arms for --learning-curve: aux,noaux")
     ap.add_argument("--examples", type=int, default=6000)
     ap.add_argument("--deep-frac", type=float, default=0.6, dest="deep_frac")
     ap.add_argument("--rule-w", type=float, default=0.1, dest="rule_w")
@@ -220,9 +279,16 @@ def main():
         args.eval_depths = [int(x.strip()) for x in args.eval_depths.split(",") if x.strip()]
     if isinstance(args.eval_decodes, str):
         args.eval_decodes = [x.strip() for x in args.eval_decodes.split(",") if x.strip()]
+    if isinstance(args.curve_steps, str):
+        args.curve_steps = [int(x.strip()) for x in args.curve_steps.split(",") if x.strip()]
+    if isinstance(args.curve_arms, str):
+        args.curve_arms = [x.strip() for x in args.curve_arms.split(",") if x.strip()]
     bad_decodes = sorted(set(args.eval_decodes) - {"sample", "hybrid", "constrained"})
     if bad_decodes:
         sys.exit(f"ERROR: unsupported --eval-decodes values: {','.join(bad_decodes)}")
+    bad_arms = sorted(set(args.curve_arms) - {"aux", "noaux"})
+    if bad_arms:
+        sys.exit(f"ERROR: unsupported --curve-arms values: {','.join(bad_arms)}")
 
     key = os.environ.get("RUNPOD_API_KEY")
     if not key and args.go:
@@ -239,10 +305,12 @@ def main():
              else f"WORKDIR={REMOTE} bash runpod/setup.sh")                  # deps incl. parquet corpora
     # tee to LOCAL disk: /workspace is a network volume that stalls under streaming writes
     # (see runpod/setup.sh -- it cost us rung B4: training was healthy, only the log froze)
-    remote_cmd = (f"cd {REMOTE} && {setup} && "
-                  f"export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && "
-                  f'timeout {cap}s bash -c "cd {REMOTE} && ({run}) 2>&1 | tee /root/thinking.log"; '
-                  f"cp /root/thinking.log {REMOTE}/thinking.log 2>/dev/null; true")
+    remote_cmd = (
+        f"cd {REMOTE} && rm -f thinking.log /root/thinking.log && "
+        f"({setup} && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && "
+        f"timeout {cap}s bash -c {shlex_quote(f'cd {REMOTE} && ({run})')}) "
+        f"2>&1 | tee /root/thinking.log; "
+        f"cp /root/thinking.log {REMOTE}/thinking.log 2>/dev/null; true")
 
     print("=== PLAN === thinking package on H100: kinship multi-seed"
           + (" + chain grid" if args.sweep else ""))
@@ -305,7 +373,8 @@ def main():
             time.sleep(10)
         else:
             raise RuntimeError("run.sh upload failed after 5 attempts")
-        sh(f"{ssh} 'nohup bash /root/run.sh > /root/launch.out 2>&1 & echo detached'")
+        sh(f"{ssh} 'rm -f /root/DONE /root/thinking.log /root/launch.out && "
+           f"nohup bash /root/run.sh > /root/launch.out 2>&1 & echo detached'")
         t1 = time.time()
         while time.time() - t1 < args.max_minutes * 60:
             time.sleep(60)

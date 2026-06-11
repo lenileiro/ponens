@@ -46,7 +46,7 @@ def _status_counts(lines):
 
 
 def _line_tokens(lines):
-    return sum(len(words) + 1 for words, _status in lines)  # include terminating '.'
+    return sum((len(words) if words else 0) + 1 for words, _status in lines)
 
 
 def deep_eval(runtime, trainer, depths=(4, 8, 16, 32, 64), n=None, preds=("ancestor",),

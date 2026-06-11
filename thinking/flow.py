@@ -443,6 +443,7 @@ class FlowRuntime:
             if verify and not ok:
                 trie = self._line_trie(st) if maskable else None
                 budget = self.cfg.retry * (4 if trie is not None else 1)
+                g_words, g_toks, g_state = words, toks, line_state    # greedy line, for skip
                 for _ in range(budget):
                     res.n_resampled += 1
                     if trie is not None:                   # eager prefix pruning: identical
@@ -476,13 +477,14 @@ class FlowRuntime:
                                 res.n_invalid += 1
                                 res.lines.append((words, "constrained"))
                                 continue
-                    # Verified mode must not poison the prompt with rejected text. A repeated
-                    # invalid line stalls at this same clean prefix; repair after a small budget.
+                    # SKIP, don't die: the model's own (rejected) line advances the CONTEXT,
+                    # uncommitted to the checker -- regenerating from the same clean prefix
+                    # just stalls on the same line until the budget dies (C4 lesson; removing
+                    # this collapsed verified k=3 from 0.90 to 0.10).
                     res.n_invalid += 1
-                    stalls += 1
-                    res.lines.append((words, "reject"))
-                    if stalls >= max(1, self.cfg.retry):
-                        return self._finish_goal(st, res)
+                    res.lines.append((g_words, "skip"))
+                    ids += g_toks + [dot]
+                    state = self._state_append(g_state, [dot])
                     continue
             if not ok:
                 res.n_invalid += 1
@@ -513,11 +515,22 @@ class FlowRuntime:
     def _line_trie(self, st):
         """Prefix trie over ALL valid lines at this checker state (validity only). Used to
         early-abort doomed resamples: same acceptance set as full-line propose-then-reject,
-        the failure is just detected at the first impossible token instead of after 18."""
+        the failure is just detected at the first impossible token instead of after 18.
+
+        Every premise ORDER is inserted, not just the rule's canonical one -- the checker
+        (instantiates) accepts any body permutation, and pruning an order the model prefers
+        silently collapsed verified accuracy to 0.10 (the trie must equal the checker's
+        acceptance set EXACTLY, or 'eager' becomes 'stricter')."""
+        from itertools import permutations
         from .trace import render_goal_line
-        cands = [render_goal_line(typ, head, body) + ["."]
-                 for typ, head, body in self.chk.candidate_steps(
-                     st, goal_pruned=False, relevance_pruned=False)]
+        cands = []
+        for typ, head, body in self.chk.candidate_steps(
+                st, goal_pruned=False, relevance_pruned=False):
+            if typ == "think" and len(body) > 1:
+                cands += [render_goal_line(typ, head, perm) + ["."]
+                          for perm in permutations(body)]
+            else:
+                cands.append(render_goal_line(typ, head, body) + ["."])
         cands += [["answer", a, "."] for a in self.chk.answer_candidates(st)]
         root = {}
         for words in cands:
