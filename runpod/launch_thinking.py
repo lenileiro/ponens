@@ -16,6 +16,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from shlex import quote as shlex_quote
 
 REST = "https://rest.runpod.io/v1"
 IMAGE = "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
@@ -57,6 +58,20 @@ def payload(args):
                     f"--out runs/verbalizer.pt && "
                     f"{PY.replace('thinking.cli', 'thinking.verbalize')} "
                     f"--sample runs/verbalizer.pt")
+    if args.lengen:                                        # RUNG L: train shallow-deep (<=6),
+        cmds2 = []                                         # eval FAR deeper -- length-gen arms
+        for pos in ("rope", "none"):
+            run = f"runs/lengen_{pos}"
+            evs = []
+            for hop, n in (("6", 10), ("10", 10), ("20", 6), ("40", 4)):
+                evs.append(f"{PY} eval {run} --mode verified --split iid --hops {hop} "
+                           f"--n {n} --block 6144 --preds ancestor")
+            cmds2.append(f"{PY} train --world kinship --simple --bank --no-curriculum "
+                         f"--deep-depth 6 --deep-frac 0.4 --pos {pos} --test-names 110 "
+                         f"--out {run} --seed 0 --batch 16 "
+                         f"--steps {args.train_steps or 15000} --dim 256 && "
+                         + " ; ".join(evs))                # evals NON-FATAL: one bad cell
+        return " && ".join(cmds2).replace(" && python3 -u -m thinking.cli eval", " ; python3 -u -m thinking.cli eval")
     if args.stair:                                         # staircase: minimal world, decisive evals
         run = f"runs/stair_{args.stair_world}"
         canon = ((" --canon" if args.canon else "") + (" --bank" if args.bank else "") + (" --no-curriculum" if args.no_curriculum else ""))
@@ -148,6 +163,7 @@ def main():
                     help="train non-looped (pending the loop-regression ablation verdict)")
     ap.add_argument("--ablate", action="store_true", help="run the loop ablation first")
     ap.add_argument("--verbalize", action="store_true", help="train+sample the verbalizer")
+    ap.add_argument("--lengen", action="store_true", help="rung L: depth generalization")
     ap.add_argument("--sweep", action="store_true", help="also run the chain-world grid")
     ap.add_argument("--max-minutes", type=int, default=150)
     ap.add_argument("--go", action="store_true", help="actually create the pod (spends money)")
@@ -212,8 +228,35 @@ def main():
               f"--exclude './tooling' --exclude './artifacts' --exclude '*.tgz' -C {HERE} . "
               f"| {ssh} 'mkdir -p {REMOTE} && tar xzf - -C {REMOTE}'")
         sh(up)
-        rc = sh(f"{ssh} '{remote_cmd}'")
-        print("remote run exit:", rc, "(124 = pod-side timeout hit)")
+        # DETACHED execution: nohup on the pod + short-poll. A dropped SSH pipe killed three
+        # healthy runs (B7/C6/L) when it took the cost-guard with it -- never hold a session.
+        script = remote_cmd + "; touch /root/DONE\n"
+        for _try in range(5):                              # VERIFIED upload (a silent network
+            subprocess.run(f"{ssh} 'cat > /root/run.sh'",  # blip once shipped an empty script)
+                           shell=True, input=script, text=True, timeout=120)
+            ok = subprocess.run(f"{ssh} 'test -s /root/run.sh && echo OK'", shell=True,
+                                capture_output=True, text=True, timeout=120)
+            if "OK" in (ok.stdout or ""):
+                break
+            time.sleep(10)
+        else:
+            raise RuntimeError("run.sh upload failed after 5 attempts")
+        sh(f"{ssh} 'nohup bash /root/run.sh > /root/launch.out 2>&1 & echo detached'")
+        t1 = time.time()
+        while time.time() - t1 < args.max_minutes * 60:
+            time.sleep(60)
+            try:
+                r = subprocess.run(f"{ssh} 'test -f /root/DONE && echo DONE; "
+                                   f"tail -1 /root/thinking.log 2>/dev/null'",
+                                   shell=True, capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                continue                                   # network blip: poll again
+            line = (r.stdout or "").strip().splitlines()
+            if line:
+                print(" ", line[-1][:110])
+            if "DONE" in (r.stdout or ""):
+                print("payload complete")
+                break
         fetch = (f"{ssh} 'cd {REMOTE} && tar czf - thinking.log runs 2>/dev/null' "
                  f"| tar xzf - -C {HERE}")
         sh(fetch)

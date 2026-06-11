@@ -289,6 +289,10 @@ def cmd_train(args):
         cfg.loops = args.loops
     if args.deep_frac:
         cfg.deep_frac = args.deep_frac
+    if args.pos:
+        cfg.pos_mode = args.pos
+    if args.test_names_n:
+        cfg.n_test_entities = args.test_names_n
     if args.no_loop:
         cfg.loop = False
     t = Trainer(cfg)
@@ -305,11 +309,14 @@ def cmd_eval(args):
     hops = tuple(int(h) for h in args.hops.split(",")) if args.hops else None
     mode = args.mode or ("path" if cfg.sup == "path" else "verified")
     preds = tuple(args.preds.split(",")) if args.preds else None
+    if args.block:
+        cfg.block = runtime.cfg.block = args.block         # length-gen: eval beyond training ctx
     ents = trainer.train_ents if args.train_names else None
     level = args.level if args.level != "mix" else cfg.lang_level   # respect --simple runs
     res = evaluate(runtime, trainer, mode=mode, hops=hops, split=args.split, n=args.n or None,
                    preds=preds, phrasings=args.phrasings, lang_level=level, entities=ents)
     tag = f"{mode}/{args.split}" + (f"/{args.preds}" if args.preds else "") + \
+          (f"/k{args.hops}" if args.hops else "") + \
           (f"/{args.phrasings}-phrasings" if args.phrasings != "train" else "") + \
           (f"/{args.level}" if args.level != "mix" else "")
     save_results(args.run, {tag: res})
@@ -396,6 +403,9 @@ def main(argv=None):
     p.add_argument("--examples", type=int, default=0)
     p.add_argument("--loops", type=int, default=0)
     p.add_argument("--deep-frac", type=float, default=0.0, dest="deep_frac")
+    p.add_argument("--pos", choices=("rope", "none"), help="position mode (none = NoPE)")
+    p.add_argument("--test-names", type=int, default=0, dest="test_names_n",
+                   help="test name-pool size (length-gen: must cover EVAL depth, 2k+16)")
     p.add_argument("--no-loop", action="store_true", dest="no_loop")
     p.add_argument("--neg", action="store_true")
     p = sub.add_parser("ablate")
@@ -409,6 +419,7 @@ def main(argv=None):
     p.add_argument("--hops")
     p.add_argument("--n", type=int, default=0, help="examples per depth (default cfg.n_eval)")
     p.add_argument("--preds", help="restrict query types, e.g. older_by,who_older,who_younger")
+    p.add_argument("--block", type=int, default=0, help="eval context override (length-gen)")
     p.add_argument("--phrasings", default="train", choices=("train", "eval"),
                    help="eval = HELD-OUT surface patterns (language-understanding test)")
     p.add_argument("--train-names", action="store_true", dest="train_names",

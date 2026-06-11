@@ -366,6 +366,10 @@ class FamilyWorld:
             return self.sample_deep(k, rng, include, exclude)
         return self._sample_named(k, rng, include, exclude)
 
+    def sample_contrastive(self, k, rng, exclude=None, n_q=3):
+        """Up to n_q DIFFERENT questions about one tree (the k=2 question-conditioning fix)."""
+        return self._sample_named(k, rng, exclude=exclude, n_q=n_q)
+
     DEEP_QTYPES = ("ancestor", "grandmother", "grandfather", "great_grandmother",
                    "great_grandfather", "aunt", "uncle", "cousin", "nephew", "niece",
                    "mother_in_law", "father_in_law", "age_at_death", "age_when",
@@ -576,7 +580,7 @@ class FamilyWorld:
         p = Problem(head=x, edb=tuple(edb), goal=(q, (x, z)), answer=q, k=depth)
         return p, lines
 
-    def _sample_named(self, k, rng, include=None, exclude=None):
+    def _sample_named(self, k, rng, include=None, exclude=None, n_q=1):
         for _ in range(60):                                # rejection-sample worlds
             edb = self._tree(rng)
             closure, prov = ENGINE.closure(set(edb))
@@ -593,6 +597,14 @@ class FamilyWorld:
                      and (include is None or fs[0][0] in include)
                      and (exclude is None or fs[0][0] not in exclude)]
             if cands:
+                if n_q > 1:                                # CONTRASTIVE: several questions about
+                    out = []                               # the SAME tree -- question-reading
+                    rng.shuffle(cands)                     # becomes load-bearing (k=2 fix)
+                    for goal in cands[:n_q]:
+                        p = Problem(head=goal[1][0], edb=tuple(edb), goal=goal,
+                                    answer=goal[0], k=k)
+                        out.append((p, self.proof_lines(p, prov)))
+                    return out
                 goal = cands[int(rng.integers(len(cands)))]
                 p = Problem(head=goal[1][0], edb=tuple(edb), goal=goal, answer=goal[0], k=k)
                 return p, self.proof_lines(p, prov)

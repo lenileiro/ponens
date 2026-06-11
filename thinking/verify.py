@@ -63,6 +63,7 @@ class GoalChecker:
         self.answer_preds = set(answer_preds)
         self.builtins = builtins or {}                     # pred -> fn(head, body, pair) -> bool
         #                                                    (arithmetic VERIFIED, never computed)
+        self.recursive = {h[0] for h, b in rules if any(a[0] == h[0] for a in b)}
 
     def new_state(self, pair, edb, goal_pred=None, extra_rules=()):
         return {"known": set(edb), "edb": set(edb), "derived": [], "pair": tuple(pair),
@@ -88,6 +89,12 @@ class GoalChecker:
                 return False
         elif not instantiates(self.rules + st["extra_rules"], head, body):
             return False
+        elif (head[0] in self.answer_preds and head[0] not in self.recursive
+              and tuple(head[1]) != st["pair"]):
+            return False                                   # GOAL ANCHOR: non-recursive answerable
+            #                                                conclusions must be about the ASKED
+            #                                                pair (gold traces never violate this;
+            #                                                recursive preds need intermediates)
         st["known"].add(head)
         st["derived"].append(head)
         st["seen"].add((typ, head, body))
