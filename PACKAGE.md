@@ -333,7 +333,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-sample-methods euler,heun \
     --image-sample-grid \
     --image-eval-sweep --fast --go
-RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-embed \
+RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-embed \
     --image-embed-model google/siglip-base-patch16-224 \
     --image-clean-min-side 256 --image-clean-max-aspect 2.0 \
     --image-latent --image-latent-arch mmdit \
@@ -689,6 +689,12 @@ Image-42 wires that path into the GPU launcher. `runpod/launch_thinking.py --ima
 `runs/image_train_clean.jsonl`, and points manifest training/eval at that cleaned file. Full venv
 runs install `transformers`/`accelerate` only when the HF embedding backend is requested, while
 `--fast` dry runs can use the deterministic stats backend for smoke validation.
+
+Image-43 adds the missing dataset transport step for real-image GPU jobs. `--upload-image-data`
+uploads repo-relative `--image-root` and `--image-manifest` paths to the pod before preprocessing,
+so the pinned-code deploy can still train from local `data/images/...` manifests without committing
+large image corpora into git. Absolute manifest/root paths remain reserved for datasets already
+mounted on the pod.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

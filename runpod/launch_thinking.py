@@ -43,6 +43,36 @@ def sh(cmd):
     return subprocess.run(cmd, shell=True).returncode
 
 
+def local_path_for_arg(path):
+    if not path:
+        return ""
+    return path if os.path.isabs(path) else os.path.join(HERE, path)
+
+
+def remote_path_for_arg(path):
+    if not path:
+        return ""
+    return path if os.path.isabs(path) else os.path.join(REMOTE, path)
+
+
+def upload_path_cmd(local_path, remote_path, ssh):
+    local_path = os.path.abspath(local_path)
+    if os.path.isdir(local_path):
+        return (
+            f"COPYFILE_DISABLE=1 tar czf - -C {shlex_quote(local_path)} . "
+            f"| {ssh} 'mkdir -p {shlex_quote(remote_path)} && "
+            f"tar --no-same-owner -xzf - -C {shlex_quote(remote_path)}'"
+        )
+    parent = os.path.dirname(local_path) or "."
+    name = os.path.basename(local_path)
+    remote_dir = os.path.dirname(remote_path) or "."
+    return (
+        f"COPYFILE_DISABLE=1 tar czf - -C {shlex_quote(parent)} {shlex_quote(name)} "
+        f"| {ssh} 'mkdir -p {shlex_quote(remote_dir)} && "
+        f"tar --no-same-owner -xzf - -C {shlex_quote(remote_dir)}'"
+    )
+
+
 def payload(args):
     """The pod-side run: kinship multi-seed (+ optional chain sweep), via the package CLI.
     --fast: image-native python (torch preinstalled -- skips the ~5min venv build), 1000 steps,
@@ -606,6 +636,9 @@ def main():
                     help="captioned image JSONL/CSV/TSV manifest for real image training")
     ap.add_argument("--image-root", default="", dest="image_root",
                     help="base directory for relative paths in --image-manifest")
+    ap.add_argument("--upload-image-data", action="store_true",
+                    dest="upload_image_data",
+                    help="upload --image-root and --image-manifest to the pod before running")
     ap.add_argument("--image-split", default="train", dest="image_split",
                     help="manifest split used by latent image training")
     ap.add_argument("--image-min-aesthetic", type=float, default=None,
@@ -777,6 +810,24 @@ def main():
         sys.exit("ERROR: --image-embed-batch must be positive")
     if args.image_embed_max_records < 0:
         sys.exit("ERROR: --image-embed-max-records must be non-negative")
+    if args.upload_image_data:
+        if not args.image_manifest:
+            sys.exit("ERROR: --upload-image-data requires --image-manifest")
+        if os.path.isabs(args.image_root) or os.path.isabs(args.image_manifest):
+            sys.exit(
+                "ERROR: --upload-image-data expects repo-relative --image-root and "
+                "--image-manifest paths; omit the upload flag for pod-mounted absolute paths"
+            )
+        for label, raw_path, want_dir in (
+                ("--image-root", args.image_root, True),
+                ("--image-manifest", args.image_manifest, False)):
+            if not raw_path:
+                sys.exit(f"ERROR: --upload-image-data requires {label}")
+            local_path = local_path_for_arg(raw_path)
+            if want_dir and not os.path.isdir(local_path):
+                sys.exit(f"ERROR: {label} not found or not a directory: {local_path}")
+            if not want_dir and not os.path.isfile(local_path):
+                sys.exit(f"ERROR: {label} not found or not a file: {local_path}")
 
     key = os.environ.get("RUNPOD_API_KEY")
     if not key and args.go:
@@ -823,6 +874,11 @@ def main():
     print(f"gpu/cloud : {args.gpu} / {args.cloud}")
     print(f"seeds     : {args.seeds}")
     print(f"sync up   : {HERE}/ -> pod:{REMOTE}")
+    if args.upload_image_data:
+        print(f"image data: {local_path_for_arg(args.image_root)} -> "
+              f"pod:{remote_path_for_arg(args.image_root)}")
+        print(f"manifest  : {local_path_for_arg(args.image_manifest)} -> "
+              f"pod:{remote_path_for_arg(args.image_manifest)}")
     print(f"fetch     : thinking.log + runs/ (models, config, results) -> {HERE}/")
     print(f"guard     : pod-side timeout {cap}s + always-terminate; SSH-wait cap {args.max_minutes}m")
     if not args.go:
@@ -865,6 +921,14 @@ def main():
                   f"--exclude '*.tgz' -C {HERE} . "
                   f"| {ssh} 'mkdir -p {REMOTE} && tar --no-same-owner -xzf - -C {REMOTE}'")
         sh(up)
+        if args.upload_image_data:
+            root_local = local_path_for_arg(args.image_root)
+            root_remote = remote_path_for_arg(args.image_root)
+            manifest_local = local_path_for_arg(args.image_manifest)
+            manifest_remote = remote_path_for_arg(args.image_manifest)
+            sh(upload_path_cmd(root_local, root_remote, ssh))
+            if os.path.abspath(manifest_local) != os.path.abspath(root_local):
+                sh(upload_path_cmd(manifest_local, manifest_remote, ssh))
         if args.eval_only_run:
             local_run = os.path.join(HERE, args.eval_only_run)
             if not os.path.isdir(local_run):
