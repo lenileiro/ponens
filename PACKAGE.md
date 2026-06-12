@@ -281,6 +281,10 @@ python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --flow-ema-decay 0.999 --ae-intervention-w 0.1 --ae-factor-orth-w 0.05 \
     --semantic-guidance-w 2.0 \
     --out runs/image_latent_mmdit_text.pt
+python -m thinking.image_embed --manifest data/images/train.jsonl \
+    --root data/images --backend hf --model google/siglip-base-patch16-224 \
+    --features both --batch 64 --device cuda --out data/images/embeddings.jsonl \
+    --report-out runs/image_embed_report.json
 python -m thinking.image_data --manifest data/images/train.jsonl \
     --root data/images --min-side 256 --max-aspect 2.0 \
     --embedding-manifest data/images/embeddings.jsonl --embedding-key image \
@@ -669,6 +673,13 @@ external feature job can write a sidecar JSONL/CSV/TSV and the validator can joi
 embeddings into the cleaned manifest before training. The join report records matched/missing
 rows, duplicate sidecar keys, written/preserved embeddings, and embedding dimensions, which keeps
 CLIP/SigLIP/DINO/MAE preprocessing auditable and reproducible instead of implicit notebook state.
+
+Image-41 adds the generic preprocessing job itself. `thinking.image_embed` reads the same manifest
+format and writes sidecar JSONL rows with `text_embedding` and/or `image_embedding`; local smoke
+tests use a deterministic stats backend, while GPU jobs can use `--backend hf --model ...` for
+CLIP/SigLIP text-image encoders or DINO/MAE-style image encoders with `--features image`. The
+generator stays model-agnostic: feature extraction, manifest QA, and training remain separate
+auditable stages.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

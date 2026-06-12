@@ -95,6 +95,10 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --sample-steps 4 --flow-semantic-w 0.25 --time-sampling logit-normal \
     --flow-consistency-w 0.05 --flow-ema-decay 0.99 \
     --out runs/image_latent_mmdit_text.pt
+.venv/bin/python -m thinking.image_embed --manifest data/images/train.jsonl \
+    --root data/images --backend hf --model google/siglip-base-patch16-224 \
+    --features both --batch 64 --device cuda --out data/images/embeddings.jsonl \
+    --report-out runs/image_embed_report.json
 .venv/bin/python -m thinking.image_data --manifest data/images/train.jsonl \
     --root data/images --min-side 256 --max-aspect 2.0 \
     --embedding-manifest data/images/embeddings.jsonl --embedding-key image \
