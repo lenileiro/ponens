@@ -104,6 +104,12 @@ def payload(args):
                      f"--dit-head-width-mult {args.image_dit_head_width_mult} "
                      f"--cond-mode {args.image_cond_mode} "
                      f"--text-cond-dim {args.image_text_cond_dim} "
+                     f"--image-manifest {shlex_quote(args.image_manifest)} "
+                     f"--image-root {shlex_quote(args.image_root)} "
+                     f"--image-split {shlex_quote(args.image_split)} "
+                     f"--image-max-records {args.image_max_records} "
+                     f"--caption-vocab-max {args.image_caption_vocab_max} "
+                     f"--caption-max-len {args.image_caption_max_len} "
                      f"--cond-drop {args.image_cond_drop} "
                      f"--cfg-scale {args.image_cfg_scale} "
                      f"--cfg-interval {shlex_quote(args.image_cfg_interval)} "
@@ -134,7 +140,12 @@ def payload(args):
                 train += " --no-ema-warmup"
             if args.image_prompt_templates:
                 train += f" --prompt-templates {shlex_quote(args.image_prompt_templates)}"
-            if args.image_eval_sweep:
+            if args.image_min_aesthetic is not None:
+                train += f" --image-min-aesthetic {args.image_min_aesthetic}"
+            if args.image_eval_sweep and args.image_manifest:
+                train += (" && echo 'manifest image eval sweep skipped: train report already "
+                          "contains real-image reconstruction, endpoint, and caption sample metrics'")
+            elif args.image_eval_sweep:
                 train += (f" && {IL} --eval-checkpoint {ckpt} "
                           f"--checkpoint-weight-mode {args.image_checkpoint_weight_mode} "
                           f"--cfg-scales {shlex_quote(args.image_cfg_sweep)} "
@@ -388,6 +399,23 @@ def main():
                     help="latent image conditioning source: canonical facts or learned text prompts")
     ap.add_argument("--image-text-cond-dim", type=int, default=0, dest="image_text_cond_dim",
                     help="text condition vector width; default uses --dim/hidden")
+    ap.add_argument("--image-manifest", default="", dest="image_manifest",
+                    help="captioned image JSONL/CSV/TSV manifest for real image training")
+    ap.add_argument("--image-root", default="", dest="image_root",
+                    help="base directory for relative paths in --image-manifest")
+    ap.add_argument("--image-split", default="train", dest="image_split",
+                    help="manifest split used by latent image training")
+    ap.add_argument("--image-min-aesthetic", type=float, default=None,
+                    dest="image_min_aesthetic",
+                    help="optional minimum aesthetic/quality score for image manifest rows")
+    ap.add_argument("--image-max-records", type=int, default=0, dest="image_max_records",
+                    help="cap image manifest records for GPU smoke tests; 0 means all")
+    ap.add_argument("--image-caption-vocab-max", type=int, default=8192,
+                    dest="image_caption_vocab_max",
+                    help="maximum caption vocabulary size for image manifest training")
+    ap.add_argument("--image-caption-max-len", type=int, default=64,
+                    dest="image_caption_max_len",
+                    help="maximum caption tokens for image manifest training")
     ap.add_argument("--image-prompt-templates", default="", dest="image_prompt_templates",
                     help="semicolon-separated prompt templates using {color} and {shape}")
     ap.add_argument("--image-cond-drop", type=float, default=0.0, dest="image_cond_drop",
@@ -543,7 +571,7 @@ def main():
             "env": {"PUBLIC_KEY": pubkey}}
     cap = args.max_minutes * 60
     run = payload(args)
-    setup = ("pip install -q numpy tokenizers pandas pyarrow" if args.fast   # image torch; verbalizer
+    setup = ("pip install -q numpy tokenizers pandas pyarrow pillow" if args.fast   # image torch; verbalizer
              else f"WORKDIR={REMOTE} bash runpod/setup.sh")                  # deps incl. parquet corpora
     # tee to LOCAL disk: /workspace is a network volume that stalls under streaming writes
     # (see runpod/setup.sh -- it cost us rung B4: training was healthy, only the log froze)

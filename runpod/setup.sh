@@ -27,7 +27,7 @@ uv venv --python 3.12 "$VENV"
 # but we install into our own venv for reproducibility.
 VIRTUAL_ENV=$VENV uv pip install --quiet \
   "torch" --index-url "https://download.pytorch.org/whl/${CUDA_WHL}"
-VIRTUAL_ENV=$VENV uv pip install --quiet numpy pandas scikit-learn tokenizers nltk
+VIRTUAL_ENV=$VENV uv pip install --quiet numpy pandas scikit-learn tokenizers nltk pillow
 # WordNet for dictionary.py (genus-projected A1 dictionary)
 $VENV/bin/python -c "import nltk; nltk.download('wordnet', quiet=True); nltk.download('omw-1.4', quiet=True)"
 

@@ -36,7 +36,7 @@ memorization, and curriculum.
 | `datalog.py` | minimal Datalog: least-fixpoint closure with provenance, entailment oracle, proof trees, SLD backward chaining |
 | `surfaces.json` | frontier-distilled surface bank: 1,300+ validated English patterns across 8 education registers (preschool → scholar), with held-out splits |
 | `runpod/` | H100 launchers (tar-over-ssh, timeout-bounded, always-terminate) |
-| `thinking/vision.py`, `thinking/image2.py`, `thinking/image_flow.py`, `thinking/image_latent.py` | Image rungs: synthetic visual factors → canonical facts, head-aware FER probes, pixel flow, and semantic latent flow |
+| `thinking/vision.py`, `thinking/image2.py`, `thinking/image_flow.py`, `thinking/image_data.py`, `thinking/image_latent.py` | Image rungs: synthetic visual factors → canonical facts, head-aware FER probes, captioned image data, pixel flow, and semantic latent flow |
 | `thinking/text.py` | Text-0 semantic understanding rung: web-imported English records → canonical facts, with artifact controls |
 | `thinking/audio.py`, `thinking/multimodal.py` | Audio factors and the M-0 multimodal bridge: image+audio+transcript prefixes → one canonical extraction trace |
 | `thinking/listen.py`, `thinking/speak.py` | speech: **listen** (transcribe real synthesized speech, speaker-invariant), **speak** (emit audio tokens *verified by round-trip* through the frozen listener — the checker, applied to generation) |
@@ -95,6 +95,10 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --sample-steps 4 --flow-semantic-w 0.25 --time-sampling logit-normal \
     --flow-consistency-w 0.05 --flow-ema-decay 0.99 \
     --out runs/image_latent_mmdit_text.pt
+.venv/bin/python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
+    --image-manifest data/images/train.jsonl --image-root data/images \
+    --ae-steps 40 --flow-steps 40 --sample-grid-out runs/image_manifest_grid.ppm \
+    --flow-consistency-w 0.05 --out runs/image_manifest_mmdit.pt
 .venv/bin/python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.5 --sample-steps-list 4,8 --eval-seeds 1,2,3 \
     --eval-out runs/image_latent_dit_sweep.json
@@ -140,6 +144,13 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
     --out runs/text_snli_mnli_hans_grounded_smoke.json \
     --checkpoint runs/text_snli_mnli_hans_grounded_smoke.pt
+.venv/bin/python -m thinking.text --data data/text_mnli.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_mnli_smoke.pt \
+    --steps 40 --batch 32 --study-lr 0.0005 --semantic-w 0.75 \
+    --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_mnli_smoke.json
 .venv/bin/python -m thinking.multimodal --steps 240 --eval-n 120 --free-n 20 \
     --counterfactual-n 40 --free-counterfactual-n 20 \
     --out runs/m0_multimodal.json --checkpoint runs/m0_multimodal.pt

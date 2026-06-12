@@ -183,6 +183,13 @@ python -m thinking.text --data data/text_snli.jsonl --data data/text_mnli.jsonl 
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
     --out runs/text_snli_mnli_hans_grounded_smoke.json \
     --checkpoint runs/text_snli_mnli_hans_grounded_smoke.pt
+python -m thinking.text --data data/text_mnli.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_mnli_smoke.pt \
+    --steps 40 --batch 32 --study-lr 0.0005 --semantic-w 0.75 \
+    --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_mnli_smoke.json
 ```
 
 Current local Text-0 SNLI baseline (20k train / 1k dev, 1.5k steps, d=192, 4 layers, 6 heads,
@@ -234,6 +241,14 @@ it does **not** gate (**0.324** sampled teacher-forced, **0.591** sampled semant
 useful outcome is infrastructure: wider web-backed semantic data, sampled large-set evaluation,
 and no hard-coded English rules.
 
+The first reading-task update path is also wired. `--study-checkpoint` loads an existing text
+checkpoint, expands token embeddings and semantic heads for new reading-task vocabulary/facts,
+evaluates before, fine-tunes on the reading records (plus optional `--study-replay-data`), saves
+to a new checkpoint, and evaluates after. A 40-step MultiNLI study smoke expanded the balanced
+SNLI+HANS+grounded checkpoint from **11,251** to **34,017** text tokens and improved sampled
+MultiNLI semantic-head accuracy from **0.317** to **0.392**. It still fails the gate; this is the
+weight-update mechanism for future reading curricula, not language mastery.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
@@ -266,6 +281,11 @@ python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --flow-ema-decay 0.999 --ae-intervention-w 0.1 --ae-factor-orth-w 0.05 \
     --semantic-guidance-w 2.0 \
     --out runs/image_latent_mmdit_text.pt
+python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
+    --image-manifest data/images/train.jsonl --image-root data/images \
+    --ae-steps 400 --flow-steps 400 --sample-steps 8 \
+    --flow-consistency-w 0.05 --sample-grid-out runs/image_manifest_grid.ppm \
+    --out runs/image_manifest_mmdit.pt
 python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
     --eval-seeds 1,2,3 --roundtrip-samples 2 --eval-out runs/image_latent_dit_sweep.json
@@ -289,6 +309,12 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-sample-methods euler,heun \
     --image-sample-grid \
     --image-eval-sweep --fast --go
+RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-latent-arch mmdit \
+    --image-cond-mode text --image-dit-head-width-mult 2 \
+    --image-manifest data/images/train.jsonl --image-root data/images \
+    --image-sample-steps 8 --image-flow-consistency-w 0.05 \
+    --image-latent-normalize channel --image-latent-stat-samples 4096 \
+    --image-sample-grid --fast --go
 ```
 
 `thinking.image2` is the head-aware FER experiment: shared factored heads vs explicit
@@ -525,6 +551,15 @@ Image-28 adds an optional endpoint-consistency regularizer (`--flow-consistency-
 times on the same noise/data path to predict the same clean latent endpoint. This targets the
 few-step image-generation bottleneck without adding renderer-specific grammar: if the path is
 more self-consistent, Euler/Heun sweeps should need fewer steps to preserve facts and pixels.
+
+Image-29 starts the real image-text data bridge. `thinking.image_data` reads JSONL/CSV/TSV
+captioned-image manifests, supports dependency-free PPM fixtures locally, and uses Pillow for
+JPEG/PNG/WebP on GPU boxes. `thinking.image_latent --image-manifest ... --cond-mode text` now
+trains the same semantic AE + text-conditioned latent flow on captioned images instead of only
+synthetic color/shape renders. Manifest JSONL rows need `image`/`path` plus `caption`/`text`, with
+optional `split`, `aesthetic`, `width`, and `height`. This is the necessary data-plane step toward
+SOTA-quality images: synthetic factors remain the controllable probe, but real image/caption data
+is now a first-class training source.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

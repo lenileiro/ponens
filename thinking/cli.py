@@ -398,6 +398,8 @@ def cmd_selftest(_args):
     # IMAGE-0: synthetic visual factors produce canonical facts and probeable embeddings.
     from .vision import selftest as vision_selftest
     vision_selftest()
+    from .image_data import selftest as image_data_selftest
+    image_data_selftest()
     from .image_latent import selftest as image_latent_selftest
     image_latent_selftest()
     from .audio import selftest as audio_selftest
