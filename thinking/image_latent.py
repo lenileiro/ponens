@@ -962,7 +962,7 @@ def estimate_latent_stats_tensor(latents, n=512, seed=123, mode="none", eps=1.0e
 @torch.no_grad()
 def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_records=0,
                              batch=64, seed=0, size=32, device=DEV, precision="fp32",
-                             cond_source="tokens"):
+                             cond_source="tokens", cache_dir="", shard_size=1024):
     rows = list(records)
     if not rows:
         raise ValueError("cannot build latent cache from empty records")
@@ -972,6 +972,11 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         rows = [rows[int(i)] for i in chosen_idx]
     if cond_source == "embedding":
         infer_text_embedding_dim(rows)
+    if cache_dir:
+        return build_disk_image_latent_cache(
+            ae, rows, prompt_vocab, caption_max_len=caption_max_len,
+            batch=batch, size=size, device=device, precision=precision,
+            cond_source=cond_source, cache_dir=cache_dir, shard_size=shard_size)
     latents, captions, embeddings = [], [], []
     ae.eval()
     for start in range(0, len(rows), max(1, int(batch))):
@@ -987,6 +992,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         if cond_source == "embedding":
             embeddings.append(record_text_embedding_tensor(chunk, device="cpu"))
     cache = {
+        "backend": "memory",
         "latents": torch.cat(latents, dim=0).contiguous(),
         "captions": captions,
         "caption_ids": (
@@ -1006,6 +1012,176 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             cache["text_embeddings"].numel() * cache["text_embeddings"].element_size()
         )
     return cache
+
+
+@torch.no_grad()
+def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, batch=64,
+                                  size=32, device=DEV, precision="fp32",
+                                  cond_source="tokens", cache_dir="", shard_size=1024):
+    if not cache_dir:
+        raise ValueError("cache_dir is required for disk latent cache")
+    shard_size = int(shard_size)
+    if shard_size <= 0:
+        raise ValueError("flow cache shard size must be positive")
+    rows = list(rows)
+    if not rows:
+        raise ValueError("cannot build latent cache from empty records")
+    cache_dir = os.path.abspath(cache_dir)
+    os.makedirs(cache_dir, exist_ok=True)
+    shards = []
+    total_bytes = 0
+    latent_shape = None
+    ae.eval()
+    for shard_i, start in enumerate(range(0, len(rows), shard_size)):
+        chunk_rows = rows[start:start + shard_size]
+        latents = []
+        for enc_start in range(0, len(chunk_rows), max(1, int(batch))):
+            enc_rows = chunk_rows[enc_start:enc_start + max(1, int(batch))]
+            x = torch.stack([
+                load_image_tensor(rec.path, size=size, device=device)
+                for rec in enc_rows
+            ], dim=0)
+            with amp_autocast(device, precision):
+                z = ae.encode(x)
+            latents.append(z.detach().float().cpu())
+        captions = [rec.caption for rec in chunk_rows]
+        shard = {
+            "latents": torch.cat(latents, dim=0).contiguous(),
+            "captions": captions,
+            "caption_ids": (
+                caption_ids(captions, prompt_vocab, max_len=caption_max_len, device="cpu")
+                if cond_source == "tokens" else None
+            ),
+            "text_embeddings": (
+                record_text_embedding_tensor(chunk_rows, device="cpu")
+                if cond_source == "embedding" else None
+            ),
+            "cond_source": cond_source,
+            "start": int(start),
+            "count": int(len(chunk_rows)),
+        }
+        if latent_shape is None:
+            latent_shape = tuple(int(x) for x in shard["latents"].shape[1:])
+        name = f"shard_{shard_i:06d}.pt"
+        path = os.path.join(cache_dir, name)
+        tmp_path = path + ".tmp"
+        torch.save(shard, tmp_path)
+        os.replace(tmp_path, path)
+        file_bytes = int(os.path.getsize(path))
+        total_bytes += file_bytes
+        shards.append({"path": path, "file": name, "count": int(len(chunk_rows)),
+                       "bytes": file_bytes})
+    meta = {
+        "format": "image_latent_cache_v1",
+        "backend": "disk",
+        "cache_dir": cache_dir,
+        "records": int(len(rows)),
+        "latent_shape": list(latent_shape or ()),
+        "cond_source": cond_source,
+        "shard_size": int(shard_size),
+        "shards": [
+            {"file": s["file"], "count": int(s["count"]), "bytes": int(s["bytes"])}
+            for s in shards
+        ],
+        "bytes": int(total_bytes),
+    }
+    meta_path = os.path.join(cache_dir, "meta.json")
+    tmp_meta = meta_path + ".tmp"
+    with open(tmp_meta, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=1, sort_keys=True)
+    os.replace(tmp_meta, meta_path)
+    total_bytes += int(os.path.getsize(meta_path))
+    return {
+        "backend": "disk",
+        "cache_dir": cache_dir,
+        "meta_path": meta_path,
+        "records": int(len(rows)),
+        "latent_shape": tuple(int(x) for x in latent_shape),
+        "cond_source": cond_source,
+        "shard_size": int(shard_size),
+        "shards": shards,
+        "bytes": int(total_bytes),
+    }
+
+
+def latent_cache_backend(cache):
+    return str((cache or {}).get("backend", "memory" if cache is not None else ""))
+
+
+def _latent_cache_shard_offsets(cache):
+    offsets, pos = [], 0
+    for shard in cache.get("shards", []):
+        offsets.append(pos)
+        pos += int(shard["count"])
+    return offsets
+
+
+def _load_latent_cache_shard(shard):
+    return torch.load(shard["path"], map_location="cpu")
+
+
+def _latent_cache_payload(source, ids=None, embeddings=None):
+    return {
+        "cond_source": source,
+        "caption_ids": ids,
+        "text_embeddings": embeddings,
+    }
+
+
+def sample_latent_cache(cache, rng, batch, device=DEV):
+    backend = latent_cache_backend(cache)
+    if backend == "disk":
+        shards = list(cache.get("shards", []))
+        if not shards:
+            raise ValueError("disk latent cache has no shards")
+        counts = np.asarray([int(s["count"]) for s in shards], dtype=np.float64)
+        probs = counts / counts.sum()
+        shard_i = int(rng.choice(len(shards), p=probs))
+        shard = _load_latent_cache_shard(shards[shard_i])
+        n = int(shard["latents"].shape[0])
+        idx = torch.tensor(rng.integers(0, n, size=int(batch)), dtype=torch.long)
+        z1 = shard["latents"][idx].to(device=device)
+        if cache["cond_source"] == "embedding":
+            payload = _latent_cache_payload(
+                "embedding", embeddings=shard["text_embeddings"][idx])
+        else:
+            payload = _latent_cache_payload("tokens", ids=shard["caption_ids"][idx])
+        return z1, payload
+    idx_np = rng.integers(0, int(cache["records"]), size=int(batch))
+    idx = torch.tensor(idx_np, dtype=torch.long)
+    z1 = cache["latents"][idx].to(device=device)
+    if cache["cond_source"] == "embedding":
+        payload = _latent_cache_payload("embedding", embeddings=cache["text_embeddings"][idx])
+    else:
+        payload = _latent_cache_payload("tokens", ids=cache["caption_ids"][idx])
+    return z1, payload
+
+
+@torch.no_grad()
+def estimate_latent_stats_cache(cache, n=512, seed=123, mode="none"):
+    backend = latent_cache_backend(cache)
+    if backend != "disk":
+        return estimate_latent_stats_tensor(cache["latents"], n=n, seed=seed, mode=mode)
+    if mode == "none":
+        return {"mode": "none", "n": 0}
+    total = int(cache["records"])
+    if total <= 0:
+        raise ValueError("latent cache is empty")
+    n = min(max(1, int(n)), total)
+    rng = np.random.default_rng(seed)
+    idxs = rng.choice(total, size=n, replace=total < n)
+    offsets = _latent_cache_shard_offsets(cache)
+    grouped = {}
+    for global_i in idxs:
+        shard_i = int(np.searchsorted(offsets, int(global_i), side="right") - 1)
+        grouped.setdefault(shard_i, []).append(int(global_i) - offsets[shard_i])
+    samples = []
+    for shard_i in sorted(grouped):
+        shard = _load_latent_cache_shard(cache["shards"][shard_i])
+        local = torch.tensor(grouped[shard_i], dtype=torch.long)
+        samples.append(shard["latents"][local])
+    latents = torch.cat(samples, dim=0)
+    return estimate_latent_stats_tensor(latents, n=n, seed=seed + 1, mode=mode)
 
 
 def latent_stats_state(stats):
@@ -1683,10 +1859,22 @@ def caption_record_condition(captions, records, conditioner, vocab, source="toke
 
 def cached_caption_condition(cache, idx, conditioner, source="tokens", device=DEV,
                              return_tokens=False):
+    if "latents" not in cache and "shards" not in cache:
+        return cached_caption_payload_condition(
+            cache, conditioner, source=source, device=device, return_tokens=return_tokens)
     if source == "embedding":
         embs = cache["text_embeddings"][idx].to(device=device)
         return conditioner(embs, return_tokens=return_tokens)
     ids = cache["caption_ids"][idx]
+    return caption_condition_ids(ids, conditioner, device=device, return_tokens=return_tokens)
+
+
+def cached_caption_payload_condition(payload, conditioner, source="tokens", device=DEV,
+                                     return_tokens=False):
+    if source == "embedding":
+        embs = payload["text_embeddings"].to(device=device)
+        return conditioner(embs, return_tokens=return_tokens)
+    ids = payload["caption_ids"]
     return caption_condition_ids(ids, conditioner, device=device, return_tokens=return_tokens)
 
 
@@ -2733,6 +2921,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       train_precision="fp32", ae_accum_steps=1, flow_accum_steps=1,
                       grad_clip=0.0,
                       flow_cache_latents=False, flow_cache_records=0, flow_cache_batch=64,
+                      flow_cache_dir="", flow_cache_shard_size=1024,
                       return_conditioner=False, return_ema=False, return_aligner=False):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -2780,10 +2969,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("semantic_guidance_w must be non-negative")
     if flow_consistency_w < 0.0:
         raise ValueError("flow_consistency_w must be non-negative")
+    flow_cache_dir = str(flow_cache_dir or "")
+    flow_cache_latents = bool(flow_cache_latents or flow_cache_dir)
     if flow_cache_latents and image_records is None:
         raise ValueError("flow latent cache currently requires image_manifest training")
     if flow_cache_records < 0 or flow_cache_batch <= 0:
         raise ValueError("flow cache record/batch settings must be non-negative/positive")
+    if flow_cache_shard_size <= 0:
+        raise ValueError("flow cache shard size must be positive")
     if semantic_guidance_mode not in ("latent", "decoded"):
         raise ValueError(f"unknown semantic guidance mode {semantic_guidance_mode!r}")
     if sample_method not in SAMPLE_METHODS:
@@ -2912,15 +3105,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             ae, image_records, prompt_vocab, caption_max_len=caption_max_len,
             max_records=flow_cache_records, batch=flow_cache_batch, seed=seed + 211,
             size=size, device=device, precision=train_precision,
-            cond_source=caption_cond_source)
+            cond_source=caption_cond_source, cache_dir=flow_cache_dir,
+            shard_size=flow_cache_shard_size)
     if image_records is None:
         latent_stats = estimate_latent_stats(
             ae, n=latent_stat_samples, batch=batch, seed=seed + 97, size=size, device=device,
             mode=latent_normalize)
     elif flow_cache is not None:
-        latent_stats = estimate_latent_stats_tensor(
-            flow_cache["latents"], n=latent_stat_samples, seed=seed + 97,
-            mode=latent_normalize)
+        latent_stats = estimate_latent_stats_cache(
+            flow_cache, n=latent_stat_samples, seed=seed + 97, mode=latent_normalize)
     else:
         latent_stats = estimate_latent_stats_records(
             ae, image_records, n=latent_stat_samples, batch=batch, seed=seed + 97,
@@ -2941,12 +3134,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         opt_flow.zero_grad(set_to_none=True)
         for _micro in range(flow_accum_steps):
             if flow_cache is not None:
-                idx_np = rng.integers(0, int(flow_cache["records"]), size=int(batch))
-                idx = torch.tensor(idx_np, dtype=torch.long)
-                z1 = flow_cache["latents"][idx].to(device=device)
+                z1, cache_payload = sample_latent_cache(flow_cache, rng, batch, device=device)
                 fact_cond, specs = None, None
-                cond = cached_caption_condition(
-                    flow_cache, idx, conditioner, source=caption_cond_source,
+                cond = cached_caption_payload_condition(
+                    cache_payload, conditioner, source=caption_cond_source,
                     device=device, return_tokens=flow_uses_cond_tokens(flow))
             elif image_records is None:
                 x, fact_cond, _yc, _ys, specs = _batch(batch, rng, size=size, device=device,
@@ -3051,9 +3242,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "batch": int(batch),
         "flow_cache_latents": bool(flow_cache is not None),
         "flow_cache_requested": bool(flow_cache_latents),
+        "flow_cache_backend": latent_cache_backend(flow_cache) if flow_cache is not None else "",
+        "flow_cache_dir": str(flow_cache.get("cache_dir", "")) if flow_cache is not None else "",
         "flow_cache_records": int(flow_cache["records"]) if flow_cache is not None else 0,
         "flow_cache_max_records": int(flow_cache_records),
         "flow_cache_batch": int(flow_cache_batch),
+        "flow_cache_shard_size": int(flow_cache_shard_size),
+        "flow_cache_shards": (
+            len(flow_cache.get("shards", [])) if flow_cache is not None else 0
+        ),
         "flow_cache_bytes": int(flow_cache["bytes"]) if flow_cache is not None else 0,
         "flow_cache_cond_source": (
             str(flow_cache["cond_source"]) if flow_cache is not None else caption_cond_source
@@ -3355,7 +3552,29 @@ def selftest():
         assert "caption_align_i2t_acc" in report6["last_ae"]
         assert "flow_caption_align_i2t_acc" in report6["last_flow"]
         assert report6["flow_cache_latents"] is True
+        assert report6["flow_cache_backend"] == "memory"
         assert report6["flow_cache_records"] == 2 and report6["flow_cache_bytes"] > 0
+        assert report6["flow_cache_shards"] == 0
+        disk_cache_dir = os.path.join(td, "latent_cache")
+        _ae_disk, _flow_disk, _cond_disk, _vocab_disk, _aligner_disk, report_disk = (
+            train_latent_flow(
+                ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32,
+                flow_arch="mmdit", dit_depth=1, dit_heads=2, seed=13,
+                device="cpu", cond_mode="text", text_cond_dim=8,
+                image_manifest=manifest, image_root=img_dir, image_split="train",
+                image_max_records=2, caption_max_len=8, sample_steps=1,
+                caption_cond_source="embedding",
+                image_text_align_w=0.1, flow_text_align_w=0.1, text_embed_dim=12,
+                flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
+                flow_cache_dir=disk_cache_dir, flow_cache_shard_size=1,
+                latent_normalize="channel", latent_stat_samples=2,
+                intervention_samples=0, return_conditioner=True, return_aligner=True))
+        assert report_disk["flow_cache_backend"] == "disk"
+        assert report_disk["flow_cache_records"] == 2
+        assert report_disk["flow_cache_shards"] == 2
+        assert report_disk["flow_cache_bytes"] > 0
+        assert os.path.exists(os.path.join(disk_cache_dir, "meta.json"))
+        assert report_disk["latent_normalize"] == "channel"
         manifest_rows = read_image_manifest(manifest, root=img_dir, split="eval")
         img_sweep = image_record_sweep(
             ae6, flow6, manifest_rows, cfg_scales=(1.0,), sample_steps_list=(1,),
@@ -3438,6 +3657,11 @@ def main(argv=None):
                     help="maximum manifest records to cache for flow training; 0 means all")
     ap.add_argument("--flow-cache-batch", type=int, default=64, dest="flow_cache_batch",
                     help="batch size used while building the AE latent cache")
+    ap.add_argument("--flow-cache-dir", default="", dest="flow_cache_dir",
+                    help="directory for disk-backed manifest latent cache; implies cache")
+    ap.add_argument("--flow-cache-shard-size", type=int, default=1024,
+                    dest="flow_cache_shard_size",
+                    help="records per shard for --flow-cache-dir")
     ap.add_argument("--train-precision", default="fp32", choices=TRAIN_PRECISIONS,
                     dest="train_precision",
                     help="training precision; bf16/fp16 AMP is enabled on CUDA")
@@ -3733,6 +3957,8 @@ def main(argv=None):
         flow_cache_latents=args.flow_cache_latents,
         flow_cache_records=args.flow_cache_records,
         flow_cache_batch=args.flow_cache_batch,
+        flow_cache_dir=args.flow_cache_dir,
+        flow_cache_shard_size=args.flow_cache_shard_size,
         return_conditioner=True, return_ema=True, return_aligner=True)
     if args.sample_grid_out:
         raw_flow = clone_state_dict(flow)
@@ -3809,9 +4035,14 @@ def main(argv=None):
         "ae_accum_steps": args.ae_accum_steps,
         "flow_accum_steps": args.flow_accum_steps,
         "flow_cache_latents": report.get("flow_cache_latents", False),
+        "flow_cache_backend": report.get("flow_cache_backend", ""),
+        "flow_cache_dir": report.get("flow_cache_dir", ""),
         "flow_cache_records": report.get("flow_cache_records", 0),
         "flow_cache_max_records": args.flow_cache_records,
         "flow_cache_batch": args.flow_cache_batch,
+        "flow_cache_shard_size": args.flow_cache_shard_size,
+        "flow_cache_shards": report.get("flow_cache_shards", 0),
+        "flow_cache_bytes": report.get("flow_cache_bytes", 0),
         "train_precision": args.train_precision,
         "train_amp_enabled": report.get("train_amp_enabled", False),
         "grad_clip": args.grad_clip,

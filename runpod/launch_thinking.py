@@ -104,6 +104,7 @@ def payload(args):
                      f"--flow-accum-steps {args.image_flow_accum_steps} "
                      f"--flow-cache-records {args.image_flow_cache_records} "
                      f"--flow-cache-batch {args.image_flow_cache_batch} "
+                     f"--flow-cache-shard-size {args.image_flow_cache_shard_size} "
                      f"--train-precision {args.image_train_precision} "
                      f"--grad-clip {args.image_grad_clip} "
                      f"--size {args.image_size} "
@@ -159,6 +160,8 @@ def payload(args):
                 train += " --no-ema-warmup"
             if args.image_flow_cache_latents:
                 train += " --flow-cache-latents"
+            if args.image_flow_cache_dir:
+                train += f" --flow-cache-dir {shlex_quote(args.image_flow_cache_dir)}"
             if args.image_prompt_templates:
                 train += f" --prompt-templates {shlex_quote(args.image_prompt_templates)}"
             if args.image_min_aesthetic is not None:
@@ -436,6 +439,12 @@ def main():
     ap.add_argument("--image-flow-cache-batch", type=int, default=64,
                     dest="image_flow_cache_batch",
                     help="batch size used while building the image latent cache")
+    ap.add_argument("--image-flow-cache-dir", default="",
+                    dest="image_flow_cache_dir",
+                    help="directory for disk-backed image latent cache; implies cache")
+    ap.add_argument("--image-flow-cache-shard-size", type=int, default=1024,
+                    dest="image_flow_cache_shard_size",
+                    help="records per shard for disk-backed image latent cache")
     ap.add_argument("--image-train-precision", default="fp32",
                     choices=("fp32", "bf16", "fp16"), dest="image_train_precision",
                     help="latent image training precision; bf16/fp16 AMP runs on CUDA")

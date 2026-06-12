@@ -292,7 +292,8 @@ python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 \
     --image-text-align-w 0.1 --flow-text-align-w 0.05 --text-embed-dim 128 \
     --ae-accum-steps 2 --flow-accum-steps 2 --grad-clip 1.0 \
-    --flow-cache-latents --flow-cache-batch 32 \
+    --flow-cache-latents --flow-cache-dir runs/image_manifest_cache \
+    --flow-cache-shard-size 2048 --flow-cache-batch 32 \
     --ae-steps 400 --flow-steps 400 --sample-steps 8 \
     --flow-consistency-w 0.05 --sample-grid-out runs/image_manifest_grid.ppm \
     --out runs/image_manifest_mmdit.pt
@@ -336,7 +337,8 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-text-embed-dim 128 \
     --image-ae-accum-steps 2 --image-flow-accum-steps 2 \
     --image-train-precision bf16 --image-grad-clip 1.0 \
-    --image-flow-cache-latents --image-flow-cache-batch 64 \
+    --image-flow-cache-latents --image-flow-cache-dir runs/image_manifest_cache \
+    --image-flow-cache-shard-size 2048 --image-flow-cache-batch 64 \
     --image-sample-steps 8 --image-flow-consistency-w 0.05 \
     --image-latent-normalize channel --image-latent-stat-samples 4096 \
     --image-eval-sweep --image-eval-split eval --image-sample-grid --fast --go
@@ -640,6 +642,13 @@ tokens|embedding|auto` chooses whether real-image training uses the local token 
 those external embeddings into the conditioning stream. This is the hook for CLIP/T5/SigLIP-style
 frozen text features: the model can move toward stronger prompt understanding without baking in a
 specific provider or adding renderer-specific rules.
+
+Image-38 adds disk-backed manifest latent caching. `--flow-cache-dir` writes AE latents,
+caption token IDs or text embeddings, and shard metadata to disk, then flow training samples from
+those shards instead of keeping the full cache resident in CPU RAM. Reports/checkpoints now expose
+`flow_cache_backend`, `flow_cache_dir`, `flow_cache_shards`, shard size, and byte count. This keeps
+the latent-diffusion separation practical for larger real-image manifests: encode pixels once,
+train the rectified-flow transformer from reusable latent shards, and avoid a hidden RAM ceiling.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

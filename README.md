@@ -106,7 +106,8 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 \
     --image-text-align-w 0.1 --flow-text-align-w 0.05 --text-embed-dim 128 \
     --ae-accum-steps 2 --flow-accum-steps 2 --grad-clip 1.0 \
-    --flow-cache-latents --flow-cache-batch 32 \
+    --flow-cache-latents --flow-cache-dir runs/image_manifest_cache \
+    --flow-cache-shard-size 2048 --flow-cache-batch 32 \
     --ae-steps 40 --flow-steps 40 --sample-grid-out runs/image_manifest_grid.ppm \
     --flow-consistency-w 0.05 --out runs/image_manifest_mmdit.pt
 .venv/bin/python -m thinking.image_latent --eval-checkpoint runs/image_manifest_mmdit.pt \
