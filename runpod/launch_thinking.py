@@ -229,6 +229,8 @@ def payload(args):
                      f"--time-logit-mean {args.image_time_logit_mean} "
                      f"--time-logit-std {args.image_time_logit_std} "
                      f"--time-shift {args.image_time_shift} "
+                     f"--flow-loss-weight {args.image_flow_loss_weight} "
+                     f"--flow-loss-weight-gamma {args.image_flow_loss_weight_gamma} "
                      f"--latent-normalize {args.image_latent_normalize} "
                      f"--latent-stat-samples {args.image_latent_stat_samples} "
                      f"--out {ckpt}")
@@ -241,6 +243,8 @@ def payload(args):
                 train += " --dit-qk-norm"
             if args.image_flow_cache_latents:
                 train += " --flow-cache-latents"
+            if args.image_no_flow_loss_weight_normalize:
+                train += " --no-flow-loss-weight-normalize"
             if args.image_flow_cache_dir:
                 train += f" --flow-cache-dir {shlex_quote(args.image_flow_cache_dir)}"
             if args.image_prompt_templates:
@@ -764,6 +768,16 @@ def main():
     ap.add_argument("--image-time-shift", type=float, default=1.0,
                     dest="image_time_shift",
                     help="latent image RF data-time shift; >1 biases training toward noise")
+    ap.add_argument("--image-flow-loss-weight", default="none",
+                    choices=("none", "min-snr-v", "soft-min-snr-v"),
+                    dest="image_flow_loss_weight",
+                    help="latent image per-timestep velocity loss weighting")
+    ap.add_argument("--image-flow-loss-weight-gamma", type=float, default=5.0,
+                    dest="image_flow_loss_weight_gamma",
+                    help="gamma for latent image Min-SNR-style velocity weighting")
+    ap.add_argument("--image-no-flow-loss-weight-normalize", action="store_true",
+                    dest="image_no_flow_loss_weight_normalize",
+                    help="do not normalize weighted latent image velocity loss to batch mean 1")
     ap.add_argument("--image-latent-normalize", default="none",
                     choices=("none", "global", "channel"), dest="image_latent_normalize",
                     help="normalize semantic AE latents before latent image flow training")
@@ -847,6 +861,8 @@ def main():
         sys.exit("ERROR: --image-hflip-prob must be in [0, 1]")
     if args.image_time_shift <= 0.0:
         sys.exit("ERROR: --image-time-shift must be positive")
+    if args.image_flow_loss_weight_gamma <= 0.0:
+        sys.exit("ERROR: --image-flow-loss-weight-gamma must be positive")
     if args.upload_image_data:
         if not args.image_manifest:
             sys.exit("ERROR: --upload-image-data requires --image-manifest")

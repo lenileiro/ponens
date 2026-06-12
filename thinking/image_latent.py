@@ -50,6 +50,7 @@ FACT_GROUPS = {
 }
 SAMPLE_METHODS = ("euler", "heun")
 MMDIT_ATTN_IMPLS = ("manual", "sdpa", "auto")
+FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
 DEFAULT_GUIDANCE_INTERVAL = (0.0, 1.0)
 
 
@@ -998,6 +999,33 @@ def sample_flow_times(batch, device=DEV, mode="uniform", logit_mean=0.0, logit_s
     else:
         raise ValueError(f"unknown time sampling mode {mode!r}")
     return apply_flow_time_shift(t, shift=time_shift)
+
+
+def flow_loss_time_weights(t, mode="none", gamma=5.0, normalize=True, eps=1.0e-5):
+    """Per-example weighting for rectified-flow velocity loss.
+
+    The repo's data-time convention is t=0 noise and t=1 data, so the signal-to-noise
+    ratio is (t / (1 - t))^2.  The *-v modes use the velocity-target form of Min-SNR
+    weighting, dividing by SNR+1, and optionally normalize the batch mean back to one.
+    """
+    mode = str(mode)
+    if mode not in FLOW_LOSS_WEIGHTS:
+        raise ValueError(f"unknown flow loss weighting mode {mode!r}")
+    flat_t = t.flatten(1)[:, 0].float().clamp(float(eps), 1.0 - float(eps))
+    if mode == "none":
+        return torch.ones_like(flat_t)
+    gamma = float(gamma)
+    if gamma <= 0.0:
+        raise ValueError("flow_loss_weight_gamma must be positive")
+    snr = flat_t.square() / (1.0 - flat_t).square().clamp_min(float(eps))
+    if mode == "min-snr-v":
+        base = torch.minimum(snr, torch.full_like(snr, gamma))
+    elif mode == "soft-min-snr-v":
+        base = (snr * gamma) / (snr + gamma).clamp_min(float(eps))
+    weight = base / (snr + 1.0).clamp_min(float(eps))
+    if normalize:
+        weight = weight / weight.mean().detach().clamp_min(float(eps))
+    return weight
 
 
 def latent_stats_enabled(stats):
@@ -2037,6 +2065,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
                        semantic_cond=None, time_sampling="uniform", time_logit_mean=0.0,
                        time_logit_std=1.0, time_shift=1.0,
                        latent_stats=None, consistency_w=0.0,
+                       flow_loss_weight="none", flow_loss_weight_gamma=5.0,
+                       flow_loss_weight_normalize=True,
                        text_aligner=None, text_align_w=0.0,
                        feature_aligner=None, image_features=None, feature_align_w=0.0,
                        repa_aligner=None, repa_w=0.0):
@@ -2054,10 +2084,25 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
         pred, flow_features = flow(zt, t, cond_model, return_features=True)
     else:
         pred = flow(zt, t, cond_model)
-    velocity = F.mse_loss(pred, target)
+    if flow_loss_weight == "none":
+        velocity = F.mse_loss(pred, target)
+        velocity_unweighted = velocity
+        velocity_weights = torch.ones(z1.shape[0], device=z1.device)
+    else:
+        per_sample_velocity = (pred - target).float().pow(2).flatten(1).mean(dim=1)
+        velocity_weights = flow_loss_time_weights(
+            t, mode=flow_loss_weight, gamma=flow_loss_weight_gamma,
+            normalize=flow_loss_weight_normalize)
+        velocity_unweighted = per_sample_velocity.mean()
+        velocity = (per_sample_velocity * velocity_weights.to(per_sample_velocity.dtype)).mean()
     total = velocity
     parts = {
         "velocity_mse": velocity.detach(),
+        "velocity_mse_unweighted": velocity_unweighted.detach(),
+        "velocity_weight_mean": velocity_weights.detach().mean(),
+        "velocity_weight_min": velocity_weights.detach().min(),
+        "velocity_weight_max": velocity_weights.detach().max(),
+        "velocity_weight_gamma": torch.tensor(float(flow_loss_weight_gamma), device=z1.device),
         "time_mean": t.detach().mean(),
         "time_std": t.detach().std(unbiased=False),
         "time_shift": torch.tensor(float(time_shift), device=z1.device),
@@ -2149,13 +2194,17 @@ def flow_endpoint_metrics(flow, z1, cond, time_sampling="uniform", time_logit_me
 
 def latent_flow_loss(flow, z1, cond, cond_drop=0.0, time_sampling="uniform",
                      time_logit_mean=0.0, time_logit_std=1.0, time_shift=1.0,
-                     latent_stats=None):
+                     latent_stats=None, flow_loss_weight="none",
+                     flow_loss_weight_gamma=5.0, flow_loss_weight_normalize=True):
     loss, _parts = latent_flow_losses(flow, z1, cond, cond_drop=cond_drop,
                                       time_sampling=time_sampling,
                                       time_logit_mean=time_logit_mean,
                                       time_logit_std=time_logit_std,
                                       time_shift=time_shift,
-                                      latent_stats=latent_stats)
+                                      latent_stats=latent_stats,
+                                      flow_loss_weight=flow_loss_weight,
+                                      flow_loss_weight_gamma=flow_loss_weight_gamma,
+                                      flow_loss_weight_normalize=flow_loss_weight_normalize)
     return loss
 
 
@@ -2984,6 +3033,12 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "flow_consistency_w": float(ckpt.get(
             "flow_consistency_w", report.get("flow_consistency_w", 0.0))),
         "time_shift": float(ckpt.get("time_shift", report.get("time_shift", 1.0))),
+        "flow_loss_weight": str(ckpt.get(
+            "flow_loss_weight", report.get("flow_loss_weight", "none"))),
+        "flow_loss_weight_gamma": float(ckpt.get(
+            "flow_loss_weight_gamma", report.get("flow_loss_weight_gamma", 5.0))),
+        "flow_loss_weight_normalize": bool(ckpt.get(
+            "flow_loss_weight_normalize", report.get("flow_loss_weight_normalize", True))),
         "sample_time_shift": float(ckpt.get(
             "sample_time_shift", report.get("sample_time_shift",
                                              report.get("time_shift", 1.0)))),
@@ -3487,6 +3542,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       dit_qk_norm=False, dit_attn_impl="manual",
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0, time_shift=1.0,
+                      flow_loss_weight="none", flow_loss_weight_gamma=5.0,
+                      flow_loss_weight_normalize=True,
                       latent_normalize="none", latent_stat_samples=512,
                       ae_intervention_w=0.0, ae_factor_orth_w=0.0,
                       semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
@@ -3536,6 +3593,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
     if time_shift <= 0.0:
         raise ValueError("time_shift must be positive")
+    if flow_loss_weight not in FLOW_LOSS_WEIGHTS:
+        raise ValueError(f"unknown flow loss weighting mode {flow_loss_weight!r}")
+    if flow_loss_weight_gamma <= 0.0:
+        raise ValueError("flow_loss_weight_gamma must be positive")
     if latent_normalize not in ("none", "global", "channel"):
         raise ValueError(f"unknown latent normalization mode {latent_normalize!r}")
     if image_crop_mode not in ("center", "random", "none"):
@@ -3823,6 +3884,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     semantic_w=flow_semantic_w, semantic_cond=fact_cond,
                     time_sampling=time_sampling, time_logit_mean=time_logit_mean,
                     time_logit_std=time_logit_std, time_shift=time_shift,
+                    flow_loss_weight=flow_loss_weight,
+                    flow_loss_weight_gamma=flow_loss_weight_gamma,
+                    flow_loss_weight_normalize=flow_loss_weight_normalize,
                     consistency_w=flow_consistency_w,
                     text_aligner=text_aligner, text_align_w=flow_text_align_w,
                     feature_aligner=image_feature_aligner, image_features=image_features,
@@ -4001,6 +4065,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "time_logit_mean": float(time_logit_mean),
         "time_logit_std": float(time_logit_std),
         "time_shift": float(time_shift),
+        "flow_loss_weight": flow_loss_weight,
+        "flow_loss_weight_gamma": float(flow_loss_weight_gamma),
+        "flow_loss_weight_normalize": bool(flow_loss_weight_normalize),
         "sample_time_shift": float(time_shift),
         "latent_stat_samples": int(latent_stat_samples),
         **latent_stats_report(latent_stats),
@@ -4081,6 +4148,8 @@ def selftest():
                                             flow_semantic_w=0.25, ae_intervention_w=0.1,
                                             ae_factor_orth_w=0.05,
                                             flow_consistency_w=0.1,
+                                            flow_loss_weight="min-snr-v",
+                                            flow_loss_weight_gamma=5.0,
                                             latent_normalize="channel",
                                             latent_stat_samples=8,
                                             cfg_interval=(0.0, 0.5),
@@ -4089,6 +4158,9 @@ def selftest():
     assert report2["cond_drop"] == 0.5 and report2["cfg_scale"] == 1.5
     assert report2["flow_semantic_w"] == 0.25
     assert report2["flow_consistency_w"] == 0.1
+    assert report2["flow_loss_weight"] == "min-snr-v"
+    assert report2["flow_loss_weight_gamma"] == 5.0
+    assert report2["flow_loss_weight_normalize"] is True
     assert report2["ae_intervention_w"] == 0.1
     assert report2["ae_factor_orth_w"] == 0.05
     assert report2["latent_normalize"] == "channel" and report2["latent_norm_n"] == 8
@@ -4098,6 +4170,8 @@ def selftest():
     assert "latent_factor_orth_loss" in report2["last_ae"]
     assert "semantic_endpoint_ce" in report2["last_flow"]
     assert "endpoint_consistency_mse" in report2["last_flow"]
+    assert "velocity_mse_unweighted" in report2["last_flow"]
+    assert report2["last_flow"]["velocity_weight_max"] >= report2["last_flow"]["velocity_weight_min"]
     img2 = sample_images(ae2, flow2, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
                          seed=1, cfg_scale=1.5)
     assert img2.shape == (1, 3, 32, 32)
@@ -4523,6 +4597,15 @@ def main(argv=None):
                     help="stddev for --time-sampling logit-normal")
     ap.add_argument("--time-shift", type=float, default=1.0, dest="time_shift",
                     help="rectified-flow data-time shift; >1 biases training toward noise")
+    ap.add_argument("--flow-loss-weight", default="none", choices=FLOW_LOSS_WEIGHTS,
+                    dest="flow_loss_weight",
+                    help="per-timestep velocity loss weighting")
+    ap.add_argument("--flow-loss-weight-gamma", type=float, default=5.0,
+                    dest="flow_loss_weight_gamma",
+                    help="gamma for Min-SNR-style flow loss weighting")
+    ap.add_argument("--no-flow-loss-weight-normalize", action="store_true",
+                    dest="no_flow_loss_weight_normalize",
+                    help="do not normalize weighted velocity loss to batch mean 1")
     ap.add_argument("--sample-time-shift", type=float, default=None,
                     dest="sample_time_shift",
                     help="override checkpoint sample-time shift; omitted uses checkpoint metadata")
@@ -4719,6 +4802,9 @@ def main(argv=None):
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
         time_logit_std=args.time_logit_std,
         time_shift=args.time_shift,
+        flow_loss_weight=args.flow_loss_weight,
+        flow_loss_weight_gamma=args.flow_loss_weight_gamma,
+        flow_loss_weight_normalize=not args.no_flow_loss_weight_normalize,
         latent_normalize=args.latent_normalize,
         latent_stat_samples=args.latent_stat_samples,
         ae_intervention_w=args.ae_intervention_w,
@@ -4881,6 +4967,9 @@ def main(argv=None):
         "time_logit_mean": args.time_logit_mean,
         "time_logit_std": args.time_logit_std,
         "time_shift": args.time_shift,
+        "flow_loss_weight": args.flow_loss_weight,
+        "flow_loss_weight_gamma": args.flow_loss_weight_gamma,
+        "flow_loss_weight_normalize": not args.no_flow_loss_weight_normalize,
         "sample_time_shift": report.get("sample_time_shift", args.time_shift),
         "latent_normalize": args.latent_normalize,
         "latent_stat_samples": args.latent_stat_samples,

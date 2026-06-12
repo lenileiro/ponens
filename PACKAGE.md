@@ -714,6 +714,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
     --image-flow-cache-shard-size 2048 --image-flow-cache-batch 64 \
     --image-sample-steps 8 --image-flow-consistency-w 0.05 \
     --image-time-sampling logit-normal --image-time-shift 3.0 \
+    --image-flow-loss-weight min-snr-v --image-flow-loss-weight-gamma 5.0 \
     --image-latent-normalize channel --image-latent-stat-samples 4096 \
     --image-eval-sweep --image-eval-split eval --image-sample-grid --fast --go
 ```
@@ -1087,6 +1088,13 @@ manifest `image_embedding` rows, separately from endpoint feature alignment, and
 settings as `--image-flow-repa-w`, `--image-flow-repa-steps`, and
 `--image-flow-repa-embed-dim`; disk latent caches now carry image embeddings when either endpoint
 feature alignment or REPA needs them.
+
+Image-49 adds optional Min-SNR-style velocity loss weighting for rectified-flow training.
+`--flow-loss-weight none|min-snr-v|soft-min-snr-v` keeps the exact legacy objective by default,
+but can reweight per-example velocity MSE by the data-time SNR with batch-mean normalization.
+Reports/checkpoints record the weighting mode, gamma, and observed weight range; RunPod exposes the
+same controls as `--image-flow-loss-weight`, `--image-flow-loss-weight-gamma`, and
+`--image-no-flow-loss-weight-normalize`.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
