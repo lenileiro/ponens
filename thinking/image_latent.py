@@ -2658,6 +2658,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     dit_head_width_mult = int(ckpt.get("dit_head_width_mult",
                                        report.get("dit_head_width_mult", 1)))
     cond_mode = ckpt.get("cond_mode", report.get("cond_mode", "facts"))
+    data_mode = ckpt.get("data_mode", report.get("data_mode", "synthetic_factors"))
     cond_dim = int(ckpt.get("cond_dim", report.get("cond_dim", len(FACT_VOCAB))))
     caption_cond_source = ckpt.get("caption_cond_source",
                                    report.get("caption_cond_source", "tokens"))
@@ -2669,6 +2670,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     image_feature_embed_dim = int(ckpt.get(
         "image_feature_embed_dim", report.get("image_feature_embed_dim", 128)) or 128)
     caption_max_len = int(ckpt.get("caption_max_len", report.get("caption_max_len", 32)) or 32)
+    if cond_mode == "text" and data_mode != "image_manifest":
+        caption_max_len = 32
     prompt_templates = tuple(ckpt.get("prompt_templates", report.get("prompt_templates", []))
                              or DEFAULT_PROMPT_TEMPLATES)
     prompt_vocab = ckpt.get("prompt_vocab") or None
@@ -2764,7 +2767,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
             "flow_ema_effective_decay", report.get("flow_ema_effective_decay", 0.0))),
         **latent_stats_report(latent_stats),
         "cond_mode": cond_mode,
-        "data_mode": ckpt.get("data_mode", report.get("data_mode", "synthetic_factors")),
+        "data_mode": data_mode,
         "image_manifest": ckpt.get("image_manifest", report.get("image_manifest", "")),
         "image_root": ckpt.get("image_root", report.get("image_root", "")),
         "image_split": ckpt.get("image_split", report.get("image_split", "")),
@@ -4540,7 +4543,7 @@ def main(argv=None):
         "image_crop_mode": report.get("image_crop_mode", ""),
         "image_hflip_prob": report.get("image_hflip_prob", 0.0),
         "caption_vocab_max": args.caption_vocab_max,
-        "caption_max_len": args.caption_max_len,
+        "caption_max_len": report.get("caption_max_len", 0),
         "caption_cond_source": report.get("caption_cond_source", ""),
         "text_embedding_in_dim": report.get("text_embedding_in_dim", 0),
         "image_embedding_in_dim": report.get("image_embedding_in_dim", 0),
