@@ -33,6 +33,7 @@ import csv
 import itertools
 import io
 import json
+import math
 import os
 import re
 import urllib.request
@@ -937,20 +938,41 @@ def qa_choice_target(rec):
 
 def qa_context_question_spans(rec):
     toks = list(rec.tokens)
+    ctx_start = 2 if len(toks) >= 2 and toks[0] == "context" and toks[1] == ":" else 0
+    try:
+        choices_at = toks.index("choices")
+    except ValueError:
+        choices_at = len(toks)
     try:
         q_at = toks.index("question")
     except ValueError:
-        return 0, len(toks), 0, len(toks)
-    ctx_start = 2 if len(toks) >= 2 and toks[0] == "context" and toks[1] == ":" else 0
-    ctx_end = q_at
+        return ctx_start, choices_at, 0, 0
+    ctx_end = min(q_at, choices_at)
     q_start = q_at + 1
     if q_start < len(toks) and toks[q_start] == ":":
         q_start += 1
-    try:
-        q_end = toks.index("choices", q_start)
-    except ValueError:
-        q_end = len(toks)
+    q_end = choices_at if choices_at >= q_start else len(toks)
     return ctx_start, ctx_end, q_start, q_end
+
+
+def _subsequence_positions(tokens, pattern):
+    tokens = tuple(tokens)
+    pattern = tuple(pattern)
+    if not pattern or len(pattern) > len(tokens):
+        return []
+    out = []
+    n = len(pattern)
+    for i in range(0, len(tokens) - n + 1):
+        if tokens[i:i + n] == pattern:
+            out.extend(range(i, i + n))
+    return sorted(set(out))
+
+
+def qa_context_positions_for_span(rec, start, end):
+    ctx_start, ctx_end, _q_start, _q_end = qa_context_question_spans(rec)
+    if ctx_start >= ctx_end or start >= end:
+        return []
+    return _subsequence_positions(rec.tokens[ctx_start:ctx_end], rec.tokens[start:end])
 
 
 def build_vocab(records, base_vocab=None):
@@ -1039,6 +1061,7 @@ class TextFactLM(nn.Module):
         self.choice_context = nn.Linear(d, d, bias=False)
         self.choice_value = nn.Linear(d, d, bias=False)
         self.choice_threshold = nn.Parameter(torch.zeros(()))
+        self.choice_context_mass_scale = nn.Parameter(torch.tensor(-3.0))
         self.fact_schema = fact_schema
         self.fact_heads = nn.ModuleDict()
         if fact_schema is not None:
@@ -1074,6 +1097,31 @@ class TextFactLM(nn.Module):
             out[self.fact_schema.keys[idx]] = head(pooled)
         return out
 
+    def _choice_question(self, prefix, pooled, row, q_start, q_end):
+        if q_start < q_end:
+            q_tokens = self.choice_query(prefix[row, q_start:q_end])
+            return q_tokens, q_tokens.mean(0)
+        return None, torch.zeros_like(pooled[row])
+
+    def _choice_question_context_scores(self, q_tokens, ctx_src):
+        if q_tokens is None or ctx_src is None or not ctx_src.numel():
+            return None
+        scale = ctx_src.shape[-1] ** -0.5
+        pair = torch.matmul(q_tokens, ctx_src.t()) * scale
+        return torch.logsumexp(pair, 0) - math.log(max(1, q_tokens.shape[0]))
+
+    def _choice_context_mass_score(self, rec, start, end, q_ctx_scores):
+        if q_ctx_scores is None:
+            return None
+        positions = qa_context_positions_for_span(rec, start, end)
+        if not positions:
+            return torch.full((), -math.log(max(2, int(q_ctx_scores.numel()) + 1)),
+                              dtype=q_ctx_scores.dtype, device=q_ctx_scores.device)
+        idx = torch.tensor(positions, dtype=torch.long, device=q_ctx_scores.device)
+        log_mass = torch.logsumexp(q_ctx_scores[idx], 0) - torch.logsumexp(q_ctx_scores, 0)
+        uniform_log_mass = math.log(len(positions)) - math.log(max(1, int(q_ctx_scores.numel())))
+        return log_mass - uniform_log_mass
+
     def choice_logits(self, txt, records):
         """Return candidate logits plus a learned threshold logit for `none`.
 
@@ -1103,23 +1151,28 @@ class TextFactLM(nn.Module):
                 out.append((rec, [], None))
                 continue
             ctx_start, ctx_end, q_start, q_end = qa_context_question_spans(rec)
-            q_src = prefix[r, q_start:q_end] if q_start < q_end else pooled[r:r + 1]
-            q_vec = self.choice_query(q_src).mean(0)
+            q_tokens, q_vec = self._choice_question(prefix, pooled, r, q_start, q_end)
             ctx_src = context_values[r, ctx_start:ctx_end] if ctx_start < ctx_end else None
+            q_ctx_scores = self._choice_question_context_scores(q_tokens, ctx_src)
             fallback_ctx = self.choice_context(pooled[r])
             logits = []
             ids = []
             for choice_id, start, end in choices:
                 span = values[r, start:end].mean(0)
                 if ctx_src is not None and ctx_src.numel():
-                    cand_query = q_vec + span
-                    attn = (ctx_src * cand_query).sum(-1) * scale
+                    attn = (ctx_src * span).sum(-1) * scale
+                    if q_ctx_scores is not None:
+                        attn = attn + q_ctx_scores
                     ctx_vec = (attn.softmax(-1).unsqueeze(-1) * ctx_src).sum(0)
                 else:
                     ctx_vec = fallback_ctx
                 logits.append(((q_vec * span).sum()
                                + (ctx_vec * span).sum()
                                + (q_vec * ctx_vec).sum()) * scale)
+                mass_score = self._choice_context_mass_score(rec, start, end, q_ctx_scores)
+                if mass_score is not None:
+                    logits[-1] = logits[-1] + F.softplus(
+                        self.choice_context_mass_scale) * mass_score
                 ids.append(choice_id)
             out.append((rec, ids, torch.stack(logits)))
         return out
@@ -1236,16 +1289,20 @@ def semantic_loss(model, txt, records, schema):
     return sum(losses) / len(losses)
 
 
-def choice_loss(model, txt, records, answer_w=1.0, none_w=1.0):
+def choice_loss(model, txt, records, answer_w=1.0, none_w=1.0,
+                answer_margin=0.0, none_margin=0.0):
     answer_losses = []
     none_losses = []
     threshold = model.choice_threshold
+    answer_margin_t = torch.tensor(float(answer_margin), dtype=torch.float32, device=txt.device)
+    none_margin_t = torch.tensor(float(none_margin), dtype=torch.float32, device=txt.device)
     for rec, ids, logits in model.choice_candidate_logits(txt, records):
         target = qa_choice_target(rec)
         if target is None or logits is None:
             continue
         if target == "none":
-            none_losses.append(F.softplus(torch.logsumexp(logits, 0) - threshold))
+            none_losses.append(F.softplus(torch.logsumexp(logits, 0) + none_margin_t
+                                          - threshold))
         else:
             try:
                 target_idx = ids.index(target)
@@ -1253,7 +1310,7 @@ def choice_loss(model, txt, records, answer_w=1.0, none_w=1.0):
                 continue
             target_t = torch.tensor([target_idx], dtype=torch.long, device=txt.device)
             rank_loss = F.cross_entropy(logits[None], target_t)
-            evidence_loss = F.softplus(threshold - logits[target_idx])
+            evidence_loss = F.softplus(threshold + answer_margin_t - logits[target_idx])
             answer_losses.append(rank_loss + evidence_loss)
     groups = []
     weights = []
@@ -1269,16 +1326,42 @@ def choice_loss(model, txt, records, answer_w=1.0, none_w=1.0):
 
 
 def _subsequence_token_positions(tokens, pattern):
-    tokens = tuple(tokens)
-    pattern = tuple(pattern)
-    if not pattern or len(pattern) > len(tokens):
+    return _subsequence_positions(tokens, pattern)
+
+
+def choice_target_context_positions(rec):
+    target = qa_choice_target(rec)
+    if target is None or target == "none":
         return []
-    out = []
-    n = len(pattern)
-    for i in range(0, len(tokens) - n + 1):
-        if tokens[i:i + n] == pattern:
-            out.extend(range(i, i + n))
-    return sorted(set(out))
+    choices = {choice_id: (start, end)
+               for choice_id, start, end in qa_choice_spans(rec)}
+    if target not in choices:
+        return []
+    ctx_start, ctx_end, _q_start, _q_end = qa_context_question_spans(rec)
+    if ctx_start >= ctx_end:
+        return []
+    choice_start, choice_end = choices[target]
+    return _subsequence_token_positions(
+        rec.tokens[ctx_start:ctx_end],
+        rec.tokens[choice_start:choice_end])
+
+
+def choice_answer_context_positions(rec):
+    positions = choice_target_context_positions(rec)
+    if positions:
+        return positions
+    if qa_choice_target(rec) != "none":
+        return []
+    if not isinstance(rec.meta, dict) or rec.meta.get("negative") != "answer_absent":
+        return []
+    answer = rec.meta.get("answer_text")
+    if not answer:
+        return []
+    ctx_start, ctx_end, _q_start, _q_end = qa_context_question_spans(rec)
+    if ctx_start >= ctx_end:
+        return []
+    return _subsequence_token_positions(rec.tokens[ctx_start:ctx_end],
+                                        split_words(answer))
 
 
 def choice_context_attention_loss(model, txt, records):
@@ -1299,17 +1382,37 @@ def choice_context_attention_loss(model, txt, records):
         if ctx_start >= ctx_end:
             continue
         choice_start, choice_end = choices[target]
-        context_tokens = rec.tokens[ctx_start:ctx_end]
-        choice_tokens = rec.tokens[choice_start:choice_end]
-        positions = _subsequence_token_positions(context_tokens, choice_tokens)
+        positions = choice_target_context_positions(rec)
         if not positions:
             continue
-        q_src = prefix[r, q_start:q_end] if q_start < q_end else pooled[r:r + 1]
-        q_vec = model.choice_query(q_src).mean(0)
+        _q_tokens, q_vec = model._choice_question(prefix, pooled, r, q_start, q_end)
         span = values[r, choice_start:choice_end].mean(0)
         ctx_src = context_values[r, ctx_start:ctx_end]
         cand_query = q_vec + span
         attn = (ctx_src * cand_query).sum(-1) * scale
+        target_idx = torch.tensor(positions, dtype=torch.long, device=txt.device)
+        losses.append(torch.logsumexp(attn, 0) - torch.logsumexp(attn[target_idx], 0))
+    if not losses:
+        return torch.tensor(0.0, device=txt.device)
+    return sum(losses) / len(losses)
+
+
+def choice_question_context_attention_loss(model, txt, records):
+    prefix, pooled = model.encode_text(txt)
+    context_values = model.choice_context(prefix)
+    losses = []
+    for r, rec in enumerate(records):
+        positions = choice_answer_context_positions(rec)
+        if not positions:
+            continue
+        ctx_start, ctx_end, q_start, q_end = qa_context_question_spans(rec)
+        if ctx_start >= ctx_end or q_start >= q_end:
+            continue
+        q_tokens, _q_vec = model._choice_question(prefix, pooled, r, q_start, q_end)
+        ctx_src = context_values[r, ctx_start:ctx_end]
+        attn = model._choice_question_context_scores(q_tokens, ctx_src)
+        if attn is None:
+            continue
         target_idx = torch.tensor(positions, dtype=torch.long, device=txt.device)
         losses.append(torch.logsumexp(attn, 0) - torch.logsumexp(attn[target_idx], 0))
     if not losses:
@@ -1523,11 +1626,79 @@ def choice_control_contrast_loss(model, txt, records, pair_ids, margin=0.0):
     return sum(losses) / len(losses)
 
 
+def choice_question_context_scores(model, txt, records):
+    prefix, pooled = model.encode_text(txt)
+    context_values = model.choice_context(prefix)
+    scores = {}
+    for r, rec in enumerate(records):
+        positions = choice_target_context_positions(rec)
+        if not positions:
+            continue
+        ctx_start, ctx_end, q_start, q_end = qa_context_question_spans(rec)
+        if ctx_start >= ctx_end or q_start >= q_end:
+            continue
+        q_tokens, _q_vec = model._choice_question(prefix, pooled, r, q_start, q_end)
+        ctx_src = context_values[r, ctx_start:ctx_end]
+        attn = model._choice_question_context_scores(q_tokens, ctx_src)
+        if attn is None:
+            continue
+        target_idx = torch.tensor(positions, dtype=torch.long, device=txt.device)
+        scores[rec.rec_id] = torch.logsumexp(attn[target_idx], 0) - torch.logsumexp(attn, 0)
+    return scores
+
+
+def choice_question_context_swap_batch(sources, rng, pairs, swap_groups=None):
+    if not sources or pairs <= 0:
+        return [], []
+    groups = swap_groups if swap_groups is not None else choice_question_swap_groups(sources)
+    if not groups:
+        return [], []
+    rows = []
+    ids = []
+    tries = 0
+    while len(ids) < int(pairs) and tries < int(pairs) * 4:
+        rec, donors = groups[int(rng.integers(len(groups)))]
+        donor = donors[int(rng.integers(len(donors)))]
+        swapped = _qa_question_swap_record(rec, donor)
+        if swapped is not None:
+            full_id = f"{rec.rec_id}:qctx_full:{len(ids)}"
+            swap_id = f"{rec.rec_id}:qctx_swap:{len(ids)}"
+            full = TextRecord(rec_id=full_id, split=rec.split, tokens=rec.tokens,
+                              facts=rec.facts, group=rec.group, kind=rec.kind,
+                              base_id=rec.base_id, changed=rec.changed, meta=rec.meta)
+            swapped = TextRecord(rec_id=swap_id, split=rec.split,
+                                 tokens=swapped.tokens, facts=rec.facts,
+                                 group=rec.group, kind=swapped.kind,
+                                 base_id=rec.rec_id, changed=rec.changed,
+                                 meta=rec.meta)
+            rows.extend([full, swapped])
+            ids.append((full_id, swap_id))
+        tries += 1
+    return rows, ids
+
+
+def choice_question_context_contrast_loss(model, txt, records, pair_ids, margin=0.0):
+    scores = choice_question_context_scores(model, txt, records)
+    losses = []
+    margin_t = torch.tensor(float(margin), dtype=torch.float32, device=txt.device)
+    for full_id, swap_id in pair_ids:
+        full_score = scores.get(full_id)
+        swap_score = scores.get(swap_id)
+        if full_score is not None and swap_score is not None:
+            losses.append(F.softplus(swap_score + margin_t - full_score))
+    if not losses:
+        return torch.tensor(0.0, device=txt.device)
+    return sum(losses) / len(losses)
+
+
 def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               device=DEV, log_every=100, semantic_w=0.5, balance_by="none",
               prefix="text", decode_w=1.0, choice_w=0.0,
               choice_answer_w=1.0, choice_none_w=1.0,
-              choice_context_w=0.0,
+              choice_answer_margin=0.0, choice_none_margin=0.0,
+              choice_context_w=0.0, choice_question_context_w=0.0,
+              choice_question_context_contrast_w=0.0,
+              choice_question_context_margin=0.0,
               choice_pair_w=0.0, choice_pair_margin=0.0,
               choice_control_w=0.0, choice_control_contrast_w=0.0,
               choice_control_margin=0.0):
@@ -1539,9 +1710,11 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
     train_buckets = bucket_records(train_records, balance_by)
     pair_groups = choice_pair_groups(train_records) if choice_pair_w else []
     control_sources = (choice_control_source_records(train_records)
-                       if choice_control_w or choice_control_contrast_w else [])
+                       if (choice_control_w or choice_control_contrast_w
+                           or choice_question_context_contrast_w) else [])
     swap_groups = (choice_question_swap_groups(control_sources)
-                   if choice_control_contrast_w and control_sources else [])
+                   if ((choice_control_contrast_w or choice_question_context_contrast_w)
+                       and control_sources) else [])
     for st in range(1, steps + 1):
         model.train()
         if balance_by == "none":
@@ -1552,9 +1725,13 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
         dec_loss = token_loss(model(txt, ids), ids, pad=vocab.pad)
         sem_loss = semantic_loss(model, txt, rec_batch, model.fact_schema)
         ch_loss = choice_loss(model, txt, rec_batch,
-                              answer_w=choice_answer_w, none_w=choice_none_w)
+                              answer_w=choice_answer_w, none_w=choice_none_w,
+                              answer_margin=choice_answer_margin,
+                              none_margin=choice_none_margin)
         ctx_loss = (choice_context_attention_loss(model, txt, rec_batch)
                     if choice_context_w else torch.tensor(0.0, device=device))
+        qctx_loss = (choice_question_context_attention_loss(model, txt, rec_batch)
+                     if choice_question_context_w else torch.tensor(0.0, device=device))
         if choice_pair_w and pair_groups:
             pair_records = choice_pair_batch_records(pair_groups, rng, max(1, batch // 2))
             pair_txt, _pair_ids = pack(pair_records, vocab, device)
@@ -1568,7 +1745,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
             if control_records:
                 control_txt, _control_ids = pack(control_records, vocab, device)
                 control_loss = choice_loss(model, control_txt, control_records,
-                                           answer_w=0.0, none_w=1.0)
+                                           answer_w=0.0, none_w=1.0,
+                                           none_margin=choice_none_margin)
             else:
                 control_loss = torch.tensor(0.0, device=device)
         else:
@@ -1586,8 +1764,24 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 contrast_loss = torch.tensor(0.0, device=device)
         else:
             contrast_loss = torch.tensor(0.0, device=device)
+        if choice_question_context_contrast_w and control_sources and swap_groups:
+            qctx_contrast_records, qctx_contrast_pairs = choice_question_context_swap_batch(
+                control_sources, rng, max(1, batch // 2),
+                swap_groups=swap_groups)
+            if qctx_contrast_records and qctx_contrast_pairs:
+                qctx_contrast_txt, _qctx_contrast_ids = pack(qctx_contrast_records,
+                                                             vocab, device)
+                qctx_contrast_loss = choice_question_context_contrast_loss(
+                    model, qctx_contrast_txt, qctx_contrast_records,
+                    qctx_contrast_pairs, margin=choice_question_context_margin)
+            else:
+                qctx_contrast_loss = torch.tensor(0.0, device=device)
+        else:
+            qctx_contrast_loss = torch.tensor(0.0, device=device)
         loss = (decode_w * dec_loss + semantic_w * sem_loss + choice_w * ch_loss
                 + choice_context_w * ctx_loss
+                + choice_question_context_w * qctx_loss
+                + choice_question_context_contrast_w * qctx_contrast_loss
                 + choice_pair_w * pair_loss + choice_control_w * control_loss
                 + choice_control_contrast_w * contrast_loss)
         opt.zero_grad()
@@ -1597,6 +1791,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
             print(f"  {prefix} {st}/{steps} loss {loss.item():.3f} "
                   f"dec {dec_loss.item():.3f} sem {sem_loss.item():.3f} "
                   f"choice {ch_loss.item():.3f} ctx {ctx_loss.item():.3f} "
+                  f"qctx {qctx_loss.item():.3f} "
+                  f"qctx-contrast {qctx_contrast_loss.item():.3f} "
                   f"pair {pair_loss.item():.3f} "
                   f"control {control_loss.item():.3f} "
                   f"ctrl-contrast {contrast_loss.item():.3f}", flush=True)
@@ -1607,6 +1803,10 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                 device=DEV, log_every=100, semantic_w=0.5, balance_by="none",
                 decode_w=1.0, choice_w=0.0, choice_answer_w=1.0,
                 choice_none_w=1.0, choice_context_w=0.0,
+                choice_answer_margin=0.0, choice_none_margin=0.0,
+                choice_question_context_w=0.0,
+                choice_question_context_contrast_w=0.0,
+                choice_question_context_margin=0.0,
                 choice_pair_w=0.0, choice_pair_margin=0.0,
                 choice_control_w=0.0, choice_control_contrast_w=0.0,
                 choice_control_margin=0.0):
@@ -1620,7 +1820,13 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                      balance_by=balance_by, prefix="text", decode_w=decode_w,
                      choice_w=choice_w, choice_answer_w=choice_answer_w,
                      choice_none_w=choice_none_w,
-                     choice_context_w=choice_context_w, choice_pair_w=choice_pair_w,
+                     choice_answer_margin=choice_answer_margin,
+                     choice_none_margin=choice_none_margin,
+                     choice_context_w=choice_context_w,
+                     choice_question_context_w=choice_question_context_w,
+                     choice_question_context_contrast_w=choice_question_context_contrast_w,
+                     choice_question_context_margin=choice_question_context_margin,
+                     choice_pair_w=choice_pair_w,
                      choice_pair_margin=choice_pair_margin,
                      choice_control_w=choice_control_w,
                      choice_control_contrast_w=choice_control_contrast_w,
@@ -1762,6 +1968,13 @@ def semantic_record_errors(model, vocab, records, device=DEV, n=0, seed=0):
 
 def choice_record_errors(model, vocab, records, device=DEV, n=0, seed=0):
     """Return choice-QA records whose candidate head currently predicts the wrong target."""
+    errors, _correct, report = choice_record_outcomes(
+        model, vocab, records, device=device, n=n, seed=seed)
+    return errors, report
+
+
+def choice_record_outcomes(model, vocab, records, device=DEV, n=0, seed=0):
+    """Return currently wrong and right choice-QA records under the candidate head."""
     candidates = [r for r in records if qa_choice_target(r) is not None]
     sampled = bool(n and n < len(candidates))
     if sampled:
@@ -1769,6 +1982,8 @@ def choice_record_errors(model, vocab, records, device=DEV, n=0, seed=0):
         idx = rng.choice(len(candidates), size=n, replace=False)
         candidates = [candidates[int(i)] for i in idx]
     errors = []
+    correct = []
+    by_kind = {}
     n_errors = n_choices = 0
     model.eval()
     with torch.no_grad():
@@ -1783,16 +1998,61 @@ def choice_record_errors(model, vocab, records, device=DEV, n=0, seed=0):
                 if logits is not None and target in ids:
                     pred = ids[int(logits.argmax(-1))]
                     wrong = pred != target
+                kind_row = by_kind.setdefault(
+                    rec.kind, {"records": 0, "errors": 0, "correct": 0})
+                kind_row["records"] += 1
                 if wrong:
                     errors.append(rec)
+                    kind_row["errors"] += 1
                     n_errors += 1
+                else:
+                    correct.append(rec)
+                    kind_row["correct"] += 1
                 n_choices += 1
-    return errors, {"n_records": len(candidates),
-                    "sampled": sampled,
-                    "n_error_records": len(errors),
-                    "n_facts": n_choices,
-                    "n_errors": n_errors,
-                    "choice_error_rate": n_errors / max(1, n_choices)}
+    report = {"n_records": len(candidates),
+              "sampled": sampled,
+              "n_error_records": len(errors),
+              "n_correct_records": len(correct),
+              "n_facts": n_choices,
+              "n_errors": n_errors,
+              "choice_error_rate": n_errors / max(1, n_choices),
+              "by_kind": by_kind}
+    return errors, correct, report
+
+
+def sample_records_per_kind(records, rng, per_kind):
+    if per_kind <= 0:
+        return [], {}
+    buckets = {}
+    for rec in records:
+        buckets.setdefault(rec.kind, []).append(rec)
+    out = []
+    counts = {}
+    for kind, rows in sorted(buckets.items()):
+        n = min(int(per_kind), len(rows))
+        if n <= 0:
+            continue
+        if n < len(rows):
+            idx = rng.choice(len(rows), size=n, replace=False)
+            picked = [rows[int(i)] for i in idx]
+        else:
+            picked = list(rows)
+        out.extend(picked)
+        counts[kind] = len(picked)
+    return out, counts
+
+
+def semantic_record_outcomes(model, vocab, records, device=DEV, n=0, seed=0):
+    errors, report = semantic_record_errors(model, vocab, records, device=device,
+                                            n=n, seed=seed)
+    error_ids = {r.rec_id for r in errors}
+    candidates = list(records)
+    if n and n < len(candidates):
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=n, replace=False)
+        candidates = [candidates[int(i)] for i in idx]
+    correct = [r for r in candidates if r.rec_id not in error_ids]
+    return errors, correct, report | {"n_correct_records": len(correct)}
 
 
 def bucket_fact_eval(model, vocab, records, device=DEV, n=0, seed=0):
@@ -2521,7 +2781,11 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         counterfactual_n=0, kind_free_n=0, balance_by="none",
         fact_n=0, kind_fact_n=0, artifact_n=0, decode_w=1.0, choice_w=0.0,
         choice_answer_w=1.0, choice_none_w=1.0,
-        choice_context_w=0.0, choice_pair_w=0.0, choice_pair_margin=0.0,
+        choice_answer_margin=0.0, choice_none_margin=0.0,
+        choice_context_w=0.0, choice_question_context_w=0.0,
+        choice_question_context_contrast_w=0.0,
+        choice_question_context_margin=0.0,
+        choice_pair_w=0.0, choice_pair_margin=0.0,
         choice_control_w=0.0,
         choice_control_contrast_w=0.0, choice_control_margin=0.0):
     records = load_records(data)
@@ -2530,7 +2794,13 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                balance_by=balance_by, decode_w=decode_w,
                                choice_w=choice_w, choice_answer_w=choice_answer_w,
                                choice_none_w=choice_none_w,
+                               choice_answer_margin=choice_answer_margin,
+                               choice_none_margin=choice_none_margin,
                                choice_context_w=choice_context_w,
+                               choice_question_context_w=choice_question_context_w,
+                               choice_question_context_contrast_w=(
+                                   choice_question_context_contrast_w),
+                               choice_question_context_margin=choice_question_context_margin,
                                choice_pair_w=choice_pair_w,
                                choice_pair_margin=choice_pair_margin,
                                choice_control_w=choice_control_w,
@@ -2542,7 +2812,13 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
               "choice_w": float(choice_w),
               "choice_answer_w": float(choice_answer_w),
               "choice_none_w": float(choice_none_w),
+              "choice_answer_margin": float(choice_answer_margin),
+              "choice_none_margin": float(choice_none_margin),
               "choice_context_w": float(choice_context_w),
+              "choice_question_context_w": float(choice_question_context_w),
+              "choice_question_context_contrast_w": float(
+                  choice_question_context_contrast_w),
+              "choice_question_context_margin": float(choice_question_context_margin),
               "choice_pair_w": float(choice_pair_w),
               "choice_pair_margin": float(choice_pair_margin),
               "choice_control_w": float(choice_control_w),
@@ -2587,11 +2863,16 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      kind_free_n=0, balance_by="kind", fact_n=0, kind_fact_n=0,
                      artifact_n=0, decode_w=1.0, choice_w=0.0,
                      choice_answer_w=1.0, choice_none_w=1.0,
-                     choice_context_w=0.0, choice_pair_w=0.0,
+                     choice_answer_margin=0.0, choice_none_margin=0.0,
+                     choice_context_w=0.0, choice_question_context_w=0.0,
+                     choice_question_context_contrast_w=0.0,
+                     choice_question_context_margin=0.0,
+                     choice_pair_w=0.0,
                      choice_pair_margin=0.0,
                      choice_control_w=0.0, choice_control_contrast_w=0.0,
                      choice_control_margin=0.0, study_rounds=1,
                      study_strategy="all", study_probe_n=0, study_hard_max=0,
+                     study_anchor_correct_per_kind=0,
                      study_select_best=False, study_score_metric="both",
                      study_retention_w=1.0, study_control_w=1.0,
                      study_kind_w=1.0, study_require_positive_score=True):
@@ -2632,7 +2913,13 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "choice_w": float(choice_w),
               "choice_answer_w": float(choice_answer_w),
               "choice_none_w": float(choice_none_w),
+              "choice_answer_margin": float(choice_answer_margin),
+              "choice_none_margin": float(choice_none_margin),
               "choice_context_w": float(choice_context_w),
+              "choice_question_context_w": float(choice_question_context_w),
+              "choice_question_context_contrast_w": float(
+                  choice_question_context_contrast_w),
+              "choice_question_context_margin": float(choice_question_context_margin),
               "choice_pair_w": float(choice_pair_w),
               "choice_pair_margin": float(choice_pair_margin),
               "choice_control_w": float(choice_control_w),
@@ -2643,6 +2930,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "study_strategy": study_strategy,
               "study_probe_n": int(study_probe_n),
               "study_hard_max": int(study_hard_max),
+              "study_anchor_correct_per_kind": int(study_anchor_correct_per_kind),
               "study_select_best": bool(study_select_best),
               "study_score_metric": study_score_metric,
               "study_retention_w": float(study_retention_w),
@@ -2689,16 +2977,30 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
     best_score = best_components["score"]
     for round_i in range(max(1, int(study_rounds))):
         round_seed = seed + 1009 * round_i
+        anchor_records = []
+        anchor_counts = {}
         if study_strategy == "errors":
             if study_score_metric == "choice":
-                hard_records, hard_report = choice_record_errors(
-                    model, vocab, train_study_records, device=device, n=study_probe_n,
-                    seed=round_seed)
+                if study_anchor_correct_per_kind:
+                    hard_records, correct_records, hard_report = choice_record_outcomes(
+                        model, vocab, train_study_records, device=device,
+                        n=study_probe_n, seed=round_seed)
+                else:
+                    hard_records, hard_report = choice_record_errors(
+                        model, vocab, train_study_records, device=device,
+                        n=study_probe_n, seed=round_seed)
+                    correct_records = []
                 hard_report = hard_report | {"error_metric": "choice"}
             else:
-                hard_records, hard_report = semantic_record_errors(
-                    model, vocab, train_study_records, device=device, n=study_probe_n,
-                    seed=round_seed)
+                if study_anchor_correct_per_kind:
+                    hard_records, correct_records, hard_report = semantic_record_outcomes(
+                        model, vocab, train_study_records, device=device,
+                        n=study_probe_n, seed=round_seed)
+                else:
+                    hard_records, hard_report = semantic_record_errors(
+                        model, vocab, train_study_records, device=device,
+                        n=study_probe_n, seed=round_seed)
+                    correct_records = []
                 hard_report = hard_report | {"error_metric": "semantic"}
             if study_hard_max and len(hard_records) > study_hard_max:
                 rng = np.random.default_rng(round_seed + 17)
@@ -2709,7 +3011,15 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
             else:
                 hard_report = hard_report | {"capped": False,
                                              "n_error_records_used": len(hard_records)}
-            round_fit_records = hard_records + train_replay_records
+            if study_anchor_correct_per_kind and correct_records:
+                rng = np.random.default_rng(round_seed + 53)
+                anchor_records, anchor_counts = sample_records_per_kind(
+                    correct_records, rng, study_anchor_correct_per_kind)
+            hard_report = hard_report | {
+                "n_anchor_records": len(anchor_records),
+                "anchor_records_by_kind": anchor_counts,
+            }
+            round_fit_records = hard_records + anchor_records + train_replay_records
             if not hard_records:
                 round_fit_records = train_study_records + train_replay_records
         elif study_strategy == "all":
@@ -2724,6 +3034,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                               "fit_records": len(round_fit_records),
                               "study_fit_records": max(0, len(round_fit_records)
                                                        - len(train_replay_records)),
+                              "anchor_records": len(anchor_records),
+                              "anchor_records_by_kind": anchor_counts,
                               "replay_fit_records": len(train_replay_records),
                               "hard_examples": hard_report})
         fit_model(model, vocab, round_fit_records, steps=steps, batch=batch, lr=lr,
@@ -2731,7 +3043,12 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   balance_by=balance_by, prefix=f"study-r{round_i + 1}",
                   decode_w=decode_w, choice_w=choice_w,
                   choice_answer_w=choice_answer_w, choice_none_w=choice_none_w,
+                  choice_answer_margin=choice_answer_margin,
+                  choice_none_margin=choice_none_margin,
                   choice_context_w=choice_context_w,
+                  choice_question_context_w=choice_question_context_w,
+                  choice_question_context_contrast_w=choice_question_context_contrast_w,
+                  choice_question_context_margin=choice_question_context_margin,
                   choice_pair_w=choice_pair_w,
                   choice_pair_margin=choice_pair_margin,
                   choice_control_w=choice_control_w,
@@ -2937,14 +3254,22 @@ def selftest():
                               pad=choice_vocab.pad, fact_schema=choice_schema).to("cpu")
     choice_txt, _choice_ids = pack(choice_eval, choice_vocab, "cpu")
     assert torch.isfinite(choice_loss(choice_model, choice_txt, choice_eval))
+    assert torch.isfinite(choice_loss(choice_model, choice_txt, choice_eval,
+                                      answer_margin=0.25, none_margin=0.25))
     assert torch.isfinite(choice_context_attention_loss(choice_model, choice_txt,
                                                         choice_eval))
+    assert torch.isfinite(choice_question_context_attention_loss(choice_model, choice_txt,
+                                                                 choice_eval))
     first_target = qa_choice_target(choice_eval[0])
     first_spans = {cid: (start, end) for cid, start, end in qa_choice_spans(choice_eval[0])}
     ctx_start, ctx_end, _q_start, _q_end = qa_context_question_spans(choice_eval[0])
     assert _subsequence_token_positions(
         choice_eval[0].tokens[ctx_start:ctx_end],
         choice_eval[0].tokens[first_spans[first_target][0]:first_spans[first_target][1]])
+    assert choice_target_context_positions(choice_eval[0])
+    assert qa_context_positions_for_span(choice_eval[0],
+                                         first_spans[first_target][0],
+                                         first_spans[first_target][1])
     choice_eval_report = choice_head_eval(choice_model, choice_vocab, choice_eval, device="cpu")
     assert choice_eval_report["n_records"] == len(choice_eval)
     choice_hard, choice_hard_report = choice_record_errors(
@@ -2952,6 +3277,10 @@ def selftest():
     assert choice_hard_report["n_records"] == 2
     assert "choice_error_rate" in choice_hard_report
     assert isinstance(choice_hard, list)
+    choice_errs, choice_correct, choice_outcome_report = choice_record_outcomes(
+        choice_model, choice_vocab, choice_eval, device="cpu", n=2, seed=0)
+    assert len(choice_errs) + len(choice_correct) == choice_outcome_report["n_records"]
+    assert "by_kind" in choice_outcome_report
     swap_rec = _qa_question_swap_record(choice_norm[0], choice_norm[1])
     assert swap_rec is not None and swap_rec.facts == choice_norm[0].facts
     donor_q = tuple(choice_norm[1].tokens[
@@ -2961,6 +3290,13 @@ def selftest():
         swap_rec.tokens.index("question"):
         swap_rec.tokens.index("choices")])
     assert donor_q == swapped_q
+    q_only = _qa_ablation_record(choice_norm[0], "question")
+    c_only = _qa_ablation_record(choice_norm[0], "context")
+    assert q_only is not None and c_only is not None
+    q_ctx_start, q_ctx_end, q_q_start, q_q_end = qa_context_question_spans(q_only)
+    c_ctx_start, c_ctx_end, c_q_start, c_q_end = qa_context_question_spans(c_only)
+    assert q_ctx_start == q_ctx_end and q_q_start < q_q_end
+    assert c_ctx_start < c_ctx_end and c_q_start == c_q_end == 0
     squad_choice_neg, _neg_seen, neg_stats = _squad_records_from_payload(
         squad_payload, "train", 0, np.random.default_rng(2), "fixture",
         max_context_tokens=8, max_question_tokens=8, max_answer_tokens=3,
@@ -2982,6 +3318,11 @@ def selftest():
         assert rec["meta"]["negative"] == "answer_absent"
         assert rec["meta"]["answer_text"].lower() not in rec["meta"]["choices"]
     pair_norm = [normalize_record(r, idx=i) for i, r in enumerate(squad_choice_absent)]
+    absent_norm = [r for r in pair_norm if r.kind == "squad_choice_absent_negative"]
+    assert absent_norm and choice_answer_context_positions(absent_norm[0])
+    anchors, anchor_counts = sample_records_per_kind(pair_norm, np.random.default_rng(9),
+                                                     per_kind=1)
+    assert anchors and all(n == 1 for n in anchor_counts.values())
     pair_groups = choice_pair_groups(pair_norm)
     assert len(pair_groups) == 3
     pair_rows = choice_pair_batch_records(pair_groups, np.random.default_rng(4), pairs=2)
@@ -3003,6 +3344,10 @@ def selftest():
             control_sources, np.random.default_rng(7), pairs=2,
             swap_groups=swap_groups)
         assert len(swap_rows) == 4 and len(swap_pairs) == 2
+        qctx_rows, qctx_pairs = choice_question_context_swap_batch(
+            control_sources, np.random.default_rng(8), pairs=2,
+            swap_groups=swap_groups)
+        assert len(qctx_rows) == 4 and len(qctx_pairs) == 2
     pair_vocab = build_vocab(pair_rows)
     pair_schema = build_fact_schema(pair_rows)
     pair_model = TextFactLM(len(pair_vocab), d=32, layers=1, heads=4,
@@ -3023,6 +3368,16 @@ def selftest():
     contrast_txt, _contrast_ids = pack(contrast_rows, contrast_vocab, "cpu")
     assert torch.isfinite(choice_control_contrast_loss(
         contrast_model, contrast_txt, contrast_rows, contrast_pairs))
+    if swap_groups:
+        qctx_vocab = build_vocab(qctx_rows)
+        qctx_schema = build_fact_schema(qctx_rows)
+        qctx_model = TextFactLM(len(qctx_vocab), d=32, layers=1, heads=4,
+                                pad=qctx_vocab.pad, fact_schema=qctx_schema).to("cpu")
+        qctx_txt, _qctx_ids = pack(qctx_rows, qctx_vocab, "cpu")
+        qctx_scores = choice_question_context_scores(qctx_model, qctx_txt, qctx_rows)
+        assert set(qctx_scores).issubset({r.rec_id for r in qctx_rows})
+        assert torch.isfinite(choice_question_context_contrast_loss(
+            qctx_model, qctx_txt, qctx_rows, qctx_pairs))
     grounded = grounded_records(max_train=4, max_eval=3, counterfactual_n=2, seed=0)
     assert any(r["split"] == "train" and len(r["facts"]) > 1
                for r in grounded)
@@ -3234,8 +3589,23 @@ def main(argv=None):
                     help="relative loss weight for non-none QA choice targets")
     ap.add_argument("--choice-none-w", type=float, default=1.0, dest="choice_none_w",
                     help="relative loss weight for none QA choice targets")
+    ap.add_argument("--choice-answer-margin", type=float, default=0.0,
+                    dest="choice_answer_margin",
+                    help="margin by which positive QA choices must clear the none threshold")
+    ap.add_argument("--choice-none-margin", type=float, default=0.0,
+                    dest="choice_none_margin",
+                    help="margin by which none QA records must keep candidates below threshold")
     ap.add_argument("--choice-context-w", type=float, default=0.0, dest="choice_context_w",
                     help="weight for target-choice context span localization loss")
+    ap.add_argument("--choice-question-context-w", type=float, default=0.0,
+                    dest="choice_question_context_w",
+                    help="weight for question-to-answer-span context binding loss")
+    ap.add_argument("--choice-question-context-contrast-w", type=float, default=0.0,
+                    dest="choice_question_context_contrast_w",
+                    help="weight for full-vs-swapped question context-binding contrast loss")
+    ap.add_argument("--choice-question-context-margin", type=float, default=0.0,
+                    dest="choice_question_context_margin",
+                    help="margin for full-vs-swapped question context-binding contrast loss")
     ap.add_argument("--choice-pair-w", type=float, default=0.0, dest="choice_pair_w",
                     help="weight for paired positive-vs-none QA choice evidence loss")
     ap.add_argument("--choice-pair-margin", type=float, default=0.0,
@@ -3271,6 +3641,9 @@ def main(argv=None):
                     help="sample this many train records when mining errors; 0 = all")
     ap.add_argument("--study-hard-max", type=int, default=0,
                     help="cap hard examples used per round; 0 = no cap")
+    ap.add_argument("--study-anchor-correct-per-kind", type=int, default=0,
+                    help=("for error self-study, mix in this many currently-correct "
+                          "study records per kind as retention anchors"))
     ap.add_argument("--study-select-best", action="store_true",
                     help="evaluate each study round and restore the best scoring weights")
     ap.add_argument("--study-score-metric", choices=("semantic", "teacher", "both", "min",
@@ -3353,7 +3726,13 @@ def main(argv=None):
                          choice_w=args.choice_w,
                          choice_answer_w=args.choice_answer_w,
                          choice_none_w=args.choice_none_w,
+                         choice_answer_margin=args.choice_answer_margin,
+                         choice_none_margin=args.choice_none_margin,
                          choice_context_w=args.choice_context_w,
+                         choice_question_context_w=args.choice_question_context_w,
+                         choice_question_context_contrast_w=(
+                             args.choice_question_context_contrast_w),
+                         choice_question_context_margin=args.choice_question_context_margin,
                          choice_pair_w=args.choice_pair_w,
                          choice_pair_margin=args.choice_pair_margin,
                          choice_control_w=args.choice_control_w,
@@ -3363,6 +3742,7 @@ def main(argv=None):
                          study_strategy=args.study_strategy,
                          study_probe_n=args.study_probe_n,
                          study_hard_max=args.study_hard_max,
+                         study_anchor_correct_per_kind=args.study_anchor_correct_per_kind,
                          study_select_best=args.study_select_best,
                          study_score_metric=args.study_score_metric,
                          study_retention_w=args.study_retention_w,
@@ -3378,7 +3758,12 @@ def main(argv=None):
         fact_n=args.fact_n, kind_fact_n=args.kind_fact_n, artifact_n=args.artifact_n,
         decode_w=args.decode_w, choice_w=args.choice_w,
         choice_answer_w=args.choice_answer_w, choice_none_w=args.choice_none_w,
+        choice_answer_margin=args.choice_answer_margin,
+        choice_none_margin=args.choice_none_margin,
         choice_context_w=args.choice_context_w,
+        choice_question_context_w=args.choice_question_context_w,
+        choice_question_context_contrast_w=args.choice_question_context_contrast_w,
+        choice_question_context_margin=args.choice_question_context_margin,
         choice_pair_w=args.choice_pair_w,
         choice_pair_margin=args.choice_pair_margin,
         choice_control_w=args.choice_control_w,

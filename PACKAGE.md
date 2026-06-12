@@ -352,6 +352,21 @@ python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
     --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
     --out runs/text_study_squad_choice_contextloc025_pair_2round_smoke.json
+python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_qctxmass_ansabs_swapcontrast010_pair_2round_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
+    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
+    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
+    --choice-context-w 0.25 --choice-question-context-w 0.25 \
+    --choice-question-context-contrast-w 0.10 --choice-question-context-margin 0.0 \
+    --choice-pair-w 1.0 --choice-pair-margin 0.0 \
+    --choice-control-w 0 --choice-control-contrast-w 0 --choice-control-margin 0.0 \
+    --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_qctxmass_ansabs_swapcontrast010_pair_2round_smoke.json
 ```
 
 Current local Text-0 SNLI baseline (20k train / 1k dev, 1.5k steps, d=192, 4 layers, 6 heads,
@@ -545,6 +560,51 @@ controls remained below threshold (`context_only` gap **-0.0375**, question-swap
 Adding same-paragraph question-swap contrast on top made the small head worse, not better. The
 current evidence says span localization helps candidate evidence, but the architecture still needs
 a stronger question-conditioned binding mechanism before a reading update should be accepted.
+
+The scorer now includes that stronger binding path: candidate context evidence is gated by a
+question-to-context attention distribution instead of letting the context stand in for the question
+when a control ablates it. `--choice-question-context-w` trains that question-only attention to
+locate the data-labeled answer span, and `--choice-question-context-contrast-w` asks the full
+question's answer-span attention to outrank a same-context swapped question's attention to the
+original answer. This is the first objective to pass all held-out choice shortcut controls in a
+round: with `--choice-context-w 0.25 --choice-question-context-w 0.25
+--choice-question-context-contrast-w 0.10`, round 1 reached sampled choice accuracy **0.425** and
+control gaps `question_only` **0.100**, `context_only` **0.1625**, `question_swap` **0.0769**.
+The selector still rejected the update because the real-answer `squad_choice` kind regressed
+from **0.200** to **0.150** while the negative kinds improved (**0.700** / **0.750**). Raising
+positive answer weight to **2.0** flipped the failure: `squad_choice` rose to **0.250**, but both
+negative kinds collapsed to **0.000** and controls failed. The current bottleneck is therefore not
+a missing scalar weight; it is preserving positive and negative answerability simultaneously while
+maintaining the new binding controls.
+
+Two retention/calibration probes make that bottleneck sharper. `--study-anchor-correct-per-kind`
+mixes currently-correct train records back into error-mined self-study batches, so the model
+teaches itself from misses without forgetting examples it already handles. On the qctx
+swap-contrast smoke, 32 anchors per kind were correctly added (**96** anchors total; **32** each
+for `squad_choice`, answer-absent, and swapped-question negatives), but the accepted checkpoint
+still stayed at round **0**: round 1 reached choice accuracy **0.450** while `squad_choice`
+regressed to **0.100** and question-swap control fell to **0.000**. `--choice-answer-margin`
+adds a margin between positive evidence and the learned `none` threshold without changing class
+weights; at margin **0.5**, round 1 reached **0.2375** choice accuracy and kept negatives usable
+(**0.400** / **0.500**), but `squad_choice` still regressed to **0.150** and question-only /
+question-swap controls remained just under threshold (**0.0375** / **0.0385**). The evidence now
+points away from more sampling or scalar loss knobs and toward a representation that models
+answerability as a joint relation between question predicate, context span, and candidate span.
+
+The current scorer also adds a small learned context-mass term: if the question-to-context
+distribution places more mass on a candidate's matching context span than a uniform distribution
+would, the candidate logit gets learned support. Answer-absent negatives now still supervise the
+question-to-context distribution toward the true answer span, so "none" is learned as an uncovered
+answer relation instead of as missing answer evidence. With this path and the same qctx contrast,
+round 2 reached choice accuracy **0.4125**, preserved all three choice kinds
+(`squad_choice` **0.400**, answer-absent **0.500**, swapped-question **0.550**), and retained
+replay (**0.965** semantic), but controls failed again (`question_only` **-0.0125**,
+`question_swap` **-0.0769**), so the selector kept round **0**. Adding
+`--choice-control-contrast-w 0.25` did not rescue it: the best round stayed rejected, with
+question-only and context-only gaps negative in round 1 and all three shortcut controls negative
+by round 2. That makes the next architectural target clearer: the model needs an answerability
+head that separates "the question finds an answer span" from "this candidate covers that span",
+rather than pushing both jobs through the candidate logits alone.
 
 ## 3b. Image grounding: synthetic visual factors first
 
