@@ -22,15 +22,18 @@ linearly usable after compression instead of becoming another entangled bottlene
 """
 import argparse
 import json
+import math
 import os
+import tempfile
+from contextlib import nullcontext
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .image_data import (build_caption_vocab, caption_ids, read_image_manifest,
-                         sample_image_text_batch, summarize_records)
+from .image_data import (build_caption_vocab, caption_ids, load_image_tensor,
+                         read_image_manifest, sample_image_text_batch, summarize_records)
 from .image_flow import FACT_VOCAB, fact_condition
 from .vision import COLORS, SHAPES, DEV, ObjectSpec, object_facts, render_object, sample_object
 
@@ -105,6 +108,7 @@ class SemanticAutoencoder(nn.Module):
     def __init__(self, latent_ch=16, hidden=64):
         super().__init__()
         self.latent_ch = int(latent_ch)
+        self.downsample = 4
         self.encoder = nn.Sequential(
             nn.Conv2d(3, hidden // 2, 3, stride=2, padding=1),
             nn.GELU(),
@@ -149,6 +153,119 @@ class SemanticAutoencoder(nn.Module):
         out["latent"] = z
         out["recon"] = self.decode(z)
         return out
+
+
+def _norm(ch):
+    groups = min(8, int(ch))
+    while groups > 1 and int(ch) % groups:
+        groups -= 1
+    return nn.GroupNorm(groups, int(ch))
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            _norm(ch),
+            nn.GELU(),
+            nn.Conv2d(ch, ch, 3, padding=1),
+            _norm(ch),
+            nn.GELU(),
+            nn.Conv2d(ch, ch, 3, padding=1),
+        )
+
+    def forward(self, x):
+        return x + self.net(x)
+
+
+class ResidualAutoencoder(nn.Module):
+    """Deeper representation AE with configurable spatial compression.
+
+    This is still lightweight enough for local tests, but it has the shape we need for real
+    image work: residual stages, high-dimensional latents, and explicit downsample control.
+    """
+
+    def __init__(self, latent_ch=16, hidden=64, downsample=8, res_blocks=1):
+        super().__init__()
+        downsample = int(downsample)
+        if downsample < 2 or downsample & (downsample - 1):
+            raise ValueError("latent_downsample must be a power of two >= 2")
+        self.latent_ch = int(latent_ch)
+        self.downsample = downsample
+        self.res_blocks = int(res_blocks)
+        levels = int(math.log2(downsample))
+        stem_ch = max(8, hidden // 2)
+        enc = [nn.Conv2d(3, stem_ch, 3, padding=1)]
+        channels = [stem_ch]
+        ch = stem_ch
+        for i in range(levels):
+            out_ch = min(int(hidden) * (2 ** i), int(hidden) * 4)
+            enc.extend([nn.GELU(), nn.Conv2d(ch, out_ch, 4, stride=2, padding=1)])
+            enc.extend(ResidualBlock(out_ch) for _ in range(max(0, self.res_blocks)))
+            ch = out_ch
+            channels.append(ch)
+        enc.extend([nn.GELU(), nn.Conv2d(ch, latent_ch, 3, padding=1), _norm(latent_ch)])
+        self.encoder = nn.Sequential(*enc)
+
+        dec_ch = channels[-1]
+        dec = [nn.Conv2d(latent_ch, dec_ch, 3, padding=1)]
+        for level in reversed(range(levels)):
+            out_ch = channels[level]
+            dec.extend(ResidualBlock(dec_ch) for _ in range(max(0, self.res_blocks)))
+            dec.extend([nn.GELU(), nn.ConvTranspose2d(dec_ch, out_ch, 4,
+                                                      stride=2, padding=1)])
+            dec_ch = out_ch
+        dec.extend([nn.GELU(), nn.Conv2d(dec_ch, 3, 3, padding=1), nn.Tanh()])
+        self.decoder = nn.Sequential(*dec)
+        self.fact_pool = nn.AdaptiveAvgPool2d((2, 2))
+        self.color = nn.Sequential(
+            nn.Linear(latent_ch * 4, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, len(COLORS)),
+        )
+        self.shape = nn.Sequential(
+            nn.Linear(latent_ch * 4, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, len(SHAPES)),
+        )
+
+    def encode(self, x):
+        return self.encoder(x)
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def fact_logits(self, z):
+        pooled = self.fact_pool(z).flatten(1)
+        return {"color": self.color(pooled), "shape": self.shape(pooled)}
+
+    def forward(self, x):
+        z = self.encode(x)
+        out = self.fact_logits(z)
+        out["latent"] = z
+        out["recon"] = self.decode(z)
+        return out
+
+
+def make_autoencoder(ae_arch="semantic", latent_ch=16, hidden=64, latent_downsample=4,
+                     ae_res_blocks=1):
+    if ae_arch == "semantic":
+        if int(latent_downsample) != 4:
+            raise ValueError("semantic AE uses latent_downsample=4; use --ae-arch residual")
+        return SemanticAutoencoder(latent_ch=latent_ch, hidden=hidden)
+    if ae_arch == "residual":
+        return ResidualAutoencoder(latent_ch=latent_ch, hidden=hidden,
+                                   downsample=latent_downsample,
+                                   res_blocks=ae_res_blocks)
+    raise ValueError(f"unknown autoencoder architecture {ae_arch!r}")
+
+
+def ae_latent_shape(ae, size):
+    downsample = int(getattr(ae, "downsample", 4))
+    if int(size) % downsample:
+        raise ValueError(f"image size {size} must be divisible by AE downsample {downsample}")
+    side = int(size) // downsample
+    return int(ae.latent_ch), side, side
 
 
 class PromptConditioner(nn.Module):
@@ -495,7 +612,7 @@ class LatentMMDiTFlowNet(nn.Module):
 
 
 def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4,
-              cond_dim=None, dit_head_width_mult=1):
+              cond_dim=None, dit_head_width_mult=1, latent_max_tokens=256):
     if flow_arch == "conv":
         return LatentFlowNet(latent_ch=latent_ch, hidden=hidden, cond_dim=cond_dim)
     dit_head_width_mult = int(dit_head_width_mult)
@@ -507,21 +624,24 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
             heads -= 1
         return LatentDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth, heads=heads,
                                 cond_dim=cond_dim,
-                                head_width_mult=dit_head_width_mult)
+                                head_width_mult=dit_head_width_mult,
+                                max_tokens=latent_max_tokens)
     if flow_arch == "crossdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
             heads -= 1
         return LatentCrossDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth,
                                      heads=heads, cond_dim=cond_dim,
-                                     head_width_mult=dit_head_width_mult)
+                                     head_width_mult=dit_head_width_mult,
+                                     max_tokens=latent_max_tokens)
     if flow_arch == "mmdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
             heads -= 1
         return LatentMMDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth,
                                   heads=heads, cond_dim=cond_dim,
-                                  head_width_mult=dit_head_width_mult)
+                                  head_width_mult=dit_head_width_mult,
+                                  max_tokens=latent_max_tokens)
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
@@ -737,6 +857,71 @@ def estimate_latent_stats_records(ae, records, n=512, batch=64, seed=123, size=3
     }
 
 
+@torch.no_grad()
+def estimate_latent_stats_tensor(latents, n=512, seed=123, mode="none", eps=1.0e-6):
+    mode = str(mode)
+    if mode == "none":
+        return {"mode": "none", "n": 0}
+    if mode not in ("global", "channel"):
+        raise ValueError(f"unknown latent normalization mode {mode!r}")
+    latents = latents.detach().float().cpu()
+    if latents.ndim != 4:
+        raise ValueError(f"expected cached BCHW latents, got shape {tuple(latents.shape)}")
+    total = int(latents.shape[0])
+    if total <= 0:
+        raise ValueError("latent cache is empty")
+    n = min(max(1, int(n)), total)
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(total, size=n, replace=total < n)
+    z = latents[torch.tensor(idx, dtype=torch.long)].double()
+    if mode == "global":
+        mean = z.mean().view(1, 1, 1, 1)
+        std = z.std(unbiased=False).clamp_min(float(eps)).view(1, 1, 1, 1)
+    else:
+        mean = z.mean(dim=(0, 2, 3)).view(1, -1, 1, 1)
+        std = z.std(dim=(0, 2, 3), unbiased=False).clamp_min(float(eps)).view(1, -1, 1, 1)
+    return {
+        "mode": mode,
+        "n": int(n),
+        "mean": mean.float(),
+        "std": std.float(),
+    }
+
+
+@torch.no_grad()
+def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_records=0,
+                             batch=64, seed=0, size=32, device=DEV, precision="fp32"):
+    rows = list(records)
+    if not rows:
+        raise ValueError("cannot build latent cache from empty records")
+    rng = np.random.default_rng(seed)
+    if max_records and int(max_records) < len(rows):
+        chosen_idx = rng.choice(len(rows), size=int(max_records), replace=False)
+        rows = [rows[int(i)] for i in chosen_idx]
+    latents, captions = [], []
+    ae.eval()
+    for start in range(0, len(rows), max(1, int(batch))):
+        chunk = rows[start:start + max(1, int(batch))]
+        x = torch.stack([
+            load_image_tensor(rec.path, size=size, device=device)
+            for rec in chunk
+        ], dim=0)
+        with amp_autocast(device, precision):
+            z = ae.encode(x)
+        latents.append(z.detach().float().cpu())
+        captions.extend(rec.caption for rec in chunk)
+    cache = {
+        "latents": torch.cat(latents, dim=0).contiguous(),
+        "captions": captions,
+        "caption_ids": caption_ids(captions, prompt_vocab, max_len=caption_max_len,
+                                   device="cpu"),
+        "records": len(rows),
+        "latent_shape": tuple(int(x) for x in latents[0].shape[1:]),
+        "bytes": int(sum(z.numel() * z.element_size() for z in latents)),
+    }
+    return cache
+
+
 def latent_stats_state(stats):
     if not latent_stats_enabled(stats):
         return {"mode": "none", "n": int((stats or {}).get("n", 0))}
@@ -763,10 +948,103 @@ def latent_stats_report(stats):
     }
 
 
-def autoencoder_loss(out, x, yc, ys, fact_w=0.25):
-    recon = F.mse_loss(out["recon"], x)
+AE_RECON_LOSSES = ("mse", "l1", "hybrid")
+TRAIN_PRECISIONS = ("fp32", "bf16", "fp16")
+
+
+def _device_type(device):
+    return torch.device(device).type
+
+
+def amp_config(device, precision):
+    precision = str(precision)
+    if precision not in TRAIN_PRECISIONS:
+        raise ValueError(f"unknown training precision {precision!r}")
+    dev_type = _device_type(device)
+    enabled = precision != "fp32" and dev_type == "cuda"
+    dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[precision]
+    return {
+        "requested": precision,
+        "device_type": dev_type,
+        "enabled": bool(enabled),
+        "dtype": dtype,
+        "dtype_name": str(dtype).replace("torch.", ""),
+    }
+
+
+def amp_autocast(device, precision):
+    cfg = amp_config(device, precision)
+    if not cfg["enabled"]:
+        return nullcontext()
+    return torch.autocast(device_type=cfg["device_type"], dtype=cfg["dtype"], enabled=True)
+
+
+def amp_grad_scaler(device, precision):
+    cfg = amp_config(device, precision)
+    return torch.amp.GradScaler("cuda", enabled=bool(cfg["enabled"] and precision == "fp16"))
+
+
+def image_gradient_loss(pred, target):
+    dx_pred = pred[..., :, 1:] - pred[..., :, :-1]
+    dx_target = target[..., :, 1:] - target[..., :, :-1]
+    dy_pred = pred[..., 1:, :] - pred[..., :-1, :]
+    dy_target = target[..., 1:, :] - target[..., :-1, :]
+    return F.l1_loss(dx_pred, dx_target) + F.l1_loss(dy_pred, dy_target)
+
+
+def multiscale_recon_loss(pred, target, levels=3):
+    losses = []
+    cur_pred, cur_target = pred, target
+    for _ in range(max(1, int(levels))):
+        losses.append(F.l1_loss(cur_pred, cur_target))
+        if min(cur_pred.shape[-2:]) < 4:
+            break
+        cur_pred = F.avg_pool2d(cur_pred, kernel_size=2, stride=2)
+        cur_target = F.avg_pool2d(cur_target, kernel_size=2, stride=2)
+    return torch.stack(losses).mean()
+
+
+def reconstruction_loss_parts(pred, target, mode="mse", grad_w=0.0, ms_w=0.0,
+                              latent=None, latent_reg_w=0.0):
+    if mode not in AE_RECON_LOSSES:
+        raise ValueError(f"unknown AE reconstruction loss {mode!r}")
+    mse = F.mse_loss(pred, target)
+    l1 = F.l1_loss(pred, target)
+    if mode == "mse":
+        base = mse
+    elif mode == "l1":
+        base = l1
+    else:
+        base = 0.5 * (mse + l1)
+    loss = base
+    parts = {
+        "recon_mse": mse.detach(),
+        "recon_l1": l1.detach(),
+        "recon_base": base.detach(),
+    }
+    if grad_w > 0.0:
+        grad = image_gradient_loss(pred, target)
+        loss = loss + float(grad_w) * grad
+        parts["recon_grad_l1"] = grad.detach()
+    if ms_w > 0.0:
+        ms = multiscale_recon_loss(pred, target)
+        loss = loss + float(ms_w) * ms
+        parts["recon_multiscale_l1"] = ms.detach()
+    if latent is not None and latent_reg_w > 0.0:
+        lat = latent.float().pow(2).mean()
+        loss = loss + float(latent_reg_w) * lat
+        parts["latent_l2"] = lat.detach()
+    return loss, parts
+
+
+def autoencoder_loss(out, x, yc, ys, fact_w=0.25, recon_loss="mse", grad_w=0.0,
+                     ms_w=0.0, latent_reg_w=0.0):
+    recon, parts = reconstruction_loss_parts(
+        out["recon"], x, mode=recon_loss, grad_w=grad_w, ms_w=ms_w,
+        latent=out.get("latent"), latent_reg_w=latent_reg_w)
     facts = F.cross_entropy(out["color"], yc) + F.cross_entropy(out["shape"], ys)
-    return recon + fact_w * facts, {"recon_mse": recon.detach(), "fact_ce": facts.detach()}
+    parts["fact_ce"] = facts.detach()
+    return recon + fact_w * facts, parts
 
 
 def flow_uses_cond_tokens(flow):
@@ -1213,6 +1491,12 @@ def caption_condition(captions, conditioner, vocab, max_len=64, device=DEV, retu
     return conditioner(ids, return_tokens=return_tokens)
 
 
+def caption_condition_ids(ids, conditioner, device=DEV, return_tokens=False):
+    if conditioner is None:
+        raise ValueError("caption id conditioning requires conditioner")
+    return conditioner(ids.to(device=device), return_tokens=return_tokens)
+
+
 @torch.no_grad()
 def guided_velocity(flow, z, t, cond, cfg_scale=1.0):
     """Classifier-free guidance in latent velocity space."""
@@ -1362,7 +1646,7 @@ def save_sample_grid(ae, flow, path, size=32, device=DEV, cond_mode="facts", con
     cond = model_condition(specs, fact_cond, cond_mode=cond_mode, conditioner=conditioner,
                            prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
                            rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
-    sample = sample_images(ae, flow, cond, latent_shape=(ae.latent_ch, size // 4, size // 4),
+    sample = sample_images(ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            semantic_cond=fact_cond, semantic_guidance_w=semantic_guidance_w,
                            semantic_guidance_mode=semantic_guidance_mode,
@@ -1400,7 +1684,7 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
     captions = [rec.caption for rec in chosen]
     cond = caption_condition(captions, conditioner, prompt_vocab, max_len=caption_max_len,
                              device=device, return_tokens=flow_uses_cond_tokens(flow))
-    sample = sample_images(ae, flow, cond, latent_shape=(ae.latent_ch, size // 4, size // 4),
+    sample = sample_images(ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            sample_method=sample_method, cfg_interval=cfg_interval)
     cols = int(np.ceil(np.sqrt(n)))
@@ -1431,7 +1715,7 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_s
     flow.eval()
     got_c = got_s = got_both = total = 0
     mses = []
-    latent_shape = (ae.latent_ch, size // 4, size // 4)
+    latent_shape = ae_latent_shape(ae, size)
     for ci, color in enumerate(COLORS):
         for si, shape in enumerate(SHAPES):
             spec = ObjectSpec("p0", color, shape)
@@ -1521,7 +1805,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
     cond = model_condition([spec], fact_cond, cond_mode=cond_mode, conditioner=conditioner,
                            prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
                            rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
-    sample = sample_images(ae, flow, cond, latent_shape=(ae.latent_ch, size // 4, size // 4),
+    sample = sample_images(ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            semantic_cond=fact_cond, semantic_guidance_w=semantic_guidance_w,
                            semantic_guidance_mode=semantic_guidance_mode,
@@ -1612,7 +1896,7 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                                     max_len=caption_max_len, device=device,
                                     return_tokens=flow_uses_cond_tokens(flow))
     sample = sample_images(ae, flow, sample_cond,
-                           latent_shape=(ae.latent_ch, size // 4, size // 4),
+                           latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            sample_method=sample_method, cfg_interval=cfg_interval)
     report = {
@@ -1682,8 +1966,15 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     ckpt = torch.load(path, map_location=device)
     report = ckpt.get("report", {})
     latent_ch = int(ckpt.get("latent_ch", report.get("latent_ch", 16)))
+    image_size = int(ckpt.get("image_size", report.get("image_size", 32)))
     hidden = int(ckpt.get("hidden", report.get("hidden", 64)))
     flow_arch = ckpt.get("flow_arch", report.get("flow_arch", "conv"))
+    ae_arch = ckpt.get("ae_arch", report.get("ae_arch", "semantic"))
+    latent_downsample = int(ckpt.get("latent_downsample",
+                                     report.get("latent_downsample", 4)))
+    ae_res_blocks = int(ckpt.get("ae_res_blocks", report.get("ae_res_blocks", 0)))
+    latent_max_tokens = int(ckpt.get("latent_max_tokens",
+                                     report.get("latent_max_tokens", 256)))
     dit_depth = int(ckpt.get("dit_depth", report.get("dit_depth", 3)))
     dit_heads = int(ckpt.get("dit_heads", report.get("dit_heads", 4)))
     dit_head_width_mult = int(ckpt.get("dit_head_width_mult",
@@ -1705,10 +1996,13 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
             cond_state = ckpt["conditioner_ema_state_dict"]
         conditioner.load_state_dict(cond_state)
         conditioner.eval()
-    ae = SemanticAutoencoder(latent_ch=latent_ch, hidden=hidden).to(device)
+    ae = make_autoencoder(ae_arch=ae_arch, latent_ch=latent_ch, hidden=hidden,
+                          latent_downsample=latent_downsample,
+                          ae_res_blocks=ae_res_blocks).to(device)
     flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
                      dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim,
-                     dit_head_width_mult=dit_head_width_mult).to(device)
+                     dit_head_width_mult=dit_head_width_mult,
+                     latent_max_tokens=latent_max_tokens).to(device)
     latent_stats = latent_stats_to_device(
         ckpt.get("latent_stats", {"mode": ckpt.get("latent_normalize", "none")}),
         device)
@@ -1725,7 +2019,12 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     return ae, flow, conditioner, prompt_vocab, prompt_templates, {
         "checkpoint": path,
         "checkpoint_report": report,
+        "image_size": image_size,
         "latent_ch": latent_ch,
+        "ae_arch": ae_arch,
+        "latent_downsample": int(getattr(ae, "downsample", latent_downsample)),
+        "ae_res_blocks": int(ae_res_blocks) if ae_arch == "residual" else 0,
+        "latent_max_tokens": int(latent_max_tokens),
         "hidden": hidden,
         "flow_arch": flow_arch,
         "dit_depth": dit_depth if flow_arch in ("dit", "crossdit", "mmdit") else 0,
@@ -1749,6 +2048,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "cond_mode": cond_mode,
         "data_mode": ckpt.get("data_mode", report.get("data_mode", "synthetic_factors")),
         "image_manifest": ckpt.get("image_manifest", report.get("image_manifest", "")),
+        "image_root": ckpt.get("image_root", report.get("image_root", "")),
         "image_split": ckpt.get("image_split", report.get("image_split", "")),
         "caption_max_len": caption_max_len,
         "cond_dim": cond_dim,
@@ -1793,12 +2093,42 @@ def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
     return rows
 
 
+@torch.no_grad()
+def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
+                       n=128, batch=64, seed=10, size=32, device=DEV, conditioner=None,
+                       prompt_vocab=None, caption_max_len=64, sample_method="euler",
+                       sample_methods=None, cfg_interval=DEFAULT_GUIDANCE_INTERVAL):
+    if sample_methods is None:
+        sample_methods = (sample_method,)
+    rows = []
+    for cfg_scale in cfg_scales:
+        for sample_steps in sample_steps_list:
+            for method in sample_methods:
+                row = evaluate_image_records(
+                    ae, flow, records, n=n, batch=batch, seed=seed, size=size,
+                    device=device, conditioner=conditioner, prompt_vocab=prompt_vocab,
+                    caption_max_len=caption_max_len, cfg_scale=float(cfg_scale),
+                    sample_steps=int(sample_steps), sample_method=method,
+                    cfg_interval=cfg_interval)
+                row["semantic_guidance_w"] = 0.0
+                row["semantic_guidance_mode"] = "none"
+                row["semantic_guidance_interval"] = list(DEFAULT_GUIDANCE_INTERVAL)
+                row["sweep_key"] = (
+                    f"cfg={float(cfg_scale):g};steps={int(sample_steps)};"
+                    f"method={method};cfgint={format_interval(cfg_interval)}"
+                )
+                rows.append(row)
+    return rows
+
+
 SWEEP_METRICS = (
     "sample_roundtrip_color_acc",
     "sample_roundtrip_shape_acc",
     "sample_roundtrip_both_acc",
     "conditional_sample_mse",
+    "caption_sample_mse",
     "sample_center_target_mse",
+    "recon_mse",
     "latent_velocity_mse",
     "latent_endpoint_mse",
     "latent_endpoint_consistency_mse",
@@ -1908,7 +2238,10 @@ def aggregate_sweep_rows(rows):
             "eval_seeds": [int(r["eval_seed"]) for r in group if "eval_seed" in r],
         }
         for metric in SWEEP_METRICS:
-            vals = np.asarray([float(r[metric]) for r in group], dtype=np.float64)
+            vals = np.asarray([float(r[metric]) for r in group if metric in r],
+                              dtype=np.float64)
+            if vals.size == 0:
+                continue
             agg[f"{metric}_mean"] = float(vals.mean())
             agg[f"{metric}_std"] = float(vals.std())
             agg[f"{metric}_min"] = float(vals.min())
@@ -1924,7 +2257,9 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         semantic_guidance_weights=None, semantic_guidance_mode="decoded",
                         sample_method="euler", sample_methods=None,
                         cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
-                        semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
+                        semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                        eval_image_manifest="", eval_image_root="", eval_image_split="eval",
+                        eval_image_min_aesthetic=None, eval_image_max_records=0):
     if weight_mode is None:
         weight_mode = "ema" if prefer_ema else "raw"
     if weight_mode not in EVAL_WEIGHT_MODES:
@@ -1935,11 +2270,82 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
         ae, flow, conditioner, prompt_vocab, prompt_templates, meta = load_checkpoint(
             path, device=device, prefer_ema=(mode == "ema"))
         actual_mode = "ema" if meta["ema_loaded"] else "raw"
+        eval_size = int(size or meta.get("image_size", 32) or 32)
+        manifest_path = eval_image_manifest
+        if not manifest_path and meta.get("data_mode") == "image_manifest":
+            manifest_path = meta.get("image_manifest", "")
+        if meta.get("data_mode") == "image_manifest" and not manifest_path:
+            raise ValueError(
+                "image-manifest checkpoints require --eval-image-manifest for checkpoint eval"
+            )
+        if manifest_path and meta["cond_mode"] != "text":
+            raise ValueError("manifest checkpoint eval requires a text-conditioned checkpoint")
+        if manifest_path:
+            guidance_values = [float(semantic_guidance_w)]
+            if semantic_guidance_weights is not None:
+                guidance_values.extend(float(w) for w in semantic_guidance_weights)
+            if any(abs(w) > 0.0 for w in guidance_values):
+                raise ValueError(
+                    "manifest checkpoint eval has captions but no canonical fact labels; "
+                    "keep semantic guidance weights at 0"
+                )
+            split = eval_image_split or "eval"
+            image_root = eval_image_root or meta.get("image_root", "")
+            records = read_image_manifest(
+                manifest_path, root=image_root, split=split,
+                min_aesthetic=eval_image_min_aesthetic,
+                max_records=eval_image_max_records)
+            rows = []
+            for eval_seed in eval_seeds:
+                for row in image_record_sweep(
+                        ae, flow, records, cfg_scales=cfg_scales,
+                        sample_steps_list=sample_steps_list, n=n, batch=batch,
+                        seed=int(eval_seed), size=eval_size, device=device,
+                        conditioner=conditioner, prompt_vocab=prompt_vocab,
+                        caption_max_len=meta["caption_max_len"],
+                        sample_method=sample_method, sample_methods=sample_methods,
+                        cfg_interval=cfg_interval):
+                    row["eval_seed"] = int(eval_seed)
+                    row["checkpoint_weight_mode"] = actual_mode
+                    rows.append(row)
+            aggregate = aggregate_sweep_rows(rows)
+            best = max(aggregate, key=aggregate_selection_key)
+            report = {
+                "experiment": "image_latent_manifest_sampler_sweep",
+                **meta,
+                "checkpoint_weight_mode": actual_mode,
+                "requested_checkpoint_weight_mode": weight_mode,
+                "selected_checkpoint_weights": actual_mode,
+                "n": int(n),
+                "image_size": int(eval_size),
+                "sample_method": sample_method,
+                "sample_methods": list(sample_methods or (sample_method,)),
+                "cfg_interval": list(validate_guidance_interval(cfg_interval)),
+                "semantic_guidance_w": 0.0,
+                "semantic_guidance_weights": [0.0],
+                "semantic_guidance_mode": "none",
+                "semantic_guidance_interval": list(DEFAULT_GUIDANCE_INTERVAL),
+                "eval_seeds": [int(s) for s in eval_seeds],
+                "eval_image_manifest": manifest_path,
+                "eval_image_root": image_root,
+                "eval_image_split": split,
+                "eval_image_min_aesthetic": (
+                    float(eval_image_min_aesthetic)
+                    if eval_image_min_aesthetic is not None else None
+                ),
+                "eval_image_max_records": int(eval_image_max_records),
+                "rows": rows,
+                "aggregate": aggregate,
+                "best": best,
+            }
+            report.update(summarize_records(records))
+            return report
+
         rows = []
         for eval_seed in eval_seeds:
             for row in sampler_sweep(ae, flow, cfg_scales=cfg_scales,
                                      sample_steps_list=sample_steps_list, n=n, batch=batch,
-                                     seed=int(eval_seed), size=size, device=device,
+                                     seed=int(eval_seed), size=eval_size, device=device,
                                      roundtrip_samples=roundtrip_samples,
                                      cond_mode=meta["cond_mode"], conditioner=conditioner,
                                      prompt_vocab=prompt_vocab,
@@ -1963,6 +2369,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             "requested_checkpoint_weight_mode": weight_mode,
             "selected_checkpoint_weights": actual_mode,
             "n": int(n),
+            "image_size": int(eval_size),
             "roundtrip_samples": int(roundtrip_samples),
             "sample_method": sample_method,
             "sample_methods": list(sample_methods or (sample_method,)),
@@ -1981,7 +2388,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
         }
         if intervention_samples:
             report.update(latent_intervention_diagnostic(
-                ae, n=intervention_samples, batch=batch, seed=seed + 31, size=size,
+                ae, n=intervention_samples, batch=batch, seed=seed + 31, size=eval_size,
                 device=device))
         return report
 
@@ -2028,7 +2435,10 @@ def selected_grid_settings(report, fallback_cfg=1.0, fallback_steps=4,
 def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidden=64,
                       lr=2e-4, fact_w=1.0, seed=0, size=32, device=DEV, flow_arch="conv",
                       dit_depth=3, dit_heads=4, cond_drop=0.0, cfg_scale=1.0,
-                      dit_head_width_mult=1,
+                      dit_head_width_mult=1, latent_max_tokens=256,
+                      ae_arch="semantic", latent_downsample=4, ae_res_blocks=1,
+                      ae_recon_loss="mse", ae_grad_w=0.0, ae_ms_w=0.0,
+                      ae_latent_reg_w=0.0,
                       sample_steps=4, roundtrip_samples=1, flow_semantic_w=0.0,
                       flow_consistency_w=0.0,
                       cond_mode="facts", text_cond_dim=0,
@@ -2045,6 +2455,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       sample_method="euler",
                       flow_ema_decay=0.0, flow_ema_warmup=True, eval_with_ema=True,
                       eval_weight_mode="auto", intervention_samples=32,
+                      train_precision="fp32", ae_accum_steps=1, flow_accum_steps=1,
+                      grad_clip=0.0,
+                      flow_cache_latents=False, flow_cache_records=0, flow_cache_batch=64,
                       return_conditioner=False, return_ema=False):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -2065,6 +2478,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
     if latent_normalize not in ("none", "global", "channel"):
         raise ValueError(f"unknown latent normalization mode {latent_normalize!r}")
+    if ae_recon_loss not in AE_RECON_LOSSES:
+        raise ValueError(f"unknown AE reconstruction loss {ae_recon_loss!r}")
+    if ae_grad_w < 0.0 or ae_ms_w < 0.0 or ae_latent_reg_w < 0.0:
+        raise ValueError("AE reconstruction weights must be non-negative")
+    amp_cfg = amp_config(device, train_precision)
+    ae_accum_steps = max(1, int(ae_accum_steps))
+    flow_accum_steps = max(1, int(flow_accum_steps))
+    if grad_clip < 0.0:
+        raise ValueError("grad_clip must be non-negative")
     if ae_intervention_w < 0.0:
         raise ValueError("ae_intervention_w must be non-negative")
     if ae_factor_orth_w < 0.0:
@@ -2073,6 +2495,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("semantic_guidance_w must be non-negative")
     if flow_consistency_w < 0.0:
         raise ValueError("flow_consistency_w must be non-negative")
+    if flow_cache_latents and image_records is None:
+        raise ValueError("flow latent cache currently requires image_manifest training")
+    if flow_cache_records < 0 or flow_cache_batch <= 0:
+        raise ValueError("flow cache record/batch settings must be non-negative/positive")
     if semantic_guidance_mode not in ("latent", "decoded"):
         raise ValueError(f"unknown semantic guidance mode {semantic_guidance_mode!r}")
     if sample_method not in SAMPLE_METHODS:
@@ -2082,6 +2508,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         semantic_guidance_interval, name="semantic_guidance_interval")
     if dit_head_width_mult <= 0:
         raise ValueError("dit_head_width_mult must be positive")
+    if latent_max_tokens <= 0:
+        raise ValueError("latent_max_tokens must be positive")
     if flow_ema_decay < 0.0 or flow_ema_decay >= 1.0:
         raise ValueError("flow_ema_decay must be in [0, 1)")
     if eval_weight_mode not in EVAL_WEIGHT_MODES:
@@ -2100,39 +2528,63 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                                         hidden=hidden,
                                         max_len=caption_max_len if image_records is not None
                                         else 32).to(device)
-    ae = SemanticAutoencoder(latent_ch=latent_ch, hidden=hidden).to(device)
+    ae = make_autoencoder(ae_arch=ae_arch, latent_ch=latent_ch, hidden=hidden,
+                          latent_downsample=latent_downsample,
+                          ae_res_blocks=ae_res_blocks).to(device)
+    latent_shape = ae_latent_shape(ae, size)
+    latent_tokens = latent_shape[1] * latent_shape[2]
+    if flow_arch in ("dit", "crossdit", "mmdit") and latent_tokens > int(latent_max_tokens):
+        raise ValueError(
+            f"latent token count {latent_tokens} exceeds latent_max_tokens={latent_max_tokens}; "
+            "increase --latent-max-tokens or use a larger --latent-downsample"
+        )
     flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
                      dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim,
-                     dit_head_width_mult=dit_head_width_mult).to(device)
+                     dit_head_width_mult=dit_head_width_mult,
+                     latent_max_tokens=latent_max_tokens).to(device)
     opt_ae = torch.optim.AdamW(ae.parameters(), lr=lr, weight_decay=0.01)
+    scaler = amp_grad_scaler(device, train_precision)
     ae.train()
     last_ae = {}
     for _ in range(ae_steps):
-        if image_records is None:
-            x, fact_cond, yc, ys = _batch(batch, rng, size=size, device=device)
-        else:
-            x, _captions = sample_image_text_batch(
-                image_records, rng, batch=batch, size=size, device=device)
-        out = ae(x)
-        if image_records is None:
-            loss, parts = autoencoder_loss(out, x, yc, ys, fact_w=fact_w)
-        else:
-            recon = F.mse_loss(out["recon"], x)
-            loss, parts = recon, {"recon_mse": recon.detach()}
-        if image_records is None and ae_intervention_w > 0.0:
-            intervention, intervention_parts = latent_intervention_training_loss(
-                ae, out["latent"], fact_cond)
-            loss = loss + float(ae_intervention_w) * intervention
-            parts.update({f"latent_{k}": v for k, v in intervention_parts.items()})
-        if image_records is None and ae_factor_orth_w > 0.0:
-            factor_orth, factor_orth_parts = latent_factor_orthogonality_loss(
-                out["latent"], fact_cond)
-            loss = loss + float(ae_factor_orth_w) * factor_orth
-            parts.update({f"latent_{k}": v for k, v in factor_orth_parts.items()})
-        opt_ae.zero_grad()
-        loss.backward()
-        opt_ae.step()
-        last_ae = {k: float(v.detach().cpu()) for k, v in parts.items()}
+        opt_ae.zero_grad(set_to_none=True)
+        for _micro in range(ae_accum_steps):
+            if image_records is None:
+                x, fact_cond, yc, ys = _batch(batch, rng, size=size, device=device)
+            else:
+                x, _captions = sample_image_text_batch(
+                    image_records, rng, batch=batch, size=size, device=device)
+            with amp_autocast(device, train_precision):
+                out = ae(x)
+                if image_records is None:
+                    loss, parts = autoencoder_loss(
+                        out, x, yc, ys, fact_w=fact_w, recon_loss=ae_recon_loss,
+                        grad_w=ae_grad_w, ms_w=ae_ms_w, latent_reg_w=ae_latent_reg_w)
+                else:
+                    loss, parts = reconstruction_loss_parts(
+                        out["recon"], x, mode=ae_recon_loss, grad_w=ae_grad_w,
+                        ms_w=ae_ms_w, latent=out.get("latent"),
+                        latent_reg_w=ae_latent_reg_w)
+                if image_records is None and ae_intervention_w > 0.0:
+                    intervention, intervention_parts = latent_intervention_training_loss(
+                        ae, out["latent"], fact_cond)
+                    loss = loss + float(ae_intervention_w) * intervention
+                    parts.update({f"latent_{k}": v for k, v in intervention_parts.items()})
+                if image_records is None and ae_factor_orth_w > 0.0:
+                    factor_orth, factor_orth_parts = latent_factor_orthogonality_loss(
+                        out["latent"], fact_cond)
+                    loss = loss + float(ae_factor_orth_w) * factor_orth
+                    parts.update({f"latent_{k}": v for k, v in factor_orth_parts.items()})
+                scaled_loss = loss / float(ae_accum_steps)
+            scaler.scale(scaled_loss).backward()
+            last_ae = {k: float(v.detach().cpu()) for k, v in parts.items()}
+            last_ae["total_loss"] = float(loss.detach().cpu())
+        if grad_clip > 0.0:
+            scaler.unscale_(opt_ae)
+            grad_norm = torch.nn.utils.clip_grad_norm_(ae.parameters(), float(grad_clip))
+            last_ae["grad_norm"] = float(grad_norm.detach().cpu())
+        scaler.step(opt_ae)
+        scaler.update()
 
     flow_params = list(flow.parameters()) + ([] if conditioner is None
                                              else list(conditioner.parameters()))
@@ -2140,9 +2592,19 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     ae.eval()
     for p in ae.parameters():
         p.requires_grad_(False)
+    flow_cache = None
+    if flow_cache_latents:
+        flow_cache = build_image_latent_cache(
+            ae, image_records, prompt_vocab, caption_max_len=caption_max_len,
+            max_records=flow_cache_records, batch=flow_cache_batch, seed=seed + 211,
+            size=size, device=device, precision=train_precision)
     if image_records is None:
         latent_stats = estimate_latent_stats(
             ae, n=latent_stat_samples, batch=batch, seed=seed + 97, size=size, device=device,
+            mode=latent_normalize)
+    elif flow_cache is not None:
+        latent_stats = estimate_latent_stats_tensor(
+            flow_cache["latents"], n=latent_stat_samples, seed=seed + 97,
             mode=latent_normalize)
     else:
         latent_stats = estimate_latent_stats_records(
@@ -2159,35 +2621,50 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     ema_updates = 0
     last_ema_decay = 0.0
     for _ in range(flow_steps):
-        if image_records is None:
-            x, fact_cond, _yc, _ys, specs = _batch(batch, rng, size=size, device=device,
-                                                   return_specs=True)
-            captions = None
-        else:
-            x, captions = sample_image_text_batch(
-                image_records, rng, batch=batch, size=size, device=device)
-            fact_cond, specs = None, None
-        with torch.no_grad():
-            z1 = ae.encode(x)
-        if image_records is None:
-            cond = model_condition(specs, fact_cond, cond_mode=cond_mode, conditioner=conditioner,
-                                   prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
-                                   rng=rng, device=device,
-                                   return_tokens=flow_uses_cond_tokens(flow))
-        else:
-            cond = caption_condition(captions, conditioner, prompt_vocab,
-                                     max_len=caption_max_len, device=device,
-                                     return_tokens=flow_uses_cond_tokens(flow))
-        loss, parts = latent_flow_losses(flow, z1, cond, cond_drop=cond_drop, ae=ae,
-                                         semantic_w=flow_semantic_w,
-                                         semantic_cond=fact_cond,
-                                         time_sampling=time_sampling,
-                                         time_logit_mean=time_logit_mean,
-                                         time_logit_std=time_logit_std,
-                                         consistency_w=flow_consistency_w)
-        opt_flow.zero_grad()
-        loss.backward()
-        opt_flow.step()
+        opt_flow.zero_grad(set_to_none=True)
+        for _micro in range(flow_accum_steps):
+            if flow_cache is not None:
+                idx_np = rng.integers(0, int(flow_cache["records"]), size=int(batch))
+                idx = torch.tensor(idx_np, dtype=torch.long)
+                z1 = flow_cache["latents"][idx].to(device=device)
+                ids = flow_cache["caption_ids"][idx]
+                fact_cond, specs = None, None
+                cond = caption_condition_ids(
+                    ids, conditioner, device=device, return_tokens=flow_uses_cond_tokens(flow))
+            elif image_records is None:
+                x, fact_cond, _yc, _ys, specs = _batch(batch, rng, size=size, device=device,
+                                                       return_specs=True)
+                with torch.no_grad(), amp_autocast(device, train_precision):
+                    z1 = ae.encode(x)
+                cond = model_condition(
+                    specs, fact_cond, cond_mode=cond_mode, conditioner=conditioner,
+                    prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
+                    rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
+            else:
+                x, captions = sample_image_text_batch(
+                    image_records, rng, batch=batch, size=size, device=device)
+                fact_cond, specs = None, None
+                with torch.no_grad(), amp_autocast(device, train_precision):
+                    z1 = ae.encode(x)
+                cond = caption_condition(captions, conditioner, prompt_vocab,
+                                         max_len=caption_max_len, device=device,
+                                         return_tokens=flow_uses_cond_tokens(flow))
+            with amp_autocast(device, train_precision):
+                loss, parts = latent_flow_losses(
+                    flow, z1, cond, cond_drop=cond_drop, ae=ae,
+                    semantic_w=flow_semantic_w, semantic_cond=fact_cond,
+                    time_sampling=time_sampling, time_logit_mean=time_logit_mean,
+                    time_logit_std=time_logit_std, consistency_w=flow_consistency_w)
+                scaled_loss = loss / float(flow_accum_steps)
+            scaler.scale(scaled_loss).backward()
+            last_flow = {"total_loss": float(loss.detach().cpu())}
+            last_flow.update({k: float(v.detach().cpu()) for k, v in parts.items()})
+        if grad_clip > 0.0:
+            scaler.unscale_(opt_flow)
+            grad_norm = torch.nn.utils.clip_grad_norm_(flow_params, float(grad_clip))
+            last_flow["grad_norm"] = float(grad_norm.detach().cpu())
+        scaler.step(opt_flow)
+        scaler.update()
         if flow_ema is not None:
             ema_updates += 1
             last_ema_decay = ema_effective_decay(flow_ema_decay, ema_updates,
@@ -2195,8 +2672,6 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             update_ema_state(flow_ema, flow, last_ema_decay)
             if conditioner is not None:
                 update_ema_state(conditioner_ema, conditioner, last_ema_decay)
-        last_flow = {"total_loss": float(loss.detach().cpu())}
-        last_flow.update({k: float(v.detach().cpu()) for k, v in parts.items()})
 
     if conditioner is not None:
         conditioner.eval()
@@ -2251,7 +2726,29 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "ae_steps": int(ae_steps),
         "flow_steps": int(flow_steps),
         "batch": int(batch),
+        "flow_cache_latents": bool(flow_cache is not None),
+        "flow_cache_requested": bool(flow_cache_latents),
+        "flow_cache_records": int(flow_cache["records"]) if flow_cache is not None else 0,
+        "flow_cache_max_records": int(flow_cache_records),
+        "flow_cache_batch": int(flow_cache_batch),
+        "flow_cache_bytes": int(flow_cache["bytes"]) if flow_cache is not None else 0,
+        "ae_accum_steps": int(ae_accum_steps),
+        "flow_accum_steps": int(flow_accum_steps),
+        "ae_effective_batch": int(batch) * int(ae_accum_steps),
+        "flow_effective_batch": int(batch) * int(flow_accum_steps),
+        "train_precision": train_precision,
+        "train_amp_enabled": bool(amp_cfg["enabled"]),
+        "train_amp_dtype": amp_cfg["dtype_name"],
+        "grad_clip": float(grad_clip),
+        "image_size": int(size),
         "latent_ch": int(latent_ch),
+        "ae_arch": ae_arch,
+        "latent_downsample": int(getattr(ae, "downsample", latent_downsample)),
+        "ae_res_blocks": int(ae_res_blocks) if ae_arch == "residual" else 0,
+        "latent_h": int(latent_shape[1]),
+        "latent_w": int(latent_shape[2]),
+        "latent_tokens": int(latent_tokens),
+        "latent_max_tokens": int(latent_max_tokens),
         "hidden": int(hidden),
         "flow_arch": flow_arch,
         "dit_depth": int(dit_depth) if flow_arch in ("dit", "crossdit", "mmdit") else 0,
@@ -2262,6 +2759,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "fact_w": float(fact_w),
+        "ae_recon_loss": ae_recon_loss,
+        "ae_grad_w": float(ae_grad_w),
+        "ae_ms_w": float(ae_ms_w),
+        "ae_latent_reg_w": float(ae_latent_reg_w),
         "ae_intervention_w": float(ae_intervention_w),
         "ae_factor_orth_w": float(ae_factor_orth_w),
         "cond_drop": float(cond_drop),
@@ -2293,6 +2794,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "cond_mode": cond_mode,
         "data_mode": "image_manifest" if image_records is not None else "synthetic_factors",
         "image_manifest": image_manifest,
+        "image_root": image_root if image_records is not None else "",
         "image_split": image_split if image_records is not None else "",
         "image_min_aesthetic": (
             float(image_min_aesthetic) if image_min_aesthetic is not None else None
@@ -2371,6 +2873,52 @@ def selftest():
     img2 = sample_images(ae2, flow2, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
                          seed=1, cfg_scale=1.5)
     assert img2.shape == (1, 3, 32, 32)
+    ae_res, flow_res, report_res = train_latent_flow(
+        ae_steps=1, flow_steps=1, batch=2, latent_ch=6, hidden=32, flow_arch="dit",
+        dit_depth=1, dit_heads=2, seed=12, device="cpu", sample_steps=1,
+        ae_arch="residual", latent_downsample=8, ae_res_blocks=1,
+        latent_max_tokens=32, ae_recon_loss="hybrid", ae_grad_w=0.1, ae_ms_w=0.1,
+        ae_latent_reg_w=0.01, train_precision="bf16", ae_accum_steps=2,
+        flow_accum_steps=2, grad_clip=1.0, intervention_samples=0)
+    assert report_res["ae_arch"] == "residual"
+    assert report_res["ae_recon_loss"] == "hybrid"
+    assert report_res["ae_accum_steps"] == 2 and report_res["flow_accum_steps"] == 2
+    assert report_res["ae_effective_batch"] == 4 and report_res["flow_effective_batch"] == 4
+    assert report_res["train_precision"] == "bf16" and report_res["train_amp_enabled"] is False
+    assert report_res["grad_clip"] == 1.0
+    assert report_res["latent_downsample"] == 8
+    assert report_res["latent_h"] == 4 and report_res["latent_tokens"] == 16
+    assert "recon_grad_l1" in report_res["last_ae"]
+    assert "recon_multiscale_l1" in report_res["last_ae"]
+    assert "latent_l2" in report_res["last_ae"]
+    assert "grad_norm" in report_res["last_ae"] and "grad_norm" in report_res["last_flow"]
+    img_res = sample_images(ae_res, flow_res, cond, latent_shape=ae_latent_shape(ae_res, 32),
+                            steps=1, device="cpu", seed=12)
+    assert img_res.shape == (1, 3, 32, 32)
+    res_ckpt = "/tmp/image_latent_residual_selftest.pt"
+    torch.save({
+        "autoencoder_state_dict": ae_res.state_dict(),
+        "flow_state_dict": flow_res.state_dict(),
+        "report": report_res,
+        "fact_vocab": FACT_VOCAB,
+        "latent_ch": 6,
+        "ae_arch": "residual",
+        "latent_downsample": 8,
+        "ae_res_blocks": 1,
+        "latent_max_tokens": 32,
+        "hidden": 32,
+        "flow_arch": "dit",
+        "dit_depth": 1,
+        "dit_heads": 2,
+        "dit_head_width_mult": 1,
+        "cond_mode": "facts",
+        "cond_dim": len(FACT_VOCAB),
+        "latent_stats": latent_stats_state(flow_latent_stats(flow_res)),
+    }, res_ckpt)
+    ae_res2, _flow_res2, _cond_res2, _vocab_res2, _tpl_res2, meta_res2 = load_checkpoint(
+        res_ckpt, device="cpu", prefer_ema=False)
+    assert meta_res2["ae_arch"] == "residual"
+    assert ae_latent_shape(ae_res2, 32) == (6, 4, 4)
     sweep = sampler_sweep(ae2, flow2, cfg_scales=(1.0, 1.5), sample_steps_list=(1,),
                           semantic_guidance_weights=(0.0, 0.05),
                           sample_methods=("euler", "heun"),
@@ -2432,6 +2980,77 @@ def selftest():
                              batch=2, seed=8, device="cpu", cond_mode="text",
                              conditioner=conditioner5, prompt_vocab=vocab5)
     assert len(mm_sweep) == 1 and mm_sweep[0]["cond_mode"] == "text"
+    with tempfile.TemporaryDirectory() as td:
+        img_dir = os.path.join(td, "images")
+        os.makedirs(img_dir, exist_ok=True)
+        manifest = os.path.join(td, "manifest.jsonl")
+        rows = []
+        for i, (name, split, color) in enumerate((
+                ("red.ppm", "train", (255, 0, 0)),
+                ("green.ppm", "train", (0, 255, 0)),
+                ("blue.ppm", "eval", (0, 0, 255)),
+                ("white.ppm", "eval", (255, 255, 255)))):
+            arr = np.zeros((8, 8, 3), dtype=np.uint8)
+            arr[:, :] = np.asarray(color, dtype=np.uint8)
+            with open(os.path.join(img_dir, name), "wb") as f:
+                f.write(b"P6\n8 8\n255\n")
+                f.write(arr.tobytes())
+            rows.append({"image": name, "caption": f"{split} color patch {i}",
+                         "split": split})
+        with open(manifest, "w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        ae6, flow6, conditioner6, vocab6, report6 = train_latent_flow(
+            ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32,
+            flow_arch="mmdit", dit_depth=1, dit_heads=2, seed=9,
+            device="cpu", cond_mode="text", text_cond_dim=8,
+            image_manifest=manifest, image_root=img_dir, image_split="train",
+            image_max_records=2, caption_max_len=8, sample_steps=1,
+            flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
+            intervention_samples=0, return_conditioner=True)
+        assert report6["data_mode"] == "image_manifest"
+        assert report6["flow_cache_latents"] is True
+        assert report6["flow_cache_records"] == 2 and report6["flow_cache_bytes"] > 0
+        manifest_rows = read_image_manifest(manifest, root=img_dir, split="eval")
+        img_sweep = image_record_sweep(
+            ae6, flow6, manifest_rows, cfg_scales=(1.0,), sample_steps_list=(1,),
+            n=2, batch=2, seed=10, device="cpu", conditioner=conditioner6,
+            prompt_vocab=vocab6, caption_max_len=8)
+        img_agg = aggregate_sweep_rows([dict(r, eval_seed=10) for r in img_sweep])
+        assert "caption_sample_mse_mean" in img_agg[0]
+        ckpt = os.path.join(td, "manifest.pt")
+        torch.save({
+            "autoencoder_state_dict": ae6.state_dict(),
+            "flow_state_dict": flow6.state_dict(),
+            "report": report6,
+            "fact_vocab": FACT_VOCAB,
+            "latent_ch": 4,
+            "hidden": 32,
+            "flow_arch": "mmdit",
+            "dit_depth": 1,
+            "dit_heads": 2,
+            "dit_head_width_mult": 1,
+            "cond_mode": "text",
+            "cond_dim": report6["cond_dim"],
+            "data_mode": "image_manifest",
+            "image_manifest": manifest,
+            "image_root": img_dir,
+            "image_split": "train",
+            "caption_max_len": 8,
+            "latent_stats": latent_stats_state(flow_latent_stats(flow6)),
+            "prompt_templates": [],
+            "prompt_vocab": vocab6,
+            "conditioner_state_dict": conditioner6.state_dict(),
+            "flow_ema_state_dict": {},
+            "conditioner_ema_state_dict": {},
+        }, ckpt)
+        eval6 = evaluate_checkpoint(
+            ckpt, cfg_scales=(1.0,), sample_steps_list=(1,), n=2, batch=2,
+            seed=11, eval_seeds=(11,), size=32, device="cpu",
+            eval_image_manifest=manifest, eval_image_root=img_dir,
+            eval_image_split="eval")
+        assert eval6["experiment"] == "image_latent_manifest_sampler_sweep"
+        assert eval6["best"]["caption_sample_mse_mean"] >= 0.0
     print("image_latent selftest OK")
 
 
@@ -2441,10 +3060,57 @@ def main(argv=None):
     ap.add_argument("--train", action="store_true")
     ap.add_argument("--eval-checkpoint", default="", dest="eval_checkpoint",
                     help="load a saved image_latent checkpoint and run a sampler sweep")
+    ap.add_argument("--eval-image-manifest", default="", dest="eval_image_manifest",
+                    help="JSONL/CSV/TSV captioned image manifest for real-image checkpoint eval")
+    ap.add_argument("--eval-image-root", default="", dest="eval_image_root",
+                    help="base directory for relative paths in --eval-image-manifest")
+    ap.add_argument("--eval-image-split", default="eval", dest="eval_image_split",
+                    help="manifest split used for real-image checkpoint eval")
+    ap.add_argument("--eval-image-min-aesthetic", type=float, default=None,
+                    dest="eval_image_min_aesthetic",
+                    help="optional minimum aesthetic/quality score for eval manifest rows")
+    ap.add_argument("--eval-image-max-records", type=int, default=0,
+                    dest="eval_image_max_records",
+                    help="cap eval manifest records for smoke tests; 0 means all")
     ap.add_argument("--ae-steps", type=int, default=200, dest="ae_steps")
     ap.add_argument("--flow-steps", type=int, default=200, dest="flow_steps")
     ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--ae-accum-steps", type=int, default=1, dest="ae_accum_steps",
+                    help="AE gradient accumulation microsteps; effective batch=batch*steps")
+    ap.add_argument("--flow-accum-steps", type=int, default=1, dest="flow_accum_steps",
+                    help="flow gradient accumulation microsteps; effective batch=batch*steps")
+    ap.add_argument("--flow-cache-latents", action="store_true", dest="flow_cache_latents",
+                    help="precompute AE latents for manifest flow training")
+    ap.add_argument("--flow-cache-records", type=int, default=0, dest="flow_cache_records",
+                    help="maximum manifest records to cache for flow training; 0 means all")
+    ap.add_argument("--flow-cache-batch", type=int, default=64, dest="flow_cache_batch",
+                    help="batch size used while building the AE latent cache")
+    ap.add_argument("--train-precision", default="fp32", choices=TRAIN_PRECISIONS,
+                    dest="train_precision",
+                    help="training precision; bf16/fp16 AMP is enabled on CUDA")
+    ap.add_argument("--grad-clip", type=float, default=0.0, dest="grad_clip",
+                    help="clip AE/flow gradient norm after accumulation; 0 disables")
+    ap.add_argument("--size", type=int, default=0,
+                    help="square image size; 0 means 32 for train or checkpoint size for eval")
     ap.add_argument("--latent-ch", type=int, default=16, dest="latent_ch")
+    ap.add_argument("--ae-arch", default="semantic", choices=("semantic", "residual"),
+                    dest="ae_arch",
+                    help="autoencoder architecture for image latents")
+    ap.add_argument("--latent-downsample", type=int, default=4, dest="latent_downsample",
+                    help="AE spatial compression factor; residual AE supports powers of two")
+    ap.add_argument("--ae-res-blocks", type=int, default=1, dest="ae_res_blocks",
+                    help="residual blocks per AE stage when --ae-arch residual")
+    ap.add_argument("--latent-max-tokens", type=int, default=256, dest="latent_max_tokens",
+                    help="maximum latent grid tokens for DiT/CrossDiT/MM-DiT flows")
+    ap.add_argument("--ae-recon-loss", default="mse", choices=AE_RECON_LOSSES,
+                    dest="ae_recon_loss",
+                    help="base reconstruction loss for the image autoencoder")
+    ap.add_argument("--ae-grad-w", type=float, default=0.0, dest="ae_grad_w",
+                    help="edge/gradient reconstruction loss weight")
+    ap.add_argument("--ae-ms-w", type=float, default=0.0, dest="ae_ms_w",
+                    help="multi-scale reconstruction loss weight")
+    ap.add_argument("--ae-latent-reg-w", type=float, default=0.0, dest="ae_latent_reg_w",
+                    help="latent L2 regularization weight during AE training")
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--fact-w", type=float, default=1.0, dest="fact_w")
@@ -2571,6 +3237,7 @@ def main(argv=None):
             cfg_scales=_parse_number_list(args.cfg_scales, float),
             sample_steps_list=_parse_number_list(args.sample_steps_list, int),
             seed=args.seed,
+            size=args.size,
             eval_seeds=(_parse_number_list(args.eval_seeds, int) if args.eval_seeds else None),
             roundtrip_samples=args.roundtrip_samples,
             prefer_ema=not args.no_ema_checkpoint,
@@ -2588,6 +3255,11 @@ def main(argv=None):
             ),
             cfg_interval=cfg_interval,
             semantic_guidance_interval=semantic_guidance_interval,
+            eval_image_manifest=args.eval_image_manifest,
+            eval_image_root=args.eval_image_root,
+            eval_image_split=args.eval_image_split,
+            eval_image_min_aesthetic=args.eval_image_min_aesthetic,
+            eval_image_max_records=args.eval_image_max_records,
         )
         if args.sample_grid_out:
             selected_weights = report.get("selected_checkpoint_weights",
@@ -2603,19 +3275,38 @@ def main(argv=None):
                 fallback_semantic_mode=args.semantic_guidance_mode,
                 fallback_cfg_interval=cfg_interval,
                 fallback_semantic_interval=semantic_guidance_interval)
-            grid_meta = save_sample_grid(
-                ae, flow, args.sample_grid_out, cond_mode=meta["cond_mode"],
-                conditioner=conditioner, prompt_vocab=prompt_vocab,
-                prompt_templates=prompt_templates,
-                cfg_scale=settings["cfg_scale"],
-                cfg_interval=settings["cfg_interval"],
-                sample_steps=settings["sample_steps"],
-                sample_method=settings["sample_method"],
-                semantic_guidance_w=settings["semantic_guidance_w"],
-                semantic_guidance_mode=settings["semantic_guidance_mode"],
-                semantic_guidance_interval=settings["semantic_guidance_interval"],
-                samples_per_combo=args.sample_grid_samples,
-                seed=args.seed + 991)
+            grid_size = int(args.size or report.get("image_size", meta.get("image_size", 32))
+                            or 32)
+            if report.get("experiment") == "image_latent_manifest_sampler_sweep":
+                grid_records = read_image_manifest(
+                    report["eval_image_manifest"], root=report.get("eval_image_root", ""),
+                    split=report.get("eval_image_split", "eval"),
+                    min_aesthetic=report.get("eval_image_min_aesthetic"),
+                    max_records=report.get("eval_image_max_records", 0))
+                grid_meta = save_caption_sample_grid(
+                    ae, flow, grid_records, args.sample_grid_out, conditioner=conditioner,
+                    prompt_vocab=prompt_vocab, caption_max_len=meta["caption_max_len"],
+                    size=grid_size,
+                    cfg_scale=settings["cfg_scale"],
+                    cfg_interval=settings["cfg_interval"],
+                    sample_steps=settings["sample_steps"],
+                    sample_method=settings["sample_method"],
+                    samples=args.sample_grid_samples,
+                    seed=args.seed + 991)
+            else:
+                grid_meta = save_sample_grid(
+                    ae, flow, args.sample_grid_out, size=grid_size, cond_mode=meta["cond_mode"],
+                    conditioner=conditioner, prompt_vocab=prompt_vocab,
+                    prompt_templates=prompt_templates,
+                    cfg_scale=settings["cfg_scale"],
+                    cfg_interval=settings["cfg_interval"],
+                    sample_steps=settings["sample_steps"],
+                    sample_method=settings["sample_method"],
+                    semantic_guidance_w=settings["semantic_guidance_w"],
+                    semantic_guidance_mode=settings["semantic_guidance_mode"],
+                    semantic_guidance_interval=settings["semantic_guidance_interval"],
+                    samples_per_combo=args.sample_grid_samples,
+                    seed=args.seed + 991)
             grid_meta["sample_grid_checkpoint_weight_mode"] = (
                 "ema" if meta["ema_loaded"] else "raw")
             report.update(grid_meta)
@@ -2631,12 +3322,17 @@ def main(argv=None):
     if not args.train:
         ap.error("use --selftest, --train, or --eval-checkpoint")
     templates = _parse_templates(args.prompt_templates)
+    run_size = int(args.size or 32)
     ae, flow, conditioner, prompt_vocab, report, flow_ema, conditioner_ema = train_latent_flow(
         ae_steps=args.ae_steps, flow_steps=args.flow_steps, batch=args.batch,
         latent_ch=args.latent_ch, hidden=args.hidden, lr=args.lr, fact_w=args.fact_w,
-        seed=args.seed, flow_arch=args.flow_arch, dit_depth=args.dit_depth,
+        seed=args.seed, size=run_size, flow_arch=args.flow_arch, dit_depth=args.dit_depth,
         dit_heads=args.dit_heads, cond_drop=args.cond_drop, cfg_scale=args.cfg_scale,
         dit_head_width_mult=args.dit_head_width_mult,
+        latent_max_tokens=args.latent_max_tokens, ae_arch=args.ae_arch,
+        latent_downsample=args.latent_downsample, ae_res_blocks=args.ae_res_blocks,
+        ae_recon_loss=args.ae_recon_loss, ae_grad_w=args.ae_grad_w,
+        ae_ms_w=args.ae_ms_w, ae_latent_reg_w=args.ae_latent_reg_w,
         sample_steps=args.sample_steps, roundtrip_samples=args.roundtrip_samples,
         flow_semantic_w=args.flow_semantic_w, cond_mode=args.cond_mode,
         flow_consistency_w=args.flow_consistency_w,
@@ -2661,6 +3357,13 @@ def main(argv=None):
         eval_with_ema=not args.no_ema_eval,
         eval_weight_mode=("raw" if args.no_ema_eval else args.ema_eval_mode),
         intervention_samples=args.intervention_samples,
+        train_precision=args.train_precision,
+        ae_accum_steps=args.ae_accum_steps,
+        flow_accum_steps=args.flow_accum_steps,
+        grad_clip=args.grad_clip,
+        flow_cache_latents=args.flow_cache_latents,
+        flow_cache_records=args.flow_cache_records,
+        flow_cache_batch=args.flow_cache_batch,
         return_conditioner=True, return_ema=True)
     if args.sample_grid_out:
         raw_flow = clone_state_dict(flow)
@@ -2687,6 +3390,7 @@ def main(argv=None):
             grid_meta = save_caption_sample_grid(
                 ae, flow, grid_records, args.sample_grid_out, conditioner=conditioner,
                 prompt_vocab=prompt_vocab, caption_max_len=args.caption_max_len,
+                size=run_size,
                 cfg_scale=settings["cfg_scale"],
                 cfg_interval=settings["cfg_interval"],
                 sample_steps=settings["sample_steps"],
@@ -2695,7 +3399,8 @@ def main(argv=None):
                 seed=args.seed + 991)
         else:
             grid_meta = save_sample_grid(
-                ae, flow, args.sample_grid_out, cond_mode=args.cond_mode, conditioner=conditioner,
+                ae, flow, args.sample_grid_out, size=run_size, cond_mode=args.cond_mode,
+                conditioner=conditioner,
                 prompt_vocab=prompt_vocab, prompt_templates=templates,
                 cfg_scale=settings["cfg_scale"],
                 cfg_interval=settings["cfg_interval"],
@@ -2718,7 +3423,25 @@ def main(argv=None):
         "report": report,
         "fact_vocab": FACT_VOCAB,
         "latent_ch": args.latent_ch,
+        "image_size": run_size,
+        "ae_arch": args.ae_arch,
+        "latent_downsample": report.get("latent_downsample", args.latent_downsample),
+        "ae_res_blocks": report.get("ae_res_blocks", args.ae_res_blocks),
+        "latent_max_tokens": args.latent_max_tokens,
+        "ae_recon_loss": args.ae_recon_loss,
+        "ae_grad_w": args.ae_grad_w,
+        "ae_ms_w": args.ae_ms_w,
+        "ae_latent_reg_w": args.ae_latent_reg_w,
         "hidden": args.hidden,
+        "ae_accum_steps": args.ae_accum_steps,
+        "flow_accum_steps": args.flow_accum_steps,
+        "flow_cache_latents": report.get("flow_cache_latents", False),
+        "flow_cache_records": report.get("flow_cache_records", 0),
+        "flow_cache_max_records": args.flow_cache_records,
+        "flow_cache_batch": args.flow_cache_batch,
+        "train_precision": args.train_precision,
+        "train_amp_enabled": report.get("train_amp_enabled", False),
+        "grad_clip": args.grad_clip,
         "flow_arch": args.flow_arch,
         "dit_depth": args.dit_depth,
         "dit_heads": args.dit_heads,
@@ -2727,6 +3450,7 @@ def main(argv=None):
         "cond_dim": report["cond_dim"],
         "data_mode": report.get("data_mode", "synthetic_factors"),
         "image_manifest": args.image_manifest,
+        "image_root": args.image_root,
         "image_split": args.image_split,
         "image_min_aesthetic": args.image_min_aesthetic,
         "image_max_records": args.image_max_records,

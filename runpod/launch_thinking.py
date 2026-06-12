@@ -100,8 +100,23 @@ def payload(args):
             grid = f"runs/image_latent_{args.image_latent_arch}{cond_suffix}_grid.ppm"
             train = (f"{IL} --train --ae-steps {args.train_steps or 800} "
                      f"--flow-steps {args.train_steps or 800} --batch {args.batch} "
+                     f"--ae-accum-steps {args.image_ae_accum_steps} "
+                     f"--flow-accum-steps {args.image_flow_accum_steps} "
+                     f"--flow-cache-records {args.image_flow_cache_records} "
+                     f"--flow-cache-batch {args.image_flow_cache_batch} "
+                     f"--train-precision {args.image_train_precision} "
+                     f"--grad-clip {args.image_grad_clip} "
+                     f"--size {args.image_size} "
                      f"--hidden {args.dim or 64} --flow-arch {args.image_latent_arch} "
                      f"--dit-head-width-mult {args.image_dit_head_width_mult} "
+                     f"--ae-arch {args.image_ae_arch} "
+                     f"--latent-downsample {args.image_latent_downsample} "
+                     f"--ae-res-blocks {args.image_ae_res_blocks} "
+                     f"--latent-max-tokens {args.image_latent_max_tokens} "
+                     f"--ae-recon-loss {args.image_ae_recon_loss} "
+                     f"--ae-grad-w {args.image_ae_grad_w} "
+                     f"--ae-ms-w {args.image_ae_ms_w} "
+                     f"--ae-latent-reg-w {args.image_ae_latent_reg_w} "
                      f"--cond-mode {args.image_cond_mode} "
                      f"--text-cond-dim {args.image_text_cond_dim} "
                      f"--image-manifest {shlex_quote(args.image_manifest)} "
@@ -138,35 +153,47 @@ def payload(args):
                           f"--sample-grid-samples {args.image_sample_grid_samples}")
             if args.image_no_ema_warmup:
                 train += " --no-ema-warmup"
+            if args.image_flow_cache_latents:
+                train += " --flow-cache-latents"
             if args.image_prompt_templates:
                 train += f" --prompt-templates {shlex_quote(args.image_prompt_templates)}"
             if args.image_min_aesthetic is not None:
                 train += f" --image-min-aesthetic {args.image_min_aesthetic}"
-            if args.image_eval_sweep and args.image_manifest:
-                train += (" && echo 'manifest image eval sweep skipped: train report already "
-                          "contains real-image reconstruction, endpoint, and caption sample metrics'")
-            elif args.image_eval_sweep:
-                train += (f" && {IL} --eval-checkpoint {ckpt} "
+            if args.image_eval_sweep:
+                eval_cmd = (f" && {IL} --eval-checkpoint {ckpt} "
+                          f"--size {args.image_size} "
                           f"--checkpoint-weight-mode {args.image_checkpoint_weight_mode} "
                           f"--cfg-scales {shlex_quote(args.image_cfg_sweep)} "
                           f"--sample-steps-list {shlex_quote(args.image_sample_steps_sweep)} "
                           f"--cfg-interval {shlex_quote(args.image_cfg_interval)} "
                           f"--sample-method {args.image_sample_method} "
                           f"--sample-methods {shlex_quote(args.image_sample_methods)} "
-                          f"--semantic-guidance-w {args.image_semantic_guidance_w} "
+                          f"--eval-seeds {shlex_quote(args.image_eval_seeds)} "
+                          f"--eval-out runs/image_latent_{args.image_latent_arch}"
+                          f"{cond_suffix}_sweep.json")
+                if args.image_manifest:
+                    eval_cmd += (f" --eval-image-manifest {shlex_quote(args.image_manifest)} "
+                                 f"--eval-image-root {shlex_quote(args.image_root)} "
+                                 f"--eval-image-split {shlex_quote(args.image_eval_split)} "
+                                 f"--eval-image-max-records {args.image_eval_max_records}")
+                    if args.image_min_aesthetic is not None:
+                        eval_cmd += (
+                            f" --eval-image-min-aesthetic {args.image_min_aesthetic}"
+                        )
+                else:
+                    eval_cmd += (
+                          f" --semantic-guidance-w {args.image_semantic_guidance_w} "
                           f"--semantic-guidance-weights "
                           f"{shlex_quote(args.image_semantic_guidance_sweep)} "
                           f"--semantic-guidance-mode {args.image_semantic_guidance_mode} "
                           f"--semantic-guidance-interval "
                           f"{shlex_quote(args.image_semantic_guidance_interval)} "
-                          f"--eval-seeds {shlex_quote(args.image_eval_seeds)} "
                           f"--roundtrip-samples {args.image_roundtrip_samples} "
-                          f"--intervention-samples {args.image_intervention_samples} "
-                          f"--eval-out runs/image_latent_{args.image_latent_arch}"
-                          f"{cond_suffix}_sweep.json")
+                          f"--intervention-samples {args.image_intervention_samples}")
                 if args.image_sample_grid:
-                    train += (f" --sample-grid-out {grid} "
-                              f"--sample-grid-samples {args.image_sample_grid_samples}")
+                    eval_cmd += (f" --sample-grid-out {grid} "
+                                 f"--sample-grid-samples {args.image_sample_grid_samples}")
+                train += eval_cmd
             cmds.append(train)
         if args.audio:                                     # AUDIO-1: audio factors -> facts
             AU = PY.replace("thinking.cli", "thinking.audio")
@@ -388,12 +415,56 @@ def main():
                     help="train the tiny fact-conditioned rectified-flow image generator")
     ap.add_argument("--image-latent", action="store_true", dest="image_latent",
                     help="IMAGE-3: train semantic autoencoder + latent image flow")
+    ap.add_argument("--image-size", type=int, default=32, dest="image_size",
+                    help="square image size for latent image train/eval/sample grids")
+    ap.add_argument("--image-ae-accum-steps", type=int, default=1,
+                    dest="image_ae_accum_steps",
+                    help="AE gradient accumulation microsteps")
+    ap.add_argument("--image-flow-accum-steps", type=int, default=1,
+                    dest="image_flow_accum_steps",
+                    help="flow gradient accumulation microsteps")
+    ap.add_argument("--image-flow-cache-latents", action="store_true",
+                    dest="image_flow_cache_latents",
+                    help="precompute AE latents for manifest flow training")
+    ap.add_argument("--image-flow-cache-records", type=int, default=0,
+                    dest="image_flow_cache_records",
+                    help="maximum manifest records cached for image flow training; 0 means all")
+    ap.add_argument("--image-flow-cache-batch", type=int, default=64,
+                    dest="image_flow_cache_batch",
+                    help="batch size used while building the image latent cache")
+    ap.add_argument("--image-train-precision", default="fp32",
+                    choices=("fp32", "bf16", "fp16"), dest="image_train_precision",
+                    help="latent image training precision; bf16/fp16 AMP runs on CUDA")
+    ap.add_argument("--image-grad-clip", type=float, default=0.0, dest="image_grad_clip",
+                    help="clip latent image AE/flow gradient norm; 0 disables")
     ap.add_argument("--image-latent-arch", default="conv",
                     choices=("conv", "dit", "crossdit", "mmdit"),
                     dest="image_latent_arch", help="latent velocity architecture")
     ap.add_argument("--image-dit-head-width-mult", type=int, default=1,
                     dest="image_dit_head_width_mult",
                     help="width multiplier for the latent DiT/MM-DiT velocity head")
+    ap.add_argument("--image-ae-arch", default="semantic", choices=("semantic", "residual"),
+                    dest="image_ae_arch",
+                    help="autoencoder architecture for latent image generation")
+    ap.add_argument("--image-latent-downsample", type=int, default=4,
+                    dest="image_latent_downsample",
+                    help="AE spatial compression factor for latent image generation")
+    ap.add_argument("--image-ae-res-blocks", type=int, default=1,
+                    dest="image_ae_res_blocks",
+                    help="residual blocks per AE stage when --image-ae-arch residual")
+    ap.add_argument("--image-latent-max-tokens", type=int, default=256,
+                    dest="image_latent_max_tokens",
+                    help="maximum latent grid tokens for image DiT/MM-DiT flows")
+    ap.add_argument("--image-ae-recon-loss", default="mse", choices=("mse", "l1", "hybrid"),
+                    dest="image_ae_recon_loss",
+                    help="base reconstruction loss for image autoencoder")
+    ap.add_argument("--image-ae-grad-w", type=float, default=0.0, dest="image_ae_grad_w",
+                    help="edge/gradient reconstruction loss weight")
+    ap.add_argument("--image-ae-ms-w", type=float, default=0.0, dest="image_ae_ms_w",
+                    help="multi-scale reconstruction loss weight")
+    ap.add_argument("--image-ae-latent-reg-w", type=float, default=0.0,
+                    dest="image_ae_latent_reg_w",
+                    help="latent L2 regularization weight during AE training")
     ap.add_argument("--image-cond-mode", default="facts", choices=("facts", "text"),
                     dest="image_cond_mode",
                     help="latent image conditioning source: canonical facts or learned text prompts")
@@ -410,6 +481,11 @@ def main():
                     help="optional minimum aesthetic/quality score for image manifest rows")
     ap.add_argument("--image-max-records", type=int, default=0, dest="image_max_records",
                     help="cap image manifest records for GPU smoke tests; 0 means all")
+    ap.add_argument("--image-eval-split", default="eval", dest="image_eval_split",
+                    help="manifest split used by --image-eval-sweep for real image eval")
+    ap.add_argument("--image-eval-max-records", type=int, default=0,
+                    dest="image_eval_max_records",
+                    help="cap image eval manifest records for GPU smoke tests; 0 means all")
     ap.add_argument("--image-caption-vocab-max", type=int, default=8192,
                     dest="image_caption_vocab_max",
                     help="maximum caption vocabulary size for image manifest training")

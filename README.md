@@ -95,10 +95,23 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --sample-steps 4 --flow-semantic-w 0.25 --time-sampling logit-normal \
     --flow-consistency-w 0.05 --flow-ema-decay 0.99 \
     --out runs/image_latent_mmdit_text.pt
+.venv/bin/python -m thinking.image_data --manifest data/images/train.jsonl \
+    --root data/images --min-side 256 --max-aspect 2.0 \
+    --min-caption-tokens 3 --write-filtered data/images/train_clean.jsonl \
+    --report-out runs/image_manifest_report.json
 .venv/bin/python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
-    --image-manifest data/images/train.jsonl --image-root data/images \
+    --image-manifest data/images/train_clean.jsonl --image-root data/images \
+    --size 64 --ae-arch residual --latent-downsample 8 --latent-max-tokens 128 \
+    --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 \
+    --ae-accum-steps 2 --flow-accum-steps 2 --grad-clip 1.0 \
+    --flow-cache-latents --flow-cache-batch 32 \
     --ae-steps 40 --flow-steps 40 --sample-grid-out runs/image_manifest_grid.ppm \
     --flow-consistency-w 0.05 --out runs/image_manifest_mmdit.pt
+.venv/bin/python -m thinking.image_latent --eval-checkpoint runs/image_manifest_mmdit.pt \
+    --eval-image-manifest data/images/train_clean.jsonl --eval-image-root data/images \
+    --eval-image-split eval --size 64 --cfg-scales 1.0,1.5 --sample-steps-list 4,8 \
+    --eval-seeds 1,2,3 --sample-grid-out runs/image_manifest_eval_grid.ppm \
+    --eval-out runs/image_manifest_mmdit_sweep.json
 .venv/bin/python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.5 --sample-steps-list 4,8 --eval-seeds 1,2,3 \
     --eval-out runs/image_latent_dit_sweep.json

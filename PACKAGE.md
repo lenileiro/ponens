@@ -281,11 +281,25 @@ python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --flow-ema-decay 0.999 --ae-intervention-w 0.1 --ae-factor-orth-w 0.05 \
     --semantic-guidance-w 2.0 \
     --out runs/image_latent_mmdit_text.pt
+python -m thinking.image_data --manifest data/images/train.jsonl \
+    --root data/images --min-side 256 --max-aspect 2.0 \
+    --min-caption-tokens 3 --write-filtered data/images/train_clean.jsonl \
+    --report-out runs/image_manifest_report.json
 python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
-    --image-manifest data/images/train.jsonl --image-root data/images \
+    --image-manifest data/images/train_clean.jsonl --image-root data/images \
+    --size 64 --ae-arch residual --latent-downsample 8 --latent-max-tokens 128 \
+    --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 \
+    --ae-accum-steps 2 --flow-accum-steps 2 --grad-clip 1.0 \
+    --flow-cache-latents --flow-cache-batch 32 \
     --ae-steps 400 --flow-steps 400 --sample-steps 8 \
     --flow-consistency-w 0.05 --sample-grid-out runs/image_manifest_grid.ppm \
     --out runs/image_manifest_mmdit.pt
+python -m thinking.image_latent --eval-checkpoint runs/image_manifest_mmdit.pt \
+    --eval-image-manifest data/images/train_clean.jsonl --eval-image-root data/images \
+    --eval-image-split eval --size 64 --cfg-scales 1.0,1.25,1.5,2.0 \
+    --sample-steps-list 4,8,16 --eval-seeds 1,2,3 \
+    --sample-grid-out runs/image_manifest_eval_grid.ppm \
+    --eval-out runs/image_manifest_mmdit_sweep.json
 python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
     --eval-seeds 1,2,3 --roundtrip-samples 2 --eval-out runs/image_latent_dit_sweep.json
@@ -311,10 +325,16 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-eval-sweep --fast --go
 RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-latent-arch mmdit \
     --image-cond-mode text --image-dit-head-width-mult 2 \
-    --image-manifest data/images/train.jsonl --image-root data/images \
+    --image-manifest data/images/train_clean.jsonl --image-root data/images \
+    --image-size 128 --image-ae-arch residual --image-latent-downsample 8 \
+    --image-latent-max-tokens 256 \
+    --image-ae-recon-loss hybrid --image-ae-grad-w 0.1 --image-ae-ms-w 0.1 \
+    --image-ae-accum-steps 2 --image-flow-accum-steps 2 \
+    --image-train-precision bf16 --image-grad-clip 1.0 \
+    --image-flow-cache-latents --image-flow-cache-batch 64 \
     --image-sample-steps 8 --image-flow-consistency-w 0.05 \
     --image-latent-normalize channel --image-latent-stat-samples 4096 \
-    --image-sample-grid --fast --go
+    --image-eval-sweep --image-eval-split eval --image-sample-grid --fast --go
 ```
 
 `thinking.image2` is the head-aware FER experiment: shared factored heads vs explicit
@@ -560,6 +580,47 @@ synthetic color/shape renders. Manifest JSONL rows need `image`/`path` plus `cap
 optional `split`, `aesthetic`, `width`, and `height`. This is the necessary data-plane step toward
 SOTA-quality images: synthetic factors remain the controllable probe, but real image/caption data
 is now a first-class training source.
+
+Image-30 makes real image-text checkpoint evaluation explicit. `thinking.image_latent
+--eval-checkpoint ... --eval-image-manifest ... --eval-image-split eval` now runs CFG/step/method
+sweeps on held-out captioned records and reports `caption_sample_mse`, reconstruction, velocity,
+and endpoint-consistency metrics. Manifest checkpoints no longer silently fall back to the
+synthetic color/shape evaluator, and RunPod `--image-eval-sweep` now uses the held-out manifest
+path when `--image-manifest` is present.
+
+Image-31 adds manifest QA and cleaned-manifest export. `python -m thinking.image_data --manifest
+...` reports split counts, extension counts, caption length stats, dimensions/aspect stats,
+duplicates, missing/corrupt files, low-resolution rows, and rejection examples, then can write a
+filtered JSONL with `--write-filtered`. This makes the real image data path auditable before GPU
+training, which is a prerequisite for scaling toward high-quality image generation rather than
+training on silent path/caption/data-quality failures.
+
+Image-32 adds a residual representation autoencoder path. `thinking.image_latent --ae-arch
+residual --latent-downsample 8` uses residual encoder/decoder stages, records the actual latent
+grid and token count, reloads from checkpoint metadata, and replaces hard-coded 4x latent
+assumptions with the AE's own latent shape. `--size` and `--latent-max-tokens` are now first-class
+CLI/RunPod controls, so real-image runs can move beyond 32px while keeping DiT/MM-DiT token counts
+explicit.
+
+Image-33 adds dependency-free AE reconstruction-quality controls. `--ae-recon-loss
+mse|l1|hybrid`, `--ae-grad-w`, `--ae-ms-w`, and `--ae-latent-reg-w` let real-image runs optimize
+pixel fidelity, image gradients, multi-scale structure, and latent magnitude without adding LPIPS
+or discriminator dependencies. This is not a replacement for full perceptual/adversarial AE
+training, but it moves the local/RPU smoke path away from plain MSE compression and records the
+loss configuration in reports/checkpoints.
+
+Image-34 adds GPU training-scale controls for latent image runs. `--ae-accum-steps`,
+`--flow-accum-steps`, `--train-precision fp32|bf16|fp16`, and `--grad-clip` make the per-step
+effective batch explicit, enable CUDA AMP for bf16/fp16, and clip gradients after accumulation.
+CPU tests stay fp32 even if bf16/fp16 is requested, while H100 RunPod jobs can now use bf16 and
+larger effective batches without changing the model objective.
+
+Image-35 adds optional cached-latent flow training for manifest runs. `--flow-cache-latents`
+encodes the post-AE training manifest once, stores raw AE latents and caption token IDs on CPU,
+uses the cache for latent normalization stats, and trains the flow from cached latents instead of
+reloading images and re-running `ae.encode` every microstep. This follows the latent-diffusion
+separation between compression and generative-model training while keeping the cache opt-in and
+auditable via `flow_cache_*` report/checkpoint fields.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

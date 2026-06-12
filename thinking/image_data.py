@@ -9,12 +9,14 @@ large image/text corpora.  This module is deliberately light on dependencies:
 """
 from __future__ import annotations
 
+import argparse
+from collections import Counter
 import csv
 import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable
 
 import numpy as np
@@ -66,6 +68,29 @@ def _coerce_record(row, manifest_dir, root=""):
     )
 
 
+def _read_manifest_rows(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".jsonl":
+        with open(path, "r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+    elif ext in (".csv", ".tsv"):
+        delimiter = "\t" if ext == ".tsv" else ","
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            sample = f.read(2048)
+            f.seek(0)
+            try:
+                has_header = csv.Sniffer().has_header(sample) if sample.strip() else False
+            except csv.Error:
+                has_header = False
+            if has_header:
+                return list(csv.DictReader(f, delimiter=delimiter))
+            return [
+                    {"path": r[0], "caption": r[1], "split": r[2] if len(r) > 2 else "train"}
+                    for r in csv.reader(f, delimiter=delimiter) if len(r) >= 2
+                ]
+    raise ValueError(f"unsupported image manifest format {ext!r}; use .jsonl, .csv, or .tsv")
+
+
 def read_image_manifest(path, root="", split="train", min_aesthetic=None, max_records=0):
     """Read captioned image records from JSONL/CSV/TSV.
 
@@ -73,26 +98,7 @@ def read_image_manifest(path, root="", split="train", min_aesthetic=None, max_re
     TSV rows are interpreted as: path<TAB>caption[<TAB>split].
     """
     manifest_dir = os.path.dirname(os.path.abspath(path))
-    ext = os.path.splitext(path)[1].lower()
-    rows = []
-    if ext == ".jsonl":
-        with open(path, "r", encoding="utf-8") as f:
-            rows = [json.loads(line) for line in f if line.strip()]
-    elif ext in (".csv", ".tsv"):
-        delimiter = "\t" if ext == ".tsv" else ","
-        with open(path, "r", encoding="utf-8", newline="") as f:
-            sample = f.read(2048)
-            f.seek(0)
-            has_header = csv.Sniffer().has_header(sample) if sample.strip() else False
-            if has_header:
-                rows = list(csv.DictReader(f, delimiter=delimiter))
-            else:
-                rows = [
-                    {"path": r[0], "caption": r[1], "split": r[2] if len(r) > 2 else "train"}
-                    for r in csv.reader(f, delimiter=delimiter) if len(r) >= 2
-                ]
-    else:
-        raise ValueError(f"unsupported image manifest format {ext!r}; use .jsonl, .csv, or .tsv")
+    rows = _read_manifest_rows(path)
 
     records = []
     for row in rows:
@@ -114,14 +120,16 @@ def summarize_records(records: Iterable[ImageTextRecord]):
     rows = list(records)
     splits = {}
     aesthetic = []
+    caption_lens = []
     for rec in rows:
         splits[rec.split] = splits.get(rec.split, 0) + 1
         if rec.aesthetic is not None:
             aesthetic.append(float(rec.aesthetic))
+        caption_lens.append(len(caption_tokens(rec.caption)))
     out = {
         "image_records": len(rows),
         "image_splits": splits,
-        "caption_token_mean": float(np.mean([len(caption_tokens(r.caption)) for r in rows])),
+        "caption_token_mean": float(np.mean(caption_lens)) if caption_lens else 0.0,
     }
     if aesthetic:
         out.update({
@@ -130,6 +138,21 @@ def summarize_records(records: Iterable[ImageTextRecord]):
             "aesthetic_max": float(np.max(aesthetic)),
         })
     return out
+
+
+def _stats(vals):
+    vals = [float(v) for v in vals if v is not None]
+    if not vals:
+        return {}
+    arr = np.asarray(vals, dtype=np.float64)
+    return {
+        "min": float(np.min(arr)),
+        "p10": float(np.percentile(arr, 10)),
+        "p50": float(np.percentile(arr, 50)),
+        "mean": float(np.mean(arr)),
+        "p90": float(np.percentile(arr, 90)),
+        "max": float(np.max(arr)),
+    }
 
 
 def build_caption_vocab(records, max_vocab=8192, min_freq=1):
@@ -192,6 +215,36 @@ def _read_ppm(path):
     return data.reshape(height, width, 3)
 
 
+def _ppm_dimensions(path):
+    with open(path, "rb") as f:
+        raw = f.read(4096)
+    pos = 0
+
+    def token():
+        nonlocal pos
+        while pos < len(raw) and raw[pos] in b" \t\r\n":
+            pos += 1
+        while pos < len(raw) and raw[pos] == ord("#"):
+            while pos < len(raw) and raw[pos] not in b"\r\n":
+                pos += 1
+            while pos < len(raw) and raw[pos] in b" \t\r\n":
+                pos += 1
+        start = pos
+        while pos < len(raw) and raw[pos] not in b" \t\r\n":
+            pos += 1
+        return raw[start:pos]
+
+    magic = token()
+    if magic not in (b"P6", b"P3"):
+        raise ValueError(f"unsupported PPM magic {magic!r}")
+    width = int(token())
+    height = int(token())
+    maxval = int(token())
+    if maxval <= 0 or maxval > 255:
+        raise ValueError("only 8-bit PPM files are supported")
+    return width, height
+
+
 def _pil_image(path):
     try:
         from PIL import Image
@@ -201,6 +254,21 @@ def _pil_image(path):
             "or use PPM fixtures for dependency-free tests."
         ) from e
     return Image.open(path).convert("RGB")
+
+
+def image_dimensions(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".ppm", ".pnm"):
+        return _ppm_dimensions(path)
+    try:
+        from PIL import Image
+    except Exception as e:  # pragma: no cover - depends on optional runtime package.
+        raise ImportError(
+            "JPEG/PNG/WebP dimension checks require Pillow. Install it with `pip install pillow` "
+            "or pass --no-check-images for manifest-only validation."
+        ) from e
+    with Image.open(path) as im:
+        return int(im.width), int(im.height)
 
 
 def load_image_tensor(path, size=256, device="cpu", center_crop=True):
@@ -222,6 +290,176 @@ def load_image_tensor(path, size=256, device="cpu", center_crop=True):
         x = F.interpolate(x[None], size=(int(size), int(size)), mode="bilinear",
                           align_corners=False)[0]
     return x.to(device=device)
+
+
+def _manifest_image_path(path, root=""):
+    if not root:
+        return path
+    abs_root = os.path.abspath(root)
+    abs_path = os.path.abspath(path)
+    try:
+        rel = os.path.relpath(abs_path, abs_root)
+    except ValueError:
+        return path
+    if rel.startswith("..") or os.path.isabs(rel):
+        return path
+    return rel
+
+
+def _record_to_manifest_row(rec: ImageTextRecord, root=""):
+    row = {
+        "image": _manifest_image_path(rec.path, root=root),
+        "caption": rec.caption,
+        "split": rec.split,
+    }
+    if rec.aesthetic is not None:
+        row["aesthetic"] = float(rec.aesthetic)
+    if rec.width:
+        row["width"] = int(rec.width)
+    if rec.height:
+        row["height"] = int(rec.height)
+    return row
+
+
+def inspect_image_manifest(path, root="", split="", min_aesthetic=None, max_records=0,
+                           check_images=True, min_side=0, max_aspect=0.0,
+                           min_caption_tokens=1, max_caption_tokens=0,
+                           dedupe_paths=True, sample_errors=8):
+    """Validate and summarize a captioned-image manifest.
+
+    This is data-plane tooling for real image generation: it catches missing files, corrupt
+    images, duplicate paths, very short/long captions, low-resolution images, and extreme aspect
+    ratios before a costly GPU run.
+    """
+    manifest_dir = os.path.dirname(os.path.abspath(path))
+    rows = _read_manifest_rows(path)
+    kept, rejected = [], []
+    reject_causes = Counter()
+    extension_counts = Counter()
+    seen_kept_paths = set()
+    seen_any_paths = Counter()
+    skipped_split = 0
+    skipped_aesthetic = 0
+    inspected = 0
+
+    for row_index, row in enumerate(rows):
+        try:
+            rec = _coerce_record(row, manifest_dir=manifest_dir, root=root)
+        except Exception as e:
+            reason = "malformed_row"
+            reject_causes[reason] += 1
+            rejected.append({"row": row_index, "path": "", "caption": "",
+                             "reasons": [reason], "error": str(e)})
+            continue
+        if split and rec.split != split:
+            skipped_split += 1
+            continue
+        if min_aesthetic is not None and rec.aesthetic is not None:
+            if rec.aesthetic < float(min_aesthetic):
+                skipped_aesthetic += 1
+                continue
+        inspected += 1
+        reasons = []
+        toks = caption_tokens(rec.caption)
+        if min_caption_tokens and len(toks) < int(min_caption_tokens):
+            reasons.append("caption_too_short")
+        if max_caption_tokens and len(toks) > int(max_caption_tokens):
+            reasons.append("caption_too_long")
+
+        ext = os.path.splitext(rec.path)[1].lower() or "<none>"
+        extension_counts[ext] += 1
+        seen_any_paths[rec.path] += 1
+        if ext not in IMAGE_EXTS:
+            reasons.append("unsupported_extension")
+
+        width, height = int(rec.width or 0), int(rec.height or 0)
+        if not os.path.exists(rec.path):
+            reasons.append("missing_file")
+        elif check_images:
+            try:
+                width, height = image_dimensions(rec.path)
+                rec = replace(rec, width=width, height=height)
+            except Exception as e:
+                reasons.append("invalid_image")
+                rejected.append({"row": row_index, "path": rec.path, "caption": rec.caption,
+                                 "reasons": list(reasons), "error": str(e)})
+                for reason in reasons:
+                    reject_causes[reason] += 1
+                if max_records and inspected >= int(max_records):
+                    break
+                continue
+
+        if width > 0 and height > 0:
+            side = min(width, height)
+            aspect = max(width, height) / max(1.0, float(side))
+            if min_side and side < int(min_side):
+                reasons.append("low_resolution")
+            if max_aspect and aspect > float(max_aspect):
+                reasons.append("extreme_aspect")
+
+        if dedupe_paths and rec.path in seen_kept_paths:
+            reasons.append("duplicate_path")
+
+        if reasons:
+            rejected.append({"row": row_index, "path": rec.path, "caption": rec.caption,
+                             "reasons": reasons})
+            for reason in reasons:
+                reject_causes[reason] += 1
+        else:
+            kept.append(rec)
+            seen_kept_paths.add(rec.path)
+        if max_records and inspected >= int(max_records):
+            break
+
+    caption_lengths = [len(caption_tokens(rec.caption)) for rec in kept]
+    widths = [rec.width for rec in kept if rec.width]
+    heights = [rec.height for rec in kept if rec.height]
+    min_sides = [min(rec.width, rec.height) for rec in kept if rec.width and rec.height]
+    aspects = [
+        max(rec.width, rec.height) / max(1.0, float(min(rec.width, rec.height)))
+        for rec in kept if rec.width and rec.height
+    ]
+    aesthetic = [rec.aesthetic for rec in kept if rec.aesthetic is not None]
+    duplicate_total = sum(max(0, n - 1) for n in seen_any_paths.values())
+    report = {
+        "manifest": path,
+        "root": root,
+        "split_filter": split,
+        "min_aesthetic": float(min_aesthetic) if min_aesthetic is not None else None,
+        "max_records": int(max_records),
+        "check_images": bool(check_images),
+        "min_side": int(min_side),
+        "max_aspect": float(max_aspect),
+        "min_caption_tokens": int(min_caption_tokens),
+        "max_caption_tokens": int(max_caption_tokens),
+        "dedupe_paths": bool(dedupe_paths),
+        "rows_total": len(rows),
+        "records_inspected": int(inspected),
+        "records_kept": len(kept),
+        "records_rejected": len(rejected),
+        "records_skipped_split": int(skipped_split),
+        "records_skipped_aesthetic": int(skipped_aesthetic),
+        "duplicate_path_rows": int(duplicate_total),
+        "reject_causes": dict(sorted(reject_causes.items())),
+        "extension_counts": dict(sorted(extension_counts.items())),
+        "quality_pass_rate": float(len(kept) / inspected) if inspected else 0.0,
+        "caption_token_stats": _stats(caption_lengths),
+        "width_stats": _stats(widths),
+        "height_stats": _stats(heights),
+        "min_side_stats": _stats(min_sides),
+        "aspect_stats": _stats(aspects),
+        "aesthetic_stats": _stats(aesthetic),
+        "kept_summary": summarize_records(kept),
+        "error_examples": rejected[:max(0, int(sample_errors))],
+    }
+    return report, kept, rejected
+
+
+def write_image_manifest(records, path, root=""):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(_record_to_manifest_row(rec, root=root), sort_keys=True) + "\n")
 
 
 def sample_image_text_batch(records, rng, batch=32, size=256, device="cpu"):
@@ -261,4 +499,86 @@ def selftest():
         assert xb.shape == (2, 3, 4, 4) and captions == [records[0].caption] * 2
         summary = summarize_records(records)
         assert summary["image_records"] == 1 and summary["image_splits"]["train"] == 1
+        qa_manifest = os.path.join(td, "qa.jsonl")
+        with open(qa_manifest, "w", encoding="utf-8") as f:
+            for row in (
+                    {"image": "sample.ppm", "caption": "red green blocks", "split": "train"},
+                    {"image": "sample.ppm", "caption": "duplicate patch", "split": "train"},
+                    {"image": "missing.ppm", "caption": "x", "split": "train"},
+                    {"image": "sample.ppm", "caption": "held out patch", "split": "eval"}):
+                f.write(json.dumps(row) + "\n")
+        report, kept, rejected = inspect_image_manifest(
+            qa_manifest, split="train", min_caption_tokens=2, check_images=True)
+        assert report["records_kept"] == 1 and len(kept) == 1
+        assert report["reject_causes"]["duplicate_path"] == 1
+        assert report["reject_causes"]["missing_file"] == 1
+        assert report["reject_causes"]["caption_too_short"] == 1
+        assert report["records_skipped_split"] == 1 and rejected
+        assert report["width_stats"]["min"] == 8.0 and report["height_stats"]["min"] == 6.0
+        filtered = os.path.join(td, "filtered.jsonl")
+        write_image_manifest(kept, filtered, root=td)
+        with open(filtered, "r", encoding="utf-8") as f:
+            filtered_row = json.loads(f.readline())
+        assert filtered_row["image"] == "sample.ppm"
+        reread = read_image_manifest(filtered, root=td, split="train")
+        assert len(reread) == 1 and reread[0].width == 8 and reread[0].height == 6
     print("image_data selftest OK")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--manifest", default="", help="JSONL/CSV/TSV captioned image manifest")
+    ap.add_argument("--root", default="", help="base directory for relative manifest paths")
+    ap.add_argument("--split", default="",
+                    help="optional split filter; default inspects all splits")
+    ap.add_argument("--min-aesthetic", type=float, default=None,
+                    help="skip rows with aesthetic/score/quality below this threshold")
+    ap.add_argument("--max-records", type=int, default=0,
+                    help="cap inspected records for smoke tests; 0 means all")
+    ap.add_argument("--min-side", type=int, default=0,
+                    help="reject images whose smaller side is below this size")
+    ap.add_argument("--max-aspect", type=float, default=0.0,
+                    help="reject images wider/taller than this aspect ratio; 0 disables")
+    ap.add_argument("--min-caption-tokens", type=int, default=1,
+                    help="reject captions shorter than this token count")
+    ap.add_argument("--max-caption-tokens", type=int, default=0,
+                    help="reject captions longer than this token count; 0 disables")
+    ap.add_argument("--no-check-images", action="store_true",
+                    help="skip image decode/header checks but still check paths and captions")
+    ap.add_argument("--keep-duplicate-paths", action="store_true",
+                    help="do not reject duplicate image paths")
+    ap.add_argument("--sample-errors", type=int, default=8,
+                    help="number of rejected examples to include in the report")
+    ap.add_argument("--write-filtered", default="",
+                    help="optional JSONL path for records that pass validation")
+    ap.add_argument("--report-out", default="",
+                    help="optional JSON path for the validation report")
+    args = ap.parse_args(argv)
+    if args.selftest:
+        selftest()
+        return
+    if not args.manifest:
+        ap.error("use --selftest or --manifest")
+    report, kept, _rejected = inspect_image_manifest(
+        args.manifest, root=args.root, split=args.split,
+        min_aesthetic=args.min_aesthetic, max_records=args.max_records,
+        check_images=not args.no_check_images, min_side=args.min_side,
+        max_aspect=args.max_aspect, min_caption_tokens=args.min_caption_tokens,
+        max_caption_tokens=args.max_caption_tokens,
+        dedupe_paths=not args.keep_duplicate_paths,
+        sample_errors=args.sample_errors)
+    if args.write_filtered:
+        write_image_manifest(kept, args.write_filtered, root=args.root)
+        report["filtered_manifest"] = args.write_filtered
+    text = json.dumps(report, indent=1)
+    print(text)
+    if args.report_out:
+        os.makedirs(os.path.dirname(args.report_out) or ".", exist_ok=True)
+        with open(args.report_out, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+        print(f"saved -> {args.report_out}")
+
+
+if __name__ == "__main__":
+    main()
