@@ -49,6 +49,7 @@ FACT_GROUPS = {
     for pred in sorted({fact[0] for fact in FACT_VOCAB})
 }
 SAMPLE_METHODS = ("euler", "heun")
+MMDIT_ATTN_IMPLS = ("manual", "sdpa", "auto")
 DEFAULT_GUIDANCE_INTERVAL = (0.0, 1.0)
 
 
@@ -605,13 +606,17 @@ class HeadRMSNorm(nn.Module):
 class MMDiTBlock(nn.Module):
     """Tiny dual-stream block with separate image/text projections and joint attention."""
 
-    def __init__(self, hidden=96, heads=4, qk_norm=False):
+    def __init__(self, hidden=96, heads=4, qk_norm=False, attn_impl="manual"):
         super().__init__()
         if hidden % heads:
             raise ValueError(f"hidden={hidden} must be divisible by heads={heads}")
+        attn_impl = str(attn_impl)
+        if attn_impl not in MMDIT_ATTN_IMPLS:
+            raise ValueError(f"unknown MM-DiT attention implementation {attn_impl!r}")
         self.heads = int(heads)
         self.head_dim = hidden // heads
         self.uses_qk_norm = bool(qk_norm)
+        self.attn_impl = attn_impl
         self.scale = self.head_dim ** -0.5
         self.img_norm = nn.LayerNorm(hidden)
         self.ctx_norm = nn.LayerNorm(hidden)
@@ -645,6 +650,42 @@ class MMDiTBlock(nn.Module):
     def _modulate(x, shift, scale):
         return x * (1.0 + scale[:, None, :]) + shift[:, None, :]
 
+    @staticmethod
+    def _sdpa_available():
+        return hasattr(F, "scaled_dot_product_attention")
+
+    @staticmethod
+    def _key_mask(ctx_mask, b, n_img, device):
+        if ctx_mask is None:
+            return None
+        img_mask = torch.zeros((b, n_img), dtype=torch.bool, device=device)
+        return torch.cat([img_mask, ctx_mask], dim=1)
+
+    def _manual_attention(self, q, k, v, key_mask=None):
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        if key_mask is not None:
+            attn = attn.masked_fill(key_mask[:, None, None, :], torch.finfo(attn.dtype).min)
+        return torch.softmax(attn, dim=-1).matmul(v)
+
+    def _sdpa_attention(self, q, k, v, key_mask=None):
+        attn_mask = None
+        if key_mask is not None:
+            attn_mask = torch.zeros((q.shape[0], 1, 1, key_mask.shape[1]),
+                                    dtype=q.dtype, device=q.device)
+            attn_mask = attn_mask.masked_fill(key_mask[:, None, None, :],
+                                              torch.finfo(q.dtype).min)
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+
+    def _joint_attention(self, q, k, v, key_mask=None):
+        if self.attn_impl == "manual":
+            return self._manual_attention(q, k, v, key_mask=key_mask)
+        if self._sdpa_available():
+            return self._sdpa_attention(q, k, v, key_mask=key_mask)
+        if self.attn_impl == "sdpa":
+            raise RuntimeError("scaled_dot_product_attention is unavailable in this torch build")
+        return self._manual_attention(q, k, v, key_mask=key_mask)
+
     def forward(self, img, ctx, cond_ctx, ctx_mask=None):
         b, n_img, h = img.shape
         n_ctx = ctx.shape[1]
@@ -662,12 +703,9 @@ class MMDiTBlock(nn.Module):
         q = torch.cat([qi, qc], dim=2)
         k = torch.cat([ki, kc], dim=2)
         v = torch.cat([vi, vc], dim=2)
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        if ctx_mask is not None:
-            img_mask = torch.zeros((b, n_img), dtype=torch.bool, device=ctx_mask.device)
-            key_mask = torch.cat([img_mask, ctx_mask], dim=1)
-            attn = attn.masked_fill(key_mask[:, None, None, :], torch.finfo(attn.dtype).min)
-        mixed = torch.softmax(attn, dim=-1).matmul(v).transpose(1, 2).reshape(b, n_img + n_ctx, h)
+        key_mask = self._key_mask(ctx_mask, b, n_img, q.device)
+        mixed = self._joint_attention(q, k, v, key_mask=key_mask)
+        mixed = mixed.transpose(1, 2).reshape(b, n_img + n_ctx, h)
         img_delta, ctx_delta = mixed[:, :n_img], mixed[:, n_img:]
         img = img + (1.0 + img_attn_gate[:, None, :]) * self.img_out(img_delta)
         ctx = ctx + (1.0 + ctx_attn_gate[:, None, :]) * self.ctx_out(ctx_delta)
@@ -688,21 +726,29 @@ class LatentMMDiTFlowNet(nn.Module):
     uses_residual_gating = True
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
-                 max_tokens=256, head_width_mult=1, qk_norm=False):
+                 max_tokens=256, head_width_mult=1, qk_norm=False,
+                 attn_impl="manual"):
         super().__init__()
+        attn_impl = str(attn_impl)
+        if attn_impl not in MMDIT_ATTN_IMPLS:
+            raise ValueError(f"unknown MM-DiT attention implementation {attn_impl!r}")
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
         self.hidden = int(hidden)
         self.max_tokens = int(max_tokens)
         self.head_width_mult = int(head_width_mult)
         self.uses_qk_norm = bool(qk_norm)
+        self.attn_impl = attn_impl
         self.in_proj = nn.Linear(latent_ch, hidden)
         self.pos = nn.Parameter(torch.zeros(1, max_tokens, hidden))
         self.time = nn.Sequential(nn.Linear(cond_dim + 1, hidden), nn.GELU(),
                                   nn.Linear(hidden, hidden))
         self.ctx_proj = nn.Linear(cond_dim, hidden)
         self.blocks = nn.ModuleList([
-            MMDiTBlock(hidden, heads, qk_norm=self.uses_qk_norm) for _ in range(depth)
+            MMDiTBlock(
+                hidden, heads, qk_norm=self.uses_qk_norm, attn_impl=self.attn_impl
+            )
+            for _ in range(depth)
         ])
         self.norm = nn.LayerNorm(hidden)
         self.out_proj = make_velocity_head(hidden, latent_ch, self.head_width_mult)
@@ -738,7 +784,7 @@ class LatentMMDiTFlowNet(nn.Module):
 
 def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4,
               cond_dim=None, dit_head_width_mult=1, latent_max_tokens=256,
-              dit_qk_norm=False):
+              dit_qk_norm=False, dit_attn_impl="manual"):
     if flow_arch == "conv":
         return LatentFlowNet(latent_ch=latent_ch, hidden=hidden, cond_dim=cond_dim)
     dit_head_width_mult = int(dit_head_width_mult)
@@ -768,7 +814,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                   heads=heads, cond_dim=cond_dim,
                                   head_width_mult=dit_head_width_mult,
                                   max_tokens=latent_max_tokens,
-                                  qk_norm=dit_qk_norm)
+                                  qk_norm=dit_qk_norm,
+                                  attn_impl=dit_attn_impl)
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
@@ -2685,6 +2732,9 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     dit_head_width_mult = int(ckpt.get("dit_head_width_mult",
                                        report.get("dit_head_width_mult", 1)))
     dit_qk_norm = bool(ckpt.get("dit_qk_norm", report.get("dit_qk_norm", False)))
+    dit_attn_impl = str(ckpt.get("dit_attn_impl", report.get("dit_attn_impl", "manual")))
+    if dit_attn_impl not in MMDIT_ATTN_IMPLS:
+        raise ValueError(f"unknown MM-DiT attention implementation {dit_attn_impl!r}")
     cond_mode = ckpt.get("cond_mode", report.get("cond_mode", "facts"))
     data_mode = ckpt.get("data_mode", report.get("data_mode", "synthetic_factors"))
     cond_dim = int(ckpt.get("cond_dim", report.get("cond_dim", len(FACT_VOCAB))))
@@ -2746,7 +2796,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                      dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim,
                      dit_head_width_mult=dit_head_width_mult,
                      latent_max_tokens=latent_max_tokens,
-                     dit_qk_norm=dit_qk_norm).to(device)
+                     dit_qk_norm=dit_qk_norm,
+                     dit_attn_impl=dit_attn_impl).to(device)
     latent_stats = latent_stats_to_device(
         ckpt.get("latent_stats", {"mode": ckpt.get("latent_normalize", "none")}),
         device)
@@ -2779,6 +2830,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
             dit_head_width_mult if flow_arch in ("dit", "crossdit", "mmdit") else 1
         ),
         "dit_qk_norm": bool(dit_qk_norm) if flow_arch == "mmdit" else False,
+        "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "flow_load": flow_load,
@@ -3282,7 +3334,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       caption_vocab_max=8192, caption_max_len=64,
                       caption_cond_source="tokens",
                       image_crop_mode="center", image_hflip_prob=0.0,
-                      dit_qk_norm=False,
+                      dit_qk_norm=False, dit_attn_impl="manual",
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0, time_shift=1.0,
                       latent_normalize="none", latent_stat_samples=512,
@@ -3380,6 +3432,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         semantic_guidance_interval, name="semantic_guidance_interval")
     if dit_head_width_mult <= 0:
         raise ValueError("dit_head_width_mult must be positive")
+    if dit_attn_impl not in MMDIT_ATTN_IMPLS:
+        raise ValueError(f"unknown MM-DiT attention implementation {dit_attn_impl!r}")
     if latent_max_tokens <= 0:
         raise ValueError("latent_max_tokens must be positive")
     if flow_ema_decay < 0.0 or flow_ema_decay >= 1.0:
@@ -3431,7 +3485,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                      dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim,
                      dit_head_width_mult=dit_head_width_mult,
                      latent_max_tokens=latent_max_tokens,
-                     dit_qk_norm=bool(dit_qk_norm)).to(device)
+                     dit_qk_norm=bool(dit_qk_norm),
+                     dit_attn_impl=dit_attn_impl).to(device)
     attach_text_aligner(flow, text_aligner)
     attach_image_feature_aligner(flow, image_feature_aligner)
     ae_params = list(ae.parameters())
@@ -3718,6 +3773,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             int(dit_head_width_mult) if flow_arch in ("dit", "crossdit", "mmdit") else 1
         ),
         "dit_qk_norm": bool(dit_qk_norm) if flow_arch == "mmdit" else False,
+        "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "fact_w": float(fact_w),
@@ -3949,10 +4005,12 @@ def selftest():
         dit_depth=1, dit_heads=2, seed=7, device="cpu", cond_mode="text",
         text_cond_dim=8, sample_steps=1, time_sampling="logit-normal",
         flow_ema_decay=0.5, dit_head_width_mult=2, dit_qk_norm=True,
+        dit_attn_impl=("sdpa" if hasattr(F, "scaled_dot_product_attention") else "auto"),
         return_conditioner=True)
     assert report5["flow_arch"] == "mmdit" and flow_uses_cond_tokens(flow5)
     assert report5["dit_head_width_mult"] == 2
     assert report5["dit_qk_norm"] is True
+    assert report5["dit_attn_impl"] in ("sdpa", "auto")
     assert any("q_norm" in k for k in flow5.state_dict())
     assert report5["adaptive_modulation"] is True
     assert report5["residual_gating"] is True
@@ -3966,7 +4024,8 @@ def selftest():
     legacy_state = {k: v for k, v in flow5.state_dict().items() if ".gate." not in k}
     compat_flow = make_flow(flow_arch="mmdit", latent_ch=4, hidden=32, dit_depth=1,
                             dit_heads=2, cond_dim=8, dit_head_width_mult=2,
-                            dit_qk_norm=True)
+                            dit_qk_norm=True,
+                            dit_attn_impl=report5["dit_attn_impl"])
     compat_load = load_flow_state(compat_flow, legacy_state)
     assert compat_load["tolerated_missing"] and all(
         ".gate." in k for k in compat_load["tolerated_missing"])
@@ -4203,6 +4262,9 @@ def main(argv=None):
                     help="width multiplier for the DiT/MM-DiT latent velocity head")
     ap.add_argument("--dit-qk-norm", action="store_true", dest="dit_qk_norm",
                     help="enable per-head QK RMSNorm in MM-DiT attention")
+    ap.add_argument("--dit-attn-impl", default="manual", choices=MMDIT_ATTN_IMPLS,
+                    dest="dit_attn_impl",
+                    help="MM-DiT attention implementation: manual, sdpa, or auto")
     ap.add_argument("--cond-drop", type=float, default=0.0, dest="cond_drop")
     ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
     ap.add_argument("--cfg-interval", default="0.0,1.0", dest="cfg_interval",
@@ -4429,6 +4491,7 @@ def main(argv=None):
         dit_heads=args.dit_heads, cond_drop=args.cond_drop, cfg_scale=args.cfg_scale,
         dit_head_width_mult=args.dit_head_width_mult,
         dit_qk_norm=args.dit_qk_norm,
+        dit_attn_impl=args.dit_attn_impl,
         latent_max_tokens=args.latent_max_tokens, ae_arch=args.ae_arch,
         latent_downsample=args.latent_downsample, ae_res_blocks=args.ae_res_blocks,
         ae_recon_loss=args.ae_recon_loss, ae_grad_w=args.ae_grad_w,
@@ -4572,6 +4635,7 @@ def main(argv=None):
         "dit_heads": args.dit_heads,
         "dit_head_width_mult": args.dit_head_width_mult,
         "dit_qk_norm": report.get("dit_qk_norm", False),
+        "dit_attn_impl": report.get("dit_attn_impl", "manual"),
         "cond_mode": args.cond_mode,
         "cond_dim": report["cond_dim"],
         "data_mode": report.get("data_mode", "synthetic_factors"),

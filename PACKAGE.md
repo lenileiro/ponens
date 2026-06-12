@@ -635,6 +635,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
     --image-clean-min-side 256 --image-clean-max-aspect 2.0 \
     --image-latent --image-latent-arch mmdit \
     --image-cond-mode text --image-dit-head-width-mult 2 --image-dit-qk-norm \
+    --image-dit-attn-impl sdpa \
     --image-manifest data/images/train.jsonl --image-root data/images \
     --image-caption-cond-source auto \
     --image-crop-mode random --image-hflip-prob 0.5 \
@@ -1011,6 +1012,11 @@ Image-46 adds optional per-head QK RMSNorm to the custom MM-DiT attention path. 
 `thinking.image_latent --dit-qk-norm` or RunPod `--image-dit-qk-norm` for high-resolution MM-DiT
 runs; checkpoint metadata records the flag so qk-normalized checkpoints reload with the same
 attention modules, while legacy checkpoints keep the default non-normalized architecture.
+
+Image-47 adds an MM-DiT attention implementation selector. `--dit-attn-impl manual|sdpa|auto`
+keeps the original explicit attention path available, uses PyTorch scaled-dot-product attention for
+fused/flash kernels when requested, or falls back automatically. RunPod exposes the same setting as
+`--image-dit-attn-impl`, and checkpoint metadata records the selected implementation.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
