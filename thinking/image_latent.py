@@ -369,6 +369,43 @@ class ImageTextAligner(nn.Module):
         return self.logit_scale.exp().clamp(max=100.0)
 
 
+class ImageFeatureAligner(nn.Module):
+    """Contrastive bridge between AE latents and external image features."""
+
+    def __init__(self, latent_ch=16, feature_dim=768, hidden=64, embed_dim=128,
+                 temperature=0.07):
+        super().__init__()
+        self.feature_dim = int(feature_dim)
+        self.embed_dim = int(embed_dim)
+        self.image = nn.Sequential(
+            nn.LayerNorm(int(latent_ch)),
+            nn.Linear(int(latent_ch), int(hidden)),
+            nn.GELU(),
+            nn.Linear(int(hidden), self.embed_dim),
+        )
+        self.feature = nn.Sequential(
+            nn.LayerNorm(self.feature_dim),
+            nn.Linear(self.feature_dim, int(hidden)),
+            nn.GELU(),
+            nn.Linear(int(hidden), self.embed_dim),
+        )
+        temp = max(float(temperature), 1.0e-4)
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / temp)))
+
+    def encode_image(self, z):
+        pooled = z.float().mean(dim=(2, 3))
+        return F.normalize(self.image(pooled), dim=-1)
+
+    def encode_feature(self, features):
+        return F.normalize(self.feature(features.float()), dim=-1)
+
+    def forward(self, z, features):
+        return self.encode_image(z), self.encode_feature(features)
+
+    def scale(self):
+        return self.logit_scale.exp().clamp(max=100.0)
+
+
 class LatentFlowNet(nn.Module):
     """Velocity field v_theta(z_t, t, canonical_facts)."""
 
@@ -716,6 +753,14 @@ def attach_text_aligner(flow, text_aligner):
     return flow
 
 
+def attach_image_feature_aligner(flow, image_feature_aligner):
+    # Keep the aligner available for eval without registering it as part of flow.state_dict().
+    if hasattr(flow, "_modules"):
+        flow._modules.pop("image_feature_aligner", None)
+    flow.__dict__["image_feature_aligner"] = image_feature_aligner
+    return flow
+
+
 def _parse_number_list(s, cast=float):
     if isinstance(s, (tuple, list)):
         return tuple(cast(x) for x in s)
@@ -962,7 +1007,8 @@ def estimate_latent_stats_tensor(latents, n=512, seed=123, mode="none", eps=1.0e
 @torch.no_grad()
 def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_records=0,
                              batch=64, seed=0, size=32, device=DEV, precision="fp32",
-                             cond_source="tokens", cache_dir="", shard_size=1024):
+                             cond_source="tokens", cache_dir="", shard_size=1024,
+                             include_image_embeddings=False):
     rows = list(records)
     if not rows:
         raise ValueError("cannot build latent cache from empty records")
@@ -972,12 +1018,15 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         rows = [rows[int(i)] for i in chosen_idx]
     if cond_source == "embedding":
         infer_text_embedding_dim(rows)
+    if include_image_embeddings:
+        infer_image_embedding_dim(rows)
     if cache_dir:
         return build_disk_image_latent_cache(
             ae, rows, prompt_vocab, caption_max_len=caption_max_len,
             batch=batch, size=size, device=device, precision=precision,
-            cond_source=cond_source, cache_dir=cache_dir, shard_size=shard_size)
-    latents, captions, embeddings = [], [], []
+            cond_source=cond_source, cache_dir=cache_dir, shard_size=shard_size,
+            include_image_embeddings=include_image_embeddings)
+    latents, captions, embeddings, image_embeddings = [], [], [], []
     ae.eval()
     for start in range(0, len(rows), max(1, int(batch))):
         chunk = rows[start:start + max(1, int(batch))]
@@ -991,6 +1040,8 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         captions.extend(rec.caption for rec in chunk)
         if cond_source == "embedding":
             embeddings.append(record_text_embedding_tensor(chunk, device="cpu"))
+        if include_image_embeddings:
+            image_embeddings.append(record_image_embedding_tensor(chunk, device="cpu"))
     cache = {
         "backend": "memory",
         "latents": torch.cat(latents, dim=0).contiguous(),
@@ -1002,7 +1053,11 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         "text_embeddings": (
             torch.cat(embeddings, dim=0).contiguous() if embeddings else None
         ),
+        "image_embeddings": (
+            torch.cat(image_embeddings, dim=0).contiguous() if image_embeddings else None
+        ),
         "cond_source": cond_source,
+        "has_image_embeddings": bool(image_embeddings),
         "records": len(rows),
         "latent_shape": tuple(int(x) for x in latents[0].shape[1:]),
         "bytes": int(sum(z.numel() * z.element_size() for z in latents)),
@@ -1011,13 +1066,18 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         cache["bytes"] += int(
             cache["text_embeddings"].numel() * cache["text_embeddings"].element_size()
         )
+    if cache["image_embeddings"] is not None:
+        cache["bytes"] += int(
+            cache["image_embeddings"].numel() * cache["image_embeddings"].element_size()
+        )
     return cache
 
 
 @torch.no_grad()
 def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, batch=64,
                                   size=32, device=DEV, precision="fp32",
-                                  cond_source="tokens", cache_dir="", shard_size=1024):
+                                  cond_source="tokens", cache_dir="", shard_size=1024,
+                                  include_image_embeddings=False):
     if not cache_dir:
         raise ValueError("cache_dir is required for disk latent cache")
     shard_size = int(shard_size)
@@ -1056,7 +1116,12 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
                 record_text_embedding_tensor(chunk_rows, device="cpu")
                 if cond_source == "embedding" else None
             ),
+            "image_embeddings": (
+                record_image_embedding_tensor(chunk_rows, device="cpu")
+                if include_image_embeddings else None
+            ),
             "cond_source": cond_source,
+            "has_image_embeddings": bool(include_image_embeddings),
             "start": int(start),
             "count": int(len(chunk_rows)),
         }
@@ -1078,6 +1143,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         "records": int(len(rows)),
         "latent_shape": list(latent_shape or ()),
         "cond_source": cond_source,
+        "has_image_embeddings": bool(include_image_embeddings),
         "shard_size": int(shard_size),
         "shards": [
             {"file": s["file"], "count": int(s["count"]), "bytes": int(s["bytes"])}
@@ -1098,6 +1164,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         "records": int(len(rows)),
         "latent_shape": tuple(int(x) for x in latent_shape),
         "cond_source": cond_source,
+        "has_image_embeddings": bool(include_image_embeddings),
         "shard_size": int(shard_size),
         "shards": shards,
         "bytes": int(total_bytes),
@@ -1120,11 +1187,12 @@ def _load_latent_cache_shard(shard):
     return torch.load(shard["path"], map_location="cpu")
 
 
-def _latent_cache_payload(source, ids=None, embeddings=None):
+def _latent_cache_payload(source, ids=None, embeddings=None, image_embeddings=None):
     return {
         "cond_source": source,
         "caption_ids": ids,
         "text_embeddings": embeddings,
+        "image_embeddings": image_embeddings,
     }
 
 
@@ -1141,19 +1209,30 @@ def sample_latent_cache(cache, rng, batch, device=DEV):
         n = int(shard["latents"].shape[0])
         idx = torch.tensor(rng.integers(0, n, size=int(batch)), dtype=torch.long)
         z1 = shard["latents"][idx].to(device=device)
+        image_embs = (
+            shard["image_embeddings"][idx] if shard.get("image_embeddings") is not None else None
+        )
         if cache["cond_source"] == "embedding":
             payload = _latent_cache_payload(
-                "embedding", embeddings=shard["text_embeddings"][idx])
+                "embedding", embeddings=shard["text_embeddings"][idx],
+                image_embeddings=image_embs)
         else:
-            payload = _latent_cache_payload("tokens", ids=shard["caption_ids"][idx])
+            payload = _latent_cache_payload(
+                "tokens", ids=shard["caption_ids"][idx], image_embeddings=image_embs)
         return z1, payload
     idx_np = rng.integers(0, int(cache["records"]), size=int(batch))
     idx = torch.tensor(idx_np, dtype=torch.long)
     z1 = cache["latents"][idx].to(device=device)
+    image_embs = (
+        cache["image_embeddings"][idx] if cache.get("image_embeddings") is not None else None
+    )
     if cache["cond_source"] == "embedding":
-        payload = _latent_cache_payload("embedding", embeddings=cache["text_embeddings"][idx])
+        payload = _latent_cache_payload(
+            "embedding", embeddings=cache["text_embeddings"][idx],
+            image_embeddings=image_embs)
     else:
-        payload = _latent_cache_payload("tokens", ids=cache["caption_ids"][idx])
+        payload = _latent_cache_payload(
+            "tokens", ids=cache["caption_ids"][idx], image_embeddings=image_embs)
     return z1, payload
 
 
@@ -1349,6 +1428,45 @@ def image_text_alignment_loss(aligner, z, cond, prefix="caption_align", mask=Non
         f"{prefix}_loss": loss.detach(),
         f"{prefix}_i2t_acc": i2t.detach(),
         f"{prefix}_t2i_acc": t2i.detach(),
+        f"{prefix}_diag_logit": diag.detach(),
+        f"{prefix}_offdiag_logit": offdiag.detach(),
+        f"{prefix}_n": torch.tensor(float(n), device=z.device),
+    }
+
+
+def image_feature_alignment_loss(aligner, z, features, prefix="image_feature_align", mask=None):
+    if aligner is None:
+        zero = z.sum() * 0.0
+        return zero, {}
+    features = features.to(device=z.device)
+    img_emb, feat_emb = aligner(z, features)
+    if mask is not None:
+        mask = mask.to(device=img_emb.device, dtype=torch.bool).flatten()
+        img_emb = img_emb[mask]
+        feat_emb = feat_emb[mask]
+    n = int(img_emb.shape[0])
+    if n <= 0:
+        zero = z.sum() * 0.0 + features.sum() * 0.0
+        return zero, {
+            f"{prefix}_loss": zero.detach(),
+            f"{prefix}_i2f_acc": zero.detach(),
+            f"{prefix}_f2i_acc": zero.detach(),
+            f"{prefix}_n": torch.tensor(0.0, device=z.device),
+        }
+    logits = aligner.scale().to(img_emb.dtype) * img_emb.matmul(feat_emb.t())
+    targets = torch.arange(n, device=logits.device)
+    loss = 0.5 * (
+        F.cross_entropy(logits, targets) + F.cross_entropy(logits.t(), targets)
+    )
+    i2f = logits.argmax(dim=1).eq(targets).float().mean()
+    f2i = logits.argmax(dim=0).eq(targets).float().mean()
+    diag = logits.diag().mean()
+    offdiag = ((logits.sum() - logits.diag().sum()) / max(1, n * n - n)
+               if n > 1 else logits.diag().mean())
+    return loss, {
+        f"{prefix}_loss": loss.detach(),
+        f"{prefix}_i2f_acc": i2f.detach(),
+        f"{prefix}_f2i_acc": f2i.detach(),
         f"{prefix}_diag_logit": diag.detach(),
         f"{prefix}_offdiag_logit": offdiag.detach(),
         f"{prefix}_n": torch.tensor(float(n), device=z.device),
@@ -1689,7 +1807,8 @@ def latent_factor_orthogonality_loss(z, cond, eps=1.0e-6):
 def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
                        semantic_cond=None, time_sampling="uniform", time_logit_mean=0.0,
                        time_logit_std=1.0, latent_stats=None, consistency_w=0.0,
-                       text_aligner=None, text_align_w=0.0):
+                       text_aligner=None, text_align_w=0.0,
+                       feature_aligner=None, image_features=None, feature_align_w=0.0):
     latent_stats = flow_latent_stats(flow) if latent_stats is None else latent_stats
     z1_model = normalize_latent(z1, latent_stats)
     x0 = torch.randn_like(z1_model)
@@ -1738,6 +1857,15 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
             text_aligner, z_clean, cond_model, prefix="flow_caption_align", mask=keep)
         total = total + float(text_align_w) * text_align
         parts.update(text_parts)
+    if feature_aligner is not None and feature_align_w > 0.0:
+        if image_features is None:
+            raise ValueError("flow feature alignment requires image_features")
+        if z_clean is None:
+            z_clean = denormalize_latent(zt + (1.0 - t) * pred, latent_stats)
+        feature_align, feature_parts = image_feature_alignment_loss(
+            feature_aligner, z_clean, image_features, prefix="flow_image_feature_align")
+        total = total + float(feature_align_w) * feature_align
+        parts.update(feature_parts)
     return total, parts
 
 
@@ -1821,6 +1949,19 @@ def infer_text_embedding_dim(records):
     return int(dim)
 
 
+def infer_image_embedding_dim(records):
+    dims = {len(rec.image_embedding) for rec in records if rec.image_embedding is not None}
+    if not dims:
+        return 0
+    if len(dims) != 1:
+        raise ValueError(f"manifest image embeddings have mixed dimensions: {sorted(dims)}")
+    dim = next(iter(dims))
+    missing = sum(1 for rec in records if rec.image_embedding is None)
+    if missing:
+        raise ValueError(f"{missing} manifest records are missing image embeddings")
+    return int(dim)
+
+
 def resolve_caption_cond_source(source, records):
     source = str(source or "tokens")
     if source not in ("tokens", "embedding", "auto"):
@@ -1845,6 +1986,14 @@ def record_text_embedding_tensor(records, device=DEV):
     if dim <= 0:
         raise ValueError("records do not have text embeddings")
     return torch.tensor([rec.text_embedding for rec in records], dtype=torch.float32,
+                        device=device)
+
+
+def record_image_embedding_tensor(records, device=DEV):
+    dim = infer_image_embedding_dim(records)
+    if dim <= 0:
+        raise ValueError("records do not have image embeddings")
+    return torch.tensor([rec.image_embedding for rec in records], dtype=torch.float32,
                         device=device)
 
 
@@ -2248,6 +2397,7 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                            conditioner=None, prompt_vocab=None, caption_max_len=64,
                            cfg_scale=1.0, sample_steps=4, sample_method="euler",
                            cfg_interval=DEFAULT_GUIDANCE_INTERVAL, text_aligner=None,
+                           image_feature_aligner=None,
                            caption_cond_source="tokens"):
     rng = np.random.default_rng(seed)
     ae.eval()
@@ -2256,6 +2406,7 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
     endpoint_mses, endpoint_consistency_mses, endpoint_time_gaps = [], [], []
     latent_means, latent_stds = [], []
     align_losses, align_i2t, align_t2i = [], [], []
+    feature_losses, feature_i2f, feature_f2i = [], [], []
     total = 0
     while total < n:
         b = min(batch, n - total)
@@ -2273,6 +2424,16 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
             align_losses.append(float(align_parts["caption_retrieval_loss"].detach().cpu()))
             align_i2t.append(float(align_parts["caption_retrieval_i2t_acc"].detach().cpu()))
             align_t2i.append(float(align_parts["caption_retrieval_t2i_acc"].detach().cpu()))
+        if image_feature_aligner is not None:
+            image_features = record_image_embedding_tensor(chosen_records, device=device)
+            _feature_loss, feature_parts = image_feature_alignment_loss(
+                image_feature_aligner, z, image_features, prefix="image_feature_retrieval")
+            feature_losses.append(
+                float(feature_parts["image_feature_retrieval_loss"].detach().cpu()))
+            feature_i2f.append(
+                float(feature_parts["image_feature_retrieval_i2f_acc"].detach().cpu()))
+            feature_f2i.append(
+                float(feature_parts["image_feature_retrieval_f2i_acc"].detach().cpu()))
         flow_losses.append(float(latent_flow_loss(flow, z, cond).detach().cpu()))
         endpoint_metrics = flow_endpoint_metrics(flow, z, cond)
         endpoint_mses.append(endpoint_metrics["latent_endpoint_mse"])
@@ -2332,6 +2493,29 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                 sample_align_parts["generated_caption_retrieval_t2i_acc"].detach().cpu()),
             "generated_caption_retrieval_n": int(
                 sample_align_parts["generated_caption_retrieval_n"].detach().cpu()),
+        })
+    if image_feature_aligner is not None:
+        sample_z = ae.encode(sample)
+        sample_features = record_image_embedding_tensor(
+            sample_records[:sample.shape[0]], device=device)
+        _sample_feature_loss, sample_feature_parts = image_feature_alignment_loss(
+            image_feature_aligner, sample_z, sample_features,
+            prefix="generated_image_feature_retrieval")
+        if feature_losses:
+            report.update({
+                "image_feature_retrieval_loss": float(np.mean(feature_losses)),
+                "image_feature_retrieval_i2f_acc": float(np.mean(feature_i2f)),
+                "image_feature_retrieval_f2i_acc": float(np.mean(feature_f2i)),
+            })
+        report.update({
+            "generated_image_feature_retrieval_loss": float(
+                sample_feature_parts["generated_image_feature_retrieval_loss"].detach().cpu()),
+            "generated_image_feature_retrieval_i2f_acc": float(
+                sample_feature_parts["generated_image_feature_retrieval_i2f_acc"].detach().cpu()),
+            "generated_image_feature_retrieval_f2i_acc": float(
+                sample_feature_parts["generated_image_feature_retrieval_f2i_acc"].detach().cpu()),
+            "generated_image_feature_retrieval_n": int(
+                sample_feature_parts["generated_image_feature_retrieval_n"].detach().cpu()),
         })
     report.update(summarize_records(records))
     return report
@@ -2400,6 +2584,10 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     text_embedding_in_dim = int(ckpt.get(
         "text_embedding_in_dim", report.get("text_embedding_in_dim", 0)) or 0)
     text_embed_dim = int(ckpt.get("text_embed_dim", report.get("text_embed_dim", 128)) or 128)
+    image_embedding_in_dim = int(ckpt.get(
+        "image_embedding_in_dim", report.get("image_embedding_in_dim", 0)) or 0)
+    image_feature_embed_dim = int(ckpt.get(
+        "image_feature_embed_dim", report.get("image_feature_embed_dim", 128)) or 128)
     caption_max_len = int(ckpt.get("caption_max_len", report.get("caption_max_len", 32)) or 32)
     prompt_templates = tuple(ckpt.get("prompt_templates", report.get("prompt_templates", []))
                              or DEFAULT_PROMPT_TEMPLATES)
@@ -2430,6 +2618,16 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
             embed_dim=text_embed_dim).to(device)
         text_aligner.load_state_dict(ckpt["text_aligner_state_dict"])
         text_aligner.eval()
+    image_feature_aligner = None
+    if ckpt.get("image_feature_aligner_state_dict"):
+        if image_embedding_in_dim <= 0:
+            raise ValueError(
+                "image-feature-aligned checkpoint is missing image_embedding_in_dim")
+        image_feature_aligner = ImageFeatureAligner(
+            latent_ch=latent_ch, feature_dim=image_embedding_in_dim, hidden=hidden,
+            embed_dim=image_feature_embed_dim).to(device)
+        image_feature_aligner.load_state_dict(ckpt["image_feature_aligner_state_dict"])
+        image_feature_aligner.eval()
     ae = make_autoencoder(ae_arch=ae_arch, latent_ch=latent_ch, hidden=hidden,
                           latent_downsample=latent_downsample,
                           ae_res_blocks=ae_res_blocks).to(device)
@@ -2449,6 +2647,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         flow_state = ckpt["flow_ema_state_dict"]
     flow_load = load_flow_state(flow, flow_state)
     attach_text_aligner(flow, text_aligner)
+    attach_image_feature_aligner(flow, image_feature_aligner)
     ae.eval()
     flow.eval()
     return ae, flow, conditioner, prompt_vocab, prompt_templates, {
@@ -2491,10 +2690,17 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "cond_dim": cond_dim,
         "text_aligner": text_aligner is not None,
         "text_embed_dim": text_embed_dim,
+        "image_feature_aligner": image_feature_aligner is not None,
+        "image_embedding_in_dim": int(image_embedding_in_dim),
+        "image_feature_embed_dim": int(image_feature_embed_dim),
         "image_text_align_w": float(ckpt.get(
             "image_text_align_w", report.get("image_text_align_w", 0.0))),
         "flow_text_align_w": float(ckpt.get(
             "flow_text_align_w", report.get("flow_text_align_w", 0.0))),
+        "image_feature_align_w": float(ckpt.get(
+            "image_feature_align_w", report.get("image_feature_align_w", 0.0))),
+        "flow_feature_align_w": float(ckpt.get(
+            "flow_feature_align_w", report.get("flow_feature_align_w", 0.0))),
     }
 
 
@@ -2541,7 +2747,8 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                        n=128, batch=64, seed=10, size=32, device=DEV, conditioner=None,
                        prompt_vocab=None, caption_max_len=64, sample_method="euler",
                        sample_methods=None, cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
-                       text_aligner=None, caption_cond_source="tokens"):
+                       text_aligner=None, image_feature_aligner=None,
+                       caption_cond_source="tokens"):
     if sample_methods is None:
         sample_methods = (sample_method,)
     rows = []
@@ -2554,6 +2761,7 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                     caption_max_len=caption_max_len, cfg_scale=float(cfg_scale),
                     sample_steps=int(sample_steps), sample_method=method,
                     cfg_interval=cfg_interval, text_aligner=text_aligner,
+                    image_feature_aligner=image_feature_aligner,
                     caption_cond_source=caption_cond_source)
                 row["semantic_guidance_w"] = 0.0
                 row["semantic_guidance_mode"] = "none"
@@ -2578,6 +2786,12 @@ SWEEP_METRICS = (
     "generated_caption_retrieval_loss",
     "generated_caption_retrieval_i2t_acc",
     "generated_caption_retrieval_t2i_acc",
+    "image_feature_retrieval_loss",
+    "image_feature_retrieval_i2f_acc",
+    "image_feature_retrieval_f2i_acc",
+    "generated_image_feature_retrieval_loss",
+    "generated_image_feature_retrieval_i2f_acc",
+    "generated_image_feature_retrieval_f2i_acc",
     "sample_center_target_mse",
     "recon_mse",
     "latent_velocity_mse",
@@ -2598,6 +2812,8 @@ def report_selection_key(report):
         float(report.get("sample_roundtrip_both_acc", 0.0)),
         float(report.get("sample_roundtrip_shape_acc", 0.0)),
         float(report.get("sample_roundtrip_color_acc", 0.0)),
+        float(report.get("generated_image_feature_retrieval_i2f_acc", 0.0)),
+        float(report.get("image_feature_retrieval_i2f_acc", 0.0)),
         float(report.get("generated_caption_retrieval_i2t_acc", 0.0)),
         float(report.get("caption_retrieval_i2t_acc", 0.0)),
         -float(conditional_mse),
@@ -2616,6 +2832,8 @@ def aggregate_selection_key(report):
         float(report.get("sample_roundtrip_both_acc_mean", 0.0)),
         float(report.get("sample_roundtrip_shape_acc_mean", 0.0)),
         float(report.get("sample_roundtrip_color_acc_mean", 0.0)),
+        float(report.get("generated_image_feature_retrieval_i2f_acc_mean", 0.0)),
+        float(report.get("image_feature_retrieval_i2f_acc_mean", 0.0)),
         float(report.get("generated_caption_retrieval_i2t_acc_mean", 0.0)),
         float(report.get("caption_retrieval_i2t_acc_mean", 0.0)),
         -float(conditional_mse),
@@ -2645,6 +2863,10 @@ def eval_report_summary(report):
         "caption_retrieval_t2i_acc",
         "generated_caption_retrieval_i2t_acc",
         "generated_caption_retrieval_t2i_acc",
+        "image_feature_retrieval_i2f_acc",
+        "image_feature_retrieval_f2i_acc",
+        "generated_image_feature_retrieval_i2f_acc",
+        "generated_image_feature_retrieval_f2i_acc",
         "sample_center_target_mse",
         "recon_mse",
         "latent_velocity_mse",
@@ -2765,6 +2987,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         sample_method=sample_method, sample_methods=sample_methods,
                         cfg_interval=cfg_interval,
                         text_aligner=getattr(flow, "text_aligner", None),
+                        image_feature_aligner=getattr(flow, "image_feature_aligner", None),
                         caption_cond_source=meta["caption_cond_source"]):
                     row["eval_seed"] = int(eval_seed)
                     row["checkpoint_weight_mode"] = actual_mode
@@ -2901,6 +3124,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       ae_recon_loss="mse", ae_grad_w=0.0, ae_ms_w=0.0,
                       ae_latent_reg_w=0.0,
                       image_text_align_w=0.0, flow_text_align_w=0.0, text_embed_dim=128,
+                      image_feature_align_w=0.0, flow_feature_align_w=0.0,
+                      image_feature_embed_dim=128,
                       sample_steps=4, roundtrip_samples=1, flow_semantic_w=0.0,
                       flow_consistency_w=0.0,
                       cond_mode="facts", text_cond_dim=0,
@@ -2940,10 +3165,19 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             min_aesthetic=image_min_aesthetic, max_records=image_max_records)
         caption_cond_source, text_embedding_in_dim = resolve_caption_cond_source(
             caption_cond_source, image_records)
-    elif image_text_align_w > 0.0 or flow_text_align_w > 0.0:
-        raise ValueError("image/text alignment losses require image_manifest training")
+        image_embedding_in_dim = (
+            infer_image_embedding_dim(image_records)
+            if image_feature_align_w > 0.0 or flow_feature_align_w > 0.0 else 0
+        )
+        if (image_feature_align_w > 0.0 or flow_feature_align_w > 0.0
+                ) and image_embedding_in_dim <= 0:
+            raise ValueError("image feature alignment requires image_embedding rows")
+    elif (image_text_align_w > 0.0 or flow_text_align_w > 0.0
+          or image_feature_align_w > 0.0 or flow_feature_align_w > 0.0):
+        raise ValueError("image/text or image-feature alignment losses require image_manifest training")
     else:
         caption_cond_source, text_embedding_in_dim = "tokens", 0
+        image_embedding_in_dim = 0
     if time_sampling not in ("uniform", "logit-normal"):
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
     if latent_normalize not in ("none", "global", "channel"):
@@ -2954,8 +3188,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("AE reconstruction weights must be non-negative")
     if image_text_align_w < 0.0 or flow_text_align_w < 0.0:
         raise ValueError("image/text alignment weights must be non-negative")
+    if image_feature_align_w < 0.0 or flow_feature_align_w < 0.0:
+        raise ValueError("image feature alignment weights must be non-negative")
     if text_embed_dim <= 0:
         raise ValueError("text_embed_dim must be positive")
+    if image_feature_embed_dim <= 0:
+        raise ValueError("image_feature_embed_dim must be positive")
     amp_cfg = amp_config(device, train_precision)
     ae_accum_steps = max(1, int(ae_accum_steps))
     flow_accum_steps = max(1, int(flow_accum_steps))
@@ -3020,6 +3258,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         text_aligner = ImageTextAligner(
             latent_ch=latent_ch, cond_dim=cond_dim, hidden=hidden,
             embed_dim=text_embed_dim).to(device)
+    image_feature_aligner = None
+    if image_records is not None and (
+            image_feature_align_w > 0.0 or flow_feature_align_w > 0.0):
+        image_feature_aligner = ImageFeatureAligner(
+            latent_ch=latent_ch, feature_dim=image_embedding_in_dim, hidden=hidden,
+            embed_dim=image_feature_embed_dim).to(device)
     latent_shape = ae_latent_shape(ae, size)
     latent_tokens = latent_shape[1] * latent_shape[2]
     if flow_arch in ("dit", "crossdit", "mmdit") and latent_tokens > int(latent_max_tokens):
@@ -3032,14 +3276,19 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                      dit_head_width_mult=dit_head_width_mult,
                      latent_max_tokens=latent_max_tokens).to(device)
     attach_text_aligner(flow, text_aligner)
+    attach_image_feature_aligner(flow, image_feature_aligner)
     ae_params = list(ae.parameters())
     if text_aligner is not None and image_text_align_w > 0.0:
         ae_params += list(conditioner.parameters()) + list(text_aligner.parameters())
+    if image_feature_aligner is not None and image_feature_align_w > 0.0:
+        ae_params += list(image_feature_aligner.parameters())
     opt_ae = torch.optim.AdamW(ae_params, lr=lr, weight_decay=0.01)
     scaler = amp_grad_scaler(device, train_precision)
     ae.train()
     if text_aligner is not None:
         text_aligner.train()
+    if image_feature_aligner is not None:
+        image_feature_aligner.train()
     last_ae = {}
     for _ in range(ae_steps):
         opt_ae.zero_grad(set_to_none=True)
@@ -3070,6 +3319,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                             text_aligner, out["latent"], cond_vec, prefix="caption_align")
                         loss = loss + float(image_text_align_w) * align_loss
                         parts.update(align_parts)
+                    if image_feature_aligner is not None and image_feature_align_w > 0.0:
+                        image_features = record_image_embedding_tensor(
+                            chosen_records, device=device)
+                        feature_loss, feature_parts = image_feature_alignment_loss(
+                            image_feature_aligner, out["latent"], image_features,
+                            prefix="image_feature_align")
+                        loss = loss + float(image_feature_align_w) * feature_loss
+                        parts.update(feature_parts)
                 if image_records is None and ae_intervention_w > 0.0:
                     intervention, intervention_parts = latent_intervention_training_loss(
                         ae, out["latent"], fact_cond)
@@ -3095,6 +3352,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                                              else list(conditioner.parameters()))
     if text_aligner is not None and flow_text_align_w > 0.0:
         flow_params += list(text_aligner.parameters())
+    if image_feature_aligner is not None and flow_feature_align_w > 0.0:
+        flow_params += list(image_feature_aligner.parameters())
     opt_flow = torch.optim.AdamW(flow_params, lr=lr, weight_decay=0.01)
     ae.eval()
     for p in ae.parameters():
@@ -3106,7 +3365,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             max_records=flow_cache_records, batch=flow_cache_batch, seed=seed + 211,
             size=size, device=device, precision=train_precision,
             cond_source=caption_cond_source, cache_dir=flow_cache_dir,
-            shard_size=flow_cache_shard_size)
+            shard_size=flow_cache_shard_size,
+            include_image_embeddings=flow_feature_align_w > 0.0)
     if image_records is None:
         latent_stats = estimate_latent_stats(
             ae, n=latent_stat_samples, batch=batch, seed=seed + 97, size=size, device=device,
@@ -3124,6 +3384,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         conditioner.train()
     if text_aligner is not None:
         text_aligner.train()
+    if image_feature_aligner is not None:
+        image_feature_aligner.train()
     last_flow = {}
     flow_ema = clone_state_dict(flow) if flow_ema_decay > 0.0 else None
     conditioner_ema = (clone_state_dict(conditioner)
@@ -3139,7 +3401,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 cond = cached_caption_payload_condition(
                     cache_payload, conditioner, source=caption_cond_source,
                     device=device, return_tokens=flow_uses_cond_tokens(flow))
+                image_features = cache_payload.get("image_embeddings")
             elif image_records is None:
+                image_features = None
                 x, fact_cond, _yc, _ys, specs = _batch(batch, rng, size=size, device=device,
                                                        return_specs=True)
                 with torch.no_grad(), amp_autocast(device, train_precision):
@@ -3159,13 +3423,19 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     captions, chosen_records, conditioner, prompt_vocab,
                     source=caption_cond_source, max_len=caption_max_len, device=device,
                     return_tokens=flow_uses_cond_tokens(flow))
+                image_features = (
+                    record_image_embedding_tensor(chosen_records, device=device)
+                    if flow_feature_align_w > 0.0 else None
+                )
             with amp_autocast(device, train_precision):
                 loss, parts = latent_flow_losses(
                     flow, z1, cond, cond_drop=cond_drop, ae=ae,
                     semantic_w=flow_semantic_w, semantic_cond=fact_cond,
                     time_sampling=time_sampling, time_logit_mean=time_logit_mean,
                     time_logit_std=time_logit_std, consistency_w=flow_consistency_w,
-                    text_aligner=text_aligner, text_align_w=flow_text_align_w)
+                    text_aligner=text_aligner, text_align_w=flow_text_align_w,
+                    feature_aligner=image_feature_aligner, image_features=image_features,
+                    feature_align_w=flow_feature_align_w)
                 scaled_loss = loss / float(flow_accum_steps)
             scaler.scale(scaled_loss).backward()
             last_flow = {"total_loss": float(loss.detach().cpu())}
@@ -3188,6 +3458,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         conditioner.eval()
     if text_aligner is not None:
         text_aligner.eval()
+    if image_feature_aligner is not None:
+        image_feature_aligner.eval()
     raw_flow = clone_state_dict(flow)
     raw_conditioner = clone_state_dict(conditioner) if conditioner is not None else None
     requested_eval_weight_mode = "raw" if not eval_with_ema else eval_weight_mode
@@ -3226,6 +3498,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 caption_max_len=caption_max_len, cfg_scale=cfg_scale,
                 sample_steps=sample_steps, sample_method=sample_method,
                 cfg_interval=cfg_interval, text_aligner=text_aligner,
+                image_feature_aligner=image_feature_aligner,
                 caption_cond_source=caption_cond_source)
         candidate["eval_weight_mode"] = mode
         candidate_reports[mode] = candidate
@@ -3290,6 +3563,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_text_align_w": float(flow_text_align_w),
         "text_embed_dim": int(text_embed_dim),
         "text_aligner": text_aligner is not None,
+        "image_feature_align_w": float(image_feature_align_w),
+        "flow_feature_align_w": float(flow_feature_align_w),
+        "image_feature_embed_dim": int(image_feature_embed_dim),
+        "image_feature_aligner": image_feature_aligner is not None,
         "ae_intervention_w": float(ae_intervention_w),
         "ae_factor_orth_w": float(ae_factor_orth_w),
         "cond_drop": float(cond_drop),
@@ -3330,6 +3607,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "caption_max_len": int(caption_max_len) if image_records is not None else 0,
         "caption_cond_source": caption_cond_source if image_records is not None else "",
         "text_embedding_in_dim": int(text_embedding_in_dim),
+        "image_embedding_in_dim": int(image_embedding_in_dim),
         "cond_dim": int(cond_dim),
         "prompt_templates": (
             [] if image_records is not None else list(prompt_templates) if cond_mode == "text"
@@ -3533,7 +3811,9 @@ def selftest():
                 f.write(arr.tobytes())
             rows.append({"image": name, "caption": f"{split} color patch {i}",
                          "split": split,
-                         "text_embedding": [float(i), float(i + 1), float(i % 2)]})
+                         "text_embedding": [float(i), float(i + 1), float(i % 2)],
+                         "image_embedding": [float(i), float(i + 2),
+                                             float((i + 1) % 2), 1.0]})
         with open(manifest, "w", encoding="utf-8") as f:
             for row in rows:
                 f.write(json.dumps(row) + "\n")
@@ -3545,12 +3825,18 @@ def selftest():
             image_max_records=2, caption_max_len=8, sample_steps=1,
             caption_cond_source="embedding",
             image_text_align_w=0.1, flow_text_align_w=0.1, text_embed_dim=12,
+            image_feature_align_w=0.1, flow_feature_align_w=0.1,
+            image_feature_embed_dim=10,
             flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
             intervention_samples=0, return_conditioner=True, return_aligner=True)
         assert report6["data_mode"] == "image_manifest"
         assert report6["text_aligner"] is True and aligner6 is not None
+        assert report6["image_feature_aligner"] is True
         assert "caption_align_i2t_acc" in report6["last_ae"]
+        assert "image_feature_align_i2f_acc" in report6["last_ae"]
         assert "flow_caption_align_i2t_acc" in report6["last_flow"]
+        assert "flow_image_feature_align_i2f_acc" in report6["last_flow"]
+        assert report6["image_embedding_in_dim"] == 4
         assert report6["flow_cache_latents"] is True
         assert report6["flow_cache_backend"] == "memory"
         assert report6["flow_cache_records"] == 2 and report6["flow_cache_bytes"] > 0
@@ -3565,6 +3851,8 @@ def selftest():
                 image_max_records=2, caption_max_len=8, sample_steps=1,
                 caption_cond_source="embedding",
                 image_text_align_w=0.1, flow_text_align_w=0.1, text_embed_dim=12,
+                image_feature_align_w=0.1, flow_feature_align_w=0.1,
+                image_feature_embed_dim=10,
                 flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
                 flow_cache_dir=disk_cache_dir, flow_cache_shard_size=1,
                 latent_normalize="channel", latent_stat_samples=2,
@@ -3572,6 +3860,7 @@ def selftest():
         assert report_disk["flow_cache_backend"] == "disk"
         assert report_disk["flow_cache_records"] == 2
         assert report_disk["flow_cache_shards"] == 2
+        assert report_disk["image_feature_aligner"] is True
         assert report_disk["flow_cache_bytes"] > 0
         assert os.path.exists(os.path.join(disk_cache_dir, "meta.json"))
         assert report_disk["latent_normalize"] == "channel"
@@ -3580,10 +3869,12 @@ def selftest():
             ae6, flow6, manifest_rows, cfg_scales=(1.0,), sample_steps_list=(1,),
             n=2, batch=2, seed=10, device="cpu", conditioner=conditioner6,
             prompt_vocab=vocab6, caption_max_len=8, text_aligner=aligner6,
+            image_feature_aligner=getattr(flow6, "image_feature_aligner", None),
             caption_cond_source="embedding")
         img_agg = aggregate_sweep_rows([dict(r, eval_seed=10) for r in img_sweep])
         assert "caption_sample_mse_mean" in img_agg[0]
         assert "generated_caption_retrieval_i2t_acc_mean" in img_agg[0]
+        assert "generated_image_feature_retrieval_i2f_acc_mean" in img_agg[0]
         ckpt = os.path.join(td, "manifest.pt")
         torch.save({
             "autoencoder_state_dict": ae6.state_dict(),
@@ -3606,11 +3897,18 @@ def selftest():
             "caption_cond_source": "embedding",
             "text_embedding_in_dim": 3,
             "text_embed_dim": 12,
+            "image_embedding_in_dim": 4,
+            "image_feature_embed_dim": 10,
+            "image_feature_align_w": 0.1,
+            "flow_feature_align_w": 0.1,
             "latent_stats": latent_stats_state(flow_latent_stats(flow6)),
             "prompt_templates": [],
             "prompt_vocab": vocab6,
             "conditioner_state_dict": conditioner6.state_dict(),
             "text_aligner_state_dict": aligner6.state_dict(),
+            "image_feature_aligner_state_dict": (
+                getattr(flow6, "image_feature_aligner").state_dict()
+            ),
             "flow_ema_state_dict": {},
             "conditioner_ema_state_dict": {},
         }, ckpt)
@@ -3622,7 +3920,9 @@ def selftest():
         assert eval6["experiment"] == "image_latent_manifest_sampler_sweep"
         assert eval6["best"]["caption_sample_mse_mean"] >= 0.0
         assert eval6["text_aligner"] is True
+        assert eval6["image_feature_aligner"] is True
         assert "generated_caption_retrieval_i2t_acc_mean" in eval6["best"]
+        assert "generated_image_feature_retrieval_i2f_acc_mean" in eval6["best"]
     print("image_latent selftest OK")
 
 
@@ -3696,6 +3996,15 @@ def main(argv=None):
                     help="contrastive caption alignment weight on predicted flow endpoints")
     ap.add_argument("--text-embed-dim", type=int, default=128, dest="text_embed_dim",
                     help="shared image/text embedding width for manifest alignment")
+    ap.add_argument("--image-feature-align-w", type=float, default=0.0,
+                    dest="image_feature_align_w",
+                    help="contrastive AE-latent/external-image-feature alignment weight")
+    ap.add_argument("--flow-feature-align-w", type=float, default=0.0,
+                    dest="flow_feature_align_w",
+                    help="contrastive external image-feature weight on predicted flow endpoints")
+    ap.add_argument("--image-feature-embed-dim", type=int, default=128,
+                    dest="image_feature_embed_dim",
+                    help="shared embedding width for latent/image-feature alignment")
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--fact-w", type=float, default=1.0, dest="fact_w")
@@ -3926,6 +4235,9 @@ def main(argv=None):
         image_text_align_w=args.image_text_align_w,
         flow_text_align_w=args.flow_text_align_w,
         text_embed_dim=args.text_embed_dim,
+        image_feature_align_w=args.image_feature_align_w,
+        flow_feature_align_w=args.flow_feature_align_w,
+        image_feature_embed_dim=args.image_feature_embed_dim,
         sample_steps=args.sample_steps, roundtrip_samples=args.roundtrip_samples,
         flow_semantic_w=args.flow_semantic_w, cond_mode=args.cond_mode,
         flow_consistency_w=args.flow_consistency_w,
@@ -4031,6 +4343,9 @@ def main(argv=None):
         "image_text_align_w": args.image_text_align_w,
         "flow_text_align_w": args.flow_text_align_w,
         "text_embed_dim": args.text_embed_dim,
+        "image_feature_align_w": args.image_feature_align_w,
+        "flow_feature_align_w": args.flow_feature_align_w,
+        "image_feature_embed_dim": args.image_feature_embed_dim,
         "hidden": args.hidden,
         "ae_accum_steps": args.ae_accum_steps,
         "flow_accum_steps": args.flow_accum_steps,
@@ -4062,6 +4377,7 @@ def main(argv=None):
         "caption_max_len": args.caption_max_len,
         "caption_cond_source": report.get("caption_cond_source", ""),
         "text_embedding_in_dim": report.get("text_embedding_in_dim", 0),
+        "image_embedding_in_dim": report.get("image_embedding_in_dim", 0),
         "cond_drop": args.cond_drop,
         "cfg_scale": args.cfg_scale,
         "cfg_interval": list(cfg_interval),
@@ -4091,6 +4407,10 @@ def main(argv=None):
         "conditioner_state_dict": (conditioner.state_dict() if conditioner is not None else {}),
         "text_aligner_state_dict": (
             text_aligner.state_dict() if text_aligner is not None else {}
+        ),
+        "image_feature_aligner_state_dict": (
+            getattr(flow, "image_feature_aligner", None).state_dict()
+            if getattr(flow, "image_feature_aligner", None) is not None else {}
         ),
         "flow_ema_state_dict": flow_ema if flow_ema is not None else {},
         "conditioner_ema_state_dict": (conditioner_ema if conditioner_ema is not None else {}),

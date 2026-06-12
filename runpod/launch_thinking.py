@@ -121,6 +121,9 @@ def payload(args):
                      f"--image-text-align-w {args.image_text_align_w} "
                      f"--flow-text-align-w {args.image_flow_text_align_w} "
                      f"--text-embed-dim {args.image_text_embed_dim} "
+                     f"--image-feature-align-w {args.image_feature_align_w} "
+                     f"--flow-feature-align-w {args.image_flow_feature_align_w} "
+                     f"--image-feature-embed-dim {args.image_feature_embed_dim} "
                      f"--cond-mode {args.image_cond_mode} "
                      f"--text-cond-dim {args.image_text_cond_dim} "
                      f"--image-manifest {shlex_quote(args.image_manifest)} "
@@ -487,6 +490,15 @@ def main():
     ap.add_argument("--image-text-embed-dim", type=int, default=128,
                     dest="image_text_embed_dim",
                     help="shared image/text embedding width for manifest alignment")
+    ap.add_argument("--image-feature-align-w", type=float, default=0.0,
+                    dest="image_feature_align_w",
+                    help="contrastive AE-latent/external-image-feature alignment weight")
+    ap.add_argument("--image-flow-feature-align-w", type=float, default=0.0,
+                    dest="image_flow_feature_align_w",
+                    help="contrastive external image-feature weight on predicted flow endpoints")
+    ap.add_argument("--image-feature-embed-dim", type=int, default=128,
+                    dest="image_feature_embed_dim",
+                    help="shared embedding width for latent/image-feature alignment")
     ap.add_argument("--image-cond-mode", default="facts", choices=("facts", "text"),
                     dest="image_cond_mode",
                     help="latent image conditioning source: canonical facts or learned text prompts")

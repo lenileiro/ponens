@@ -37,13 +37,14 @@ class ImageTextRecord:
     width: int = 0
     height: int = 0
     text_embedding: tuple[float, ...] | None = None
+    image_embedding: tuple[float, ...] | None = None
 
 
 def caption_tokens(text: str) -> list[str]:
     return [m.group(0).lower() for m in TOKEN_RE.finditer(str(text))]
 
 
-def _coerce_text_embedding(raw):
+def _coerce_float_embedding(raw):
     if raw in ("", None):
         return None
     if isinstance(raw, str):
@@ -55,6 +56,14 @@ def _coerce_text_embedding(raw):
     if not vals:
         return None
     return vals
+
+
+def _coerce_text_embedding(raw):
+    return _coerce_float_embedding(raw)
+
+
+def _coerce_image_embedding(raw):
+    return _coerce_float_embedding(raw)
 
 
 def _coerce_record(row, manifest_dir, root=""):
@@ -78,6 +87,15 @@ def _coerce_record(row, manifest_dir, root=""):
                 row.get("caption_embedding",
                         row.get("embedding", row.get("text_emb"))))
     )
+    image_embedding = _coerce_image_embedding(
+        row.get("image_embedding",
+                row.get("visual_embedding",
+                        row.get("vision_embedding",
+                                row.get("clip_image_embedding",
+                                        row.get("dino_embedding",
+                                                row.get("image_emb",
+                                                        row.get("visual_emb")))))))
+    )
     return ImageTextRecord(
         path=os.path.normpath(path),
         caption=str(caption),
@@ -86,6 +104,7 @@ def _coerce_record(row, manifest_dir, root=""):
         width=width,
         height=height,
         text_embedding=text_embedding,
+        image_embedding=image_embedding,
     )
 
 
@@ -152,10 +171,14 @@ def summarize_records(records: Iterable[ImageTextRecord]):
         "image_splits": splits,
         "caption_token_mean": float(np.mean(caption_lens)) if caption_lens else 0.0,
         "text_embedding_records": sum(1 for r in rows if r.text_embedding is not None),
+        "image_embedding_records": sum(1 for r in rows if r.image_embedding is not None),
     }
     dims = sorted({len(r.text_embedding) for r in rows if r.text_embedding is not None})
     if dims:
         out["text_embedding_dims"] = dims
+    image_dims = sorted({len(r.image_embedding) for r in rows if r.image_embedding is not None})
+    if image_dims:
+        out["image_embedding_dims"] = image_dims
     if aesthetic:
         out.update({
             "aesthetic_mean": float(np.mean(aesthetic)),
@@ -345,6 +368,8 @@ def _record_to_manifest_row(rec: ImageTextRecord, root=""):
         row["height"] = int(rec.height)
     if rec.text_embedding is not None:
         row["text_embedding"] = [float(x) for x in rec.text_embedding]
+    if rec.image_embedding is not None:
+        row["image_embedding"] = [float(x) for x in rec.image_embedding]
     return row
 
 
@@ -517,11 +542,13 @@ def selftest():
                 "caption": "red and green blocks",
                 "split": "train",
                 "text_embedding": [0.1, 0.2, 0.3],
+                "image_embedding": [0.4, 0.5, 0.6, 0.7],
                 "aesthetic": 7.5,
             }) + "\n")
         records = read_image_manifest(manifest)
         assert len(records) == 1 and records[0].caption.startswith("red")
         assert records[0].text_embedding == (0.1, 0.2, 0.3)
+        assert records[0].image_embedding == (0.4, 0.5, 0.6, 0.7)
         x = load_image_tensor(records[0].path, size=4)
         assert x.shape == (3, 4, 4) and float(x.max()) <= 1.0 and float(x.min()) >= -1.0
         vocab = build_caption_vocab(records)
@@ -532,11 +559,13 @@ def selftest():
         summary = summarize_records(records)
         assert summary["image_records"] == 1 and summary["image_splits"]["train"] == 1
         assert summary["text_embedding_records"] == 1 and summary["text_embedding_dims"] == [3]
+        assert summary["image_embedding_records"] == 1 and summary["image_embedding_dims"] == [4]
         qa_manifest = os.path.join(td, "qa.jsonl")
         with open(qa_manifest, "w", encoding="utf-8") as f:
             for row in (
                     {"image": "sample.ppm", "caption": "red green blocks",
-                     "split": "train", "text_embedding": [1.0, 0.0]},
+                     "split": "train", "text_embedding": [1.0, 0.0],
+                     "image_embedding": [0.0, 1.0]},
                     {"image": "sample.ppm", "caption": "duplicate patch", "split": "train"},
                     {"image": "missing.ppm", "caption": "x", "split": "train"},
                     {"image": "sample.ppm", "caption": "held out patch", "split": "eval"}):
@@ -555,6 +584,7 @@ def selftest():
             filtered_row = json.loads(f.readline())
         assert filtered_row["image"] == "sample.ppm"
         assert filtered_row["text_embedding"] == [1.0, 0.0]
+        assert filtered_row["image_embedding"] == [0.0, 1.0]
         reread = read_image_manifest(filtered, root=td, split="train")
         assert len(reread) == 1 and reread[0].width == 8 and reread[0].height == 6
     print("image_data selftest OK")

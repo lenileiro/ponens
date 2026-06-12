@@ -291,6 +291,8 @@ python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --size 64 --ae-arch residual --latent-downsample 8 --latent-max-tokens 128 \
     --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 \
     --image-text-align-w 0.1 --flow-text-align-w 0.05 --text-embed-dim 128 \
+    --image-feature-align-w 0.1 --flow-feature-align-w 0.05 \
+    --image-feature-embed-dim 128 \
     --ae-accum-steps 2 --flow-accum-steps 2 --grad-clip 1.0 \
     --flow-cache-latents --flow-cache-dir runs/image_manifest_cache \
     --flow-cache-shard-size 2048 --flow-cache-batch 32 \
@@ -335,6 +337,8 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-ae-recon-loss hybrid --image-ae-grad-w 0.1 --image-ae-ms-w 0.1 \
     --image-text-align-w 0.1 --image-flow-text-align-w 0.05 \
     --image-text-embed-dim 128 \
+    --image-feature-align-w 0.1 --image-flow-feature-align-w 0.05 \
+    --image-feature-embed-dim 128 \
     --image-ae-accum-steps 2 --image-flow-accum-steps 2 \
     --image-train-precision bf16 --image-grad-clip 1.0 \
     --image-flow-cache-latents --image-flow-cache-dir runs/image_manifest_cache \
@@ -649,6 +653,14 @@ those shards instead of keeping the full cache resident in CPU RAM. Reports/chec
 `flow_cache_backend`, `flow_cache_dir`, `flow_cache_shards`, shard size, and byte count. This keeps
 the latent-diffusion separation practical for larger real-image manifests: encode pixels once,
 train the rectified-flow transformer from reusable latent shards, and avoid a hidden RAM ceiling.
+
+Image-39 adds manifest-level visual embedding alignment. Rows may include `image_embedding` /
+`visual_embedding` / `vision_embedding` / `clip_image_embedding` / `dino_embedding` arrays, and
+`--image-feature-align-w` plus `--flow-feature-align-w` contrastively align AE latents and
+predicted clean flow endpoints against those external image features. This is the generic RAE-style
+hook: plug in DINO/SigLIP/CLIP/MAE features from a separate preprocessing job, train the generator
+latents to preserve high-level visual semantics, and keep the core model free of provider-specific
+or dataset-specific labels.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

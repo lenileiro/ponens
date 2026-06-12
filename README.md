@@ -105,6 +105,8 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --size 64 --ae-arch residual --latent-downsample 8 --latent-max-tokens 128 \
     --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 \
     --image-text-align-w 0.1 --flow-text-align-w 0.05 --text-embed-dim 128 \
+    --image-feature-align-w 0.1 --flow-feature-align-w 0.05 \
+    --image-feature-embed-dim 128 \
     --ae-accum-steps 2 --flow-accum-steps 2 --grad-clip 1.0 \
     --flow-cache-latents --flow-cache-dir runs/image_manifest_cache \
     --flow-cache-shard-size 2048 --flow-cache-batch 32 \
