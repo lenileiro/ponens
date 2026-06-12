@@ -129,6 +129,26 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --snli-train 20000 --snli-eval 1000 --seed 11 --out data/text_snli.jsonl
 .venv/bin/python -m thinking.text --import-mnli --mnli-zip /private/tmp/multinli_1.0.zip \
     --mnli-train 20000 --mnli-eval 2000 --seed 19 --out data/text_mnli.jsonl
+.venv/bin/python -m thinking.text --import-squad --squad-train 5000 --squad-eval 1000 \
+    --squad-max-context-tokens 160 --squad-max-question-tokens 40 \
+    --squad-max-answer-tokens 8 --seed 23 --out data/text_squad.jsonl
+.venv/bin/python -m thinking.text --import-squad --squad-train 800 --squad-eval 200 \
+    --squad-max-context-tokens 96 --squad-max-question-tokens 32 \
+    --squad-max-answer-tokens 5 --seed 29 --out data/text_squad_smoke.jsonl
+.venv/bin/python -m thinking.text --import-squad --squad-choice-only --squad-choice-n 4 \
+    --squad-train 1200 --squad-eval 300 --squad-max-context-tokens 128 \
+    --squad-max-question-tokens 32 --squad-max-answer-tokens 6 --seed 31 \
+    --out data/text_squad_choice_smoke.jsonl
+.venv/bin/python -m thinking.text --import-squad --squad-choice-only --squad-choice-n 4 \
+    --squad-choice-swap-negatives 1 --squad-train 1800 --squad-eval 450 \
+    --squad-max-context-tokens 128 --squad-max-question-tokens 32 \
+    --squad-max-answer-tokens 6 --seed 37 \
+    --out data/text_squad_choice_neg_smoke.jsonl
+.venv/bin/python -m thinking.text --import-squad --squad-choice-only --squad-choice-n 4 \
+    --squad-choice-swap-negatives 1 --squad-choice-absent-negatives 1 \
+    --squad-train 2400 --squad-eval 600 --squad-max-context-tokens 128 \
+    --squad-max-question-tokens 32 --squad-max-answer-tokens 6 --seed 41 \
+    --out data/text_squad_choice_absent_neg_smoke.jsonl
 .venv/bin/python -m thinking.text --data data/text_snli.jsonl --steps 1500 \
     --batch 64 --d 192 --layers 4 --heads 6 --semantic-w 0.75 \
     --free-n 200 --max-new 20 \
@@ -174,6 +194,148 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
     --out runs/text_study_mnli_smoke.json
+.venv/bin/python -m thinking.text --data data/text_mnli.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_mnli_semantic_replay_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 80 --batch 32 --study-lr 0.0005 --decode-w 0 --semantic-w 1.0 \
+    --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_mnli_semantic_replay_smoke.json
+.venv/bin/python -m thinking.text --data data/text_mnli.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_mnli_error_replay_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 40 --study-rounds 2 --study-strategy errors \
+    --study-probe-n 512 --study-hard-max 256 \
+    --batch 32 --study-lr 0.0005 --decode-w 0 --semantic-w 1.0 \
+    --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_mnli_error_replay_smoke.json
+.venv/bin/python -m thinking.text --data data/text_mnli.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_mnli_select_both_replay_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 40 --study-rounds 2 --study-strategy errors \
+    --study-probe-n 512 --study-hard-max 256 --study-select-best \
+    --study-score-metric both --study-retention-w 2.0 \
+    --batch 32 --study-lr 0.0005 --decode-w 0 --semantic-w 1.0 \
+    --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_mnli_select_both_replay_smoke.json
+.venv/bin/python -m thinking.text --data data/text_squad_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_control_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 12 --study-rounds 1 --study-strategy errors \
+    --study-probe-n 128 --study-hard-max 96 --study-select-best \
+    --study-score-metric both --study-retention-w 2.0 --study-control-w 2.0 \
+    --batch 24 --study-lr 0.0005 --decode-w 0.25 --semantic-w 1.0 \
+    --balance-by kind --fact-n 80 --kind-fact-n 10 --artifact-n 80 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 36 \
+    --out runs/text_study_squad_control_smoke.json
+.venv/bin/python -m thinking.text --data data/text_squad_choice_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_all_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 80 --study-rounds 1 --study-strategy all --study-select-best \
+    --study-score-metric both --study-retention-w 2.0 --study-control-w 2.0 \
+    --batch 32 --study-lr 0.0005 --decode-w 0.25 --semantic-w 1.0 \
+    --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_all_smoke.json
+.venv/bin/python -m thinking.text --data data/text_squad_choice_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_neg_guard_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 100 --study-rounds 1 --study-strategy all --study-select-best \
+    --study-score-metric both --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0.25 \
+    --semantic-w 1.0 --balance-by kind --fact-n 160 --kind-fact-n 30 \
+    --artifact-n 160 --free-n -1 --paraphrase-n -1 --counterfactual-n -1 \
+    --max-new 24 --out runs/text_study_squad_choice_neg_guard_smoke.json
+.venv/bin/python -m thinking.text --data data/text_squad_choice_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_seeded_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 100 --study-rounds 1 --study-strategy all --study-select-best \
+    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0.25 \
+    --semantic-w 0.5 --choice-w 1.0 --balance-by kind --fact-n 160 \
+    --kind-fact-n 30 --artifact-n 160 --free-n -1 --paraphrase-n -1 \
+    --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_seeded_smoke.json
+.venv/bin/python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_absent_answerw4_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 100 --study-rounds 1 --study-strategy all --study-select-best \
+    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
+    --semantic-w 0 --choice-w 1.0 --choice-answer-w 4.0 --choice-none-w 1.0 \
+    --balance-by kind --fact-n 160 --kind-fact-n 30 --artifact-n 160 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_absent_answerw4_smoke.json
+.venv/bin/python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_evidence_2round_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 10 --study-rounds 2 --study-strategy all --study-select-best \
+    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
+    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
+    --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_evidence_2round_smoke.json
+.venv/bin/python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_errors_kindguard_2round_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
+    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
+    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
+    --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_errors_kindguard_2round_smoke.json
+.venv/bin/python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_candidate_ctx_pair_controlguard_2round_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
+    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
+    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
+    --choice-pair-w 1.0 --choice-pair-margin 0.0 --balance-by kind \
+    --fact-n 80 --kind-fact-n 20 --artifact-n 80 --free-n -1 \
+    --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_candidate_ctx_pair_controlguard_2round_smoke.json
+.venv/bin/python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_candidate_ctx_pair_ctrlcontrast_2round_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
+    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
+    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
+    --choice-pair-w 1.0 --choice-pair-margin 0.0 --choice-control-w 0 \
+    --choice-control-contrast-w 1.0 --choice-control-margin 0.0 \
+    --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_candidate_ctx_pair_ctrlcontrast_2round_smoke.json
+.venv/bin/python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_contextloc025_pair_2round_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
+    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
+    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
+    --choice-context-w 0.25 --choice-pair-w 1.0 --choice-pair-margin 0.0 \
+    --choice-control-w 0 --choice-control-contrast-w 0 --choice-control-margin 0.0 \
+    --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_contextloc025_pair_2round_smoke.json
 .venv/bin/python -m thinking.multimodal --steps 240 --eval-n 120 --free-n 20 \
     --counterfactual-n 40 --free-counterfactual-n 20 \
     --out runs/m0_multimodal.json --checkpoint runs/m0_multimodal.pt

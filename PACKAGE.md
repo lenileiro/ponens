@@ -147,6 +147,26 @@ python -m thinking.text --import-snli --snli-zip /private/tmp/snli_1.0.zip \
     --snli-train 20000 --snli-eval 1000 --seed 11 --out data/text_snli.jsonl
 python -m thinking.text --import-mnli --mnli-zip /private/tmp/multinli_1.0.zip \
     --mnli-train 20000 --mnli-eval 2000 --seed 19 --out data/text_mnli.jsonl
+python -m thinking.text --import-squad --squad-train 5000 --squad-eval 1000 \
+    --squad-max-context-tokens 160 --squad-max-question-tokens 40 \
+    --squad-max-answer-tokens 8 --seed 23 --out data/text_squad.jsonl
+python -m thinking.text --import-squad --squad-train 800 --squad-eval 200 \
+    --squad-max-context-tokens 96 --squad-max-question-tokens 32 \
+    --squad-max-answer-tokens 5 --seed 29 --out data/text_squad_smoke.jsonl
+python -m thinking.text --import-squad --squad-choice-only --squad-choice-n 4 \
+    --squad-train 1200 --squad-eval 300 --squad-max-context-tokens 128 \
+    --squad-max-question-tokens 32 --squad-max-answer-tokens 6 --seed 31 \
+    --out data/text_squad_choice_smoke.jsonl
+python -m thinking.text --import-squad --squad-choice-only --squad-choice-n 4 \
+    --squad-choice-swap-negatives 1 --squad-train 1800 --squad-eval 450 \
+    --squad-max-context-tokens 128 --squad-max-question-tokens 32 \
+    --squad-max-answer-tokens 6 --seed 37 \
+    --out data/text_squad_choice_neg_smoke.jsonl
+python -m thinking.text --import-squad --squad-choice-only --squad-choice-n 4 \
+    --squad-choice-swap-negatives 1 --squad-choice-absent-negatives 1 \
+    --squad-train 2400 --squad-eval 600 --squad-max-context-tokens 128 \
+    --squad-max-question-tokens 32 --squad-max-answer-tokens 6 --seed 41 \
+    --out data/text_squad_choice_absent_neg_smoke.jsonl
 python -m thinking.text --data data/text_snli.jsonl --steps 1500 --batch 64 --d 192 \
     --layers 4 --heads 6 --semantic-w 0.75 --free-n 200 --max-new 20 \
     --out runs/text_snli.json --checkpoint runs/text_snli.pt
@@ -190,6 +210,148 @@ python -m thinking.text --data data/text_mnli.jsonl \
     --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
     --out runs/text_study_mnli_smoke.json
+python -m thinking.text --data data/text_mnli.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_mnli_semantic_replay_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 80 --batch 32 --study-lr 0.0005 --decode-w 0 --semantic-w 1.0 \
+    --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_mnli_semantic_replay_smoke.json
+python -m thinking.text --data data/text_mnli.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_mnli_error_replay_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 40 --study-rounds 2 --study-strategy errors \
+    --study-probe-n 512 --study-hard-max 256 \
+    --batch 32 --study-lr 0.0005 --decode-w 0 --semantic-w 1.0 \
+    --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_mnli_error_replay_smoke.json
+python -m thinking.text --data data/text_mnli.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_mnli_select_both_replay_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 40 --study-rounds 2 --study-strategy errors \
+    --study-probe-n 512 --study-hard-max 256 --study-select-best \
+    --study-score-metric both --study-retention-w 2.0 \
+    --batch 32 --study-lr 0.0005 --decode-w 0 --semantic-w 1.0 \
+    --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_mnli_select_both_replay_smoke.json
+python -m thinking.text --data data/text_squad_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_control_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 12 --study-rounds 1 --study-strategy errors \
+    --study-probe-n 128 --study-hard-max 96 --study-select-best \
+    --study-score-metric both --study-retention-w 2.0 --study-control-w 2.0 \
+    --batch 24 --study-lr 0.0005 --decode-w 0.25 --semantic-w 1.0 \
+    --balance-by kind --fact-n 80 --kind-fact-n 10 --artifact-n 80 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 36 \
+    --out runs/text_study_squad_control_smoke.json
+python -m thinking.text --data data/text_squad_choice_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_all_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 80 --study-rounds 1 --study-strategy all --study-select-best \
+    --study-score-metric both --study-retention-w 2.0 --study-control-w 2.0 \
+    --batch 32 --study-lr 0.0005 --decode-w 0.25 --semantic-w 1.0 \
+    --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_all_smoke.json
+python -m thinking.text --data data/text_squad_choice_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_neg_guard_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 100 --study-rounds 1 --study-strategy all --study-select-best \
+    --study-score-metric both --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0.25 \
+    --semantic-w 1.0 --balance-by kind --fact-n 160 --kind-fact-n 30 \
+    --artifact-n 160 --free-n -1 --paraphrase-n -1 --counterfactual-n -1 \
+    --max-new 24 --out runs/text_study_squad_choice_neg_guard_smoke.json
+python -m thinking.text --data data/text_squad_choice_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_seeded_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 100 --study-rounds 1 --study-strategy all --study-select-best \
+    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0.25 \
+    --semantic-w 0.5 --choice-w 1.0 --balance-by kind --fact-n 160 \
+    --kind-fact-n 30 --artifact-n 160 --free-n -1 --paraphrase-n -1 \
+    --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_seeded_smoke.json
+python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_absent_answerw4_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 100 --study-rounds 1 --study-strategy all --study-select-best \
+    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
+    --semantic-w 0 --choice-w 1.0 --choice-answer-w 4.0 --choice-none-w 1.0 \
+    --balance-by kind --fact-n 160 --kind-fact-n 30 --artifact-n 160 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_absent_answerw4_smoke.json
+python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_evidence_2round_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 10 --study-rounds 2 --study-strategy all --study-select-best \
+    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
+    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
+    --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_evidence_2round_smoke.json
+python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_errors_kindguard_2round_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
+    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
+    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
+    --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_errors_kindguard_2round_smoke.json
+python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_candidate_ctx_pair_controlguard_2round_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
+    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
+    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
+    --choice-pair-w 1.0 --choice-pair-margin 0.0 --balance-by kind \
+    --fact-n 80 --kind-fact-n 20 --artifact-n 80 --free-n -1 \
+    --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_candidate_ctx_pair_controlguard_2round_smoke.json
+python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_candidate_ctx_pair_ctrlcontrast_2round_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
+    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
+    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
+    --choice-pair-w 1.0 --choice-pair-margin 0.0 --choice-control-w 0 \
+    --choice-control-contrast-w 1.0 --choice-control-margin 0.0 \
+    --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_candidate_ctx_pair_ctrlcontrast_2round_smoke.json
+python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
+    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_contextloc025_pair_2round_smoke.pt \
+    --study-replay-data data/text_grounded.jsonl \
+    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
+    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
+    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
+    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
+    --choice-context-w 0.25 --choice-pair-w 1.0 --choice-pair-margin 0.0 \
+    --choice-control-w 0 --choice-control-contrast-w 0 --choice-control-margin 0.0 \
+    --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_study_squad_choice_contextloc025_pair_2round_smoke.json
 ```
 
 Current local Text-0 SNLI baseline (20k train / 1k dev, 1.5k steps, d=192, 4 layers, 6 heads,
@@ -244,10 +406,145 @@ and no hard-coded English rules.
 The first reading-task update path is also wired. `--study-checkpoint` loads an existing text
 checkpoint, expands token embeddings and semantic heads for new reading-task vocabulary/facts,
 evaluates before, fine-tunes on the reading records (plus optional `--study-replay-data`), saves
-to a new checkpoint, and evaluates after. A 40-step MultiNLI study smoke expanded the balanced
-SNLI+HANS+grounded checkpoint from **11,251** to **34,017** text tokens and improved sampled
-MultiNLI semantic-head accuracy from **0.317** to **0.392**. It still fails the gate; this is the
-weight-update mechanism for future reading curricula, not language mastery.
+to a new checkpoint, and evaluates after. `--decode-w 0` gives a semantic-only study mode for
+understanding updates that do not train the canonical trace decoder on the same step. A 40-step
+full-loss MultiNLI study smoke expanded the balanced SNLI+HANS+grounded checkpoint from
+**11,251** to **34,017** text tokens and improved sampled MultiNLI semantic-head accuracy from
+**0.317** to **0.392**, while teacher-forced accuracy fell. The safer semantic-only replay smoke
+with grounded replay improved sampled MultiNLI semantic-head accuracy from **0.342** to
+**0.375**, nudged teacher-forced from **0.350** to **0.358**, and preserved grounded replay
+semantic accuracy at **0.988**. `--study-strategy errors` adds an explicit self-study loop:
+each round samples train records, mines examples where the semantic head is wrong, and trains on
+those hard examples plus replay. In the current smoke it mined ~60% hard examples, improved
+sampled MultiNLI teacher-forced accuracy from **0.350** to **0.400**, barely moved semantic-head
+accuracy (**0.317** to **0.325**), and preserved grounded replay semantic accuracy at **0.988**.
+`--study-select-best` now evaluates each study round and can restore the best weights using
+semantic, teacher-forced, combined, or bottleneck scoring. The current combined-score smoke
+(`--study-score-metric both --study-retention-w 2.0`) selected round 2 only after both sampled
+MultiNLI teacher-forced accuracy (**0.350** to **0.408**) and semantic-head accuracy
+(**0.333** to **0.383**) improved, with a small grounded replay drop (**0.988** to **0.983** for
+both heads). It still fails the gate; this is the weight-update mechanism for future reading
+curricula, not language mastery.
+
+SQuAD v1.1 is now a second real reading-task source. `--import-squad` downloads the official
+context/question/answer JSON, windows each passage around the labeled answer span, and can render
+either extractive answer facts (`answer length`, `a000 answer_token`, ...) or contrastive
+multiple-choice facts (`answer choice c00x`) whose candidates are shuffled real answers from the
+same paragraph. The importer writes filtering/windowing stats so skipped long-answer examples are
+visible instead of hidden. Evaluation now also includes QA controls: full context+question must
+beat question-only, context-only, and same-paragraph question-swap inputs, otherwise the study
+selector receives a shortcut-control penalty via `--study-control-w`. `--study-kind-w` penalizes
+updates that improve the aggregate score by sacrificing an entire eval kind, and the study selector
+now refuses non-positive total scores unless `--study-allow-negative-score` is set.
+
+A local 800/200 extractive SQuAD smoke expanded the balanced text checkpoint from **11,251** to
+**20,633** text tokens and from **26** to **1,760** fact values. After a 12-step hard-example
+replay study, sampled SQuAD semantic-head accuracy rose from **0.049** to **0.117**, but
+teacher-forced accuracy fell (**0.019** to **0.004**) and QA ablation gaps remained below the 0.05
+gate. The contrastive choice smoke is more tractable: four-choice SQuAD imports add only **4**
+fact values. An 80-step all-record replay study improved sampled teacher-forced choice accuracy
+from **0.000** to **0.283**, kept grounded replay gated, and scored positive before kind-collapse
+guarding, but still failed understanding controls (`full - context_only = 0.000`, question-swap
+teacher gap **0.000**, semantic question-swap gap **0.026**).
+
+Question-swap negatives add an explicit data-derived `answer choice none` target for swapped
+questions whose answers are not in the candidate list. The first 100-step negative-swap study
+learned the negative class while collapsing positive SQuAD choices (`squad_choice` sampled
+teacher/semantic **0.000**, `squad_choice_swap_negative` **1.000**). With `--study-kind-w 1.0`
+and the positive-score guard, the same collapsed round is rejected (`score_allowed=false`,
+selected round **0**, checkpoint deltas **0.000**), preserving replay and refusing a misleading
+update.
+
+The candidate-aware choice head is now separate from the fixed semantic value head: it scores each
+record's candidate spans plus a learned `none` option, uses a target-balanced positive/none loss
+(`--choice-w`), and can be selected with `--study-score-metric choice`. Checkpoint expansion and
+eval now seed missing/new weights from `--seed`, so repeated study commands are reproducible. The
+seeded 100-step SQuAD choice smoke improved aggregate candidate-head accuracy from **0.188** to
+**0.463**, but the selector still rejected the update (`score_allowed=false`, selected round
+**0**) because `squad_choice` fell to **0.033** while `squad_choice_swap_negative` reached
+**0.833**, grounded replay teacher accuracy dropped from **0.983** to **0.922**, and QA choice
+control gaps stayed below threshold. This proves the architecture can train a data-derived
+candidate scorer and reject a shortcut update; it is still not language understanding.
+
+Answer-absent negatives are now another data-derived SQuAD choice control. They keep the original
+context and question but replace the choices with same-paragraph answer candidates that exclude the
+gold answer, so `answer choice none` cannot be learned solely from a swapped-question surface.
+The new 2.4k/600 smoke writes positives, swapped-question negatives, and answer-absent negatives.
+A 100-step choice-only run with extra positive pressure (`--choice-answer-w 4.0`) still failed to
+beat the guarded baseline: the candidate-head round scored **0.106** aggregate, kept
+`squad_choice` at **0.233**, and only weakly learned answerability (`squad_choice_absent_negative`
+**0.067**, `squad_choice_swap_negative` **0.133**). The selected round stayed **0**. This rules
+out simple scalar loss weighting as the fix.
+
+The candidate scorer now uses an evidence threshold instead of a static `none` vector. The question
+span attends over context tokens, each candidate span is scored against both the question and the
+attended context, and `none` wins only when no candidate clears the learned threshold. That is a
+better architecture for answerability, but the current small study still rejects training updates:
+the 100-step evidence run learned both negative kinds perfectly while collapsing real choices
+(`squad_choice` **0.000**, absent/swap negatives **1.000**), and the lighter 2-round/10-step
+self-study run selected round **0** over both trained rounds. Its untrained expanded head was more
+balanced on the sampled eval (`squad_choice` **0.250**, absent **0.150**, swap **0.400**), while
+both trained rounds again drove `squad_choice` to **0.000**. The guarded self-study machinery is
+doing its job; the next text rung needs richer positive supervision or a stronger candidate
+matching objective before accepting reading-task weight updates.
+
+The choice objective now combines candidate ranking for real answers with a learned threshold for
+answerability, and `--study-strategy errors` is choice-aware when `--study-score-metric choice` is
+selected. That means reading-task self-study mines the candidate-head records the model actually
+misses instead of using semantic-head errors as a proxy. On the 2-round SQuAD choice/absent/swap
+smoke, round 1 mined **1,776 / 2,400** choice errors and round 2 mined **1,407 / 2,400**. Aggregate
+choice accuracy could rise from **0.338** to **0.625**, and the QA choice control gaps cleared the
+0.05 thresholds, but the real-answer kind still regressed (`squad_choice` **0.250** to **0.150**)
+while negative kinds dominated (absent **0.850**, swap **0.900**). The selector now compares each
+eval kind against the pre-study baseline, records `kind_regressions`, and blocks a round when the
+kind guard is enabled. The same smoke therefore keeps `selected_round` **0** with checkpoint deltas
+**0.000**. This is a stronger self-teaching guard, not language mastery; the remaining gap is a
+positive candidate-matching objective that can improve real answers without leaning on `none`.
+
+The next candidate objective is paired rather than label-count based. SQuAD positives are paired
+with their dataset-derived answer-absent or swapped-question negatives through `base_id`; the
+paired loss (`--choice-pair-w`) asks the positive answer evidence to outrank the paired `none`
+record's candidate evidence. The choice scorer also now retrieves context evidence per candidate
+instead of sharing one question-attended context vector across every option. That made the initial
+expanded head less lucky on the sampled SQuAD choice eval (**0.150** aggregate), but after 10
+choice-error steps the candidate head reached **0.400** without regressing `squad_choice`
+(**0.200** before and after; absent/swap negatives **0.450**/**0.450**). The update still failed
+understanding controls (`qa_choice_full_minus_question_only` **0.0375**,
+`qa_choice_full_minus_context_only` **-0.0750**, `qa_choice_full_minus_question_swap` **-0.0385**).
+Selection now records `control_failures` and, when `--study-control-w` is enabled, treats failed
+shortcut controls as hard blockers instead of only score penalties. The strict-control smoke keeps
+`selected_round` **0** and checkpoint deltas **0.000**. This is the right failure: the model can
+fit more of the task, but it is still not allowed to call that understanding until it beats the
+ablations.
+
+Training-side QA controls are now generated from the same data, not from English rules.
+`--choice-control-w` samples question-only/context-only ablations from positive choice records and
+trains them as `answer choice none`; `--choice-control-contrast-w` instead keeps the original target
+and asks the full context+question target evidence to outrank the ablated target evidence. Both are
+guarded by the same held-out ablation checks. In the 2-round smoke, blunt ablation-none training
+overcorrected into `none`: with weight **1.0**, aggregate choice reached **0.588** but
+`squad_choice` fell from **0.200** to **0.050**; with weight **0.25**, aggregate reached **0.500**
+but `squad_choice` still fell to **0.050**. The contrastive control loss avoided the blunt `none`
+target, but still did not solve the shortcut: one round preserved `squad_choice` at **0.200** while
+choice controls became worse (`question_only` gap **-0.4875**, `context_only` **-0.2000**), and the
+other improved negatives while leaving all control gaps negative. All control-training smokes keep
+`selected_round` **0**. The next model-side gap is not more scalar loss pressure; it needs a
+stronger mechanism for binding question predicates to matching context spans before answerability
+training can be trusted.
+
+The choice head now has an explicit data-derived context localization loss (`--choice-context-w`).
+For positive SQuAD choice records, the target choice tokens are located in the context token stream,
+and the question+candidate context attention is trained to place probability mass on that answer
+span. This is not an English rule; it is span supervision extracted from the reading record. With
+`--choice-context-w 1.0`, the model improved negatives while preserving `squad_choice` in the first
+round, but still failed context-only and question-swap controls. With the lighter
+`--choice-context-w 0.25`, round 1 was the cleanest result so far: sampled choice accuracy improved
+from **0.150** to **0.4125**, `squad_choice` stayed at **0.200**, answer-absent rose to **0.450**,
+and swapped-question negatives rose to **0.400**. The selector still rejected it because held-out
+controls remained below threshold (`context_only` gap **-0.0375**, question-swap gap **-0.0385**).
+Adding same-paragraph question-swap contrast on top made the small head worse, not better. The
+current evidence says span localization helps candidate evidence, but the architecture still needs
+a stronger question-conditioned binding mechanism before a reading update should be accepted.
 
 ## 3b. Image grounding: synthetic visual factors first
 
@@ -353,6 +650,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
     --image-flow-cache-latents --image-flow-cache-dir runs/image_manifest_cache \
     --image-flow-cache-shard-size 2048 --image-flow-cache-batch 64 \
     --image-sample-steps 8 --image-flow-consistency-w 0.05 \
+    --image-time-sampling logit-normal --image-time-shift 3.0 \
     --image-latent-normalize channel --image-latent-stat-samples 4096 \
     --image-eval-sweep --image-eval-split eval --image-sample-grid --fast --go
 ```
@@ -702,6 +1000,12 @@ Image-44 adds explicit manifest image augmentation. `thinking.image_latent` now 
 through. Eval remains deterministic, but real-image AE/flow training, latent-stat estimation, and
 latent cache construction can now sample random square crops and horizontal flips. The settings are
 recorded in train reports/checkpoints so caption-sensitive runs can keep flips at zero.
+
+Image-45 adds rectified-flow timestep shifting for high-resolution latent image runs.
+`thinking.image_latent --time-shift` shifts training samples and sampler nodes toward the noisy
+part of the data-time path while keeping `1.0` as the exact legacy schedule. Checkpoint eval uses
+the saved shift by default, `--sample-time-shift` can override it for sweeps, and RunPod exposes the
+training knob as `--image-time-shift`.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

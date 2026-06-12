@@ -224,6 +224,7 @@ def payload(args):
                      f"--time-sampling {args.image_time_sampling} "
                      f"--time-logit-mean {args.image_time_logit_mean} "
                      f"--time-logit-std {args.image_time_logit_std} "
+                     f"--time-shift {args.image_time_shift} "
                      f"--latent-normalize {args.image_latent_normalize} "
                      f"--latent-stat-samples {args.image_latent_stat_samples} "
                      f"--out {ckpt}")
@@ -739,6 +740,9 @@ def main():
     ap.add_argument("--image-time-logit-std", type=float, default=1.0,
                     dest="image_time_logit_std",
                     help="stddev for --image-time-sampling logit-normal")
+    ap.add_argument("--image-time-shift", type=float, default=1.0,
+                    dest="image_time_shift",
+                    help="latent image RF data-time shift; >1 biases training toward noise")
     ap.add_argument("--image-latent-normalize", default="none",
                     choices=("none", "global", "channel"), dest="image_latent_normalize",
                     help="normalize semantic AE latents before latent image flow training")
@@ -820,6 +824,8 @@ def main():
         sys.exit("ERROR: --image-embed-max-records must be non-negative")
     if args.image_hflip_prob < 0.0 or args.image_hflip_prob > 1.0:
         sys.exit("ERROR: --image-hflip-prob must be in [0, 1]")
+    if args.image_time_shift <= 0.0:
+        sys.exit("ERROR: --image-time-shift must be positive")
     if args.upload_image_data:
         if not args.image_manifest:
             sys.exit("ERROR: --upload-image-data requires --image-manifest")
