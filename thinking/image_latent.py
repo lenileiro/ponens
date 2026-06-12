@@ -925,7 +925,8 @@ def estimate_latent_stats(ae, n=512, batch=64, seed=123, size=32, device=DEV,
 
 @torch.no_grad()
 def estimate_latent_stats_records(ae, records, n=512, batch=64, seed=123, size=32, device=DEV,
-                                  mode="none", eps=1.0e-6):
+                                  mode="none", eps=1.0e-6, crop_mode="center",
+                                  hflip_prob=0.0):
     mode = str(mode)
     if mode == "none":
         return {"mode": "none", "n": 0}
@@ -939,7 +940,9 @@ def estimate_latent_stats_records(ae, records, n=512, batch=64, seed=123, size=3
     sums = sums2 = None
     while seen < n:
         b = min(batch, n - seen)
-        x, _captions = sample_image_text_batch(records, rng, batch=b, size=size, device=device)
+        x, _captions = sample_image_text_batch(
+            records, rng, batch=b, size=size, device=device,
+            crop_mode=crop_mode, hflip_prob=hflip_prob)
         z = ae.encode(x).detach().float().cpu().double()
         if mode == "global":
             cur_sum = z.sum()
@@ -1008,7 +1011,8 @@ def estimate_latent_stats_tensor(latents, n=512, seed=123, mode="none", eps=1.0e
 def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_records=0,
                              batch=64, seed=0, size=32, device=DEV, precision="fp32",
                              cond_source="tokens", cache_dir="", shard_size=1024,
-                             include_image_embeddings=False):
+                             include_image_embeddings=False, crop_mode="center",
+                             hflip_prob=0.0):
     rows = list(records)
     if not rows:
         raise ValueError("cannot build latent cache from empty records")
@@ -1025,13 +1029,18 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             ae, rows, prompt_vocab, caption_max_len=caption_max_len,
             batch=batch, size=size, device=device, precision=precision,
             cond_source=cond_source, cache_dir=cache_dir, shard_size=shard_size,
-            include_image_embeddings=include_image_embeddings)
+            include_image_embeddings=include_image_embeddings, seed=seed,
+            crop_mode=crop_mode, hflip_prob=hflip_prob)
     latents, captions, embeddings, image_embeddings = [], [], [], []
     ae.eval()
+    crop_rng = np.random.default_rng(seed + 17)
     for start in range(0, len(rows), max(1, int(batch))):
         chunk = rows[start:start + max(1, int(batch))]
         x = torch.stack([
-            load_image_tensor(rec.path, size=size, device=device)
+            load_image_tensor(
+                rec.path, size=size, device=device, crop_mode=crop_mode,
+                hflip=(hflip_prob > 0.0 and float(crop_rng.random()) < float(hflip_prob)),
+                rng=crop_rng)
             for rec in chunk
         ], dim=0)
         with amp_autocast(device, precision):
@@ -1077,7 +1086,8 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
 def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, batch=64,
                                   size=32, device=DEV, precision="fp32",
                                   cond_source="tokens", cache_dir="", shard_size=1024,
-                                  include_image_embeddings=False):
+                                  include_image_embeddings=False, seed=0,
+                                  crop_mode="center", hflip_prob=0.0):
     if not cache_dir:
         raise ValueError("cache_dir is required for disk latent cache")
     shard_size = int(shard_size)
@@ -1092,13 +1102,20 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
     total_bytes = 0
     latent_shape = None
     ae.eval()
+    crop_rng = np.random.default_rng(seed + 17)
     for shard_i, start in enumerate(range(0, len(rows), shard_size)):
         chunk_rows = rows[start:start + shard_size]
         latents = []
         for enc_start in range(0, len(chunk_rows), max(1, int(batch))):
             enc_rows = chunk_rows[enc_start:enc_start + max(1, int(batch))]
             x = torch.stack([
-                load_image_tensor(rec.path, size=size, device=device)
+                load_image_tensor(
+                    rec.path, size=size, device=device, crop_mode=crop_mode,
+                    hflip=(
+                        hflip_prob > 0.0
+                        and float(crop_rng.random()) < float(hflip_prob)
+                    ),
+                    rng=crop_rng)
                 for rec in enc_rows
             ], dim=0)
             with amp_autocast(device, precision):
@@ -3133,6 +3150,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       image_min_aesthetic=None, image_max_records=0,
                       caption_vocab_max=8192, caption_max_len=64,
                       caption_cond_source="tokens",
+                      image_crop_mode="center", image_hflip_prob=0.0,
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0,
                       latent_normalize="none", latent_stat_samples=512,
@@ -3182,6 +3200,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
     if latent_normalize not in ("none", "global", "channel"):
         raise ValueError(f"unknown latent normalization mode {latent_normalize!r}")
+    if image_crop_mode not in ("center", "random", "none"):
+        raise ValueError(f"unknown image crop mode {image_crop_mode!r}")
+    if image_hflip_prob < 0.0 or image_hflip_prob > 1.0:
+        raise ValueError("image_hflip_prob must be in [0, 1]")
     if ae_recon_loss not in AE_RECON_LOSSES:
         raise ValueError(f"unknown AE reconstruction loss {ae_recon_loss!r}")
     if ae_grad_w < 0.0 or ae_ms_w < 0.0 or ae_latent_reg_w < 0.0:
@@ -3298,7 +3320,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             else:
                 x, captions, chosen_records = sample_image_text_batch(
                     image_records, rng, batch=batch, size=size, device=device,
-                    return_records=True)
+                    return_records=True, crop_mode=image_crop_mode,
+                    hflip_prob=image_hflip_prob)
             with amp_autocast(device, train_precision):
                 out = ae(x)
                 if image_records is None:
@@ -3366,7 +3389,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             size=size, device=device, precision=train_precision,
             cond_source=caption_cond_source, cache_dir=flow_cache_dir,
             shard_size=flow_cache_shard_size,
-            include_image_embeddings=flow_feature_align_w > 0.0)
+            include_image_embeddings=flow_feature_align_w > 0.0,
+            crop_mode=image_crop_mode, hflip_prob=image_hflip_prob)
     if image_records is None:
         latent_stats = estimate_latent_stats(
             ae, n=latent_stat_samples, batch=batch, seed=seed + 97, size=size, device=device,
@@ -3377,7 +3401,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     else:
         latent_stats = estimate_latent_stats_records(
             ae, image_records, n=latent_stat_samples, batch=batch, seed=seed + 97,
-            size=size, device=device, mode=latent_normalize)
+            size=size, device=device, mode=latent_normalize,
+            crop_mode=image_crop_mode, hflip_prob=image_hflip_prob)
     attach_latent_stats(flow, latent_stats)
     flow.train()
     if conditioner is not None:
@@ -3415,7 +3440,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             else:
                 x, captions, chosen_records = sample_image_text_batch(
                     image_records, rng, batch=batch, size=size, device=device,
-                    return_records=True)
+                    return_records=True, crop_mode=image_crop_mode,
+                    hflip_prob=image_hflip_prob)
                 fact_cond, specs = None, None
                 with torch.no_grad(), amp_autocast(device, train_precision):
                     z1 = ae.encode(x)
@@ -3603,6 +3629,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "image_min_aesthetic": (
             float(image_min_aesthetic) if image_min_aesthetic is not None else None
         ),
+        "image_crop_mode": image_crop_mode if image_records is not None else "",
+        "image_hflip_prob": float(image_hflip_prob) if image_records is not None else 0.0,
         "caption_vocab_max": int(caption_vocab_max) if image_records is not None else 0,
         "caption_max_len": int(caption_max_len) if image_records is not None else 0,
         "caption_cond_source": caption_cond_source if image_records is not None else "",
@@ -4103,6 +4131,12 @@ def main(argv=None):
     ap.add_argument("--caption-cond-source", default="tokens",
                     choices=("tokens", "embedding", "auto"), dest="caption_cond_source",
                     help="caption conditioning source for image manifests")
+    ap.add_argument("--image-crop-mode", default="center",
+                    choices=("center", "random", "none"), dest="image_crop_mode",
+                    help="crop mode for manifest training images")
+    ap.add_argument("--image-hflip-prob", type=float, default=0.0,
+                    dest="image_hflip_prob",
+                    help="random horizontal flip probability for manifest training images")
     ap.add_argument("--prompt-templates", default="", dest="prompt_templates",
                     help="semicolon-separated prompt templates using {color} and {shape}")
     ap.add_argument("--seed", type=int, default=0)
@@ -4246,6 +4280,7 @@ def main(argv=None):
         image_split=args.image_split, image_min_aesthetic=args.image_min_aesthetic,
         image_max_records=args.image_max_records, caption_vocab_max=args.caption_vocab_max,
         caption_max_len=args.caption_max_len, caption_cond_source=args.caption_cond_source,
+        image_crop_mode=args.image_crop_mode, image_hflip_prob=args.image_hflip_prob,
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
         time_logit_std=args.time_logit_std,
         latent_normalize=args.latent_normalize,
@@ -4373,6 +4408,8 @@ def main(argv=None):
         "image_split": args.image_split,
         "image_min_aesthetic": args.image_min_aesthetic,
         "image_max_records": args.image_max_records,
+        "image_crop_mode": report.get("image_crop_mode", ""),
+        "image_hflip_prob": report.get("image_hflip_prob", 0.0),
         "caption_vocab_max": args.caption_vocab_max,
         "caption_max_len": args.caption_max_len,
         "caption_cond_source": report.get("caption_cond_source", ""),

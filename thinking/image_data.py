@@ -445,7 +445,8 @@ def image_dimensions(path):
         return int(im.width), int(im.height)
 
 
-def load_image_tensor(path, size=256, device="cpu", center_crop=True):
+def load_image_tensor(path, size=256, device="cpu", center_crop=True,
+                      crop_mode=None, hflip=False, rng=None):
     ext = os.path.splitext(path)[1].lower()
     if ext in (".ppm", ".pnm"):
         arr = _read_ppm(path)
@@ -454,12 +455,25 @@ def load_image_tensor(path, size=256, device="cpu", center_crop=True):
         im = _pil_image(path)
         arr = np.asarray(im, dtype=np.uint8)
         x = torch.tensor(arr, dtype=torch.float32).permute(2, 0, 1) / 127.5 - 1.0
-    if center_crop:
+    if crop_mode is None:
+        crop_mode = "center" if center_crop else "none"
+    crop_mode = str(crop_mode)
+    if crop_mode not in ("center", "random", "none"):
+        raise ValueError(f"unknown crop mode {crop_mode!r}")
+    if crop_mode in ("center", "random"):
         _c, h, w = x.shape
         side = min(h, w)
-        y0 = (h - side) // 2
-        x0 = (w - side) // 2
+        if crop_mode == "random" and (h > side or w > side):
+            if rng is None:
+                rng = np.random.default_rng()
+            y0 = int(rng.integers(0, h - side + 1)) if h > side else 0
+            x0 = int(rng.integers(0, w - side + 1)) if w > side else 0
+        else:
+            y0 = (h - side) // 2
+            x0 = (w - side) // 2
         x = x[:, y0:y0 + side, x0:x0 + side]
+    if hflip:
+        x = torch.flip(x, dims=(2,))
     if size:
         x = F.interpolate(x[None], size=(int(size), int(size)), mode="bilinear",
                           align_corners=False)[0]
@@ -641,11 +655,17 @@ def write_image_manifest(records, path, root=""):
 
 
 def sample_image_text_batch(records, rng, batch=32, size=256, device="cpu",
-                            return_records=False):
+                            return_records=False, crop_mode="center", hflip_prob=0.0):
     records = list(records)
     idx = rng.integers(0, len(records), size=int(batch))
     chosen = [records[int(i)] for i in idx]
-    imgs = [load_image_tensor(rec.path, size=size, device=device) for rec in chosen]
+    hflip_prob = float(hflip_prob)
+    imgs = [
+        load_image_tensor(
+            rec.path, size=size, device=device, crop_mode=crop_mode,
+            hflip=(hflip_prob > 0.0 and float(rng.random()) < hflip_prob), rng=rng)
+        for rec in chosen
+    ]
     captions = [rec.caption for rec in chosen]
     if return_records:
         return torch.stack(imgs, dim=0), captions, chosen
@@ -677,10 +697,17 @@ def selftest():
         assert records[0].image_embedding == (0.4, 0.5, 0.6, 0.7)
         x = load_image_tensor(records[0].path, size=4)
         assert x.shape == (3, 4, 4) and float(x.max()) <= 1.0 and float(x.min()) >= -1.0
+        xr = load_image_tensor(records[0].path, size=4, crop_mode="random",
+                               rng=np.random.default_rng(2))
+        xf = load_image_tensor(records[0].path, size=4, crop_mode="center", hflip=True)
+        assert xr.shape == (3, 4, 4) and xf.shape == (3, 4, 4)
+        assert torch.allclose(x[:, :, 0], xf[:, :, -1])
         vocab = build_caption_vocab(records)
         ids = caption_ids([records[0].caption], vocab, max_len=5)
         assert ids.shape == (1, 5) and int(ids[0, 0]) > 0
-        xb, captions = sample_image_text_batch(records, np.random.default_rng(0), batch=2, size=4)
+        xb, captions = sample_image_text_batch(
+            records, np.random.default_rng(0), batch=2, size=4,
+            crop_mode="random", hflip_prob=0.5)
         assert xb.shape == (2, 3, 4, 4) and captions == [records[0].caption] * 2
         summary = summarize_records(records)
         assert summary["image_records"] == 1 and summary["image_splits"]["train"] == 1

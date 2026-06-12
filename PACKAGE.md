@@ -340,6 +340,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
     --image-cond-mode text --image-dit-head-width-mult 2 \
     --image-manifest data/images/train.jsonl --image-root data/images \
     --image-caption-cond-source auto \
+    --image-crop-mode random --image-hflip-prob 0.5 \
     --image-size 128 --image-ae-arch residual --image-latent-downsample 8 \
     --image-latent-max-tokens 256 \
     --image-ae-recon-loss hybrid --image-ae-grad-w 0.1 --image-ae-ms-w 0.1 \
@@ -695,6 +696,12 @@ uploads repo-relative `--image-root` and `--image-manifest` paths to the pod bef
 so the pinned-code deploy can still train from local `data/images/...` manifests without committing
 large image corpora into git. Absolute manifest/root paths remain reserved for datasets already
 mounted on the pod.
+
+Image-44 adds explicit manifest image augmentation. `thinking.image_latent` now accepts
+`--image-crop-mode center|random|none` and `--image-hflip-prob`, and RunPod passes the same flags
+through. Eval remains deterministic, but real-image AE/flow training, latent-stat estimation, and
+latent cache construction can now sample random square crops and horizontal flips. The settings are
+recorded in train reports/checkpoints so caption-sensitive runs can keep flips at zero.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

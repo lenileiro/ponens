@@ -202,6 +202,8 @@ def payload(args):
                      f"--caption-vocab-max {args.image_caption_vocab_max} "
                      f"--caption-max-len {args.image_caption_max_len} "
                      f"--caption-cond-source {args.image_caption_cond_source} "
+                     f"--image-crop-mode {args.image_crop_mode} "
+                     f"--image-hflip-prob {args.image_hflip_prob} "
                      f"--cond-drop {args.image_cond_drop} "
                      f"--cfg-scale {args.image_cfg_scale} "
                      f"--cfg-interval {shlex_quote(args.image_cfg_interval)} "
@@ -661,6 +663,12 @@ def main():
                     choices=("tokens", "embedding", "auto"),
                     dest="image_caption_cond_source",
                     help="caption conditioning source for image manifests")
+    ap.add_argument("--image-crop-mode", default="center",
+                    choices=("center", "random", "none"), dest="image_crop_mode",
+                    help="crop mode for manifest image training")
+    ap.add_argument("--image-hflip-prob", type=float, default=0.0,
+                    dest="image_hflip_prob",
+                    help="random horizontal flip probability for manifest image training")
     ap.add_argument("--image-prompt-templates", default="", dest="image_prompt_templates",
                     help="semicolon-separated prompt templates using {color} and {shape}")
     ap.add_argument("--image-cond-drop", type=float, default=0.0, dest="image_cond_drop",
@@ -810,6 +818,8 @@ def main():
         sys.exit("ERROR: --image-embed-batch must be positive")
     if args.image_embed_max_records < 0:
         sys.exit("ERROR: --image-embed-max-records must be non-negative")
+    if args.image_hflip_prob < 0.0 or args.image_hflip_prob > 1.0:
+        sys.exit("ERROR: --image-hflip-prob must be in [0, 1]")
     if args.upload_image_data:
         if not args.image_manifest:
             sys.exit("ERROR: --upload-image-data requires --image-manifest")
