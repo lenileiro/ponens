@@ -75,9 +75,48 @@ def payload(args):
         return " && ".join(cmds)                           # lang is a COMPLETE payload: without
         #                                                    this return the default kinship
         #                                                    multi-seed run was appended after it
-    if (args.vision or args.image2 or args.image_flow or args.image_latent or args.audio
-            or args.multimodal):
+    if (args.vision or args.image2 or args.image_flow or args.image_latent or args.image_embed
+            or args.audio or args.multimodal):
         VI = PY.replace("thinking.cli", "thinking.vision")
+        effective_image_manifest = args.image_manifest
+        if args.image_embed:
+            IE = PY.replace("thinking.cli", "thinking.image_embed")
+            ID = PY.replace("thinking.cli", "thinking.image_data")
+            embed = (f"{IE} --manifest {shlex_quote(args.image_manifest)} "
+                     f"--root {shlex_quote(args.image_root)} "
+                     f"--backend {args.image_embed_backend} "
+                     f"--features {args.image_embed_features} "
+                     f"--batch {args.image_embed_batch} "
+                     f"--device {args.image_embed_device} "
+                     f"--dtype {args.image_embed_dtype} "
+                     f"--max-records {args.image_embed_max_records} "
+                     f"--out {shlex_quote(args.image_embed_out)} "
+                     f"--report-out {shlex_quote(args.image_embed_report_out)}")
+            if args.image_embed_model:
+                embed += f" --model {shlex_quote(args.image_embed_model)}"
+            if args.image_embed_no_normalize:
+                embed += " --no-normalize"
+            if args.image_embed_trust_remote_code:
+                embed += " --trust-remote-code"
+            clean = (f"{ID} --manifest {shlex_quote(args.image_manifest)} "
+                     f"--root {shlex_quote(args.image_root)} "
+                     f"--min-side {args.image_clean_min_side} "
+                     f"--max-aspect {args.image_clean_max_aspect} "
+                     f"--min-caption-tokens {args.image_clean_min_caption_tokens} "
+                     f"--max-caption-tokens {args.image_clean_max_caption_tokens} "
+                     f"--embedding-manifest {shlex_quote(args.image_embed_out)} "
+                     f"--embedding-root {shlex_quote(args.image_root)} "
+                     f"--embedding-key image "
+                     f"--write-filtered {shlex_quote(args.image_clean_manifest)} "
+                     f"--report-out {shlex_quote(args.image_clean_report_out)}")
+            if args.image_min_aesthetic is not None:
+                clean += f" --min-aesthetic {args.image_min_aesthetic}"
+            if args.image_clean_keep_duplicate_paths:
+                clean += " --keep-duplicate-paths"
+            if args.image_clean_no_check_images:
+                clean += " --no-check-images"
+            cmds.extend([embed, clean])
+            effective_image_manifest = args.image_clean_manifest
         if args.vision:                                    # IMAGE-0/1: visual factors -> facts
             cmds.append(f"{VI} --train --steps {args.train_steps or 2000} "
                         f"--batch {args.batch} --dim {args.dim or 64} "
@@ -126,7 +165,7 @@ def payload(args):
                      f"--image-feature-embed-dim {args.image_feature_embed_dim} "
                      f"--cond-mode {args.image_cond_mode} "
                      f"--text-cond-dim {args.image_text_cond_dim} "
-                     f"--image-manifest {shlex_quote(args.image_manifest)} "
+                     f"--image-manifest {shlex_quote(effective_image_manifest)} "
                      f"--image-root {shlex_quote(args.image_root)} "
                      f"--image-split {shlex_quote(args.image_split)} "
                      f"--image-max-records {args.image_max_records} "
@@ -181,8 +220,9 @@ def payload(args):
                           f"--eval-seeds {shlex_quote(args.image_eval_seeds)} "
                           f"--eval-out runs/image_latent_{args.image_latent_arch}"
                           f"{cond_suffix}_sweep.json")
-                if args.image_manifest:
-                    eval_cmd += (f" --eval-image-manifest {shlex_quote(args.image_manifest)} "
+                if effective_image_manifest:
+                    eval_cmd += (f" --eval-image-manifest "
+                                 f"{shlex_quote(effective_image_manifest)} "
                                  f"--eval-image-root {shlex_quote(args.image_root)} "
                                  f"--eval-image-split {shlex_quote(args.image_eval_split)} "
                                  f"--eval-image-max-records {args.image_eval_max_records}")
@@ -425,6 +465,64 @@ def main():
                     help="train the tiny fact-conditioned rectified-flow image generator")
     ap.add_argument("--image-latent", action="store_true", dest="image_latent",
                     help="IMAGE-3: train semantic autoencoder + latent image flow")
+    ap.add_argument("--image-embed", action="store_true", dest="image_embed",
+                    help="precompute text/image embedding sidecar and cleaned manifest on pod")
+    ap.add_argument("--image-embed-backend", default="hf", choices=("stats", "hf"),
+                    dest="image_embed_backend",
+                    help="embedding backend for --image-embed")
+    ap.add_argument("--image-embed-model", default="google/siglip-base-patch16-224",
+                    dest="image_embed_model",
+                    help="Hugging Face model id for --image-embed-backend hf")
+    ap.add_argument("--image-embed-features", default="both", choices=("both", "image", "text"),
+                    dest="image_embed_features",
+                    help="which embedding columns to write before manifest training")
+    ap.add_argument("--image-embed-batch", type=int, default=64,
+                    dest="image_embed_batch",
+                    help="batch size for image embedding preprocessing")
+    ap.add_argument("--image-embed-device", default="cuda", dest="image_embed_device",
+                    help="device used by image embedding preprocessing")
+    ap.add_argument("--image-embed-dtype", default="auto",
+                    choices=("auto", "fp32", "fp16", "bf16"), dest="image_embed_dtype",
+                    help="dtype used by Hugging Face image embedding preprocessing")
+    ap.add_argument("--image-embed-max-records", type=int, default=0,
+                    dest="image_embed_max_records",
+                    help="cap records for image embedding preprocessing; 0 means all")
+    ap.add_argument("--image-embed-out", default="runs/image_embeddings.jsonl",
+                    dest="image_embed_out",
+                    help="sidecar JSONL written by --image-embed")
+    ap.add_argument("--image-embed-report-out", default="runs/image_embed_report.json",
+                    dest="image_embed_report_out",
+                    help="JSON report written by --image-embed")
+    ap.add_argument("--image-embed-no-normalize", action="store_true",
+                    dest="image_embed_no_normalize",
+                    help="do not L2-normalize image/text embedding rows")
+    ap.add_argument("--image-embed-trust-remote-code", action="store_true",
+                    dest="image_embed_trust_remote_code",
+                    help="pass trust_remote_code=True to Hugging Face embedding loaders")
+    ap.add_argument("--image-clean-manifest", default="runs/image_train_clean.jsonl",
+                    dest="image_clean_manifest",
+                    help="cleaned manifest written after embedding merge")
+    ap.add_argument("--image-clean-report-out", default="runs/image_manifest_report.json",
+                    dest="image_clean_report_out",
+                    help="manifest QA report written after embedding merge")
+    ap.add_argument("--image-clean-min-side", type=int, default=0,
+                    dest="image_clean_min_side",
+                    help="reject manifest images whose smaller side is below this size")
+    ap.add_argument("--image-clean-max-aspect", type=float, default=0.0,
+                    dest="image_clean_max_aspect",
+                    help="reject manifest images wider/taller than this aspect ratio; 0 disables")
+    ap.add_argument("--image-clean-min-caption-tokens", type=int, default=1,
+                    dest="image_clean_min_caption_tokens",
+                    help="reject captions shorter than this token count")
+    ap.add_argument("--image-clean-max-caption-tokens", type=int, default=0,
+                    dest="image_clean_max_caption_tokens",
+                    help="reject captions longer than this token count; 0 disables")
+    ap.add_argument("--image-clean-no-check-images", action="store_true",
+                    dest="image_clean_no_check_images",
+                    help="skip image header/decode checks during pod-side manifest cleaning")
+    ap.add_argument("--image-clean-keep-duplicate-paths", action="store_true",
+                    dest="image_clean_keep_duplicate_paths",
+                    help="do not reject duplicate image paths during pod-side manifest cleaning")
     ap.add_argument("--image-size", type=int, default=32, dest="image_size",
                     help="square image size for latent image train/eval/sample grids")
     ap.add_argument("--image-ae-accum-steps", type=int, default=1,
@@ -673,6 +771,12 @@ def main():
     bad_arms = sorted(set(args.curve_arms) - {"aux", "noaux"})
     if bad_arms:
         sys.exit(f"ERROR: unsupported --curve-arms values: {','.join(bad_arms)}")
+    if args.image_embed and not args.image_manifest:
+        sys.exit("ERROR: --image-embed requires --image-manifest")
+    if args.image_embed_batch <= 0:
+        sys.exit("ERROR: --image-embed-batch must be positive")
+    if args.image_embed_max_records < 0:
+        sys.exit("ERROR: --image-embed-max-records must be non-negative")
 
     key = os.environ.get("RUNPOD_API_KEY")
     if not key and args.go:
@@ -685,8 +789,15 @@ def main():
             "env": {"PUBLIC_KEY": pubkey}}
     cap = args.max_minutes * 60
     run = payload(args)
-    setup = ("pip install -q numpy tokenizers pandas pyarrow pillow" if args.fast   # image torch; verbalizer
-             else f"WORKDIR={REMOTE} bash runpod/setup.sh")                  # deps incl. parquet corpora
+    image_embed_deps = bool(args.image_embed and args.image_embed_backend == "hf")
+    if args.fast:                                           # image torch; verbalizer
+        fast_pkgs = "numpy tokenizers pandas pyarrow pillow"
+        if image_embed_deps:
+            fast_pkgs += " transformers accelerate"
+        setup = f"pip install -q {fast_pkgs}"
+    else:
+        install_embed = "INSTALL_IMAGE_EMBED_DEPS=1 " if image_embed_deps else ""
+        setup = f"{install_embed}WORKDIR={REMOTE} bash runpod/setup.sh"
     # tee to LOCAL disk: /workspace is a network volume that stalls under streaming writes
     # (see runpod/setup.sh -- it cost us rung B4: training was healthy, only the log froze)
     remote_cmd = (
@@ -697,6 +808,7 @@ def main():
         f"cp /root/thinking.log {REMOTE}/thinking.log 2>/dev/null; true")
 
     image_jobs = [name for enabled, name in (
+        (args.image_embed, "image embedding preprocess"),
         (args.vision, "vision factor encoder"),
         (args.image2, "image2 FER arms"),
         (args.image_flow, "fact-conditioned flow"),

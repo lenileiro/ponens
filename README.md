@@ -36,7 +36,7 @@ memorization, and curriculum.
 | `datalog.py` | minimal Datalog: least-fixpoint closure with provenance, entailment oracle, proof trees, SLD backward chaining |
 | `surfaces.json` | frontier-distilled surface bank: 1,300+ validated English patterns across 8 education registers (preschool → scholar), with held-out splits |
 | `runpod/` | H100 launchers (tar-over-ssh, timeout-bounded, always-terminate) |
-| `thinking/vision.py`, `thinking/image2.py`, `thinking/image_flow.py`, `thinking/image_data.py`, `thinking/image_latent.py` | Image rungs: synthetic visual factors → canonical facts, head-aware FER probes, captioned image data, pixel flow, and semantic latent flow |
+| `thinking/vision.py`, `thinking/image2.py`, `thinking/image_flow.py`, `thinking/image_data.py`, `thinking/image_embed.py`, `thinking/image_latent.py` | Image rungs: synthetic visual factors → canonical facts, head-aware FER probes, captioned image data, embedding sidecars, pixel flow, and semantic latent flow |
 | `thinking/text.py` | Text-0 semantic understanding rung: web-imported English records → canonical facts, with artifact controls |
 | `thinking/audio.py`, `thinking/multimodal.py` | Audio factors and the M-0 multimodal bridge: image+audio+transcript prefixes → one canonical extraction trace |
 | `thinking/listen.py`, `thinking/speak.py` | speech: **listen** (transcribe real synthesized speech, speaker-invariant), **speak** (emit audio tokens *verified by round-trip* through the frozen listener — the checker, applied to generation) |

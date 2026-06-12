@@ -333,9 +333,12 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-sample-methods euler,heun \
     --image-sample-grid \
     --image-eval-sweep --fast --go
-RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-latent-arch mmdit \
+RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-embed \
+    --image-embed-model google/siglip-base-patch16-224 \
+    --image-clean-min-side 256 --image-clean-max-aspect 2.0 \
+    --image-latent --image-latent-arch mmdit \
     --image-cond-mode text --image-dit-head-width-mult 2 \
-    --image-manifest data/images/train_clean.jsonl --image-root data/images \
+    --image-manifest data/images/train.jsonl --image-root data/images \
     --image-caption-cond-source auto \
     --image-size 128 --image-ae-arch residual --image-latent-downsample 8 \
     --image-latent-max-tokens 256 \
@@ -680,6 +683,12 @@ tests use a deterministic stats backend, while GPU jobs can use `--backend hf --
 CLIP/SigLIP text-image encoders or DINO/MAE-style image encoders with `--features image`. The
 generator stays model-agnostic: feature extraction, manifest QA, and training remain separate
 auditable stages.
+
+Image-42 wires that path into the GPU launcher. `runpod/launch_thinking.py --image-embed` now runs
+`thinking.image_embed`, merges the sidecar through `thinking.image_data`, writes
+`runs/image_train_clean.jsonl`, and points manifest training/eval at that cleaned file. Full venv
+runs install `transformers`/`accelerate` only when the HF embedding backend is requested, while
+`--fast` dry runs can use the deterministic stats backend for smoke validation.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
