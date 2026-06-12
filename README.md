@@ -97,6 +97,7 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --out runs/image_latent_mmdit_text.pt
 .venv/bin/python -m thinking.image_data --manifest data/images/train.jsonl \
     --root data/images --min-side 256 --max-aspect 2.0 \
+    --embedding-manifest data/images/embeddings.jsonl --embedding-key image \
     --min-caption-tokens 3 --write-filtered data/images/train_clean.jsonl \
     --report-out runs/image_manifest_report.json
 .venv/bin/python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \

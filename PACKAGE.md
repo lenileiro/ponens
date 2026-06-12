@@ -283,6 +283,7 @@ python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --out runs/image_latent_mmdit_text.pt
 python -m thinking.image_data --manifest data/images/train.jsonl \
     --root data/images --min-side 256 --max-aspect 2.0 \
+    --embedding-manifest data/images/embeddings.jsonl --embedding-key image \
     --min-caption-tokens 3 --write-filtered data/images/train_clean.jsonl \
     --report-out runs/image_manifest_report.json
 python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
@@ -661,6 +662,13 @@ predicted clean flow endpoints against those external image features. This is th
 hook: plug in DINO/SigLIP/CLIP/MAE features from a separate preprocessing job, train the generator
 latents to preserve high-level visual semantics, and keep the core model free of provider-specific
 or dataset-specific labels.
+
+Image-40 makes that preprocessing path concrete. `thinking.image_data` now accepts
+`--embedding-manifest`, `--embedding-key image|caption|basename`, and `--embedding-overwrite` so an
+external feature job can write a sidecar JSONL/CSV/TSV and the validator can join text/image
+embeddings into the cleaned manifest before training. The join report records matched/missing
+rows, duplicate sidecar keys, written/preserved embeddings, and embedding dimensions, which keeps
+CLIP/SigLIP/DINO/MAE preprocessing auditable and reproducible instead of implicit notebook state.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

@@ -108,6 +108,132 @@ def _coerce_record(row, manifest_dir, root=""):
     )
 
 
+def _path_key(path):
+    return os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
+
+
+def _caption_key(caption):
+    return " ".join(str(caption).strip().lower().split())
+
+
+def _embedding_key_from_row(row, sidecar_dir, root="", key="image"):
+    key = str(key)
+    if key == "caption":
+        caption = row.get("caption") or row.get("text") or row.get("prompt")
+        return _caption_key(caption) if caption is not None else None
+    image = row.get("image") or row.get("path") or row.get("file") or row.get("filepath")
+    if not image:
+        return None
+    if key == "basename":
+        return os.path.basename(str(image))
+    if key != "image":
+        raise ValueError(f"unknown embedding merge key {key!r}")
+    base = root or sidecar_dir
+    path = str(image)
+    if base and not os.path.isabs(path):
+        path = os.path.join(base, path)
+    return _path_key(path)
+
+
+def _embedding_key_from_record(rec, key="image"):
+    key = str(key)
+    if key == "caption":
+        return _caption_key(rec.caption)
+    if key == "basename":
+        return os.path.basename(rec.path)
+    if key != "image":
+        raise ValueError(f"unknown embedding merge key {key!r}")
+    return _path_key(rec.path)
+
+
+def merge_embedding_sidecar(records, sidecar_path, root="", key="image", overwrite=False):
+    rows = _read_manifest_rows(sidecar_path)
+    sidecar_dir = os.path.dirname(os.path.abspath(sidecar_path))
+    index = {}
+    skipped_no_key = skipped_no_embedding = duplicate_keys = 0
+    for row in rows:
+        row_key = _embedding_key_from_row(row, sidecar_dir, root=root, key=key)
+        if row_key is None:
+            skipped_no_key += 1
+            continue
+        text_embedding = _coerce_text_embedding(
+            row.get("text_embedding",
+                    row.get("caption_embedding",
+                            row.get("embedding", row.get("text_emb"))))
+        )
+        image_embedding = _coerce_image_embedding(
+            row.get("image_embedding",
+                    row.get("visual_embedding",
+                            row.get("vision_embedding",
+                                    row.get("clip_image_embedding",
+                                            row.get("dino_embedding",
+                                                    row.get("image_emb",
+                                                            row.get("visual_emb")))))))
+        )
+        if text_embedding is None and image_embedding is None:
+            skipped_no_embedding += 1
+            continue
+        if row_key in index:
+            duplicate_keys += 1
+            continue
+        index[row_key] = (text_embedding, image_embedding)
+
+    merged = []
+    matched = missing = 0
+    text_added = image_added = 0
+    text_preserved = image_preserved = 0
+    for rec in records:
+        rec_key = _embedding_key_from_record(rec, key=key)
+        vals = index.get(rec_key)
+        if vals is None:
+            missing += 1
+            merged.append(rec)
+            continue
+        matched += 1
+        text_embedding, image_embedding = vals
+        new_text = rec.text_embedding
+        new_image = rec.image_embedding
+        if text_embedding is not None:
+            if overwrite or rec.text_embedding is None:
+                if rec.text_embedding != text_embedding:
+                    text_added += 1
+                new_text = text_embedding
+            else:
+                text_preserved += 1
+        if image_embedding is not None:
+            if overwrite or rec.image_embedding is None:
+                if rec.image_embedding != image_embedding:
+                    image_added += 1
+                new_image = image_embedding
+            else:
+                image_preserved += 1
+        merged.append(replace(rec, text_embedding=new_text, image_embedding=new_image))
+
+    text_dims = sorted({len(v[0]) for v in index.values() if v[0] is not None})
+    image_dims = sorted({len(v[1]) for v in index.values() if v[1] is not None})
+    report = {
+        "embedding_sidecar": sidecar_path,
+        "embedding_key": key,
+        "embedding_rows": len(rows),
+        "embedding_indexed": len(index),
+        "embedding_skipped_no_key": int(skipped_no_key),
+        "embedding_skipped_no_embedding": int(skipped_no_embedding),
+        "embedding_duplicate_keys": int(duplicate_keys),
+        "embedding_records_matched": int(matched),
+        "embedding_records_missing": int(missing),
+        "embedding_text_written": int(text_added),
+        "embedding_image_written": int(image_added),
+        "embedding_text_preserved": int(text_preserved),
+        "embedding_image_preserved": int(image_preserved),
+        "embedding_overwrite": bool(overwrite),
+    }
+    if text_dims:
+        report["embedding_text_dims"] = text_dims
+    if image_dims:
+        report["embedding_image_dims"] = image_dims
+    return merged, report
+
+
 def _read_manifest_rows(path):
     ext = os.path.splitext(path)[1].lower()
     if ext == ".jsonl":
@@ -585,6 +711,25 @@ def selftest():
         assert filtered_row["image"] == "sample.ppm"
         assert filtered_row["text_embedding"] == [1.0, 0.0]
         assert filtered_row["image_embedding"] == [0.0, 1.0]
+        sidecar = os.path.join(td, "embeddings.jsonl")
+        with open(sidecar, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "image": "sample.ppm",
+                "text_embedding": [9.0, 8.0],
+                "image_embedding": [7.0, 6.0, 5.0],
+            }) + "\n")
+        preserved, preserved_report = merge_embedding_sidecar(
+            kept, sidecar, root=td, key="image", overwrite=False)
+        assert preserved_report["embedding_records_matched"] == 1
+        assert preserved_report["embedding_text_preserved"] == 1
+        assert preserved_report["embedding_image_preserved"] == 1
+        assert preserved[0].text_embedding == (1.0, 0.0)
+        overwritten, overwrite_report = merge_embedding_sidecar(
+            kept, sidecar, root=td, key="image", overwrite=True)
+        assert overwrite_report["embedding_text_written"] == 1
+        assert overwrite_report["embedding_image_written"] == 1
+        assert overwritten[0].text_embedding == (9.0, 8.0)
+        assert overwritten[0].image_embedding == (7.0, 6.0, 5.0)
         reread = read_image_manifest(filtered, root=td, split="train")
         assert len(reread) == 1 and reread[0].width == 8 and reread[0].height == 6
     print("image_data selftest OK")
@@ -619,6 +764,15 @@ def main(argv=None):
                     help="optional JSONL path for records that pass validation")
     ap.add_argument("--report-out", default="",
                     help="optional JSON path for the validation report")
+    ap.add_argument("--embedding-manifest", default="",
+                    help="optional sidecar manifest with text/image embeddings to merge")
+    ap.add_argument("--embedding-root", default="",
+                    help="base directory for relative paths in --embedding-manifest")
+    ap.add_argument("--embedding-key", default="image",
+                    choices=("image", "caption", "basename"),
+                    help="join key for --embedding-manifest")
+    ap.add_argument("--embedding-overwrite", action="store_true",
+                    help="replace existing manifest embeddings with sidecar values")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest()
@@ -633,6 +787,12 @@ def main(argv=None):
         max_caption_tokens=args.max_caption_tokens,
         dedupe_paths=not args.keep_duplicate_paths,
         sample_errors=args.sample_errors)
+    if args.embedding_manifest:
+        kept, embedding_report = merge_embedding_sidecar(
+            kept, args.embedding_manifest, root=args.embedding_root or args.root,
+            key=args.embedding_key, overwrite=args.embedding_overwrite)
+        report["embedding_merge"] = embedding_report
+        report.update(summarize_records(kept))
     if args.write_filtered:
         write_image_manifest(kept, args.write_filtered, root=args.root)
         report["filtered_manifest"] = args.write_filtered
