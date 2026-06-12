@@ -101,8 +101,10 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --report-out runs/image_manifest_report.json
 .venv/bin/python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --image-manifest data/images/train_clean.jsonl --image-root data/images \
+    --caption-cond-source auto \
     --size 64 --ae-arch residual --latent-downsample 8 --latent-max-tokens 128 \
     --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 \
+    --image-text-align-w 0.1 --flow-text-align-w 0.05 --text-embed-dim 128 \
     --ae-accum-steps 2 --flow-accum-steps 2 --grad-clip 1.0 \
     --flow-cache-latents --flow-cache-batch 32 \
     --ae-steps 40 --flow-steps 40 --sample-grid-out runs/image_manifest_grid.ppm \

@@ -117,6 +117,9 @@ def payload(args):
                      f"--ae-grad-w {args.image_ae_grad_w} "
                      f"--ae-ms-w {args.image_ae_ms_w} "
                      f"--ae-latent-reg-w {args.image_ae_latent_reg_w} "
+                     f"--image-text-align-w {args.image_text_align_w} "
+                     f"--flow-text-align-w {args.image_flow_text_align_w} "
+                     f"--text-embed-dim {args.image_text_embed_dim} "
                      f"--cond-mode {args.image_cond_mode} "
                      f"--text-cond-dim {args.image_text_cond_dim} "
                      f"--image-manifest {shlex_quote(args.image_manifest)} "
@@ -125,6 +128,7 @@ def payload(args):
                      f"--image-max-records {args.image_max_records} "
                      f"--caption-vocab-max {args.image_caption_vocab_max} "
                      f"--caption-max-len {args.image_caption_max_len} "
+                     f"--caption-cond-source {args.image_caption_cond_source} "
                      f"--cond-drop {args.image_cond_drop} "
                      f"--cfg-scale {args.image_cfg_scale} "
                      f"--cfg-interval {shlex_quote(args.image_cfg_interval)} "
@@ -465,6 +469,15 @@ def main():
     ap.add_argument("--image-ae-latent-reg-w", type=float, default=0.0,
                     dest="image_ae_latent_reg_w",
                     help="latent L2 regularization weight during AE training")
+    ap.add_argument("--image-text-align-w", type=float, default=0.0,
+                    dest="image_text_align_w",
+                    help="contrastive image-latent/caption alignment weight during AE training")
+    ap.add_argument("--image-flow-text-align-w", type=float, default=0.0,
+                    dest="image_flow_text_align_w",
+                    help="contrastive caption alignment weight on predicted flow endpoints")
+    ap.add_argument("--image-text-embed-dim", type=int, default=128,
+                    dest="image_text_embed_dim",
+                    help="shared image/text embedding width for manifest alignment")
     ap.add_argument("--image-cond-mode", default="facts", choices=("facts", "text"),
                     dest="image_cond_mode",
                     help="latent image conditioning source: canonical facts or learned text prompts")
@@ -492,6 +505,10 @@ def main():
     ap.add_argument("--image-caption-max-len", type=int, default=64,
                     dest="image_caption_max_len",
                     help="maximum caption tokens for image manifest training")
+    ap.add_argument("--image-caption-cond-source", default="tokens",
+                    choices=("tokens", "embedding", "auto"),
+                    dest="image_caption_cond_source",
+                    help="caption conditioning source for image manifests")
     ap.add_argument("--image-prompt-templates", default="", dest="image_prompt_templates",
                     help="semicolon-separated prompt templates using {color} and {shape}")
     ap.add_argument("--image-cond-drop", type=float, default=0.0, dest="image_cond_drop",

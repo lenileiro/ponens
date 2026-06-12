@@ -287,8 +287,10 @@ python -m thinking.image_data --manifest data/images/train.jsonl \
     --report-out runs/image_manifest_report.json
 python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --image-manifest data/images/train_clean.jsonl --image-root data/images \
+    --caption-cond-source auto \
     --size 64 --ae-arch residual --latent-downsample 8 --latent-max-tokens 128 \
     --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 \
+    --image-text-align-w 0.1 --flow-text-align-w 0.05 --text-embed-dim 128 \
     --ae-accum-steps 2 --flow-accum-steps 2 --grad-clip 1.0 \
     --flow-cache-latents --flow-cache-batch 32 \
     --ae-steps 400 --flow-steps 400 --sample-steps 8 \
@@ -326,9 +328,12 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
 RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-latent-arch mmdit \
     --image-cond-mode text --image-dit-head-width-mult 2 \
     --image-manifest data/images/train_clean.jsonl --image-root data/images \
+    --image-caption-cond-source auto \
     --image-size 128 --image-ae-arch residual --image-latent-downsample 8 \
     --image-latent-max-tokens 256 \
     --image-ae-recon-loss hybrid --image-ae-grad-w 0.1 --image-ae-ms-w 0.1 \
+    --image-text-align-w 0.1 --image-flow-text-align-w 0.05 \
+    --image-text-embed-dim 128 \
     --image-ae-accum-steps 2 --image-flow-accum-steps 2 \
     --image-train-precision bf16 --image-grad-clip 1.0 \
     --image-flow-cache-latents --image-flow-cache-batch 64 \
@@ -621,6 +626,20 @@ uses the cache for latent normalization stats, and trains the flow from cached l
 reloading images and re-running `ae.encode` every microstep. This follows the latent-diffusion
 separation between compression and generative-model training while keeping the cache opt-in and
 auditable via `flow_cache_*` report/checkpoint fields.
+
+Image-36 adds a generic caption-image alignment objective for real-image manifests.
+`--image-text-align-w` trains a contrastive bridge between AE latents and caption conditions during
+compression, while `--flow-text-align-w` applies the same paired caption signal to predicted clean
+flow endpoints. Eval/checkpoint sweeps now report caption retrieval and generated-caption
+retrieval accuracy when the aligner is present. This gives real-image runs a prompt-alignment
+metric and loss without adding color/shape grammar or renderer-specific labels.
+
+Image-37 adds manifest-level precomputed text embedding conditioning. Rows may now include
+`text_embedding` / `caption_embedding` / `embedding` arrays, and `--caption-cond-source
+tokens|embedding|auto` chooses whether real-image training uses the local token encoder or projects
+those external embeddings into the conditioning stream. This is the hook for CLIP/T5/SigLIP-style
+frozen text features: the model can move toward stronger prompt understanding without baking in a
+specific provider or adding renderer-specific rules.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

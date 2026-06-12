@@ -306,6 +306,69 @@ class PromptConditioner(nn.Module):
         return vec
 
 
+class PrecomputedTextConditioner(nn.Module):
+    """Project external caption embeddings into the model's conditioning space."""
+
+    def __init__(self, input_dim, cond_dim=64, hidden=64):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.cond_dim = int(cond_dim)
+        self.net = nn.Sequential(
+            nn.LayerNorm(self.input_dim),
+            nn.Linear(self.input_dim, int(hidden)),
+            nn.GELU(),
+            nn.Linear(int(hidden), self.cond_dim),
+        )
+
+    def forward(self, embeddings, return_tokens=False):
+        vec = self.net(embeddings.float())
+        if return_tokens:
+            mask = torch.zeros((vec.shape[0], 1), dtype=torch.bool, device=vec.device)
+            return {"vec": vec, "tokens": vec[:, None, :], "mask": mask}
+        return vec
+
+
+class ImageTextAligner(nn.Module):
+    """Contrastive bridge between image latents and caption conditions.
+
+    This is the manifest-data equivalent of the synthetic fact heads: it gives real-image runs a
+    generic paired image/text semantic signal without renderer-specific labels.
+    """
+
+    def __init__(self, latent_ch=16, cond_dim=64, hidden=64, embed_dim=128,
+                 temperature=0.07):
+        super().__init__()
+        self.embed_dim = int(embed_dim)
+        self.image = nn.Sequential(
+            nn.LayerNorm(int(latent_ch)),
+            nn.Linear(int(latent_ch), int(hidden)),
+            nn.GELU(),
+            nn.Linear(int(hidden), self.embed_dim),
+        )
+        self.text = nn.Sequential(
+            nn.LayerNorm(int(cond_dim)),
+            nn.Linear(int(cond_dim), int(hidden)),
+            nn.GELU(),
+            nn.Linear(int(hidden), self.embed_dim),
+        )
+        temp = max(float(temperature), 1.0e-4)
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / temp)))
+
+    def encode_image(self, z):
+        pooled = z.float().mean(dim=(2, 3))
+        return F.normalize(self.image(pooled), dim=-1)
+
+    def encode_text(self, cond):
+        vec = condition_vector(cond).float()
+        return F.normalize(self.text(vec), dim=-1)
+
+    def forward(self, z, cond):
+        return self.encode_image(z), self.encode_text(cond)
+
+    def scale(self):
+        return self.logit_scale.exp().clamp(max=100.0)
+
+
 class LatentFlowNet(nn.Module):
     """Velocity field v_theta(z_t, t, canonical_facts)."""
 
@@ -645,6 +708,14 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
+def attach_text_aligner(flow, text_aligner):
+    # Keep the aligner available for eval without registering it as part of flow.state_dict().
+    if hasattr(flow, "_modules"):
+        flow._modules.pop("text_aligner", None)
+    flow.__dict__["text_aligner"] = text_aligner
+    return flow
+
+
 def _parse_number_list(s, cast=float):
     if isinstance(s, (tuple, list)):
         return tuple(cast(x) for x in s)
@@ -890,7 +961,8 @@ def estimate_latent_stats_tensor(latents, n=512, seed=123, mode="none", eps=1.0e
 
 @torch.no_grad()
 def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_records=0,
-                             batch=64, seed=0, size=32, device=DEV, precision="fp32"):
+                             batch=64, seed=0, size=32, device=DEV, precision="fp32",
+                             cond_source="tokens"):
     rows = list(records)
     if not rows:
         raise ValueError("cannot build latent cache from empty records")
@@ -898,7 +970,9 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
     if max_records and int(max_records) < len(rows):
         chosen_idx = rng.choice(len(rows), size=int(max_records), replace=False)
         rows = [rows[int(i)] for i in chosen_idx]
-    latents, captions = [], []
+    if cond_source == "embedding":
+        infer_text_embedding_dim(rows)
+    latents, captions, embeddings = [], [], []
     ae.eval()
     for start in range(0, len(rows), max(1, int(batch))):
         chunk = rows[start:start + max(1, int(batch))]
@@ -910,15 +984,27 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             z = ae.encode(x)
         latents.append(z.detach().float().cpu())
         captions.extend(rec.caption for rec in chunk)
+        if cond_source == "embedding":
+            embeddings.append(record_text_embedding_tensor(chunk, device="cpu"))
     cache = {
         "latents": torch.cat(latents, dim=0).contiguous(),
         "captions": captions,
-        "caption_ids": caption_ids(captions, prompt_vocab, max_len=caption_max_len,
-                                   device="cpu"),
+        "caption_ids": (
+            caption_ids(captions, prompt_vocab, max_len=caption_max_len, device="cpu")
+            if cond_source == "tokens" else None
+        ),
+        "text_embeddings": (
+            torch.cat(embeddings, dim=0).contiguous() if embeddings else None
+        ),
+        "cond_source": cond_source,
         "records": len(rows),
         "latent_shape": tuple(int(x) for x in latents[0].shape[1:]),
         "bytes": int(sum(z.numel() * z.element_size() for z in latents)),
     }
+    if cache["text_embeddings"] is not None:
+        cache["bytes"] += int(
+            cache["text_embeddings"].numel() * cache["text_embeddings"].element_size()
+        )
     return cache
 
 
@@ -1053,6 +1139,44 @@ def flow_uses_cond_tokens(flow):
 
 def condition_vector(cond):
     return cond["vec"] if isinstance(cond, dict) else cond
+
+
+def image_text_alignment_loss(aligner, z, cond, prefix="caption_align", mask=None):
+    if aligner is None:
+        zero = z.sum() * 0.0
+        return zero, {}
+    img_emb, txt_emb = aligner(z, cond)
+    if mask is not None:
+        mask = mask.to(device=img_emb.device, dtype=torch.bool).flatten()
+        img_emb = img_emb[mask]
+        txt_emb = txt_emb[mask]
+    n = int(img_emb.shape[0])
+    if n <= 0:
+        zero = z.sum() * 0.0 + condition_vector(cond).sum() * 0.0
+        return zero, {
+            f"{prefix}_loss": zero.detach(),
+            f"{prefix}_i2t_acc": zero.detach(),
+            f"{prefix}_t2i_acc": zero.detach(),
+            f"{prefix}_n": torch.tensor(0.0, device=z.device),
+        }
+    logits = aligner.scale().to(img_emb.dtype) * img_emb.matmul(txt_emb.t())
+    targets = torch.arange(n, device=logits.device)
+    loss = 0.5 * (
+        F.cross_entropy(logits, targets) + F.cross_entropy(logits.t(), targets)
+    )
+    i2t = logits.argmax(dim=1).eq(targets).float().mean()
+    t2i = logits.argmax(dim=0).eq(targets).float().mean()
+    diag = logits.diag().mean()
+    offdiag = ((logits.sum() - logits.diag().sum()) / max(1, n * n - n)
+               if n > 1 else logits.diag().mean())
+    return loss, {
+        f"{prefix}_loss": loss.detach(),
+        f"{prefix}_i2t_acc": i2t.detach(),
+        f"{prefix}_t2i_acc": t2i.detach(),
+        f"{prefix}_diag_logit": diag.detach(),
+        f"{prefix}_offdiag_logit": offdiag.detach(),
+        f"{prefix}_n": torch.tensor(float(n), device=z.device),
+    }
 
 
 def condition_batch(cond):
@@ -1388,7 +1512,8 @@ def latent_factor_orthogonality_loss(z, cond, eps=1.0e-6):
 
 def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
                        semantic_cond=None, time_sampling="uniform", time_logit_mean=0.0,
-                       time_logit_std=1.0, latent_stats=None, consistency_w=0.0):
+                       time_logit_std=1.0, latent_stats=None, consistency_w=0.0,
+                       text_aligner=None, text_align_w=0.0):
     latent_stats = flow_latent_stats(flow) if latent_stats is None else latent_stats
     z1_model = normalize_latent(z1, latent_stats)
     x0 = torch.randn_like(z1_model)
@@ -1418,6 +1543,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
         )
         total = total + float(consistency_w) * consistency
         parts["endpoint_consistency_mse"] = consistency.detach()
+    z_clean = None
     if ae is not None and semantic_w > 0.0:
         z_clean = denormalize_latent(zt + (1.0 - t) * pred, latent_stats)
         sem_cond = cond if semantic_cond is None else semantic_cond
@@ -1427,6 +1553,15 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
         total = total + semantic_w * semantic
         parts["semantic_endpoint_ce"] = semantic.detach()
         parts.update(sem_parts)
+    if text_aligner is not None and text_align_w > 0.0:
+        if z_clean is None:
+            z_clean = denormalize_latent(zt + (1.0 - t) * pred, latent_stats)
+        cond_vec = condition_vector(cond_model)
+        keep = cond_vec.detach().abs().sum(dim=1).gt(0)
+        text_align, text_parts = image_text_alignment_loss(
+            text_aligner, z_clean, cond_model, prefix="flow_caption_align", mask=keep)
+        total = total + float(text_align_w) * text_align
+        parts.update(text_parts)
     return total, parts
 
 
@@ -1495,6 +1630,64 @@ def caption_condition_ids(ids, conditioner, device=DEV, return_tokens=False):
     if conditioner is None:
         raise ValueError("caption id conditioning requires conditioner")
     return conditioner(ids.to(device=device), return_tokens=return_tokens)
+
+
+def infer_text_embedding_dim(records):
+    dims = {len(rec.text_embedding) for rec in records if rec.text_embedding is not None}
+    if not dims:
+        return 0
+    if len(dims) != 1:
+        raise ValueError(f"manifest text embeddings have mixed dimensions: {sorted(dims)}")
+    dim = next(iter(dims))
+    missing = sum(1 for rec in records if rec.text_embedding is None)
+    if missing:
+        raise ValueError(f"{missing} manifest records are missing text embeddings")
+    return int(dim)
+
+
+def resolve_caption_cond_source(source, records):
+    source = str(source or "tokens")
+    if source not in ("tokens", "embedding", "auto"):
+        raise ValueError(f"unknown caption condition source {source!r}")
+    if source == "tokens":
+        return "tokens", 0
+    try:
+        dim = infer_text_embedding_dim(records)
+    except ValueError:
+        if source == "auto":
+            return "tokens", 0
+        raise
+    if dim <= 0:
+        if source == "embedding":
+            raise ValueError("caption condition source 'embedding' requires text_embedding rows")
+        return "tokens", 0
+    return "embedding", dim
+
+
+def record_text_embedding_tensor(records, device=DEV):
+    dim = infer_text_embedding_dim(records)
+    if dim <= 0:
+        raise ValueError("records do not have text embeddings")
+    return torch.tensor([rec.text_embedding for rec in records], dtype=torch.float32,
+                        device=device)
+
+
+def caption_record_condition(captions, records, conditioner, vocab, source="tokens",
+                             max_len=64, device=DEV, return_tokens=False):
+    if source == "embedding":
+        embs = record_text_embedding_tensor(records, device=device)
+        return conditioner(embs, return_tokens=return_tokens)
+    return caption_condition(captions, conditioner, vocab, max_len=max_len, device=device,
+                             return_tokens=return_tokens)
+
+
+def cached_caption_condition(cache, idx, conditioner, source="tokens", device=DEV,
+                             return_tokens=False):
+    if source == "embedding":
+        embs = cache["text_embeddings"][idx].to(device=device)
+        return conditioner(embs, return_tokens=return_tokens)
+    ids = cache["caption_ids"][idx]
+    return caption_condition_ids(ids, conditioner, device=device, return_tokens=return_tokens)
 
 
 @torch.no_grad()
@@ -1674,7 +1867,7 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
                              prompt_vocab=None, caption_max_len=64, cfg_scale=1.0,
                              sample_steps=4, sample_method="euler",
                              cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
-                             samples=16, seed=0):
+                             samples=16, seed=0, caption_cond_source="tokens"):
     ae.eval()
     flow.eval()
     rng = np.random.default_rng(seed)
@@ -1682,8 +1875,9 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
     idx = rng.choice(len(records), size=n, replace=len(records) < n)
     chosen = [records[int(i)] for i in idx]
     captions = [rec.caption for rec in chosen]
-    cond = caption_condition(captions, conditioner, prompt_vocab, max_len=caption_max_len,
-                             device=device, return_tokens=flow_uses_cond_tokens(flow))
+    cond = caption_record_condition(
+        captions, chosen, conditioner, prompt_vocab, source=caption_cond_source,
+        max_len=caption_max_len, device=device, return_tokens=flow_uses_cond_tokens(flow))
     sample = sample_images(ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            sample_method=sample_method, cfg_interval=cfg_interval)
@@ -1696,6 +1890,7 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
         "sample_grid_sample_method": sample_method,
         "sample_grid_cfg_interval": list(validate_guidance_interval(cfg_interval)),
         "sample_grid_cond_mode": "caption",
+        "sample_grid_caption_cond_source": caption_cond_source,
         "sample_grid_seed": int(seed),
         "sample_grid_caption_count": int(n),
         "sample_grid_captions": captions[:min(5, len(captions))],
@@ -1864,22 +2059,32 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
 def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32, device=DEV,
                            conditioner=None, prompt_vocab=None, caption_max_len=64,
                            cfg_scale=1.0, sample_steps=4, sample_method="euler",
-                           cfg_interval=DEFAULT_GUIDANCE_INTERVAL):
+                           cfg_interval=DEFAULT_GUIDANCE_INTERVAL, text_aligner=None,
+                           caption_cond_source="tokens"):
     rng = np.random.default_rng(seed)
     ae.eval()
     flow.eval()
     recon_losses, flow_losses = [], []
     endpoint_mses, endpoint_consistency_mses, endpoint_time_gaps = [], [], []
     latent_means, latent_stds = [], []
+    align_losses, align_i2t, align_t2i = [], [], []
     total = 0
     while total < n:
         b = min(batch, n - total)
-        x, captions = sample_image_text_batch(records, rng, batch=b, size=size, device=device)
+        x, captions, chosen_records = sample_image_text_batch(
+            records, rng, batch=b, size=size, device=device, return_records=True)
         out = ae(x)
         z = out["latent"]
         recon_losses.append(float(F.mse_loss(out["recon"], x).detach().cpu()))
-        cond = caption_condition(captions, conditioner, prompt_vocab, max_len=caption_max_len,
-                                 device=device, return_tokens=flow_uses_cond_tokens(flow))
+        cond = caption_record_condition(
+            captions, chosen_records, conditioner, prompt_vocab, source=caption_cond_source,
+            max_len=caption_max_len, device=device, return_tokens=flow_uses_cond_tokens(flow))
+        if text_aligner is not None:
+            _align_loss, align_parts = image_text_alignment_loss(
+                text_aligner, z, cond, prefix="caption_retrieval")
+            align_losses.append(float(align_parts["caption_retrieval_loss"].detach().cpu()))
+            align_i2t.append(float(align_parts["caption_retrieval_i2t_acc"].detach().cpu()))
+            align_t2i.append(float(align_parts["caption_retrieval_t2i_acc"].detach().cpu()))
         flow_losses.append(float(latent_flow_loss(flow, z, cond).detach().cpu()))
         endpoint_metrics = flow_endpoint_metrics(flow, z, cond)
         endpoint_mses.append(endpoint_metrics["latent_endpoint_mse"])
@@ -1889,12 +2094,12 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         latent_stds.append(float(z.std().detach().cpu()))
         total += b
 
-    sample_x, sample_captions = sample_image_text_batch(
+    sample_x, sample_captions, sample_records = sample_image_text_batch(
         records, np.random.default_rng(seed + 17), batch=min(batch, max(1, sample_steps)),
-        size=size, device=device)
-    sample_cond = caption_condition(sample_captions, conditioner, prompt_vocab,
-                                    max_len=caption_max_len, device=device,
-                                    return_tokens=flow_uses_cond_tokens(flow))
+        size=size, device=device, return_records=True)
+    sample_cond = caption_record_condition(
+        sample_captions, sample_records, conditioner, prompt_vocab, source=caption_cond_source,
+        max_len=caption_max_len, device=device, return_tokens=flow_uses_cond_tokens(flow))
     sample = sample_images(ae, flow, sample_cond,
                            latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
@@ -1916,9 +2121,30 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         "sample_steps": int(sample_steps),
         "sample_method": sample_method,
         "cond_mode": "text",
+        "caption_cond_source": caption_cond_source,
         "data_mode": "image_manifest",
         "eval_captions": sample_captions[:min(3, len(sample_captions))],
     }
+    if text_aligner is not None:
+        sample_z = ae.encode(sample)
+        _sample_align_loss, sample_align_parts = image_text_alignment_loss(
+            text_aligner, sample_z, sample_cond, prefix="generated_caption_retrieval")
+        if align_losses:
+            report.update({
+                "caption_retrieval_loss": float(np.mean(align_losses)),
+                "caption_retrieval_i2t_acc": float(np.mean(align_i2t)),
+                "caption_retrieval_t2i_acc": float(np.mean(align_t2i)),
+            })
+        report.update({
+            "generated_caption_retrieval_loss": float(
+                sample_align_parts["generated_caption_retrieval_loss"].detach().cpu()),
+            "generated_caption_retrieval_i2t_acc": float(
+                sample_align_parts["generated_caption_retrieval_i2t_acc"].detach().cpu()),
+            "generated_caption_retrieval_t2i_acc": float(
+                sample_align_parts["generated_caption_retrieval_t2i_acc"].detach().cpu()),
+            "generated_caption_retrieval_n": int(
+                sample_align_parts["generated_caption_retrieval_n"].detach().cpu()),
+        })
     report.update(summarize_records(records))
     return report
 
@@ -1981,21 +2207,41 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                                        report.get("dit_head_width_mult", 1)))
     cond_mode = ckpt.get("cond_mode", report.get("cond_mode", "facts"))
     cond_dim = int(ckpt.get("cond_dim", report.get("cond_dim", len(FACT_VOCAB))))
+    caption_cond_source = ckpt.get("caption_cond_source",
+                                   report.get("caption_cond_source", "tokens"))
+    text_embedding_in_dim = int(ckpt.get(
+        "text_embedding_in_dim", report.get("text_embedding_in_dim", 0)) or 0)
+    text_embed_dim = int(ckpt.get("text_embed_dim", report.get("text_embed_dim", 128)) or 128)
     caption_max_len = int(ckpt.get("caption_max_len", report.get("caption_max_len", 32)) or 32)
     prompt_templates = tuple(ckpt.get("prompt_templates", report.get("prompt_templates", []))
                              or DEFAULT_PROMPT_TEMPLATES)
     prompt_vocab = ckpt.get("prompt_vocab") or None
     conditioner = None
     if cond_mode == "text":
-        if prompt_vocab is None:
+        if caption_cond_source == "embedding":
+            if text_embedding_in_dim <= 0:
+                raise ValueError("embedding-conditioned checkpoint is missing text_embedding_in_dim")
+            conditioner = PrecomputedTextConditioner(
+                text_embedding_in_dim, cond_dim=cond_dim, hidden=hidden).to(device)
+        else:
+            if prompt_vocab is None:
+                prompt_vocab = build_prompt_vocab(prompt_templates)
+            conditioner = PromptConditioner(len(prompt_vocab), cond_dim=cond_dim,
+                                            hidden=hidden, max_len=caption_max_len).to(device)
+        if caption_cond_source != "embedding" and prompt_vocab is None:
             prompt_vocab = build_prompt_vocab(prompt_templates)
-        conditioner = PromptConditioner(len(prompt_vocab), cond_dim=cond_dim,
-                                        hidden=hidden, max_len=caption_max_len).to(device)
         cond_state = ckpt["conditioner_state_dict"]
         if prefer_ema and ckpt.get("conditioner_ema_state_dict"):
             cond_state = ckpt["conditioner_ema_state_dict"]
         conditioner.load_state_dict(cond_state)
         conditioner.eval()
+    text_aligner = None
+    if ckpt.get("text_aligner_state_dict"):
+        text_aligner = ImageTextAligner(
+            latent_ch=latent_ch, cond_dim=cond_dim, hidden=hidden,
+            embed_dim=text_embed_dim).to(device)
+        text_aligner.load_state_dict(ckpt["text_aligner_state_dict"])
+        text_aligner.eval()
     ae = make_autoencoder(ae_arch=ae_arch, latent_ch=latent_ch, hidden=hidden,
                           latent_downsample=latent_downsample,
                           ae_res_blocks=ae_res_blocks).to(device)
@@ -2014,6 +2260,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     if ema_loaded:
         flow_state = ckpt["flow_ema_state_dict"]
     flow_load = load_flow_state(flow, flow_state)
+    attach_text_aligner(flow, text_aligner)
     ae.eval()
     flow.eval()
     return ae, flow, conditioner, prompt_vocab, prompt_templates, {
@@ -2051,7 +2298,15 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "image_root": ckpt.get("image_root", report.get("image_root", "")),
         "image_split": ckpt.get("image_split", report.get("image_split", "")),
         "caption_max_len": caption_max_len,
+        "caption_cond_source": caption_cond_source,
+        "text_embedding_in_dim": int(text_embedding_in_dim),
         "cond_dim": cond_dim,
+        "text_aligner": text_aligner is not None,
+        "text_embed_dim": text_embed_dim,
+        "image_text_align_w": float(ckpt.get(
+            "image_text_align_w", report.get("image_text_align_w", 0.0))),
+        "flow_text_align_w": float(ckpt.get(
+            "flow_text_align_w", report.get("flow_text_align_w", 0.0))),
     }
 
 
@@ -2097,7 +2352,8 @@ def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
 def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                        n=128, batch=64, seed=10, size=32, device=DEV, conditioner=None,
                        prompt_vocab=None, caption_max_len=64, sample_method="euler",
-                       sample_methods=None, cfg_interval=DEFAULT_GUIDANCE_INTERVAL):
+                       sample_methods=None, cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
+                       text_aligner=None, caption_cond_source="tokens"):
     if sample_methods is None:
         sample_methods = (sample_method,)
     rows = []
@@ -2109,7 +2365,8 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                     device=device, conditioner=conditioner, prompt_vocab=prompt_vocab,
                     caption_max_len=caption_max_len, cfg_scale=float(cfg_scale),
                     sample_steps=int(sample_steps), sample_method=method,
-                    cfg_interval=cfg_interval)
+                    cfg_interval=cfg_interval, text_aligner=text_aligner,
+                    caption_cond_source=caption_cond_source)
                 row["semantic_guidance_w"] = 0.0
                 row["semantic_guidance_mode"] = "none"
                 row["semantic_guidance_interval"] = list(DEFAULT_GUIDANCE_INTERVAL)
@@ -2127,6 +2384,12 @@ SWEEP_METRICS = (
     "sample_roundtrip_both_acc",
     "conditional_sample_mse",
     "caption_sample_mse",
+    "caption_retrieval_loss",
+    "caption_retrieval_i2t_acc",
+    "caption_retrieval_t2i_acc",
+    "generated_caption_retrieval_loss",
+    "generated_caption_retrieval_i2t_acc",
+    "generated_caption_retrieval_t2i_acc",
     "sample_center_target_mse",
     "recon_mse",
     "latent_velocity_mse",
@@ -2147,6 +2410,8 @@ def report_selection_key(report):
         float(report.get("sample_roundtrip_both_acc", 0.0)),
         float(report.get("sample_roundtrip_shape_acc", 0.0)),
         float(report.get("sample_roundtrip_color_acc", 0.0)),
+        float(report.get("generated_caption_retrieval_i2t_acc", 0.0)),
+        float(report.get("caption_retrieval_i2t_acc", 0.0)),
         -float(conditional_mse),
         -float(center_mse),
         -float(report.get("latent_velocity_mse", inf)),
@@ -2163,6 +2428,8 @@ def aggregate_selection_key(report):
         float(report.get("sample_roundtrip_both_acc_mean", 0.0)),
         float(report.get("sample_roundtrip_shape_acc_mean", 0.0)),
         float(report.get("sample_roundtrip_color_acc_mean", 0.0)),
+        float(report.get("generated_caption_retrieval_i2t_acc_mean", 0.0)),
+        float(report.get("caption_retrieval_i2t_acc_mean", 0.0)),
         -float(conditional_mse),
         -float(center_mse),
         -float(report.get("latent_velocity_mse_mean", inf)),
@@ -2186,6 +2453,10 @@ def eval_report_summary(report):
         "sample_roundtrip_both_acc",
         "conditional_sample_mse",
         "caption_sample_mse",
+        "caption_retrieval_i2t_acc",
+        "caption_retrieval_t2i_acc",
+        "generated_caption_retrieval_i2t_acc",
+        "generated_caption_retrieval_t2i_acc",
         "sample_center_target_mse",
         "recon_mse",
         "latent_velocity_mse",
@@ -2304,7 +2575,9 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         conditioner=conditioner, prompt_vocab=prompt_vocab,
                         caption_max_len=meta["caption_max_len"],
                         sample_method=sample_method, sample_methods=sample_methods,
-                        cfg_interval=cfg_interval):
+                        cfg_interval=cfg_interval,
+                        text_aligner=getattr(flow, "text_aligner", None),
+                        caption_cond_source=meta["caption_cond_source"]):
                     row["eval_seed"] = int(eval_seed)
                     row["checkpoint_weight_mode"] = actual_mode
                     rows.append(row)
@@ -2439,12 +2712,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       ae_arch="semantic", latent_downsample=4, ae_res_blocks=1,
                       ae_recon_loss="mse", ae_grad_w=0.0, ae_ms_w=0.0,
                       ae_latent_reg_w=0.0,
+                      image_text_align_w=0.0, flow_text_align_w=0.0, text_embed_dim=128,
                       sample_steps=4, roundtrip_samples=1, flow_semantic_w=0.0,
                       flow_consistency_w=0.0,
                       cond_mode="facts", text_cond_dim=0,
                       image_manifest="", image_root="", image_split="train",
                       image_min_aesthetic=None, image_max_records=0,
                       caption_vocab_max=8192, caption_max_len=64,
+                      caption_cond_source="tokens",
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0,
                       latent_normalize="none", latent_stat_samples=512,
@@ -2458,7 +2733,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       train_precision="fp32", ae_accum_steps=1, flow_accum_steps=1,
                       grad_clip=0.0,
                       flow_cache_latents=False, flow_cache_records=0, flow_cache_batch=64,
-                      return_conditioner=False, return_ema=False):
+                      return_conditioner=False, return_ema=False, return_aligner=False):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     if cond_mode not in ("facts", "text"):
@@ -2474,6 +2749,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         image_records = read_image_manifest(
             image_manifest, root=image_root, split=image_split,
             min_aesthetic=image_min_aesthetic, max_records=image_max_records)
+        caption_cond_source, text_embedding_in_dim = resolve_caption_cond_source(
+            caption_cond_source, image_records)
+    elif image_text_align_w > 0.0 or flow_text_align_w > 0.0:
+        raise ValueError("image/text alignment losses require image_manifest training")
+    else:
+        caption_cond_source, text_embedding_in_dim = "tokens", 0
     if time_sampling not in ("uniform", "logit-normal"):
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
     if latent_normalize not in ("none", "global", "channel"):
@@ -2482,6 +2763,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError(f"unknown AE reconstruction loss {ae_recon_loss!r}")
     if ae_grad_w < 0.0 or ae_ms_w < 0.0 or ae_latent_reg_w < 0.0:
         raise ValueError("AE reconstruction weights must be non-negative")
+    if image_text_align_w < 0.0 or flow_text_align_w < 0.0:
+        raise ValueError("image/text alignment weights must be non-negative")
+    if text_embed_dim <= 0:
+        raise ValueError("text_embed_dim must be positive")
     amp_cfg = amp_config(device, train_precision)
     ae_accum_steps = max(1, int(ae_accum_steps))
     flow_accum_steps = max(1, int(flow_accum_steps))
@@ -2517,20 +2802,31 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     prompt_vocab = None
     if cond_mode == "text":
         prompt_vocab = (
-            build_caption_vocab(image_records, max_vocab=caption_vocab_max)
-            if image_records is not None else build_prompt_vocab(prompt_templates)
+            None if image_records is not None and caption_cond_source == "embedding"
+            else build_caption_vocab(image_records, max_vocab=caption_vocab_max)
+            if image_records is not None
+            else build_prompt_vocab(prompt_templates)
         )
     cond_dim = len(FACT_VOCAB)
     conditioner = None
     if cond_mode == "text":
         cond_dim = int(text_cond_dim or hidden)
-        conditioner = PromptConditioner(len(prompt_vocab), cond_dim=cond_dim,
-                                        hidden=hidden,
-                                        max_len=caption_max_len if image_records is not None
-                                        else 32).to(device)
+        if image_records is not None and caption_cond_source == "embedding":
+            conditioner = PrecomputedTextConditioner(
+                text_embedding_in_dim, cond_dim=cond_dim, hidden=hidden).to(device)
+        else:
+            conditioner = PromptConditioner(len(prompt_vocab), cond_dim=cond_dim,
+                                            hidden=hidden,
+                                            max_len=caption_max_len if image_records is not None
+                                            else 32).to(device)
     ae = make_autoencoder(ae_arch=ae_arch, latent_ch=latent_ch, hidden=hidden,
                           latent_downsample=latent_downsample,
                           ae_res_blocks=ae_res_blocks).to(device)
+    text_aligner = None
+    if image_records is not None and (image_text_align_w > 0.0 or flow_text_align_w > 0.0):
+        text_aligner = ImageTextAligner(
+            latent_ch=latent_ch, cond_dim=cond_dim, hidden=hidden,
+            embed_dim=text_embed_dim).to(device)
     latent_shape = ae_latent_shape(ae, size)
     latent_tokens = latent_shape[1] * latent_shape[2]
     if flow_arch in ("dit", "crossdit", "mmdit") and latent_tokens > int(latent_max_tokens):
@@ -2542,9 +2838,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                      dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim,
                      dit_head_width_mult=dit_head_width_mult,
                      latent_max_tokens=latent_max_tokens).to(device)
-    opt_ae = torch.optim.AdamW(ae.parameters(), lr=lr, weight_decay=0.01)
+    attach_text_aligner(flow, text_aligner)
+    ae_params = list(ae.parameters())
+    if text_aligner is not None and image_text_align_w > 0.0:
+        ae_params += list(conditioner.parameters()) + list(text_aligner.parameters())
+    opt_ae = torch.optim.AdamW(ae_params, lr=lr, weight_decay=0.01)
     scaler = amp_grad_scaler(device, train_precision)
     ae.train()
+    if text_aligner is not None:
+        text_aligner.train()
     last_ae = {}
     for _ in range(ae_steps):
         opt_ae.zero_grad(set_to_none=True)
@@ -2552,8 +2854,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             if image_records is None:
                 x, fact_cond, yc, ys = _batch(batch, rng, size=size, device=device)
             else:
-                x, _captions = sample_image_text_batch(
-                    image_records, rng, batch=batch, size=size, device=device)
+                x, captions, chosen_records = sample_image_text_batch(
+                    image_records, rng, batch=batch, size=size, device=device,
+                    return_records=True)
             with amp_autocast(device, train_precision):
                 out = ae(x)
                 if image_records is None:
@@ -2565,6 +2868,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                         out["recon"], x, mode=ae_recon_loss, grad_w=ae_grad_w,
                         ms_w=ae_ms_w, latent=out.get("latent"),
                         latent_reg_w=ae_latent_reg_w)
+                    if text_aligner is not None and image_text_align_w > 0.0:
+                        cond_vec = caption_record_condition(
+                            captions, chosen_records, conditioner, prompt_vocab,
+                            source=caption_cond_source, max_len=caption_max_len,
+                            device=device, return_tokens=False)
+                        align_loss, align_parts = image_text_alignment_loss(
+                            text_aligner, out["latent"], cond_vec, prefix="caption_align")
+                        loss = loss + float(image_text_align_w) * align_loss
+                        parts.update(align_parts)
                 if image_records is None and ae_intervention_w > 0.0:
                     intervention, intervention_parts = latent_intervention_training_loss(
                         ae, out["latent"], fact_cond)
@@ -2581,13 +2893,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             last_ae["total_loss"] = float(loss.detach().cpu())
         if grad_clip > 0.0:
             scaler.unscale_(opt_ae)
-            grad_norm = torch.nn.utils.clip_grad_norm_(ae.parameters(), float(grad_clip))
+            grad_norm = torch.nn.utils.clip_grad_norm_(ae_params, float(grad_clip))
             last_ae["grad_norm"] = float(grad_norm.detach().cpu())
         scaler.step(opt_ae)
         scaler.update()
 
     flow_params = list(flow.parameters()) + ([] if conditioner is None
                                              else list(conditioner.parameters()))
+    if text_aligner is not None and flow_text_align_w > 0.0:
+        flow_params += list(text_aligner.parameters())
     opt_flow = torch.optim.AdamW(flow_params, lr=lr, weight_decay=0.01)
     ae.eval()
     for p in ae.parameters():
@@ -2597,7 +2911,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         flow_cache = build_image_latent_cache(
             ae, image_records, prompt_vocab, caption_max_len=caption_max_len,
             max_records=flow_cache_records, batch=flow_cache_batch, seed=seed + 211,
-            size=size, device=device, precision=train_precision)
+            size=size, device=device, precision=train_precision,
+            cond_source=caption_cond_source)
     if image_records is None:
         latent_stats = estimate_latent_stats(
             ae, n=latent_stat_samples, batch=batch, seed=seed + 97, size=size, device=device,
@@ -2614,6 +2929,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow.train()
     if conditioner is not None:
         conditioner.train()
+    if text_aligner is not None:
+        text_aligner.train()
     last_flow = {}
     flow_ema = clone_state_dict(flow) if flow_ema_decay > 0.0 else None
     conditioner_ema = (clone_state_dict(conditioner)
@@ -2627,10 +2944,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 idx_np = rng.integers(0, int(flow_cache["records"]), size=int(batch))
                 idx = torch.tensor(idx_np, dtype=torch.long)
                 z1 = flow_cache["latents"][idx].to(device=device)
-                ids = flow_cache["caption_ids"][idx]
                 fact_cond, specs = None, None
-                cond = caption_condition_ids(
-                    ids, conditioner, device=device, return_tokens=flow_uses_cond_tokens(flow))
+                cond = cached_caption_condition(
+                    flow_cache, idx, conditioner, source=caption_cond_source,
+                    device=device, return_tokens=flow_uses_cond_tokens(flow))
             elif image_records is None:
                 x, fact_cond, _yc, _ys, specs = _batch(batch, rng, size=size, device=device,
                                                        return_specs=True)
@@ -2641,20 +2958,23 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
                     rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
             else:
-                x, captions = sample_image_text_batch(
-                    image_records, rng, batch=batch, size=size, device=device)
+                x, captions, chosen_records = sample_image_text_batch(
+                    image_records, rng, batch=batch, size=size, device=device,
+                    return_records=True)
                 fact_cond, specs = None, None
                 with torch.no_grad(), amp_autocast(device, train_precision):
                     z1 = ae.encode(x)
-                cond = caption_condition(captions, conditioner, prompt_vocab,
-                                         max_len=caption_max_len, device=device,
-                                         return_tokens=flow_uses_cond_tokens(flow))
+                cond = caption_record_condition(
+                    captions, chosen_records, conditioner, prompt_vocab,
+                    source=caption_cond_source, max_len=caption_max_len, device=device,
+                    return_tokens=flow_uses_cond_tokens(flow))
             with amp_autocast(device, train_precision):
                 loss, parts = latent_flow_losses(
                     flow, z1, cond, cond_drop=cond_drop, ae=ae,
                     semantic_w=flow_semantic_w, semantic_cond=fact_cond,
                     time_sampling=time_sampling, time_logit_mean=time_logit_mean,
-                    time_logit_std=time_logit_std, consistency_w=flow_consistency_w)
+                    time_logit_std=time_logit_std, consistency_w=flow_consistency_w,
+                    text_aligner=text_aligner, text_align_w=flow_text_align_w)
                 scaled_loss = loss / float(flow_accum_steps)
             scaler.scale(scaled_loss).backward()
             last_flow = {"total_loss": float(loss.detach().cpu())}
@@ -2675,6 +2995,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
 
     if conditioner is not None:
         conditioner.eval()
+    if text_aligner is not None:
+        text_aligner.eval()
     raw_flow = clone_state_dict(flow)
     raw_conditioner = clone_state_dict(conditioner) if conditioner is not None else None
     requested_eval_weight_mode = "raw" if not eval_with_ema else eval_weight_mode
@@ -2712,7 +3034,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 conditioner=conditioner, prompt_vocab=prompt_vocab,
                 caption_max_len=caption_max_len, cfg_scale=cfg_scale,
                 sample_steps=sample_steps, sample_method=sample_method,
-                cfg_interval=cfg_interval)
+                cfg_interval=cfg_interval, text_aligner=text_aligner,
+                caption_cond_source=caption_cond_source)
         candidate["eval_weight_mode"] = mode
         candidate_reports[mode] = candidate
     selected_eval_weights = max(candidate_reports, key=lambda mode: report_selection_key(
@@ -2732,6 +3055,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_cache_max_records": int(flow_cache_records),
         "flow_cache_batch": int(flow_cache_batch),
         "flow_cache_bytes": int(flow_cache["bytes"]) if flow_cache is not None else 0,
+        "flow_cache_cond_source": (
+            str(flow_cache["cond_source"]) if flow_cache is not None else caption_cond_source
+        ),
         "ae_accum_steps": int(ae_accum_steps),
         "flow_accum_steps": int(flow_accum_steps),
         "ae_effective_batch": int(batch) * int(ae_accum_steps),
@@ -2763,6 +3089,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "ae_grad_w": float(ae_grad_w),
         "ae_ms_w": float(ae_ms_w),
         "ae_latent_reg_w": float(ae_latent_reg_w),
+        "image_text_align_w": float(image_text_align_w),
+        "flow_text_align_w": float(flow_text_align_w),
+        "text_embed_dim": int(text_embed_dim),
+        "text_aligner": text_aligner is not None,
         "ae_intervention_w": float(ae_intervention_w),
         "ae_factor_orth_w": float(ae_factor_orth_w),
         "cond_drop": float(cond_drop),
@@ -2801,6 +3131,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         ),
         "caption_vocab_max": int(caption_vocab_max) if image_records is not None else 0,
         "caption_max_len": int(caption_max_len) if image_records is not None else 0,
+        "caption_cond_source": caption_cond_source if image_records is not None else "",
+        "text_embedding_in_dim": int(text_embedding_in_dim),
         "cond_dim": int(cond_dim),
         "prompt_templates": (
             [] if image_records is not None else list(prompt_templates) if cond_mode == "text"
@@ -2814,9 +3146,16 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     })
     if return_ema:
         if return_conditioner:
+            if return_aligner:
+                return (
+                    ae, flow, conditioner, prompt_vocab, text_aligner, report,
+                    flow_ema, conditioner_ema
+                )
             return ae, flow, conditioner, prompt_vocab, report, flow_ema, conditioner_ema
         return ae, flow, report, flow_ema
     if return_conditioner:
+        if return_aligner:
+            return ae, flow, conditioner, prompt_vocab, text_aligner, report
         return ae, flow, conditioner, prompt_vocab, report
     return ae, flow, report
 
@@ -2996,28 +3335,36 @@ def selftest():
                 f.write(b"P6\n8 8\n255\n")
                 f.write(arr.tobytes())
             rows.append({"image": name, "caption": f"{split} color patch {i}",
-                         "split": split})
+                         "split": split,
+                         "text_embedding": [float(i), float(i + 1), float(i % 2)]})
         with open(manifest, "w", encoding="utf-8") as f:
             for row in rows:
                 f.write(json.dumps(row) + "\n")
-        ae6, flow6, conditioner6, vocab6, report6 = train_latent_flow(
+        ae6, flow6, conditioner6, vocab6, aligner6, report6 = train_latent_flow(
             ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32,
             flow_arch="mmdit", dit_depth=1, dit_heads=2, seed=9,
             device="cpu", cond_mode="text", text_cond_dim=8,
             image_manifest=manifest, image_root=img_dir, image_split="train",
             image_max_records=2, caption_max_len=8, sample_steps=1,
+            caption_cond_source="embedding",
+            image_text_align_w=0.1, flow_text_align_w=0.1, text_embed_dim=12,
             flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
-            intervention_samples=0, return_conditioner=True)
+            intervention_samples=0, return_conditioner=True, return_aligner=True)
         assert report6["data_mode"] == "image_manifest"
+        assert report6["text_aligner"] is True and aligner6 is not None
+        assert "caption_align_i2t_acc" in report6["last_ae"]
+        assert "flow_caption_align_i2t_acc" in report6["last_flow"]
         assert report6["flow_cache_latents"] is True
         assert report6["flow_cache_records"] == 2 and report6["flow_cache_bytes"] > 0
         manifest_rows = read_image_manifest(manifest, root=img_dir, split="eval")
         img_sweep = image_record_sweep(
             ae6, flow6, manifest_rows, cfg_scales=(1.0,), sample_steps_list=(1,),
             n=2, batch=2, seed=10, device="cpu", conditioner=conditioner6,
-            prompt_vocab=vocab6, caption_max_len=8)
+            prompt_vocab=vocab6, caption_max_len=8, text_aligner=aligner6,
+            caption_cond_source="embedding")
         img_agg = aggregate_sweep_rows([dict(r, eval_seed=10) for r in img_sweep])
         assert "caption_sample_mse_mean" in img_agg[0]
+        assert "generated_caption_retrieval_i2t_acc_mean" in img_agg[0]
         ckpt = os.path.join(td, "manifest.pt")
         torch.save({
             "autoencoder_state_dict": ae6.state_dict(),
@@ -3037,10 +3384,14 @@ def selftest():
             "image_root": img_dir,
             "image_split": "train",
             "caption_max_len": 8,
+            "caption_cond_source": "embedding",
+            "text_embedding_in_dim": 3,
+            "text_embed_dim": 12,
             "latent_stats": latent_stats_state(flow_latent_stats(flow6)),
             "prompt_templates": [],
             "prompt_vocab": vocab6,
             "conditioner_state_dict": conditioner6.state_dict(),
+            "text_aligner_state_dict": aligner6.state_dict(),
             "flow_ema_state_dict": {},
             "conditioner_ema_state_dict": {},
         }, ckpt)
@@ -3051,6 +3402,8 @@ def selftest():
             eval_image_split="eval")
         assert eval6["experiment"] == "image_latent_manifest_sampler_sweep"
         assert eval6["best"]["caption_sample_mse_mean"] >= 0.0
+        assert eval6["text_aligner"] is True
+        assert "generated_caption_retrieval_i2t_acc_mean" in eval6["best"]
     print("image_latent selftest OK")
 
 
@@ -3111,6 +3464,14 @@ def main(argv=None):
                     help="multi-scale reconstruction loss weight")
     ap.add_argument("--ae-latent-reg-w", type=float, default=0.0, dest="ae_latent_reg_w",
                     help="latent L2 regularization weight during AE training")
+    ap.add_argument("--image-text-align-w", type=float, default=0.0,
+                    dest="image_text_align_w",
+                    help="contrastive image-latent/caption alignment weight during AE training")
+    ap.add_argument("--flow-text-align-w", type=float, default=0.0,
+                    dest="flow_text_align_w",
+                    help="contrastive caption alignment weight on predicted flow endpoints")
+    ap.add_argument("--text-embed-dim", type=int, default=128, dest="text_embed_dim",
+                    help="shared image/text embedding width for manifest alignment")
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--fact-w", type=float, default=1.0, dest="fact_w")
@@ -3206,6 +3567,9 @@ def main(argv=None):
                     help="maximum caption vocabulary size for image manifests")
     ap.add_argument("--caption-max-len", type=int, default=64, dest="caption_max_len",
                     help="maximum caption tokens for image manifests")
+    ap.add_argument("--caption-cond-source", default="tokens",
+                    choices=("tokens", "embedding", "auto"), dest="caption_cond_source",
+                    help="caption conditioning source for image manifests")
     ap.add_argument("--prompt-templates", default="", dest="prompt_templates",
                     help="semicolon-separated prompt templates using {color} and {shape}")
     ap.add_argument("--seed", type=int, default=0)
@@ -3292,7 +3656,8 @@ def main(argv=None):
                     sample_steps=settings["sample_steps"],
                     sample_method=settings["sample_method"],
                     samples=args.sample_grid_samples,
-                    seed=args.seed + 991)
+                    seed=args.seed + 991,
+                    caption_cond_source=meta["caption_cond_source"])
             else:
                 grid_meta = save_sample_grid(
                     ae, flow, args.sample_grid_out, size=grid_size, cond_mode=meta["cond_mode"],
@@ -3323,7 +3688,8 @@ def main(argv=None):
         ap.error("use --selftest, --train, or --eval-checkpoint")
     templates = _parse_templates(args.prompt_templates)
     run_size = int(args.size or 32)
-    ae, flow, conditioner, prompt_vocab, report, flow_ema, conditioner_ema = train_latent_flow(
+    (ae, flow, conditioner, prompt_vocab, text_aligner, report,
+     flow_ema, conditioner_ema) = train_latent_flow(
         ae_steps=args.ae_steps, flow_steps=args.flow_steps, batch=args.batch,
         latent_ch=args.latent_ch, hidden=args.hidden, lr=args.lr, fact_w=args.fact_w,
         seed=args.seed, size=run_size, flow_arch=args.flow_arch, dit_depth=args.dit_depth,
@@ -3333,6 +3699,9 @@ def main(argv=None):
         latent_downsample=args.latent_downsample, ae_res_blocks=args.ae_res_blocks,
         ae_recon_loss=args.ae_recon_loss, ae_grad_w=args.ae_grad_w,
         ae_ms_w=args.ae_ms_w, ae_latent_reg_w=args.ae_latent_reg_w,
+        image_text_align_w=args.image_text_align_w,
+        flow_text_align_w=args.flow_text_align_w,
+        text_embed_dim=args.text_embed_dim,
         sample_steps=args.sample_steps, roundtrip_samples=args.roundtrip_samples,
         flow_semantic_w=args.flow_semantic_w, cond_mode=args.cond_mode,
         flow_consistency_w=args.flow_consistency_w,
@@ -3340,7 +3709,7 @@ def main(argv=None):
         image_manifest=args.image_manifest, image_root=args.image_root,
         image_split=args.image_split, image_min_aesthetic=args.image_min_aesthetic,
         image_max_records=args.image_max_records, caption_vocab_max=args.caption_vocab_max,
-        caption_max_len=args.caption_max_len,
+        caption_max_len=args.caption_max_len, caption_cond_source=args.caption_cond_source,
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
         time_logit_std=args.time_logit_std,
         latent_normalize=args.latent_normalize,
@@ -3364,7 +3733,7 @@ def main(argv=None):
         flow_cache_latents=args.flow_cache_latents,
         flow_cache_records=args.flow_cache_records,
         flow_cache_batch=args.flow_cache_batch,
-        return_conditioner=True, return_ema=True)
+        return_conditioner=True, return_ema=True, return_aligner=True)
     if args.sample_grid_out:
         raw_flow = clone_state_dict(flow)
         raw_conditioner = clone_state_dict(conditioner) if conditioner is not None else None
@@ -3396,7 +3765,8 @@ def main(argv=None):
                 sample_steps=settings["sample_steps"],
                 sample_method=settings["sample_method"],
                 samples=args.sample_grid_samples,
-                seed=args.seed + 991)
+                seed=args.seed + 991,
+                caption_cond_source=report.get("caption_cond_source", "tokens"))
         else:
             grid_meta = save_sample_grid(
                 ae, flow, args.sample_grid_out, size=run_size, cond_mode=args.cond_mode,
@@ -3432,6 +3802,9 @@ def main(argv=None):
         "ae_grad_w": args.ae_grad_w,
         "ae_ms_w": args.ae_ms_w,
         "ae_latent_reg_w": args.ae_latent_reg_w,
+        "image_text_align_w": args.image_text_align_w,
+        "flow_text_align_w": args.flow_text_align_w,
+        "text_embed_dim": args.text_embed_dim,
         "hidden": args.hidden,
         "ae_accum_steps": args.ae_accum_steps,
         "flow_accum_steps": args.flow_accum_steps,
@@ -3456,6 +3829,8 @@ def main(argv=None):
         "image_max_records": args.image_max_records,
         "caption_vocab_max": args.caption_vocab_max,
         "caption_max_len": args.caption_max_len,
+        "caption_cond_source": report.get("caption_cond_source", ""),
+        "text_embedding_in_dim": report.get("text_embedding_in_dim", 0),
         "cond_drop": args.cond_drop,
         "cfg_scale": args.cfg_scale,
         "cfg_interval": list(cfg_interval),
@@ -3483,6 +3858,9 @@ def main(argv=None):
         "prompt_templates": list(templates) if args.cond_mode == "text" else [],
         "prompt_vocab": prompt_vocab if prompt_vocab is not None else {},
         "conditioner_state_dict": (conditioner.state_dict() if conditioner is not None else {}),
+        "text_aligner_state_dict": (
+            text_aligner.state_dict() if text_aligner is not None else {}
+        ),
         "flow_ema_state_dict": flow_ema if flow_ema is not None else {},
         "conditioner_ema_state_dict": (conditioner_ema if conditioner_ema is not None else {}),
     }, args.out)
