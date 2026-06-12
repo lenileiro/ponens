@@ -587,20 +587,40 @@ class LatentCrossDiTFlowNet(nn.Module):
         return v.transpose(1, 2).reshape(b, c, h, w)
 
 
+class HeadRMSNorm(nn.Module):
+    """RMS-normalize query/key vectors per attention head."""
+
+    def __init__(self, head_dim, eps=1.0e-6):
+        super().__init__()
+        self.eps = float(eps)
+        self.weight = nn.Parameter(torch.ones(int(head_dim)))
+
+    def forward(self, x):
+        dtype = x.dtype
+        x_float = x.float()
+        denom = x_float.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return (x_float * denom).to(dtype) * self.weight.to(dtype=dtype)
+
+
 class MMDiTBlock(nn.Module):
     """Tiny dual-stream block with separate image/text projections and joint attention."""
 
-    def __init__(self, hidden=96, heads=4):
+    def __init__(self, hidden=96, heads=4, qk_norm=False):
         super().__init__()
         if hidden % heads:
             raise ValueError(f"hidden={hidden} must be divisible by heads={heads}")
         self.heads = int(heads)
         self.head_dim = hidden // heads
+        self.uses_qk_norm = bool(qk_norm)
         self.scale = self.head_dim ** -0.5
         self.img_norm = nn.LayerNorm(hidden)
         self.ctx_norm = nn.LayerNorm(hidden)
         self.img_qkv = nn.Linear(hidden, hidden * 3)
         self.ctx_qkv = nn.Linear(hidden, hidden * 3)
+        self.img_q_norm = HeadRMSNorm(self.head_dim) if self.uses_qk_norm else nn.Identity()
+        self.img_k_norm = HeadRMSNorm(self.head_dim) if self.uses_qk_norm else nn.Identity()
+        self.ctx_q_norm = HeadRMSNorm(self.head_dim) if self.uses_qk_norm else nn.Identity()
+        self.ctx_k_norm = HeadRMSNorm(self.head_dim) if self.uses_qk_norm else nn.Identity()
         self.img_out = nn.Linear(hidden, hidden)
         self.ctx_out = nn.Linear(hidden, hidden)
         self.img_ff_norm = nn.LayerNorm(hidden)
@@ -637,6 +657,8 @@ class MMDiTBlock(nn.Module):
         ctx_attn = self._modulate(self.ctx_norm(ctx), ctx_attn_shift, ctx_attn_scale)
         qi, ki, vi = self._qkv(self.img_qkv, img_attn)
         qc, kc, vc = self._qkv(self.ctx_qkv, ctx_attn)
+        qi, ki = self.img_q_norm(qi), self.img_k_norm(ki)
+        qc, kc = self.ctx_q_norm(qc), self.ctx_k_norm(kc)
         q = torch.cat([qi, qc], dim=2)
         k = torch.cat([ki, kc], dim=2)
         v = torch.cat([vi, vc], dim=2)
@@ -666,19 +688,22 @@ class LatentMMDiTFlowNet(nn.Module):
     uses_residual_gating = True
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
-                 max_tokens=256, head_width_mult=1):
+                 max_tokens=256, head_width_mult=1, qk_norm=False):
         super().__init__()
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
         self.hidden = int(hidden)
         self.max_tokens = int(max_tokens)
         self.head_width_mult = int(head_width_mult)
+        self.uses_qk_norm = bool(qk_norm)
         self.in_proj = nn.Linear(latent_ch, hidden)
         self.pos = nn.Parameter(torch.zeros(1, max_tokens, hidden))
         self.time = nn.Sequential(nn.Linear(cond_dim + 1, hidden), nn.GELU(),
                                   nn.Linear(hidden, hidden))
         self.ctx_proj = nn.Linear(cond_dim, hidden)
-        self.blocks = nn.ModuleList([MMDiTBlock(hidden, heads) for _ in range(depth)])
+        self.blocks = nn.ModuleList([
+            MMDiTBlock(hidden, heads, qk_norm=self.uses_qk_norm) for _ in range(depth)
+        ])
         self.norm = nn.LayerNorm(hidden)
         self.out_proj = make_velocity_head(hidden, latent_ch, self.head_width_mult)
 
@@ -712,7 +737,8 @@ class LatentMMDiTFlowNet(nn.Module):
 
 
 def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4,
-              cond_dim=None, dit_head_width_mult=1, latent_max_tokens=256):
+              cond_dim=None, dit_head_width_mult=1, latent_max_tokens=256,
+              dit_qk_norm=False):
     if flow_arch == "conv":
         return LatentFlowNet(latent_ch=latent_ch, hidden=hidden, cond_dim=cond_dim)
     dit_head_width_mult = int(dit_head_width_mult)
@@ -741,7 +767,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
         return LatentMMDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth,
                                   heads=heads, cond_dim=cond_dim,
                                   head_width_mult=dit_head_width_mult,
-                                  max_tokens=latent_max_tokens)
+                                  max_tokens=latent_max_tokens,
+                                  qk_norm=dit_qk_norm)
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
@@ -2657,6 +2684,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     dit_heads = int(ckpt.get("dit_heads", report.get("dit_heads", 4)))
     dit_head_width_mult = int(ckpt.get("dit_head_width_mult",
                                        report.get("dit_head_width_mult", 1)))
+    dit_qk_norm = bool(ckpt.get("dit_qk_norm", report.get("dit_qk_norm", False)))
     cond_mode = ckpt.get("cond_mode", report.get("cond_mode", "facts"))
     data_mode = ckpt.get("data_mode", report.get("data_mode", "synthetic_factors"))
     cond_dim = int(ckpt.get("cond_dim", report.get("cond_dim", len(FACT_VOCAB))))
@@ -2717,7 +2745,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
                      dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim,
                      dit_head_width_mult=dit_head_width_mult,
-                     latent_max_tokens=latent_max_tokens).to(device)
+                     latent_max_tokens=latent_max_tokens,
+                     dit_qk_norm=dit_qk_norm).to(device)
     latent_stats = latent_stats_to_device(
         ckpt.get("latent_stats", {"mode": ckpt.get("latent_normalize", "none")}),
         device)
@@ -2749,6 +2778,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "dit_head_width_mult": (
             dit_head_width_mult if flow_arch in ("dit", "crossdit", "mmdit") else 1
         ),
+        "dit_qk_norm": bool(dit_qk_norm) if flow_arch == "mmdit" else False,
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "flow_load": flow_load,
@@ -3252,6 +3282,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       caption_vocab_max=8192, caption_max_len=64,
                       caption_cond_source="tokens",
                       image_crop_mode="center", image_hflip_prob=0.0,
+                      dit_qk_norm=False,
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0, time_shift=1.0,
                       latent_normalize="none", latent_stat_samples=512,
@@ -3399,7 +3430,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
                      dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim,
                      dit_head_width_mult=dit_head_width_mult,
-                     latent_max_tokens=latent_max_tokens).to(device)
+                     latent_max_tokens=latent_max_tokens,
+                     dit_qk_norm=bool(dit_qk_norm)).to(device)
     attach_text_aligner(flow, text_aligner)
     attach_image_feature_aligner(flow, image_feature_aligner)
     ae_params = list(ae.parameters())
@@ -3685,6 +3717,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "dit_head_width_mult": (
             int(dit_head_width_mult) if flow_arch in ("dit", "crossdit", "mmdit") else 1
         ),
+        "dit_qk_norm": bool(dit_qk_norm) if flow_arch == "mmdit" else False,
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "fact_w": float(fact_w),
@@ -3915,10 +3948,12 @@ def selftest():
         ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="mmdit",
         dit_depth=1, dit_heads=2, seed=7, device="cpu", cond_mode="text",
         text_cond_dim=8, sample_steps=1, time_sampling="logit-normal",
-        flow_ema_decay=0.5, dit_head_width_mult=2,
+        flow_ema_decay=0.5, dit_head_width_mult=2, dit_qk_norm=True,
         return_conditioner=True)
     assert report5["flow_arch"] == "mmdit" and flow_uses_cond_tokens(flow5)
     assert report5["dit_head_width_mult"] == 2
+    assert report5["dit_qk_norm"] is True
+    assert any("q_norm" in k for k in flow5.state_dict())
     assert report5["adaptive_modulation"] is True
     assert report5["residual_gating"] is True
     assert report5["ema_available"] is True
@@ -3930,7 +3965,8 @@ def selftest():
     assert report5["flow_ema_warmup"] is True and report5["flow_ema_effective_decay"] < 0.5
     legacy_state = {k: v for k, v in flow5.state_dict().items() if ".gate." not in k}
     compat_flow = make_flow(flow_arch="mmdit", latent_ch=4, hidden=32, dit_depth=1,
-                            dit_heads=2, cond_dim=8, dit_head_width_mult=2)
+                            dit_heads=2, cond_dim=8, dit_head_width_mult=2,
+                            dit_qk_norm=True)
     compat_load = load_flow_state(compat_flow, legacy_state)
     assert compat_load["tolerated_missing"] and all(
         ".gate." in k for k in compat_load["tolerated_missing"])
@@ -4165,6 +4201,8 @@ def main(argv=None):
     ap.add_argument("--dit-head-width-mult", type=int, default=1,
                     dest="dit_head_width_mult",
                     help="width multiplier for the DiT/MM-DiT latent velocity head")
+    ap.add_argument("--dit-qk-norm", action="store_true", dest="dit_qk_norm",
+                    help="enable per-head QK RMSNorm in MM-DiT attention")
     ap.add_argument("--cond-drop", type=float, default=0.0, dest="cond_drop")
     ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
     ap.add_argument("--cfg-interval", default="0.0,1.0", dest="cfg_interval",
@@ -4390,6 +4428,7 @@ def main(argv=None):
         seed=args.seed, size=run_size, flow_arch=args.flow_arch, dit_depth=args.dit_depth,
         dit_heads=args.dit_heads, cond_drop=args.cond_drop, cfg_scale=args.cfg_scale,
         dit_head_width_mult=args.dit_head_width_mult,
+        dit_qk_norm=args.dit_qk_norm,
         latent_max_tokens=args.latent_max_tokens, ae_arch=args.ae_arch,
         latent_downsample=args.latent_downsample, ae_res_blocks=args.ae_res_blocks,
         ae_recon_loss=args.ae_recon_loss, ae_grad_w=args.ae_grad_w,
@@ -4532,6 +4571,7 @@ def main(argv=None):
         "dit_depth": args.dit_depth,
         "dit_heads": args.dit_heads,
         "dit_head_width_mult": args.dit_head_width_mult,
+        "dit_qk_norm": report.get("dit_qk_norm", False),
         "cond_mode": args.cond_mode,
         "cond_dim": report["cond_dim"],
         "data_mode": report.get("data_mode", "synthetic_factors"),

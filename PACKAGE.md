@@ -634,7 +634,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
     --image-embed-model google/siglip-base-patch16-224 \
     --image-clean-min-side 256 --image-clean-max-aspect 2.0 \
     --image-latent --image-latent-arch mmdit \
-    --image-cond-mode text --image-dit-head-width-mult 2 \
+    --image-cond-mode text --image-dit-head-width-mult 2 --image-dit-qk-norm \
     --image-manifest data/images/train.jsonl --image-root data/images \
     --image-caption-cond-source auto \
     --image-crop-mode random --image-hflip-prob 0.5 \
@@ -1006,6 +1006,11 @@ Image-45 adds rectified-flow timestep shifting for high-resolution latent image 
 part of the data-time path while keeping `1.0` as the exact legacy schedule. Checkpoint eval uses
 the saved shift by default, `--sample-time-shift` can override it for sweeps, and RunPod exposes the
 training knob as `--image-time-shift`.
+
+Image-46 adds optional per-head QK RMSNorm to the custom MM-DiT attention path. Use
+`thinking.image_latent --dit-qk-norm` or RunPod `--image-dit-qk-norm` for high-resolution MM-DiT
+runs; checkpoint metadata records the flag so qk-normalized checkpoints reload with the same
+attention modules, while legacy checkpoints keep the default non-normalized architecture.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

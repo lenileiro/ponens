@@ -233,6 +233,8 @@ def payload(args):
                           f"--sample-grid-samples {args.image_sample_grid_samples}")
             if args.image_no_ema_warmup:
                 train += " --no-ema-warmup"
+            if args.image_dit_qk_norm:
+                train += " --dit-qk-norm"
             if args.image_flow_cache_latents:
                 train += " --flow-cache-latents"
             if args.image_flow_cache_dir:
@@ -590,6 +592,9 @@ def main():
     ap.add_argument("--image-dit-head-width-mult", type=int, default=1,
                     dest="image_dit_head_width_mult",
                     help="width multiplier for the latent DiT/MM-DiT velocity head")
+    ap.add_argument("--image-dit-qk-norm", action="store_true",
+                    dest="image_dit_qk_norm",
+                    help="enable per-head QK RMSNorm in latent image MM-DiT attention")
     ap.add_argument("--image-ae-arch", default="semantic", choices=("semantic", "residual"),
                     dest="image_ae_arch",
                     help="autoencoder architecture for latent image generation")
