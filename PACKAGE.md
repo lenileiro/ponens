@@ -646,6 +646,8 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
     --image-text-embed-dim 128 \
     --image-feature-align-w 0.1 --image-flow-feature-align-w 0.05 \
     --image-feature-embed-dim 128 \
+    --image-flow-repa-w 0.05 --image-flow-repa-steps 20000 \
+    --image-flow-repa-embed-dim 128 \
     --image-ae-accum-steps 2 --image-flow-accum-steps 2 \
     --image-train-precision bf16 --image-grad-clip 1.0 \
     --image-flow-cache-latents --image-flow-cache-dir runs/image_manifest_cache \
@@ -1017,6 +1019,14 @@ Image-47 adds an MM-DiT attention implementation selector. `--dit-attn-impl manu
 keeps the original explicit attention path available, uses PyTorch scaled-dot-product attention for
 fused/flash kernels when requested, or falls back automatically. RunPod exposes the same setting as
 `--image-dit-attn-impl`, and checkpoint metadata records the selected implementation.
+
+Image-48 adds a REPA-style hidden-state representation alignment path for real-image latent flows.
+`--flow-repa-w` trains the flow transformer's noisy-step image-token states against generic
+manifest `image_embedding` rows, separately from endpoint feature alignment, and
+`--flow-repa-steps` can restrict that auxiliary pressure to early training. RunPod exposes the same
+settings as `--image-flow-repa-w`, `--image-flow-repa-steps`, and
+`--image-flow-repa-embed-dim`; disk latent caches now carry image embeddings when either endpoint
+feature alignment or REPA needs them.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

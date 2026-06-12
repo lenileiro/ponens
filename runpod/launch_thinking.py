@@ -194,6 +194,9 @@ def payload(args):
                      f"--image-feature-align-w {args.image_feature_align_w} "
                      f"--flow-feature-align-w {args.image_flow_feature_align_w} "
                      f"--image-feature-embed-dim {args.image_feature_embed_dim} "
+                     f"--flow-repa-w {args.image_flow_repa_w} "
+                     f"--flow-repa-steps {args.image_flow_repa_steps} "
+                     f"--flow-repa-embed-dim {args.image_flow_repa_embed_dim} "
                      f"--cond-mode {args.image_cond_mode} "
                      f"--text-cond-dim {args.image_text_cond_dim} "
                      f"--image-manifest {shlex_quote(effective_image_manifest)} "
@@ -639,6 +642,15 @@ def main():
     ap.add_argument("--image-feature-embed-dim", type=int, default=128,
                     dest="image_feature_embed_dim",
                     help="shared embedding width for latent/image-feature alignment")
+    ap.add_argument("--image-flow-repa-w", type=float, default=0.0,
+                    dest="image_flow_repa_w",
+                    help="REPA-style hidden-state/image-feature alignment weight")
+    ap.add_argument("--image-flow-repa-steps", type=int, default=0,
+                    dest="image_flow_repa_steps",
+                    help="limit image REPA alignment to the first N flow steps; 0 means all steps")
+    ap.add_argument("--image-flow-repa-embed-dim", type=int, default=128,
+                    dest="image_flow_repa_embed_dim",
+                    help="shared embedding width for image REPA alignment")
     ap.add_argument("--image-cond-mode", default="facts", choices=("facts", "text"),
                     dest="image_cond_mode",
                     help="latent image conditioning source: canonical facts or learned text prompts")

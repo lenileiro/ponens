@@ -407,6 +407,53 @@ class ImageFeatureAligner(nn.Module):
         return self.logit_scale.exp().clamp(max=100.0)
 
 
+class FlowFeatureAligner(nn.Module):
+    """Contrastive bridge between denoiser hidden states and external image features.
+
+    This is the REPA-style training signal: it aligns the flow transformer's noisy-step
+    representation to a generic visual embedding without changing the generated latent target.
+    """
+
+    def __init__(self, hidden_dim=96, feature_dim=768, hidden=96, embed_dim=128,
+                 temperature=0.07):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.feature_dim = int(feature_dim)
+        self.embed_dim = int(embed_dim)
+        self.hidden = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, int(hidden)),
+            nn.GELU(),
+            nn.Linear(int(hidden), self.embed_dim),
+        )
+        self.feature = nn.Sequential(
+            nn.LayerNorm(self.feature_dim),
+            nn.Linear(self.feature_dim, int(hidden)),
+            nn.GELU(),
+            nn.Linear(int(hidden), self.embed_dim),
+        )
+        temp = max(float(temperature), 1.0e-4)
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / temp)))
+
+    def encode_hidden(self, tokens):
+        if tokens.ndim == 3:
+            pooled = tokens.float().mean(dim=1)
+        elif tokens.ndim == 2:
+            pooled = tokens.float()
+        else:
+            raise ValueError(f"expected hidden tokens as B,N,H or B,H, got {tuple(tokens.shape)}")
+        return F.normalize(self.hidden(pooled), dim=-1)
+
+    def encode_feature(self, features):
+        return F.normalize(self.feature(features.float()), dim=-1)
+
+    def forward(self, tokens, features):
+        return self.encode_hidden(tokens), self.encode_feature(features)
+
+    def scale(self):
+        return self.logit_scale.exp().clamp(max=100.0)
+
+
 class LatentFlowNet(nn.Module):
     """Velocity field v_theta(z_t, t, canonical_facts)."""
 
@@ -469,6 +516,7 @@ class LatentDiTFlowNet(nn.Module):
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
         self.hidden = int(hidden)
+        self.hidden_feature_dim = int(hidden)
         self.max_tokens = int(max_tokens)
         self.head_width_mult = int(head_width_mult)
         self.in_proj = nn.Linear(latent_ch, hidden)
@@ -491,7 +539,7 @@ class LatentDiTFlowNet(nn.Module):
         self.norm = nn.LayerNorm(hidden)
         self.out_proj = make_velocity_head(hidden, latent_ch, self.head_width_mult)
 
-    def forward(self, z, t, cond):
+    def forward(self, z, t, cond, return_features=False):
         cond = condition_vector(cond)
         if t.ndim > 2:
             t = t.flatten(1)[:, :1]
@@ -505,8 +553,12 @@ class LatentDiTFlowNet(nn.Module):
         ctx = self.cond(torch.cat([cond, t.to(cond.dtype)], dim=1))[:, None, :]
         x = self.in_proj(toks) + self.pos[:, :n] + ctx
         x = self.blocks(x)
-        v = self.out_proj(self.norm(x))
-        return v.transpose(1, 2).reshape(b, c, h, w)
+        features = self.norm(x)
+        v = self.out_proj(features)
+        velocity = v.transpose(1, 2).reshape(b, c, h, w)
+        if return_features:
+            return velocity, {"image_tokens": features}
+        return velocity
 
 
 class CrossDiTBlock(nn.Module):
@@ -545,6 +597,7 @@ class LatentCrossDiTFlowNet(nn.Module):
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
         self.hidden = int(hidden)
+        self.hidden_feature_dim = int(hidden)
         self.max_tokens = int(max_tokens)
         self.head_width_mult = int(head_width_mult)
         self.in_proj = nn.Linear(latent_ch, hidden)
@@ -568,7 +621,7 @@ class LatentCrossDiTFlowNet(nn.Module):
             mask = None
         return self.ctx_proj(tokens), mask
 
-    def forward(self, z, t, cond):
+    def forward(self, z, t, cond, return_features=False):
         cond_vec = condition_vector(cond)
         if t.ndim > 2:
             t = t.flatten(1)[:, :1]
@@ -584,8 +637,12 @@ class LatentCrossDiTFlowNet(nn.Module):
         x = self.in_proj(toks) + self.pos[:, :n] + global_ctx
         for block in self.blocks:
             x = block(x, ctx, ctx_mask=ctx_mask)
-        v = self.out_proj(self.norm(x))
-        return v.transpose(1, 2).reshape(b, c, h, w)
+        features = self.norm(x)
+        v = self.out_proj(features)
+        velocity = v.transpose(1, 2).reshape(b, c, h, w)
+        if return_features:
+            return velocity, {"image_tokens": features}
+        return velocity
 
 
 class HeadRMSNorm(nn.Module):
@@ -735,6 +792,7 @@ class LatentMMDiTFlowNet(nn.Module):
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
         self.hidden = int(hidden)
+        self.hidden_feature_dim = int(hidden)
         self.max_tokens = int(max_tokens)
         self.head_width_mult = int(head_width_mult)
         self.uses_qk_norm = bool(qk_norm)
@@ -762,7 +820,7 @@ class LatentMMDiTFlowNet(nn.Module):
             mask = None
         return self.ctx_proj(tokens), mask
 
-    def forward(self, z, t, cond):
+    def forward(self, z, t, cond, return_features=False):
         cond_vec = condition_vector(cond)
         if t.ndim > 2:
             t = t.flatten(1)[:, :1]
@@ -778,8 +836,12 @@ class LatentMMDiTFlowNet(nn.Module):
         ctx, ctx_mask = self._context(cond)
         for block in self.blocks:
             img, ctx = block(img, ctx, cond_ctx, ctx_mask=ctx_mask)
-        v = self.out_proj(self.norm(img))
-        return v.transpose(1, 2).reshape(b, c, h, w)
+        features = self.norm(img)
+        v = self.out_proj(features)
+        velocity = v.transpose(1, 2).reshape(b, c, h, w)
+        if return_features:
+            return velocity, {"image_tokens": features}
+        return velocity
 
 
 def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4,
@@ -832,6 +894,14 @@ def attach_image_feature_aligner(flow, image_feature_aligner):
     if hasattr(flow, "_modules"):
         flow._modules.pop("image_feature_aligner", None)
     flow.__dict__["image_feature_aligner"] = image_feature_aligner
+    return flow
+
+
+def attach_flow_repa_aligner(flow, flow_repa_aligner):
+    # Keep the auxiliary REPA head out of flow.state_dict(); checkpoint it explicitly.
+    if hasattr(flow, "_modules"):
+        flow._modules.pop("flow_repa_aligner", None)
+    flow.__dict__["flow_repa_aligner"] = flow_repa_aligner
     return flow
 
 
@@ -1507,6 +1577,10 @@ def flow_uses_cond_tokens(flow):
     return bool(getattr(flow, "uses_cond_tokens", False))
 
 
+def flow_hidden_feature_dim(flow):
+    return int(getattr(flow, "hidden_feature_dim", 0) or 0)
+
+
 def condition_vector(cond):
     return cond["vec"] if isinstance(cond, dict) else cond
 
@@ -1585,6 +1659,46 @@ def image_feature_alignment_loss(aligner, z, features, prefix="image_feature_ali
         f"{prefix}_diag_logit": diag.detach(),
         f"{prefix}_offdiag_logit": offdiag.detach(),
         f"{prefix}_n": torch.tensor(float(n), device=z.device),
+    }
+
+
+def flow_hidden_feature_alignment_loss(aligner, hidden_tokens, features, prefix="flow_repa",
+                                       mask=None):
+    if aligner is None:
+        zero = hidden_tokens.sum() * 0.0
+        return zero, {}
+    features = features.to(device=hidden_tokens.device)
+    hidden_emb, feat_emb = aligner(hidden_tokens, features)
+    if mask is not None:
+        mask = mask.to(device=hidden_emb.device, dtype=torch.bool).flatten()
+        hidden_emb = hidden_emb[mask]
+        feat_emb = feat_emb[mask]
+    n = int(hidden_emb.shape[0])
+    if n <= 0:
+        zero = hidden_tokens.sum() * 0.0 + features.sum() * 0.0
+        return zero, {
+            f"{prefix}_loss": zero.detach(),
+            f"{prefix}_h2f_acc": zero.detach(),
+            f"{prefix}_f2h_acc": zero.detach(),
+            f"{prefix}_n": torch.tensor(0.0, device=hidden_tokens.device),
+        }
+    logits = aligner.scale().to(hidden_emb.dtype) * hidden_emb.matmul(feat_emb.t())
+    targets = torch.arange(n, device=logits.device)
+    loss = 0.5 * (
+        F.cross_entropy(logits, targets) + F.cross_entropy(logits.t(), targets)
+    )
+    h2f = logits.argmax(dim=1).eq(targets).float().mean()
+    f2h = logits.argmax(dim=0).eq(targets).float().mean()
+    diag = logits.diag().mean()
+    offdiag = ((logits.sum() - logits.diag().sum()) / max(1, n * n - n)
+               if n > 1 else logits.diag().mean())
+    return loss, {
+        f"{prefix}_loss": loss.detach(),
+        f"{prefix}_h2f_acc": h2f.detach(),
+        f"{prefix}_f2h_acc": f2h.detach(),
+        f"{prefix}_diag_logit": diag.detach(),
+        f"{prefix}_offdiag_logit": offdiag.detach(),
+        f"{prefix}_n": torch.tensor(float(n), device=hidden_tokens.device),
     }
 
 
@@ -1924,7 +2038,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
                        time_logit_std=1.0, time_shift=1.0,
                        latent_stats=None, consistency_w=0.0,
                        text_aligner=None, text_align_w=0.0,
-                       feature_aligner=None, image_features=None, feature_align_w=0.0):
+                       feature_aligner=None, image_features=None, feature_align_w=0.0,
+                       repa_aligner=None, repa_w=0.0):
     latent_stats = flow_latent_stats(flow) if latent_stats is None else latent_stats
     z1_model = normalize_latent(z1, latent_stats)
     x0 = torch.randn_like(z1_model)
@@ -1934,7 +2049,11 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
     zt = (1.0 - t) * x0 + t * z1_model
     target = z1_model - x0
     cond_model = condition_dropout(cond, cond_drop)
-    pred = flow(zt, t, cond_model)
+    flow_features = None
+    if repa_aligner is not None and repa_w > 0.0:
+        pred, flow_features = flow(zt, t, cond_model, return_features=True)
+    else:
+        pred = flow(zt, t, cond_model)
     velocity = F.mse_loss(pred, target)
     total = velocity
     parts = {
@@ -1985,6 +2104,16 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
             feature_aligner, z_clean, image_features, prefix="flow_image_feature_align")
         total = total + float(feature_align_w) * feature_align
         parts.update(feature_parts)
+    if repa_aligner is not None and repa_w > 0.0:
+        if image_features is None:
+            raise ValueError("flow REPA alignment requires image_features")
+        if flow_features is None or "image_tokens" not in flow_features:
+            raise ValueError("flow REPA alignment requires transformer image-token features")
+        repa_align, repa_parts = flow_hidden_feature_alignment_loss(
+            repa_aligner, flow_features["image_tokens"], image_features, prefix="flow_repa")
+        total = total + float(repa_w) * repa_align
+        parts.update(repa_parts)
+        parts["flow_repa_w"] = torch.tensor(float(repa_w), device=z1.device)
     return total, parts
 
 
@@ -2747,6 +2876,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "image_embedding_in_dim", report.get("image_embedding_in_dim", 0)) or 0)
     image_feature_embed_dim = int(ckpt.get(
         "image_feature_embed_dim", report.get("image_feature_embed_dim", 128)) or 128)
+    flow_repa_embed_dim = int(ckpt.get(
+        "flow_repa_embed_dim", report.get("flow_repa_embed_dim", 128)) or 128)
     caption_max_len = int(ckpt.get("caption_max_len", report.get("caption_max_len", 32)) or 32)
     if cond_mode == "text" and data_mode != "image_manifest":
         caption_max_len = 32
@@ -2798,6 +2929,18 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                      latent_max_tokens=latent_max_tokens,
                      dit_qk_norm=dit_qk_norm,
                      dit_attn_impl=dit_attn_impl).to(device)
+    flow_repa_aligner = None
+    if ckpt.get("flow_repa_aligner_state_dict"):
+        if image_embedding_in_dim <= 0:
+            raise ValueError("REPA-aligned checkpoint is missing image_embedding_in_dim")
+        hidden_feature_dim = flow_hidden_feature_dim(flow)
+        if hidden_feature_dim <= 0:
+            raise ValueError("REPA-aligned checkpoint requires a transformer flow")
+        flow_repa_aligner = FlowFeatureAligner(
+            hidden_dim=hidden_feature_dim, feature_dim=image_embedding_in_dim,
+            hidden=hidden, embed_dim=flow_repa_embed_dim).to(device)
+        flow_repa_aligner.load_state_dict(ckpt["flow_repa_aligner_state_dict"])
+        flow_repa_aligner.eval()
     latent_stats = latent_stats_to_device(
         ckpt.get("latent_stats", {"mode": ckpt.get("latent_normalize", "none")}),
         device)
@@ -2811,6 +2954,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     flow_load = load_flow_state(flow, flow_state)
     attach_text_aligner(flow, text_aligner)
     attach_image_feature_aligner(flow, image_feature_aligner)
+    attach_flow_repa_aligner(flow, flow_repa_aligner)
     ae.eval()
     flow.eval()
     return ae, flow, conditioner, prompt_vocab, prompt_templates, {
@@ -2862,6 +3006,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "image_feature_aligner": image_feature_aligner is not None,
         "image_embedding_in_dim": int(image_embedding_in_dim),
         "image_feature_embed_dim": int(image_feature_embed_dim),
+        "flow_repa_aligner": flow_repa_aligner is not None,
+        "flow_repa_embed_dim": int(flow_repa_embed_dim),
         "image_text_align_w": float(ckpt.get(
             "image_text_align_w", report.get("image_text_align_w", 0.0))),
         "flow_text_align_w": float(ckpt.get(
@@ -2870,6 +3016,9 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
             "image_feature_align_w", report.get("image_feature_align_w", 0.0))),
         "flow_feature_align_w": float(ckpt.get(
             "flow_feature_align_w", report.get("flow_feature_align_w", 0.0))),
+        "flow_repa_w": float(ckpt.get("flow_repa_w", report.get("flow_repa_w", 0.0))),
+        "flow_repa_steps": int(ckpt.get(
+            "flow_repa_steps", report.get("flow_repa_steps", 0)) or 0),
     }
 
 
@@ -3326,6 +3475,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       image_text_align_w=0.0, flow_text_align_w=0.0, text_embed_dim=128,
                       image_feature_align_w=0.0, flow_feature_align_w=0.0,
                       image_feature_embed_dim=128,
+                      flow_repa_w=0.0, flow_repa_steps=0, flow_repa_embed_dim=128,
                       sample_steps=4, roundtrip_samples=1, flow_semantic_w=0.0,
                       flow_consistency_w=0.0,
                       cond_mode="facts", text_cond_dim=0,
@@ -3369,13 +3519,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             caption_cond_source, image_records)
         image_embedding_in_dim = (
             infer_image_embedding_dim(image_records)
-            if image_feature_align_w > 0.0 or flow_feature_align_w > 0.0 else 0
+            if (image_feature_align_w > 0.0 or flow_feature_align_w > 0.0
+                or flow_repa_w > 0.0) else 0
         )
-        if (image_feature_align_w > 0.0 or flow_feature_align_w > 0.0
+        if (image_feature_align_w > 0.0 or flow_feature_align_w > 0.0 or flow_repa_w > 0.0
                 ) and image_embedding_in_dim <= 0:
-            raise ValueError("image feature alignment requires image_embedding rows")
+            raise ValueError("image feature/REPA alignment requires image_embedding rows")
     elif (image_text_align_w > 0.0 or flow_text_align_w > 0.0
-          or image_feature_align_w > 0.0 or flow_feature_align_w > 0.0):
+          or image_feature_align_w > 0.0 or flow_feature_align_w > 0.0
+          or flow_repa_w > 0.0):
         raise ValueError("image/text or image-feature alignment losses require image_manifest training")
     else:
         caption_cond_source, text_embedding_in_dim = "tokens", 0
@@ -3398,10 +3550,16 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("image/text alignment weights must be non-negative")
     if image_feature_align_w < 0.0 or flow_feature_align_w < 0.0:
         raise ValueError("image feature alignment weights must be non-negative")
+    if flow_repa_w < 0.0:
+        raise ValueError("flow_repa_w must be non-negative")
+    if flow_repa_steps < 0:
+        raise ValueError("flow_repa_steps must be non-negative")
     if text_embed_dim <= 0:
         raise ValueError("text_embed_dim must be positive")
     if image_feature_embed_dim <= 0:
         raise ValueError("image_feature_embed_dim must be positive")
+    if flow_repa_embed_dim <= 0:
+        raise ValueError("flow_repa_embed_dim must be positive")
     amp_cfg = amp_config(device, train_precision)
     ae_accum_steps = max(1, int(ae_accum_steps))
     flow_accum_steps = max(1, int(flow_accum_steps))
@@ -3487,8 +3645,17 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                      latent_max_tokens=latent_max_tokens,
                      dit_qk_norm=bool(dit_qk_norm),
                      dit_attn_impl=dit_attn_impl).to(device)
+    flow_repa_aligner = None
+    if image_records is not None and flow_repa_w > 0.0:
+        hidden_feature_dim = flow_hidden_feature_dim(flow)
+        if hidden_feature_dim <= 0:
+            raise ValueError("flow REPA alignment requires DiT/CrossDiT/MM-DiT flow architecture")
+        flow_repa_aligner = FlowFeatureAligner(
+            hidden_dim=hidden_feature_dim, feature_dim=image_embedding_in_dim,
+            hidden=hidden, embed_dim=flow_repa_embed_dim).to(device)
     attach_text_aligner(flow, text_aligner)
     attach_image_feature_aligner(flow, image_feature_aligner)
+    attach_flow_repa_aligner(flow, flow_repa_aligner)
     ae_params = list(ae.parameters())
     if text_aligner is not None and image_text_align_w > 0.0:
         ae_params += list(conditioner.parameters()) + list(text_aligner.parameters())
@@ -3567,6 +3734,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         flow_params += list(text_aligner.parameters())
     if image_feature_aligner is not None and flow_feature_align_w > 0.0:
         flow_params += list(image_feature_aligner.parameters())
+    if flow_repa_aligner is not None and flow_repa_w > 0.0:
+        flow_params += list(flow_repa_aligner.parameters())
     opt_flow = torch.optim.AdamW(flow_params, lr=lr, weight_decay=0.01)
     ae.eval()
     for p in ae.parameters():
@@ -3579,7 +3748,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             size=size, device=device, precision=train_precision,
             cond_source=caption_cond_source, cache_dir=flow_cache_dir,
             shard_size=flow_cache_shard_size,
-            include_image_embeddings=flow_feature_align_w > 0.0,
+            include_image_embeddings=flow_feature_align_w > 0.0 or flow_repa_w > 0.0,
             crop_mode=image_crop_mode, hflip_prob=image_hflip_prob)
     if image_records is None:
         latent_stats = estimate_latent_stats(
@@ -3601,14 +3770,19 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         text_aligner.train()
     if image_feature_aligner is not None:
         image_feature_aligner.train()
+    if flow_repa_aligner is not None:
+        flow_repa_aligner.train()
     last_flow = {}
     flow_ema = clone_state_dict(flow) if flow_ema_decay > 0.0 else None
     conditioner_ema = (clone_state_dict(conditioner)
                        if flow_ema_decay > 0.0 and conditioner is not None else None)
     ema_updates = 0
     last_ema_decay = 0.0
-    for _ in range(flow_steps):
+    for flow_step in range(flow_steps):
         opt_flow.zero_grad(set_to_none=True)
+        active_flow_repa_w = float(flow_repa_w)
+        if flow_repa_steps > 0 and flow_step >= int(flow_repa_steps):
+            active_flow_repa_w = 0.0
         for _micro in range(flow_accum_steps):
             if flow_cache is not None:
                 z1, cache_payload = sample_latent_cache(flow_cache, rng, batch, device=device)
@@ -3641,7 +3815,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     return_tokens=flow_uses_cond_tokens(flow))
                 image_features = (
                     record_image_embedding_tensor(chosen_records, device=device)
-                    if flow_feature_align_w > 0.0 else None
+                    if flow_feature_align_w > 0.0 or active_flow_repa_w > 0.0 else None
                 )
             with amp_autocast(device, train_precision):
                 loss, parts = latent_flow_losses(
@@ -3652,7 +3826,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     consistency_w=flow_consistency_w,
                     text_aligner=text_aligner, text_align_w=flow_text_align_w,
                     feature_aligner=image_feature_aligner, image_features=image_features,
-                    feature_align_w=flow_feature_align_w)
+                    feature_align_w=flow_feature_align_w,
+                    repa_aligner=flow_repa_aligner, repa_w=active_flow_repa_w)
                 scaled_loss = loss / float(flow_accum_steps)
             scaler.scale(scaled_loss).backward()
             last_flow = {"total_loss": float(loss.detach().cpu())}
@@ -3677,6 +3852,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         text_aligner.eval()
     if image_feature_aligner is not None:
         image_feature_aligner.eval()
+    if flow_repa_aligner is not None:
+        flow_repa_aligner.eval()
     raw_flow = clone_state_dict(flow)
     raw_conditioner = clone_state_dict(conditioner) if conditioner is not None else None
     requested_eval_weight_mode = "raw" if not eval_with_ema else eval_weight_mode
@@ -3789,6 +3966,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_feature_align_w": float(flow_feature_align_w),
         "image_feature_embed_dim": int(image_feature_embed_dim),
         "image_feature_aligner": image_feature_aligner is not None,
+        "flow_repa_w": float(flow_repa_w),
+        "flow_repa_steps": int(flow_repa_steps),
+        "flow_repa_active_steps": (
+            int(flow_steps) if flow_repa_w > 0.0 and int(flow_repa_steps) == 0
+            else min(int(flow_steps), int(flow_repa_steps)) if flow_repa_w > 0.0 else 0
+        ),
+        "flow_repa_embed_dim": int(flow_repa_embed_dim),
+        "flow_repa_aligner": flow_repa_aligner is not None,
         "ae_intervention_w": float(ae_intervention_w),
         "ae_factor_orth_w": float(ae_factor_orth_w),
         "cond_drop": float(cond_drop),
@@ -4065,17 +4250,20 @@ def selftest():
             caption_cond_source="embedding",
             image_text_align_w=0.1, flow_text_align_w=0.1, text_embed_dim=12,
             image_feature_align_w=0.1, flow_feature_align_w=0.1,
-            image_feature_embed_dim=10,
+            image_feature_embed_dim=10, flow_repa_w=0.1, flow_repa_embed_dim=11,
             flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
             intervention_samples=0, return_conditioner=True, return_aligner=True)
         assert report6["data_mode"] == "image_manifest"
         assert report6["text_aligner"] is True and aligner6 is not None
         assert report6["image_feature_aligner"] is True
+        assert report6["flow_repa_aligner"] is True
         assert "caption_align_i2t_acc" in report6["last_ae"]
         assert "image_feature_align_i2f_acc" in report6["last_ae"]
         assert "flow_caption_align_i2t_acc" in report6["last_flow"]
         assert "flow_image_feature_align_i2f_acc" in report6["last_flow"]
+        assert "flow_repa_h2f_acc" in report6["last_flow"]
         assert report6["image_embedding_in_dim"] == 4
+        assert report6["flow_repa_embed_dim"] == 11
         assert report6["flow_cache_latents"] is True
         assert report6["flow_cache_backend"] == "memory"
         assert report6["flow_cache_records"] == 2 and report6["flow_cache_bytes"] > 0
@@ -4138,8 +4326,11 @@ def selftest():
             "text_embed_dim": 12,
             "image_embedding_in_dim": 4,
             "image_feature_embed_dim": 10,
+            "flow_repa_embed_dim": 11,
             "image_feature_align_w": 0.1,
             "flow_feature_align_w": 0.1,
+            "flow_repa_w": 0.1,
+            "flow_repa_steps": 0,
             "latent_stats": latent_stats_state(flow_latent_stats(flow6)),
             "prompt_templates": [],
             "prompt_vocab": vocab6,
@@ -4147,6 +4338,9 @@ def selftest():
             "text_aligner_state_dict": aligner6.state_dict(),
             "image_feature_aligner_state_dict": (
                 getattr(flow6, "image_feature_aligner").state_dict()
+            ),
+            "flow_repa_aligner_state_dict": (
+                getattr(flow6, "flow_repa_aligner").state_dict()
             ),
             "flow_ema_state_dict": {},
             "conditioner_ema_state_dict": {},
@@ -4160,6 +4354,7 @@ def selftest():
         assert eval6["best"]["caption_sample_mse_mean"] >= 0.0
         assert eval6["text_aligner"] is True
         assert eval6["image_feature_aligner"] is True
+        assert eval6["flow_repa_aligner"] is True
         assert "generated_caption_retrieval_i2t_acc_mean" in eval6["best"]
         assert "generated_image_feature_retrieval_i2f_acc_mean" in eval6["best"]
     print("image_latent selftest OK")
@@ -4244,6 +4439,13 @@ def main(argv=None):
     ap.add_argument("--image-feature-embed-dim", type=int, default=128,
                     dest="image_feature_embed_dim",
                     help="shared embedding width for latent/image-feature alignment")
+    ap.add_argument("--flow-repa-w", type=float, default=0.0, dest="flow_repa_w",
+                    help="REPA-style hidden-state/image-feature alignment weight")
+    ap.add_argument("--flow-repa-steps", type=int, default=0, dest="flow_repa_steps",
+                    help="limit REPA alignment to the first N flow steps; 0 means all steps")
+    ap.add_argument("--flow-repa-embed-dim", type=int, default=128,
+                    dest="flow_repa_embed_dim",
+                    help="shared embedding width for REPA hidden/image-feature alignment")
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--fact-w", type=float, default=1.0, dest="fact_w")
@@ -4502,6 +4704,9 @@ def main(argv=None):
         image_feature_align_w=args.image_feature_align_w,
         flow_feature_align_w=args.flow_feature_align_w,
         image_feature_embed_dim=args.image_feature_embed_dim,
+        flow_repa_w=args.flow_repa_w,
+        flow_repa_steps=args.flow_repa_steps,
+        flow_repa_embed_dim=args.flow_repa_embed_dim,
         sample_steps=args.sample_steps, roundtrip_samples=args.roundtrip_samples,
         flow_semantic_w=args.flow_semantic_w, cond_mode=args.cond_mode,
         flow_consistency_w=args.flow_consistency_w,
@@ -4615,6 +4820,9 @@ def main(argv=None):
         "image_feature_align_w": args.image_feature_align_w,
         "flow_feature_align_w": args.flow_feature_align_w,
         "image_feature_embed_dim": args.image_feature_embed_dim,
+        "flow_repa_w": args.flow_repa_w,
+        "flow_repa_steps": args.flow_repa_steps,
+        "flow_repa_embed_dim": args.flow_repa_embed_dim,
         "hidden": args.hidden,
         "ae_accum_steps": args.ae_accum_steps,
         "flow_accum_steps": args.flow_accum_steps,
@@ -4686,6 +4894,10 @@ def main(argv=None):
         "image_feature_aligner_state_dict": (
             getattr(flow, "image_feature_aligner", None).state_dict()
             if getattr(flow, "image_feature_aligner", None) is not None else {}
+        ),
+        "flow_repa_aligner_state_dict": (
+            getattr(flow, "flow_repa_aligner", None).state_dict()
+            if getattr(flow, "flow_repa_aligner", None) is not None else {}
         ),
         "flow_ema_state_dict": flow_ema if flow_ema is not None else {},
         "conditioner_ema_state_dict": (conditioner_ema if conditioner_ema is not None else {}),
