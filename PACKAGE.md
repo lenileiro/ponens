@@ -126,22 +126,27 @@ python -m thinking.distill --definitions   # add/refresh leveled definitions
 surface bank. It consumes web-backed semantic records, not next-token corpora: each example pairs
 natural language with a canonical meaning target, and the model must decode `extract fact ...`
 traces. The first importer is SNLI premise/hypothesis inference; the target is the human label
-(`entailment`, `contradiction`, or `neutral`) rendered as a canonical `nli` fact. The HANS
-importer adds controlled adversarial NLI examples for lexical-overlap, subsequence, and
-constituent heuristics; HANS `non-entailment` maps to SNLI-compatible `neutral` by default so
-checkpoints can be scored across both datasets. The grounded importer samples transcript-only
-descriptions from `thinking.multimodal` and asks that module to render the canonical multimodal
-trace; `thinking.text` parses that trace into target facts, so the text rung does not duplicate
-or hard-code the image/audio fact schema. The evaluator reports teacher-forced fact accuracy,
+(`entailment`, `contradiction`, or `neutral`) rendered as a canonical `nli` fact. The MultiNLI
+importer uses the same canonical target across broader genres, so the text rung can learn from
+more language domains without adding English rules. The HANS importer adds controlled
+adversarial NLI examples for lexical-overlap, subsequence, and constituent heuristics; HANS
+`non-entailment` maps to SNLI-compatible `neutral` by default so checkpoints can be scored
+across both datasets. The grounded importer samples transcript-only descriptions from
+`thinking.multimodal` and asks that module to render the canonical multimodal trace;
+`thinking.text` parses that trace into target facts, so the text rung does not duplicate or
+hard-code the image/audio fact schema. The evaluator reports teacher-forced fact accuracy,
 direct semantic-head fact accuracy, free decoded fact F1/exact match, per-dataset and
 per-heuristic buckets, paraphrase groups when the dataset supplies them, explicit counterfactual
 records when supplied, and an NLI artifact control that scores hypothesis-only and premise-only
-ablations.
+ablations. Large mixed-language runs can cap teacher/semantic eval with `--fact-n`,
+`--kind-fact-n`, and `--artifact-n`; sampled reports explicitly mark `sampled: true`.
 
 ```bash
 python -m thinking.text --selftest
 python -m thinking.text --import-snli --snli-zip /private/tmp/snli_1.0.zip \
     --snli-train 20000 --snli-eval 1000 --seed 11 --out data/text_snli.jsonl
+python -m thinking.text --import-mnli --mnli-zip /private/tmp/multinli_1.0.zip \
+    --mnli-train 20000 --mnli-eval 2000 --seed 19 --out data/text_mnli.jsonl
 python -m thinking.text --data data/text_snli.jsonl --steps 1500 --batch 64 --d 192 \
     --layers 4 --heads 6 --semantic-w 0.75 --free-n 200 --max-new 20 \
     --out runs/text_snli.json --checkpoint runs/text_snli.pt
@@ -171,6 +176,13 @@ python -m thinking.text --data data/text_snli.jsonl --data data/text_hans.jsonl 
     --free-n 80 --kind-free-n 5 --paraphrase-n 20 --counterfactual-n 20 --max-new 32 \
     --out runs/text_snli_hans_grounded_balanced.json \
     --checkpoint runs/text_snli_hans_grounded_balanced.pt
+python -m thinking.text --data data/text_snli.jsonl --data data/text_mnli.jsonl \
+    --data data/text_hans.jsonl --data data/text_grounded.jsonl \
+    --steps 120 --batch 48 --d 96 --layers 3 --heads 4 --semantic-w 0.75 \
+    --balance-by kind --fact-n 240 --kind-fact-n 40 --artifact-n 240 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_snli_mnli_hans_grounded_smoke.json \
+    --checkpoint runs/text_snli_mnli_hans_grounded_smoke.pt
 ```
 
 Current local Text-0 SNLI baseline (20k train / 1k dev, 1.5k steps, d=192, 4 layers, 6 heads,
@@ -213,6 +225,14 @@ grounded semantic accuracy high (**0.975**). It still fails the language gate: S
 semantic-head accuracy drops to **0.413** and sampled paraphrase consistency is only **0.65**.
 This says the next step is broader language supervision and better paraphrase/counterfactual
 coverage, not hand-coded English rules.
+
+The first MultiNLI integration is now wired and measured as a smoke, not as a mastery run. A
+20k-train / 2k-dev MultiNLI sample imports from the official NYU zip into
+`data/text_mnli.jsonl` across ten genres. A small SNLI+MultiNLI+HANS+grounded smoke
+(120 steps, d=96, sampled eval) completes end to end and writes a checkpoint before evaluation;
+it does **not** gate (**0.324** sampled teacher-forced, **0.591** sampled semantic-head). The
+useful outcome is infrastructure: wider web-backed semantic data, sampled large-set evaluation,
+and no hard-coded English rules.
 
 ## 3b. Image grounding: synthetic visual factors first
 

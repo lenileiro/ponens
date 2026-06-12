@@ -100,6 +100,8 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --eval-out runs/image_latent_dit_sweep.json
 .venv/bin/python -m thinking.text --import-snli --snli-zip /private/tmp/snli_1.0.zip \
     --snli-train 20000 --snli-eval 1000 --seed 11 --out data/text_snli.jsonl
+.venv/bin/python -m thinking.text --import-mnli --mnli-zip /private/tmp/multinli_1.0.zip \
+    --mnli-train 20000 --mnli-eval 2000 --seed 19 --out data/text_mnli.jsonl
 .venv/bin/python -m thinking.text --data data/text_snli.jsonl --steps 1500 \
     --batch 64 --d 192 --layers 4 --heads 6 --semantic-w 0.75 \
     --free-n 200 --max-new 20 \
@@ -131,6 +133,13 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --free-n 80 --kind-free-n 5 --paraphrase-n 20 --counterfactual-n 20 --max-new 32 \
     --out runs/text_snli_hans_grounded_balanced.json \
     --checkpoint runs/text_snli_hans_grounded_balanced.pt
+.venv/bin/python -m thinking.text --data data/text_snli.jsonl --data data/text_mnli.jsonl \
+    --data data/text_hans.jsonl --data data/text_grounded.jsonl \
+    --steps 120 --batch 48 --d 96 --layers 3 --heads 4 --semantic-w 0.75 \
+    --balance-by kind --fact-n 240 --kind-fact-n 40 --artifact-n 240 \
+    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
+    --out runs/text_snli_mnli_hans_grounded_smoke.json \
+    --checkpoint runs/text_snli_mnli_hans_grounded_smoke.pt
 .venv/bin/python -m thinking.multimodal --steps 240 --eval-n 120 --free-n 20 \
     --counterfactual-n 40 --free-counterfactual-n 20 \
     --out runs/m0_multimodal.json --checkpoint runs/m0_multimodal.pt

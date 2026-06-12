@@ -791,13 +791,13 @@ def fact_scores(pred, gold):
     return {"precision": precision, "recall": recall, "f1": f1, "exact": float(p == g)}
 
 
-def teacher_forced_eval(model, vocab, records, device=DEV):
-    eval_records = [r for r in records if r.split == "eval"]
+def teacher_forced_eval(model, vocab, records, device=DEV, n=0, seed=0):
+    selected = eval_records(records, n=n, seed=seed)
     model.eval()
     correct = total = 0
     with torch.no_grad():
-        for off in range(0, len(eval_records), 64):
-            batch = eval_records[off:off + 64]
+        for off in range(0, len(selected), 64):
+            batch = selected[off:off + 64]
             txt, ids = pack(batch, vocab, device)
             logits = model(txt, ids)
             for r, rec in enumerate(batch):
@@ -808,19 +808,24 @@ def teacher_forced_eval(model, vocab, records, device=DEV):
                     correct += int(pred == gold)
                     total += 1
                     pos += 5
-    return {"fact_value_acc": correct / max(1, total), "n_facts": total}
+    eval_count = len([r for r in records if r.split == "eval"])
+    return {"fact_value_acc": correct / max(1, total), "n_facts": total,
+            "n_records": len(selected),
+            "sampled": bool(n > 0 and n < eval_count),
+            "skipped": bool(n < 0)}
 
 
-def semantic_fact_eval(model, vocab, records, device=DEV):
+def semantic_fact_eval(model, vocab, records, device=DEV, n=0, seed=0):
     if model.fact_schema is None:
-        return {"fact_value_acc": 0.0, "n_facts": 0}
-    eval_records = [r for r in records if r.split == "eval"]
+        return {"fact_value_acc": 0.0, "n_facts": 0, "n_records": 0,
+                "sampled": False, "skipped": bool(n < 0)}
+    selected = eval_records(records, n=n, seed=seed)
     value_index = model.fact_schema.value_index
     correct = total = 0
     model.eval()
     with torch.no_grad():
-        for off in range(0, len(eval_records), 64):
-            batch = eval_records[off:off + 64]
+        for off in range(0, len(selected), 64):
+            batch = selected[off:off + 64]
             txt, _ids = pack(batch, vocab, device)
             logits = model.semantic_logits(txt)
             for r, rec in enumerate(batch):
@@ -833,19 +838,27 @@ def semantic_fact_eval(model, vocab, records, device=DEV):
                     pred_id = int(logits[key][r].argmax(-1))
                     correct += int(pred_id == value_index[(key, val)])
                     total += 1
-    return {"fact_value_acc": correct / max(1, total), "n_facts": total}
+    eval_count = len([r for r in records if r.split == "eval"])
+    return {"fact_value_acc": correct / max(1, total), "n_facts": total,
+            "n_records": len(selected),
+            "sampled": bool(n > 0 and n < eval_count),
+            "skipped": bool(n < 0)}
 
 
-def bucket_fact_eval(model, vocab, records, device=DEV):
+def bucket_fact_eval(model, vocab, records, device=DEV, n=0, seed=0):
     buckets = {}
     for rec in records:
         if rec.split == "eval":
             buckets.setdefault(rec.kind, []).append(rec)
     out = {}
-    for name, rows in sorted(buckets.items()):
-        teacher = teacher_forced_eval(model, vocab, rows, device=device)
-        semantic = semantic_fact_eval(model, vocab, rows, device=device)
+    for i, (name, rows) in enumerate(sorted(buckets.items())):
+        teacher = teacher_forced_eval(model, vocab, rows, device=device, n=n,
+                                      seed=seed + 2003 * i)
+        semantic = semantic_fact_eval(model, vocab, rows, device=device, n=n,
+                                      seed=seed + 3001 * i)
         out[name] = {"n": len(rows),
+                     "n_records": teacher["n_records"],
+                     "sampled": teacher["sampled"],
                      "teacher_forced_fact_value_acc": teacher["fact_value_acc"],
                      "semantic_fact_value_acc": semantic["fact_value_acc"]}
     return out
@@ -887,30 +900,42 @@ def _is_nli_record(rec):
     return any((slot, pred) == ("pair0", "nli") for slot, pred, _val in rec.facts)
 
 
-def nli_artifact_eval(model, vocab, records, full_fact_value_acc, device=DEV):
+def nli_artifact_eval(model, vocab, records, full_fact_value_acc, device=DEV, n=0, seed=0):
     """Hypothesis-only / premise-only controls for SNLI-style records.
 
     Gururangan et al. showed that NLI datasets can contain annotation artifacts where the
     hypothesis alone predicts the label surprisingly well.  A text-understanding gate should
     surface that shortcut instead of counting it as premise-hypothesis reasoning.
     """
-    eval_records = [r for r in records if r.split == "eval" and _is_nli_record(r)]
-    if not eval_records:
-        return {"n": 0}
-    hypo = [r for r in (_nli_side_record(rec, "hypothesis") for rec in eval_records)
+    all_eval = [r for r in records if r.split == "eval" and _is_nli_record(r)]
+    if n < 0:
+        return {"n": 0, "sampled": False, "skipped": True}
+    if not all_eval:
+        return {"n": 0, "sampled": False, "skipped": False}
+    eval_records_ = all_eval
+    sampled = bool(n and n < len(eval_records_))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(eval_records_), size=n, replace=False)
+        eval_records_ = [eval_records_[int(i)] for i in idx]
+    hypo = [r for r in (_nli_side_record(rec, "hypothesis") for rec in eval_records_)
             if r is not None]
-    prem = [r for r in (_nli_side_record(rec, "premise") for rec in eval_records)
+    prem = [r for r in (_nli_side_record(rec, "premise") for rec in eval_records_)
             if r is not None]
+    full_acc = teacher_forced_eval(model, vocab, eval_records_,
+                                   device=device)["fact_value_acc"]
     h_acc = teacher_forced_eval(model, vocab, hypo, device=device)["fact_value_acc"] if hypo else 0.0
     p_acc = teacher_forced_eval(model, vocab, prem, device=device)["fact_value_acc"] if prem else 0.0
     h_sem = semantic_fact_eval(model, vocab, hypo, device=device)["fact_value_acc"] if hypo else 0.0
     p_sem = semantic_fact_eval(model, vocab, prem, device=device)["fact_value_acc"] if prem else 0.0
-    full_sem = semantic_fact_eval(model, vocab, eval_records, device=device)["fact_value_acc"]
-    return {"n": len(eval_records),
+    full_sem = semantic_fact_eval(model, vocab, eval_records_, device=device)["fact_value_acc"]
+    return {"n": len(eval_records_),
+            "sampled": sampled,
+            "skipped": False,
             "hypothesis_only_fact_value_acc": h_acc,
             "premise_only_fact_value_acc": p_acc,
-            "full_minus_hypothesis_only": full_fact_value_acc - h_acc,
-            "full_minus_premise_only": full_fact_value_acc - p_acc,
+            "full_minus_hypothesis_only": full_acc - h_acc,
+            "full_minus_premise_only": full_acc - p_acc,
             "semantic_full_fact_value_acc": full_sem,
             "semantic_hypothesis_only_fact_value_acc": h_sem,
             "semantic_premise_only_fact_value_acc": p_sem,
@@ -1009,9 +1034,12 @@ def counterfactual_eval(model, vocab, records, device=DEV, max_new=80, n=0, seed
 
 
 def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
-                 paraphrase_n=0, counterfactual_n=0, kind_free_n=0, seed=0):
-    teacher = teacher_forced_eval(model, vocab, records, device=device)
-    semantic = semantic_fact_eval(model, vocab, records, device=device)
+                 paraphrase_n=0, counterfactual_n=0, kind_free_n=0,
+                 fact_n=0, kind_fact_n=0, artifact_n=0, seed=0):
+    teacher = teacher_forced_eval(model, vocab, records, device=device, n=fact_n,
+                                  seed=seed + 11)
+    semantic = semantic_fact_eval(model, vocab, records, device=device, n=fact_n,
+                                  seed=seed + 11)
     free = free_eval(model, vocab, records, device=device, max_new=max_new, n=free_n,
                      seed=seed)
     para = paraphrase_eval(model, vocab, records, device=device, max_new=max_new,
@@ -1019,8 +1047,9 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
     cf = counterfactual_eval(model, vocab, records, device=device, max_new=max_new,
                              n=counterfactual_n, seed=seed + 2)
     artifact = nli_artifact_eval(model, vocab, records, teacher["fact_value_acc"],
-                                 device=device)
-    by_kind = bucket_fact_eval(model, vocab, records, device=device)
+                                 device=device, n=artifact_n, seed=seed + 13)
+    by_kind = bucket_fact_eval(model, vocab, records, device=device, n=kind_fact_n,
+                               seed=seed + 19)
     by_kind_free = (bucket_free_eval(model, vocab, records, device=device, max_new=max_new,
                                      n=kind_free_n, seed=seed + 3)
                     if kind_free_n else {})
@@ -1028,7 +1057,8 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
             and (free.get("skipped") or free["f1"] >= 0.80)
             and (para.get("skipped") or para["n_groups"] == 0 or para["consistent"] >= 0.80)
             and (cf.get("skipped") or cf["n"] == 0 or cf["f1"] >= 0.80)
-            and (artifact["n"] == 0 or artifact["full_minus_hypothesis_only"] >= 0.05))
+            and (artifact.get("skipped") or artifact["n"] == 0
+                 or artifact["full_minus_hypothesis_only"] >= 0.05))
     return {"teacher_forced": teacher, "free_decode": free,
             "semantic_head": semantic,
             "by_kind": by_kind,
@@ -1074,7 +1104,8 @@ def vocab_coverage(records, vocab):
 
 
 def eval_checkpoint(checkpoint, data, out=None, device=DEV, max_new=160, free_n=0,
-                    paraphrase_n=0, counterfactual_n=0, kind_free_n=0, seed=0):
+                    paraphrase_n=0, counterfactual_n=0, kind_free_n=0,
+                    fact_n=0, kind_fact_n=0, artifact_n=0, seed=0):
     records = load_records(data, require_train=False, require_eval=True)
     model, vocab, ckpt = load_checkpoint(checkpoint, device=device)
     report = {"experiment": "text0_checkpoint_eval", "data": data,
@@ -1086,12 +1117,17 @@ def eval_checkpoint(checkpoint, data, out=None, device=DEV, max_new=160, free_n=
               "paraphrase_n": int(paraphrase_n),
               "counterfactual_n": int(counterfactual_n),
               "kind_free_n": int(kind_free_n),
+              "fact_n": int(fact_n),
+              "kind_fact_n": int(kind_fact_n),
+              "artifact_n": int(artifact_n),
               "vocab_coverage": vocab_coverage([r for r in records if r.split == "eval"],
                                                 vocab)}
     report.update(evaluate_all(model, vocab, records, device=device, max_new=max_new,
                                free_n=free_n, paraphrase_n=paraphrase_n,
                                counterfactual_n=counterfactual_n,
-                               kind_free_n=kind_free_n, seed=seed + 17))
+                               kind_free_n=kind_free_n, fact_n=fact_n,
+                               kind_fact_n=kind_fact_n, artifact_n=artifact_n,
+                               seed=seed + 17))
     if out:
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         with open(out, "w") as f:
@@ -1102,7 +1138,8 @@ def eval_checkpoint(checkpoint, data, out=None, device=DEV, max_new=160, free_n=
 
 def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, out=None,
         checkpoint=None, max_new=160, semantic_w=0.5, free_n=0, paraphrase_n=0,
-        counterfactual_n=0, kind_free_n=0, balance_by="none"):
+        counterfactual_n=0, kind_free_n=0, balance_by="none",
+        fact_n=0, kind_fact_n=0, artifact_n=0):
     records = load_records(data)
     model, vocab = train_model(records, steps=steps, batch=batch, d=d, layers=layers,
                                heads=heads, seed=seed, device=device, semantic_w=semantic_w,
@@ -1113,13 +1150,26 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
               "paraphrase_n": int(paraphrase_n),
               "counterfactual_n": int(counterfactual_n),
               "kind_free_n": int(kind_free_n),
+              "fact_n": int(fact_n),
+              "kind_fact_n": int(kind_fact_n),
+              "artifact_n": int(artifact_n),
               "balance_by": balance_by,
               "train_records": sum(r.split == "train" for r in records),
               "eval_records": sum(r.split == "eval" for r in records)}
+    if checkpoint:
+        os.makedirs(os.path.dirname(checkpoint) or ".", exist_ok=True)
+        torch.save({"state_dict": model.state_dict(), "vocab": vocab.itos,
+                    "d": d, "layers": layers, "heads": heads, "fact_schema": {
+                        "keys": model.fact_schema.keys,
+                        "values": model.fact_schema.values,
+                    }, "report": report | {"status": "trained_pending_eval"}},
+                   checkpoint)
     report.update(evaluate_all(model, vocab, records, device=device, max_new=max_new,
                                free_n=free_n, paraphrase_n=paraphrase_n,
                                counterfactual_n=counterfactual_n,
-                               kind_free_n=kind_free_n, seed=seed + 17))
+                               kind_free_n=kind_free_n, fact_n=fact_n,
+                               kind_fact_n=kind_fact_n, artifact_n=artifact_n,
+                               seed=seed + 17))
     if checkpoint:
         os.makedirs(os.path.dirname(checkpoint) or ".", exist_ok=True)
         torch.save({"state_dict": model.state_dict(), "vocab": vocab.itos,
@@ -1267,6 +1317,12 @@ def main(argv=None):
                     help="sample this many counterfactual records for slow free decoding; 0 = all, negative = skip")
     ap.add_argument("--kind-free-n", type=int, default=0, dest="kind_free_n",
                     help="sample this many eval records per kind for slow per-kind free decoding")
+    ap.add_argument("--fact-n", type=int, default=0, dest="fact_n",
+                    help="sample this many eval records for teacher/semantic fact eval; 0 = all")
+    ap.add_argument("--kind-fact-n", type=int, default=0, dest="kind_fact_n",
+                    help="sample this many eval records per kind for teacher/semantic buckets; 0 = all")
+    ap.add_argument("--artifact-n", type=int, default=0, dest="artifact_n",
+                    help="sample this many NLI eval records for artifact controls; 0 = all")
     ap.add_argument("--balance-by", choices=("none", "kind"), default="none",
                     help="balance training batches across metadata buckets")
     ap.add_argument("--semantic-w", type=float, default=0.5, dest="semantic_w",
@@ -1310,13 +1366,16 @@ def main(argv=None):
                         max_new=args.max_new, free_n=args.free_n,
                         paraphrase_n=args.paraphrase_n,
                         counterfactual_n=args.counterfactual_n,
-                        kind_free_n=args.kind_free_n, seed=args.seed)
+                        kind_free_n=args.kind_free_n, fact_n=args.fact_n,
+                        kind_fact_n=args.kind_fact_n, artifact_n=args.artifact_n,
+                        seed=args.seed)
         return
     run(args.data, steps=args.steps, batch=args.batch, d=args.d, layers=args.layers,
         heads=args.heads, seed=args.seed, out=args.out, checkpoint=args.checkpoint,
         max_new=args.max_new, semantic_w=args.semantic_w, free_n=args.free_n,
         paraphrase_n=args.paraphrase_n, counterfactual_n=args.counterfactual_n,
-        kind_free_n=args.kind_free_n, balance_by=args.balance_by)
+        kind_free_n=args.kind_free_n, balance_by=args.balance_by,
+        fact_n=args.fact_n, kind_fact_n=args.kind_fact_n, artifact_n=args.artifact_n)
 
 
 if __name__ == "__main__":
