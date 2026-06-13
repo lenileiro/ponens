@@ -684,6 +684,19 @@ shortcut controls (`question_only` **-0.225**, `context_only` **-0.1125**, `ques
 a representation/calibration method that improves shortcut dependence without making same-context
 controls overconfident.
 
+The evaluated QA head now uses candidate-specific answerability coverage when available, and
+`--choice-candidate-answerability-w` / `--choice-candidate-answerability-control-w` train that
+coverage directly. This follows the FER paper's warning that output accuracy alone is not enough:
+the model should represent answerability as reusable question-context-candidate structure, not as one
+record-level shortcut score. In the guarded 2-round SQuAD smoke, candidate coverage was active
+(`cand-ans` **1.774 -> 1.944**, generated control coverage **1.462 -> 0.998**) and round 2 raised
+primary aggregate choice to **0.425**, but it still overfit negatives (`squad_choice` **0.150**,
+absent **0.600**, swap **0.750**) and failed shortcut controls (`question_only` **-0.1375**,
+`question_swap` **-0.0385**). Confirmation preserved the same failure shape and regressed
+`squad_choice` from **0.250** to **0.150**, so `selected_round` stayed **0**. The next gap is
+question-conditioned evidence routing: coverage must depend on the actual question tokens enough to
+drop under question-only and swapped-question controls.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
