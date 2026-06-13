@@ -59,6 +59,34 @@ def parse_nonnegative_float_csv(raw, name):
     return vals or [0.0]
 
 
+def parse_source_weight_csv(raw, name):
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    vals = {}
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" in part:
+            key, value = part.split("=", 1)
+        elif ":" in part:
+            key, value = part.split(":", 1)
+        else:
+            raise ValueError(f"{name} entries must be source=weight or source:weight")
+        key = key.strip()
+        if not key:
+            raise ValueError(f"{name} contains an empty source key")
+        try:
+            val = float(value)
+        except ValueError:
+            raise ValueError(f"{name} weights must be numbers")
+        if val < 0.0:
+            raise ValueError(f"{name} weights must be non-negative")
+        vals[key] = val
+    return vals
+
+
 def local_path_for_arg(path):
     if not path:
         return ""
@@ -257,6 +285,7 @@ def payload(args):
                      f"--image-split {shlex_quote(args.image_split)} "
                      f"--image-max-records {args.image_max_records} "
                      f"--image-quality-weight {args.image_quality_weight} "
+                     f"--image-source-weights {shlex_quote(args.image_source_weights)} "
                      f"--image-quality-score-w {args.image_quality_score_w} "
                      f"--flow-quality-score-w {args.image_flow_quality_score_w} "
                      f"--caption-vocab-max {args.image_caption_vocab_max} "
@@ -770,6 +799,10 @@ def main():
                     dest="image_quality_weight",
                     help=("sample image manifest rows by normalized aesthetic/score/quality "
                           "metadata; 0 keeps uniform sampling"))
+    ap.add_argument("--image-source-weights", default="",
+                    dest="image_source_weights",
+                    help=("comma-separated source=weight data-mixture controls for image "
+                          "manifest rows; '*' sets the default source weight"))
     ap.add_argument("--image-quality-score-w", type=float, default=0.0,
                     dest="image_quality_score_w",
                     help="train a latent aesthetic/quality score head from image manifest metadata")
@@ -1064,6 +1097,10 @@ def main():
         sys.exit("ERROR: --image-embed-max-records must be non-negative")
     if args.image_hflip_prob < 0.0 or args.image_hflip_prob > 1.0:
         sys.exit("ERROR: --image-hflip-prob must be in [0, 1]")
+    try:
+        parse_source_weight_csv(args.image_source_weights, "--image-source-weights")
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
     if args.image_cfg_rescale < 0.0 or args.image_cfg_rescale > 1.0:
         sys.exit("ERROR: --image-cfg-rescale must be in [0, 1]")
     try:

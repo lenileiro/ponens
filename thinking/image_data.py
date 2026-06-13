@@ -33,6 +33,7 @@ class ImageTextRecord:
     path: str
     caption: str
     split: str = "train"
+    source: str = ""
     aesthetic: float | None = None
     width: int = 0
     height: int = 0
@@ -130,6 +131,14 @@ def _coerce_record(row, manifest_dir, root=""):
         path=os.path.normpath(path),
         caption=str(caption),
         split=str(row.get("split") or "train"),
+        source=str(
+            row.get("source")
+            or row.get("dataset")
+            or row.get("domain")
+            or row.get("collection")
+            or row.get("bucket")
+            or ""
+        ),
         aesthetic=aesthetic,
         width=width,
         height=height,
@@ -349,16 +358,21 @@ def read_image_manifest(path, root="", split="train", min_aesthetic=None, max_re
 def summarize_records(records: Iterable[ImageTextRecord]):
     rows = list(records)
     splits = {}
+    sources = {}
     aesthetic = []
     caption_lens = []
     for rec in rows:
         splits[rec.split] = splits.get(rec.split, 0) + 1
+        source = str(getattr(rec, "source", "") or "").strip()
+        if source:
+            sources[source] = sources.get(source, 0) + 1
         if rec.aesthetic is not None:
             aesthetic.append(float(rec.aesthetic))
         caption_lens.append(len(caption_tokens(rec.caption)))
     out = {
         "image_records": len(rows),
         "image_splits": splits,
+        "image_sources": dict(sorted(sources.items())),
         "caption_token_mean": float(np.mean(caption_lens)) if caption_lens else 0.0,
         "text_embedding_records": sum(1 for r in rows if r.text_embedding is not None),
         "text_embedding_sequence_records": sum(
@@ -610,6 +624,8 @@ def _record_to_manifest_row(rec: ImageTextRecord, root=""):
         "caption": rec.caption,
         "split": rec.split,
     }
+    if rec.source:
+        row["source"] = rec.source
     if rec.aesthetic is not None:
         row["aesthetic"] = float(rec.aesthetic)
     if rec.width:
@@ -822,6 +838,7 @@ def selftest():
                 "image": "sample.ppm",
                 "caption": "red and green blocks",
                 "split": "train",
+                "source": "fixture",
                 "text_embedding": [0.1, 0.2, 0.3],
                 "text_embedding_sequence": [[0.1, 0.0], [0.0, 0.2]],
                 "image_embedding": [0.4, 0.5, 0.6, 0.7],
@@ -829,6 +846,7 @@ def selftest():
             }) + "\n")
         records = read_image_manifest(manifest)
         assert len(records) == 1 and records[0].caption.startswith("red")
+        assert records[0].source == "fixture"
         assert records[0].text_embedding == (0.1, 0.2, 0.3)
         assert records[0].text_embedding_sequence == ((0.1, 0.0), (0.0, 0.2))
         assert records[0].image_embedding == (0.4, 0.5, 0.6, 0.7)
@@ -863,6 +881,7 @@ def selftest():
         assert weighted_captions == ["weighted target"] * 8
         summary = summarize_records(records)
         assert summary["image_records"] == 1 and summary["image_splits"]["train"] == 1
+        assert summary["image_sources"] == {"fixture": 1}
         assert summary["text_embedding_records"] == 1 and summary["text_embedding_dims"] == [3]
         assert summary["text_embedding_sequence_records"] == 1
         assert summary["text_embedding_sequence_dims"] == [2]
@@ -871,7 +890,7 @@ def selftest():
         with open(qa_manifest, "w", encoding="utf-8") as f:
             for row in (
                     {"image": "sample.ppm", "caption": "red green blocks",
-                     "split": "train", "text_embedding": [1.0, 0.0],
+                     "split": "train", "source": "qa", "text_embedding": [1.0, 0.0],
                      "text_embedding_sequence": [[1.0, 0.0], [0.0, 1.0]],
                      "image_embedding": [0.0, 1.0]},
                     {"image": "sample.ppm", "caption": "duplicate patch", "split": "train"},
@@ -891,6 +910,7 @@ def selftest():
         with open(filtered, "r", encoding="utf-8") as f:
             filtered_row = json.loads(f.readline())
         assert filtered_row["image"] == "sample.ppm"
+        assert filtered_row["source"] == "qa"
         assert filtered_row["text_embedding"] == [1.0, 0.0]
         assert filtered_row["text_embedding_sequence"] == [[1.0, 0.0], [0.0, 1.0]]
         assert filtered_row["image_embedding"] == [0.0, 1.0]
@@ -922,6 +942,7 @@ def selftest():
         assert overwritten[0].image_embedding == (7.0, 6.0, 5.0)
         reread = read_image_manifest(filtered, root=td, split="train")
         assert len(reread) == 1 and reread[0].width == 8 and reread[0].height == 6
+        assert reread[0].source == "qa"
     print("image_data selftest OK")
 
 

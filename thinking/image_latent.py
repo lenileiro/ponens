@@ -544,6 +544,103 @@ def quality_sampling_weights(records, strength=0.0):
     return weights.astype(np.float64), report
 
 
+def record_source_key(rec):
+    source = str(getattr(rec, "source", "") or "").strip()
+    return source or "__unknown__"
+
+
+def parse_source_weight_spec(spec):
+    spec = str(spec or "").strip()
+    if not spec:
+        return {}
+    if spec.startswith("{"):
+        raw = json.loads(spec)
+        if not isinstance(raw, dict):
+            raise ValueError("image_source_weights JSON must be an object")
+        items = raw.items()
+    else:
+        items = []
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" in part:
+                key, value = part.split("=", 1)
+            elif ":" in part:
+                key, value = part.split(":", 1)
+            else:
+                raise ValueError(
+                    "image_source_weights entries must be source=weight or source:weight"
+                )
+            items.append((key, value))
+    weights = {}
+    for key, value in items:
+        key = str(key).strip()
+        if not key:
+            raise ValueError("image_source_weights contains an empty source key")
+        val = float(value)
+        if val < 0.0:
+            raise ValueError("image_source_weights must be non-negative")
+        weights[key] = val
+    return weights
+
+
+def source_sampling_weights(records, spec=""):
+    rows = list(records)
+    counts = {}
+    for rec in rows:
+        key = record_source_key(rec)
+        counts[key] = counts.get(key, 0) + 1
+    weights_by_source = parse_source_weight_spec(spec)
+    report = {
+        "image_source_weights": dict(sorted(weights_by_source.items())),
+        "image_source_weighted": False,
+        "image_source_weight_records": int(len(rows)),
+        "image_source_weight_default": float(weights_by_source.get("*", 1.0)),
+        "image_source_counts": dict(sorted(counts.items())),
+    }
+    if not weights_by_source or not rows:
+        return None, report
+    default = float(weights_by_source.get("*", 1.0))
+    weights = np.asarray([
+        float(weights_by_source.get(record_source_key(rec), default))
+        for rec in rows
+    ], dtype=np.float64)
+    if not np.all(np.isfinite(weights)):
+        raise ValueError("image_source_weights must be finite")
+    if float(weights.sum()) <= 0.0:
+        raise ValueError("image_source_weights give every manifest record zero probability")
+    report.update({
+        "image_source_weighted": True,
+        "image_source_weight_min": float(np.min(weights)),
+        "image_source_weight_mean": float(np.mean(weights)),
+        "image_source_weight_max": float(np.max(weights)),
+        "image_source_weight_ratio": float(
+            np.max(weights) / max(np.min(weights), 1.0e-12)
+        ),
+    })
+    return weights, report
+
+
+def combine_sampling_weights(*weight_sets):
+    arrays = [np.asarray(w, dtype=np.float64) for w in weight_sets if w is not None]
+    if not arrays:
+        return None
+    shape = arrays[0].shape
+    out = np.ones(shape, dtype=np.float64)
+    for arr in arrays:
+        if arr.shape != shape:
+            raise ValueError(f"sampling weight shape mismatch: {arr.shape} vs {shape}")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("sampling weights must be finite")
+        if np.any(arr < 0.0):
+            raise ValueError("sampling weights must be non-negative")
+        out *= arr
+    if float(out.sum()) <= 0.0:
+        raise ValueError("combined sampling weights have zero probability mass")
+    return out
+
+
 def quality_score_stats(records):
     vals = np.asarray([
         float(rec.aesthetic) if rec.aesthetic is not None else np.nan
@@ -5378,6 +5475,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       image_manifest="", image_root="", image_split="train",
                       image_min_aesthetic=None, image_max_records=0,
                       image_quality_weight=0.0,
+                      image_source_weights="",
                       image_quality_score_w=0.0, flow_quality_score_w=0.0,
                       caption_vocab_max=8192, caption_max_len=64,
                       caption_cond_source="tokens",
@@ -5475,6 +5573,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("image_quality_weight must be non-negative")
     if image_quality_weight > 0.0 and image_records is None:
         raise ValueError("image_quality_weight requires image_manifest training")
+    source_weight_map = parse_source_weight_spec(image_source_weights)
+    if source_weight_map and image_records is None:
+        raise ValueError("image_source_weights require image_manifest training")
     if image_quality_score_w < 0.0 or flow_quality_score_w < 0.0:
         raise ValueError("quality score weights must be non-negative")
     if (image_quality_score_w > 0.0 or flow_quality_score_w > 0.0) and image_records is None:
@@ -5564,6 +5665,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     prompt_vocab = None
     image_sample_weights = None
     image_record_weights = None
+    image_source_report = {
+        "image_source_weights": dict(sorted(source_weight_map.items())),
+        "image_source_weighted": False,
+        "image_source_weight_records": 0,
+        "image_source_weight_default": float(source_weight_map.get("*", 1.0)),
+        "image_source_counts": {},
+    }
     image_quality_report = {
         "image_quality_weight": float(image_quality_weight),
         "image_quality_weighted": False,
@@ -5572,8 +5680,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "image_quality_weight_missing": 0,
     }
     if image_records is not None:
-        image_sample_weights, image_quality_report = quality_sampling_weights(
+        quality_weights, image_quality_report = quality_sampling_weights(
             image_records, image_quality_weight)
+        source_weights, image_source_report = source_sampling_weights(
+            image_records, image_source_weights)
+        image_sample_weights = combine_sampling_weights(quality_weights, source_weights)
         image_record_weights = record_weight_lookup(image_records, image_sample_weights)
     image_quality_score_stats = (
         quality_score_stats(image_records) if image_records is not None else
@@ -6249,6 +6360,17 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             float(image_min_aesthetic) if image_min_aesthetic is not None else None
         ),
         **image_quality_report,
+        **image_source_report,
+        "image_sampling_weighted": image_sample_weights is not None,
+        "image_sampling_weight_min": (
+            float(np.min(image_sample_weights)) if image_sample_weights is not None else 0.0
+        ),
+        "image_sampling_weight_mean": (
+            float(np.mean(image_sample_weights)) if image_sample_weights is not None else 0.0
+        ),
+        "image_sampling_weight_max": (
+            float(np.max(image_sample_weights)) if image_sample_weights is not None else 0.0
+        ),
         "image_quality_score_w": float(image_quality_score_w),
         "flow_quality_score_w": float(flow_quality_score_w),
         "image_quality_scorer": image_quality_scorer is not None,
@@ -6541,11 +6663,11 @@ def selftest():
         os.makedirs(img_dir, exist_ok=True)
         manifest = os.path.join(td, "manifest.jsonl")
         rows = []
-        for i, (name, split, color) in enumerate((
-                ("red.ppm", "train", (255, 0, 0)),
-                ("green.ppm", "train", (0, 255, 0)),
-                ("blue.ppm", "eval", (0, 0, 255)),
-                ("white.ppm", "eval", (255, 255, 255)))):
+        for i, (name, split, source, color) in enumerate((
+                ("red.ppm", "train", "curated", (255, 0, 0)),
+                ("green.ppm", "train", "synthetic", (0, 255, 0)),
+                ("blue.ppm", "eval", "curated", (0, 0, 255)),
+                ("white.ppm", "eval", "synthetic", (255, 255, 255)))):
             arr = np.zeros((8, 8, 3), dtype=np.uint8)
             arr[:, :] = np.asarray(color, dtype=np.uint8)
             with open(os.path.join(img_dir, name), "wb") as f:
@@ -6553,6 +6675,7 @@ def selftest():
                 f.write(arr.tobytes())
             rows.append({"image": name, "caption": f"{split} color patch {i}",
                          "split": split,
+                         "source": source,
                          "aesthetic": float(i + 1),
                          "text_embedding": [float(i), float(i + 1), float(i % 2), 1.0],
                          "text_embedding_sequence": [
@@ -6574,7 +6697,9 @@ def selftest():
             image_text_align_w=0.1, flow_text_align_w=0.1, text_embed_dim=12,
             image_feature_align_w=0.1, flow_feature_align_w=0.1,
             image_feature_embed_dim=10, flow_repa_w=0.1, flow_repa_embed_dim=11,
-            image_quality_weight=2.0, image_quality_score_w=0.1,
+            image_quality_weight=2.0,
+            image_source_weights="curated=3.0,synthetic=0.5,*=1.0",
+            image_quality_score_w=0.1,
             flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
             intervention_samples=0, return_conditioner=True, return_aligner=True)
         assert report6["data_mode"] == "image_manifest"
@@ -6601,6 +6726,13 @@ def selftest():
         assert report6["image_quality_weight_source"] == "aesthetic_score_quality"
         assert report6["image_quality_weight_records"] == 2
         assert report6["image_quality_weight_ratio"] > 1.0
+        assert report6["image_source_weighted"] is True
+        assert report6["image_source_weights"]["curated"] == 3.0
+        assert report6["image_source_weight_default"] == 1.0
+        assert report6["image_source_counts"] == {"curated": 1, "synthetic": 1}
+        assert report6["image_sources"] == {"curated": 1, "synthetic": 1}
+        assert report6["image_sampling_weighted"] is True
+        assert report6["image_sampling_weight_max"] > report6["image_sampling_weight_min"]
         assert report6["image_quality_scorer"] is True
         assert report6["image_quality_score_records"] == 2
         assert "quality_score_loss" in report6["last_ae"]
@@ -7103,6 +7235,10 @@ def main(argv=None):
                     dest="image_quality_weight",
                     help=("sample manifest rows by normalized aesthetic/score/quality metadata; "
                           "0 keeps uniform sampling"))
+    ap.add_argument("--image-source-weights", default="",
+                    dest="image_source_weights",
+                    help=("comma-separated source=weight data-mixture controls for image "
+                          "manifest rows; '*' sets the default source weight"))
     ap.add_argument("--image-quality-score-w", type=float, default=0.0,
                     dest="image_quality_score_w",
                     help="train a latent aesthetic/quality score head on manifest metadata")
@@ -7218,6 +7354,7 @@ def main(argv=None):
             args.sample_feature_guidance_interval)
         sample_quality_guidance_interval = _parse_interval(
             args.sample_quality_guidance_interval)
+        parse_source_weight_spec(args.image_source_weights)
         sample_schedules = (
             _parse_string_list(args.sample_schedules) if args.sample_schedules else None
         )
@@ -7258,6 +7395,8 @@ def main(argv=None):
         bad_schedules = sorted(set(sample_schedules) - set(SAMPLE_SCHEDULES))
         if bad_schedules:
             ap.error(f"unknown sample schedule(s): {','.join(bad_schedules)}")
+    if args.image_source_weights and not args.image_manifest:
+        ap.error("--image-source-weights requires --image-manifest")
     if args.eval_checkpoint:
         report = evaluate_checkpoint(
             args.eval_checkpoint,
@@ -7438,6 +7577,7 @@ def main(argv=None):
         image_split=args.image_split, image_min_aesthetic=args.image_min_aesthetic,
         image_max_records=args.image_max_records,
         image_quality_weight=args.image_quality_weight,
+        image_source_weights=args.image_source_weights,
         image_quality_score_w=args.image_quality_score_w,
         flow_quality_score_w=args.flow_quality_score_w,
         caption_vocab_max=args.caption_vocab_max,
@@ -7635,6 +7775,10 @@ def main(argv=None):
         "image_min_aesthetic": args.image_min_aesthetic,
         "image_quality_weight": args.image_quality_weight,
         "image_quality_weighted": report.get("image_quality_weighted", False),
+        "image_source_weights": args.image_source_weights,
+        "image_source_weighted": report.get("image_source_weighted", False),
+        "image_source_counts": report.get("image_source_counts", {}),
+        "image_sampling_weighted": report.get("image_sampling_weighted", False),
         "image_quality_score_w": args.image_quality_score_w,
         "flow_quality_score_w": args.flow_quality_score_w,
         "image_quality_scorer": report.get("image_quality_scorer", False),

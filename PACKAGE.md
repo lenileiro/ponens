@@ -1419,6 +1419,15 @@ RunPod exposes the same knobs as `--image-eval-text-guidance-sweep`,
 validation. This gives real-image runs a generic way to measure whether text, external-feature, or
 quality guidance improves sample metrics before scaling the setting on GPU.
 
+Image-73 adds generic manifest source-mixture weighting. Manifest rows now preserve a `source`
+field (or `dataset` / `domain` / `collection` / `bucket` aliases), summaries report source counts,
+and `thinking.image_latent --image-source-weights "curated=2.0,text_render=1.5,*=0.5"` multiplies
+those weights with existing quality weights for AE training, latent-stat estimation, flow training,
+and latent-cache sampling. RunPod exposes the same setting as `--image-source-weights`. This is the
+data-composition lever we need for SOTA-scale image training: we can rebalance curated photos,
+synthetic/diagram/text-rendering subsets, and noisy web data without adding domain-specific model
+rules.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
