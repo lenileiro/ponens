@@ -1578,6 +1578,20 @@ checkpoints record the full architecture, and RunPod forwards the same levers th
 `--multimodal-trunk-arch`, `--multimodal-img-tokens`, `--multimodal-txt-tokens`,
 `--multimodal-dropout`, and `--multimodal-agreement-w`.
 
+M-2 upstream concept update: multimodal now has a shared concept-fusion architecture instead of
+only concatenating independent reader prefixes. `--fusion-arch concept` prepends learned concept
+tokens, mixes them with image/audio/text prefixes before the trace decoder, and exposes an
+auxiliary concept head over the same factor schema. `--concept-w` trains those upstream concept
+tokens directly, `--concept-agreement-w` aligns their factor distributions across full,
+sensor-only, and text-only paths, and `--concept-distill-w` distills the full multimodal concept
+distribution into partial modes. This lets the multimodal bridge use the same idea as the text
+self-teaching work: preserve and transfer model-derived concept distributions upstream, before the
+canonical trace decoder has to emit tokens. `--fusion-arch concat` remains available as the old
+architecture. Reports now include `concept_head`, `concept_gate`, reader-prefix token count, and
+total prefix token count, and RunPod exposes the new controls as `--multimodal-fusion-arch`,
+`--multimodal-concept-tokens`, `--multimodal-fusion-layers`, `--multimodal-concept-w`,
+`--multimodal-concept-agreement-w`, and `--multimodal-concept-distill-w`.
+
 M-0 local update (240 steps, value-token weighted loss, all-mode ablations every step): the
 tracked run now gates three paths separately. Teacher-forced full multimodal accuracy is color
 **1.00**, shape **1.00**, pitch **0.79**, timbre **0.94**, envelope **1.00**. Text-only held-out

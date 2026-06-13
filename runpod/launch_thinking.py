@@ -411,6 +411,14 @@ def payload(args):
                 f"--lr {args.multimodal_lr} --log-every {args.multimodal_log_every} "
                 f"--value-w {args.multimodal_value_w} "
                 f"--agreement-w {args.multimodal_agreement_w} "
+                f"--fusion-arch {args.multimodal_fusion_arch} "
+                f"--concept-tokens {args.multimodal_concept_tokens} "
+                f"--fusion-layers {args.multimodal_fusion_layers} "
+                f"--concept-w {args.multimodal_concept_w} "
+                f"--concept-agreement-w {args.multimodal_concept_agreement_w} "
+                f"--concept-distill-w {args.multimodal_concept_distill_w} "
+                f"--concept-distill-temperature "
+                f"{args.multimodal_concept_distill_temperature} "
                 f"--img-tokens {args.multimodal_img_tokens} "
                 f"--aud-tokens {args.multimodal_aud_tokens} "
                 f"--txt-tokens {args.multimodal_txt_tokens} "
@@ -1086,6 +1094,24 @@ def main():
     ap.add_argument("--multimodal-agreement-w", type=float, default=0.0,
                     dest="multimodal_agreement_w",
                     help="M-0 cross-mode factor-value agreement loss weight")
+    ap.add_argument("--multimodal-fusion-arch", default="concept",
+                    choices=("concat", "concept"), dest="multimodal_fusion_arch",
+                    help="M-0 upstream fusion architecture")
+    ap.add_argument("--multimodal-concept-tokens", type=int, default=4,
+                    dest="multimodal_concept_tokens")
+    ap.add_argument("--multimodal-fusion-layers", type=int, default=1,
+                    dest="multimodal_fusion_layers")
+    ap.add_argument("--multimodal-concept-w", type=float, default=0.0,
+                    dest="multimodal_concept_w",
+                    help="M-0 upstream concept-token factor loss weight")
+    ap.add_argument("--multimodal-concept-agreement-w", type=float, default=0.0,
+                    dest="multimodal_concept_agreement_w",
+                    help="M-0 cross-mode upstream concept agreement weight")
+    ap.add_argument("--multimodal-concept-distill-w", type=float, default=0.0,
+                    dest="multimodal_concept_distill_w",
+                    help="M-0 full-to-partial upstream concept distillation weight")
+    ap.add_argument("--multimodal-concept-distill-temperature", type=float, default=1.0,
+                    dest="multimodal_concept_distill_temperature")
     ap.add_argument("--multimodal-img-tokens", type=int, default=4,
                     dest="multimodal_img_tokens")
     ap.add_argument("--multimodal-aud-tokens", type=int, default=8,
@@ -1275,6 +1301,8 @@ def main():
             "--multimodal-trunk-width": args.multimodal_trunk_width,
             "--multimodal-trunk-depth": args.multimodal_trunk_depth,
             "--multimodal-text-layers": args.multimodal_text_layers,
+            "--multimodal-concept-tokens": args.multimodal_concept_tokens,
+            "--multimodal-fusion-layers": args.multimodal_fusion_layers,
             "--multimodal-eval-n": args.multimodal_eval_n,
         }
         for name, value in positive.items():
@@ -1289,8 +1317,13 @@ def main():
             sys.exit("ERROR: multimodal head dimension must be even for rope attention")
         if args.multimodal_lr <= 0.0:
             sys.exit("ERROR: --multimodal-lr must be positive")
-        if args.multimodal_value_w < 0.0 or args.multimodal_agreement_w < 0.0:
+        if (args.multimodal_value_w < 0.0 or args.multimodal_agreement_w < 0.0
+                or args.multimodal_concept_w < 0.0
+                or args.multimodal_concept_agreement_w < 0.0
+                or args.multimodal_concept_distill_w < 0.0):
             sys.exit("ERROR: multimodal loss weights must be non-negative")
+        if args.multimodal_concept_distill_temperature <= 0.0:
+            sys.exit("ERROR: --multimodal-concept-distill-temperature must be positive")
         if args.multimodal_dropout < 0.0 or args.multimodal_dropout > 1.0:
             sys.exit("ERROR: --multimodal-dropout must be in [0, 1]")
         if (args.multimodal_free_n < 0 or args.multimodal_counterfactual_n < 0

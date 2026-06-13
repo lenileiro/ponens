@@ -40,6 +40,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_SURFACES = os.path.join(ROOT, "data", "multimodal_transcripts.json")
 MODES = ("full", "sensor_only", "text_only")
 TRUNK_ARCHES = ("conv", "residual")
+FUSION_ARCHES = ("concat", "concept")
 FACTOR_VALUES = {
     "color": COLOR_NAMES,
     "shape": SHAPES,
@@ -47,6 +48,9 @@ FACTOR_VALUES = {
     "timbre": TIMBRES,
     "env": ENVELOPES,
 }
+VALUE_POS = {"color": 4, "shape": 9, "pitch": 14, "timbre": 19, "env": 24}  # value tokens
+FACTOR_INDEX = {k: {v: i for i, v in enumerate(vals)}
+                for k, vals in FACTOR_VALUES.items()}
 FORMATTER = string.Formatter()
 
 
@@ -289,18 +293,45 @@ class TextTrunk(nn.Module):
         return h
 
 
+class ConceptFusion(nn.Module):
+    """Shared concept-token mixer for image/audio/text prefixes before decoding."""
+
+    def __init__(self, d, heads=4, concept_tokens=4, layers=1):
+        super().__init__()
+        self.concept_tokens = int(concept_tokens)
+        self.layers = int(layers)
+        if self.concept_tokens <= 0 or self.layers <= 0:
+            raise ValueError("concept token/layer counts must be positive")
+        self.queries = nn.Parameter(torch.randn(self.concept_tokens, d) * 0.02)
+        enc = nn.TransformerEncoderLayer(d_model=d, nhead=heads, dim_feedforward=4 * d,
+                                         dropout=0.0, activation="gelu", batch_first=True)
+        self.enc = nn.TransformerEncoder(enc, num_layers=self.layers,
+                                         enable_nested_tensor=False)
+        self.ln = nn.LayerNorm(d)
+
+    def forward(self, ip, ap, tp):
+        q = self.queries.unsqueeze(0).expand(ip.shape[0], -1, -1)
+        h = torch.cat([q, ip, ap, tp], dim=1)
+        h = self.ln(self.enc(h))
+        return h, h[:, :self.concept_tokens]
+
+
 class MultimodalLM(nn.Module):
     """Image, audio, and transcript readers feeding one trace decoder."""
 
     def __init__(self, vocab_size, d=96, layers=3, heads=4, pad=0, max_len=128,
                  img_tokens=4, aud_tokens=8, txt_tokens=8, trunk_arch="conv",
-                 trunk_width=64, trunk_depth=1, text_layers=1, modality_dropout=0.0):
+                 trunk_width=64, trunk_depth=1, text_layers=1, modality_dropout=0.0,
+                 fusion_arch="concept", concept_tokens=4, fusion_layers=1):
         super().__init__()
         if img_tokens <= 0 or aud_tokens <= 0 or txt_tokens <= 0:
             raise ValueError("multimodal prefix token counts must be positive")
         if modality_dropout < 0.0 or modality_dropout > 1.0:
             raise ValueError("modality_dropout must be in [0, 1]")
         trunk_arch = str(trunk_arch)
+        fusion_arch = str(fusion_arch)
+        if fusion_arch not in FUSION_ARCHES:
+            raise ValueError(f"unknown multimodal fusion arch {fusion_arch!r}")
         self.config = {
             "vocab_size": int(vocab_size), "d": int(d), "layers": int(layers),
             "heads": int(heads), "pad": int(pad), "max_len": int(max_len),
@@ -308,8 +339,11 @@ class MultimodalLM(nn.Module):
             "txt_tokens": int(txt_tokens), "trunk_arch": trunk_arch,
             "trunk_width": int(trunk_width), "trunk_depth": int(trunk_depth),
             "text_layers": int(text_layers), "modality_dropout": float(modality_dropout),
+            "fusion_arch": fusion_arch, "concept_tokens": int(concept_tokens),
+            "fusion_layers": int(fusion_layers),
         }
         self.modality_dropout = float(modality_dropout)
+        self.fusion_arch = fusion_arch
         self.lm = ScratchpadLM(vocab_size, d=d, layers=layers, heads=heads, max_len=max_len,
                                pad=pad, pointer=False, loop=False)
         img_pool = _grid_pool(img_tokens)
@@ -321,6 +355,13 @@ class MultimodalLM(nn.Module):
                               width=trunk_width, depth=trunk_depth)
         self.txt = TextTrunk(vocab_size, d, pad=pad, n_tokens=txt_tokens, heads=heads,
                              layers=text_layers, modality=2)
+        self.fusion = (ConceptFusion(d, heads=heads, concept_tokens=concept_tokens,
+                                     layers=fusion_layers)
+                       if fusion_arch == "concept" else None)
+        self.factor_queries = nn.Parameter(torch.randn(len(VALUE_POS), d) * 0.02)
+        self.factor_heads = nn.ModuleDict({
+            factor: nn.Linear(d, len(FACTOR_VALUES[factor])) for factor in VALUE_POS
+        })
 
     def _apply_modality_dropout(self, ip, ap, tp):
         if not self.training or self.modality_dropout <= 0.0:
@@ -335,7 +376,7 @@ class MultimodalLM(nn.Module):
         ]
         return ip * masks[0], ap * masks[1], tp * masks[2]
 
-    def forward(self, img, aud, txt, ids, mode="full"):
+    def encode_prefix(self, img, aud, txt, mode="full"):
         ip, ap, tp = self.img(img), self.aud(aud), self.txt(txt)
         if mode == "text_only":
             ip, ap = ip * 0.0, ap * 0.0
@@ -345,7 +386,24 @@ class MultimodalLM(nn.Module):
             raise ValueError(f"unknown multimodal mode {mode!r}")
         elif self.modality_dropout > 0.0:
             ip, ap, tp = self._apply_modality_dropout(ip, ap, tp)
-        prefix = torch.cat([ip, ap, tp], dim=1)
+        if self.fusion is None:
+            prefix = torch.cat([ip, ap, tp], dim=1)
+            return prefix, None
+        return self.fusion(ip, ap, tp)
+
+    def factor_logits(self, img, aud, txt, mode="full"):
+        prefix, concepts = self.encode_prefix(img, aud, txt, mode=mode)
+        source = concepts if concepts is not None else prefix
+        scale = source.shape[-1] ** -0.5
+        out = {}
+        for idx, factor in enumerate(VALUE_POS):
+            scores = (source * self.factor_queries[idx]).sum(-1) * scale
+            pooled = (scores.softmax(-1).unsqueeze(-1) * source).sum(1)
+            out[factor] = self.factor_heads[factor](pooled)
+        return out
+
+    def forward(self, img, aud, txt, ids, mode="full"):
+        prefix, _concepts = self.encode_prefix(img, aud, txt, mode=mode)
         logits = self.lm(ids, prefix=prefix)
         return logits[:, prefix.shape[1]:]                  # token positions only
 
@@ -390,9 +448,6 @@ def _batch(n, rng, vocab, device, surfaces, text_split="train"):
     return x, a, t, ids, golds
 
 
-VALUE_POS = {"color": 4, "shape": 9, "pitch": 14, "timbre": 19, "env": 24}  # token index of value
-
-
 def evaluate(model, vocab, surfaces, n=200, seed=1, device=DEV, text_split="eval", mode="full"):
     """Teacher-forced per-factor accuracy: at each fact's value position, does the model put
     the oracle value first among that factor's candidates?"""
@@ -409,6 +464,26 @@ def evaluate(model, vocab, surfaces, n=200, seed=1, device=DEV, text_split="eval
                 pred = logits[:, pos - 1].argmax(-1)        # next-token prediction of the value
                 for r in range(b):
                     hits[k] += int(vocab.itos[int(pred[r])] == golds[r][k])
+    return {k: v / n for k, v in hits.items()}
+
+
+def concept_evaluate(model, vocab, surfaces, n=200, seed=11, device=DEV, text_split="eval",
+                     mode="full"):
+    """Auxiliary concept-token factor accuracy before the trace decoder."""
+    rng = np.random.default_rng(seed)
+    model.eval()
+    hits = {k: 0 for k in VALUE_POS}
+    with torch.no_grad():
+        for off in range(0, n, 50):
+            b = min(50, n - off)
+            img, aud, txt, _ids, golds = _batch(b, rng, vocab, device, surfaces,
+                                                text_split=text_split)
+            logits = model.factor_logits(img, aud, txt, mode=mode)
+            for factor in VALUE_POS:
+                pred = logits[factor].argmax(-1)
+                values = FACTOR_VALUES[factor]
+                for r in range(b):
+                    hits[factor] += int(values[int(pred[r])] == golds[r][factor])
     return {k: v / n for k, v in hits.items()}
 
 
@@ -596,10 +671,72 @@ def value_agreement_loss(logits_by_mode, vocab):
     return torch.stack(losses).mean()
 
 
+def concept_factor_targets(golds, factor, device):
+    return torch.tensor([FACTOR_INDEX[factor][gold[factor]] for gold in golds],
+                        dtype=torch.long, device=device)
+
+
+def concept_factor_loss(factor_logits_by_mode, golds):
+    if not factor_logits_by_mode:
+        return torch.tensor(0.0)
+    first_mode = next(iter(factor_logits_by_mode.values()))
+    first_factor = next(iter(first_mode.values()))
+    device = first_factor.device
+    losses = []
+    for logits_by_factor in factor_logits_by_mode.values():
+        for factor, logits in logits_by_factor.items():
+            targets = concept_factor_targets(golds, factor, device)
+            losses.append(F.cross_entropy(logits, targets))
+    if not losses:
+        return torch.tensor(0.0, device=device)
+    return torch.stack(losses).mean()
+
+
+def concept_factor_agreement_loss(factor_logits_by_mode):
+    items = list(factor_logits_by_mode.items())
+    if len(items) < 2:
+        return next(iter(next(iter(factor_logits_by_mode.values())).values())).sum() * 0.0
+    losses = []
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            _mode_a, factors_a = items[i]
+            _mode_b, factors_b = items[j]
+            for factor in VALUE_POS:
+                a = factors_a[factor]
+                b = factors_b[factor]
+                losses.append(0.5 * (
+                    F.kl_div(F.log_softmax(a, dim=-1), F.softmax(b.detach(), dim=-1),
+                             reduction="batchmean")
+                    + F.kl_div(F.log_softmax(b, dim=-1), F.softmax(a.detach(), dim=-1),
+                               reduction="batchmean")
+                ))
+    return torch.stack(losses).mean()
+
+
+def concept_full_distill_loss(factor_logits_by_mode, temperature=1.0):
+    if "full" not in factor_logits_by_mode:
+        return next(iter(next(iter(factor_logits_by_mode.values())).values())).sum() * 0.0
+    temp = max(float(temperature), 1e-6)
+    full = factor_logits_by_mode["full"]
+    losses = []
+    for mode, logits_by_factor in factor_logits_by_mode.items():
+        if mode == "full":
+            continue
+        for factor in VALUE_POS:
+            teacher = F.softmax(full[factor].detach() / temp, dim=-1)
+            student = F.log_softmax(logits_by_factor[factor] / temp, dim=-1)
+            losses.append(F.kl_div(student, teacher, reduction="batchmean") * temp * temp)
+    if not losses:
+        return next(iter(full.values())).sum() * 0.0
+    return torch.stack(losses).mean()
+
+
 def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100, value_w=6.0,
           surfaces_path=None, layers=3, heads=4, max_len=128, img_tokens=4, aud_tokens=8,
           txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
-          modality_dropout=0.0, agreement_w=0.0):
+          modality_dropout=0.0, agreement_w=0.0, fusion_arch="concept", concept_tokens=4,
+          fusion_layers=1, concept_w=0.0, concept_agreement_w=0.0,
+          concept_distill_w=0.0, concept_distill_temperature=1.0):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     surfaces = load_text_surfaces(surfaces_path)
@@ -608,28 +745,55 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                          max_len=max_len, img_tokens=img_tokens, aud_tokens=aud_tokens,
                          txt_tokens=txt_tokens, trunk_arch=trunk_arch, trunk_width=trunk_width,
                          trunk_depth=trunk_depth, text_layers=text_layers,
-                         modality_dropout=modality_dropout).to(device)
+                         modality_dropout=modality_dropout, fusion_arch=fusion_arch,
+                         concept_tokens=concept_tokens, fusion_layers=fusion_layers).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    last_base = last_agreement = 0.0
+    last_base = last_agreement = last_concept = 0.0
+    last_concept_agreement = last_concept_distill = 0.0
     for st in range(1, steps + 1):
         model.train()
-        img, aud, txt, ids, _ = _batch(batch, rng, vocab, device, surfaces, text_split="train")
+        img, aud, txt, ids, golds = _batch(batch, rng, vocab, device, surfaces,
+                                           text_split="train")
         logits_by_mode = {mode: model(img, aud, txt, ids, mode=mode) for mode in MODES}
         losses = [token_loss(logits, ids, value_w=value_w)
                   for logits in logits_by_mode.values()]
         base_loss = sum(losses) / len(losses)
         agreement = (value_agreement_loss(logits_by_mode, vocab)
                      if agreement_w else base_loss * 0.0)
-        loss = base_loss + float(agreement_w) * agreement
+        if concept_w or concept_agreement_w or concept_distill_w:
+            factor_logits_by_mode = {
+                mode: model.factor_logits(img, aud, txt, mode=mode) for mode in MODES
+            }
+            concept_loss = concept_factor_loss(factor_logits_by_mode, golds)
+            concept_agreement = concept_factor_agreement_loss(factor_logits_by_mode)
+            concept_distill = concept_full_distill_loss(
+                factor_logits_by_mode, temperature=concept_distill_temperature)
+        else:
+            concept_loss = base_loss * 0.0
+            concept_agreement = base_loss * 0.0
+            concept_distill = base_loss * 0.0
+        loss = (base_loss + float(agreement_w) * agreement
+                + float(concept_w) * concept_loss
+                + float(concept_agreement_w) * concept_agreement
+                + float(concept_distill_w) * concept_distill)
         opt.zero_grad()
         loss.backward()
         opt.step()
         last_base = float(base_loss.detach())
         last_agreement = float(agreement.detach())
+        last_concept = float(concept_loss.detach())
+        last_concept_agreement = float(concept_agreement.detach())
+        last_concept_distill = float(concept_distill.detach())
         if st % log_every == 0 or st == steps:
             print(f"  m0 {st}/{steps} loss {loss.item():.3f} "
-                  f"base {last_base:.3f} agree {last_agreement:.3f}", flush=True)
-    model.train_metrics = {"token_loss": last_base, "agreement_loss": last_agreement}
+                  f"base {last_base:.3f} agree {last_agreement:.3f} "
+                  f"concept {last_concept:.3f} "
+                  f"concept-agree {last_concept_agreement:.3f} "
+                  f"concept-distill {last_concept_distill:.3f}", flush=True)
+    model.train_metrics = {"token_loss": last_base, "agreement_loss": last_agreement,
+                           "concept_loss": last_concept,
+                           "concept_agreement_loss": last_concept_agreement,
+                           "concept_distill_loss": last_concept_distill}
     return model, vocab, surfaces
 
 
@@ -651,7 +815,9 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         counterfactual_n=40, free_counterfactual_n=20, surfaces_path=None, checkpoint=None,
         batch=32, d=96, lr=1e-3, layers=3, heads=4, max_len=128, img_tokens=4, aud_tokens=8,
         txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
-        modality_dropout=0.0, agreement_w=0.0, log_every=100):
+        modality_dropout=0.0, agreement_w=0.0, fusion_arch="concept", concept_tokens=4,
+        fusion_layers=1, concept_w=0.0, concept_agreement_w=0.0,
+        concept_distill_w=0.0, concept_distill_temperature=1.0, log_every=100):
     model, vocab, surfaces = train(steps=steps, seed=seed, device=device, value_w=value_w,
                                    surfaces_path=surfaces_path, batch=batch, d=d, lr=lr,
                                    layers=layers, heads=heads, max_len=max_len,
@@ -660,13 +826,26 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                    trunk_width=trunk_width, trunk_depth=trunk_depth,
                                    text_layers=text_layers,
                                    modality_dropout=modality_dropout,
-                                   agreement_w=agreement_w, log_every=log_every)
+                                   agreement_w=agreement_w, fusion_arch=fusion_arch,
+                                   concept_tokens=concept_tokens,
+                                   fusion_layers=fusion_layers, concept_w=concept_w,
+                                   concept_agreement_w=concept_agreement_w,
+                                   concept_distill_w=concept_distill_w,
+                                   concept_distill_temperature=(
+                                       concept_distill_temperature),
+                                   log_every=log_every)
     full = evaluate(model, vocab, surfaces, n=eval_n, device=device, text_split="eval",
                     mode="full")
     text = evaluate(model, vocab, surfaces, n=eval_n, device=device, text_split="eval",
                     mode="text_only")
     sensor = evaluate(model, vocab, surfaces, n=eval_n, device=device, text_split="eval",
                       mode="sensor_only")
+    concept_full = concept_evaluate(model, vocab, surfaces, n=eval_n, device=device,
+                                    text_split="eval", mode="full")
+    concept_text = concept_evaluate(model, vocab, surfaces, n=eval_n, device=device,
+                                    text_split="eval", mode="text_only")
+    concept_sensor = concept_evaluate(model, vocab, surfaces, n=eval_n, device=device,
+                                      text_split="eval", mode="sensor_only")
     free_text = free_evaluate(model, vocab, surfaces, n=free_n, device=device, text_split="eval",
                               mode="text_only") if free_n else {}
     counterfactual = counterfactual_text_evaluate(
@@ -678,10 +857,17 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
     architecture = dict(model.config)
     architecture["img_pool"] = list(model.img.pool)
     architecture["aud_pool"] = list(model.aud.pool)
-    architecture["prefix_tokens"] = int(img_tokens) + int(aud_tokens) + int(txt_tokens)
+    architecture["reader_prefix_tokens"] = int(img_tokens) + int(aud_tokens) + int(txt_tokens)
+    architecture["prefix_tokens"] = (
+        architecture["reader_prefix_tokens"]
+        + (int(concept_tokens) if fusion_arch == "concept" else 0))
     report = {"experiment": "m0_multimodal_bridge", "steps": steps, "batch": int(batch),
               "lr": float(lr), "value_w": float(value_w),
               "agreement_w": float(agreement_w),
+              "concept_w": float(concept_w),
+              "concept_agreement_w": float(concept_agreement_w),
+              "concept_distill_w": float(concept_distill_w),
+              "concept_distill_temperature": float(concept_distill_temperature),
               "train_metrics": getattr(model, "train_metrics", {}),
               "architecture": architecture,
               "eval_n": int(eval_n), "free_n": int(free_n),
@@ -694,10 +880,17 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                 "eval_examples": len(surfaces.get("eval_examples", []))},
               "teacher_forced": {"full": full, "text_only_eval_phrasings": text,
                                  "sensor_only": sensor},
+              "concept_head": {"full": concept_full,
+                               "text_only_eval_phrasings": concept_text,
+                               "sensor_only": concept_sensor},
               "free_text_only_eval_phrasings": free_text,
               "counterfactual_text_only_eval_phrasings": counterfactual,
               "free_counterfactual_text_only_eval_phrasings": free_counterfactual,
               "chance": CHANCE, "gate_thresholds": thresholds,
+              "concept_gate": all(concept_full[k] >= thresholds[k]
+                                  and concept_text[k] >= thresholds[k]
+                                  and concept_sensor[k] >= thresholds[k]
+                                  for k in VALUE_POS),
               "gate": all(full[k] >= thresholds[k] and text[k] >= thresholds[k]
                           and sensor[k] >= thresholds[k] for k in VALUE_POS)
               and (not counterfactual or (
@@ -742,18 +935,36 @@ def selftest():
     assert ex_gold["color"] == "red" and ex_txt[0] == "external"
     assert all(t in ex_vocab.stoi for t in ex_txt + ex_toks)
     model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad).to("cpu")
-    x, a, tt, ids, _ = _batch(2, rng, vocab, "cpu", surfaces)
+    x, a, tt, ids, golds = _batch(2, rng, vocab, "cpu", surfaces)
     assert _grid_pool(4) == (2, 2) and _grid_pool(8) == (2, 4)
+    assert model.config["fusion_arch"] == "concept"
     logits = model(x, a, tt, ids)
     assert logits.shape == (2, ids.shape[1], len(vocab)), logits.shape
     logits_text = model(x, a, tt, ids, mode="text_only")
     assert logits_text.shape == logits.shape
+    prefix, concepts = model.encode_prefix(x, a, tt, mode="full")
+    assert concepts is not None and concepts.shape == (2, model.config["concept_tokens"], 32)
+    assert prefix.shape[1] == (model.config["img_tokens"] + model.config["aud_tokens"]
+                               + model.config["txt_tokens"] + model.config["concept_tokens"])
+    factor_logits = {mode: model.factor_logits(x, a, tt, mode=mode) for mode in MODES}
+    assert set(factor_logits["full"]) == set(VALUE_POS)
+    concept_loss = concept_factor_loss(factor_logits, golds)
+    assert torch.isfinite(concept_loss), concept_loss
+    assert torch.isfinite(concept_factor_agreement_loss(factor_logits))
+    assert torch.isfinite(concept_full_distill_loss(factor_logits, temperature=1.25))
+    concat_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
+                                fusion_arch="concat").to("cpu")
+    concat_prefix, concat_concepts = concat_model.encode_prefix(x, a, tt, mode="full")
+    assert concat_concepts is None and concat_prefix.shape[1] == 20
     res_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
                              img_tokens=4, aud_tokens=8, txt_tokens=6,
                              trunk_arch="residual", trunk_width=32, trunk_depth=1,
-                             text_layers=2, modality_dropout=0.1).to("cpu")
+                             text_layers=2, modality_dropout=0.1,
+                             fusion_arch="concept", concept_tokens=3,
+                             fusion_layers=2).to("cpu")
     assert res_model.img.arch == "residual" and res_model.img.pool == (2, 2)
     assert res_model.txt.layers == 2 and res_model.txt.n_tokens == 6
+    assert res_model.config["fusion_layers"] == 2
     res_logits = {mode: res_model(x, a, tt, ids, mode=mode) for mode in MODES}
     assert all(v.shape == logits.shape for v in res_logits.values())
     agree = value_agreement_loss(res_logits, vocab)
@@ -789,6 +1000,24 @@ def main(argv=None):
     ap.add_argument("--value-w", type=float, default=6.0, dest="value_w")
     ap.add_argument("--agreement-w", type=float, default=0.0, dest="agreement_w",
                     help="cross-mode factor-value distribution agreement loss weight")
+    ap.add_argument("--fusion-arch", default="concept", choices=FUSION_ARCHES,
+                    dest="fusion_arch",
+                    help="upstream prefix fusion: concat keeps old path, concept adds shared tokens")
+    ap.add_argument("--concept-tokens", type=int, default=4, dest="concept_tokens",
+                    help="shared concept tokens prepended before the decoder in concept fusion")
+    ap.add_argument("--fusion-layers", type=int, default=1, dest="fusion_layers",
+                    help="transformer layers used by concept prefix fusion")
+    ap.add_argument("--concept-w", type=float, default=0.0, dest="concept_w",
+                    help="supervised upstream concept-token factor loss weight")
+    ap.add_argument("--concept-agreement-w", type=float, default=0.0,
+                    dest="concept_agreement_w",
+                    help="cross-mode agreement loss on upstream concept heads")
+    ap.add_argument("--concept-distill-w", type=float, default=0.0,
+                    dest="concept_distill_w",
+                    help="distill full multimodal concept distributions into partial modes")
+    ap.add_argument("--concept-distill-temperature", type=float, default=1.0,
+                    dest="concept_distill_temperature",
+                    help="temperature for full-to-partial upstream concept distillation")
     ap.add_argument("--img-tokens", type=int, default=4, dest="img_tokens")
     ap.add_argument("--aud-tokens", type=int, default=8, dest="aud_tokens")
     ap.add_argument("--txt-tokens", type=int, default=8, dest="txt_tokens")
@@ -817,7 +1046,8 @@ def main(argv=None):
         "--log-every": args.log_every, "--img-tokens": args.img_tokens,
         "--aud-tokens": args.aud_tokens, "--txt-tokens": args.txt_tokens,
         "--trunk-width": args.trunk_width, "--trunk-depth": args.trunk_depth,
-        "--text-layers": args.text_layers,
+        "--text-layers": args.text_layers, "--concept-tokens": args.concept_tokens,
+        "--fusion-layers": args.fusion_layers,
     }
     for name, value in positive.items():
         if value <= 0:
@@ -828,8 +1058,11 @@ def main(argv=None):
         ap.error("--dim must be divisible by --heads")
     if (args.d // args.heads) % 2 != 0:
         ap.error("--dim / --heads must be even for rope attention")
-    if args.agreement_w < 0.0:
-        ap.error("--agreement-w must be non-negative")
+    if (args.agreement_w < 0.0 or args.concept_w < 0.0
+            or args.concept_agreement_w < 0.0 or args.concept_distill_w < 0.0):
+        ap.error("agreement/concept loss weights must be non-negative")
+    if args.concept_distill_temperature <= 0.0:
+        ap.error("--concept-distill-temperature must be positive")
     if args.modality_dropout < 0.0 or args.modality_dropout > 1.0:
         ap.error("--modality-dropout must be in [0, 1]")
     if args.eval_n <= 0:
@@ -847,7 +1080,13 @@ def main(argv=None):
                  txt_tokens=args.txt_tokens, trunk_arch=args.trunk_arch,
                  trunk_width=args.trunk_width, trunk_depth=args.trunk_depth,
                  text_layers=args.text_layers, modality_dropout=args.modality_dropout,
-                 agreement_w=args.agreement_w, log_every=args.log_every,
+                 agreement_w=args.agreement_w, fusion_arch=args.fusion_arch,
+                 concept_tokens=args.concept_tokens, fusion_layers=args.fusion_layers,
+                 concept_w=args.concept_w,
+                 concept_agreement_w=args.concept_agreement_w,
+                 concept_distill_w=args.concept_distill_w,
+                 concept_distill_temperature=args.concept_distill_temperature,
+                 log_every=args.log_every,
                  device=args.device)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
