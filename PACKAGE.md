@@ -1359,6 +1359,13 @@ reports include `flow_cache_text_embedding_*` shape fields. This keeps large man
 failing only after a cache chunk happens to contain longer captions than earlier chunks, and makes
 GPU reports show whether training used pooled vectors or token streams.
 
+Image-70 improves prompt-grid selection for real-image runs. `--sample-candidates-per-prompt`
+still works without task-specific rules, but embedding-conditioned prompt grids now reuse compatible
+external image-feature alignment as a candidate scorer alongside the learned text aligner. This
+means CLIP/SigLIP-style sidecars can help choose the best generated candidate for a prompt even
+when the strongest training signal came from image-feature or REPA alignment rather than the
+internal caption aligner alone.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered

@@ -3287,7 +3287,7 @@ def expand_negative_prompts(raw, n):
 def prompt_embedding_condition(prompts, conditioner, embed_backend="stats", embed_model="",
                                embed_device=None, embed_dtype="auto", embed_normalize=True,
                                embed_stats_dim=0, trust_remote_code=False, device=DEV,
-                               return_tokens=False):
+                               return_tokens=False, return_embedding=False):
     if conditioner is None:
         raise ValueError("prompt embedding conditioning requires a loaded conditioner")
     input_dim = int(getattr(conditioner, "input_dim", 0) or 0)
@@ -3307,7 +3307,10 @@ def prompt_embedding_condition(prompts, conditioner, embed_backend="stats", embe
             f"prompt embedding dim {int(embeddings.shape[-1])} does not match "
             f"checkpoint text_embedding_in_dim {input_dim}"
         )
-    return conditioner(embeddings, return_tokens=return_tokens)
+    cond = conditioner(embeddings, return_tokens=return_tokens)
+    if return_embedding:
+        return cond, embeddings
+    return cond
 
 
 @torch.no_grad()
@@ -3315,17 +3318,21 @@ def text_prompt_condition(prompts, conditioner, prompt_vocab=None, caption_max_l
                           source="tokens", device=DEV, return_tokens=False,
                           embed_backend="stats", embed_model="", embed_device=None,
                           embed_dtype="auto", embed_normalize=True, embed_stats_dim=0,
-                          trust_remote_code=False):
+                          trust_remote_code=False, return_embedding=False):
     source = str(source or "tokens")
     if source == "embedding":
         return prompt_embedding_condition(
             prompts, conditioner, embed_backend=embed_backend, embed_model=embed_model,
             embed_device=embed_device, embed_dtype=embed_dtype,
             embed_normalize=embed_normalize, embed_stats_dim=embed_stats_dim,
-            trust_remote_code=trust_remote_code, device=device, return_tokens=return_tokens)
-    return caption_condition(
+            trust_remote_code=trust_remote_code, device=device, return_tokens=return_tokens,
+            return_embedding=return_embedding)
+    cond = caption_condition(
         prompts, conditioner, prompt_vocab, max_len=caption_max_len, device=device,
         return_tokens=return_tokens)
+    if return_embedding:
+        return cond, None
+    return cond
 
 
 def infer_text_embedding_dim(records):
@@ -3667,7 +3674,8 @@ def make_condition_grid_specs(samples_per_combo=1):
 
 @torch.no_grad()
 def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1,
-                             text_aligner=None):
+                             text_aligner=None, image_feature_aligner=None,
+                             prompt_features=None):
     candidates_per_prompt = int(candidates_per_prompt)
     if candidates_per_prompt <= 0:
         raise ValueError("candidates_per_prompt must be positive")
@@ -3684,13 +3692,35 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
     }
     if candidates_per_prompt == 1:
         return samples, meta
-    if text_aligner is None:
-        meta["sample_grid_selection_scorer"] = "first_candidate_no_text_aligner"
+    scorers = []
+    z = None
+    if text_aligner is not None:
+        text_aligner.eval()
+        z = ae.encode(samples)
+        img_emb, txt_emb = text_aligner(z, cond)
+        scorers.append(("text_aligner", (img_emb.float() * txt_emb.float()).sum(dim=-1)))
+    if image_feature_aligner is not None and prompt_features is not None:
+        feature_dim = int(getattr(image_feature_aligner, "feature_dim", 0) or 0)
+        feature_rows = pool_embedding_sequence(prompt_features).to(device=samples.device)
+        if int(feature_rows.shape[-1]) == feature_dim:
+            image_feature_aligner.eval()
+            if z is None:
+                z = ae.encode(samples)
+            target_features = feature_rows.repeat_interleave(candidates_per_prompt, dim=0)
+            img_feat, prompt_feat = image_feature_aligner(z, target_features)
+            scorers.append((
+                "image_feature_aligner",
+                (img_feat.float() * prompt_feat.float()).sum(dim=-1),
+            ))
+        else:
+            meta["sample_grid_feature_selection_skipped"] = (
+                f"prompt feature dim {int(feature_rows.shape[-1])} != "
+                f"image feature dim {feature_dim}"
+            )
+    if not scorers:
+        meta["sample_grid_selection_scorer"] = "first_candidate_no_compatible_scorer"
         return samples[::candidates_per_prompt].contiguous(), meta
-    text_aligner.eval()
-    z = ae.encode(samples)
-    img_emb, txt_emb = text_aligner(z, cond)
-    scores = (img_emb.float() * txt_emb.float()).sum(dim=-1)
+    scores = torch.stack([score for _name, score in scorers], dim=0).mean(dim=0)
     scores = scores.reshape(n, candidates_per_prompt)
     best = scores.argmax(dim=1)
     base = torch.arange(n, device=samples.device) * candidates_per_prompt
@@ -3698,7 +3728,9 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
     chosen = samples.index_select(0, selected)
     best_scores = scores.gather(1, best[:, None]).squeeze(1)
     meta.update({
-        "sample_grid_selection_scorer": "text_aligner_cosine",
+        "sample_grid_selection_scorer": "+".join(
+            f"{name}_cosine" for name, _score in scorers
+        ),
         "sample_grid_selected_candidate_indices": [
             int(x) for x in best.detach().cpu().tolist()
         ],
@@ -3837,13 +3869,13 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         raise ValueError("quality_guidance_w must be non-negative")
     quality_guidance_interval = validate_guidance_interval(
         quality_guidance_interval, name="quality_guidance_interval")
-    cond = text_prompt_condition(
+    cond, prompt_features = text_prompt_condition(
         prompts, conditioner, prompt_vocab=prompt_vocab, caption_max_len=caption_max_len,
         source=caption_cond_source, device=device, return_tokens=flow_uses_cond_tokens(flow),
         embed_backend=prompt_embed_backend, embed_model=prompt_embed_model,
         embed_device=prompt_embed_device, embed_dtype=prompt_embed_dtype,
         embed_normalize=prompt_embed_normalize, embed_stats_dim=prompt_embed_stats_dim,
-        trust_remote_code=prompt_embed_trust_remote_code)
+        trust_remote_code=prompt_embed_trust_remote_code, return_embedding=True)
     negative_prompts = expand_negative_prompts(negative_prompts, len(prompts))
     cfg_uncond = None
     if negative_prompts:
@@ -3858,6 +3890,7 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
     sample_cond = repeat_condition_rows(cond, candidates_per_prompt)
     sample_uncond = repeat_condition_rows(cfg_uncond, candidates_per_prompt)
     text_aligner = getattr(flow, "text_aligner", None)
+    image_feature_aligner = getattr(flow, "image_feature_aligner", None)
     quality_scorer = getattr(flow, "image_quality_scorer", None)
     sample = sample_images(ae, flow, sample_cond, latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
@@ -3874,7 +3907,8 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                            quality_guidance_interval=quality_guidance_interval)
     sample, selection_meta = select_prompt_candidates(
         ae, sample, sample_cond, prompts, candidates_per_prompt=candidates_per_prompt,
-        text_aligner=text_aligner)
+        text_aligner=text_aligner, image_feature_aligner=image_feature_aligner,
+        prompt_features=prompt_features)
     n = len(prompts)
     cols = int(np.ceil(np.sqrt(n)))
     rows = int(np.ceil(n / cols))
@@ -6233,7 +6267,9 @@ def selftest():
     assert prompt_grid_meta["sample_grid_cfg_uncond_mode"] == "negative_prompt"
     assert prompt_grid_meta["sample_grid_negative_prompt_count"] == 2
     assert prompt_grid_meta["sample_grid_candidates_per_prompt"] == 2
-    assert prompt_grid_meta["sample_grid_selection_scorer"] == "first_candidate_no_text_aligner"
+    assert prompt_grid_meta["sample_grid_selection_scorer"] == (
+        "first_candidate_no_compatible_scorer"
+    )
     ae4, flow4, conditioner4, vocab4, report4 = train_latent_flow(
         ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="crossdit",
         dit_depth=1, dit_heads=2, seed=5, device="cpu", cond_mode="text",
@@ -6371,7 +6407,9 @@ def selftest():
         assert embed_prompt_meta["sample_grid_cfg_uncond_mode"] == "negative_prompt"
         assert embed_prompt_meta["sample_grid_negative_prompt_count"] == 2
         assert embed_prompt_meta["sample_grid_candidates_per_prompt"] == 2
-        assert embed_prompt_meta["sample_grid_selection_scorer"] == "text_aligner_cosine"
+        assert embed_prompt_meta["sample_grid_selection_scorer"] == (
+            "text_aligner_cosine+image_feature_aligner_cosine"
+        )
         assert "sample_grid_selection_score_mean" in embed_prompt_meta
         assert embed_prompt_meta["sample_grid_text_guidance_w"] == 0.05
         assert embed_prompt_meta["sample_grid_text_guidance_scorer"] == "text_aligner"
