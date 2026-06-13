@@ -54,6 +54,7 @@ FACT_GROUPS = {
     for pred in sorted({fact[0] for fact in FACT_VOCAB})
 }
 SAMPLE_METHODS = ("euler", "heun", "midpoint", "rk4")
+SAMPLE_SCHEDULES = ("linear", "quadratic", "sqrt", "cosine")
 MMDIT_ATTN_IMPLS = ("manual", "sdpa", "auto")
 DIT_POS_EMBEDS = ("learned", "sincos2d")
 FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
@@ -1409,9 +1410,20 @@ def resolve_time_shift(time_shift=1.0, mode="manual", latent_shape=None,
     }
 
 
-def flow_time_schedule(steps, device=DEV, shift=1.0):
+def flow_time_schedule(steps, device=DEV, shift=1.0, schedule="linear"):
     steps = max(1, int(steps))
-    base = torch.linspace(0.0, 1.0, steps + 1, device=device)
+    schedule = str(schedule)
+    u = torch.linspace(0.0, 1.0, steps + 1, device=device)
+    if schedule == "linear":
+        base = u
+    elif schedule == "quadratic":
+        base = u.square()
+    elif schedule == "sqrt":
+        base = torch.sqrt(u)
+    elif schedule == "cosine":
+        base = 0.5 - 0.5 * torch.cos(math.pi * u)
+    else:
+        raise ValueError(f"unknown sample schedule {schedule!r}")
     return apply_flow_time_shift(base, shift=shift)
 
 
@@ -3156,7 +3168,7 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                    semantic_guidance_mode="decoded", sample_method="euler",
                    cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                    semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-                   sample_time_shift=1.0):
+                   sample_time_shift=1.0, sample_schedule="linear"):
     batch = condition_batch(cond)
     latent_stats = flow_latent_stats(flow)
     z = _seeded_randn((batch,) + tuple(latent_shape), device=device, seed=seed)
@@ -3169,12 +3181,15 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         raise ValueError("semantic guidance requires ae")
     if sample_method not in SAMPLE_METHODS:
         raise ValueError(f"unknown sample method {sample_method!r}")
+    if sample_schedule not in SAMPLE_SCHEDULES:
+        raise ValueError(f"unknown sample schedule {sample_schedule!r}")
     if cfg_rescale < 0.0 or cfg_rescale > 1.0:
         raise ValueError("cfg_rescale must be in [0, 1]")
     cfg_interval = validate_guidance_interval(cfg_interval, name="cfg_interval")
     semantic_guidance_interval = validate_guidance_interval(
         semantic_guidance_interval, name="semantic_guidance_interval")
-    schedule = flow_time_schedule(steps, device=device, shift=sample_time_shift)
+    schedule = flow_time_schedule(
+        steps, device=device, shift=sample_time_shift, schedule=sample_schedule)
     for i in range(steps):
         t_scalar = float(schedule[i].detach().cpu())
         t_next_scalar = float(schedule[i + 1].detach().cpu())
@@ -3225,7 +3240,7 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
                   semantic_guidance_mode="decoded", sample_method="euler",
                   cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                   semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-                  sample_time_shift=1.0):
+                  sample_time_shift=1.0, sample_schedule="linear"):
     z = sample_latents(flow, cond, latent_shape=latent_shape, steps=steps, device=device,
                        seed=seed, cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
                        ae=ae, semantic_cond=semantic_cond,
@@ -3233,7 +3248,8 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
                        semantic_guidance_mode=semantic_guidance_mode,
                        sample_method=sample_method, cfg_interval=cfg_interval,
                        semantic_guidance_interval=semantic_guidance_interval,
-                       sample_time_shift=sample_time_shift)
+                       sample_time_shift=sample_time_shift,
+                       sample_schedule=sample_schedule)
     ae.eval()
     return ae.decode(z).clamp(-1.0, 1.0)
 
@@ -3302,7 +3318,8 @@ def save_sample_grid(ae, flow, path, size=32, device=DEV, cond_mode="facts", con
                      semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
                      cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                      semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-                     samples_per_combo=1, seed=0, sample_time_shift=1.0):
+                     samples_per_combo=1, seed=0, sample_time_shift=1.0,
+                     sample_schedule="linear"):
     ae.eval()
     flow.eval()
     specs, rows, cols = make_condition_grid_specs(samples_per_combo=samples_per_combo)
@@ -3322,7 +3339,8 @@ def save_sample_grid(ae, flow, path, size=32, device=DEV, cond_mode="facts", con
                            semantic_guidance_mode=semantic_guidance_mode,
                            sample_method=sample_method, cfg_interval=cfg_interval,
                            semantic_guidance_interval=semantic_guidance_interval,
-                           sample_time_shift=sample_time_shift)
+                           sample_time_shift=sample_time_shift,
+                           sample_schedule=sample_schedule)
     meta = write_ppm_grid(sample, path, rows=rows, cols=cols)
     meta.update({
         "sample_grid_cfg_scale": float(cfg_scale),
@@ -3330,6 +3348,7 @@ def save_sample_grid(ae, flow, path, size=32, device=DEV, cond_mode="facts", con
         "sample_grid_sample_steps": int(sample_steps),
         "sample_grid_sample_time_shift": float(sample_time_shift),
         "sample_grid_sample_method": sample_method,
+        "sample_grid_sample_schedule": sample_schedule,
         "sample_grid_cfg_interval": list(validate_guidance_interval(cfg_interval)),
         "sample_grid_semantic_guidance_w": float(semantic_guidance_w),
         "sample_grid_semantic_guidance_mode": semantic_guidance_mode,
@@ -3348,7 +3367,7 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
                              cfg_rescale=0.0, sample_steps=4, sample_method="euler",
                              cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                              samples=16, seed=0, caption_cond_source="tokens",
-                             sample_time_shift=1.0):
+                             sample_time_shift=1.0, sample_schedule="linear"):
     ae.eval()
     flow.eval()
     rng = np.random.default_rng(seed)
@@ -3363,7 +3382,8 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            cfg_rescale=cfg_rescale,
                            sample_method=sample_method, cfg_interval=cfg_interval,
-                           sample_time_shift=sample_time_shift)
+                           sample_time_shift=sample_time_shift,
+                           sample_schedule=sample_schedule)
     cols = int(np.ceil(np.sqrt(n)))
     rows = int(np.ceil(n / cols))
     meta = write_ppm_grid(sample, path, rows=rows, cols=cols)
@@ -3373,6 +3393,7 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
         "sample_grid_sample_steps": int(sample_steps),
         "sample_grid_sample_time_shift": float(sample_time_shift),
         "sample_grid_sample_method": sample_method,
+        "sample_grid_sample_schedule": sample_schedule,
         "sample_grid_cfg_interval": list(validate_guidance_interval(cfg_interval)),
         "sample_grid_cond_mode": "caption",
         "sample_grid_caption_cond_source": caption_cond_source,
@@ -3389,6 +3410,7 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                                  cfg_rescale=0.0, sample_steps=4, sample_method="euler",
                                  cfg_interval=DEFAULT_GUIDANCE_INTERVAL, seed=0,
                                  caption_cond_source="tokens", sample_time_shift=1.0,
+                                 sample_schedule="linear",
                                  prompt_embed_backend="stats", prompt_embed_model="",
                                  prompt_embed_device=None, prompt_embed_dtype="auto",
                                  prompt_embed_normalize=True, prompt_embed_stats_dim=0,
@@ -3409,7 +3431,8 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            cfg_rescale=cfg_rescale,
                            sample_method=sample_method, cfg_interval=cfg_interval,
-                           sample_time_shift=sample_time_shift)
+                           sample_time_shift=sample_time_shift,
+                           sample_schedule=sample_schedule)
     n = len(prompts)
     cols = int(np.ceil(np.sqrt(n)))
     rows = int(np.ceil(n / cols))
@@ -3420,6 +3443,7 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         "sample_grid_sample_steps": int(sample_steps),
         "sample_grid_sample_time_shift": float(sample_time_shift),
         "sample_grid_sample_method": sample_method,
+        "sample_grid_sample_schedule": sample_schedule,
         "sample_grid_cfg_interval": list(validate_guidance_interval(cfg_interval)),
         "sample_grid_cond_mode": "prompt",
         "sample_grid_caption_cond_source": caption_cond_source,
@@ -3447,7 +3471,7 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, cfg_resc
                           semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
                           sample_method="euler", cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                           semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-                          sample_time_shift=1.0):
+                          sample_time_shift=1.0, sample_schedule="linear"):
     """Generate from every canonical color/shape request and re-read facts from the image."""
     samples_per_combo = int(samples_per_combo)
     if samples_per_combo <= 0:
@@ -3483,7 +3507,8 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, cfg_resc
                                    semantic_guidance_mode=semantic_guidance_mode,
                                    sample_method=sample_method, cfg_interval=cfg_interval,
                                    semantic_guidance_interval=semantic_guidance_interval,
-                                   sample_time_shift=sample_time_shift)
+                                   sample_time_shift=sample_time_shift,
+                                   sample_schedule=sample_schedule)
             out = ae(sample)
             pc = out["color"].argmax(-1)
             ps = out["shape"].argmax(-1)
@@ -3516,7 +3541,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
              semantic_guidance_mode="decoded", sample_method="euler",
              cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
              semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-             sample_time_shift=1.0, time_shift=1.0):
+             sample_time_shift=1.0, sample_schedule="linear", time_shift=1.0):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     ae.eval()
@@ -3565,7 +3590,8 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
                            semantic_guidance_mode=semantic_guidance_mode,
                            sample_method=sample_method, cfg_interval=cfg_interval,
                            semantic_guidance_interval=semantic_guidance_interval,
-                           sample_time_shift=sample_time_shift)
+                           sample_time_shift=sample_time_shift,
+                           sample_schedule=sample_schedule)
     target = torch.tensor(render_object(spec, size=side) * 2.0 - 1.0,
                           dtype=torch.float32, device=device)[None]
     report = {
@@ -3589,6 +3615,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
         "sample_time_shift": float(sample_time_shift),
         "time_shift": float(time_shift),
         "sample_method": sample_method,
+        "sample_schedule": sample_schedule,
         "semantic_guidance_w": float(semantic_guidance_w),
         "semantic_guidance_mode": semantic_guidance_mode,
         "semantic_guidance_interval": list(validate_guidance_interval(
@@ -3612,7 +3639,8 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
                                         sample_method=sample_method,
                                         cfg_interval=cfg_interval,
                                         semantic_guidance_interval=semantic_guidance_interval,
-                                        sample_time_shift=sample_time_shift))
+                                        sample_time_shift=sample_time_shift,
+                                        sample_schedule=sample_schedule))
     if intervention_samples:
         report.update(latent_intervention_diagnostic(
             ae, n=intervention_samples, batch=batch, seed=seed + 31, size=size, device=device))
@@ -3628,6 +3656,7 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                            cfg_interval=DEFAULT_GUIDANCE_INTERVAL, text_aligner=None,
                            image_feature_aligner=None,
                            caption_cond_source="tokens", sample_time_shift=1.0,
+                           sample_schedule="linear",
                            time_shift=1.0):
     rng = np.random.default_rng(seed)
     ae.eval()
@@ -3699,7 +3728,8 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            cfg_rescale=cfg_rescale,
                            sample_method=sample_method, cfg_interval=cfg_interval,
-                           sample_time_shift=sample_time_shift)
+                           sample_time_shift=sample_time_shift,
+                           sample_schedule=sample_schedule)
     report = {
         "n": int(total),
         "recon_mse": float(np.mean(recon_losses)),
@@ -3719,6 +3749,7 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         "sample_time_shift": float(sample_time_shift),
         "time_shift": float(time_shift),
         "sample_method": sample_method,
+        "sample_schedule": sample_schedule,
         "cond_mode": "text",
         "caption_cond_source": caption_cond_source,
         "data_mode": "image_manifest",
@@ -4074,6 +4105,7 @@ def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                   prompt_templates=DEFAULT_PROMPT_TEMPLATES, semantic_guidance_w=0.0,
                   semantic_guidance_weights=None, semantic_guidance_mode="decoded",
                   sample_method="euler", sample_methods=None, cfg_rescales=(0.0,),
+                  sample_schedule="linear", sample_schedules=None,
                   cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                   semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                   sample_time_shift=1.0, time_shift=1.0):
@@ -4081,34 +4113,41 @@ def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
         semantic_guidance_weights = (semantic_guidance_w,)
     if sample_methods is None:
         sample_methods = (sample_method,)
+    if sample_schedules is None:
+        sample_schedules = (sample_schedule,)
     cfg_rescales = tuple(float(x) for x in cfg_rescales)
     rows = []
     for cfg_scale in cfg_scales:
         for cfg_rescale in cfg_rescales:
             for sample_steps in sample_steps_list:
                 for method in sample_methods:
-                    for guidance_w in semantic_guidance_weights:
-                        row = evaluate(ae, flow, n=n, batch=batch, seed=seed, size=size,
-                                       device=device, cfg_scale=float(cfg_scale),
-                                       cfg_rescale=float(cfg_rescale),
-                                       sample_steps=int(sample_steps),
-                                       roundtrip_samples=roundtrip_samples,
-                                       cond_mode=cond_mode, conditioner=conditioner,
-                                       prompt_vocab=prompt_vocab,
-                                       prompt_templates=prompt_templates,
-                                       semantic_guidance_w=float(guidance_w),
-                                       semantic_guidance_mode=semantic_guidance_mode,
-                                       sample_method=method, cfg_interval=cfg_interval,
-                                       semantic_guidance_interval=semantic_guidance_interval,
-                                       sample_time_shift=sample_time_shift, time_shift=time_shift)
-                        row["sweep_key"] = (
-                            f"cfg={float(cfg_scale):g};rescale={float(cfg_rescale):g};"
-                            f"steps={int(sample_steps)};method={method};"
-                            f"sem={float(guidance_w):g};shift={float(sample_time_shift):g};"
-                            f"cfgint={format_interval(cfg_interval)};"
-                            f"semint={format_interval(semantic_guidance_interval)}"
-                        )
-                        rows.append(row)
+                    for schedule in sample_schedules:
+                        for guidance_w in semantic_guidance_weights:
+                            row = evaluate(
+                                ae, flow, n=n, batch=batch, seed=seed, size=size,
+                                device=device, cfg_scale=float(cfg_scale),
+                                cfg_rescale=float(cfg_rescale),
+                                sample_steps=int(sample_steps),
+                                roundtrip_samples=roundtrip_samples,
+                                cond_mode=cond_mode, conditioner=conditioner,
+                                prompt_vocab=prompt_vocab,
+                                prompt_templates=prompt_templates,
+                                semantic_guidance_w=float(guidance_w),
+                                semantic_guidance_mode=semantic_guidance_mode,
+                                sample_method=method, sample_schedule=schedule,
+                                cfg_interval=cfg_interval,
+                                semantic_guidance_interval=semantic_guidance_interval,
+                                sample_time_shift=sample_time_shift, time_shift=time_shift)
+                            row["sweep_key"] = (
+                                f"cfg={float(cfg_scale):g};rescale={float(cfg_rescale):g};"
+                                f"steps={int(sample_steps)};method={method};"
+                                f"schedule={schedule};"
+                                f"sem={float(guidance_w):g};"
+                                f"shift={float(sample_time_shift):g};"
+                                f"cfgint={format_interval(cfg_interval)};"
+                                f"semint={format_interval(semantic_guidance_interval)}"
+                            )
+                            rows.append(row)
     return rows
 
 
@@ -4117,38 +4156,43 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                        n=128, batch=64, seed=10, size=32, device=DEV, conditioner=None,
                        prompt_vocab=None, caption_max_len=64, sample_method="euler",
                        sample_methods=None, cfg_rescales=(0.0,),
+                       sample_schedule="linear", sample_schedules=None,
                        cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                        text_aligner=None, image_feature_aligner=None,
                        caption_cond_source="tokens", sample_time_shift=1.0,
                        time_shift=1.0):
     if sample_methods is None:
         sample_methods = (sample_method,)
+    if sample_schedules is None:
+        sample_schedules = (sample_schedule,)
     cfg_rescales = tuple(float(x) for x in cfg_rescales)
     rows = []
     for cfg_scale in cfg_scales:
         for cfg_rescale in cfg_rescales:
             for sample_steps in sample_steps_list:
                 for method in sample_methods:
-                    row = evaluate_image_records(
-                        ae, flow, records, n=n, batch=batch, seed=seed, size=size,
-                        device=device, conditioner=conditioner, prompt_vocab=prompt_vocab,
-                        caption_max_len=caption_max_len, cfg_scale=float(cfg_scale),
-                        cfg_rescale=float(cfg_rescale),
-                        sample_steps=int(sample_steps), sample_method=method,
-                        cfg_interval=cfg_interval, text_aligner=text_aligner,
-                        image_feature_aligner=image_feature_aligner,
-                        caption_cond_source=caption_cond_source,
-                        sample_time_shift=sample_time_shift, time_shift=time_shift)
-                    row["semantic_guidance_w"] = 0.0
-                    row["semantic_guidance_mode"] = "none"
-                    row["semantic_guidance_interval"] = list(DEFAULT_GUIDANCE_INTERVAL)
-                    row["sweep_key"] = (
-                        f"cfg={float(cfg_scale):g};rescale={float(cfg_rescale):g};"
-                        f"steps={int(sample_steps)};"
-                        f"method={method};shift={float(sample_time_shift):g};"
-                        f"cfgint={format_interval(cfg_interval)}"
-                    )
-                    rows.append(row)
+                    for schedule in sample_schedules:
+                        row = evaluate_image_records(
+                            ae, flow, records, n=n, batch=batch, seed=seed, size=size,
+                            device=device, conditioner=conditioner, prompt_vocab=prompt_vocab,
+                            caption_max_len=caption_max_len, cfg_scale=float(cfg_scale),
+                            cfg_rescale=float(cfg_rescale),
+                            sample_steps=int(sample_steps), sample_method=method,
+                            sample_schedule=schedule,
+                            cfg_interval=cfg_interval, text_aligner=text_aligner,
+                            image_feature_aligner=image_feature_aligner,
+                            caption_cond_source=caption_cond_source,
+                            sample_time_shift=sample_time_shift, time_shift=time_shift)
+                        row["semantic_guidance_w"] = 0.0
+                        row["semantic_guidance_mode"] = "none"
+                        row["semantic_guidance_interval"] = list(DEFAULT_GUIDANCE_INTERVAL)
+                        row["sweep_key"] = (
+                            f"cfg={float(cfg_scale):g};rescale={float(cfg_rescale):g};"
+                            f"steps={int(sample_steps)};method={method};"
+                            f"schedule={schedule};shift={float(sample_time_shift):g};"
+                            f"cfgint={format_interval(cfg_interval)}"
+                        )
+                        rows.append(row)
     return rows
 
 
@@ -4241,6 +4285,7 @@ def eval_report_summary(report):
         "sample_time_shift",
         "time_shift",
         "sample_method",
+        "sample_schedule",
         "semantic_guidance_w",
         "semantic_guidance_mode",
         "semantic_guidance_interval",
@@ -4285,6 +4330,7 @@ def aggregate_sweep_rows(rows):
     for row in rows:
         key = (float(row["cfg_scale"]), int(row["sample_steps"]),
                str(row.get("sample_method", "euler")),
+               str(row.get("sample_schedule", "linear")),
                float(row.get("sample_time_shift", 1.0)),
                float(row.get("cfg_rescale", 0.0)),
                float(row.get("semantic_guidance_w", 0.0)),
@@ -4294,14 +4340,16 @@ def aggregate_sweep_rows(rows):
                                                 DEFAULT_GUIDANCE_INTERVAL)))
         grouped.setdefault(key, []).append(row)
     out = []
-    for (cfg_scale, sample_steps, sample_method, sample_time_shift, cfg_rescale,
+    for (cfg_scale, sample_steps, sample_method, sample_schedule, sample_time_shift,
+         cfg_rescale,
          semantic_guidance_w,
          semantic_guidance_mode, cfg_interval, semantic_guidance_interval), group in sorted(
              grouped.items()):
         agg = {
             "sweep_key": (
                 f"cfg={cfg_scale:g};steps={sample_steps};method={sample_method};"
-                f"shift={sample_time_shift:g};rescale={cfg_rescale:g};"
+                f"schedule={sample_schedule};shift={sample_time_shift:g};"
+                f"rescale={cfg_rescale:g};"
                 f"sem={semantic_guidance_w:g};"
                 f"cfgint={format_interval(cfg_interval)};"
                 f"semint={format_interval(semantic_guidance_interval)}"
@@ -4311,6 +4359,7 @@ def aggregate_sweep_rows(rows):
             "cfg_interval": list(cfg_interval),
             "sample_steps": int(sample_steps),
             "sample_method": sample_method,
+            "sample_schedule": sample_schedule,
             "sample_time_shift": float(sample_time_shift),
             "semantic_guidance_w": float(semantic_guidance_w),
             "semantic_guidance_mode": semantic_guidance_mode,
@@ -4337,6 +4386,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         intervention_samples=0, semantic_guidance_w=0.0,
                         semantic_guidance_weights=None, semantic_guidance_mode="decoded",
                         sample_method="euler", sample_methods=None,
+                        sample_schedule="linear", sample_schedules=None,
                         cfg_rescales=(0.0,),
                         cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                         semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
@@ -4394,6 +4444,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         conditioner=conditioner, prompt_vocab=prompt_vocab,
                         caption_max_len=meta["caption_max_len"],
                         sample_method=sample_method, sample_methods=sample_methods,
+                        sample_schedule=sample_schedule, sample_schedules=sample_schedules,
                         cfg_rescales=cfg_rescales,
                         cfg_interval=cfg_interval,
                         text_aligner=getattr(flow, "text_aligner", None),
@@ -4418,6 +4469,8 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                 "image_w": int(eval_size[1]),
                 "sample_method": sample_method,
                 "sample_methods": list(sample_methods or (sample_method,)),
+                "sample_schedule": sample_schedule,
+                "sample_schedules": list(sample_schedules or (sample_schedule,)),
                 "cfg_rescales": [float(x) for x in cfg_rescales],
                 "sample_time_shift": float(actual_sample_time_shift),
                 "time_shift": float(train_time_shift),
@@ -4456,6 +4509,8 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                                      semantic_guidance_mode=semantic_guidance_mode,
                                      sample_method=sample_method,
                                      sample_methods=sample_methods,
+                                     sample_schedule=sample_schedule,
+                                     sample_schedules=sample_schedules,
                                      cfg_rescales=cfg_rescales,
                                      cfg_interval=cfg_interval,
                                      sample_time_shift=actual_sample_time_shift,
@@ -4479,6 +4534,8 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             "roundtrip_samples": int(roundtrip_samples),
             "sample_method": sample_method,
             "sample_methods": list(sample_methods or (sample_method,)),
+            "sample_schedule": sample_schedule,
+            "sample_schedules": list(sample_schedules or (sample_schedule,)),
             "cfg_rescales": [float(x) for x in cfg_rescales],
             "sample_time_shift": float(actual_sample_time_shift),
             "time_shift": float(train_time_shift),
@@ -4527,7 +4584,8 @@ def selected_grid_settings(report, fallback_cfg=1.0, fallback_cfg_rescale=0.0, f
                            fallback_semantic_mode="decoded",
                            fallback_cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                            fallback_semantic_interval=DEFAULT_GUIDANCE_INTERVAL,
-                           fallback_sample_time_shift=1.0):
+                           fallback_sample_time_shift=1.0,
+                           fallback_sample_schedule="linear"):
     best = report.get("best") or report
     return {
         "cfg_scale": float(best.get("cfg_scale", fallback_cfg)),
@@ -4537,6 +4595,7 @@ def selected_grid_settings(report, fallback_cfg=1.0, fallback_cfg_rescale=0.0, f
         "sample_time_shift": float(best.get("sample_time_shift",
                                             fallback_sample_time_shift)),
         "sample_method": str(best.get("sample_method", fallback_method)),
+        "sample_schedule": str(best.get("sample_schedule", fallback_sample_schedule)),
         "semantic_guidance_w": float(best.get("semantic_guidance_w", fallback_semantic_w)),
         "semantic_guidance_mode": str(best.get("semantic_guidance_mode",
                                                fallback_semantic_mode)),
@@ -4584,6 +4643,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                       semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                       sample_method="euler",
+                      sample_schedule="linear",
                       flow_ema_decay=0.0, flow_ema_warmup=True, eval_with_ema=True,
                       eval_weight_mode="auto", intervention_samples=32,
                       train_precision="fp32", ae_accum_steps=1, flow_accum_steps=1,
@@ -4722,6 +4782,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError(f"unknown semantic guidance mode {semantic_guidance_mode!r}")
     if sample_method not in SAMPLE_METHODS:
         raise ValueError(f"unknown sample method {sample_method!r}")
+    if sample_schedule not in SAMPLE_SCHEDULES:
+        raise ValueError(f"unknown sample schedule {sample_schedule!r}")
     cfg_interval = validate_guidance_interval(cfg_interval, name="cfg_interval")
     semantic_guidance_interval = validate_guidance_interval(
         semantic_guidance_interval, name="semantic_guidance_interval")
@@ -5214,6 +5276,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                                  semantic_guidance_w=semantic_guidance_w,
                                  semantic_guidance_mode=semantic_guidance_mode,
                                  sample_method=sample_method,
+                                 sample_schedule=sample_schedule,
                                  cfg_interval=cfg_interval,
                                  semantic_guidance_interval=semantic_guidance_interval,
                                  sample_time_shift=effective_time_shift,
@@ -5225,6 +5288,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 caption_max_len=caption_max_len, cfg_scale=cfg_scale,
                 cfg_rescale=cfg_rescale,
                 sample_steps=sample_steps, sample_method=sample_method,
+                sample_schedule=sample_schedule,
                 cfg_interval=cfg_interval, text_aligner=text_aligner,
                 image_feature_aligner=image_feature_aligner,
                 caption_cond_source=caption_cond_source,
@@ -5339,6 +5403,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "cfg_rescale": float(cfg_rescale),
         "cfg_interval": list(cfg_interval),
         "sample_method": sample_method,
+        "sample_schedule": sample_schedule,
         "semantic_guidance_w": float(semantic_guidance_w),
         "semantic_guidance_mode": semantic_guidance_mode,
         "semantic_guidance_interval": list(semantic_guidance_interval),
@@ -5429,6 +5494,16 @@ def selftest():
     shifted = flow_time_schedule(4, device="cpu", shift=4.0)
     assert torch.allclose(shifted[[0, -1]], torch.tensor([0.0, 1.0]))
     assert 0.0 < float(shifted[1]) < 0.25
+    schedules = {
+        name: flow_time_schedule(8, device="cpu", shift=1.0, schedule=name)
+        for name in SAMPLE_SCHEDULES
+    }
+    for name, schedule in schedules.items():
+        assert torch.allclose(schedule[[0, -1]], torch.tensor([0.0, 1.0])), name
+        assert bool(torch.all(schedule[1:] >= schedule[:-1])), name
+    assert float(schedules["quadratic"][1]) < float(schedules["linear"][1])
+    assert float(schedules["sqrt"][1]) > float(schedules["linear"][1])
+    assert float(schedules["cosine"][1]) < float(schedules["linear"][1])
     try:
         make_autoencoder(ae_arch="hf-vae")
     except ValueError as e:
@@ -6011,6 +6086,12 @@ def main(argv=None):
     ap.add_argument("--sample-methods", default="",
                     dest="sample_methods",
                     help="comma-separated sampler methods for --eval-checkpoint sweeps")
+    ap.add_argument("--sample-schedule", default="linear", choices=SAMPLE_SCHEDULES,
+                    dest="sample_schedule",
+                    help="timestep placement schedule for latent image generation")
+    ap.add_argument("--sample-schedules", default="",
+                    dest="sample_schedules",
+                    help="comma-separated timestep schedules for --eval-checkpoint sweeps")
     ap.add_argument("--semantic-guidance-w", type=float, default=0.0,
                     dest="semantic_guidance_w",
                     help="sampling-time semantic AE guidance weight")
@@ -6172,6 +6253,9 @@ def main(argv=None):
         cli_size = normalize_image_size(args.size, default=None)
         cli_size_buckets = normalize_image_size_buckets(args.size_buckets)
         sample_prompts = parse_sample_prompts(args.sample_prompts)
+        sample_schedules = (
+            _parse_string_list(args.sample_schedules) if args.sample_schedules else None
+        )
     except ValueError as e:
         ap.error(str(e))
     if args.selftest:
@@ -6181,6 +6265,10 @@ def main(argv=None):
         ap.error("--sample-prompts requires --sample-grid-out")
     if sample_prompts and args.prompt_embed_backend == "hf" and not args.prompt_embed_model:
         ap.error("--prompt-embed-backend hf requires --prompt-embed-model")
+    if sample_schedules is not None:
+        bad_schedules = sorted(set(sample_schedules) - set(SAMPLE_SCHEDULES))
+        if bad_schedules:
+            ap.error(f"unknown sample schedule(s): {','.join(bad_schedules)}")
     if args.eval_checkpoint:
         report = evaluate_checkpoint(
             args.eval_checkpoint,
@@ -6204,6 +6292,8 @@ def main(argv=None):
             sample_methods=(
                 _parse_string_list(args.sample_methods) if args.sample_methods else None
             ),
+            sample_schedule=args.sample_schedule,
+            sample_schedules=sample_schedules,
             cfg_interval=cfg_interval,
             semantic_guidance_interval=semantic_guidance_interval,
             eval_image_manifest=args.eval_image_manifest,
@@ -6224,6 +6314,7 @@ def main(argv=None):
                 fallback_cfg_rescale=args.cfg_rescale,
                 fallback_steps=args.sample_steps,
                 fallback_method=args.sample_method,
+                fallback_sample_schedule=args.sample_schedule,
                 fallback_semantic_w=args.semantic_guidance_w,
                 fallback_semantic_mode=args.semantic_guidance_mode,
                 fallback_cfg_interval=cfg_interval,
@@ -6245,6 +6336,7 @@ def main(argv=None):
                     sample_time_shift=settings["sample_time_shift"],
                     sample_steps=settings["sample_steps"],
                     sample_method=settings["sample_method"],
+                    sample_schedule=settings["sample_schedule"],
                     seed=args.seed + 991,
                     caption_cond_source=meta["caption_cond_source"] or "tokens",
                     prompt_embed_backend=args.prompt_embed_backend,
@@ -6270,6 +6362,7 @@ def main(argv=None):
                     sample_time_shift=settings["sample_time_shift"],
                     sample_steps=settings["sample_steps"],
                     sample_method=settings["sample_method"],
+                    sample_schedule=settings["sample_schedule"],
                     samples=args.sample_grid_samples,
                     seed=args.seed + 991,
                     caption_cond_source=meta["caption_cond_source"])
@@ -6284,6 +6377,7 @@ def main(argv=None):
                     sample_steps=settings["sample_steps"],
                     sample_time_shift=settings["sample_time_shift"],
                     sample_method=settings["sample_method"],
+                    sample_schedule=settings["sample_schedule"],
                     semantic_guidance_w=settings["semantic_guidance_w"],
                     semantic_guidance_mode=settings["semantic_guidance_mode"],
                     semantic_guidance_interval=settings["semantic_guidance_interval"],
@@ -6365,6 +6459,7 @@ def main(argv=None):
         cfg_interval=cfg_interval,
         semantic_guidance_interval=semantic_guidance_interval,
         sample_method=args.sample_method,
+        sample_schedule=args.sample_schedule,
         flow_ema_decay=args.flow_ema_decay,
         flow_ema_warmup=not args.no_ema_warmup,
         eval_with_ema=not args.no_ema_eval,
@@ -6395,6 +6490,7 @@ def main(argv=None):
             fallback_cfg_rescale=args.cfg_rescale,
             fallback_steps=args.sample_steps,
             fallback_method=args.sample_method,
+            fallback_sample_schedule=args.sample_schedule,
             fallback_semantic_w=args.semantic_guidance_w,
             fallback_semantic_mode=args.semantic_guidance_mode,
             fallback_cfg_interval=cfg_interval,
@@ -6411,6 +6507,7 @@ def main(argv=None):
                 sample_steps=settings["sample_steps"],
                 sample_time_shift=settings["sample_time_shift"],
                 sample_method=settings["sample_method"],
+                sample_schedule=settings["sample_schedule"],
                 seed=args.seed + 991,
                 caption_cond_source=report.get("caption_cond_source", "tokens") or "tokens",
                 prompt_embed_backend=args.prompt_embed_backend,
@@ -6434,6 +6531,7 @@ def main(argv=None):
                 sample_steps=settings["sample_steps"],
                 sample_time_shift=settings["sample_time_shift"],
                 sample_method=settings["sample_method"],
+                sample_schedule=settings["sample_schedule"],
                 samples=args.sample_grid_samples,
                 seed=args.seed + 991,
                 caption_cond_source=report.get("caption_cond_source", "tokens"))
@@ -6448,6 +6546,7 @@ def main(argv=None):
                 sample_steps=settings["sample_steps"],
                 sample_time_shift=settings["sample_time_shift"],
                 sample_method=settings["sample_method"],
+                sample_schedule=settings["sample_schedule"],
                 semantic_guidance_w=settings["semantic_guidance_w"],
                 semantic_guidance_mode=settings["semantic_guidance_mode"],
                 semantic_guidance_interval=settings["semantic_guidance_interval"],
@@ -6540,6 +6639,7 @@ def main(argv=None):
         "cfg_interval": list(cfg_interval),
         "sample_steps": args.sample_steps,
         "sample_method": args.sample_method,
+        "sample_schedule": args.sample_schedule,
         "semantic_guidance_w": args.semantic_guidance_w,
         "semantic_guidance_mode": args.semantic_guidance_mode,
         "semantic_guidance_interval": list(semantic_guidance_interval),

@@ -232,6 +232,7 @@ def payload(args):
                      f"--cfg-interval {shlex_quote(args.image_cfg_interval)} "
                      f"--sample-steps {args.image_sample_steps} "
                      f"--sample-method {args.image_sample_method} "
+                     f"--sample-schedule {args.image_sample_schedule} "
                      f"--semantic-guidance-w {args.image_semantic_guidance_w} "
                      f"--semantic-guidance-mode {args.image_semantic_guidance_mode} "
                      f"--semantic-guidance-interval "
@@ -288,6 +289,8 @@ def payload(args):
                           f"--cfg-interval {shlex_quote(args.image_cfg_interval)} "
                           f"--sample-method {args.image_sample_method} "
                           f"--sample-methods {shlex_quote(args.image_sample_methods)} "
+                          f"--sample-schedule {args.image_sample_schedule} "
+                          f"--sample-schedules {shlex_quote(args.image_sample_schedules)} "
                           f"--eval-seeds {shlex_quote(args.image_eval_seeds)} "
                           f"--eval-out runs/image_latent_{args.image_latent_arch}"
                           f"{cond_suffix}_sweep.json")
@@ -763,6 +766,13 @@ def main():
     ap.add_argument("--image-sample-methods", default="euler,heun,midpoint",
                     dest="image_sample_methods",
                     help="comma-separated latent image sampler methods for sweeps")
+    ap.add_argument("--image-sample-schedule", default="linear",
+                    choices=("linear", "quadratic", "sqrt", "cosine"),
+                    dest="image_sample_schedule",
+                    help="latent image timestep placement schedule")
+    ap.add_argument("--image-sample-schedules", default="linear",
+                    dest="image_sample_schedules",
+                    help="comma-separated latent image timestep schedules for sweeps")
     ap.add_argument("--image-sample-grid", action="store_true",
                     dest="image_sample_grid",
                     help="save a generated color x shape PPM grid for latent image jobs")
@@ -970,6 +980,16 @@ def main():
                 raise ValueError(raw)
     except ValueError:
         sys.exit("ERROR: --image-cfg-rescale-sweep values must be in [0, 1]")
+    valid_sample_schedules = {"linear", "quadratic", "sqrt", "cosine"}
+    bad_sample_schedules = sorted(
+        {raw.strip() for raw in str(args.image_sample_schedules).split(",") if raw.strip()}
+        - valid_sample_schedules
+    )
+    if bad_sample_schedules:
+        sys.exit(
+            "ERROR: unsupported --image-sample-schedules values: "
+            + ",".join(bad_sample_schedules)
+        )
     if args.image_time_shift <= 0.0:
         sys.exit("ERROR: --image-time-shift must be positive")
     if args.image_time_shift_ref_dim <= 0.0:

@@ -1272,6 +1272,13 @@ whether sample quality is integration-limited. RunPod now accepts `--image-sampl
 or `rk4`, and its default sweep compares `euler,heun,midpoint` while leaving Euler as the single-run
 default for compatibility.
 
+Image-62 makes timestep placement a first-class sampler axis. `thinking.image_latent` now accepts
+`--sample-schedule linear|quadratic|sqrt|cosine` and checkpoint sweeps can pass
+`--sample-schedules ...`; sample-grid metadata records the selected schedule. This lets GPU runs
+measure whether quality improves by spending more solver evaluations near noisy states, clean
+states, or both endpoints, instead of assuming the shifted linear schedule is always optimal.
+RunPod forwards the same controls as `--image-sample-schedule` and `--image-sample-schedules`.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
