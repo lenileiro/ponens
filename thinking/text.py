@@ -1828,11 +1828,46 @@ def _choice_control_record(rec, side):
                                   "source_record_id": rec.rec_id}))
 
 
-def choice_control_batch_records(sources, rng, n):
+CHOICE_CONTROL_SIDES = ("question", "context", "candidate_replace", "question_swap")
+
+
+def normalize_choice_control_sides(sides, swap_groups=None):
+    if not sides:
+        out = ["question", "context", "candidate_replace"]
+    elif isinstance(sides, str):
+        out = [x.strip() for x in sides.split(",") if x.strip()]
+    else:
+        out = [str(x).strip() for x in sides if str(x).strip()]
+    bad = sorted(set(out) - set(CHOICE_CONTROL_SIDES))
+    if bad:
+        raise ValueError(f"unknown choice control side(s): {bad}")
+    if "question_swap" in out and not swap_groups:
+        out = [x for x in out if x != "question_swap"]
+    return tuple(out)
+
+
+def choice_control_sides_from_failures(eval_report, metric="choice", threshold=0.05):
+    sides = []
+    for name, _gap in _control_gap_failures(
+            eval_report, metric=metric, threshold=threshold).items():
+        if "question_only" in name:
+            sides.append("question")
+        if "context_only" in name:
+            sides.append("context")
+        if "question_swap" in name:
+            sides.append("question_swap")
+        if "candidate_replacement" in name:
+            sides.append("candidate_replace")
+    return tuple(dict.fromkeys(sides))
+
+
+def choice_control_batch_records(sources, rng, n, sides=None):
     if not sources or n <= 0:
         return []
     rows = []
-    sides = ("question", "context", "candidate_replace")
+    sides = normalize_choice_control_sides(sides)
+    if not sides:
+        return []
     tries = 0
     while len(rows) < int(n) and tries < int(n) * 4:
         rec = sources[int(rng.integers(len(sources)))]
@@ -1903,13 +1938,13 @@ def choice_positive_anchor_batch_records(sources, rng, n):
     return rows
 
 
-def choice_answerability_control_batch_records(sources, rng, n, swap_groups=None):
+def choice_answerability_control_batch_records(sources, rng, n, swap_groups=None, sides=None):
     if not sources or n <= 0:
         return []
     rows = []
-    sides = ["question", "context", "candidate_replace"]
-    if swap_groups:
-        sides.append("question_swap")
+    sides = normalize_choice_control_sides(sides, swap_groups=swap_groups)
+    if not sides:
+        return []
     tries = 0
     while len(rows) < int(n) and tries < int(n) * 4:
         side = sides[int(rng.integers(len(sides)))]
@@ -1942,9 +1977,9 @@ def choice_answerability_control_batch_records(sources, rng, n, swap_groups=None
     return rows
 
 
-def choice_final_control_batch_records(sources, rng, n, swap_groups=None):
+def choice_final_control_batch_records(sources, rng, n, swap_groups=None, sides=None):
     return choice_answerability_control_batch_records(
-        sources, rng, n, swap_groups=swap_groups)
+        sources, rng, n, swap_groups=swap_groups, sides=sides)
 
 
 def choice_answerability_contrast_batch(sources, rng, pairs, swap_groups=None):
@@ -2014,14 +2049,14 @@ def choice_question_swap_groups(sources):
     return groups
 
 
-def choice_control_contrast_batch(sources, rng, pairs, swap_groups=None):
+def choice_control_contrast_batch(sources, rng, pairs, swap_groups=None, sides=None):
     if not sources or pairs <= 0:
         return [], []
     rows = []
     ids = []
-    sides = ["question", "context", "candidate_replace"]
-    if swap_groups:
-        sides.append("question_swap")
+    sides = normalize_choice_control_sides(sides, swap_groups=swap_groups)
+    if not sides:
+        return [], []
     tries = 0
     while len(ids) < int(pairs) and tries < int(pairs) * 4:
         side = sides[int(rng.integers(len(sides)))]
@@ -2555,7 +2590,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               choice_question_context_margin=0.0,
               choice_pair_w=0.0, choice_pair_margin=0.0,
               choice_control_w=0.0, choice_control_contrast_w=0.0,
-              choice_control_margin=0.0):
+              choice_control_margin=0.0,
+              choice_control_sides=None):
     rng = np.random.default_rng(seed)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     train_records = [r for r in records if r.split == "train"]
@@ -2637,7 +2673,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
             pair_loss = torch.tensor(0.0, device=device)
         if choice_control_w and control_sources:
             control_records = choice_control_batch_records(control_sources, rng,
-                                                           max(1, batch // 2))
+                                                           max(1, batch // 2),
+                                                           sides=choice_control_sides)
             if control_records:
                 control_txt, _control_ids = pack(control_records, vocab, device)
                 control_loss = choice_loss(model, control_txt, control_records,
@@ -2649,7 +2686,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
             control_loss = torch.tensor(0.0, device=device)
         if choice_final_control_w and control_sources:
             final_control_records = choice_final_control_batch_records(
-                control_sources, rng, max(1, batch // 2), swap_groups=swap_groups)
+                control_sources, rng, max(1, batch // 2), swap_groups=swap_groups,
+                sides=choice_control_sides)
             if final_control_records:
                 final_control_txt, _final_control_ids = pack(
                     final_control_records, vocab, device)
@@ -2663,7 +2701,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
         if choice_final_control_contrast_w and control_sources:
             final_contrast_records, final_contrast_pairs = choice_control_contrast_batch(
                 control_sources, rng, max(1, batch // 2),
-                swap_groups=swap_groups)
+                swap_groups=swap_groups, sides=choice_control_sides)
             if final_contrast_records and final_contrast_pairs:
                 final_contrast_txt, _final_contrast_ids = pack(
                     final_contrast_records, vocab, device)
@@ -2783,7 +2821,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
         if choice_answerability_control_w and control_sources:
             ans_control_records = choice_answerability_control_batch_records(
                 control_sources, rng, max(1, batch // 2),
-                swap_groups=swap_groups)
+                swap_groups=swap_groups, sides=choice_control_sides)
             if ans_control_records:
                 ans_control_txt, _ans_control_ids = pack(ans_control_records, vocab,
                                                          device)
@@ -2798,7 +2836,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
         if choice_candidate_answerability_control_w and control_sources:
             cand_ans_control_records = choice_answerability_control_batch_records(
                 control_sources, rng, max(1, batch // 2),
-                swap_groups=swap_groups)
+                swap_groups=swap_groups, sides=choice_control_sides)
             if cand_ans_control_records:
                 cand_ans_control_txt, _cand_ans_control_ids = pack(
                     cand_ans_control_records, vocab, device)
@@ -2813,7 +2851,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
         if choice_candidate_answerability_contrast_w and control_sources:
             cand_ans_contrast_records, cand_ans_contrast_pairs = choice_control_contrast_batch(
                 control_sources, rng, max(1, batch // 2),
-                swap_groups=swap_groups)
+                swap_groups=swap_groups, sides=choice_control_sides)
             if cand_ans_contrast_records and cand_ans_contrast_pairs:
                 cand_ans_contrast_txt, _cand_ans_contrast_ids = pack(
                     cand_ans_contrast_records, vocab, device)
@@ -2851,7 +2889,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
         if choice_control_contrast_w and control_sources:
             contrast_records, contrast_pairs = choice_control_contrast_batch(
                 control_sources, rng, max(1, batch // 2),
-                swap_groups=swap_groups)
+                swap_groups=swap_groups, sides=choice_control_sides)
             if contrast_records and contrast_pairs:
                 contrast_txt, _contrast_ids = pack(contrast_records, vocab, device)
                 contrast_loss = choice_control_contrast_loss(
@@ -4526,6 +4564,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      study_anchor_retention_bucket=False,
                      study_distill_correct_per_kind=0,
                      study_discovery_correct_per_kind=0,
+                     study_focus_control_failures=False,
                      study_select_best=False, study_score_metric="both",
                      study_retention_w=1.0, study_control_w=1.0,
                      study_kind_w=1.0, study_require_positive_score=True,
@@ -4557,6 +4596,15 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                        kind_free_n=kind_free_n, fact_n=fact_n,
                        kind_fact_n=kind_fact_n, artifact_n=artifact_n, seed=seed + 17)
     before = evaluate_all(model, vocab, study_records, **eval_kwargs)
+    focused_control_sides = ()
+    if study_focus_control_failures:
+        focused_control_sides = choice_control_sides_from_failures(
+            before, metric=study_score_metric)
+    focused_sampling_sides = ()
+    if focused_control_sides:
+        focused_sampling_sides = (
+            ("question", "context", "candidate_replace") + focused_control_sides)
+    fit_control_sides = focused_sampling_sides or None
     replay_before = (evaluate_all(model, vocab, replay_records, **eval_kwargs)
                      if replay_records and any(r.split == "eval" for r in replay_records)
                      else None)
@@ -4658,6 +4706,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "study_anchor_retention_bucket": bool(study_anchor_retention_bucket),
               "study_distill_correct_per_kind": int(study_distill_correct_per_kind),
               "study_discovery_correct_per_kind": int(study_discovery_correct_per_kind),
+              "study_focus_control_failures": bool(study_focus_control_failures),
+              "study_control_focus_sides": list(focused_control_sides),
+              "study_control_sampling_sides": list(focused_sampling_sides),
               "study_select_best": bool(study_select_best),
               "study_score_metric": study_score_metric,
               "study_retention_w": float(study_retention_w),
@@ -4823,6 +4874,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                               "distill_records_by_kind": distill_counts,
                               "discovery_records": len(discovery_records),
                               "discovery_records_by_kind": discovery_counts,
+                              "control_focus_sides": list(focused_control_sides),
+                              "control_sampling_sides": list(focused_sampling_sides),
                               "replay_fit_records": len(train_replay_records),
                               "hard_examples": hard_report})
         distill_teacher = None
@@ -4895,7 +4948,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   choice_pair_margin=choice_pair_margin,
                   choice_control_w=choice_control_w,
                   choice_control_contrast_w=choice_control_contrast_w,
-                  choice_control_margin=choice_control_margin)
+                  choice_control_margin=choice_control_margin,
+                  choice_control_sides=fit_control_sides)
         if study_select_best:
             round_study_eval = evaluate_all(model, vocab, study_records, **eval_kwargs)
             round_replay_eval = (evaluate_all(model, vocab, replay_records, **eval_kwargs)
@@ -5304,6 +5358,10 @@ def selftest():
     assert len(control_rows) == 4
     assert all(qa_choice_target(r) == "none" for r in control_rows)
     assert all(qa_choice_spans(r) for r in control_rows)
+    question_control_rows = choice_control_batch_records(
+        control_sources, np.random.default_rng(20), n=3, sides=("question",))
+    assert question_control_rows and all("choice_control_question" in r.kind
+                                         for r in question_control_rows)
     contrast_rows, contrast_pairs = choice_control_contrast_batch(
         control_sources, np.random.default_rng(6), pairs=2)
     assert len(contrast_rows) == 4 and len(contrast_pairs) == 2
@@ -5318,6 +5376,16 @@ def selftest():
     assert len(final_control_rows) == 8
     assert all(qa_choice_target(r) == "none" for r in final_control_rows)
     if swap_groups:
+        swap_focus_rows = choice_answerability_control_batch_records(
+            control_sources, np.random.default_rng(21), n=2, swap_groups=swap_groups,
+            sides=("question_swap",))
+        assert len(swap_focus_rows) == 2
+        assert all("question_swap" in r.kind for r in swap_focus_rows)
+        final_swap_focus_rows = choice_final_control_batch_records(
+            control_sources, np.random.default_rng(22), n=2, swap_groups=swap_groups,
+            sides=("question_swap",))
+        assert len(final_swap_focus_rows) == 2
+        assert all("question_swap" in r.kind for r in final_swap_focus_rows)
         swap_rows, swap_pairs = choice_control_contrast_batch(
             control_sources, np.random.default_rng(7), pairs=2,
             swap_groups=swap_groups)
@@ -5330,8 +5398,6 @@ def selftest():
             control_sources, np.random.default_rng(11), pairs=2,
             swap_groups=swap_groups)
         assert len(ans_contrast_rows) == 4 and len(ans_contrast_pairs) == 2
-        assert any("question_swap" in r.kind for r in ans_control_rows)
-        assert any("question_swap" in r.kind for r in final_control_rows)
     pair_vocab = build_vocab(pair_rows)
     pair_schema = build_fact_schema(pair_rows)
     pair_model = TextFactLM(len(pair_vocab), d=32, layers=1, heads=4,
@@ -5447,6 +5513,8 @@ def selftest():
         "qa_choice_full_minus_context_only",
         "qa_choice_full_minus_question_swap",
     }
+    assert choice_control_sides_from_failures(score_choice, metric="choice") == (
+        "question", "context", "question_swap")
     assert not study_selection_allowed(choice_components, control_w=1.0)["score_allowed"]
     assert study_selection_allowed(choice_components, control_w=0.0)["control_allowed"]
     score_lopsided = {"semantic_head": {"fact_value_acc": 0.95},
@@ -5797,6 +5865,9 @@ def main(argv=None):
     ap.add_argument("--study-discovery-correct-per-kind", type=int, default=0,
                     help=("for error self-study, use this many currently-correct "
                           "choice records per kind as concept-bridge discovery sources"))
+    ap.add_argument("--study-focus-control-failures", action="store_true",
+                    help=("during study, focus generated controls on control families "
+                          "that failed the initial gate"))
     ap.add_argument("--study-select-best", action="store_true",
                     help="evaluate each study round and restore the best scoring weights")
     ap.add_argument("--study-score-metric", choices=("semantic", "teacher", "both", "min",
@@ -5964,6 +6035,7 @@ def main(argv=None):
                              args.study_distill_correct_per_kind),
                          study_discovery_correct_per_kind=(
                              args.study_discovery_correct_per_kind),
+                         study_focus_control_failures=args.study_focus_control_failures,
                          study_select_best=args.study_select_best,
                          study_score_metric=args.study_score_metric,
                          study_retention_w=args.study_retention_w,

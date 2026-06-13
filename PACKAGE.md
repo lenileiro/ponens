@@ -818,6 +818,24 @@ step is that the curriculum can now create model-derived concept-connection pres
 exact repeated answers are sparse; the next issue is making those discovered neighborhoods pass the
 held-out control instead of just improving aggregate choice.
 
+`--study-focus-control-failures` adds the first adaptive control curriculum for the upstream text
+reader that later feeds multimodal fusion. The study gate already knows which shortcut controls
+failed; this option converts those failed metrics into extra generated-control sampling pressure
+during the next fit, while keeping the base question/context/candidate corruption mix active. It
+does not add facts or English rules: the focus set is derived from the model's own pre-study
+evaluation report, then written into the study report as `study_control_focus_sides` and
+`study_control_sampling_sides`.
+
+The guarded focus smoke found the same real weaknesses (`question_swap` and `candidate_replace`)
+and oversampled those controls alongside the base mix. The round still failed the selector:
+aggregate choice landed at **0.225**, real-answer `squad_choice` regressed from **0.300** to
+**0.200**, swap negatives stayed at **0.000**, and candidate replacement abstention was still
+negative (**-0.500** margin), so `selected_round` stayed **0**. That is a useful upstream
+architecture change rather than a claimed mastery jump: future multimodal runs can inherit a text
+reader that reports and targets its own failed evidence routes, but the guarded selector prevents
+those experimental updates from replacing the checkpoint until they improve both retention and
+controls.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
@@ -1590,6 +1608,12 @@ architecture. Reports now include `concept_head`, `concept_gate`, reader-prefix 
 total prefix token count, and RunPod exposes the new controls as `--multimodal-fusion-arch`,
 `--multimodal-concept-tokens`, `--multimodal-fusion-layers`, `--multimodal-concept-w`,
 `--multimodal-concept-agreement-w`, and `--multimodal-concept-distill-w`.
+
+The adaptive text study loop above is intentionally upstream of this multimodal bridge. When the
+text reader fails shortcut controls, the next study attempt can focus the generated evidence
+routes that failed, while the selector blocks regressions. Multimodal can then consume a reader
+whose concept distributions are being improved by measured failures instead of by hard-coded
+English facts or hand-written rules.
 
 M-0 local update (240 steps, value-token weighted loss, all-mode ablations every step): the
 tracked run now gates three paths separately. Teacher-forced full multimodal accuracy is color
