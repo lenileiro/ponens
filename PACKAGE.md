@@ -1293,14 +1293,14 @@ are recorded in train reports/checkpoints so caption-sensitive runs can keep fli
 
 Image-45 adds rectified-flow timestep shifting for high-resolution latent image runs.
 `thinking.image_latent --time-shift` shifts training samples and sampler nodes toward the noisy
-part of the data-time path while keeping `1.0` as the exact legacy schedule. Checkpoint eval uses
+part of the data-time path while keeping `1.0` as the original schedule. Checkpoint eval uses
 the saved shift by default, `--sample-time-shift` can override it for sweeps, and RunPod exposes the
 training knob as `--image-time-shift`.
 
 Image-46 adds optional per-head QK RMSNorm to the custom MM-DiT attention path. Use
 `thinking.image_latent --dit-qk-norm` or RunPod `--image-dit-qk-norm` for high-resolution MM-DiT
 runs; checkpoint metadata records the flag so qk-normalized checkpoints reload with the same
-attention modules, while legacy checkpoints keep the default non-normalized architecture.
+attention modules, while existing checkpoints keep the default non-normalized architecture.
 
 Image-47 adds an MM-DiT attention implementation selector. `--dit-attn-impl manual|sdpa|auto`
 keeps the original explicit attention path available, uses PyTorch scaled-dot-product attention for
@@ -1316,7 +1316,7 @@ settings as `--image-flow-repa-w`, `--image-flow-repa-steps`, and
 feature alignment or REPA needs them.
 
 Image-49 adds optional Min-SNR-style velocity loss weighting for rectified-flow training.
-`--flow-loss-weight none|min-snr-v|soft-min-snr-v` keeps the exact legacy objective by default,
+`--flow-loss-weight none|min-snr-v|soft-min-snr-v` keeps the exact original objective by default,
 but can reweight per-example velocity MSE by the data-time SNR with batch-mean normalization.
 Reports/checkpoints record the weighting mode, gamma, and observed weight range; RunPod exposes the
 same controls as `--image-flow-loss-weight`, `--image-flow-loss-weight-gamma`, and
@@ -1325,7 +1325,7 @@ same controls as `--image-flow-loss-weight`, `--image-flow-loss-weight-gamma`, a
 Image-50 adds sampler-side CFG rescale. `--cfg-rescale` rescales guided latent velocities toward
 the conditional velocity standard deviation before blending, while `--cfg-rescales` makes it a
 checkpoint-sweep axis. RunPod exposes `--image-cfg-rescale` and
-`--image-cfg-rescale-sweep`. Default `0.0` preserves legacy CFG behavior.
+`--image-cfg-rescale-sweep`. Default `0.0` preserves the original CFG behavior.
 
 Image-51 adds aspect-preserving manifest padding. `--image-crop-mode pad` resizes each image to fit
 the requested canvas and pads the remaining area instead of square-cropping or distorting it. This
@@ -1333,7 +1333,7 @@ is the minimal data-pipeline step toward mixed-aspect high-resolution training: 
 stay in frame while the current fixed-shape AE/flow code can still batch tensors locally and on
 RunPod.
 
-Image-52 adds geometry-aware latent DiT positions. `--dit-pos-embed learned|sincos2d` keeps legacy
+Image-52 adds geometry-aware latent DiT positions. `--dit-pos-embed learned|sincos2d` keeps
 learned 1D tables by default, but new high-resolution DiT/CrossDiT/MM-DiT runs can use deterministic
 2D sinusoidal image-token positions. RunPod exposes this as `--image-dit-pos-embed`. This removes a
 fixed-token-table assumption from the transformer path and is a better default for resolution and
@@ -1361,7 +1361,7 @@ eval.
 
 Image-56 adds quality-weighted manifest sampling. `thinking.image_latent
 --image-quality-weight W` samples rows from normalized `aesthetic` / `score` / `quality` metadata
-instead of treating all kept rows equally; `W=0` is the exact legacy uniform behavior. The same
+instead of treating all kept rows equally; `W=0` is the exact uniform behavior. The same
 weighting now reaches AE batches, latent-stat estimation, and memory/disk/bucketed flow latent
 caches, with reports/checkpoints exposing `image_quality_*` and `flow_cache_weighted` fields. This
 is a generic data-quality scaling lever: cleaned manifests can prefer better scored images without
@@ -1527,7 +1527,7 @@ image embedding sidecar.
 Image-77 decouples generated manifest eval count from sampler step count. `thinking.image_latent
 --eval-checkpoint ... --eval-generated-samples N` now controls how many generated images feed the
 caption retrieval, feature-distribution, diversity, coverage, and quality metrics for each sweep
-row; `0` keeps the legacy `min(batch,sample_steps)` smoke behavior. Generation is chunked by the
+row; `0` uses `min(batch,sample_steps)` for smoke behavior. Generation is chunked by the
 normal eval batch size, and RunPod exposes the same control as `--image-eval-generated-samples`.
 This makes one-step solver smokes useful without weakening full-sample quality metrics, and lets
 GPU sweeps spend eval budget on statistically meaningful generated sets.
@@ -1541,11 +1541,10 @@ sampling mode, and last active training mode; RunPod exposes the same lever as
 `--image-time-curriculum-frac`. Default `0` preserves the static timestep sampler.
 
 Image-79 fixes the MM-DiT residual-gate semantics for new runs. The original gate projection was
-zero-initialized but applied as `1 + gate`, so blocks did not start as identity. New
-`thinking.image_latent --dit-residual-gate zero` runs use the AdaLN-zero-style branch multiplier
-directly, while `legacy` remains available and is used automatically for old checkpoints without
-gate-mode metadata. Reports/checkpoints record `dit_residual_gate` and `zero_residual_gating`, and
-RunPod exposes the same setting as `--image-dit-residual-gate`.
+zero-initialized but applied as `1 + gate`, so blocks did not start as identity. MM-DiT now always
+uses the AdaLN-zero-style branch multiplier directly; there is no alternate residual-gate mode in
+the CLI or RunPod wrapper. Reports/checkpoints record `dit_residual_gate="zero"` and
+`zero_residual_gating` as fixed architecture metadata.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

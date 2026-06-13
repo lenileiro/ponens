@@ -258,7 +258,6 @@ def payload(args):
                      f"--dit-head-width-mult {args.image_dit_head_width_mult} "
                      f"--dit-attn-impl {args.image_dit_attn_impl} "
                      f"--dit-pos-embed {args.image_dit_pos_embed} "
-                     f"--dit-residual-gate {args.image_dit_residual_gate} "
                      f"--ae-arch {args.image_ae_arch} "
                      f"--ae-hf-model {shlex_quote(args.image_ae_hf_model)} "
                      f"--ae-hf-subfolder {shlex_quote(args.image_ae_hf_subfolder)} "
@@ -626,7 +625,7 @@ def main():
     ap.add_argument("--no-curriculum", action="store_true", dest="no_curriculum")
     ap.add_argument("--stair-world", default="kinship", dest="stair_world",
                     choices=("kinship", "chain"),
-                    help="rung 0 = chain (the legacy-validated task on the production trainer)")
+                    help="rung 0 = chain (the baseline-validated task on the production trainer)")
     ap.add_argument("--no-loop", action="store_true", dest="no_loop",
                     help="train non-looped (pending the loop-regression ablation verdict)")
     ap.add_argument("--ablate", action="store_true", help="run the loop ablation first")
@@ -853,8 +852,8 @@ def main():
                     help="cap image eval manifest records for GPU smoke tests; 0 means all")
     ap.add_argument("--image-eval-generated-samples", type=int, default=0,
                     dest="image_eval_generated_samples",
-                    help=("generated manifest samples per eval row; 0 keeps legacy "
-                          "min(batch,sample_steps) behavior"))
+                    help=("generated manifest samples per eval row; 0 uses "
+                          "min(batch,sample_steps)"))
     ap.add_argument("--image-caption-vocab-max", type=int, default=8192,
                     dest="image_caption_vocab_max",
                     help="maximum caption vocabulary size for image manifest training")
