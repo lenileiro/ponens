@@ -35,9 +35,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .image_data import (build_caption_vocab, caption_ids, load_image_tensor,
-                         normalized_sampling_weights, read_image_manifest,
-                         sample_image_text_batch, summarize_records)
+from .image_data import (ImageTextRecord, build_caption_vocab, caption_ids,
+                         load_image_tensor, normalized_sampling_weights,
+                         read_image_manifest, sample_image_text_batch,
+                         summarize_records)
 from .image_flow import FACT_VOCAB, fact_condition
 from .vision import COLORS, SHAPES, DEV, ObjectSpec, object_facts, render_object, sample_object
 
@@ -2967,6 +2968,70 @@ def caption_condition_ids(ids, conditioner, device=DEV, return_tokens=False):
     return conditioner(ids.to(device=device), return_tokens=return_tokens)
 
 
+def parse_sample_prompts(raw):
+    if not raw:
+        return ()
+    if isinstance(raw, (tuple, list)):
+        return tuple(str(x).strip() for x in raw if str(x).strip())
+    text = str(raw).strip()
+    if not text:
+        return ()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, str):
+            return (parsed.strip(),) if parsed.strip() else ()
+        if isinstance(parsed, (tuple, list)):
+            return tuple(str(x).strip() for x in parsed if str(x).strip())
+    except json.JSONDecodeError:
+        pass
+    return tuple(x.strip() for x in text.replace("\n", ";").split(";") if x.strip())
+
+
+@torch.no_grad()
+def prompt_embedding_condition(prompts, conditioner, embed_backend="stats", embed_model="",
+                               embed_device=None, embed_dtype="auto", embed_normalize=True,
+                               embed_stats_dim=0, trust_remote_code=False, device=DEV,
+                               return_tokens=False):
+    if conditioner is None:
+        raise ValueError("prompt embedding conditioning requires a loaded conditioner")
+    input_dim = int(getattr(conditioner, "input_dim", 0) or 0)
+    if input_dim <= 0:
+        raise ValueError("prompt embedding conditioning requires a PrecomputedTextConditioner")
+    stats_dim = int(embed_stats_dim or input_dim)
+    from .image_embed import make_embedder
+    embedder = make_embedder(
+        backend=embed_backend, model=embed_model, device=embed_device or device,
+        dtype=embed_dtype, normalize=embed_normalize, stats_dim=stats_dim,
+        trust_remote_code=trust_remote_code)
+    records = [ImageTextRecord(path="", caption=str(prompt), split="sample")
+               for prompt in prompts]
+    embeddings = embedder.encode_texts(records).to(device=device)
+    if int(embeddings.shape[-1]) != input_dim:
+        raise ValueError(
+            f"prompt embedding dim {int(embeddings.shape[-1])} does not match "
+            f"checkpoint text_embedding_in_dim {input_dim}"
+        )
+    return conditioner(embeddings, return_tokens=return_tokens)
+
+
+@torch.no_grad()
+def text_prompt_condition(prompts, conditioner, prompt_vocab=None, caption_max_len=64,
+                          source="tokens", device=DEV, return_tokens=False,
+                          embed_backend="stats", embed_model="", embed_device=None,
+                          embed_dtype="auto", embed_normalize=True, embed_stats_dim=0,
+                          trust_remote_code=False):
+    source = str(source or "tokens")
+    if source == "embedding":
+        return prompt_embedding_condition(
+            prompts, conditioner, embed_backend=embed_backend, embed_model=embed_model,
+            embed_device=embed_device, embed_dtype=embed_dtype,
+            embed_normalize=embed_normalize, embed_stats_dim=embed_stats_dim,
+            trust_remote_code=trust_remote_code, device=device, return_tokens=return_tokens)
+    return caption_condition(
+        prompts, conditioner, prompt_vocab, max_len=caption_max_len, device=device,
+        return_tokens=return_tokens)
+
+
 def infer_text_embedding_dim(records):
     dims = {len(rec.text_embedding) for rec in records if rec.text_embedding is not None}
     if not dims:
@@ -3298,6 +3363,62 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
         "sample_grid_seed": int(seed),
         "sample_grid_caption_count": int(n),
         "sample_grid_captions": captions[:min(5, len(captions))],
+    })
+    return meta
+
+
+@torch.no_grad()
+def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, conditioner=None,
+                                 prompt_vocab=None, caption_max_len=64, cfg_scale=1.0,
+                                 cfg_rescale=0.0, sample_steps=4, sample_method="euler",
+                                 cfg_interval=DEFAULT_GUIDANCE_INTERVAL, seed=0,
+                                 caption_cond_source="tokens", sample_time_shift=1.0,
+                                 prompt_embed_backend="stats", prompt_embed_model="",
+                                 prompt_embed_device=None, prompt_embed_dtype="auto",
+                                 prompt_embed_normalize=True, prompt_embed_stats_dim=0,
+                                 prompt_embed_trust_remote_code=False):
+    ae.eval()
+    flow.eval()
+    prompts = tuple(str(p).strip() for p in prompts if str(p).strip())
+    if not prompts:
+        raise ValueError("at least one sample prompt is required")
+    cond = text_prompt_condition(
+        prompts, conditioner, prompt_vocab=prompt_vocab, caption_max_len=caption_max_len,
+        source=caption_cond_source, device=device, return_tokens=flow_uses_cond_tokens(flow),
+        embed_backend=prompt_embed_backend, embed_model=prompt_embed_model,
+        embed_device=prompt_embed_device, embed_dtype=prompt_embed_dtype,
+        embed_normalize=prompt_embed_normalize, embed_stats_dim=prompt_embed_stats_dim,
+        trust_remote_code=prompt_embed_trust_remote_code)
+    sample = sample_images(ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
+                           steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
+                           cfg_rescale=cfg_rescale,
+                           sample_method=sample_method, cfg_interval=cfg_interval,
+                           sample_time_shift=sample_time_shift)
+    n = len(prompts)
+    cols = int(np.ceil(np.sqrt(n)))
+    rows = int(np.ceil(n / cols))
+    meta = write_ppm_grid(sample, path, rows=rows, cols=cols)
+    meta.update({
+        "sample_grid_cfg_scale": float(cfg_scale),
+        "sample_grid_cfg_rescale": float(cfg_rescale),
+        "sample_grid_sample_steps": int(sample_steps),
+        "sample_grid_sample_time_shift": float(sample_time_shift),
+        "sample_grid_sample_method": sample_method,
+        "sample_grid_cfg_interval": list(validate_guidance_interval(cfg_interval)),
+        "sample_grid_cond_mode": "prompt",
+        "sample_grid_caption_cond_source": caption_cond_source,
+        "sample_grid_seed": int(seed),
+        "sample_grid_prompt_count": int(n),
+        "sample_grid_prompts": list(prompts[:min(8, len(prompts))]),
+        "sample_grid_prompt_embed_backend": (
+            prompt_embed_backend if caption_cond_source == "embedding" else ""
+        ),
+        "sample_grid_prompt_embed_model": (
+            prompt_embed_model if caption_cond_source == "embedding" else ""
+        ),
+        "sample_grid_prompt_embed_normalize": (
+            bool(prompt_embed_normalize) if caption_cond_source == "embedding" else False
+        ),
     })
     return meta
 
@@ -5445,6 +5566,13 @@ def selftest():
         conditioner=conditioner3, prompt_vocab=vocab3, sample_steps=1, samples_per_combo=1,
         seed=10)
     assert text_grid_meta["sample_grid_cond_mode"] == "text"
+    prompt_grid_path = "/tmp/image_latent_selftest_prompt_grid.ppm"
+    prompt_grid_meta = save_text_prompt_sample_grid(
+        ae3, flow3, ("a blue triangle", "a red square"), prompt_grid_path,
+        size=32, device="cpu", conditioner=conditioner3, prompt_vocab=vocab3,
+        sample_steps=1, seed=13, caption_cond_source="tokens")
+    assert prompt_grid_meta["sample_grid_cond_mode"] == "prompt"
+    assert prompt_grid_meta["sample_grid_prompt_count"] == 2
     ae4, flow4, conditioner4, vocab4, report4 = train_latent_flow(
         ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="crossdit",
         dit_depth=1, dit_heads=2, seed=5, device="cpu", cond_mode="text",
@@ -5552,6 +5680,16 @@ def selftest():
         assert report6["flow_cache_weighted"] is True
         assert report6["flow_cache_records"] == 2 and report6["flow_cache_bytes"] > 0
         assert report6["flow_cache_shards"] == 0
+        embed_prompt_grid_path = "/tmp/image_latent_selftest_embed_prompt_grid.ppm"
+        embed_prompt_meta = save_text_prompt_sample_grid(
+            ae6, flow6, ("red color patch", "green color patch"),
+            embed_prompt_grid_path, size=32, device="cpu", conditioner=conditioner6,
+            prompt_vocab=vocab6, caption_max_len=8, sample_steps=1, seed=21,
+            caption_cond_source="embedding", prompt_embed_backend="stats",
+            prompt_embed_stats_dim=4)
+        assert embed_prompt_meta["sample_grid_cond_mode"] == "prompt"
+        assert embed_prompt_meta["sample_grid_caption_cond_source"] == "embedding"
+        assert embed_prompt_meta["sample_grid_prompt_embed_backend"] == "stats"
         ae_rect, flow_rect, conditioner_rect, vocab_rect, report_rect = train_latent_flow(
             ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=16,
             flow_arch="dit", dit_depth=1, dit_heads=2, seed=14,
@@ -5985,6 +6123,26 @@ def main(argv=None):
     ap.add_argument("--sample-grid-samples", type=int, default=1,
                     dest="sample_grid_samples",
                     help="generated samples per color/shape condition in --sample-grid-out")
+    ap.add_argument("--sample-prompts", default="", dest="sample_prompts",
+                    help="semicolon/newline separated prompts for --sample-grid-out")
+    ap.add_argument("--prompt-embed-backend", default="stats",
+                    choices=("stats", "hf"), dest="prompt_embed_backend",
+                    help="text embedding backend used by --sample-prompts with embedding conditioning")
+    ap.add_argument("--prompt-embed-model", default="", dest="prompt_embed_model",
+                    help="Hugging Face model id for --prompt-embed-backend hf")
+    ap.add_argument("--prompt-embed-device", default="", dest="prompt_embed_device",
+                    help="device for live prompt embedding; default uses image_latent device")
+    ap.add_argument("--prompt-embed-dtype", default="auto",
+                    choices=("auto", "fp32", "fp16", "bf16"), dest="prompt_embed_dtype")
+    ap.add_argument("--prompt-embed-stats-dim", type=int, default=0,
+                    dest="prompt_embed_stats_dim",
+                    help="stats backend prompt embedding width; 0 uses checkpoint input dim")
+    ap.add_argument("--prompt-embed-no-normalize", action="store_true",
+                    dest="prompt_embed_no_normalize",
+                    help="do not L2-normalize live prompt embeddings")
+    ap.add_argument("--prompt-embed-trust-remote-code", action="store_true",
+                    dest="prompt_embed_trust_remote_code",
+                    help="pass trust_remote_code=True to Hugging Face prompt embedder")
     ap.add_argument("--checkpoint-weight-mode", default="auto", choices=EVAL_WEIGHT_MODES,
                     dest="checkpoint_weight_mode",
                     help="which checkpoint weights to sweep: raw, ema, or measured auto-select")
@@ -5996,11 +6154,16 @@ def main(argv=None):
         semantic_guidance_interval = _parse_interval(args.semantic_guidance_interval)
         cli_size = normalize_image_size(args.size, default=None)
         cli_size_buckets = normalize_image_size_buckets(args.size_buckets)
+        sample_prompts = parse_sample_prompts(args.sample_prompts)
     except ValueError as e:
         ap.error(str(e))
     if args.selftest:
         selftest()
         return
+    if sample_prompts and not args.sample_grid_out:
+        ap.error("--sample-prompts requires --sample-grid-out")
+    if sample_prompts and args.prompt_embed_backend == "hf" and not args.prompt_embed_model:
+        ap.error("--prompt-embed-backend hf requires --prompt-embed-model")
     if args.eval_checkpoint:
         report = evaluate_checkpoint(
             args.eval_checkpoint,
@@ -6054,7 +6217,27 @@ def main(argv=None):
                 ))
             grid_size = image_hw(
                 cli_size, default=report.get("image_size", meta.get("image_size", 32)) or 32)
-            if report.get("experiment") == "image_latent_manifest_sampler_sweep":
+            if sample_prompts:
+                grid_meta = save_text_prompt_sample_grid(
+                    ae, flow, sample_prompts, args.sample_grid_out, conditioner=conditioner,
+                    prompt_vocab=prompt_vocab, caption_max_len=meta["caption_max_len"],
+                    size=grid_size,
+                    cfg_scale=settings["cfg_scale"],
+                    cfg_rescale=settings["cfg_rescale"],
+                    cfg_interval=settings["cfg_interval"],
+                    sample_time_shift=settings["sample_time_shift"],
+                    sample_steps=settings["sample_steps"],
+                    sample_method=settings["sample_method"],
+                    seed=args.seed + 991,
+                    caption_cond_source=meta["caption_cond_source"] or "tokens",
+                    prompt_embed_backend=args.prompt_embed_backend,
+                    prompt_embed_model=args.prompt_embed_model,
+                    prompt_embed_device=args.prompt_embed_device or None,
+                    prompt_embed_dtype=args.prompt_embed_dtype,
+                    prompt_embed_normalize=not args.prompt_embed_no_normalize,
+                    prompt_embed_stats_dim=args.prompt_embed_stats_dim,
+                    prompt_embed_trust_remote_code=args.prompt_embed_trust_remote_code)
+            elif report.get("experiment") == "image_latent_manifest_sampler_sweep":
                 grid_records = read_image_manifest(
                     report["eval_image_manifest"], root=report.get("eval_image_root", ""),
                     split=report.get("eval_image_split", "eval"),
@@ -6200,7 +6383,27 @@ def main(argv=None):
             fallback_cfg_interval=cfg_interval,
             fallback_semantic_interval=semantic_guidance_interval,
             fallback_sample_time_shift=args.time_shift)
-        if args.image_manifest:
+        if sample_prompts:
+            grid_meta = save_text_prompt_sample_grid(
+                ae, flow, sample_prompts, args.sample_grid_out, conditioner=conditioner,
+                prompt_vocab=prompt_vocab, caption_max_len=args.caption_max_len,
+                size=run_size,
+                cfg_scale=settings["cfg_scale"],
+                cfg_rescale=settings["cfg_rescale"],
+                cfg_interval=settings["cfg_interval"],
+                sample_steps=settings["sample_steps"],
+                sample_time_shift=settings["sample_time_shift"],
+                sample_method=settings["sample_method"],
+                seed=args.seed + 991,
+                caption_cond_source=report.get("caption_cond_source", "tokens") or "tokens",
+                prompt_embed_backend=args.prompt_embed_backend,
+                prompt_embed_model=args.prompt_embed_model,
+                prompt_embed_device=args.prompt_embed_device or None,
+                prompt_embed_dtype=args.prompt_embed_dtype,
+                prompt_embed_normalize=not args.prompt_embed_no_normalize,
+                prompt_embed_stats_dim=args.prompt_embed_stats_dim,
+                prompt_embed_trust_remote_code=args.prompt_embed_trust_remote_code)
+        elif args.image_manifest:
             grid_records = read_image_manifest(
                 args.image_manifest, root=args.image_root, split=args.image_split,
                 min_aesthetic=args.image_min_aesthetic, max_records=args.image_max_records)

@@ -167,6 +167,18 @@ def payload(args):
             cond_suffix = "" if args.image_cond_mode == "facts" else f"_{args.image_cond_mode}"
             ckpt = f"runs/image_latent_{args.image_latent_arch}{cond_suffix}.pt"
             grid = f"runs/image_latent_{args.image_latent_arch}{cond_suffix}_grid.ppm"
+            prompt_grid_args = ""
+            if args.image_sample_prompts:
+                prompt_grid_args += f" --sample-prompts {shlex_quote(args.image_sample_prompts)}"
+                prompt_grid_args += f" --prompt-embed-backend {args.image_prompt_embed_backend}"
+                prompt_grid_args += f" --prompt-embed-model {shlex_quote(args.image_prompt_embed_model)}"
+                prompt_grid_args += f" --prompt-embed-device {shlex_quote(args.image_prompt_embed_device)}"
+                prompt_grid_args += f" --prompt-embed-dtype {args.image_prompt_embed_dtype}"
+                prompt_grid_args += f" --prompt-embed-stats-dim {args.image_prompt_embed_stats_dim}"
+                if args.image_prompt_embed_no_normalize:
+                    prompt_grid_args += " --prompt-embed-no-normalize"
+                if args.image_prompt_embed_trust_remote_code:
+                    prompt_grid_args += " --prompt-embed-trust-remote-code"
             train = (f"{IL} --train --ae-steps {args.train_steps or 800} "
                      f"--flow-steps {args.train_steps or 800} --batch {args.batch} "
                      f"--ae-accum-steps {args.image_ae_accum_steps} "
@@ -250,7 +262,8 @@ def payload(args):
                      f"--out {ckpt}")
             if args.image_sample_grid:
                 train += (f" --sample-grid-out {grid} "
-                          f"--sample-grid-samples {args.image_sample_grid_samples}")
+                          f"--sample-grid-samples {args.image_sample_grid_samples}"
+                          f"{prompt_grid_args}")
             if args.image_no_ema_warmup:
                 train += " --no-ema-warmup"
             if args.image_dit_qk_norm:
@@ -300,7 +313,8 @@ def payload(args):
                           f"--intervention-samples {args.image_intervention_samples}")
                 if args.image_sample_grid:
                     eval_cmd += (f" --sample-grid-out {grid} "
-                                 f"--sample-grid-samples {args.image_sample_grid_samples}")
+                                 f"--sample-grid-samples {args.image_sample_grid_samples}"
+                                 f"{prompt_grid_args}")
                 train += eval_cmd
             cmds.append(train)
         if args.audio:                                     # AUDIO-1: audio factors -> facts
@@ -754,6 +768,29 @@ def main():
     ap.add_argument("--image-sample-grid-samples", type=int, default=1,
                     dest="image_sample_grid_samples",
                     help="generated samples per color/shape condition in the image PPM grid")
+    ap.add_argument("--image-sample-prompts", default="", dest="image_sample_prompts",
+                    help="semicolon/newline separated prompts for latent image sample grids")
+    ap.add_argument("--image-prompt-embed-backend", default="stats",
+                    choices=("stats", "hf"), dest="image_prompt_embed_backend",
+                    help="text embedding backend for --image-sample-prompts on embedding checkpoints")
+    ap.add_argument("--image-prompt-embed-model", default="",
+                    dest="image_prompt_embed_model",
+                    help="Hugging Face model id for --image-prompt-embed-backend hf")
+    ap.add_argument("--image-prompt-embed-device", default="cuda",
+                    dest="image_prompt_embed_device",
+                    help="device for live sample-prompt embedding")
+    ap.add_argument("--image-prompt-embed-dtype", default="auto",
+                    choices=("auto", "fp32", "fp16", "bf16"),
+                    dest="image_prompt_embed_dtype")
+    ap.add_argument("--image-prompt-embed-stats-dim", type=int, default=0,
+                    dest="image_prompt_embed_stats_dim",
+                    help="stats backend prompt embedding width; 0 uses checkpoint input dim")
+    ap.add_argument("--image-prompt-embed-no-normalize", action="store_true",
+                    dest="image_prompt_embed_no_normalize",
+                    help="do not L2-normalize live sample-prompt embeddings")
+    ap.add_argument("--image-prompt-embed-trust-remote-code", action="store_true",
+                    dest="image_prompt_embed_trust_remote_code",
+                    help="pass trust_remote_code=True to Hugging Face prompt embedder")
     ap.add_argument("--image-semantic-guidance-w", type=float, default=0.0,
                     dest="image_semantic_guidance_w",
                     help="sampling-time semantic AE guidance weight for latent images")
@@ -948,6 +985,11 @@ def main():
             and args.image_flow_distill_teacher == "ema"
             and args.image_flow_ema_decay <= 0.0):
         sys.exit("ERROR: --image-flow-distill-teacher ema requires --image-flow-ema-decay > 0")
+    if args.image_sample_prompts and not args.image_sample_grid:
+        sys.exit("ERROR: --image-sample-prompts requires --image-sample-grid")
+    if (args.image_sample_prompts and args.image_prompt_embed_backend == "hf"
+            and not args.image_prompt_embed_model):
+        sys.exit("ERROR: --image-prompt-embed-backend hf requires --image-prompt-embed-model")
     if args.image_ae_arch == "hf-vae" and not args.image_ae_hf_model:
         sys.exit("ERROR: --image-ae-arch hf-vae requires --image-ae-hf-model")
     if args.upload_image_data:
@@ -982,16 +1024,19 @@ def main():
     run = payload(args)
     image_embed_deps = bool(args.image_embed and args.image_embed_backend == "hf")
     image_hf_ae_deps = bool(args.image_latent and args.image_ae_arch == "hf-vae")
+    image_prompt_embed_deps = bool(
+        args.image_latent and args.image_sample_prompts
+        and args.image_prompt_embed_backend == "hf")
     if args.fast:                                           # image torch; verbalizer
         fast_pkgs = "numpy tokenizers pandas pyarrow pillow"
-        if image_embed_deps:
+        if image_embed_deps or image_prompt_embed_deps:
             fast_pkgs += " transformers accelerate"
         if image_hf_ae_deps:
             fast_pkgs += " diffusers transformers accelerate safetensors"
         setup = f"pip install -q {fast_pkgs}"
     else:
         install_deps = ""
-        if image_embed_deps:
+        if image_embed_deps or image_prompt_embed_deps:
             install_deps += "INSTALL_IMAGE_EMBED_DEPS=1 "
         if image_hf_ae_deps:
             install_deps += "INSTALL_IMAGE_HF_AE_DEPS=1 "

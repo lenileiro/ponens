@@ -1243,6 +1243,16 @@ and `last_distill.distill_endpoint_mse`; RunPod exposes the same controls as
 `--image-flow-distill-steps`, `--image-flow-distill-w`, `--image-flow-distill-time-gap`, and
 `--image-flow-distill-teacher`.
 
+Image-60 lets sample grids use arbitrary prompt text even when a manifest run trained on external
+caption embeddings. `thinking.image_latent --eval-checkpoint CKPT --sample-grid-out grid.ppm
+--sample-prompts "a glass house at sunrise; a red canoe on a lake"` now routes prompts through
+the checkpoint's token conditioner or, for `caption_cond_source=embedding`, through a live
+`--prompt-embed-backend stats|hf` text embedder before the learned projection. The HF path uses
+the same model family as the manifest sidecar (`--prompt-embed-model MODEL_ID`), validates the
+embedding width against `text_embedding_in_dim`, and is exposed on RunPod as
+`--image-sample-prompts` plus `--image-prompt-embed-*`. This closes the gap between embedding-based
+training and free-form prompt inspection after GPU runs.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
