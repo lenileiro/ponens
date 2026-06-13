@@ -2605,6 +2605,47 @@ def choice_self_distill_loss(model, teacher_model, txt, records, temperature=1.0
     return sum(losses) / len(losses)
 
 
+def choice_self_rank_distill_loss(model, teacher_model, txt, records, margin=0.0):
+    """Preserve a frozen teacher's correct choice winner and target margin."""
+    margin_t = torch.tensor(float(margin), dtype=torch.float32, device=txt.device)
+    with torch.no_grad():
+        teacher_model.eval()
+        teacher_rows = teacher_model.choice_logits(txt, records)
+    student_rows = model.choice_logits(txt, records)
+    losses = []
+    for (student_rec, student_ids, student_logits), (teacher_rec, teacher_ids,
+                                                     teacher_logits) in zip(
+            student_rows, teacher_rows):
+        if student_rec.rec_id != teacher_rec.rec_id:
+            continue
+        if student_logits is None or teacher_logits is None:
+            continue
+        if list(student_ids) != list(teacher_ids):
+            continue
+        if student_logits.shape != teacher_logits.shape or student_logits.numel() < 2:
+            continue
+        target = qa_choice_target(student_rec)
+        if target is None or target not in student_ids:
+            continue
+        target_idx = student_ids.index(target)
+        if int(teacher_logits.argmax(-1)) != target_idx:
+            continue
+        mask = torch.ones(student_logits.shape[0], dtype=torch.bool, device=txt.device)
+        mask[target_idx] = False
+        teacher_other = teacher_logits.detach()[mask].max()
+        teacher_target = teacher_logits.detach()[target_idx]
+        teacher_margin = (teacher_target - teacher_other).clamp_min(0.0)
+        desired_margin = torch.maximum(teacher_margin, margin_t)
+        student_other = student_logits[mask].max()
+        student_target = student_logits[target_idx]
+        target_t = torch.tensor([target_idx], dtype=torch.long, device=txt.device)
+        losses.append(F.cross_entropy(student_logits[None], target_t))
+        losses.append(F.softplus(student_other + desired_margin - student_target))
+    if not losses:
+        return torch.tensor(0.0, device=txt.device)
+    return sum(losses) / len(losses)
+
+
 def choice_question_context_scores(model, txt, records):
     prefix, pooled = model.encode_text(txt)
     context_values = model.choice_context(prefix)
@@ -2733,6 +2774,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               choice_concept_bridge_sources=None,
               choice_self_distill_w=0.0,
               choice_self_distill_temperature=1.0,
+              choice_self_rank_distill_w=0.0,
+              choice_self_rank_distill_margin=0.0,
               choice_self_distill_sources=None,
               choice_self_distill_model=None,
               choice_answerability_w=0.0, choice_answerability_control_w=0.0,
@@ -3003,6 +3046,16 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 temperature=choice_self_distill_temperature)
         else:
             distill_loss = torch.tensor(0.0, device=device)
+        if (choice_self_rank_distill_w and choice_self_distill_model is not None
+                and distill_sources):
+            rank_distill_records = batch_records(distill_sources, rng, max(1, batch // 2))
+            rank_distill_txt, _rank_distill_ids = pack(
+                rank_distill_records, vocab, device)
+            rank_distill_loss = choice_self_rank_distill_loss(
+                model, choice_self_distill_model, rank_distill_txt,
+                rank_distill_records, margin=choice_self_rank_distill_margin)
+        else:
+            rank_distill_loss = torch.tensor(0.0, device=device)
         if choice_answerability_control_w and control_sources:
             ans_control_records = choice_answerability_control_batch_records(
                 control_sources, rng, max(1, batch // 2),
@@ -3111,6 +3164,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 + choice_concept_bridge_w * concept_loss
                 + choice_concept_prototype_w * prototype_loss
                 + choice_self_distill_w * distill_loss
+                + choice_self_rank_distill_w * rank_distill_loss
                 + choice_answerability_w * ans_loss
                 + choice_answerability_control_w * ans_control_loss
                 + choice_candidate_answerability_w * cand_ans_loss
@@ -3141,6 +3195,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                   f"concept {concept_loss.item():.3f} "
                   f"proto {prototype_loss.item():.3f} "
                   f"distill {distill_loss.item():.3f} "
+                  f"rankdistill {rank_distill_loss.item():.3f} "
                   f"ans {ans_loss.item():.3f} "
                   f"ans-control {ans_control_loss.item():.3f} "
                   f"cand-ans {cand_ans_loss.item():.3f} "
@@ -4786,6 +4841,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      choice_concept_prototype_margin=0.0,
                      choice_self_distill_w=0.0,
                      choice_self_distill_temperature=1.0,
+                     choice_self_rank_distill_w=0.0,
+                     choice_self_rank_distill_margin=0.0,
                      choice_answerability_w=0.0, choice_answerability_control_w=0.0,
                      choice_answerability_margin=0.0,
                      choice_answerability_contrast_w=0.0,
@@ -4916,6 +4973,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "choice_concept_prototype_margin": float(choice_concept_prototype_margin),
               "choice_self_distill_w": float(choice_self_distill_w),
               "choice_self_distill_temperature": float(choice_self_distill_temperature),
+              "choice_self_rank_distill_w": float(choice_self_rank_distill_w),
+              "choice_self_rank_distill_margin": float(choice_self_rank_distill_margin),
               "choice_answerability_w": float(choice_answerability_w),
               "choice_answerability_control_w": float(choice_answerability_control_w),
               "choice_answerability_margin": float(choice_answerability_margin),
@@ -5130,7 +5189,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                               "replay_fit_records": len(train_replay_records),
                               "hard_examples": hard_report})
         distill_teacher = None
-        if choice_self_distill_w and distill_records:
+        if (choice_self_distill_w or choice_self_rank_distill_w) and distill_records:
             distill_teacher = copy.deepcopy(model).to(device)
             distill_teacher.eval()
             for param in distill_teacher.parameters():
@@ -5172,6 +5231,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   choice_concept_bridge_sources=(discovery_records or None),
                   choice_self_distill_w=choice_self_distill_w,
                   choice_self_distill_temperature=choice_self_distill_temperature,
+                  choice_self_rank_distill_w=choice_self_rank_distill_w,
+                  choice_self_rank_distill_margin=choice_self_rank_distill_margin,
                   choice_self_distill_sources=distill_records,
                   choice_self_distill_model=distill_teacher,
                   choice_answerability_w=choice_answerability_w,
@@ -5580,6 +5641,8 @@ def selftest():
     choice_teacher = copy.deepcopy(choice_model).eval()
     assert torch.isfinite(choice_self_distill_loss(
         choice_model, choice_teacher, choice_txt, choice_eval, temperature=1.5))
+    assert torch.isfinite(choice_self_rank_distill_loss(
+        choice_model, choice_teacher, choice_txt, choice_eval, margin=0.05))
     concept_eval = qa_concept_discovery_eval(
         choice_model, choice_vocab, bridge_eval, device="cpu", n=1, seed=18)
     assert concept_eval["n"] == 1
@@ -6037,6 +6100,16 @@ def main(argv=None):
                     type=float, default=1.0,
                     dest="choice_self_distill_temperature",
                     help="temperature for own-model QA choice distribution distillation")
+    ap.add_argument("--choice-self-rank-distill-w", "--choice-rank-distill-w",
+                    type=float, default=0.0,
+                    dest="choice_self_rank_distill_w",
+                    help=("weight for preserving a frozen own-model correct-choice "
+                          "winner and margin during study"))
+    ap.add_argument("--choice-self-rank-distill-margin",
+                    "--choice-rank-distill-margin",
+                    type=float, default=0.0,
+                    dest="choice_self_rank_distill_margin",
+                    help="minimum margin for own-model correct-choice rank distillation")
     ap.add_argument("--choice-answerability-w", type=float, default=0.0,
                     dest="choice_answerability_w",
                     help="weight for learned QA answerability coverage loss")
@@ -6273,6 +6346,10 @@ def main(argv=None):
                          choice_self_distill_w=args.choice_self_distill_w,
                          choice_self_distill_temperature=(
                              args.choice_self_distill_temperature),
+                         choice_self_rank_distill_w=(
+                             args.choice_self_rank_distill_w),
+                         choice_self_rank_distill_margin=(
+                             args.choice_self_rank_distill_margin),
                          choice_answerability_w=args.choice_answerability_w,
                          choice_answerability_control_w=(
                              args.choice_answerability_control_w),

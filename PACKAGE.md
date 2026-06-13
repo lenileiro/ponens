@@ -855,6 +855,21 @@ right failure mode for this stage: the architecture can now train and gate reusa
 clusters, while selection still prevents a "concept-looking" update from counting as language
 mastery if answer retention and grounding controls do not improve.
 
+`--choice-self-rank-distill-w` / `--choice-rank-distill-w` strengthens the retention side of
+self-teaching. KL distillation can be almost zero before a study step moves the student, so this
+term asks the student to preserve the frozen teacher's currently-correct winner and its
+target-over-alternative margin on mined correct records. It is still model-derived: the teacher is
+the pre-study checkpoint and the records are selected because that checkpoint answered them
+correctly.
+
+The guarded rank-distill smoke activated the new pressure (`rankdistill` **1.096**) alongside the
+concept/prototype losses and raised aggregate held-out choice from **0.050** to **0.100** while
+improving candidate-replacement abstention margin from **-0.400** to **-0.300**. The selector still
+rejected the round (`selected_round` **0**) because `squad_choice` regressed from **0.400** to
+**0.200** and shortcut/candidate/discovery controls remained below threshold. The useful progress
+is a stronger self-preservation primitive; the unresolved issue is applying that retention without
+freezing the model's existing candidate-binding mistakes.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
