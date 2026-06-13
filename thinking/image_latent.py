@@ -3658,7 +3658,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("flow_loss_weight_gamma must be positive")
     if latent_normalize not in ("none", "global", "channel"):
         raise ValueError(f"unknown latent normalization mode {latent_normalize!r}")
-    if image_crop_mode not in ("center", "random", "none"):
+    if image_crop_mode not in ("center", "random", "none", "pad"):
         raise ValueError(f"unknown image crop mode {image_crop_mode!r}")
     if image_hflip_prob < 0.0 or image_hflip_prob > 1.0:
         raise ValueError("image_hflip_prob must be in [0, 1]")
@@ -4711,7 +4711,7 @@ def main(argv=None):
                     choices=("tokens", "embedding", "auto"), dest="caption_cond_source",
                     help="caption conditioning source for image manifests")
     ap.add_argument("--image-crop-mode", default="center",
-                    choices=("center", "random", "none"), dest="image_crop_mode",
+                    choices=("center", "random", "none", "pad"), dest="image_crop_mode",
                     help="crop mode for manifest training images")
     ap.add_argument("--image-hflip-prob", type=float, default=0.0,
                     dest="image_hflip_prob",

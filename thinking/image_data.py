@@ -445,6 +445,20 @@ def image_dimensions(path):
         return int(im.width), int(im.height)
 
 
+def _target_hw(size):
+    if not size:
+        return None
+    if isinstance(size, (tuple, list)):
+        if len(size) != 2:
+            raise ValueError("image size tuple must be (height, width)")
+        h, w = int(size[0]), int(size[1])
+    else:
+        h = w = int(size)
+    if h <= 0 or w <= 0:
+        raise ValueError("image size must be positive")
+    return h, w
+
+
 def load_image_tensor(path, size=256, device="cpu", center_crop=True,
                       crop_mode=None, hflip=False, rng=None):
     ext = os.path.splitext(path)[1].lower()
@@ -458,8 +472,9 @@ def load_image_tensor(path, size=256, device="cpu", center_crop=True,
     if crop_mode is None:
         crop_mode = "center" if center_crop else "none"
     crop_mode = str(crop_mode)
-    if crop_mode not in ("center", "random", "none"):
+    if crop_mode not in ("center", "random", "none", "pad"):
         raise ValueError(f"unknown crop mode {crop_mode!r}")
+    target_hw = _target_hw(size)
     if crop_mode in ("center", "random"):
         _c, h, w = x.shape
         side = min(h, w)
@@ -472,10 +487,26 @@ def load_image_tensor(path, size=256, device="cpu", center_crop=True,
             y0 = (h - side) // 2
             x0 = (w - side) // 2
         x = x[:, y0:y0 + side, x0:x0 + side]
+    elif crop_mode == "pad" and target_hw is not None:
+        _c, h, w = x.shape
+        target_h, target_w = target_hw
+        scale = min(target_h / float(h), target_w / float(w))
+        resize_h = max(1, int(round(h * scale)))
+        resize_w = max(1, int(round(w * scale)))
+        x = F.interpolate(x[None], size=(resize_h, resize_w), mode="bilinear",
+                          align_corners=False)[0]
+        pad_h = max(0, target_h - resize_h)
+        pad_w = max(0, target_w - resize_w)
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+        x = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
+        target_hw = None
     if hflip:
         x = torch.flip(x, dims=(2,))
-    if size:
-        x = F.interpolate(x[None], size=(int(size), int(size)), mode="bilinear",
+    if target_hw is not None:
+        x = F.interpolate(x[None], size=target_hw, mode="bilinear",
                           align_corners=False)[0]
     return x.to(device=device)
 
@@ -702,6 +733,12 @@ def selftest():
         xf = load_image_tensor(records[0].path, size=4, crop_mode="center", hflip=True)
         assert xr.shape == (3, 4, 4) and xf.shape == (3, 4, 4)
         assert torch.allclose(x[:, :, 0], xf[:, :, -1])
+        xp = load_image_tensor(records[0].path, size=8, crop_mode="pad")
+        assert xp.shape == (3, 8, 8)
+        assert torch.allclose(xp[:, 0, :], torch.zeros_like(xp[:, 0, :]))
+        assert torch.allclose(xp[:, -1, :], torch.zeros_like(xp[:, -1, :]))
+        xt = load_image_tensor(records[0].path, size=(6, 10), crop_mode="pad")
+        assert xt.shape == (3, 6, 10)
         vocab = build_caption_vocab(records)
         ids = caption_ids([records[0].caption], vocab, max_len=5)
         assert ids.shape == (1, 5) and int(ids[0, 0]) > 0
@@ -709,6 +746,10 @@ def selftest():
             records, np.random.default_rng(0), batch=2, size=4,
             crop_mode="random", hflip_prob=0.5)
         assert xb.shape == (2, 3, 4, 4) and captions == [records[0].caption] * 2
+        xb_pad, captions_pad = sample_image_text_batch(
+            records, np.random.default_rng(1), batch=2, size=8,
+            crop_mode="pad")
+        assert xb_pad.shape == (2, 3, 8, 8) and captions_pad == captions
         summary = summarize_records(records)
         assert summary["image_records"] == 1 and summary["image_splits"]["train"] == 1
         assert summary["text_embedding_records"] == 1 and summary["text_embedding_dims"] == [3]

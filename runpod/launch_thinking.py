@@ -692,7 +692,7 @@ def main():
                     dest="image_caption_cond_source",
                     help="caption conditioning source for image manifests")
     ap.add_argument("--image-crop-mode", default="center",
-                    choices=("center", "random", "none"), dest="image_crop_mode",
+                    choices=("center", "random", "none", "pad"), dest="image_crop_mode",
                     help="crop mode for manifest image training")
     ap.add_argument("--image-hflip-prob", type=float, default=0.0,
                     dest="image_hflip_prob",

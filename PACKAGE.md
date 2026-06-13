@@ -718,7 +718,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
     --image-dit-attn-impl sdpa \
     --image-manifest data/images/train.jsonl --image-root data/images \
     --image-caption-cond-source auto \
-    --image-crop-mode random --image-hflip-prob 0.5 \
+    --image-crop-mode pad --image-hflip-prob 0.5 \
     --image-size 128 --image-ae-arch residual --image-latent-downsample 8 \
     --image-latent-max-tokens 256 \
     --image-ae-recon-loss hybrid --image-ae-grad-w 0.1 --image-ae-ms-w 0.1 \
@@ -1081,10 +1081,10 @@ large image corpora into git. Absolute manifest/root paths remain reserved for d
 mounted on the pod.
 
 Image-44 adds explicit manifest image augmentation. `thinking.image_latent` now accepts
-`--image-crop-mode center|random|none` and `--image-hflip-prob`, and RunPod passes the same flags
-through. Eval remains deterministic, but real-image AE/flow training, latent-stat estimation, and
-latent cache construction can now sample random square crops and horizontal flips. The settings are
-recorded in train reports/checkpoints so caption-sensitive runs can keep flips at zero.
+`--image-crop-mode center|random|none|pad` and `--image-hflip-prob`, and RunPod passes the same
+flags through. Eval remains deterministic, but real-image AE/flow training, latent-stat estimation,
+and latent cache construction can now sample random square crops and horizontal flips. The settings
+are recorded in train reports/checkpoints so caption-sensitive runs can keep flips at zero.
 
 Image-45 adds rectified-flow timestep shifting for high-resolution latent image runs.
 `thinking.image_latent --time-shift` shifts training samples and sampler nodes toward the noisy
@@ -1121,6 +1121,12 @@ Image-50 adds sampler-side CFG rescale. `--cfg-rescale` rescales guided latent v
 the conditional velocity standard deviation before blending, while `--cfg-rescales` makes it a
 checkpoint-sweep axis. RunPod exposes `--image-cfg-rescale` and
 `--image-cfg-rescale-sweep`. Default `0.0` preserves legacy CFG behavior.
+
+Image-51 adds aspect-preserving manifest padding. `--image-crop-mode pad` resizes each image to fit
+the requested canvas and pads the remaining area instead of square-cropping or distorting it. This
+is the minimal data-pipeline step toward mixed-aspect high-resolution training: captioned objects
+stay in frame while the current fixed-shape AE/flow code can still batch tensors locally and on
+RunPod.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
