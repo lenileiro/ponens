@@ -354,19 +354,20 @@ python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
     --out runs/text_study_squad_choice_contextloc025_pair_2round_smoke.json
 python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
     --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_choice_qctxmass_ansabs_swapcontrast010_pair_2round_smoke.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_answerability_swapctrl_qctx_2round_smoke.pt \
     --study-replay-data data/text_grounded.jsonl \
     --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
     --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
     --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
     --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
+    --choice-answerability-w 0.5 --choice-answerability-control-w 0.5 \
     --choice-context-w 0.25 --choice-question-context-w 0.25 \
     --choice-question-context-contrast-w 0.10 --choice-question-context-margin 0.0 \
     --choice-pair-w 1.0 --choice-pair-margin 0.0 \
     --choice-control-w 0 --choice-control-contrast-w 0 --choice-control-margin 0.0 \
     --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_squad_choice_qctxmass_ansabs_swapcontrast010_pair_2round_smoke.json
+    --out runs/text_study_squad_choice_answerability_swapctrl_qctx_2round_smoke.json
 ```
 
 Current local Text-0 SNLI baseline (20k train / 1k dev, 1.5k steps, d=192, 4 layers, 6 heads,
@@ -605,6 +606,21 @@ question-only and context-only gaps negative in round 1 and all three shortcut c
 by round 2. That makes the next architectural target clearer: the model needs an answerability
 head that separates "the question finds an answer span" from "this candidate covers that span",
 rather than pushing both jobs through the candidate logits alone.
+
+That answerability head is now implemented as a learned coverage verifier. It builds a
+question-selected context vector, compares it to each candidate span through separate learned
+projections, trains positive/none answerability with `--choice-answerability-w`, and trains
+generated question-only, context-only, and swapped-question none controls with
+`--choice-answerability-control-w`. This is still data-derived supervision: the labels come from
+the imported reading records and generated counterfactual records, not from fixed English facts.
+On the two-round smoke above, answerability improved the useful balance but did not yet satisfy
+the selector. Round 2 reached choice accuracy **0.3375**, retained replay at **0.97125**, passed
+question-only and context-only choice controls (**0.075** / **0.2625**), and improved all three
+choice kinds over the selected baseline (`squad_choice` **0.250**, answer-absent **0.650**,
+swapped-question negatives **0.750**). The remaining blocker is the held-out same-context
+question-swap gap (**-0.1538**), so round **0** was still kept. The next step is not another
+class-weight tweak; it is a contrastive answerability objective that directly makes the full
+question's covered span outrank the swapped question's covered span for the same candidate set.
 
 ## 3b. Image grounding: synthetic visual factors first
 

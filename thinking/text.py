@@ -1060,8 +1060,12 @@ class TextFactLM(nn.Module):
         self.choice_query = nn.Linear(d, d, bias=False)
         self.choice_context = nn.Linear(d, d, bias=False)
         self.choice_value = nn.Linear(d, d, bias=False)
+        self.choice_answer = nn.Linear(d, d, bias=False)
+        self.choice_cover = nn.Linear(d, d, bias=False)
         self.choice_threshold = nn.Parameter(torch.zeros(()))
         self.choice_context_mass_scale = nn.Parameter(torch.tensor(-3.0))
+        self.choice_answerability_threshold = nn.Parameter(torch.zeros(()))
+        self.choice_answerability_scale = nn.Parameter(torch.tensor(-3.0))
         self.fact_schema = fact_schema
         self.fact_heads = nn.ModuleDict()
         if fact_schema is not None:
@@ -1122,6 +1126,15 @@ class TextFactLM(nn.Module):
         uniform_log_mass = math.log(len(positions)) - math.log(max(1, int(q_ctx_scores.numel())))
         return log_mass - uniform_log_mass
 
+    def _choice_answer_vec(self, q_vec, q_ctx_scores, ctx_src):
+        if q_ctx_scores is None or ctx_src is None or not ctx_src.numel():
+            return q_vec
+        weights = q_ctx_scores.softmax(-1)
+        return (weights.unsqueeze(-1) * ctx_src).sum(0)
+
+    def _choice_answerability_scaled(self, score):
+        return F.softplus(self.choice_answerability_scale) * score
+
     def choice_logits(self, txt, records):
         """Return candidate logits plus a learned threshold logit for `none`.
 
@@ -1130,13 +1143,55 @@ class TextFactLM(nn.Module):
         evidence threshold.
         """
         out = []
+        answerability = {rec.rec_id: score
+                         for rec, score, _ids, _cover in self.choice_answerability_logits(
+                             txt, records)
+                         if score is not None}
         for rec, ids, logits in self.choice_candidate_logits(txt, records):
             if logits is None:
                 out.append((rec, [], None))
                 continue
+            ans_score = answerability.get(rec.rec_id)
+            if ans_score is not None:
+                logits = logits + self._choice_answerability_scaled(ans_score)
             ids = list(ids) + ["none"]
             logits = torch.cat([logits, self.choice_threshold.reshape(1)])
             out.append((rec, ids, logits))
+        return out
+
+    def choice_answerability_logits(self, txt, records):
+        prefix, pooled = self.encode_text(txt)
+        context_values = self.choice_context(prefix)
+        values = self.choice_value(prefix)
+        out = []
+        scale = prefix.shape[-1] ** -0.5
+        for r, rec in enumerate(records):
+            choices = qa_choice_spans(rec)
+            if not choices:
+                out.append((rec, None, [], None))
+                continue
+            ctx_start, ctx_end, q_start, q_end = qa_context_question_spans(rec)
+            q_tokens, q_vec = self._choice_question(prefix, pooled, r, q_start, q_end)
+            ctx_src = context_values[r, ctx_start:ctx_end] if ctx_start < ctx_end else None
+            q_ctx_scores = self._choice_question_context_scores(q_tokens, ctx_src)
+            answer_vec = self._choice_answer_vec(q_vec, q_ctx_scores, ctx_src)
+            answer_proj = self.choice_answer(answer_vec)
+            ids = []
+            cover_scores = []
+            for choice_id, start, end in choices:
+                span = values[r, start:end].mean(0)
+                cover = (answer_proj * self.choice_cover(span)).sum() * scale
+                mass_score = self._choice_context_mass_score(rec, start, end, q_ctx_scores)
+                if mass_score is not None:
+                    cover = cover + F.softplus(self.choice_context_mass_scale) * mass_score
+                cover_scores.append(cover)
+                ids.append(choice_id)
+            if cover_scores:
+                score = torch.logsumexp(torch.stack(cover_scores), 0)
+                score = score - self.choice_answerability_threshold
+                out.append((rec, score, ids, torch.stack(cover_scores)))
+            else:
+                out.append((rec, None, ids, None))
         return out
 
     def choice_candidate_logits(self, txt, records):
@@ -1312,6 +1367,33 @@ def choice_loss(model, txt, records, answer_w=1.0, none_w=1.0,
             rank_loss = F.cross_entropy(logits[None], target_t)
             evidence_loss = F.softplus(threshold + answer_margin_t - logits[target_idx])
             answer_losses.append(rank_loss + evidence_loss)
+    groups = []
+    weights = []
+    if answer_losses and answer_w:
+        groups.append(sum(answer_losses) / len(answer_losses))
+        weights.append(float(answer_w))
+    if none_losses and none_w:
+        groups.append(sum(none_losses) / len(none_losses))
+        weights.append(float(none_w))
+    if not groups:
+        return torch.tensor(0.0, device=txt.device)
+    return sum(w * loss for w, loss in zip(weights, groups)) / max(1e-9, sum(weights))
+
+
+def choice_answerability_loss(model, txt, records, answer_w=1.0, none_w=1.0,
+                              margin=0.0):
+    answer_losses = []
+    none_losses = []
+    margin_t = torch.tensor(float(margin), dtype=torch.float32, device=txt.device)
+    for rec, score, _ids, _cover_scores in model.choice_answerability_logits(txt, records):
+        target = qa_choice_target(rec)
+        if target is None or score is None:
+            continue
+        scaled = model._choice_answerability_scaled(score)
+        if target == "none":
+            none_losses.append(F.softplus(scaled + margin_t))
+        else:
+            answer_losses.append(F.softplus(margin_t - scaled))
     groups = []
     weights = []
     if answer_losses and answer_w:
@@ -1526,6 +1608,42 @@ def choice_control_batch_records(sources, rng, n):
     return rows
 
 
+def choice_answerability_control_batch_records(sources, rng, n, swap_groups=None):
+    if not sources or n <= 0:
+        return []
+    rows = []
+    sides = ["question", "context"]
+    if swap_groups:
+        sides.append("question_swap")
+    tries = 0
+    while len(rows) < int(n) and tries < int(n) * 4:
+        side = sides[int(rng.integers(len(sides)))]
+        if side == "question_swap":
+            rec, donors = swap_groups[int(rng.integers(len(swap_groups)))]
+            donor = donors[int(rng.integers(len(donors)))]
+            ablated = _qa_question_swap_record(rec, donor)
+        else:
+            rec = sources[int(rng.integers(len(sources)))]
+            ablated = _qa_ablation_record(rec, side)
+        if ablated is not None:
+            control_meta = {"negative": f"{side}_answerability_control",
+                            "source_record_id": rec.rec_id}
+            meta = (rec.meta | control_meta if isinstance(rec.meta, dict)
+                    else control_meta)
+            rows.append(TextRecord(
+                rec_id=f"{rec.rec_id}:answerability_control:{side}:{len(rows)}",
+                split=rec.split,
+                tokens=ablated.tokens,
+                facts=(("answer", "choice", "none"),),
+                group=rec.group,
+                kind=f"{rec.kind}:answerability_control_{side}",
+                base_id=rec.rec_id,
+                changed=(("answer", "choice", "none"),),
+                meta=meta))
+        tries += 1
+    return rows
+
+
 def choice_candidate_token_tuples(rec):
     return {choice_id: tuple(rec.tokens[start:end])
             for choice_id, start, end in qa_choice_spans(rec)}
@@ -1696,6 +1814,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               prefix="text", decode_w=1.0, choice_w=0.0,
               choice_answer_w=1.0, choice_none_w=1.0,
               choice_answer_margin=0.0, choice_none_margin=0.0,
+              choice_answerability_w=0.0, choice_answerability_control_w=0.0,
+              choice_answerability_margin=0.0,
               choice_context_w=0.0, choice_question_context_w=0.0,
               choice_question_context_contrast_w=0.0,
               choice_question_context_margin=0.0,
@@ -1711,10 +1831,14 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
     pair_groups = choice_pair_groups(train_records) if choice_pair_w else []
     control_sources = (choice_control_source_records(train_records)
                        if (choice_control_w or choice_control_contrast_w
-                           or choice_question_context_contrast_w) else [])
+                           or choice_question_context_contrast_w
+                           or choice_answerability_control_w) else [])
     swap_groups = (choice_question_swap_groups(control_sources)
-                   if ((choice_control_contrast_w or choice_question_context_contrast_w)
-                       and control_sources) else [])
+                   if ((choice_control_contrast_w
+                        or choice_question_context_contrast_w
+                        or choice_answerability_control_w)
+                       and control_sources)
+                   else [])
     for st in range(1, steps + 1):
         model.train()
         if balance_by == "none":
@@ -1728,6 +1852,11 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                               answer_w=choice_answer_w, none_w=choice_none_w,
                               answer_margin=choice_answer_margin,
                               none_margin=choice_none_margin)
+        ans_loss = (choice_answerability_loss(
+            model, txt, rec_batch,
+            answer_w=choice_answer_w, none_w=choice_none_w,
+            margin=choice_answerability_margin)
+            if choice_answerability_w else torch.tensor(0.0, device=device))
         ctx_loss = (choice_context_attention_loss(model, txt, rec_batch)
                     if choice_context_w else torch.tensor(0.0, device=device))
         qctx_loss = (choice_question_context_attention_loss(model, txt, rec_batch)
@@ -1751,6 +1880,21 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 control_loss = torch.tensor(0.0, device=device)
         else:
             control_loss = torch.tensor(0.0, device=device)
+        if choice_answerability_control_w and control_sources:
+            ans_control_records = choice_answerability_control_batch_records(
+                control_sources, rng, max(1, batch // 2),
+                swap_groups=swap_groups)
+            if ans_control_records:
+                ans_control_txt, _ans_control_ids = pack(ans_control_records, vocab,
+                                                         device)
+                ans_control_loss = choice_answerability_loss(
+                    model, ans_control_txt, ans_control_records,
+                    answer_w=0.0, none_w=1.0,
+                    margin=choice_answerability_margin)
+            else:
+                ans_control_loss = torch.tensor(0.0, device=device)
+        else:
+            ans_control_loss = torch.tensor(0.0, device=device)
         if choice_control_contrast_w and control_sources:
             contrast_records, contrast_pairs = choice_control_contrast_batch(
                 control_sources, rng, max(1, batch // 2),
@@ -1779,6 +1923,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
         else:
             qctx_contrast_loss = torch.tensor(0.0, device=device)
         loss = (decode_w * dec_loss + semantic_w * sem_loss + choice_w * ch_loss
+                + choice_answerability_w * ans_loss
+                + choice_answerability_control_w * ans_control_loss
                 + choice_context_w * ctx_loss
                 + choice_question_context_w * qctx_loss
                 + choice_question_context_contrast_w * qctx_contrast_loss
@@ -1790,7 +1936,9 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
         if st % log_every == 0 or st == steps:
             print(f"  {prefix} {st}/{steps} loss {loss.item():.3f} "
                   f"dec {dec_loss.item():.3f} sem {sem_loss.item():.3f} "
-                  f"choice {ch_loss.item():.3f} ctx {ctx_loss.item():.3f} "
+                  f"choice {ch_loss.item():.3f} ans {ans_loss.item():.3f} "
+                  f"ans-control {ans_control_loss.item():.3f} "
+                  f"ctx {ctx_loss.item():.3f} "
                   f"qctx {qctx_loss.item():.3f} "
                   f"qctx-contrast {qctx_contrast_loss.item():.3f} "
                   f"pair {pair_loss.item():.3f} "
@@ -1804,6 +1952,8 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                 decode_w=1.0, choice_w=0.0, choice_answer_w=1.0,
                 choice_none_w=1.0, choice_context_w=0.0,
                 choice_answer_margin=0.0, choice_none_margin=0.0,
+                choice_answerability_w=0.0, choice_answerability_control_w=0.0,
+                choice_answerability_margin=0.0,
                 choice_question_context_w=0.0,
                 choice_question_context_contrast_w=0.0,
                 choice_question_context_margin=0.0,
@@ -1822,6 +1972,9 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                      choice_none_w=choice_none_w,
                      choice_answer_margin=choice_answer_margin,
                      choice_none_margin=choice_none_margin,
+                     choice_answerability_w=choice_answerability_w,
+                     choice_answerability_control_w=choice_answerability_control_w,
+                     choice_answerability_margin=choice_answerability_margin,
                      choice_context_w=choice_context_w,
                      choice_question_context_w=choice_question_context_w,
                      choice_question_context_contrast_w=choice_question_context_contrast_w,
@@ -2782,6 +2935,8 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         fact_n=0, kind_fact_n=0, artifact_n=0, decode_w=1.0, choice_w=0.0,
         choice_answer_w=1.0, choice_none_w=1.0,
         choice_answer_margin=0.0, choice_none_margin=0.0,
+        choice_answerability_w=0.0, choice_answerability_control_w=0.0,
+        choice_answerability_margin=0.0,
         choice_context_w=0.0, choice_question_context_w=0.0,
         choice_question_context_contrast_w=0.0,
         choice_question_context_margin=0.0,
@@ -2796,6 +2951,9 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                choice_none_w=choice_none_w,
                                choice_answer_margin=choice_answer_margin,
                                choice_none_margin=choice_none_margin,
+                               choice_answerability_w=choice_answerability_w,
+                               choice_answerability_control_w=choice_answerability_control_w,
+                               choice_answerability_margin=choice_answerability_margin,
                                choice_context_w=choice_context_w,
                                choice_question_context_w=choice_question_context_w,
                                choice_question_context_contrast_w=(
@@ -2814,6 +2972,9 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
               "choice_none_w": float(choice_none_w),
               "choice_answer_margin": float(choice_answer_margin),
               "choice_none_margin": float(choice_none_margin),
+              "choice_answerability_w": float(choice_answerability_w),
+              "choice_answerability_control_w": float(choice_answerability_control_w),
+              "choice_answerability_margin": float(choice_answerability_margin),
               "choice_context_w": float(choice_context_w),
               "choice_question_context_w": float(choice_question_context_w),
               "choice_question_context_contrast_w": float(
@@ -2864,6 +3025,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      artifact_n=0, decode_w=1.0, choice_w=0.0,
                      choice_answer_w=1.0, choice_none_w=1.0,
                      choice_answer_margin=0.0, choice_none_margin=0.0,
+                     choice_answerability_w=0.0, choice_answerability_control_w=0.0,
+                     choice_answerability_margin=0.0,
                      choice_context_w=0.0, choice_question_context_w=0.0,
                      choice_question_context_contrast_w=0.0,
                      choice_question_context_margin=0.0,
@@ -2915,6 +3078,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "choice_none_w": float(choice_none_w),
               "choice_answer_margin": float(choice_answer_margin),
               "choice_none_margin": float(choice_none_margin),
+              "choice_answerability_w": float(choice_answerability_w),
+              "choice_answerability_control_w": float(choice_answerability_control_w),
+              "choice_answerability_margin": float(choice_answerability_margin),
               "choice_context_w": float(choice_context_w),
               "choice_question_context_w": float(choice_question_context_w),
               "choice_question_context_contrast_w": float(
@@ -3045,6 +3211,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   choice_answer_w=choice_answer_w, choice_none_w=choice_none_w,
                   choice_answer_margin=choice_answer_margin,
                   choice_none_margin=choice_none_margin,
+                  choice_answerability_w=choice_answerability_w,
+                  choice_answerability_control_w=choice_answerability_control_w,
+                  choice_answerability_margin=choice_answerability_margin,
                   choice_context_w=choice_context_w,
                   choice_question_context_w=choice_question_context_w,
                   choice_question_context_contrast_w=choice_question_context_contrast_w,
@@ -3256,6 +3425,12 @@ def selftest():
     assert torch.isfinite(choice_loss(choice_model, choice_txt, choice_eval))
     assert torch.isfinite(choice_loss(choice_model, choice_txt, choice_eval,
                                       answer_margin=0.25, none_margin=0.25))
+    answerability_rows = choice_model.choice_answerability_logits(choice_txt, choice_eval)
+    assert len(answerability_rows) == len(choice_eval)
+    assert all(score is not None and torch.isfinite(score)
+               for _rec, score, _ids, _cover in answerability_rows)
+    assert torch.isfinite(choice_answerability_loss(choice_model, choice_txt,
+                                                    choice_eval))
     assert torch.isfinite(choice_context_attention_loss(choice_model, choice_txt,
                                                         choice_eval))
     assert torch.isfinite(choice_question_context_attention_loss(choice_model, choice_txt,
@@ -3339,6 +3514,10 @@ def selftest():
     assert len(contrast_rows) == 4 and len(contrast_pairs) == 2
     assert all(qa_choice_target(r) != "none" for r in contrast_rows)
     swap_groups = choice_question_swap_groups(control_sources)
+    ans_control_rows = choice_answerability_control_batch_records(
+        control_sources, np.random.default_rng(10), n=8, swap_groups=swap_groups)
+    assert len(ans_control_rows) == 8
+    assert all(qa_choice_target(r) == "none" for r in ans_control_rows)
     if swap_groups:
         swap_rows, swap_pairs = choice_control_contrast_batch(
             control_sources, np.random.default_rng(7), pairs=2,
@@ -3348,6 +3527,7 @@ def selftest():
             control_sources, np.random.default_rng(8), pairs=2,
             swap_groups=swap_groups)
         assert len(qctx_rows) == 4 and len(qctx_pairs) == 2
+        assert any("question_swap" in r.kind for r in ans_control_rows)
     pair_vocab = build_vocab(pair_rows)
     pair_schema = build_fact_schema(pair_rows)
     pair_model = TextFactLM(len(pair_vocab), d=32, layers=1, heads=4,
@@ -3361,6 +3541,9 @@ def selftest():
     control_txt, _control_ids = pack(control_rows, control_vocab, "cpu")
     assert torch.isfinite(choice_loss(control_model, control_txt, control_rows,
                                       answer_w=0.0, none_w=1.0))
+    assert torch.isfinite(choice_answerability_loss(control_model, control_txt,
+                                                    control_rows,
+                                                    answer_w=0.0, none_w=1.0))
     contrast_vocab = build_vocab(contrast_rows)
     contrast_schema = build_fact_schema(contrast_rows)
     contrast_model = TextFactLM(len(contrast_vocab), d=32, layers=1, heads=4,
@@ -3595,6 +3778,15 @@ def main(argv=None):
     ap.add_argument("--choice-none-margin", type=float, default=0.0,
                     dest="choice_none_margin",
                     help="margin by which none QA records must keep candidates below threshold")
+    ap.add_argument("--choice-answerability-w", type=float, default=0.0,
+                    dest="choice_answerability_w",
+                    help="weight for learned QA answerability coverage loss")
+    ap.add_argument("--choice-answerability-control-w", type=float, default=0.0,
+                    dest="choice_answerability_control_w",
+                    help="weight for generated ablation none-answerability loss")
+    ap.add_argument("--choice-answerability-margin", type=float, default=0.0,
+                    dest="choice_answerability_margin",
+                    help="margin for learned QA answerability coverage loss")
     ap.add_argument("--choice-context-w", type=float, default=0.0, dest="choice_context_w",
                     help="weight for target-choice context span localization loss")
     ap.add_argument("--choice-question-context-w", type=float, default=0.0,
@@ -3728,6 +3920,10 @@ def main(argv=None):
                          choice_none_w=args.choice_none_w,
                          choice_answer_margin=args.choice_answer_margin,
                          choice_none_margin=args.choice_none_margin,
+                         choice_answerability_w=args.choice_answerability_w,
+                         choice_answerability_control_w=(
+                             args.choice_answerability_control_w),
+                         choice_answerability_margin=args.choice_answerability_margin,
                          choice_context_w=args.choice_context_w,
                          choice_question_context_w=args.choice_question_context_w,
                          choice_question_context_contrast_w=(
@@ -3760,6 +3956,9 @@ def main(argv=None):
         choice_answer_w=args.choice_answer_w, choice_none_w=args.choice_none_w,
         choice_answer_margin=args.choice_answer_margin,
         choice_none_margin=args.choice_none_margin,
+        choice_answerability_w=args.choice_answerability_w,
+        choice_answerability_control_w=args.choice_answerability_control_w,
+        choice_answerability_margin=args.choice_answerability_margin,
         choice_context_w=args.choice_context_w,
         choice_question_context_w=args.choice_question_context_w,
         choice_question_context_contrast_w=args.choice_question_context_contrast_w,
