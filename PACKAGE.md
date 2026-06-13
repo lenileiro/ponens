@@ -797,6 +797,27 @@ and still failed retention, so `selected_round` stayed **0**. This confirms the 
 is not merely more anchor mass; the learning objective has to bind question-conditioned evidence
 without stealing capacity from real answer choices.
 
+`--choice-self-distill-w` / `--choice-distill-w` and the study knobs
+`--study-distill-correct-per-kind` plus `--study-discovery-correct-per-kind` add a self-teaching
+path for those "light bulb" connections. During error self-study, the model now mines records it
+currently answers correctly, freezes a teacher snapshot of itself, and preserves that teacher's
+full QA choice distribution with KL distillation while the student trains on hard examples. The
+same mined correct pool can be passed as a concept-discovery source. Exact repeated answer-surface
+bridges still run first; when they are too sparse, the bridge falls back to an own-model
+neighborhood miner that connects nearest correct target concept vectors and contrasts them against
+distractor choices. This is deliberately data/model-derived: no English facts or answer rules are
+hand-coded.
+
+The guarded self-distill/discovery smoke mined **46** correct distillation records and **46**
+discovery records. The new bridge path activated (`concept` **0.569**, `distill` **0.001**) and
+the trained round raised aggregate choice from **0.150** to **0.250** while preserving real-answer
+`squad_choice` at **0.300**. The selector still rejected the round (`selected_round` **0**) because
+question-swap negatives regressed to **0.000**, candidate replacement/coverage controls remained
+below threshold, and held-out exact concept discovery was still negative (**-0.034**). The useful
+step is that the curriculum can now create model-derived concept-connection pressure even when
+exact repeated answers are sparse; the next issue is making those discovered neighborhoods pass the
+held-out control instead of just improving aggregate choice.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels

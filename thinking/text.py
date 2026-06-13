@@ -29,6 +29,7 @@ Example:
       --out runs/text0.json --checkpoint runs/text0.pt
 """
 import argparse
+import copy
 import csv
 import itertools
 import io
@@ -2307,12 +2308,102 @@ def choice_concept_bridge_scores(model, txt, records, pair_ids):
     return scores
 
 
+def choice_concept_neighborhood_bridge_batch(model, vocab, sources, rng, pairs, device=DEV,
+                                             pool_size=64):
+    answer_sources = [r for r in sources
+                      if qa_choice_target(r) not in (None, "none")]
+    if len(answer_sources) < 2 or pairs <= 0:
+        return [], []
+    pool_n = min(len(answer_sources), max(2, int(pool_size), int(pairs) * 4))
+    if pool_n < len(answer_sources):
+        idx = rng.choice(len(answer_sources), size=pool_n, replace=False)
+        pool = [answer_sources[int(i)] for i in idx]
+    else:
+        pool = list(answer_sources)
+    txt, _ids = pack(pool, vocab, device)
+    with torch.no_grad():
+        vectors = choice_candidate_concept_vectors(model, txt, pool)
+    items = []
+    for rec in pool:
+        target = qa_choice_target(rec)
+        row = vectors.get(rec.rec_id)
+        if row and target in row:
+            items.append((rec, target, row[target].detach()))
+    if len(items) < 2:
+        return [], []
+    rows = []
+    pair_ids = []
+    used = set()
+    tries = 0
+    while len(pair_ids) < int(pairs) and tries < int(pairs) * 8:
+        left_i = int(rng.integers(len(items)))
+        left_rec, left_target, left_vec = items[left_i]
+        best = None
+        for right_i, (right_rec, right_target, right_vec) in enumerate(items):
+            if right_i == left_i:
+                continue
+            key = tuple(sorted((left_rec.rec_id, right_rec.rec_id)))
+            if key in used:
+                continue
+            score = float((left_vec * right_vec).sum().cpu())
+            if best is None or score > best[0]:
+                best = (score, right_rec, right_target, key)
+        if best is None:
+            tries += 1
+            continue
+        _score, right_rec, right_target, key = best
+        used.add(key)
+        pair_idx = len(pair_ids)
+        left_id = f"{left_rec.rec_id}:concept_neighbor_left:{pair_idx}"
+        right_id = f"{right_rec.rec_id}:concept_neighbor_right:{pair_idx}"
+        rows.extend([
+            TextRecord(rec_id=left_id, split=left_rec.split, tokens=left_rec.tokens,
+                       facts=left_rec.facts, group=left_rec.group,
+                       kind=left_rec.kind, base_id=left_rec.base_id,
+                       changed=left_rec.changed, meta=left_rec.meta),
+            TextRecord(rec_id=right_id, split=right_rec.split, tokens=right_rec.tokens,
+                       facts=right_rec.facts, group=right_rec.group,
+                       kind=right_rec.kind, base_id=right_rec.base_id,
+                       changed=right_rec.changed, meta=right_rec.meta),
+        ])
+        pair_ids.append((left_id, right_id, left_target, right_target))
+        tries += 1
+    return rows, pair_ids
+
+
 def choice_concept_bridge_loss(model, txt, records, pair_ids, margin=0.0):
     losses = []
     margin_t = torch.tensor(float(margin), dtype=torch.float32, device=txt.device)
     for positive, negative in choice_concept_bridge_scores(model, txt, records, pair_ids):
         losses.append(F.softplus(margin_t - positive))
         losses.append(F.softplus(negative + margin_t - positive))
+    if not losses:
+        return torch.tensor(0.0, device=txt.device)
+    return sum(losses) / len(losses)
+
+
+def choice_self_distill_loss(model, teacher_model, txt, records, temperature=1.0):
+    """Preserve a frozen teacher's current QA choice distribution on mined records."""
+    temp = max(float(temperature), 1e-6)
+    with torch.no_grad():
+        teacher_model.eval()
+        teacher_rows = teacher_model.choice_logits(txt, records)
+    student_rows = model.choice_logits(txt, records)
+    losses = []
+    for (student_rec, student_ids, student_logits), (teacher_rec, teacher_ids,
+                                                     teacher_logits) in zip(
+            student_rows, teacher_rows):
+        if student_rec.rec_id != teacher_rec.rec_id:
+            continue
+        if student_logits is None or teacher_logits is None:
+            continue
+        if list(student_ids) != list(teacher_ids):
+            continue
+        if student_logits.shape != teacher_logits.shape:
+            continue
+        teacher_prob = F.softmax(teacher_logits.detach() / temp, dim=0)
+        student_logp = F.log_softmax(student_logits / temp, dim=0)
+        losses.append(F.kl_div(student_logp, teacher_prob, reduction="sum") * temp * temp)
     if not losses:
         return torch.tensor(0.0, device=txt.device)
     return sum(losses) / len(losses)
@@ -2441,6 +2532,11 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               choice_positive_anchor_margin=0.0,
               choice_concept_bridge_w=0.0,
               choice_concept_bridge_margin=0.0,
+              choice_concept_bridge_sources=None,
+              choice_self_distill_w=0.0,
+              choice_self_distill_temperature=1.0,
+              choice_self_distill_sources=None,
+              choice_self_distill_model=None,
               choice_answerability_w=0.0, choice_answerability_control_w=0.0,
               choice_answerability_margin=0.0, choice_answerability_contrast_w=0.0,
               choice_answerability_contrast_margin=0.0,
@@ -2468,8 +2564,12 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
     train_buckets = bucket_records(train_records, balance_by)
     pair_groups = (choice_pair_groups(train_records)
                    if (choice_pair_w or choice_answerability_pair_w) else [])
-    concept_groups = (choice_concept_groups(train_records)
+    concept_source_records = (list(choice_concept_bridge_sources)
+                              if choice_concept_bridge_sources is not None
+                              else train_records)
+    concept_groups = (choice_concept_groups(concept_source_records)
                       if choice_concept_bridge_w else [])
+    distill_sources = list(choice_self_distill_sources or [])
     control_sources = (choice_control_source_records(train_records)
                        if (choice_control_w or choice_control_contrast_w
                            or choice_candidate_replacement_w
@@ -2652,9 +2752,16 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 positive_anchor_loss = torch.tensor(0.0, device=device)
         else:
             positive_anchor_loss = torch.tensor(0.0, device=device)
-        if choice_concept_bridge_w and concept_groups:
-            concept_records, concept_pairs = choice_concept_bridge_batch(
-                concept_groups, rng, max(1, batch // 2))
+        if choice_concept_bridge_w:
+            if concept_groups:
+                concept_records, concept_pairs = choice_concept_bridge_batch(
+                    concept_groups, rng, max(1, batch // 2))
+            else:
+                concept_records, concept_pairs = [], []
+            if (not concept_records or not concept_pairs) and concept_source_records:
+                concept_records, concept_pairs = choice_concept_neighborhood_bridge_batch(
+                    model, vocab, concept_source_records, rng, max(1, batch // 2),
+                    device=device, pool_size=max(16, batch * 4))
             if concept_records and concept_pairs:
                 concept_txt, _concept_ids = pack(concept_records, vocab, device)
                 concept_loss = choice_concept_bridge_loss(
@@ -2664,6 +2771,15 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 concept_loss = torch.tensor(0.0, device=device)
         else:
             concept_loss = torch.tensor(0.0, device=device)
+        if (choice_self_distill_w and choice_self_distill_model is not None
+                and distill_sources):
+            distill_records = batch_records(distill_sources, rng, max(1, batch // 2))
+            distill_txt, _distill_ids = pack(distill_records, vocab, device)
+            distill_loss = choice_self_distill_loss(
+                model, choice_self_distill_model, distill_txt, distill_records,
+                temperature=choice_self_distill_temperature)
+        else:
+            distill_loss = torch.tensor(0.0, device=device)
         if choice_answerability_control_w and control_sources:
             ans_control_records = choice_answerability_control_batch_records(
                 control_sources, rng, max(1, batch // 2),
@@ -2770,6 +2886,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                    * replacement_ans_binding_loss)
                 + choice_positive_anchor_w * positive_anchor_loss
                 + choice_concept_bridge_w * concept_loss
+                + choice_self_distill_w * distill_loss
                 + choice_answerability_w * ans_loss
                 + choice_answerability_control_w * ans_control_loss
                 + choice_candidate_answerability_w * cand_ans_loss
@@ -2798,6 +2915,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                   f"cand-repl-ans-bind {replacement_ans_binding_loss.item():.3f} "
                   f"pos-anchor {positive_anchor_loss.item():.3f} "
                   f"concept {concept_loss.item():.3f} "
+                  f"distill {distill_loss.item():.3f} "
                   f"ans {ans_loss.item():.3f} "
                   f"ans-control {ans_control_loss.item():.3f} "
                   f"cand-ans {cand_ans_loss.item():.3f} "
@@ -4379,6 +4497,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      choice_positive_anchor_margin=0.0,
                      choice_concept_bridge_w=0.0,
                      choice_concept_bridge_margin=0.0,
+                     choice_self_distill_w=0.0,
+                     choice_self_distill_temperature=1.0,
                      choice_answerability_w=0.0, choice_answerability_control_w=0.0,
                      choice_answerability_margin=0.0,
                      choice_answerability_contrast_w=0.0,
@@ -4404,6 +4524,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      study_anchor_correct_per_kind=0,
                      study_anchor_correct_repeat=1,
                      study_anchor_retention_bucket=False,
+                     study_distill_correct_per_kind=0,
+                     study_discovery_correct_per_kind=0,
                      study_select_best=False, study_score_metric="both",
                      study_retention_w=1.0, study_control_w=1.0,
                      study_kind_w=1.0, study_require_positive_score=True,
@@ -4428,6 +4550,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
     study_confirm_n = max(0, int(study_confirm_n))
     study_confirm_seed_stride = max(1, int(study_confirm_seed_stride))
     study_anchor_correct_repeat = max(1, int(study_anchor_correct_repeat))
+    study_distill_correct_per_kind = max(0, int(study_distill_correct_per_kind))
+    study_discovery_correct_per_kind = max(0, int(study_discovery_correct_per_kind))
     eval_kwargs = dict(device=device, max_new=max_new, free_n=free_n,
                        paraphrase_n=paraphrase_n, counterfactual_n=counterfactual_n,
                        kind_free_n=kind_free_n, fact_n=fact_n,
@@ -4491,6 +4615,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "choice_positive_anchor_margin": float(choice_positive_anchor_margin),
               "choice_concept_bridge_w": float(choice_concept_bridge_w),
               "choice_concept_bridge_margin": float(choice_concept_bridge_margin),
+              "choice_self_distill_w": float(choice_self_distill_w),
+              "choice_self_distill_temperature": float(choice_self_distill_temperature),
               "choice_answerability_w": float(choice_answerability_w),
               "choice_answerability_control_w": float(choice_answerability_control_w),
               "choice_answerability_margin": float(choice_answerability_margin),
@@ -4530,6 +4656,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "study_anchor_correct_per_kind": int(study_anchor_correct_per_kind),
               "study_anchor_correct_repeat": int(study_anchor_correct_repeat),
               "study_anchor_retention_bucket": bool(study_anchor_retention_bucket),
+              "study_distill_correct_per_kind": int(study_distill_correct_per_kind),
+              "study_discovery_correct_per_kind": int(study_discovery_correct_per_kind),
               "study_select_best": bool(study_select_best),
               "study_score_metric": study_score_metric,
               "study_retention_w": float(study_retention_w),
@@ -4591,12 +4719,23 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
         round_seed = seed + 1009 * round_i
         anchor_records = []
         anchor_counts = {}
+        distill_records = []
+        distill_counts = {}
+        discovery_records = []
+        discovery_counts = {}
         if study_strategy == "errors":
+            need_metric_correct = bool(
+                study_anchor_correct_per_kind
+                or (study_score_metric == "choice"
+                    and (study_distill_correct_per_kind
+                         or study_discovery_correct_per_kind)))
+            choice_correct_records = []
             if study_score_metric == "choice":
-                if study_anchor_correct_per_kind:
+                if need_metric_correct:
                     hard_records, correct_records, hard_report = choice_record_outcomes(
                         model, vocab, train_study_records, device=device,
                         n=study_probe_n, seed=round_seed)
+                    choice_correct_records = correct_records
                 else:
                     hard_records, hard_report = choice_record_errors(
                         model, vocab, train_study_records, device=device,
@@ -4614,6 +4753,19 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                         n=study_probe_n, seed=round_seed)
                     correct_records = []
                 hard_report = hard_report | {"error_metric": "semantic"}
+                if study_distill_correct_per_kind or study_discovery_correct_per_kind:
+                    _choice_hard, choice_correct_records, choice_correct_report = (
+                        choice_record_outcomes(model, vocab, train_study_records,
+                                               device=device, n=study_probe_n,
+                                               seed=round_seed))
+                    hard_report = hard_report | {
+                        "choice_correct_for_self_teach": {
+                            "n_records": choice_correct_report["n_records"],
+                            "n_correct_records": choice_correct_report[
+                                "n_correct_records"],
+                            "choice_error_rate": choice_correct_report[
+                                "choice_error_rate"],
+                        }}
             if study_hard_max and len(hard_records) > study_hard_max:
                 rng = np.random.default_rng(round_seed + 17)
                 idx = rng.choice(len(hard_records), size=study_hard_max, replace=False)
@@ -4631,12 +4783,24 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                     anchor_records = retention_anchor_records(anchor_records)
                 if study_anchor_correct_repeat > 1:
                     anchor_records = anchor_records * study_anchor_correct_repeat
+            if study_distill_correct_per_kind and choice_correct_records:
+                rng = np.random.default_rng(round_seed + 71)
+                distill_records, distill_counts = sample_records_per_kind(
+                    choice_correct_records, rng, study_distill_correct_per_kind)
+            if study_discovery_correct_per_kind and choice_correct_records:
+                rng = np.random.default_rng(round_seed + 89)
+                discovery_records, discovery_counts = sample_records_per_kind(
+                    choice_correct_records, rng, study_discovery_correct_per_kind)
             hard_report = hard_report | {
                 "n_anchor_records": len(anchor_records),
                 "n_unique_anchor_records": sum(anchor_counts.values()),
                 "anchor_repeat": study_anchor_correct_repeat,
                 "anchor_retention_bucket": bool(study_anchor_retention_bucket),
                 "anchor_records_by_kind": anchor_counts,
+                "n_distill_records": len(distill_records),
+                "distill_records_by_kind": distill_counts,
+                "n_discovery_records": len(discovery_records),
+                "discovery_records_by_kind": discovery_counts,
             }
             round_fit_records = hard_records + anchor_records + train_replay_records
             if not hard_records:
@@ -4655,8 +4819,18 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                                                        - len(train_replay_records)),
                               "anchor_records": len(anchor_records),
                               "anchor_records_by_kind": anchor_counts,
+                              "distill_records": len(distill_records),
+                              "distill_records_by_kind": distill_counts,
+                              "discovery_records": len(discovery_records),
+                              "discovery_records_by_kind": discovery_counts,
                               "replay_fit_records": len(train_replay_records),
                               "hard_examples": hard_report})
+        distill_teacher = None
+        if choice_self_distill_w and distill_records:
+            distill_teacher = copy.deepcopy(model).to(device)
+            distill_teacher.eval()
+            for param in distill_teacher.parameters():
+                param.requires_grad_(False)
         fit_model(model, vocab, round_fit_records, steps=steps, batch=batch, lr=lr,
                   seed=round_seed, device=device, semantic_w=semantic_w,
                   balance_by=balance_by, prefix=f"study-r{round_i + 1}",
@@ -4689,6 +4863,11 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   choice_positive_anchor_margin=choice_positive_anchor_margin,
                   choice_concept_bridge_w=choice_concept_bridge_w,
                   choice_concept_bridge_margin=choice_concept_bridge_margin,
+                  choice_concept_bridge_sources=(discovery_records or None),
+                  choice_self_distill_w=choice_self_distill_w,
+                  choice_self_distill_temperature=choice_self_distill_temperature,
+                  choice_self_distill_sources=distill_records,
+                  choice_self_distill_model=distill_teacher,
                   choice_answerability_w=choice_answerability_w,
                   choice_answerability_control_w=choice_answerability_control_w,
                   choice_answerability_margin=choice_answerability_margin,
@@ -5069,6 +5248,16 @@ def selftest():
     concept_txt, _concept_ids = pack(concept_rows, choice_vocab, "cpu")
     assert torch.isfinite(choice_concept_bridge_loss(
         choice_model, concept_txt, concept_rows, concept_pairs))
+    neighbor_rows, neighbor_pairs = choice_concept_neighborhood_bridge_batch(
+        choice_model, choice_vocab, bridge_eval, np.random.default_rng(19), pairs=1,
+        device="cpu", pool_size=4)
+    assert len(neighbor_rows) == 2 and len(neighbor_pairs) == 1
+    neighbor_txt, _neighbor_ids = pack(neighbor_rows, choice_vocab, "cpu")
+    assert torch.isfinite(choice_concept_bridge_loss(
+        choice_model, neighbor_txt, neighbor_rows, neighbor_pairs))
+    choice_teacher = copy.deepcopy(choice_model).eval()
+    assert torch.isfinite(choice_self_distill_loss(
+        choice_model, choice_teacher, choice_txt, choice_eval, temperature=1.5))
     concept_eval = qa_concept_discovery_eval(
         choice_model, choice_vocab, bridge_eval, device="cpu", n=1, seed=18)
     assert concept_eval["n"] == 1
@@ -5491,6 +5680,15 @@ def main(argv=None):
     ap.add_argument("--choice-concept-bridge-margin", type=float, default=0.0,
                     dest="choice_concept_bridge_margin",
                     help="margin for mined same-concept candidate bridge loss")
+    ap.add_argument("--choice-self-distill-w", "--choice-distill-w",
+                    type=float, default=0.0,
+                    dest="choice_self_distill_w",
+                    help=("weight for preserving a frozen own-model QA choice "
+                          "distribution on mined correct records during study"))
+    ap.add_argument("--choice-self-distill-temperature", "--choice-distill-temperature",
+                    type=float, default=1.0,
+                    dest="choice_self_distill_temperature",
+                    help="temperature for own-model QA choice distribution distillation")
     ap.add_argument("--choice-answerability-w", type=float, default=0.0,
                     dest="choice_answerability_w",
                     help="weight for learned QA answerability coverage loss")
@@ -5593,6 +5791,12 @@ def main(argv=None):
     ap.add_argument("--study-anchor-retention-bucket", action="store_true",
                     help=("put selected correct retention anchors in their own "
                           "training kind buckets when balancing by kind"))
+    ap.add_argument("--study-distill-correct-per-kind", type=int, default=0,
+                    help=("for error self-study, preserve this many currently-correct "
+                          "choice records per kind with own-model distillation"))
+    ap.add_argument("--study-discovery-correct-per-kind", type=int, default=0,
+                    help=("for error self-study, use this many currently-correct "
+                          "choice records per kind as concept-bridge discovery sources"))
     ap.add_argument("--study-select-best", action="store_true",
                     help="evaluate each study round and restore the best scoring weights")
     ap.add_argument("--study-score-metric", choices=("semantic", "teacher", "both", "min",
@@ -5711,6 +5915,9 @@ def main(argv=None):
                          choice_concept_bridge_w=args.choice_concept_bridge_w,
                          choice_concept_bridge_margin=(
                              args.choice_concept_bridge_margin),
+                         choice_self_distill_w=args.choice_self_distill_w,
+                         choice_self_distill_temperature=(
+                             args.choice_self_distill_temperature),
                          choice_answerability_w=args.choice_answerability_w,
                          choice_answerability_control_w=(
                              args.choice_answerability_control_w),
@@ -5753,6 +5960,10 @@ def main(argv=None):
                          study_anchor_correct_repeat=args.study_anchor_correct_repeat,
                          study_anchor_retention_bucket=(
                              args.study_anchor_retention_bucket),
+                         study_distill_correct_per_kind=(
+                             args.study_distill_correct_per_kind),
+                         study_discovery_correct_per_kind=(
+                             args.study_discovery_correct_per_kind),
                          study_select_best=args.study_select_best,
                          study_score_metric=args.study_score_metric,
                          study_retention_w=args.study_retention_w,
