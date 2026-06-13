@@ -51,6 +51,7 @@ from scratchpad_model import CausalBlock, ScratchpadLM
 
 from .concepts import (
     SchemaConceptHead,
+    SchemaConceptRefiner,
     schema_concept_batch_centroid_loss,
     schema_concept_contrastive_loss,
     schema_concept_prototype_alignment_loss,
@@ -1086,9 +1087,14 @@ class TextFactLM(nn.Module):
 
     def __init__(self, vocab_size, d=96, layers=3, heads=4, pad=0, max_len=512,
                  fact_schema=None, fact_concept_prefix=False,
-                 text_encoder_arch="transformer", text_encoder_layers=1):
+                 text_encoder_arch="transformer", text_encoder_layers=1,
+                 fact_concept_refine=False, fact_concept_refine_gate_init=-2.0):
         super().__init__()
+        self.d = int(d)
+        self.heads = int(heads)
         self.fact_concept_prefix = bool(fact_concept_prefix)
+        self.fact_concept_refine = bool(fact_concept_refine)
+        self.fact_concept_refine_gate_init = float(fact_concept_refine_gate_init)
         self.text_encoder_arch = str(text_encoder_arch)
         self.text_encoder_layers = int(text_encoder_layers)
         self.txt = TextPrefix(vocab_size, d=d, pad=pad, heads=heads,
@@ -1107,18 +1113,40 @@ class TextFactLM(nn.Module):
         self.choice_answerability_scale = nn.Parameter(torch.tensor(-3.0))
         self.fact_schema = fact_schema
         self.fact_heads = nn.ModuleDict()
+        self.fact_concept_refiner = None
         if fact_schema is not None:
             self.fact_query = nn.Parameter(torch.randn(len(fact_schema.keys), d) * 0.02)
             self.fact_concepts = SchemaConceptHead(fact_schema.keys, fact_schema.values, d)
+            if self.fact_concept_refine:
+                self.fact_concept_refiner = SchemaConceptRefiner(
+                    d, heads=heads, gate_init=self.fact_concept_refine_gate_init)
             for i, vals in enumerate(fact_schema.values):
                 self.fact_heads[str(i)] = nn.Linear(d, len(vals))
         else:
+            self.fact_concept_refine = False
             self.fact_query = None
             self.fact_concepts = None
 
+    def enable_fact_concept_refiner(self, heads=None, gate_init=-2.0):
+        if self.fact_concepts is None:
+            self.fact_concept_refine = False
+            return self
+        if self.fact_concept_refiner is None:
+            self.fact_concept_refiner = SchemaConceptRefiner(
+                self.d, heads=int(heads or self.heads), gate_init=gate_init)
+            self.fact_concept_refiner.to(next(self.parameters()).device)
+            self.fact_concept_refine_gate_init = float(gate_init)
+        self.fact_concept_refine = True
+        return self
+
     def encode_text(self, txt):
+        mask = txt.eq(self.txt.pad)
         prefix = self.txt(txt)
-        keep = txt.ne(self.txt.pad).unsqueeze(-1)
+        if (self.fact_concept_refine and self.fact_concepts is not None
+                and self.fact_concept_refiner is not None):
+            concepts = self.fact_concepts.state_tensor(prefix, mask=mask)
+            prefix = self.fact_concept_refiner(prefix, concepts, mask=mask)
+        keep = (~mask).unsqueeze(-1)
         pooled = (prefix * keep).sum(1) / keep.sum(1).clamp(min=1)
         return prefix, pooled
 
@@ -3589,6 +3617,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
 
 def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4,
                 text_encoder_arch="transformer", text_encoder_layers=1,
+                fact_concept_refine=False, fact_concept_refine_gate_init=-2.0,
                 lr=1e-3, seed=0, device=DEV, log_every=100,
                 semantic_w=0.5, balance_by="none",
                 fact_concept_w=0.0, fact_concept_contrast_w=0.0,
@@ -3651,7 +3680,10 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4,
                        fact_schema=schema,
                        fact_concept_prefix=fact_concept_prefix,
                        text_encoder_arch=text_encoder_arch,
-                       text_encoder_layers=text_encoder_layers).to(device)
+                       text_encoder_layers=text_encoder_layers,
+                       fact_concept_refine=fact_concept_refine,
+                       fact_concept_refine_gate_init=(
+                           fact_concept_refine_gate_init)).to(device)
     return fit_model(model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
                      device=device, log_every=log_every, semantic_w=semantic_w,
                      balance_by=balance_by, fact_concept_w=fact_concept_w,
@@ -4977,7 +5009,11 @@ def load_checkpoint(path, device=DEV):
                            ckpt.get("fact_concept_prefix", False)),
                        text_encoder_arch=ckpt.get("text_encoder_arch", "transformer"),
                        text_encoder_layers=int(
-                           ckpt.get("text_encoder_layers", 1))).to(device)
+                           ckpt.get("text_encoder_layers", 1)),
+                       fact_concept_refine=bool(
+                           ckpt.get("fact_concept_refine", False)),
+                       fact_concept_refine_gate_init=float(
+                           ckpt.get("fact_concept_refine_gate_init", -2.0))).to(device)
     state = ckpt["state_dict"]
     model.load_state_dict(state, strict=False)
     model.has_fact_concept_state = any(k.startswith("fact_concepts.") for k in state)
@@ -4997,7 +5033,11 @@ def expanded_checkpoint_model(checkpoint, records, device=DEV):
                            ckpt.get("fact_concept_prefix", False)),
                        text_encoder_arch=ckpt.get("text_encoder_arch", "transformer"),
                        text_encoder_layers=int(
-                           ckpt.get("text_encoder_layers", 1))).to(device)
+                           ckpt.get("text_encoder_layers", 1)),
+                       fact_concept_refine=bool(
+                           ckpt.get("fact_concept_refine", False)),
+                       fact_concept_refine_gate_init=float(
+                           ckpt.get("fact_concept_refine_gate_init", -2.0))).to(device)
     copy_pretrained_text_weights(src_model, src_vocab, model, vocab)
     model.eval()
     return model, vocab, ckpt
@@ -5006,6 +5046,9 @@ def expanded_checkpoint_model(checkpoint, records, device=DEV):
 def checkpoint_payload(model, vocab, d, layers, heads, report):
     return {"state_dict": model.state_dict(), "vocab": vocab.itos,
             "fact_concept_prefix": bool(getattr(model, "fact_concept_prefix", False)),
+            "fact_concept_refine": bool(getattr(model, "fact_concept_refine", False)),
+            "fact_concept_refine_gate_init": float(
+                getattr(model, "fact_concept_refine_gate_init", -2.0)),
             "text_encoder_arch": getattr(model, "text_encoder_arch", "transformer"),
             "text_encoder_layers": int(getattr(model, "text_encoder_layers", 1)),
             "d": d, "layers": layers, "heads": heads, "fact_schema": {
@@ -5285,6 +5328,7 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         checkpoint=None, max_new=160, semantic_w=0.5, free_n=0, paraphrase_n=0,
         counterfactual_n=0, kind_free_n=0, balance_by="none",
         text_encoder_arch="transformer", text_encoder_layers=1,
+        fact_concept_refine=False, fact_concept_refine_gate_init=-2.0,
         fact_n=0, kind_fact_n=0, artifact_n=0, decode_w=1.0, choice_w=0.0,
         fact_concept_w=0.0, fact_concept_contrast_w=0.0,
         fact_concept_contrast_temperature=0.1,
@@ -5340,6 +5384,9 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                heads=heads,
                                text_encoder_arch=text_encoder_arch,
                                text_encoder_layers=text_encoder_layers,
+                               fact_concept_refine=fact_concept_refine,
+                               fact_concept_refine_gate_init=(
+                                   fact_concept_refine_gate_init),
                                seed=seed, device=device, semantic_w=semantic_w,
                                balance_by=balance_by, fact_concept_w=fact_concept_w,
                                fact_concept_contrast_w=fact_concept_contrast_w,
@@ -5447,6 +5494,9 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                   fact_concept_centroid_temperature),
               "fact_concept_centroid_margin": float(fact_concept_centroid_margin),
               "fact_concept_prefix": bool(getattr(model, "fact_concept_prefix", False)),
+              "fact_concept_refine": bool(getattr(model, "fact_concept_refine", False)),
+              "fact_concept_refine_gate_init": float(
+                  getattr(model, "fact_concept_refine_gate_init", -2.0)),
               "fact_concept_prototype_w": float(fact_concept_prototype_w),
               "fact_concept_prototype_spread_w": float(
                   fact_concept_prototype_spread_w),
@@ -5568,6 +5618,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      fact_concept_centroid_temperature=0.1,
                      fact_concept_centroid_margin=0.0,
                      fact_concept_prefix=False,
+                     fact_concept_refine=False,
+                     fact_concept_refine_gate_init=-2.0,
                      fact_concept_prototype_w=0.0,
                      fact_concept_prototype_spread_w=0.0,
                      fact_concept_prototype_spread_margin=0.2,
@@ -5651,6 +5703,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
     d = int(ckpt.get("d", 96))
     layers = int(ckpt.get("layers", 3))
     heads = int(ckpt.get("heads", 4))
+    if fact_concept_refine:
+        model.enable_fact_concept_refiner(
+            heads=heads, gate_init=fact_concept_refine_gate_init)
     old_schema = fact_schema_from_payload(ckpt.get("fact_schema"))
     old_fact_values = (sum(len(v) for v in old_schema.values) if old_schema is not None else 0)
     new_fact_values = sum(len(v) for v in model.fact_schema.values)
@@ -5712,6 +5767,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   fact_concept_centroid_temperature),
               "fact_concept_centroid_margin": float(fact_concept_centroid_margin),
               "fact_concept_prefix": bool(getattr(model, "fact_concept_prefix", False)),
+              "fact_concept_refine": bool(getattr(model, "fact_concept_refine", False)),
+              "fact_concept_refine_gate_init": float(
+                  getattr(model, "fact_concept_refine_gate_init", -2.0)),
               "fact_concept_prototype_w": float(fact_concept_prototype_w),
               "fact_concept_prototype_spread_w": float(
                   fact_concept_prototype_spread_w),
@@ -6413,6 +6471,15 @@ def selftest():
     raw_prefix, _pooled = prefix_model.encode_text(choice_txt)
     decoder_prefix = prefix_model.decoder_prefix(choice_txt)
     assert decoder_prefix.shape[1] == raw_prefix.shape[1] + len(choice_schema.keys)
+    refine_model = TextFactLM(len(choice_vocab), d=32, layers=1, heads=4,
+                              pad=choice_vocab.pad, fact_schema=choice_schema,
+                              fact_concept_refine=True).to("cpu")
+    refined_prefix, _refined_pooled = refine_model.encode_text(choice_txt)
+    assert refined_prefix.shape == raw_prefix.shape
+    assert any(name.startswith("fact_concept_refiner.")
+               for name, _param in refine_model.named_parameters())
+    refine_logits = refine_model(choice_txt, _choice_ids)
+    assert refine_logits.shape[:2] == _choice_ids.shape
     rel_model = TextFactLM(len(choice_vocab), d=32, layers=1, heads=4,
                            pad=choice_vocab.pad, fact_schema=choice_schema,
                            text_encoder_arch="relational",
@@ -6981,6 +7048,13 @@ def main(argv=None):
     ap.add_argument("--fact-concept-prefix", action="store_true",
                     dest="fact_concept_prefix",
                     help="prepend schema concept states to the text decoder prefix")
+    ap.add_argument("--fact-concept-refine", action="store_true",
+                    dest="fact_concept_refine",
+                    help=("refine upstream text states with learned schema concept "
+                          "feedback before decoding and concept heads"))
+    ap.add_argument("--fact-concept-refine-gate-init", type=float, default=-2.0,
+                    dest="fact_concept_refine_gate_init",
+                    help="initial logit for the learned concept-refinement residual gate")
     ap.add_argument("--fact-concept-prototype-w", type=float, default=0.0,
                     dest="fact_concept_prototype_w",
                     help="weight for schema-generic learned concept prototype loss")
@@ -7282,6 +7356,8 @@ def main(argv=None):
         ap.error("--fact-concept-state-spread-margin must be >= -1")
     if args.fact_concept_state_spread_covariance_w < 0.0:
         ap.error("--fact-concept-state-spread-covariance-w must be non-negative")
+    if not math.isfinite(args.fact_concept_refine_gate_init):
+        ap.error("--fact-concept-refine-gate-init must be finite")
     if args.import_scan:
         import_scan(args.out, url=args.scan_url, max_records=args.scan_max,
                     eval_frac=args.scan_eval_frac, seed=args.seed)
@@ -7353,6 +7429,9 @@ def main(argv=None):
                          fact_concept_centroid_margin=(
                              args.fact_concept_centroid_margin),
                          fact_concept_prefix=args.fact_concept_prefix,
+                         fact_concept_refine=args.fact_concept_refine,
+                         fact_concept_refine_gate_init=(
+                             args.fact_concept_refine_gate_init),
                          fact_concept_prototype_w=args.fact_concept_prototype_w,
                          fact_concept_prototype_spread_w=(
                              args.fact_concept_prototype_spread_w),
@@ -7488,6 +7567,8 @@ def main(argv=None):
         fact_concept_centroid_temperature=args.fact_concept_centroid_temperature,
         fact_concept_centroid_margin=args.fact_concept_centroid_margin,
         fact_concept_prefix=args.fact_concept_prefix,
+        fact_concept_refine=args.fact_concept_refine,
+        fact_concept_refine_gate_init=args.fact_concept_refine_gate_init,
         fact_concept_prototype_w=args.fact_concept_prototype_w,
         fact_concept_prototype_spread_w=args.fact_concept_prototype_spread_w,
         fact_concept_prototype_spread_margin=(

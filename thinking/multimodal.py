@@ -33,6 +33,7 @@ from scratchpad_model import CausalBlock, ScratchpadLM
 from .audio import (ENVELOPES, PITCH_NAMES, TIMBRES, render_tone, sample_clip, spectrogram)
 from .concepts import (
     SchemaConceptHead,
+    SchemaConceptRefiner,
     schema_concept_batch_centroid_loss,
     schema_concept_contrastive_loss,
     schema_concept_prototype_alignment_loss,
@@ -354,7 +355,8 @@ class MultimodalLM(nn.Module):
                  img_tokens=4, aud_tokens=8, txt_tokens=8, trunk_arch="conv",
                  trunk_width=64, trunk_depth=1, text_layers=1, modality_dropout=0.0,
                  text_arch="transformer", concept_tokens=4, fusion_layers=1,
-                 concept_prefix=False):
+                 concept_prefix=False, concept_refine=False,
+                 concept_refine_gate_init=-2.0):
         super().__init__()
         if img_tokens <= 0 or aud_tokens <= 0 or txt_tokens <= 0:
             raise ValueError("multimodal prefix token counts must be positive")
@@ -375,9 +377,12 @@ class MultimodalLM(nn.Module):
             "fusion": "concept", "concept_tokens": int(concept_tokens),
             "fusion_layers": int(fusion_layers),
             "concept_prefix": bool(concept_prefix),
+            "concept_refine": bool(concept_refine),
+            "concept_refine_gate_init": float(concept_refine_gate_init),
         }
         self.modality_dropout = float(modality_dropout)
         self.concept_prefix = bool(concept_prefix)
+        self.concept_refine = bool(concept_refine)
         self.lm = ScratchpadLM(vocab_size, d=d, layers=layers, heads=heads, max_len=max_len,
                                pad=pad, pointer=False, loop=False)
         img_pool = _grid_pool(img_tokens)
@@ -395,6 +400,9 @@ class MultimodalLM(nn.Module):
             [FACTOR_KEYS[factor] for factor in VALUE_POS],
             [FACTOR_VALUES[factor] for factor in VALUE_POS],
             d)
+        self.concept_refiner = (SchemaConceptRefiner(
+            d, heads=heads, gate_init=concept_refine_gate_init)
+            if self.concept_refine else None)
 
     def _apply_modality_dropout(self, ip, ap, tp):
         if not self.training or self.modality_dropout <= 0.0:
@@ -419,24 +427,39 @@ class MultimodalLM(nn.Module):
             raise ValueError(f"unknown multimodal mode {mode!r}")
         elif self.modality_dropout > 0.0:
             ip, ap, tp = self._apply_modality_dropout(ip, ap, tp)
-        return self.fusion(ip, ap, tp)
+        prefix, concepts = self.fusion(ip, ap, tp)
+        if self.concept_refiner is not None:
+            source = self._source_from_prefix(prefix, concepts)
+            factor_state_tensor = self.factor_concepts.state_tensor(source)
+            prefix = self.concept_refiner(prefix, factor_state_tensor)
+            concepts = prefix[:, :self.fusion.concept_tokens]
+        return prefix, concepts
+
+    def _factor_states_from_tensor(self, state_tensor):
+        return {factor: state_tensor[:, i] for i, factor in enumerate(VALUE_POS)}
+
+    def _source_from_prefix(self, prefix, concepts):
+        return concepts if concepts is not None else prefix
 
     def factor_concept_states(self, img, aud, txt, mode="full"):
         prefix, concepts = self.encode_prefix(img, aud, txt, mode=mode)
-        source = concepts if concepts is not None else prefix
-        states_by_key = self.factor_concepts.states(source)
-        return {factor: states_by_key[FACTOR_KEYS[factor]] for factor in VALUE_POS}
+        source = self._source_from_prefix(prefix, concepts)
+        return self._factor_states_from_tensor(self.factor_concepts.state_tensor(source))
 
     def factor_concept_geometry_states(self, img, aud, txt, mode="full"):
         prefix, concepts = self.encode_prefix(img, aud, txt, mode=mode)
-        source = concepts if concepts is not None else prefix
-        states_by_key = self.factor_concepts.geometry_states(source)
-        return {factor: states_by_key[FACTOR_KEYS[factor]] for factor in VALUE_POS}
+        source = self._source_from_prefix(prefix, concepts)
+        state_tensor = self.factor_concepts.geometry_state_tensor(source)
+        return self._factor_states_from_tensor(state_tensor)
 
     def factor_geometry_from_states(self, states):
         state_tensor = torch.stack([states[factor] for factor in VALUE_POS], dim=1)
         projected = self.factor_concepts.geometry_state_tensor_from_states(state_tensor)
         return {factor: projected[:, i] for i, factor in enumerate(VALUE_POS)}
+
+    def factor_logits_from_state_tensor(self, state_tensor):
+        logits_by_key = self.factor_concepts.logits_from_state_tensor(state_tensor)
+        return {factor: logits_by_key[FACTOR_KEYS[factor]] for factor in VALUE_POS}
 
     def factor_logits_from_states(self, states):
         states_by_key = {FACTOR_KEYS[factor]: states[factor] for factor in VALUE_POS}
@@ -447,13 +470,40 @@ class MultimodalLM(nn.Module):
         return self.factor_logits_from_states(
             self.factor_concept_states(img, aud, txt, mode=mode))
 
+    def decoder_prefix_from_encoded(self, prefix, concepts, factor_state_tensor=None):
+        if self.concept_prefix:
+            if factor_state_tensor is None:
+                source = self._source_from_prefix(prefix, concepts)
+                factor_state_tensor = self.factor_concepts.state_tensor(source)
+            prefix = torch.cat([factor_state_tensor, prefix], dim=1)
+        return prefix
+
     def decoder_prefix(self, img, aud, txt, mode="full"):
         prefix, concepts = self.encode_prefix(img, aud, txt, mode=mode)
-        if self.concept_prefix:
-            source = concepts if concepts is not None else prefix
-            factor_states = self.factor_concepts.state_tensor(source)
-            prefix = torch.cat([factor_states, prefix], dim=1)
-        return prefix
+        return self.decoder_prefix_from_encoded(prefix, concepts)
+
+    def mode_bundle(self, img, aud, txt, ids, mode="full", need_factor=False,
+                    need_geometry=False):
+        prefix, concepts = self.encode_prefix(img, aud, txt, mode=mode)
+        source = self._source_from_prefix(prefix, concepts)
+        factor_state_tensor = None
+        if self.concept_prefix or need_factor or need_geometry:
+            factor_state_tensor = self.factor_concepts.state_tensor(source)
+        decoder_prefix = self.decoder_prefix_from_encoded(
+            prefix, concepts, factor_state_tensor=factor_state_tensor)
+        logits = self.lm(ids, prefix=decoder_prefix)[:, decoder_prefix.shape[1]:]
+        out = {"logits": logits, "prefix": prefix, "concepts": concepts}
+        if need_factor or need_geometry:
+            if factor_state_tensor is None:
+                factor_state_tensor = self.factor_concepts.state_tensor(source)
+            out["factor_states"] = self._factor_states_from_tensor(factor_state_tensor)
+            out["factor_logits"] = self.factor_logits_from_state_tensor(factor_state_tensor)
+        if need_geometry:
+            geometry_tensor = self.factor_concepts.geometry_state_tensor_from_states(
+                factor_state_tensor)
+            out["factor_geometry_states"] = self._factor_states_from_tensor(
+                geometry_tensor)
+        return out
 
     def forward(self, img, aud, txt, ids, mode="full"):
         prefix = self.decoder_prefix(img, aud, txt, mode=mode)
@@ -1035,7 +1085,9 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
           text_arch="transformer", modality_dropout=0.0, agreement_w=0.0,
           concept_tokens=4, fusion_layers=1,
-          concept_prefix=False, concept_w=0.0, concept_agreement_w=0.0,
+          concept_prefix=False, concept_refine=False,
+          concept_refine_gate_init=-2.0,
+          concept_w=0.0, concept_agreement_w=0.0,
           concept_distill_w=0.0, concept_distill_temperature=1.0,
           concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
           concept_transfer_w=0.0, concept_transfer_margin=0.0,
@@ -1058,7 +1110,10 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                          text_arch=text_arch, modality_dropout=modality_dropout,
                          concept_tokens=concept_tokens,
                          fusion_layers=fusion_layers,
-                         concept_prefix=concept_prefix).to(device)
+                         concept_prefix=concept_prefix,
+                         concept_refine=concept_refine,
+                         concept_refine_gate_init=(
+                             concept_refine_gate_init)).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     last_base = last_agreement = last_concept = 0.0
     last_concept_agreement = last_concept_distill = last_concept_rank_distill = 0.0
@@ -1070,25 +1125,33 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         model.train()
         img, aud, txt, ids, golds = _batch(batch, rng, vocab, device, surfaces,
                                            text_split="train")
-        logits_by_mode = {mode: model(img, aud, txt, ids, mode=mode) for mode in MODES}
-        losses = [token_loss(logits, ids, value_w=value_w)
-                  for logits in logits_by_mode.values()]
-        base_loss = sum(losses) / len(losses)
-        agreement = (value_agreement_loss(logits_by_mode, vocab)
-                     if agreement_w else base_loss * 0.0)
         needs_factor_batch = (
             concept_w or concept_agreement_w or concept_distill_w
             or concept_rank_distill_w or concept_transfer_w
             or concept_contrast_w or concept_centroid_w or concept_prototype_w
             or concept_state_spread_w)
+        needs_geometry_batch = (
+            concept_contrast_w or concept_centroid_w or concept_prototype_w
+            or concept_state_spread_w)
+        bundles_by_mode = {
+            mode: model.mode_bundle(
+                img, aud, txt, ids, mode=mode, need_factor=needs_factor_batch,
+                need_geometry=needs_geometry_batch)
+            for mode in MODES
+        }
+        logits_by_mode = {mode: bundle["logits"]
+                          for mode, bundle in bundles_by_mode.items()}
+        losses = [token_loss(logits, ids, value_w=value_w)
+                  for logits in logits_by_mode.values()]
+        base_loss = sum(losses) / len(losses)
+        agreement = (value_agreement_loss(logits_by_mode, vocab)
+                     if agreement_w else base_loss * 0.0)
         if needs_factor_batch:
             factor_states_by_mode = {
-                mode: model.factor_concept_states(img, aud, txt, mode=mode)
-                for mode in MODES
+                mode: bundle["factor_states"] for mode, bundle in bundles_by_mode.items()
             }
             factor_logits_by_mode = {
-                mode: model.factor_logits_from_states(states)
-                for mode, states in factor_states_by_mode.items()
+                mode: bundle["factor_logits"] for mode, bundle in bundles_by_mode.items()
             }
             concept_loss = (
                 concept_factor_loss(factor_logits_by_mode, golds)
@@ -1110,10 +1173,9 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                     margin=concept_transfer_margin)
                 if concept_transfer_w else base_loss * 0.0)
             factor_geometry_states_by_mode = (
-                {mode: model.factor_geometry_from_states(states)
-                 for mode, states in factor_states_by_mode.items()}
-                if (concept_contrast_w or concept_centroid_w or concept_prototype_w
-                    or concept_state_spread_w) else {})
+                {mode: bundle["factor_geometry_states"]
+                 for mode, bundle in bundles_by_mode.items()}
+                if needs_geometry_batch else {})
             concept_contrast = (
                 concept_factor_contrastive_loss(
                     factor_geometry_states_by_mode, golds,
@@ -1226,7 +1288,9 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
         text_arch="transformer", modality_dropout=0.0, agreement_w=0.0,
         concept_tokens=4, fusion_layers=1,
-        concept_prefix=False, concept_w=0.0, concept_agreement_w=0.0,
+        concept_prefix=False, concept_refine=False,
+        concept_refine_gate_init=-2.0,
+        concept_w=0.0, concept_agreement_w=0.0,
         concept_distill_w=0.0, concept_distill_temperature=1.0,
         concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
         concept_transfer_w=0.0, concept_transfer_margin=0.0,
@@ -1248,7 +1312,10 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                    text_arch=text_arch, modality_dropout=modality_dropout,
                                    agreement_w=agreement_w, concept_tokens=concept_tokens,
                                    fusion_layers=fusion_layers,
-                                   concept_prefix=concept_prefix, concept_w=concept_w,
+                                   concept_prefix=concept_prefix,
+                                   concept_refine=concept_refine,
+                                   concept_refine_gate_init=concept_refine_gate_init,
+                                   concept_w=concept_w,
                                    concept_agreement_w=concept_agreement_w,
                                    concept_distill_w=concept_distill_w,
                                    concept_distill_temperature=(
@@ -1315,6 +1382,8 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
               "agreement_w": float(agreement_w),
               "text_arch": text_arch,
               "concept_prefix": bool(concept_prefix),
+              "concept_refine": bool(concept_refine),
+              "concept_refine_gate_init": float(concept_refine_gate_init),
               "concept_w": float(concept_w),
               "concept_agreement_w": float(concept_agreement_w),
               "concept_distill_w": float(concept_distill_w),
@@ -1413,6 +1482,18 @@ def selftest():
     assert model.config["fusion"] == "concept"
     logits = model(x, a, tt, ids)
     assert logits.shape == (2, ids.shape[1], len(vocab)), logits.shape
+    masked_head = SchemaConceptHead([("demo", "key")], [["a", "b"]], 8)
+    masked_src = torch.randn(2, 3, 8)
+    masked = torch.tensor([[True, True, True], [False, True, True]])
+    masked_states = masked_head.state_tensor(masked_src, mask=masked)
+    assert torch.isfinite(masked_states).all()
+    assert torch.allclose(masked_states[0], torch.zeros_like(masked_states[0]))
+    bundle = model.mode_bundle(x, a, tt, ids, mode="full", need_factor=True,
+                               need_geometry=True)
+    assert bundle["logits"].shape == logits.shape
+    assert set(bundle["factor_states"]) == set(VALUE_POS)
+    assert set(bundle["factor_logits"]) == set(VALUE_POS)
+    assert set(bundle["factor_geometry_states"]) == set(VALUE_POS)
     logits_text = model(x, a, tt, ids, mode="text_only")
     assert logits_text.shape == logits.shape
     prefix, concepts = model.encode_prefix(x, a, tt, mode="full")
@@ -1427,6 +1508,15 @@ def selftest():
     assert prefix_model.config["concept_prefix"] is True
     assert prefix_decoder.shape[1] == prefix_base.shape[1] + len(VALUE_POS)
     assert prefix_model(x, a, tt, ids).shape == logits.shape
+    refine_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
+                                concept_refine=True).to("cpu")
+    refine_prefix, refine_concepts = refine_model.encode_prefix(x, a, tt, mode="full")
+    assert refine_model.config["concept_refine"] is True
+    assert refine_concepts.shape == (2, refine_model.config["concept_tokens"], 32)
+    assert refine_prefix.shape == prefix.shape
+    assert any(name.startswith("concept_refiner.")
+               for name, _param in refine_model.named_parameters())
+    assert refine_model(x, a, tt, ids).shape == logits.shape
     rel_txt_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
                                  text_arch="relational", text_layers=1).to("cpu")
     assert rel_txt_model.txt.arch == "relational"
@@ -1510,6 +1600,12 @@ def main(argv=None):
                     help="transformer layers used by concept prefix fusion")
     ap.add_argument("--concept-prefix", action="store_true", dest="concept_prefix",
                     help="prepend schema concept states to the decoder prefix")
+    ap.add_argument("--concept-refine", action="store_true", dest="concept_refine",
+                    help=("refine upstream multimodal prefix states with learned schema "
+                          "concept feedback"))
+    ap.add_argument("--concept-refine-gate-init", type=float, default=-2.0,
+                    dest="concept_refine_gate_init",
+                    help="initial logit for the learned concept-refinement residual gate")
     ap.add_argument("--concept-w", type=float, default=0.0, dest="concept_w",
                     help="supervised upstream concept-token factor loss weight")
     ap.add_argument("--concept-agreement-w", type=float, default=0.0,
@@ -1636,14 +1732,16 @@ def main(argv=None):
         ap.error("--concept-centroid-temperature must be positive")
     if args.concept_centroid_margin < 0.0:
         ap.error("--concept-centroid-margin must be non-negative")
-    if args.concept_prototype_spread_margin < 0.0:
-        ap.error("--concept-prototype-spread-margin must be non-negative")
+    if args.concept_prototype_spread_margin < -1.0:
+        ap.error("--concept-prototype-spread-margin must be >= -1")
     if args.concept_state_spread_variance < 0.0:
         ap.error("--concept-state-spread-variance must be non-negative")
     if args.concept_state_spread_margin < -1.0:
         ap.error("--concept-state-spread-margin must be >= -1")
     if args.concept_state_spread_covariance_w < 0.0:
         ap.error("--concept-state-spread-covariance-w must be non-negative")
+    if not math.isfinite(args.concept_refine_gate_init):
+        ap.error("--concept-refine-gate-init must be finite")
     if args.modality_dropout < 0.0 or args.modality_dropout > 1.0:
         ap.error("--modality-dropout must be in [0, 1]")
     if args.eval_n <= 0:
@@ -1664,6 +1762,8 @@ def main(argv=None):
                  modality_dropout=args.modality_dropout,
                  agreement_w=args.agreement_w, concept_tokens=args.concept_tokens,
                  fusion_layers=args.fusion_layers, concept_prefix=args.concept_prefix,
+                 concept_refine=args.concept_refine,
+                 concept_refine_gate_init=args.concept_refine_gate_init,
                  concept_w=args.concept_w,
                  concept_agreement_w=args.concept_agreement_w,
                  concept_distill_w=args.concept_distill_w,

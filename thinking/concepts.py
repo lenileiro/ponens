@@ -40,8 +40,12 @@ class SchemaConceptHead(nn.Module):
         scale = source.shape[-1] ** -0.5
         scores = torch.einsum("btd,kd->bkt", source, self.key_query) * scale
         if mask is not None:
-            scores = scores.masked_fill(mask[:, None, :], -float("inf"))
+            mask = mask.to(device=source.device, dtype=torch.bool)
+            scores = scores.masked_fill(mask[:, None, :], torch.finfo(scores.dtype).min)
         weights = scores.softmax(-1)
+        if mask is not None:
+            weights = weights.masked_fill(mask[:, None, :], 0.0)
+            weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-12)
         return torch.einsum("bkt,btd->bkd", weights, source)
 
     def states(self, source, mask=None):
@@ -93,6 +97,45 @@ class SchemaConceptHead(nn.Module):
 
     def forward(self, source, mask=None):
         return self.logits_from_state_tensor(self.state_tensor(source, mask=mask))
+
+
+class SchemaConceptRefiner(nn.Module):
+    """Feed learned schema concept state back into source token states.
+
+    The module is schema-agnostic: callers provide concept states from data-defined
+    schema heads, and the refiner learns how much those states should reorganize
+    the upstream representation before downstream heads read from it.
+    """
+
+    def __init__(self, d, heads=4, hidden_mult=4, gate_init=-2.0):
+        super().__init__()
+        if d % heads != 0:
+            raise ValueError("refiner dimension must be divisible by heads")
+        hidden = int(hidden_mult) * d
+        self.source_ln = nn.LayerNorm(d)
+        self.concept_ln = nn.LayerNorm(d)
+        self.attn = nn.MultiheadAttention(d, heads, dropout=0.0, batch_first=True)
+        self.attn_out = nn.Linear(d, d, bias=False)
+        self.ff = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, d, bias=False),
+        )
+        self.gate_logit = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def forward(self, source, concept_states, mask=None):
+        if concept_states is None or concept_states.shape[1] == 0:
+            return source.masked_fill(mask.unsqueeze(-1), 0.0) if mask is not None else source
+        q = self.source_ln(source)
+        kv = self.concept_ln(concept_states)
+        attn, _weights = self.attn(q, kv, kv, need_weights=False)
+        gate = torch.sigmoid(self.gate_logit)
+        h = source + gate * self.attn_out(attn)
+        h = h + gate * self.ff(h)
+        if mask is not None:
+            h = h.masked_fill(mask.unsqueeze(-1), 0.0)
+        return h
 
 
 def _zero_from_states(states_by_key):
