@@ -1292,6 +1292,21 @@ measure whether quality improves by spending more solver evaluations near noisy 
 states, or both endpoints, instead of assuming the shifted linear schedule is always optimal.
 RunPod forwards the same controls as `--image-sample-schedule` and `--image-sample-schedules`.
 
+Image-63 adds generic negative-conditioned CFG for prompt sample grids. `thinking.image_latent
+--sample-prompts ... --sample-negative-prompts ...` now uses the same token or live embedding
+conditioner as the positive prompts to build the CFG baseline, instead of forcing every guided
+sample to compare only against a zero vector. One negative prompt is broadcast across all prompts;
+otherwise the negative prompt count must match the prompt count. RunPod exposes the same control as
+`--image-sample-negative-prompts`, and sample-grid metadata records whether guidance used a zero or
+negative-prompt baseline.
+
+Image-64 adds best-of-N prompt sample selection. `--sample-candidates-per-prompt K` draws K samples
+per arbitrary prompt and, when the checkpoint has the generic image/text aligner from real-image
+training, keeps the candidate with the highest learned image-text cosine score. Checkpoints without
+that scorer fall back to the first candidate and record the fallback in sample-grid metadata. RunPod
+forwards the same knob as `--image-sample-candidates-per-prompt`, so GPU prompt grids can use
+alignment-guided inspection without changing training or adding prompt-specific rules.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered

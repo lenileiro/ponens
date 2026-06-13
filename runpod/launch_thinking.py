@@ -170,6 +170,13 @@ def payload(args):
             prompt_grid_args = ""
             if args.image_sample_prompts:
                 prompt_grid_args += f" --sample-prompts {shlex_quote(args.image_sample_prompts)}"
+                if args.image_sample_negative_prompts:
+                    prompt_grid_args += (
+                        " --sample-negative-prompts "
+                        f"{shlex_quote(args.image_sample_negative_prompts)}")
+                prompt_grid_args += (
+                    f" --sample-candidates-per-prompt "
+                    f"{args.image_sample_candidates_per_prompt}")
                 prompt_grid_args += f" --prompt-embed-backend {args.image_prompt_embed_backend}"
                 prompt_grid_args += f" --prompt-embed-model {shlex_quote(args.image_prompt_embed_model)}"
                 prompt_grid_args += f" --prompt-embed-device {shlex_quote(args.image_prompt_embed_device)}"
@@ -781,6 +788,14 @@ def main():
                     help="generated samples per color/shape condition in the image PPM grid")
     ap.add_argument("--image-sample-prompts", default="", dest="image_sample_prompts",
                     help="semicolon/newline separated prompts for latent image sample grids")
+    ap.add_argument("--image-sample-negative-prompts", default="",
+                    dest="image_sample_negative_prompts",
+                    help=("semicolon/newline separated negative prompts for latent image "
+                          "prompt sample grids"))
+    ap.add_argument("--image-sample-candidates-per-prompt", type=int, default=1,
+                    dest="image_sample_candidates_per_prompt",
+                    help=("number of candidates to draw per latent image sample prompt; "
+                          "best is selected when the checkpoint has a text-image aligner"))
     ap.add_argument("--image-prompt-embed-backend", default="stats",
                     choices=("stats", "hf"), dest="image_prompt_embed_backend",
                     help="text embedding backend for --image-sample-prompts on embedding checkpoints")
@@ -1008,6 +1023,12 @@ def main():
         sys.exit("ERROR: --image-flow-distill-teacher ema requires --image-flow-ema-decay > 0")
     if args.image_sample_prompts and not args.image_sample_grid:
         sys.exit("ERROR: --image-sample-prompts requires --image-sample-grid")
+    if args.image_sample_negative_prompts and not args.image_sample_prompts:
+        sys.exit("ERROR: --image-sample-negative-prompts requires --image-sample-prompts")
+    if args.image_sample_candidates_per_prompt <= 0:
+        sys.exit("ERROR: --image-sample-candidates-per-prompt must be positive")
+    if args.image_sample_candidates_per_prompt > 1 and not args.image_sample_prompts:
+        sys.exit("ERROR: --image-sample-candidates-per-prompt > 1 requires --image-sample-prompts")
     if (args.image_sample_prompts and args.image_prompt_embed_backend == "hf"
             and not args.image_prompt_embed_model):
         sys.exit("ERROR: --image-prompt-embed-backend hf requires --image-prompt-embed-model")

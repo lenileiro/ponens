@@ -2450,6 +2450,22 @@ def zero_condition(cond):
     return out
 
 
+def repeat_condition_rows(cond, repeats):
+    repeats = int(repeats)
+    if cond is None:
+        return None
+    if repeats <= 1:
+        return cond
+    if not isinstance(cond, dict):
+        return cond.repeat_interleave(repeats, dim=0)
+    batch = condition_batch(cond)
+    out = dict(cond)
+    for key, val in cond.items():
+        if torch.is_tensor(val) and int(val.shape[0]) == batch:
+            out[key] = val.repeat_interleave(repeats, dim=0)
+    return out
+
+
 def condition_dropout(cond, p=0.0):
     """Classifier-free condition dropout: zero whole condition rows during training."""
     if p <= 0.0:
@@ -2999,6 +3015,18 @@ def parse_sample_prompts(raw):
     return tuple(x.strip() for x in text.replace("\n", ";").split(";") if x.strip())
 
 
+def expand_negative_prompts(raw, n):
+    prompts = parse_sample_prompts(raw)
+    if not prompts:
+        return ()
+    n = int(n)
+    if len(prompts) == 1:
+        return tuple(prompts[0] for _ in range(n))
+    if len(prompts) == n:
+        return prompts
+    raise ValueError("negative prompts must be empty, one prompt, or match sample prompts")
+
+
 @torch.no_grad()
 def prompt_embedding_condition(prompts, conditioner, embed_backend="stats", embed_model="",
                                embed_device=None, embed_dtype="auto", embed_normalize=True,
@@ -3150,11 +3178,11 @@ def rescale_guided_velocity(v_guided, v_cond, cfg_rescale=0.0, eps=1.0e-6):
 
 
 @torch.no_grad()
-def guided_velocity(flow, z, t, cond, cfg_scale=1.0, cfg_rescale=0.0):
+def guided_velocity(flow, z, t, cond, cfg_scale=1.0, cfg_rescale=0.0, cfg_uncond=None):
     """Classifier-free guidance in latent velocity space."""
     if cfg_scale == 1.0:
         return flow(z, t, cond)
-    uncond = zero_condition(cond)
+    uncond = zero_condition(cond) if cfg_uncond is None else cfg_uncond
     v_uncond = flow(z, t, uncond)
     v_cond = flow(z, t, cond)
     guided = v_uncond + cfg_scale * (v_cond - v_uncond)
@@ -3168,8 +3196,10 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                    semantic_guidance_mode="decoded", sample_method="euler",
                    cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                    semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-                   sample_time_shift=1.0, sample_schedule="linear"):
+                   sample_time_shift=1.0, sample_schedule="linear", cfg_uncond=None):
     batch = condition_batch(cond)
+    if cfg_uncond is not None and condition_batch(cfg_uncond) != batch:
+        raise ValueError("cfg_uncond batch must match cond batch")
     latent_stats = flow_latent_stats(flow)
     z = _seeded_randn((batch,) + tuple(latent_shape), device=device, seed=seed)
     flow.eval()
@@ -3200,7 +3230,7 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
             t = torch.full((batch, 1, 1, 1), float(raw_t), device=device)
             step_cfg = cfg_scale if interval_active(float(raw_t), cfg_interval) else 1.0
             return guided_velocity(flow, z_in, t, cond, cfg_scale=step_cfg,
-                                   cfg_rescale=cfg_rescale)
+                                   cfg_rescale=cfg_rescale, cfg_uncond=cfg_uncond)
 
         v0 = velocity_at(z, t_scalar)
         if sample_method == "euler":
@@ -3240,7 +3270,7 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
                   semantic_guidance_mode="decoded", sample_method="euler",
                   cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                   semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-                  sample_time_shift=1.0, sample_schedule="linear"):
+                  sample_time_shift=1.0, sample_schedule="linear", cfg_uncond=None):
     z = sample_latents(flow, cond, latent_shape=latent_shape, steps=steps, device=device,
                        seed=seed, cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
                        ae=ae, semantic_cond=semantic_cond,
@@ -3249,7 +3279,7 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
                        sample_method=sample_method, cfg_interval=cfg_interval,
                        semantic_guidance_interval=semantic_guidance_interval,
                        sample_time_shift=sample_time_shift,
-                       sample_schedule=sample_schedule)
+                       sample_schedule=sample_schedule, cfg_uncond=cfg_uncond)
     ae.eval()
     return ae.decode(z).clamp(-1.0, 1.0)
 
@@ -3308,6 +3338,50 @@ def make_condition_grid_specs(samples_per_combo=1):
         for shape in SHAPES:
             specs.extend(ObjectSpec("p0", color, shape) for _ in range(samples_per_combo))
     return specs, len(COLORS), len(SHAPES) * samples_per_combo
+
+
+@torch.no_grad()
+def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1,
+                             text_aligner=None):
+    candidates_per_prompt = int(candidates_per_prompt)
+    if candidates_per_prompt <= 0:
+        raise ValueError("candidates_per_prompt must be positive")
+    n = len(prompts)
+    expected = n * candidates_per_prompt
+    if int(samples.shape[0]) != expected:
+        raise ValueError(
+            f"expected {expected} prompt candidates, got {int(samples.shape[0])}"
+        )
+    meta = {
+        "sample_grid_candidates_per_prompt": candidates_per_prompt,
+        "sample_grid_selection_scorer": "none",
+        "sample_grid_selected_candidate_indices": [0 for _ in range(n)],
+    }
+    if candidates_per_prompt == 1:
+        return samples, meta
+    if text_aligner is None:
+        meta["sample_grid_selection_scorer"] = "first_candidate_no_text_aligner"
+        return samples[::candidates_per_prompt].contiguous(), meta
+    text_aligner.eval()
+    z = ae.encode(samples)
+    img_emb, txt_emb = text_aligner(z, cond)
+    scores = (img_emb.float() * txt_emb.float()).sum(dim=-1)
+    scores = scores.reshape(n, candidates_per_prompt)
+    best = scores.argmax(dim=1)
+    base = torch.arange(n, device=samples.device) * candidates_per_prompt
+    selected = base + best.to(device=samples.device)
+    chosen = samples.index_select(0, selected)
+    best_scores = scores.gather(1, best[:, None]).squeeze(1)
+    meta.update({
+        "sample_grid_selection_scorer": "text_aligner_cosine",
+        "sample_grid_selected_candidate_indices": [
+            int(x) for x in best.detach().cpu().tolist()
+        ],
+        "sample_grid_selection_score_mean": float(best_scores.mean().detach().cpu()),
+        "sample_grid_selection_score_min": float(best_scores.min().detach().cpu()),
+        "sample_grid_selection_score_max": float(best_scores.max().detach().cpu()),
+    })
+    return chosen.contiguous(), meta
 
 
 @torch.no_grad()
@@ -3414,12 +3488,16 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                                  prompt_embed_backend="stats", prompt_embed_model="",
                                  prompt_embed_device=None, prompt_embed_dtype="auto",
                                  prompt_embed_normalize=True, prompt_embed_stats_dim=0,
-                                 prompt_embed_trust_remote_code=False):
+                                 prompt_embed_trust_remote_code=False,
+                                 negative_prompts=(), candidates_per_prompt=1):
     ae.eval()
     flow.eval()
     prompts = tuple(str(p).strip() for p in prompts if str(p).strip())
     if not prompts:
         raise ValueError("at least one sample prompt is required")
+    candidates_per_prompt = int(candidates_per_prompt)
+    if candidates_per_prompt <= 0:
+        raise ValueError("candidates_per_prompt must be positive")
     cond = text_prompt_condition(
         prompts, conditioner, prompt_vocab=prompt_vocab, caption_max_len=caption_max_len,
         source=caption_cond_source, device=device, return_tokens=flow_uses_cond_tokens(flow),
@@ -3427,12 +3505,28 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         embed_device=prompt_embed_device, embed_dtype=prompt_embed_dtype,
         embed_normalize=prompt_embed_normalize, embed_stats_dim=prompt_embed_stats_dim,
         trust_remote_code=prompt_embed_trust_remote_code)
-    sample = sample_images(ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
+    negative_prompts = expand_negative_prompts(negative_prompts, len(prompts))
+    cfg_uncond = None
+    if negative_prompts:
+        cfg_uncond = text_prompt_condition(
+            negative_prompts, conditioner, prompt_vocab=prompt_vocab,
+            caption_max_len=caption_max_len, source=caption_cond_source, device=device,
+            return_tokens=flow_uses_cond_tokens(flow),
+            embed_backend=prompt_embed_backend, embed_model=prompt_embed_model,
+            embed_device=prompt_embed_device, embed_dtype=prompt_embed_dtype,
+            embed_normalize=prompt_embed_normalize, embed_stats_dim=prompt_embed_stats_dim,
+            trust_remote_code=prompt_embed_trust_remote_code)
+    sample_cond = repeat_condition_rows(cond, candidates_per_prompt)
+    sample_uncond = repeat_condition_rows(cfg_uncond, candidates_per_prompt)
+    sample = sample_images(ae, flow, sample_cond, latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            cfg_rescale=cfg_rescale,
                            sample_method=sample_method, cfg_interval=cfg_interval,
                            sample_time_shift=sample_time_shift,
-                           sample_schedule=sample_schedule)
+                           sample_schedule=sample_schedule, cfg_uncond=sample_uncond)
+    sample, selection_meta = select_prompt_candidates(
+        ae, sample, sample_cond, prompts, candidates_per_prompt=candidates_per_prompt,
+        text_aligner=getattr(flow, "text_aligner", None))
     n = len(prompts)
     cols = int(np.ceil(np.sqrt(n)))
     rows = int(np.ceil(n / cols))
@@ -3447,6 +3541,12 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         "sample_grid_cfg_interval": list(validate_guidance_interval(cfg_interval)),
         "sample_grid_cond_mode": "prompt",
         "sample_grid_caption_cond_source": caption_cond_source,
+        "sample_grid_cfg_uncond_mode": (
+            "negative_prompt" if negative_prompts else "zero"
+        ),
+        "sample_grid_negative_prompt_count": int(len(negative_prompts)),
+        "sample_grid_negative_prompts": list(
+            negative_prompts[:min(8, len(negative_prompts))]),
         "sample_grid_seed": int(seed),
         "sample_grid_prompt_count": int(n),
         "sample_grid_prompts": list(prompts[:min(8, len(prompts))]),
@@ -3460,6 +3560,7 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
             bool(prompt_embed_normalize) if caption_cond_source == "embedding" else False
         ),
     })
+    meta.update(selection_meta)
     return meta
 
 
@@ -5662,9 +5763,14 @@ def selftest():
     prompt_grid_meta = save_text_prompt_sample_grid(
         ae3, flow3, ("a blue triangle", "a red square"), prompt_grid_path,
         size=32, device="cpu", conditioner=conditioner3, prompt_vocab=vocab3,
-        sample_steps=1, seed=13, caption_cond_source="tokens")
+        cfg_scale=1.5, sample_steps=1, seed=13, caption_cond_source="tokens",
+        negative_prompts=("blurry",), candidates_per_prompt=2)
     assert prompt_grid_meta["sample_grid_cond_mode"] == "prompt"
     assert prompt_grid_meta["sample_grid_prompt_count"] == 2
+    assert prompt_grid_meta["sample_grid_cfg_uncond_mode"] == "negative_prompt"
+    assert prompt_grid_meta["sample_grid_negative_prompt_count"] == 2
+    assert prompt_grid_meta["sample_grid_candidates_per_prompt"] == 2
+    assert prompt_grid_meta["sample_grid_selection_scorer"] == "first_candidate_no_text_aligner"
     ae4, flow4, conditioner4, vocab4, report4 = train_latent_flow(
         ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="crossdit",
         dit_depth=1, dit_heads=2, seed=5, device="cpu", cond_mode="text",
@@ -5778,10 +5884,16 @@ def selftest():
             embed_prompt_grid_path, size=32, device="cpu", conditioner=conditioner6,
             prompt_vocab=vocab6, caption_max_len=8, sample_steps=1, seed=21,
             caption_cond_source="embedding", prompt_embed_backend="stats",
-            prompt_embed_stats_dim=4)
+            prompt_embed_stats_dim=4, cfg_scale=1.25,
+            negative_prompts=("low quality", "washed out"), candidates_per_prompt=2)
         assert embed_prompt_meta["sample_grid_cond_mode"] == "prompt"
         assert embed_prompt_meta["sample_grid_caption_cond_source"] == "embedding"
         assert embed_prompt_meta["sample_grid_prompt_embed_backend"] == "stats"
+        assert embed_prompt_meta["sample_grid_cfg_uncond_mode"] == "negative_prompt"
+        assert embed_prompt_meta["sample_grid_negative_prompt_count"] == 2
+        assert embed_prompt_meta["sample_grid_candidates_per_prompt"] == 2
+        assert embed_prompt_meta["sample_grid_selection_scorer"] == "text_aligner_cosine"
+        assert "sample_grid_selection_score_mean" in embed_prompt_meta
         ae_rect, flow_rect, conditioner_rect, vocab_rect, report_rect = train_latent_flow(
             ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=16,
             flow_arch="dit", dit_depth=1, dit_heads=2, seed=14,
@@ -6223,6 +6335,13 @@ def main(argv=None):
                     help="generated samples per color/shape condition in --sample-grid-out")
     ap.add_argument("--sample-prompts", default="", dest="sample_prompts",
                     help="semicolon/newline separated prompts for --sample-grid-out")
+    ap.add_argument("--sample-negative-prompts", default="", dest="sample_negative_prompts",
+                    help=("optional semicolon/newline separated negative prompts for "
+                          "--sample-prompts CFG baselines"))
+    ap.add_argument("--sample-candidates-per-prompt", type=int, default=1,
+                    dest="sample_candidates_per_prompt",
+                    help=("number of candidates to draw per sample prompt; when a text-image "
+                          "aligner is available the best candidate is selected"))
     ap.add_argument("--prompt-embed-backend", default="stats",
                     choices=("stats", "hf"), dest="prompt_embed_backend",
                     help="text embedding backend used by --sample-prompts with embedding conditioning")
@@ -6253,6 +6372,7 @@ def main(argv=None):
         cli_size = normalize_image_size(args.size, default=None)
         cli_size_buckets = normalize_image_size_buckets(args.size_buckets)
         sample_prompts = parse_sample_prompts(args.sample_prompts)
+        sample_negative_prompts = parse_sample_prompts(args.sample_negative_prompts)
         sample_schedules = (
             _parse_string_list(args.sample_schedules) if args.sample_schedules else None
         )
@@ -6263,6 +6383,12 @@ def main(argv=None):
         return
     if sample_prompts and not args.sample_grid_out:
         ap.error("--sample-prompts requires --sample-grid-out")
+    if sample_negative_prompts and not sample_prompts:
+        ap.error("--sample-negative-prompts requires --sample-prompts")
+    if args.sample_candidates_per_prompt <= 0:
+        ap.error("--sample-candidates-per-prompt must be positive")
+    if args.sample_candidates_per_prompt > 1 and not sample_prompts:
+        ap.error("--sample-candidates-per-prompt > 1 requires --sample-prompts")
     if sample_prompts and args.prompt_embed_backend == "hf" and not args.prompt_embed_model:
         ap.error("--prompt-embed-backend hf requires --prompt-embed-model")
     if sample_schedules is not None:
@@ -6345,7 +6471,9 @@ def main(argv=None):
                     prompt_embed_dtype=args.prompt_embed_dtype,
                     prompt_embed_normalize=not args.prompt_embed_no_normalize,
                     prompt_embed_stats_dim=args.prompt_embed_stats_dim,
-                    prompt_embed_trust_remote_code=args.prompt_embed_trust_remote_code)
+                    prompt_embed_trust_remote_code=args.prompt_embed_trust_remote_code,
+                    negative_prompts=sample_negative_prompts,
+                    candidates_per_prompt=args.sample_candidates_per_prompt)
             elif report.get("experiment") == "image_latent_manifest_sampler_sweep":
                 grid_records = read_image_manifest(
                     report["eval_image_manifest"], root=report.get("eval_image_root", ""),
@@ -6516,7 +6644,9 @@ def main(argv=None):
                 prompt_embed_dtype=args.prompt_embed_dtype,
                 prompt_embed_normalize=not args.prompt_embed_no_normalize,
                 prompt_embed_stats_dim=args.prompt_embed_stats_dim,
-                prompt_embed_trust_remote_code=args.prompt_embed_trust_remote_code)
+                prompt_embed_trust_remote_code=args.prompt_embed_trust_remote_code,
+                negative_prompts=sample_negative_prompts,
+                candidates_per_prompt=args.sample_candidates_per_prompt)
         elif args.image_manifest:
             grid_records = read_image_manifest(
                 args.image_manifest, root=args.image_root, split=args.image_split,
