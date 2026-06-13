@@ -31,6 +31,7 @@ from device import get_device
 from scratchpad_model import ScratchpadLM
 
 from .audio import (ENVELOPES, PITCH_NAMES, TIMBRES, render_tone, sample_clip, spectrogram)
+from .concepts import SchemaConceptHead
 from .vision import COLORS, SHAPES, ObjectSpec, render_object, sample_object
 from .trace import Vocab
 
@@ -46,6 +47,13 @@ FACTOR_VALUES = {
     "pitch": PITCH_NAMES,
     "timbre": TIMBRES,
     "env": ENVELOPES,
+}
+FACTOR_KEYS = {
+    "color": ("p0", "color"),
+    "shape": ("p0", "shape"),
+    "pitch": ("a0", "pitch"),
+    "timbre": ("a0", "timbre"),
+    "env": ("a0", "env"),
 }
 VALUE_POS = {"color": 4, "shape": 9, "pitch": 14, "timbre": 19, "env": 24}  # value tokens
 FACTOR_INDEX = {k: {v: i for i, v in enumerate(vals)}
@@ -352,10 +360,10 @@ class MultimodalLM(nn.Module):
                              layers=text_layers, modality=2)
         self.fusion = ConceptFusion(d, heads=heads, concept_tokens=concept_tokens,
                                     layers=fusion_layers)
-        self.factor_queries = nn.Parameter(torch.randn(len(VALUE_POS), d) * 0.02)
-        self.factor_heads = nn.ModuleDict({
-            factor: nn.Linear(d, len(FACTOR_VALUES[factor])) for factor in VALUE_POS
-        })
+        self.factor_concepts = SchemaConceptHead(
+            [FACTOR_KEYS[factor] for factor in VALUE_POS],
+            [FACTOR_VALUES[factor] for factor in VALUE_POS],
+            d)
 
     def _apply_modality_dropout(self, ip, ap, tp):
         if not self.training or self.modality_dropout <= 0.0:
@@ -385,15 +393,13 @@ class MultimodalLM(nn.Module):
     def factor_concept_states(self, img, aud, txt, mode="full"):
         prefix, concepts = self.encode_prefix(img, aud, txt, mode=mode)
         source = concepts if concepts is not None else prefix
-        scale = source.shape[-1] ** -0.5
-        states = {}
-        for idx, factor in enumerate(VALUE_POS):
-            scores = (source * self.factor_queries[idx]).sum(-1) * scale
-            states[factor] = (scores.softmax(-1).unsqueeze(-1) * source).sum(1)
-        return states
+        states_by_key = self.factor_concepts.states(source)
+        return {factor: states_by_key[FACTOR_KEYS[factor]] for factor in VALUE_POS}
 
     def factor_logits_from_states(self, states):
-        return {factor: self.factor_heads[factor](states[factor]) for factor in VALUE_POS}
+        states_by_key = {FACTOR_KEYS[factor]: states[factor] for factor in VALUE_POS}
+        logits_by_key = self.factor_concepts.logits_from_states(states_by_key)
+        return {factor: logits_by_key[FACTOR_KEYS[factor]] for factor in VALUE_POS}
 
     def factor_logits(self, img, aud, txt, mode="full"):
         return self.factor_logits_from_states(

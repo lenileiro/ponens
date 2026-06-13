@@ -943,6 +943,18 @@ positive. It still failed the language gate: absent/swap negatives stayed at **0
 replacement abstention stayed **0.017**, and the swapped-question gap remained negative
 (**-0.017**). This is real weight movement on web data, not mastery yet.
 
+The architecture now has a generic schema concept head in `thinking.concepts.SchemaConceptHead`.
+Instead of adding another QA-specific rule path, text records expose `(slot, predicate) -> value`
+concepts through learned key queries and learned value embeddings. `TextFactLM` trains this with
+`--fact-concept-w` and reports `fact_concept_head`; checkpoint expansion copies learned concept
+queries/value embeddings by symbolic schema identity, not by array position. The multimodal
+bridge now uses the same schema concept head for color/shape/pitch/timbre/envelope concept tokens,
+so concept transfer, agreement, and distillation operate on the same architecture as text reading.
+A concept-only SNLI check with decoder and old semantic-head losses disabled
+(`--decode-w 0 --semantic-w 0 --fact-concept-w 1`) reached sampled `fact_concept_head` **0.405**
+after 40 local MPS steps. This is not language mastery; it is the model-side insertion point for
+understanding-oriented training rather than a harness-specific QA branch.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels

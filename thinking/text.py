@@ -49,6 +49,7 @@ import torch.nn.functional as F
 from device import get_device
 from scratchpad_model import ScratchpadLM
 
+from .concepts import SchemaConceptHead
 from .trace import Vocab
 
 DEV = get_device()
@@ -1071,10 +1072,12 @@ class TextFactLM(nn.Module):
         self.fact_heads = nn.ModuleDict()
         if fact_schema is not None:
             self.fact_query = nn.Parameter(torch.randn(len(fact_schema.keys), d) * 0.02)
+            self.fact_concepts = SchemaConceptHead(fact_schema.keys, fact_schema.values, d)
             for i, vals in enumerate(fact_schema.values):
                 self.fact_heads[str(i)] = nn.Linear(d, len(vals))
         else:
             self.fact_query = None
+            self.fact_concepts = None
 
     def encode_text(self, txt):
         prefix = self.txt(txt)
@@ -1101,6 +1104,18 @@ class TextFactLM(nn.Module):
             pooled = (scores.softmax(-1).unsqueeze(-1) * prefix).sum(1)
             out[self.fact_schema.keys[idx]] = head(pooled)
         return out
+
+    def fact_concept_states(self, txt):
+        if self.fact_concepts is None:
+            return {}
+        prefix, _pooled = self.encode_text(txt)
+        return self.fact_concepts.states(prefix, mask=txt.eq(self.txt.pad))
+
+    def fact_concept_logits(self, txt):
+        if self.fact_concepts is None:
+            return {}
+        prefix, _pooled = self.encode_text(txt)
+        return self.fact_concepts(prefix, mask=txt.eq(self.txt.pad))
 
     def _choice_question(self, prefix, pooled, row, q_start, q_end):
         if q_start < q_end:
@@ -1306,7 +1321,8 @@ def copy_pretrained_text_weights(src_model, src_vocab, dst_model, dst_vocab):
     """
     src_state = src_model.state_dict()
     dst_state = dst_model.state_dict()
-    skip_prefixes = ("txt.emb.", "lm.tok.", "lm.head.", "fact_query", "fact_heads.")
+    skip_prefixes = ("txt.emb.", "lm.tok.", "lm.head.", "fact_query",
+                     "fact_heads.", "fact_concepts.")
     with torch.no_grad():
         for name, dst_val in dst_state.items():
             if name.startswith(skip_prefixes):
@@ -1339,6 +1355,25 @@ def copy_pretrained_text_weights(src_model, src_vocab, dst_model, dst_vocab):
                     dst_head.weight[dst_v].copy_(src_head.weight[src_v])
                     if src_head.bias is not None and dst_head.bias is not None:
                         dst_head.bias[dst_v].copy_(src_head.bias[src_v])
+            if (getattr(src_model, "has_fact_concept_state", False)
+                    and getattr(src_model, "fact_concepts", None) is not None
+                    and getattr(dst_model, "fact_concepts", None) is not None):
+                for src_i, key in enumerate(src_model.fact_schema.keys):
+                    dst_i = dst_keys.get(key)
+                    if dst_i is None:
+                        continue
+                    dst_model.fact_concepts.key_query[dst_i].copy_(
+                        src_model.fact_concepts.key_query[src_i])
+                    dst_vals = {val: i for i, val in enumerate(
+                        dst_model.fact_schema.values[dst_i])}
+                    for src_v, val in enumerate(src_model.fact_schema.values[src_i]):
+                        dst_v = dst_vals.get(val)
+                        if dst_v is None:
+                            continue
+                        dst_model.fact_concepts.value_embeds[dst_i][dst_v].copy_(
+                            src_model.fact_concepts.value_embeds[src_i][src_v])
+                        dst_model.fact_concepts.value_biases[dst_i][dst_v].copy_(
+                            src_model.fact_concepts.value_biases[src_i][src_v])
     return dst_model
 
 
@@ -1361,6 +1396,26 @@ def semantic_loss(model, txt, records, schema):
                 targets[i] = value_index[(key, vals[0])]
         if targets.ne(-100).any() and logits[key].shape[-1] > 1:
             losses.append(F.cross_entropy(logits[key], targets, ignore_index=-100))
+    if not losses:
+        return torch.tensor(0.0, device=txt.device)
+    return sum(losses) / len(losses)
+
+
+def fact_concept_loss(model, txt, records, schema):
+    if schema is None or getattr(model, "fact_concepts", None) is None:
+        return torch.tensor(0.0, device=txt.device)
+    logits = model.fact_concept_logits(txt)
+    value_index = schema.value_index
+    losses = []
+    for key in schema.keys:
+        targets = torch.full((len(records),), -100, dtype=torch.long, device=txt.device)
+        for i, rec in enumerate(records):
+            vals = [val for slot, pred, val in rec.facts if (slot, pred) == key]
+            if vals:
+                targets[i] = value_index[(key, vals[0])]
+        row = logits.get(key)
+        if row is not None and targets.ne(-100).any() and row.shape[-1] > 1:
+            losses.append(F.cross_entropy(row, targets, ignore_index=-100))
     if not losses:
         return torch.tensor(0.0, device=txt.device)
     return sum(losses) / len(losses)
@@ -2865,6 +2920,7 @@ def choice_answerability_pair_loss(model, txt, records, margin=0.0):
 
 def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               device=DEV, log_every=100, semantic_w=0.5, balance_by="none",
+              fact_concept_w=0.0,
               prefix="text", decode_w=1.0, choice_w=0.0,
               choice_answer_w=1.0, choice_none_w=1.0,
               choice_answer_margin=0.0, choice_none_margin=0.0,
@@ -2969,6 +3025,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
         txt, ids = pack(rec_batch, vocab, device)
         dec_loss = token_loss(model(txt, ids), ids, pad=vocab.pad)
         sem_loss = semantic_loss(model, txt, rec_batch, model.fact_schema)
+        concept_fact_loss = (fact_concept_loss(model, txt, rec_batch, model.fact_schema)
+                             if fact_concept_w else torch.tensor(0.0, device=device))
         ch_loss = choice_loss(model, txt, rec_batch,
                               answer_w=choice_answer_w, none_w=choice_none_w,
                               answer_margin=choice_answer_margin,
@@ -3288,7 +3346,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 qctx_contrast_loss = torch.tensor(0.0, device=device)
         else:
             qctx_contrast_loss = torch.tensor(0.0, device=device)
-        loss = (decode_w * dec_loss + semantic_w * sem_loss + choice_w * ch_loss
+        loss = (decode_w * dec_loss + semantic_w * sem_loss
+                + fact_concept_w * concept_fact_loss + choice_w * ch_loss
                 + choice_final_w * final_loss
                 + choice_final_control_w * final_control_loss
                 + choice_final_control_contrast_w * final_contrast_loss
@@ -3321,6 +3380,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
         if st % log_every == 0 or st == steps:
             print(f"  {prefix} {st}/{steps} loss {loss.item():.3f} "
                   f"dec {dec_loss.item():.3f} sem {sem_loss.item():.3f} "
+                  f"fact-concept {concept_fact_loss.item():.3f} "
                   f"choice {ch_loss.item():.3f} final {final_loss.item():.3f} "
                   f"final-control {final_control_loss.item():.3f} "
                   f"final-contrast {final_contrast_loss.item():.3f} "
@@ -3352,6 +3412,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
 
 def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, seed=0,
                 device=DEV, log_every=100, semantic_w=0.5, balance_by="none",
+                fact_concept_w=0.0,
                 decode_w=1.0, choice_w=0.0, choice_answer_w=1.0,
                 choice_none_w=1.0, choice_context_w=0.0,
                 choice_answer_margin=0.0, choice_none_margin=0.0,
@@ -3399,8 +3460,9 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                        fact_schema=schema).to(device)
     return fit_model(model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
                      device=device, log_every=log_every, semantic_w=semantic_w,
-                     balance_by=balance_by, prefix="text", decode_w=decode_w,
-                     choice_w=choice_w, choice_answer_w=choice_answer_w,
+                     balance_by=balance_by, fact_concept_w=fact_concept_w,
+                     prefix="text", decode_w=decode_w, choice_w=choice_w,
+                     choice_answer_w=choice_answer_w,
                      choice_none_w=choice_none_w,
                      choice_answer_margin=choice_answer_margin,
                      choice_none_margin=choice_none_margin,
@@ -3513,6 +3575,34 @@ def semantic_fact_eval(model, vocab, records, device=DEV, n=0, seed=0):
                     if key not in logits:
                         continue
                     if (key, val) not in value_index:
+                        continue
+                    pred_id = int(logits[key][r].argmax(-1))
+                    correct += int(pred_id == value_index[(key, val)])
+                    total += 1
+    eval_count = len([r for r in records if r.split == "eval"])
+    return {"fact_value_acc": correct / max(1, total), "n_facts": total,
+            "n_records": len(selected),
+            "sampled": bool(n > 0 and n < eval_count),
+            "skipped": bool(n < 0)}
+
+
+def fact_concept_eval(model, vocab, records, device=DEV, n=0, seed=0):
+    if model.fact_schema is None or getattr(model, "fact_concepts", None) is None:
+        return {"fact_value_acc": 0.0, "n_facts": 0, "n_records": 0,
+                "sampled": False, "skipped": bool(n < 0)}
+    selected = eval_records(records, n=n, seed=seed)
+    value_index = model.fact_schema.value_index
+    correct = total = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(selected), 64):
+            batch = selected[off:off + 64]
+            txt, _ids = pack(batch, vocab, device)
+            logits = model.fact_concept_logits(txt)
+            for r, rec in enumerate(batch):
+                for slot, pred, val in rec.facts:
+                    key = (slot, pred)
+                    if key not in logits or (key, val) not in value_index:
                         continue
                     pred_id = int(logits[key][r].argmax(-1))
                     correct += int(pred_id == value_index[(key, val)])
@@ -3876,6 +3966,8 @@ def bucket_fact_eval(model, vocab, records, device=DEV, n=0, seed=0):
                                       seed=seed + 2003 * i)
         semantic = semantic_fact_eval(model, vocab, rows, device=device, n=n,
                                       seed=seed + 3001 * i)
+        fact_concept = fact_concept_eval(model, vocab, rows, device=device, n=n,
+                                         seed=seed + 3001 * i)
         choice = choice_head_eval(model, vocab, rows, device=device, n=n,
                                   seed=seed + 4001 * i)
         out[name] = {"n": len(rows),
@@ -3883,6 +3975,7 @@ def bucket_fact_eval(model, vocab, records, device=DEV, n=0, seed=0):
                      "sampled": teacher["sampled"],
                      "teacher_forced_fact_value_acc": teacher["fact_value_acc"],
                      "semantic_fact_value_acc": semantic["fact_value_acc"],
+                     "fact_concept_fact_value_acc": fact_concept["fact_value_acc"],
                      "choice_head_fact_value_acc": choice["fact_value_acc"],
                      "choice_head_records": choice["n_records"]}
     return out
@@ -4493,6 +4586,8 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
                                   seed=seed + 11)
     semantic = semantic_fact_eval(model, vocab, records, device=device, n=fact_n,
                                   seed=seed + 11)
+    fact_concept = fact_concept_eval(model, vocab, records, device=device, n=fact_n,
+                                     seed=seed + 11)
     choice_head = choice_head_eval(model, vocab, records, device=device, n=fact_n,
                                    seed=seed + 11)
     free = free_eval(model, vocab, records, device=device, max_new=max_new, n=free_n,
@@ -4560,6 +4655,7 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
                  or qa_proto["prototype_margin"] >= 0.05))
     return {"teacher_forced": teacher, "free_decode": free,
             "semantic_head": semantic,
+            "fact_concept_head": fact_concept,
             "choice_head": choice_head,
             "by_kind": by_kind,
             "free_decode_by_kind": by_kind_free,
@@ -4575,6 +4671,7 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
             "qa_concept_prototype_control": qa_proto,
             "gate_thresholds": {"fact_value_acc": 0.80, "free_f1": 0.80,
                                 "semantic_fact_value_acc": 0.80,
+                                "fact_concept_fact_value_acc": 0.80,
                                 "choice_head_fact_value_acc": 0.80,
                                 "paraphrase_consistent": 0.80,
                                 "counterfactual_f1": 0.80,
@@ -4608,7 +4705,9 @@ def load_checkpoint(path, device=DEV):
                        layers=int(ckpt.get("layers", 3)),
                        heads=int(ckpt.get("heads", 4)), pad=vocab.pad,
                        fact_schema=schema).to(device)
-    model.load_state_dict(ckpt["state_dict"], strict=False)
+    state = ckpt["state_dict"]
+    model.load_state_dict(state, strict=False)
+    model.has_fact_concept_state = any(k.startswith("fact_concepts.") for k in state)
     model.eval()
     return model, vocab, ckpt
 
@@ -4648,6 +4747,9 @@ def _fact_value_scores(eval_report):
         "semantic": float(eval_report["semantic_head"]["fact_value_acc"]),
         "teacher": float(eval_report["teacher_forced"]["fact_value_acc"]),
     }
+    concept = eval_report.get("fact_concept_head") or {}
+    if concept.get("n_records", 0) and not concept.get("skipped"):
+        scores["concept"] = float(concept["fact_value_acc"])
     choice = eval_report.get("choice_head") or {}
     if choice.get("n_records", 0):
         scores["choice"] = float(choice["fact_value_acc"])
@@ -4902,6 +5004,7 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         checkpoint=None, max_new=160, semantic_w=0.5, free_n=0, paraphrase_n=0,
         counterfactual_n=0, kind_free_n=0, balance_by="none",
         fact_n=0, kind_fact_n=0, artifact_n=0, decode_w=1.0, choice_w=0.0,
+        fact_concept_w=0.0,
         choice_answer_w=1.0, choice_none_w=1.0,
         choice_answer_margin=0.0, choice_none_margin=0.0,
         choice_final_w=0.0, choice_final_control_w=0.0,
@@ -4945,7 +5048,8 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
     records = load_records(data)
     model, vocab = train_model(records, steps=steps, batch=batch, d=d, layers=layers,
                                heads=heads, seed=seed, device=device, semantic_w=semantic_w,
-                               balance_by=balance_by, decode_w=decode_w,
+                               balance_by=balance_by, fact_concept_w=fact_concept_w,
+                               decode_w=decode_w,
                                choice_w=choice_w, choice_answer_w=choice_answer_w,
                                choice_none_w=choice_none_w,
                                choice_answer_margin=choice_answer_margin,
@@ -5018,6 +5122,7 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
     report = {"experiment": "text0_semantic_extraction", "data": data, "steps": steps,
               "d": int(d), "layers": int(layers), "heads": int(heads),
               "decode_w": float(decode_w), "semantic_w": float(semantic_w),
+              "fact_concept_w": float(fact_concept_w),
               "choice_w": float(choice_w),
               "choice_answer_w": float(choice_answer_w),
               "choice_none_w": float(choice_none_w),
@@ -5121,6 +5226,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      semantic_w=0.5, free_n=0, paraphrase_n=0, counterfactual_n=0,
                      kind_free_n=0, balance_by="kind", fact_n=0, kind_fact_n=0,
                      artifact_n=0, decode_w=1.0, choice_w=0.0,
+                     fact_concept_w=0.0,
                      choice_answer_w=1.0, choice_none_w=1.0,
                      choice_answer_margin=0.0, choice_none_margin=0.0,
                      choice_final_w=0.0, choice_final_control_w=0.0,
@@ -5245,6 +5351,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "lr": float(lr),
               "decode_w": float(decode_w),
               "semantic_w": float(semantic_w),
+              "fact_concept_w": float(fact_concept_w),
               "choice_w": float(choice_w),
               "choice_answer_w": float(choice_answer_w),
               "choice_none_w": float(choice_none_w),
@@ -5580,7 +5687,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                 param.requires_grad_(False)
         fit_model(model, vocab, round_fit_records, steps=steps, batch=batch, lr=lr,
                   seed=round_seed, device=device, semantic_w=semantic_w,
-                  balance_by=balance_by, prefix=f"study-r{round_i + 1}",
+                  balance_by=balance_by, fact_concept_w=fact_concept_w,
+                  prefix=f"study-r{round_i + 1}",
                   decode_w=decode_w, choice_w=choice_w,
                   choice_answer_w=choice_answer_w, choice_none_w=choice_none_w,
                   choice_answer_margin=choice_answer_margin,
@@ -5891,6 +5999,13 @@ def selftest():
     choice_model = TextFactLM(len(choice_vocab), d=32, layers=1, heads=4,
                               pad=choice_vocab.pad, fact_schema=choice_schema).to("cpu")
     choice_txt, _choice_ids = pack(choice_eval, choice_vocab, "cpu")
+    concept_logits = choice_model.fact_concept_logits(choice_txt)
+    assert set(concept_logits) == set(choice_schema.keys)
+    assert torch.isfinite(fact_concept_loss(
+        choice_model, choice_txt, choice_eval, choice_schema))
+    concept_eval_report = fact_concept_eval(
+        choice_model, choice_vocab, choice_eval, device="cpu")
+    assert concept_eval_report["n_records"] == len(choice_eval)
     assert torch.isfinite(choice_loss(choice_model, choice_txt, choice_eval))
     assert torch.isfinite(choice_loss(choice_model, choice_txt, choice_eval,
                                       answer_margin=0.25, none_margin=0.25))
@@ -6422,6 +6537,10 @@ def main(argv=None):
                     help="balance training batches across metadata buckets")
     ap.add_argument("--semantic-w", type=float, default=0.5, dest="semantic_w",
                     help="weight for direct semantic fact classification auxiliary loss")
+    ap.add_argument("--fact-concept-w", type=float, default=0.0,
+                    dest="fact_concept_w",
+                    help=("weight for schema-generic fact/value concept embedding "
+                          "auxiliary loss"))
     ap.add_argument("--decode-w", type=float, default=1.0, dest="decode_w",
                     help="weight for canonical trace decoder loss; set 0 for semantic-only study")
     ap.add_argument("--choice-w", type=float, default=0.0, dest="choice_w",
@@ -6649,8 +6768,8 @@ def main(argv=None):
                           "that failed the initial gate"))
     ap.add_argument("--study-select-best", action="store_true",
                     help="evaluate each study round and restore the best scoring weights")
-    ap.add_argument("--study-score-metric", choices=("semantic", "teacher", "both", "min",
-                                                     "choice"),
+    ap.add_argument("--study-score-metric", choices=("semantic", "teacher", "concept",
+                                                     "both", "min", "choice"),
                     default="both",
                     help="metric used by --study-select-best")
     ap.add_argument("--study-retention-w", type=float, default=1.0,
@@ -6731,6 +6850,7 @@ def main(argv=None):
                          kind_free_n=args.kind_free_n, balance_by=args.balance_by,
                          fact_n=args.fact_n, kind_fact_n=args.kind_fact_n,
                          artifact_n=args.artifact_n, decode_w=args.decode_w,
+                         fact_concept_w=args.fact_concept_w,
                          choice_w=args.choice_w,
                          choice_answer_w=args.choice_answer_w,
                          choice_none_w=args.choice_none_w,
@@ -6845,7 +6965,8 @@ def main(argv=None):
         paraphrase_n=args.paraphrase_n, counterfactual_n=args.counterfactual_n,
         kind_free_n=args.kind_free_n, balance_by=args.balance_by,
         fact_n=args.fact_n, kind_fact_n=args.kind_fact_n, artifact_n=args.artifact_n,
-        decode_w=args.decode_w, choice_w=args.choice_w,
+        decode_w=args.decode_w, fact_concept_w=args.fact_concept_w,
+        choice_w=args.choice_w,
         choice_answer_w=args.choice_answer_w, choice_none_w=args.choice_none_w,
         choice_answer_margin=args.choice_answer_margin,
         choice_none_margin=args.choice_none_margin,
