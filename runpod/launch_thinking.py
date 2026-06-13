@@ -43,6 +43,22 @@ def sh(cmd):
     return subprocess.run(cmd, shell=True).returncode
 
 
+def parse_nonnegative_float_csv(raw, name):
+    vals = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            val = float(part)
+        except ValueError:
+            raise ValueError(f"{name} must be comma-separated numbers")
+        if val < 0.0:
+            raise ValueError(f"{name} must be non-negative")
+        vals.append(val)
+    return vals or [0.0]
+
+
 def local_path_for_arg(path):
     if not path:
         return ""
@@ -321,7 +337,13 @@ def payload(args):
                                  f"{shlex_quote(effective_image_manifest)} "
                                  f"--eval-image-root {shlex_quote(args.image_root)} "
                                  f"--eval-image-split {shlex_quote(args.image_eval_split)} "
-                                 f"--eval-image-max-records {args.image_eval_max_records}")
+                                 f"--eval-image-max-records {args.image_eval_max_records} "
+                                 f"--eval-text-guidance-weights "
+                                 f"{shlex_quote(args.image_eval_text_guidance_sweep)} "
+                                 f"--eval-feature-guidance-weights "
+                                 f"{shlex_quote(args.image_eval_feature_guidance_sweep)} "
+                                 f"--eval-quality-guidance-weights "
+                                 f"{shlex_quote(args.image_eval_quality_guidance_sweep)}")
                     if args.image_min_aesthetic is not None:
                         eval_cmd += (
                             f" --eval-image-min-aesthetic {args.image_min_aesthetic}"
@@ -871,6 +893,15 @@ def main():
     ap.add_argument("--image-semantic-guidance-sweep", default="0.0,1.0,2.0",
                     dest="image_semantic_guidance_sweep",
                     help="comma-separated semantic guidance weights for latent image sweeps")
+    ap.add_argument("--image-eval-text-guidance-sweep", default="0.0",
+                    dest="image_eval_text_guidance_sweep",
+                    help="comma-separated text guidance weights for manifest image eval sweeps")
+    ap.add_argument("--image-eval-feature-guidance-sweep", default="0.0",
+                    dest="image_eval_feature_guidance_sweep",
+                    help="comma-separated feature guidance weights for manifest image eval sweeps")
+    ap.add_argument("--image-eval-quality-guidance-sweep", default="0.0",
+                    dest="image_eval_quality_guidance_sweep",
+                    help="comma-separated quality guidance weights for manifest image eval sweeps")
     ap.add_argument("--image-semantic-guidance-mode", default="decoded",
                     choices=("latent", "decoded"), dest="image_semantic_guidance_mode",
                     help="latent image semantic guidance mode")
@@ -1045,6 +1076,21 @@ def main():
                 raise ValueError(raw)
     except ValueError:
         sys.exit("ERROR: --image-cfg-rescale-sweep values must be in [0, 1]")
+    try:
+        parse_nonnegative_float_csv(
+            args.image_eval_text_guidance_sweep,
+            "--image-eval-text-guidance-sweep",
+        )
+        parse_nonnegative_float_csv(
+            args.image_eval_feature_guidance_sweep,
+            "--image-eval-feature-guidance-sweep",
+        )
+        parse_nonnegative_float_csv(
+            args.image_eval_quality_guidance_sweep,
+            "--image-eval-quality-guidance-sweep",
+        )
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
     valid_sample_schedules = {"linear", "quadratic", "sqrt", "cosine"}
     bad_sample_schedules = sorted(
         {raw.strip() for raw in str(args.image_sample_schedules).split(",") if raw.strip()}

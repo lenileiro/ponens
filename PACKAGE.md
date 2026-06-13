@@ -1397,6 +1397,15 @@ that external text/image feature target using the checkpoint's `image_feature_al
 CLIP/SigLIP-style sidecars into both a training/eval signal and an inference-time guidance signal,
 without adding caption- or domain-specific rules.
 
+Image-72 makes manifest checkpoint eval tune the same inference guidance path instead of relying on
+one-off prompt grids. `thinking.image_latent --eval-checkpoint ... --eval-image-manifest ...` now
+accepts `--eval-text-guidance-weights`, `--eval-feature-guidance-weights`, and
+`--eval-quality-guidance-weights`; aggregate rows and best-selection keys include those axes.
+RunPod exposes the same knobs as `--image-eval-text-guidance-sweep`,
+`--image-eval-feature-guidance-sweep`, and `--image-eval-quality-guidance-sweep`, with launcher-side
+validation. This gives real-image runs a generic way to measure whether text, external-feature, or
+quality guidance improves sample metrics before scaling the setting on GPU.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered

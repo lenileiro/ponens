@@ -4229,7 +4229,13 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                            image_quality_scorer=None,
                            caption_cond_source="tokens", sample_time_shift=1.0,
                            sample_schedule="linear",
-                           time_shift=1.0):
+                           time_shift=1.0,
+                           text_guidance_w=0.0,
+                           text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                           feature_guidance_w=0.0,
+                           feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                           quality_guidance_w=0.0,
+                           quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     rng = np.random.default_rng(seed)
     ae.eval()
     flow.eval()
@@ -4241,6 +4247,30 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
     ext_pair_cos, ext_pair_i2t, ext_pair_t2i = [], [], []
     quality_scores = []
     score_external_text_image = can_score_external_text_image(records, image_feature_aligner)
+    text_guidance_interval = validate_guidance_interval(
+        text_guidance_interval, name="text_guidance_interval")
+    feature_guidance_interval = validate_guidance_interval(
+        feature_guidance_interval, name="feature_guidance_interval")
+    quality_guidance_interval = validate_guidance_interval(
+        quality_guidance_interval, name="quality_guidance_interval")
+    if text_guidance_w < 0.0:
+        raise ValueError("text_guidance_w must be non-negative")
+    if text_guidance_w > 0.0 and text_aligner is None:
+        raise ValueError("manifest text guidance requires a checkpoint text_aligner")
+    if feature_guidance_w < 0.0:
+        raise ValueError("feature_guidance_w must be non-negative")
+    if feature_guidance_w > 0.0:
+        if image_feature_aligner is None:
+            raise ValueError("manifest feature guidance requires a checkpoint image_feature_aligner")
+        if not score_external_text_image:
+            raise ValueError(
+                "manifest feature guidance requires text embeddings in the same dimension as "
+                "image embeddings"
+            )
+    if quality_guidance_w < 0.0:
+        raise ValueError("quality_guidance_w must be non-negative")
+    if quality_guidance_w > 0.0 and image_quality_scorer is None:
+        raise ValueError("manifest quality guidance requires a checkpoint image_quality_scorer")
     total = 0
     while total < n:
         b = min(batch, n - total)
@@ -4298,13 +4328,28 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
     sample_cond = caption_record_condition(
         sample_captions, sample_records, conditioner, prompt_vocab, source=caption_cond_source,
         max_len=caption_max_len, device=device, return_tokens=flow_uses_cond_tokens(flow))
+    sample_text_features = (
+        record_text_embedding_tensor(sample_records, device=device)
+        if feature_guidance_w > 0.0 else None
+    )
     sample = sample_images(ae, flow, sample_cond,
                            latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            cfg_rescale=cfg_rescale,
                            sample_method=sample_method, cfg_interval=cfg_interval,
                            sample_time_shift=sample_time_shift,
-                           sample_schedule=sample_schedule)
+                           sample_schedule=sample_schedule,
+                           text_guidance_w=text_guidance_w,
+                           text_guidance_aligner=text_aligner,
+                           text_guidance_cond=sample_cond,
+                           text_guidance_interval=text_guidance_interval,
+                           feature_guidance_w=feature_guidance_w,
+                           feature_guidance_aligner=image_feature_aligner,
+                           feature_guidance_features=sample_text_features,
+                           feature_guidance_interval=feature_guidance_interval,
+                           quality_guidance_w=quality_guidance_w,
+                           quality_guidance_scorer=image_quality_scorer,
+                           quality_guidance_interval=quality_guidance_interval)
     report = {
         "n": int(total),
         "recon_mse": float(np.mean(recon_losses)),
@@ -4325,6 +4370,12 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         "time_shift": float(time_shift),
         "sample_method": sample_method,
         "sample_schedule": sample_schedule,
+        "text_guidance_w": float(text_guidance_w),
+        "text_guidance_interval": list(text_guidance_interval),
+        "feature_guidance_w": float(feature_guidance_w),
+        "feature_guidance_interval": list(feature_guidance_interval),
+        "quality_guidance_w": float(quality_guidance_w),
+        "quality_guidance_interval": list(quality_guidance_interval),
         "cond_mode": "text",
         "caption_cond_source": caption_cond_source,
         "data_mode": "image_manifest",
@@ -4763,40 +4814,70 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                        text_aligner=None, image_feature_aligner=None,
                        image_quality_scorer=None,
                        caption_cond_source="tokens", sample_time_shift=1.0,
-                       time_shift=1.0):
+                       time_shift=1.0,
+                       text_guidance_weights=(0.0,),
+                       text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                       feature_guidance_weights=(0.0,),
+                       feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                       quality_guidance_weights=(0.0,),
+                       quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     if sample_methods is None:
         sample_methods = (sample_method,)
     if sample_schedules is None:
         sample_schedules = (sample_schedule,)
     cfg_rescales = tuple(float(x) for x in cfg_rescales)
+    text_guidance_weights = tuple(float(x) for x in (text_guidance_weights or (0.0,)))
+    feature_guidance_weights = tuple(float(x) for x in (feature_guidance_weights or (0.0,)))
+    quality_guidance_weights = tuple(float(x) for x in (quality_guidance_weights or (0.0,)))
     rows = []
     for cfg_scale in cfg_scales:
         for cfg_rescale in cfg_rescales:
             for sample_steps in sample_steps_list:
                 for method in sample_methods:
                     for schedule in sample_schedules:
-                        row = evaluate_image_records(
-                            ae, flow, records, n=n, batch=batch, seed=seed, size=size,
-                            device=device, conditioner=conditioner, prompt_vocab=prompt_vocab,
-                            caption_max_len=caption_max_len, cfg_scale=float(cfg_scale),
-                            cfg_rescale=float(cfg_rescale),
-                            sample_steps=int(sample_steps), sample_method=method,
-                            sample_schedule=schedule,
-                            cfg_interval=cfg_interval, text_aligner=text_aligner,
-                            image_feature_aligner=image_feature_aligner,
-                            image_quality_scorer=image_quality_scorer,
-                            caption_cond_source=caption_cond_source,
-                            sample_time_shift=sample_time_shift, time_shift=time_shift)
-                        row["semantic_guidance_w"] = 0.0
-                        row["semantic_guidance_mode"] = "none"
-                        row["semantic_guidance_interval"] = list(DEFAULT_GUIDANCE_INTERVAL)
-                        row["sweep_key"] = (
-                            f"cfg={float(cfg_scale):g};rescale={float(cfg_rescale):g};"
-                            f"steps={int(sample_steps)};method={method};"
-                            f"schedule={schedule};shift={float(sample_time_shift):g};"
-                            f"cfgint={format_interval(cfg_interval)}"
-                        )
-                        rows.append(row)
+                        for text_w in text_guidance_weights:
+                            for feature_w in feature_guidance_weights:
+                                for quality_w in quality_guidance_weights:
+                                    row = evaluate_image_records(
+                                        ae, flow, records, n=n, batch=batch, seed=seed,
+                                        size=size, device=device, conditioner=conditioner,
+                                        prompt_vocab=prompt_vocab,
+                                        caption_max_len=caption_max_len,
+                                        cfg_scale=float(cfg_scale),
+                                        cfg_rescale=float(cfg_rescale),
+                                        sample_steps=int(sample_steps), sample_method=method,
+                                        sample_schedule=schedule,
+                                        cfg_interval=cfg_interval, text_aligner=text_aligner,
+                                        image_feature_aligner=image_feature_aligner,
+                                        image_quality_scorer=image_quality_scorer,
+                                        caption_cond_source=caption_cond_source,
+                                        sample_time_shift=sample_time_shift,
+                                        time_shift=time_shift,
+                                        text_guidance_w=float(text_w),
+                                        text_guidance_interval=text_guidance_interval,
+                                        feature_guidance_w=float(feature_w),
+                                        feature_guidance_interval=feature_guidance_interval,
+                                        quality_guidance_w=float(quality_w),
+                                        quality_guidance_interval=quality_guidance_interval)
+                                    row["semantic_guidance_w"] = 0.0
+                                    row["semantic_guidance_mode"] = "none"
+                                    row["semantic_guidance_interval"] = list(
+                                        DEFAULT_GUIDANCE_INTERVAL)
+                                    row["sweep_key"] = (
+                                        f"cfg={float(cfg_scale):g};"
+                                        f"rescale={float(cfg_rescale):g};"
+                                        f"steps={int(sample_steps)};method={method};"
+                                        f"schedule={schedule};"
+                                        f"shift={float(sample_time_shift):g};"
+                                        f"text={float(text_w):g};"
+                                        f"feature={float(feature_w):g};"
+                                        f"quality={float(quality_w):g};"
+                                        f"cfgint={format_interval(cfg_interval)};"
+                                        f"textint={format_interval(text_guidance_interval)};"
+                                        f"featureint={format_interval(feature_guidance_interval)};"
+                                        f"qualityint={format_interval(quality_guidance_interval)}"
+                                    )
+                                    rows.append(row)
     return rows
 
 
@@ -4897,6 +4978,12 @@ def eval_report_summary(report):
         "semantic_guidance_w",
         "semantic_guidance_mode",
         "semantic_guidance_interval",
+        "text_guidance_w",
+        "text_guidance_interval",
+        "feature_guidance_w",
+        "feature_guidance_interval",
+        "quality_guidance_w",
+        "quality_guidance_interval",
         "sample_roundtrip_n",
         "sample_roundtrip_color_acc",
         "sample_roundtrip_shape_acc",
@@ -4947,22 +5034,39 @@ def aggregate_sweep_rows(rows):
                str(row.get("semantic_guidance_mode", "decoded")),
                tuple(float(x) for x in row.get("cfg_interval", DEFAULT_GUIDANCE_INTERVAL)),
                tuple(float(x) for x in row.get("semantic_guidance_interval",
+                                                DEFAULT_GUIDANCE_INTERVAL)),
+               float(row.get("text_guidance_w", 0.0)),
+               tuple(float(x) for x in row.get("text_guidance_interval",
+                                                DEFAULT_GUIDANCE_INTERVAL)),
+               float(row.get("feature_guidance_w", 0.0)),
+               tuple(float(x) for x in row.get("feature_guidance_interval",
+                                                DEFAULT_GUIDANCE_INTERVAL)),
+               float(row.get("quality_guidance_w", 0.0)),
+               tuple(float(x) for x in row.get("quality_guidance_interval",
                                                 DEFAULT_GUIDANCE_INTERVAL)))
         grouped.setdefault(key, []).append(row)
     out = []
     for (cfg_scale, sample_steps, sample_method, sample_schedule, sample_time_shift,
          cfg_rescale,
          semantic_guidance_w,
-         semantic_guidance_mode, cfg_interval, semantic_guidance_interval), group in sorted(
-             grouped.items()):
+         semantic_guidance_mode, cfg_interval, semantic_guidance_interval,
+         text_guidance_w, text_guidance_interval,
+         feature_guidance_w, feature_guidance_interval,
+         quality_guidance_w, quality_guidance_interval), group in sorted(grouped.items()):
         agg = {
             "sweep_key": (
                 f"cfg={cfg_scale:g};steps={sample_steps};method={sample_method};"
                 f"schedule={sample_schedule};shift={sample_time_shift:g};"
                 f"rescale={cfg_rescale:g};"
                 f"sem={semantic_guidance_w:g};"
+                f"text={text_guidance_w:g};"
+                f"feature={feature_guidance_w:g};"
+                f"quality={quality_guidance_w:g};"
                 f"cfgint={format_interval(cfg_interval)};"
-                f"semint={format_interval(semantic_guidance_interval)}"
+                f"semint={format_interval(semantic_guidance_interval)};"
+                f"textint={format_interval(text_guidance_interval)};"
+                f"featureint={format_interval(feature_guidance_interval)};"
+                f"qualityint={format_interval(quality_guidance_interval)}"
             ),
             "cfg_scale": float(cfg_scale),
             "cfg_rescale": float(cfg_rescale),
@@ -4974,6 +5078,12 @@ def aggregate_sweep_rows(rows):
             "semantic_guidance_w": float(semantic_guidance_w),
             "semantic_guidance_mode": semantic_guidance_mode,
             "semantic_guidance_interval": list(semantic_guidance_interval),
+            "text_guidance_w": float(text_guidance_w),
+            "text_guidance_interval": list(text_guidance_interval),
+            "feature_guidance_w": float(feature_guidance_w),
+            "feature_guidance_interval": list(feature_guidance_interval),
+            "quality_guidance_w": float(quality_guidance_w),
+            "quality_guidance_interval": list(quality_guidance_interval),
             "runs": len(group),
             "eval_seeds": [int(r["eval_seed"]) for r in group if "eval_seed" in r],
         }
@@ -5000,6 +5110,12 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         cfg_rescales=(0.0,),
                         cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                         semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                        text_guidance_weights=(0.0,),
+                        text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                        feature_guidance_weights=(0.0,),
+                        feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                        quality_guidance_weights=(0.0,),
+                        quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                         eval_image_manifest="", eval_image_root="", eval_image_split="eval",
                         eval_image_min_aesthetic=None, eval_image_max_records=0,
                         sample_time_shift=None):
@@ -5008,6 +5124,15 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
     if weight_mode not in EVAL_WEIGHT_MODES:
         raise ValueError(f"unknown checkpoint weight mode {weight_mode!r}")
     eval_seeds = tuple(eval_seeds) if eval_seeds is not None else (seed,)
+    text_guidance_weights = tuple(float(x) for x in (text_guidance_weights or (0.0,)))
+    feature_guidance_weights = tuple(float(x) for x in (feature_guidance_weights or (0.0,)))
+    quality_guidance_weights = tuple(float(x) for x in (quality_guidance_weights or (0.0,)))
+    if any(w < 0.0 for w in text_guidance_weights):
+        raise ValueError("text guidance weights must be non-negative")
+    if any(w < 0.0 for w in feature_guidance_weights):
+        raise ValueError("feature guidance weights must be non-negative")
+    if any(w < 0.0 for w in quality_guidance_weights):
+        raise ValueError("quality guidance weights must be non-negative")
 
     def run_mode(mode):
         ae, flow, conditioner, prompt_vocab, prompt_templates, meta = load_checkpoint(
@@ -5062,7 +5187,13 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         image_quality_scorer=getattr(flow, "image_quality_scorer", None),
                         caption_cond_source=meta["caption_cond_source"],
                         sample_time_shift=actual_sample_time_shift,
-                        time_shift=train_time_shift):
+                        time_shift=train_time_shift,
+                        text_guidance_weights=text_guidance_weights,
+                        text_guidance_interval=text_guidance_interval,
+                        feature_guidance_weights=feature_guidance_weights,
+                        feature_guidance_interval=feature_guidance_interval,
+                        quality_guidance_weights=quality_guidance_weights,
+                        quality_guidance_interval=quality_guidance_interval):
                     row["eval_seed"] = int(eval_seed)
                     row["checkpoint_weight_mode"] = actual_mode
                     rows.append(row)
@@ -5090,6 +5221,15 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                 "semantic_guidance_weights": [0.0],
                 "semantic_guidance_mode": "none",
                 "semantic_guidance_interval": list(DEFAULT_GUIDANCE_INTERVAL),
+                "text_guidance_weights": [float(x) for x in text_guidance_weights],
+                "text_guidance_interval": list(validate_guidance_interval(
+                    text_guidance_interval, name="text_guidance_interval")),
+                "feature_guidance_weights": [float(x) for x in feature_guidance_weights],
+                "feature_guidance_interval": list(validate_guidance_interval(
+                    feature_guidance_interval, name="feature_guidance_interval")),
+                "quality_guidance_weights": [float(x) for x in quality_guidance_weights],
+                "quality_guidance_interval": list(validate_guidance_interval(
+                    quality_guidance_interval, name="quality_guidance_interval")),
                 "eval_seeds": [int(s) for s in eval_seeds],
                 "eval_image_manifest": manifest_path,
                 "eval_image_root": image_root,
@@ -6681,13 +6821,26 @@ def selftest():
             ckpt, cfg_scales=(1.0,), sample_steps_list=(1,), n=2, batch=2,
             seed=11, eval_seeds=(11,), size=32, device="cpu",
             eval_image_manifest=manifest, eval_image_root=img_dir,
-            eval_image_split="eval")
+            eval_image_split="eval",
+            text_guidance_weights=(0.0, 0.01),
+            feature_guidance_weights=(0.0, 0.01),
+            quality_guidance_weights=(0.0, 0.01))
         assert eval6["experiment"] == "image_latent_manifest_sampler_sweep"
         assert eval6["best"]["caption_sample_mse_mean"] >= 0.0
         assert eval6["text_aligner"] is True
         assert eval6["image_feature_aligner"] is True
         assert eval6["image_quality_scorer"] is True
         assert eval6["flow_repa_aligner"] is True
+        assert eval6["text_guidance_weights"] == [0.0, 0.01]
+        assert eval6["feature_guidance_weights"] == [0.0, 0.01]
+        assert eval6["quality_guidance_weights"] == [0.0, 0.01]
+        assert len(eval6["aggregate"]) == 8
+        assert "text_guidance_w" in eval6["best"]
+        assert "feature_guidance_w" in eval6["best"]
+        assert "quality_guidance_w" in eval6["best"]
+        assert any(row["text_guidance_w"] > 0.0 for row in eval6["rows"])
+        assert any(row["feature_guidance_w"] > 0.0 for row in eval6["rows"])
+        assert any(row["quality_guidance_w"] > 0.0 for row in eval6["rows"])
         assert "generated_caption_retrieval_i2t_acc_mean" in eval6["best"]
         assert "generated_image_feature_retrieval_i2f_acc_mean" in eval6["best"]
         assert "generated_external_text_image_score_cos_mean" in eval6["best"]
@@ -6840,6 +6993,18 @@ def main(argv=None):
     ap.add_argument("--semantic-guidance-weights", default="",
                     dest="semantic_guidance_weights",
                     help="comma-separated semantic guidance weights for --eval-checkpoint sweeps")
+    ap.add_argument("--eval-text-guidance-weights", default="",
+                    dest="eval_text_guidance_weights",
+                    help=("comma-separated text-aligner guidance weights for manifest "
+                          "--eval-checkpoint sweeps"))
+    ap.add_argument("--eval-feature-guidance-weights", default="",
+                    dest="eval_feature_guidance_weights",
+                    help=("comma-separated external-feature guidance weights for manifest "
+                          "--eval-checkpoint sweeps"))
+    ap.add_argument("--eval-quality-guidance-weights", default="",
+                    dest="eval_quality_guidance_weights",
+                    help=("comma-separated quality guidance weights for manifest "
+                          "--eval-checkpoint sweeps"))
     ap.add_argument("--semantic-guidance-mode", default="decoded",
                     choices=("latent", "decoded"), dest="semantic_guidance_mode",
                     help="guide sampled latents using direct latent heads or decode/re-read heads")
@@ -7036,6 +7201,18 @@ def main(argv=None):
         cli_size_buckets = normalize_image_size_buckets(args.size_buckets)
         sample_prompts = parse_sample_prompts(args.sample_prompts)
         sample_negative_prompts = parse_sample_prompts(args.sample_negative_prompts)
+        eval_text_guidance_weights = (
+            _parse_number_list(args.eval_text_guidance_weights, float)
+            if args.eval_text_guidance_weights else (0.0,)
+        )
+        eval_feature_guidance_weights = (
+            _parse_number_list(args.eval_feature_guidance_weights, float)
+            if args.eval_feature_guidance_weights else (0.0,)
+        )
+        eval_quality_guidance_weights = (
+            _parse_number_list(args.eval_quality_guidance_weights, float)
+            if args.eval_quality_guidance_weights else (0.0,)
+        )
         sample_text_guidance_interval = _parse_interval(args.sample_text_guidance_interval)
         sample_feature_guidance_interval = _parse_interval(
             args.sample_feature_guidance_interval)
@@ -7061,6 +7238,12 @@ def main(argv=None):
         ap.error("--sample-text-guidance-w must be non-negative")
     if args.sample_text_guidance_w > 0.0 and not sample_prompts:
         ap.error("--sample-text-guidance-w requires --sample-prompts")
+    if any(w < 0.0 for w in eval_text_guidance_weights):
+        ap.error("--eval-text-guidance-weights must be non-negative")
+    if any(w < 0.0 for w in eval_feature_guidance_weights):
+        ap.error("--eval-feature-guidance-weights must be non-negative")
+    if any(w < 0.0 for w in eval_quality_guidance_weights):
+        ap.error("--eval-quality-guidance-weights must be non-negative")
     if args.sample_feature_guidance_w < 0.0:
         ap.error("--sample-feature-guidance-w must be non-negative")
     if args.sample_feature_guidance_w > 0.0 and not sample_prompts:
@@ -7102,6 +7285,9 @@ def main(argv=None):
             sample_schedules=sample_schedules,
             cfg_interval=cfg_interval,
             semantic_guidance_interval=semantic_guidance_interval,
+            text_guidance_weights=eval_text_guidance_weights,
+            feature_guidance_weights=eval_feature_guidance_weights,
+            quality_guidance_weights=eval_quality_guidance_weights,
             eval_image_manifest=args.eval_image_manifest,
             eval_image_root=args.eval_image_root,
             eval_image_split=args.eval_image_split,
