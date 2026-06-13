@@ -887,7 +887,7 @@ python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --cfg-rescale 0.7 \
     --sample-steps 8 --flow-semantic-w 0.25 --time-sampling logit-normal \
     --flow-ema-decay 0.999 --ae-intervention-w 0.1 --ae-factor-orth-w 0.05 \
-    --semantic-guidance-w 2.0 \
+    --semantic-guidance-w 2.0 --sample-churn 0.05 --sample-churn-interval 0.0,0.8 \
     --out runs/image_latent_mmdit_text.pt
 python -m thinking.image_embed --manifest data/images/train.jsonl \
     --root data/images --backend hf --model google/siglip-base-patch16-224 \
@@ -916,7 +916,8 @@ python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
 python -m thinking.image_latent --eval-checkpoint runs/image_manifest_mmdit.pt \
     --eval-image-manifest data/images/train_clean.jsonl --eval-image-root data/images \
     --eval-image-split eval --size 64 --cfg-scales 1.0,1.25,1.5,2.0 \
-    --cfg-rescales 0.0,0.7 --sample-steps-list 4,8,16 --eval-seeds 1,2,3 \
+    --cfg-rescales 0.0,0.7 --sample-steps-list 4,8,16 --sample-churns 0.0,0.05 \
+    --eval-seeds 1,2,3 \
     --sample-grid-out runs/image_manifest_eval_grid.ppm \
     --eval-out runs/image_manifest_mmdit_sweep.json
 python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
@@ -941,6 +942,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-cfg-interval 0.0,0.8 --image-semantic-guidance-interval 0.0,0.75 \
     --image-ae-intervention-w 0.1 --image-ae-factor-orth-w 0.05 \
     --image-semantic-guidance-w 2.0 --image-semantic-guidance-sweep 0.0,1.0,2.0 \
+    --image-sample-churn 0.05 --image-sample-churns 0.0,0.05 \
     --image-sample-methods euler,heun --image-cfg-rescale-sweep 0.0,0.7 \
     --image-sample-grid \
     --image-eval-sweep --fast --go
@@ -1110,12 +1112,12 @@ adapter is zero-initialized, so it starts as the previous MM-DiT block and learn
 conditioning without destabilizing checkpoint-smoke training.
 
 Image-13 adds AdaLN-style residual gates to the adaptive MM-DiT branches. Attention and feed-forward
-updates in both streams now have condition-dependent gates, and old MM-DiT checkpoints without gate
-weights are tolerated by the loader with zero-initialized identity-centered gates.
+updates in both streams now have condition-dependent gates. The flow loader is strict about MM-DiT
+gate weights so checkpoint state matches the active architecture exactly.
 
 Image-14 adds EMA checkpointing/evaluation for the latent flow and learned text conditioner. Train
 reports can evaluate the averaged weights, checkpoints save both raw and EMA states, and
-`--eval-checkpoint` prefers EMA when available while keeping `--no-ema-checkpoint` for raw-weight
+`--eval-checkpoint` prefers EMA when available. Use `--checkpoint-weight-mode raw` for raw-weight
 comparisons.
 
 Image-15 fixes the short-run EMA failure found on the first MMDiT text GPU smoke: a target decay of
@@ -1188,24 +1190,24 @@ image-generation work: the fact heads can say shape is correct, but the artifact
 failures visible.
 
 Image-25 adds a lightweight wide DiT velocity head (`--dit-head-width-mult`; RunPod:
-`--image-dit-head-width-mult`) for DiT, Cross-DiT, and MM-DiT flows. The default remains the
-old linear head for checkpoint compatibility; setting the multiplier above 1 gives the transformer
-a wider projection head for semantically rich latents. This follows the RAE/REPA direction: improve
-the model's capacity to operate in representation space without adding renderer-specific rules.
+`--image-dit-head-width-mult`) for DiT, Cross-DiT, and MM-DiT flows. The default is the compact
+linear head; setting the multiplier above 1 gives the transformer a wider projection head for
+semantically rich latents. This follows the RAE/REPA direction: improve the model's capacity to
+operate in representation space without adding renderer-specific rules.
 
 Image-26 adds checkpointed latent normalization (`--latent-normalize none|global|channel|auto`;
 RunPod: `--image-latent-normalize`). The flow can now train and sample in normalized AE latent
 coordinates while semantic losses, guidance, decoding, and visual grids still operate in raw AE
 latent space. This is a generic scale fix for semantically rich/high-dimensional latents: it
-stabilizes coordinate scale without hard-coding visual factors or renderer rules, and old
-checkpoints default to `none`. The current default is `auto`, which preserves `none` for synthetic
-factor runs and resolves to channel statistics for real-image/external-VAE runs.
+stabilizes coordinate scale without hard-coding visual factors or renderer rules. The default is
+`auto`, which preserves `none` for synthetic factor runs and resolves to channel statistics for
+real-image/external-VAE runs.
 
 Image-27 adds guidance intervals (`--cfg-interval`, `--semantic-guidance-interval`; RunPod:
 `--image-cfg-interval`, `--image-semantic-guidance-interval`). CFG and semantic AE guidance can
-now be active over selected rectified-flow time ranges while defaults preserve old always-on
-behavior. This follows the REPA/guidance-interval direction: guidance becomes a measured sampler
-schedule rather than a hard-coded every-step push, and it stays generic over conditions.
+now be active over selected rectified-flow time ranges. This follows the REPA/guidance-interval
+direction: guidance becomes a measured sampler schedule rather than a hard-coded every-step push,
+and it stays generic over conditions.
 
 Image-28 adds an optional endpoint-consistency regularizer (`--flow-consistency-w`; RunPod:
 `--image-flow-consistency-w`) and eval metrics (`latent_endpoint_mse`,
@@ -1446,7 +1448,7 @@ sample methods. The midpoint solver adds a second-order Runge-Kutta trajectory c
 Euler on less-straight flows without changing training; RK4 is a higher-NFE diagnostic for finding
 whether sample quality is integration-limited. RunPod now accepts `--image-sample-method midpoint`
 or `rk4`, and its default sweep compares `euler,heun,midpoint` while leaving Euler as the single-run
-default for compatibility.
+default.
 
 Image-62 makes timestep placement a first-class sampler axis. `thinking.image_latent` now accepts
 `--sample-schedule linear|quadratic|sqrt|cosine` and checkpoint sweeps can pass
@@ -1577,17 +1579,22 @@ uniform samples afterward. Reports/checkpoints record the requested fraction, sw
 sampling mode, and last active training mode; RunPod exposes the same lever as
 `--image-time-curriculum-frac`. Default `0` preserves the static timestep sampler.
 
-Image-79 fixes the MM-DiT residual-gate semantics for new runs. The original gate projection was
-zero-initialized but applied as `1 + gate`, so blocks did not start as identity. MM-DiT now always
-uses the AdaLN-zero-style branch multiplier directly; there is no alternate residual-gate mode in
-the CLI or RunPod wrapper. Reports/checkpoints record `dit_residual_gate="zero"` and
-`zero_residual_gating` as fixed architecture metadata.
+Image-79 makes MM-DiT branch gates strict architecture state. The adaptive branches use the
+AdaLN-zero-style multiplier directly, reports/checkpoints record `zero_residual_gating`, and the
+flow loader requires gate weights to match the active architecture.
 
 Image-80 adds opt-in activation checkpointing for latent DiT/CrossDiT/MM-DiT flow blocks.
 `thinking.image_latent --flow-checkpoint-blocks` recomputes transformer blocks during backward to
 reduce activation memory for deeper or higher-resolution image runs. The state dict is unchanged;
 reports and checkpoints record `flow_checkpoint_blocks` and `activation_checkpointing`, and RunPod
 exposes the same training knob as `--image-flow-checkpoint-blocks`.
+
+Image-81 adds opt-in stochastic sampler churn for latent rectified-flow generation.
+`thinking.image_latent --sample-churn 0.05 --sample-churn-interval 0.0,0.8` injects
+deterministic per-step latent noise during the selected flow-time interval, while the default
+`--sample-churn 0` keeps deterministic ODE sampling. Checkpoint sweeps can pass
+`--sample-churns ...`; reports, aggregate keys, sample grids, checkpoints, and RunPod expose the
+same fields so deterministic and stochastic candidate settings are directly comparable.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

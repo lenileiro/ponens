@@ -59,6 +59,19 @@ def parse_nonnegative_float_csv(raw, name):
     return vals or [0.0]
 
 
+def parse_unit_interval(raw, name):
+    parts = [part.strip() for part in str(raw).split(",") if part.strip()]
+    if len(parts) != 2:
+        raise ValueError(f"{name} must be formatted start,end")
+    try:
+        start, end = (float(parts[0]), float(parts[1]))
+    except ValueError:
+        raise ValueError(f"{name} must contain numbers")
+    if start < 0.0 or end > 1.0 or start > end:
+        raise ValueError(f"{name} must satisfy 0 <= start <= end <= 1")
+    return start, end
+
+
 def parse_source_weight_csv(raw, name):
     text = str(raw or "").strip()
     if not text:
@@ -300,6 +313,9 @@ def payload(args):
                      f"--sample-steps {args.image_sample_steps} "
                      f"--sample-method {args.image_sample_method} "
                      f"--sample-schedule {args.image_sample_schedule} "
+                     f"--sample-churn {args.image_sample_churn} "
+                     f"--sample-churn-interval "
+                     f"{shlex_quote(args.image_sample_churn_interval)} "
                      f"--semantic-guidance-w {args.image_semantic_guidance_w} "
                      f"--semantic-guidance-mode {args.image_semantic_guidance_mode} "
                      f"--semantic-guidance-interval "
@@ -361,6 +377,10 @@ def payload(args):
                           f"--sample-methods {shlex_quote(args.image_sample_methods)} "
                           f"--sample-schedule {args.image_sample_schedule} "
                           f"--sample-schedules {shlex_quote(args.image_sample_schedules)} "
+                          f"--sample-churn {args.image_sample_churn} "
+                          f"--sample-churns {shlex_quote(args.image_sample_churns)} "
+                          f"--sample-churn-interval "
+                          f"{shlex_quote(args.image_sample_churn_interval)} "
                           f"--eval-seeds {shlex_quote(args.image_eval_seeds)} "
                           f"--eval-out runs/image_latent_{args.image_latent_arch}"
                           f"{cond_suffix}_sweep.json")
@@ -902,6 +922,15 @@ def main():
     ap.add_argument("--image-sample-schedules", default="linear",
                     dest="image_sample_schedules",
                     help="comma-separated latent image timestep schedules for sweeps")
+    ap.add_argument("--image-sample-churn", type=float, default=0.0,
+                    dest="image_sample_churn",
+                    help="stochastic latent sampler churn; 0 keeps deterministic ODE sampling")
+    ap.add_argument("--image-sample-churns", default="0.0",
+                    dest="image_sample_churns",
+                    help="comma-separated stochastic sampler churn values for sweeps")
+    ap.add_argument("--image-sample-churn-interval", default="0.0,0.8",
+                    dest="image_sample_churn_interval",
+                    help="latent sampler churn active interval formatted start,end")
     ap.add_argument("--image-sample-grid", action="store_true",
                     dest="image_sample_grid",
                     help="save a generated color x shape PPM grid for latent image jobs")
@@ -1219,6 +1248,35 @@ def main():
     except ValueError:
         sys.exit("ERROR: --image-cfg-rescale-sweep values must be in [0, 1]")
     try:
+        parse_unit_interval(args.image_cfg_interval, "--image-cfg-interval")
+        parse_unit_interval(
+            args.image_semantic_guidance_interval,
+            "--image-semantic-guidance-interval",
+        )
+        parse_unit_interval(
+            args.image_sample_churn_interval,
+            "--image-sample-churn-interval",
+        )
+        parse_unit_interval(
+            args.image_sample_text_guidance_interval,
+            "--image-sample-text-guidance-interval",
+        )
+        parse_unit_interval(
+            args.image_sample_feature_guidance_interval,
+            "--image-sample-feature-guidance-interval",
+        )
+        parse_unit_interval(
+            args.image_sample_quality_guidance_interval,
+            "--image-sample-quality-guidance-interval",
+        )
+        parse_nonnegative_float_csv(
+            str(args.image_sample_churn),
+            "--image-sample-churn",
+        )
+        parse_nonnegative_float_csv(
+            args.image_sample_churns,
+            "--image-sample-churns",
+        )
         parse_nonnegative_float_csv(
             args.image_eval_text_guidance_sweep,
             "--image-eval-text-guidance-sweep",

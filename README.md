@@ -94,6 +94,7 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --ae-steps 40 --flow-steps 40 --cond-drop 0.1 --cfg-scale 1.5 \
     --sample-steps 4 --flow-semantic-w 0.25 --time-sampling logit-normal \
     --flow-consistency-w 0.05 --flow-ema-decay 0.99 --flow-checkpoint-blocks \
+    --sample-churn 0.05 --sample-churn-interval 0.0,0.8 \
     --out runs/image_latent_mmdit_text.pt
 .venv/bin/python -m thinking.image_embed --manifest data/images/train.jsonl \
     --root data/images --backend hf --model google/siglip-base-patch16-224 \
@@ -120,7 +121,8 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
 .venv/bin/python -m thinking.image_latent --eval-checkpoint runs/image_manifest_mmdit.pt \
     --eval-image-manifest data/images/train_clean.jsonl --eval-image-root data/images \
     --eval-image-split eval --size 64 --cfg-scales 1.0,1.5 --sample-steps-list 4,8 \
-    --eval-seeds 1,2,3 --sample-grid-out runs/image_manifest_eval_grid.ppm \
+    --sample-churns 0.0,0.05 --eval-seeds 1,2,3 \
+    --sample-grid-out runs/image_manifest_eval_grid.ppm \
     --eval-out runs/image_manifest_mmdit_sweep.json
 .venv/bin/python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.5 --sample-steps-list 4,8 --eval-seeds 1,2,3 \
