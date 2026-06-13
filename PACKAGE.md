@@ -658,6 +658,20 @@ because controls failed (`question_only` **0.0250**, `question_swap` **-0.0769**
 choices better, but it must still prove that the answer depends on both the actual question and
 the actual context before a reading update can be accepted.
 
+The final evaluated choice head now has optional direct supervision too:
+`--choice-final-w` trains `model.choice_logits` after answerability is added, and
+`--choice-final-control-w` trains generated question-only/context-only/swapped-question controls
+as `none` through those same final logits. This closes an instrumentation gap: earlier losses
+trained raw candidate evidence and answerability separately, while evaluation used their sum. The
+first probes show why the gate is still needed. At control weight **0.25**, aggregate sampled
+choice rose to **0.550**, but `squad_choice` collapsed to **0.000** and confirmation seed **7936**
+regressed from **0.250** to **0.000**. At control weight **0.05**, round 2 kept better aggregate
+choice (**0.4875**) and held primary control gaps closer, but confirmation still regressed
+`squad_choice` from **0.250** to **0.050** while negatives dominated (**0.750** /
+**0.700**). Both runs keep `selected_round` **0**. The useful result is diagnostic: final-logit
+control pressure reaches the evaluated head, but the next accepted update needs a
+positive-preserving calibration mechanism rather than stronger `none` pressure.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
