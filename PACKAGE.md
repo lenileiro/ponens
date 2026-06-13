@@ -1428,6 +1428,14 @@ data-composition lever we need for SOTA-scale image training: we can rebalance c
 synthetic/diagram/text-rendering subsets, and noisy web data without adding domain-specific model
 rules.
 
+Image-74 makes aspect-bucket training respect that data mixture. Multi-resolution manifest runs now
+choose size buckets by total bucket record weight when quality or source weights are active, while
+unweighted runs keep the previous uniform bucket sampling. Bucketed latent caches use the same
+`weight_sum` rule at sample time, and reports expose `size_bucket_sampling_mode`,
+`size_bucket_weight_sums`, `size_bucket_sampling_probs`, and cache bucket sampling probabilities.
+This prevents rectangular training from silently undoing curated/source/quality weighting just
+because high-weight records cluster in one aspect ratio.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
