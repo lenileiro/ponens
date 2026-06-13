@@ -354,9 +354,9 @@ python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
     --out runs/text_study_squad_choice_contextloc025_pair_2round_smoke.json
 python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
     --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_choice_answerability_anscontrast_qctx_2round_smoke.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_answerability_anscontrast_confirm1_qctx_2round_smoke.pt \
     --study-replay-data data/text_grounded.jsonl \
-    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
+    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best --study-confirm-n 1 \
     --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
     --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
     --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
@@ -368,7 +368,7 @@ python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
     --choice-control-w 0 --choice-control-contrast-w 0 --choice-control-margin 0.0 \
     --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_squad_choice_answerability_anscontrast_qctx_2round_smoke.json
+    --out runs/text_study_squad_choice_answerability_anscontrast_confirm1_qctx_2round_smoke.json
 ```
 
 Current local Text-0 SNLI baseline (20k train / 1k dev, 1.5k steps, d=192, 4 layers, 6 heads,
@@ -615,14 +615,22 @@ question-only/context-only/swapped-question none controls with `--choice-answera
 and trains the full question's covered-span score to outrank the same-context swapped question
 with `--choice-answerability-contrast-w`. This is still data-derived supervision: the labels come
 from the imported reading records and generated counterfactual records, not from fixed English
-facts. On the two-round smoke above, the selector accepted round **2** for the first time in this
-SQuAD-choice line. Choice accuracy rose from **0.1875** to **0.325**, replay stayed high
+facts. On the non-confirmed two-round smoke, the selector accepted round **2** for the first time
+in this SQuAD-choice line: choice accuracy rose from **0.1875** to **0.325**, replay stayed high
 (**0.97125**, a **0.005** drop from reference), all held-out choice shortcut controls passed
-(`question_only` **0.1125**, `context_only` **0.200**, `question_swap` **0.1154**), and no kind
-regressed (`squad_choice` **0.300**, answer-absent **0.600**, swapped-question negatives
-**0.400**). This is not language mastery, but it is a concrete reading-update gate: the model can
-study a new QA dataset, update weights, retain prior grounded facts, and reject the shortcut where
-a swapped question previously looked better than the real one.
+(`question_only` **0.1125**, `context_only` **0.200**, `question_swap` **0.1154**), and no primary
+kind regressed (`squad_choice` **0.300**, answer-absent **0.600**, swapped-question negatives
+**0.400**).
+
+The selector now has an optional confirmation gate: `--study-confirm-n` reruns selection on
+additional held-out evaluation seeds and compares each candidate against the initial checkpoint on
+the same sample. With `--study-confirm-n 1`, the same training run was correctly rejected: primary
+round 2 still passed all controls, but confirmation seed **7936** found a `squad_choice` regression
+from **0.250** to **0.100** while the negative kinds improved (**0.550** / **0.550**), producing
+score **-0.0525** and keeping selected round **0**. This is not language mastery, but it is a
+stronger reading-update gate: a candidate update must now retain prior grounded facts, pass
+shortcut controls, and preserve answerable examples across independent held-out samples before it
+can be accepted.
 
 ## 3b. Image grounding: synthetic visual factors first
 

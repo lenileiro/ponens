@@ -2916,6 +2916,17 @@ def study_selection_score(study_eval, replay_eval, replay_ref=None, metric="both
                                       study_ref=study_ref)["score"]
 
 
+def study_selection_allowed(components, require_positive=True, control_w=1.0, kind_w=1.0):
+    control_failed = bool(components.get("control_failures")) and control_w > 0
+    kind_regressed = bool(components.get("kind_regressions")) and kind_w > 0
+    score_allowed = (((not require_positive) or components["score"] > 0.0)
+                     and not control_failed
+                     and not kind_regressed)
+    return {"score_allowed": bool(score_allowed),
+            "control_allowed": not control_failed,
+            "kind_regression_allowed": not kind_regressed}
+
+
 def study_selection_components(study_eval, replay_eval, replay_ref=None, metric="both",
                                retention_w=1.0, control_w=1.0, kind_w=1.0,
                                study_ref=None):
@@ -3125,7 +3136,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      study_anchor_correct_per_kind=0,
                      study_select_best=False, study_score_metric="both",
                      study_retention_w=1.0, study_control_w=1.0,
-                     study_kind_w=1.0, study_require_positive_score=True):
+                     study_kind_w=1.0, study_require_positive_score=True,
+                     study_confirm_n=0, study_confirm_seed_stride=7919):
     """Continue a text checkpoint on a reading-task dataset and report before/after.
 
     The dataset supplies semantic supervision; this function handles the weight update. It expands
@@ -3143,6 +3155,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
     old_schema = fact_schema_from_payload(ckpt.get("fact_schema"))
     old_fact_values = (sum(len(v) for v in old_schema.values) if old_schema is not None else 0)
     new_fact_values = sum(len(v) for v in model.fact_schema.values)
+    study_confirm_n = max(0, int(study_confirm_n))
+    study_confirm_seed_stride = max(1, int(study_confirm_seed_stride))
     eval_kwargs = dict(device=device, max_new=max_new, free_n=free_n,
                        paraphrase_n=paraphrase_n, counterfactual_n=counterfactual_n,
                        kind_free_n=kind_free_n, fact_n=fact_n,
@@ -3151,6 +3165,20 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
     replay_before = (evaluate_all(model, vocab, replay_records, **eval_kwargs)
                      if replay_records and any(r.split == "eval" for r in replay_records)
                      else None)
+    confirm_refs = []
+    for confirm_i in range(study_confirm_n):
+        confirm_seed = seed + 17 + (confirm_i + 1) * study_confirm_seed_stride
+        confirm_kwargs = eval_kwargs | {"seed": confirm_seed}
+        confirm_before = evaluate_all(model, vocab, study_records, **confirm_kwargs)
+        confirm_replay_before = (
+            evaluate_all(model, vocab, replay_records, **confirm_kwargs)
+            if replay_records and any(r.split == "eval" for r in replay_records)
+            else None)
+        confirm_refs.append({"index": confirm_i + 1,
+                             "seed": confirm_seed,
+                             "eval_kwargs": confirm_kwargs,
+                             "before": confirm_before,
+                             "replay_before": confirm_replay_before})
     report = {"experiment": "text0_study_update",
               "checkpoint": checkpoint,
               "data": data,
@@ -3193,6 +3221,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "study_control_w": float(study_control_w),
               "study_kind_w": float(study_kind_w),
               "study_require_positive_score": bool(study_require_positive_score),
+              "study_confirm_n": int(study_confirm_n),
+              "study_confirm_seed_stride": int(study_confirm_seed_stride),
               "free_n": int(free_n),
               "paraphrase_n": int(paraphrase_n),
               "counterfactual_n": int(counterfactual_n),
@@ -3211,7 +3241,18 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "new_fact_values": new_fact_values,
               "new_fact_values_added": new_fact_values - old_fact_values,
               "before": before,
-              "replay_before": replay_before}
+              "replay_before": replay_before,
+              "confirmation_refs": [
+                  {"index": row["index"],
+                   "seed": row["seed"],
+                   "before_score_components": study_selection_components(
+                       row["before"], row["replay_before"], row["replay_before"],
+                       metric=study_score_metric,
+                       retention_w=study_retention_w,
+                       control_w=study_control_w,
+                       kind_w=study_kind_w)}
+                  for row in confirm_refs
+              ]}
     if out_checkpoint:
         os.makedirs(os.path.dirname(out_checkpoint) or ".", exist_ok=True)
         torch.save(checkpoint_payload(model, vocab, d, layers, heads,
@@ -3352,15 +3393,51 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                         round_replay_eval["choice_head"]["fact_value_acc"],
                     "gate": round_replay_eval["gate"],
                 }
-            control_failed = bool(round_components.get("control_failures")) and study_control_w > 0
-            kind_regressed = bool(round_components.get("kind_regressions")) and study_kind_w > 0
-            score_allowed = (((not study_require_positive_score) or round_score > 0.0)
-                             and not control_failed
-                             and not kind_regressed)
-            round_reports[-1]["score_allowed"] = bool(score_allowed)
-            round_reports[-1]["control_allowed"] = not control_failed
-            round_reports[-1]["kind_regression_allowed"] = not kind_regressed
-            if score_allowed and round_score >= best_score:
+            allowed = study_selection_allowed(
+                round_components, require_positive=study_require_positive_score,
+                control_w=study_control_w, kind_w=study_kind_w)
+            confirmation_checks = []
+            for confirm in confirm_refs:
+                confirm_study_eval = evaluate_all(
+                    model, vocab, study_records, **confirm["eval_kwargs"])
+                confirm_replay_eval = (
+                    evaluate_all(model, vocab, replay_records,
+                                 **confirm["eval_kwargs"])
+                    if replay_records and any(r.split == "eval" for r in replay_records)
+                    else None)
+                confirm_components = study_selection_components(
+                    confirm_study_eval, confirm_replay_eval,
+                    confirm["replay_before"],
+                    metric=study_score_metric,
+                    retention_w=study_retention_w,
+                    control_w=study_control_w,
+                    kind_w=study_kind_w,
+                    study_ref=confirm["before"])
+                confirm_allowed = study_selection_allowed(
+                    confirm_components,
+                    require_positive=study_require_positive_score,
+                    control_w=study_control_w,
+                    kind_w=study_kind_w)
+                confirmation_checks.append({
+                    "index": confirm["index"],
+                    "seed": confirm["seed"],
+                    "score": confirm_components["score"],
+                    "score_components": confirm_components,
+                    **confirm_allowed,
+                })
+            confirmation_allowed = all(row["score_allowed"]
+                                       for row in confirmation_checks)
+            if confirmation_checks:
+                round_reports[-1]["confirmation"] = {
+                    "n": len(confirmation_checks),
+                    "all_allowed": bool(confirmation_allowed),
+                    "checks": confirmation_checks,
+                }
+            round_allowed = allowed["score_allowed"] and confirmation_allowed
+            round_reports[-1].update(allowed)
+            round_reports[-1]["confirmation_allowed"] = bool(confirmation_allowed)
+            round_reports[-1]["round_allowed"] = bool(round_allowed)
+            if round_allowed and round_score >= best_score:
                 best_score = round_score
                 best_components = round_components
                 best_round = round_i + 1
@@ -3727,6 +3804,8 @@ def selftest():
         "qa_choice_full_minus_context_only",
         "qa_choice_full_minus_question_swap",
     }
+    assert not study_selection_allowed(choice_components, control_w=1.0)["score_allowed"]
+    assert study_selection_allowed(choice_components, control_w=0.0)["control_allowed"]
     score_lopsided = {"semantic_head": {"fact_value_acc": 0.95},
                       "teacher_forced": {"fact_value_acc": 0.10}}
     assert study_selection_score(score_lopsided, None, metric="both") < (
@@ -3777,6 +3856,10 @@ def selftest():
     assert "positive" in regressed["kind_regressions"]
     assert regressed["score"] < study_selection_score(kind_after, None, metric="choice",
                                                       control_w=0.0, kind_w=1.0)
+    assert not study_selection_allowed(regressed, control_w=0.0, kind_w=1.0)[
+        "score_allowed"]
+    assert study_selection_allowed({"score": -0.1}, require_positive=False)[
+        "score_allowed"]
     fit_model(new_model, new_vocab, records[:2], steps=1, batch=2, lr=1e-4,
               seed=3, device="cpu", semantic_w=1.0, decode_w=0.0, prefix="study-test")
     loss = token_loss(logits, ids, pad=vocab.pad)
@@ -3966,6 +4049,11 @@ def main(argv=None):
                     help="penalty weight for low-performing eval kinds during study selection")
     ap.add_argument("--study-allow-negative-score", action="store_true",
                     help="allow --study-select-best to keep a round with non-positive score")
+    ap.add_argument("--study-confirm-n", type=int, default=0,
+                    help=("with --study-select-best, require this many extra held-out "
+                          "evaluation seeds to pass before accepting a study round"))
+    ap.add_argument("--study-confirm-seed-stride", type=int, default=7919,
+                    help="seed stride for --study-confirm-n confirmation evaluations")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest()
@@ -4064,7 +4152,9 @@ def main(argv=None):
                          study_retention_w=args.study_retention_w,
                          study_control_w=args.study_control_w,
                          study_kind_w=args.study_kind_w,
-                         study_require_positive_score=not args.study_allow_negative_score)
+                         study_require_positive_score=not args.study_allow_negative_score,
+                         study_confirm_n=args.study_confirm_n,
+                         study_confirm_seed_stride=args.study_confirm_seed_stride)
         return
     run(args.data, steps=args.steps, batch=args.batch, d=args.d, layers=args.layers,
         heads=args.heads, seed=args.seed, out=args.out, checkpoint=args.checkpoint,
