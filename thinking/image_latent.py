@@ -2803,6 +2803,30 @@ def _rbf_mmd(x, y, eps=1.0e-8):
     return (kxx + kyy - 2.0 * kxy).clamp_min(0.0), sigma2
 
 
+def _pairwise_summary(x, eps=1.0e-8):
+    n = int(x.shape[0])
+    if n <= 1:
+        zero = torch.tensor(0.0, dtype=x.dtype, device=x.device)
+        return zero, zero
+    cos = x.float().matmul(x.float().t())
+    dist = torch.cdist(x.float(), x.float())
+    mask = ~torch.eye(n, dtype=torch.bool, device=x.device)
+    return cos[mask].mean(), dist[mask].mean()
+
+
+def _support_radius(x, eps=1.0e-8):
+    n = int(x.shape[0])
+    if n <= 1:
+        return torch.tensor(0.0, dtype=x.dtype, device=x.device)
+    dist = torch.cdist(x.float(), x.float())
+    dist = dist.masked_fill(torch.eye(n, dtype=torch.bool, device=x.device), float("inf"))
+    nearest = dist.min(dim=1).values
+    finite = nearest[torch.isfinite(nearest)]
+    if int(finite.numel()) <= 0:
+        return torch.tensor(0.0, dtype=x.dtype, device=x.device)
+    return finite.median().clamp_min(0.0)
+
+
 def embedding_distribution_metrics(generated_vec, real_vec, prefix="embedding_distribution"):
     generated_vec = F.normalize(pool_embedding_sequence(generated_vec).float(), dim=-1, eps=1.0e-8)
     real_vec = F.normalize(pool_embedding_sequence(real_vec).float(), dim=-1, eps=1.0e-8)
@@ -2823,6 +2847,17 @@ def embedding_distribution_metrics(generated_vec, real_vec, prefix="embedding_di
             f"{prefix}_frechet": 0.0,
             f"{prefix}_mmd_rbf": 0.0,
             f"{prefix}_mmd_rbf_sigma2": 1.0,
+            f"{prefix}_generated_pairwise_cos": 0.0,
+            f"{prefix}_real_pairwise_cos": 0.0,
+            f"{prefix}_generated_pairwise_l2": 0.0,
+            f"{prefix}_real_pairwise_l2": 0.0,
+            f"{prefix}_diversity_l2_ratio": 0.0,
+            f"{prefix}_nearest_real_l2": 0.0,
+            f"{prefix}_nearest_generated_l2": 0.0,
+            f"{prefix}_support_precision": 0.0,
+            f"{prefix}_support_recall": 0.0,
+            f"{prefix}_real_support_radius": 0.0,
+            f"{prefix}_generated_support_radius": 0.0,
         }
     generated_vec = generated_vec[:n]
     real_vec = real_vec[:n]
@@ -2831,6 +2866,15 @@ def embedding_distribution_metrics(generated_vec, real_vec, prefix="embedding_di
     gen_cov = _embedding_covariance(generated_vec)
     real_cov = _embedding_covariance(real_vec)
     cov_diff = gen_cov - real_cov
+    gen_pair_cos, gen_pair_l2 = _pairwise_summary(generated_vec)
+    real_pair_cos, real_pair_l2 = _pairwise_summary(real_vec)
+    cross_l2 = torch.cdist(generated_vec.float(), real_vec.float())
+    nearest_real = cross_l2.min(dim=1).values
+    nearest_generated = cross_l2.min(dim=0).values
+    real_radius = _support_radius(real_vec)
+    generated_radius = _support_radius(generated_vec)
+    support_precision = nearest_real.le(real_radius).float().mean()
+    support_recall = nearest_generated.le(generated_radius).float().mean()
     frechet = (
         mean_diff.pow(2).sum()
         + torch.trace(gen_cov)
@@ -2848,6 +2892,19 @@ def embedding_distribution_metrics(generated_vec, real_vec, prefix="embedding_di
         f"{prefix}_frechet": float(frechet.detach().cpu()),
         f"{prefix}_mmd_rbf": float(mmd.detach().cpu()),
         f"{prefix}_mmd_rbf_sigma2": float(sigma2.detach().cpu()),
+        f"{prefix}_generated_pairwise_cos": float(gen_pair_cos.detach().cpu()),
+        f"{prefix}_real_pairwise_cos": float(real_pair_cos.detach().cpu()),
+        f"{prefix}_generated_pairwise_l2": float(gen_pair_l2.detach().cpu()),
+        f"{prefix}_real_pairwise_l2": float(real_pair_l2.detach().cpu()),
+        f"{prefix}_diversity_l2_ratio": float(
+            (gen_pair_l2 / real_pair_l2.clamp_min(1.0e-8)).detach().cpu()
+        ),
+        f"{prefix}_nearest_real_l2": float(nearest_real.mean().detach().cpu()),
+        f"{prefix}_nearest_generated_l2": float(nearest_generated.mean().detach().cpu()),
+        f"{prefix}_support_precision": float(support_precision.detach().cpu()),
+        f"{prefix}_support_recall": float(support_recall.detach().cpu()),
+        f"{prefix}_real_support_radius": float(real_radius.detach().cpu()),
+        f"{prefix}_generated_support_radius": float(generated_radius.detach().cpu()),
     }
 
 
@@ -5173,6 +5230,13 @@ SWEEP_METRICS = (
     "generated_image_feature_distribution_cov_fro",
     "generated_image_feature_distribution_frechet",
     "generated_image_feature_distribution_mmd_rbf",
+    "generated_image_feature_distribution_generated_pairwise_l2",
+    "generated_image_feature_distribution_real_pairwise_l2",
+    "generated_image_feature_distribution_diversity_l2_ratio",
+    "generated_image_feature_distribution_nearest_real_l2",
+    "generated_image_feature_distribution_nearest_generated_l2",
+    "generated_image_feature_distribution_support_precision",
+    "generated_image_feature_distribution_support_recall",
     "external_text_image_score_cos",
     "external_text_image_score_i2t_acc",
     "external_text_image_score_t2i_acc",
@@ -5206,6 +5270,11 @@ def report_selection_key(report):
         float(report.get("generated_image_feature_retrieval_i2f_acc", 0.0)),
         -float(report.get("generated_image_feature_distribution_frechet", inf)),
         -float(report.get("generated_image_feature_distribution_mmd_rbf", inf)),
+        float(report.get("generated_image_feature_distribution_support_precision", 0.0)),
+        float(report.get("generated_image_feature_distribution_support_recall", 0.0)),
+        -abs(math.log(max(float(
+            report.get("generated_image_feature_distribution_diversity_l2_ratio", 1.0)
+        ), 1.0e-8))),
         float(report.get("external_text_image_score_cos", 0.0)),
         float(report.get("image_feature_retrieval_i2f_acc", 0.0)),
         float(report.get("generated_caption_retrieval_i2t_acc", 0.0)),
@@ -5231,6 +5300,11 @@ def aggregate_selection_key(report):
         float(report.get("generated_image_feature_retrieval_i2f_acc_mean", 0.0)),
         -float(report.get("generated_image_feature_distribution_frechet_mean", inf)),
         -float(report.get("generated_image_feature_distribution_mmd_rbf_mean", inf)),
+        float(report.get("generated_image_feature_distribution_support_precision_mean", 0.0)),
+        float(report.get("generated_image_feature_distribution_support_recall_mean", 0.0)),
+        -abs(math.log(max(float(
+            report.get("generated_image_feature_distribution_diversity_l2_ratio_mean", 1.0)
+        ), 1.0e-8))),
         float(report.get("external_text_image_score_cos_mean", 0.0)),
         float(report.get("image_feature_retrieval_i2f_acc_mean", 0.0)),
         float(report.get("generated_caption_retrieval_i2t_acc_mean", 0.0)),
@@ -5283,6 +5357,13 @@ def eval_report_summary(report):
         "generated_image_feature_distribution_cov_fro",
         "generated_image_feature_distribution_frechet",
         "generated_image_feature_distribution_mmd_rbf",
+        "generated_image_feature_distribution_generated_pairwise_l2",
+        "generated_image_feature_distribution_real_pairwise_l2",
+        "generated_image_feature_distribution_diversity_l2_ratio",
+        "generated_image_feature_distribution_nearest_real_l2",
+        "generated_image_feature_distribution_nearest_generated_l2",
+        "generated_image_feature_distribution_support_precision",
+        "generated_image_feature_distribution_support_recall",
         "external_text_image_score_cos",
         "generated_external_text_image_score_cos",
         "image_quality_score_pred_mean",
@@ -6940,6 +7021,8 @@ def selftest():
         assert "generated_external_text_image_score_cos" in report6
         assert "generated_image_feature_distribution_frechet" in report6
         assert report6["generated_image_feature_distribution_n"] >= 1
+        assert "generated_image_feature_distribution_support_precision" in report6
+        assert "generated_image_feature_distribution_diversity_l2_ratio" in report6
         assert report6["image_quality_weighted"] is True
         assert report6["image_quality_weight_source"] == "aesthetic_score_quality"
         assert report6["image_quality_weight_records"] == 2
@@ -7125,6 +7208,7 @@ def selftest():
         assert "generated_caption_retrieval_i2t_acc_mean" in img_agg[0]
         assert "generated_image_feature_retrieval_i2f_acc_mean" in img_agg[0]
         assert "generated_image_feature_distribution_frechet_mean" in img_agg[0]
+        assert "generated_image_feature_distribution_support_recall_mean" in img_agg[0]
         assert "generated_external_text_image_score_cos_mean" in img_agg[0]
         ckpt = os.path.join(td, "manifest.pt")
         torch.save({
@@ -7202,6 +7286,7 @@ def selftest():
         assert "generated_caption_retrieval_i2t_acc_mean" in eval6["best"]
         assert "generated_image_feature_retrieval_i2f_acc_mean" in eval6["best"]
         assert "generated_image_feature_distribution_frechet_mean" in eval6["best"]
+        assert "generated_image_feature_distribution_diversity_l2_ratio_mean" in eval6["best"]
         assert "generated_external_text_image_score_cos_mean" in eval6["best"]
         assert "generated_image_quality_score_pred_mean_mean" in eval6["best"]
     print("image_latent selftest OK")

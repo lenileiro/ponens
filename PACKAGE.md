@@ -1458,6 +1458,14 @@ checkpoint sweeps and participate in best-run selection as lower-is-better distr
 This gives guidance/source/quality sweeps a generic quality signal closer to FID/KID-style model
 selection without depending on a hard-coded dataset or a heavyweight eval package.
 
+Image-76 extends that same feature-space eval with diversity and coverage checks. Manifest sweeps
+now report generated-vs-real pairwise spread, diversity ratio, nearest-real/nearest-generated
+distances, and support precision/recall at data-derived feature radii. These metrics catch early
+mode collapse or over-narrow guidance: a checkpoint can match prompts pairwise but still fail to
+cover the real sidecar feature support. Best-run selection now prefers high support precision/recall
+and a generated/real diversity ratio near one, while keeping the metrics generic to any external
+image embedding sidecar.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
