@@ -967,7 +967,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
     --image-clean-min-side 256 --image-clean-max-aspect 2.0 \
     --image-latent --image-latent-arch mmdit \
     --image-cond-mode text --image-dit-head-width-mult 2 --image-dit-qk-norm \
-    --image-dit-attn-impl sdpa --image-dit-pos-embed sincos2d \
+    --image-dit-attn-impl sdpa --image-dit-pos-embed rope2d \
     --image-manifest data/images/train.jsonl --image-root data/images \
     --image-caption-cond-source auto \
     --image-crop-mode pad --image-hflip-prob 0.5 \
@@ -1387,9 +1387,10 @@ is the minimal data-pipeline step toward mixed-aspect high-resolution training: 
 stay in frame while the current fixed-shape AE/flow code can still batch tensors locally and on
 RunPod.
 
-Image-52 adds geometry-aware latent DiT positions. `--dit-pos-embed learned|sincos2d` keeps
-learned 1D tables by default, but new high-resolution DiT/CrossDiT/MM-DiT runs can use deterministic
-2D sinusoidal image-token positions. RunPod exposes this as `--image-dit-pos-embed`. This removes a
+Image-52 adds geometry-aware latent DiT positions. `--dit-pos-embed learned|sincos2d|rope2d`
+keeps learned 1D tables by default, but high-resolution DiT/CrossDiT/MM-DiT runs can use
+deterministic 2D sinusoidal image-token positions, and MM-DiT can use 2D axial rotary image-token
+Q/K positions with `rope2d`. RunPod exposes this as `--image-dit-pos-embed`. This removes a
 fixed-token-table assumption from the transformer path and is a better default for resolution and
 aspect-ratio scaling experiments.
 

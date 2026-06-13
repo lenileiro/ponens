@@ -775,8 +775,9 @@ def main():
                     choices=("manual", "sdpa", "auto"), dest="image_dit_attn_impl",
                     help="latent image MM-DiT attention implementation")
     ap.add_argument("--image-dit-pos-embed", default="learned",
-                    choices=("learned", "sincos2d"), dest="image_dit_pos_embed",
-                    help="latent image DiT positional embedding")
+                    choices=("learned", "sincos2d", "rope2d"), dest="image_dit_pos_embed",
+                    help=("latent image DiT positional embedding; rope2d requires "
+                          "--image-latent-arch mmdit"))
     ap.add_argument("--image-flow-checkpoint-blocks", action="store_true",
                     dest="image_flow_checkpoint_blocks",
                     help="checkpoint latent image transformer blocks during flow training")
@@ -1360,6 +1361,8 @@ def main():
         sys.exit("ERROR: --image-prompt-embed-backend hf requires --image-prompt-embed-model")
     if args.image_ae_arch == "hf-vae" and not args.image_ae_hf_model:
         sys.exit("ERROR: --image-ae-arch hf-vae requires --image-ae-hf-model")
+    if args.image_dit_pos_embed == "rope2d" and args.image_latent_arch != "mmdit":
+        sys.exit("ERROR: --image-dit-pos-embed rope2d requires --image-latent-arch mmdit")
     if args.multimodal:
         positive = {
             "--multimodal-layers": args.multimodal_layers,

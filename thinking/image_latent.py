@@ -57,7 +57,7 @@ FACT_GROUPS = {
 SAMPLE_METHODS = ("euler", "heun", "midpoint", "rk4")
 SAMPLE_SCHEDULES = ("linear", "quadratic", "sqrt", "cosine")
 MMDIT_ATTN_IMPLS = ("manual", "sdpa", "auto")
-DIT_POS_EMBEDS = ("learned", "sincos2d")
+DIT_POS_EMBEDS = ("learned", "sincos2d", "rope2d")
 FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
 TIME_SAMPLINGS = ("uniform", "logit-normal")
 TIME_SHIFT_MODES = ("manual", "dim")
@@ -1142,6 +1142,58 @@ def sinusoidal_2d_positions(height, width, dim, device=None, dtype=None):
     return torch.cat([y, x], dim=-1).reshape(1, int(height) * int(width), dim)
 
 
+def rotary_2d_factors(height, width, head_dim, device=None, dtype=None):
+    head_dim = int(head_dim)
+    if head_dim % 2:
+        raise ValueError("rope2d requires an even attention head dimension")
+    total_pairs = head_dim // 2
+    y_pairs = total_pairs // 2
+    x_pairs = total_pairs - y_pairs
+    y_pos = torch.arange(int(height), device=device, dtype=torch.float32)
+    x_pos = torch.arange(int(width), device=device, dtype=torch.float32)
+    yy, xx = torch.meshgrid(y_pos, x_pos, indexing="ij")
+    yy = yy.reshape(-1)
+    xx = xx.reshape(-1)
+    cos = torch.ones((int(height) * int(width), head_dim), device=device, dtype=torch.float32)
+    sin = torch.zeros_like(cos)
+
+    def fill_axis(start, pairs, pos):
+        if pairs <= 0:
+            return
+        freqs = torch.arange(pairs, device=device, dtype=torch.float32)
+        freqs = torch.exp(-math.log(10000.0) * freqs / float(max(1, pairs)))
+        angles = pos[:, None] * freqs[None, :]
+        axis_cos = torch.cos(angles)
+        axis_sin = torch.sin(angles)
+        end = start + 2 * pairs
+        cos[:, start:end:2] = axis_cos
+        cos[:, start + 1:end:2] = axis_cos
+        sin[:, start:end:2] = axis_sin
+        sin[:, start + 1:end:2] = axis_sin
+
+    fill_axis(0, y_pairs, yy)
+    fill_axis(2 * y_pairs, x_pairs, xx)
+    cos = cos.reshape(1, 1, int(height) * int(width), head_dim)
+    sin = sin.reshape(1, 1, int(height) * int(width), head_dim)
+    if dtype is not None:
+        cos = cos.to(dtype=dtype)
+        sin = sin.to(dtype=dtype)
+    return cos, sin
+
+
+def apply_rotary_factors(x, cos, sin):
+    if x.shape[-1] % 2:
+        raise ValueError("rotary embedding requires an even feature dimension")
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+    cos_even = cos[..., 0::2].to(dtype=x.dtype, device=x.device)
+    sin_even = sin[..., 0::2].to(dtype=x.dtype, device=x.device)
+    out = torch.empty_like(x)
+    out[..., 0::2] = x_even * cos_even - x_odd * sin_even
+    out[..., 1::2] = x_even * sin_even + x_odd * cos_even
+    return out
+
+
 class LatentDiTFlowNet(nn.Module):
     """Patch-token transformer velocity field over semantic image latents.
 
@@ -1157,6 +1209,8 @@ class LatentDiTFlowNet(nn.Module):
         pos_embed = str(pos_embed)
         if pos_embed not in DIT_POS_EMBEDS:
             raise ValueError(f"unknown DiT positional embedding {pos_embed!r}")
+        if pos_embed == "rope2d":
+            raise ValueError("rope2d positional embedding is only supported by MM-DiT")
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
         self.hidden = int(hidden)
@@ -1165,6 +1219,7 @@ class LatentDiTFlowNet(nn.Module):
         self.head_width_mult = int(head_width_mult)
         self.dit_pos_embed = pos_embed
         self.uses_2d_pos_embed = pos_embed == "sincos2d"
+        self.uses_rope2d_pos_embed = False
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.uses_activation_checkpointing = self.checkpoint_blocks
         self.in_proj = nn.Linear(latent_ch, hidden)
@@ -1261,6 +1316,8 @@ class LatentCrossDiTFlowNet(nn.Module):
         pos_embed = str(pos_embed)
         if pos_embed not in DIT_POS_EMBEDS:
             raise ValueError(f"unknown DiT positional embedding {pos_embed!r}")
+        if pos_embed == "rope2d":
+            raise ValueError("rope2d positional embedding is only supported by MM-DiT")
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
         self.hidden = int(hidden)
@@ -1269,6 +1326,7 @@ class LatentCrossDiTFlowNet(nn.Module):
         self.head_width_mult = int(head_width_mult)
         self.dit_pos_embed = pos_embed
         self.uses_2d_pos_embed = pos_embed == "sincos2d"
+        self.uses_rope2d_pos_embed = False
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.uses_activation_checkpointing = self.checkpoint_blocks
         self.in_proj = nn.Linear(latent_ch, hidden)
@@ -1348,7 +1406,8 @@ class HeadRMSNorm(nn.Module):
 class MMDiTBlock(nn.Module):
     """Tiny dual-stream block with separate image/text projections and joint attention."""
 
-    def __init__(self, hidden=96, heads=4, qk_norm=False, attn_impl="manual"):
+    def __init__(self, hidden=96, heads=4, qk_norm=False, attn_impl="manual",
+                 image_rope=False):
         super().__init__()
         if hidden % heads:
             raise ValueError(f"hidden={hidden} must be divisible by heads={heads}")
@@ -1357,8 +1416,11 @@ class MMDiTBlock(nn.Module):
             raise ValueError(f"unknown MM-DiT attention implementation {attn_impl!r}")
         self.heads = int(heads)
         self.head_dim = hidden // heads
+        if image_rope and self.head_dim % 2:
+            raise ValueError("rope2d requires an even MM-DiT head dimension")
         self.uses_qk_norm = bool(qk_norm)
         self.attn_impl = attn_impl
+        self.uses_image_rope2d = bool(image_rope)
         self.uses_zero_residual_gating = True
         self.scale = self.head_dim ** -0.5
         self.img_norm = nn.LayerNorm(hidden)
@@ -1429,7 +1491,7 @@ class MMDiTBlock(nn.Module):
             raise RuntimeError("scaled_dot_product_attention is unavailable in this torch build")
         return self._manual_attention(q, k, v, key_mask=key_mask)
 
-    def forward(self, img, ctx, cond_ctx, ctx_mask=None):
+    def forward(self, img, ctx, cond_ctx, ctx_mask=None, image_rope=None):
         b, n_img, h = img.shape
         n_ctx = ctx.shape[1]
         (img_attn_shift, img_attn_scale, ctx_attn_shift, ctx_attn_scale,
@@ -1443,6 +1505,10 @@ class MMDiTBlock(nn.Module):
         qc, kc, vc = self._qkv(self.ctx_qkv, ctx_attn)
         qi, ki = self.img_q_norm(qi), self.img_k_norm(ki)
         qc, kc = self.ctx_q_norm(qc), self.ctx_k_norm(kc)
+        if image_rope is not None:
+            rope_cos, rope_sin = image_rope
+            qi = apply_rotary_factors(qi, rope_cos, rope_sin)
+            ki = apply_rotary_factors(ki, rope_cos, rope_sin)
         q = torch.cat([qi, qc], dim=2)
         k = torch.cat([ki, kc], dim=2)
         v = torch.cat([vi, vc], dim=2)
@@ -1486,9 +1552,12 @@ class LatentMMDiTFlowNet(nn.Module):
         self.head_width_mult = int(head_width_mult)
         self.uses_qk_norm = bool(qk_norm)
         self.attn_impl = attn_impl
+        self.heads = int(heads)
+        self.head_dim = self.hidden // self.heads
         self.dit_pos_embed = pos_embed
         self.uses_zero_residual_gating = True
-        self.uses_2d_pos_embed = pos_embed == "sincos2d"
+        self.uses_2d_pos_embed = pos_embed in ("sincos2d", "rope2d")
+        self.uses_rope2d_pos_embed = pos_embed == "rope2d"
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.uses_activation_checkpointing = self.checkpoint_blocks
         self.in_proj = nn.Linear(latent_ch, hidden)
@@ -1501,7 +1570,8 @@ class LatentMMDiTFlowNet(nn.Module):
         self.ctx_proj = nn.Linear(cond_dim, hidden)
         self.blocks = nn.ModuleList([
             MMDiTBlock(
-                hidden, heads, qk_norm=self.uses_qk_norm, attn_impl=self.attn_impl
+                hidden, heads, qk_norm=self.uses_qk_norm, attn_impl=self.attn_impl,
+                image_rope=self.uses_rope2d_pos_embed
             )
             for _ in range(depth)
         ])
@@ -1511,7 +1581,14 @@ class LatentMMDiTFlowNet(nn.Module):
     def image_pos(self, h, w, device, dtype):
         if self.dit_pos_embed == "learned":
             return self.pos[:, :int(h) * int(w)].to(device=device, dtype=dtype)
-        return sinusoidal_2d_positions(h, w, self.hidden, device=device, dtype=dtype)
+        if self.dit_pos_embed == "sincos2d":
+            return sinusoidal_2d_positions(h, w, self.hidden, device=device, dtype=dtype)
+        return None
+
+    def image_rope(self, h, w, device, dtype):
+        if not self.uses_rope2d_pos_embed:
+            return None
+        return rotary_2d_factors(h, w, self.head_dim, device=device, dtype=dtype)
 
     def _context(self, cond):
         if isinstance(cond, dict):
@@ -1534,16 +1611,22 @@ class LatentMMDiTFlowNet(nn.Module):
             raise ValueError(f"latent token count {n} exceeds max_tokens={self.max_tokens}")
         cond_ctx = self.time(torch.cat([cond_vec, t.to(cond_vec.dtype)], dim=1))
         img = self.in_proj(z.flatten(2).transpose(1, 2))
-        img = img + self.image_pos(h, w, img.device, img.dtype)
+        image_pos = self.image_pos(h, w, img.device, img.dtype)
+        if image_pos is not None:
+            img = img + image_pos
         img = img + cond_ctx[:, None, :]
         ctx, ctx_mask = self._context(cond)
+        image_rope = self.image_rope(h, w, img.device, img.dtype)
         for block in self.blocks:
             if should_checkpoint_blocks(self):
                 def block_forward(img_arg, ctx_arg, cond_arg, block=block):
-                    return block(img_arg, ctx_arg, cond_arg, ctx_mask=ctx_mask)
+                    return block(
+                        img_arg, ctx_arg, cond_arg, ctx_mask=ctx_mask,
+                        image_rope=image_rope)
                 img, ctx = activation_checkpoint(block_forward, img, ctx, cond_ctx)
             else:
-                img, ctx = block(img, ctx, cond_ctx, ctx_mask=ctx_mask)
+                img, ctx = block(img, ctx, cond_ctx, ctx_mask=ctx_mask,
+                                 image_rope=image_rope)
         features = self.norm(img)
         v = self.out_proj(features)
         velocity = v.transpose(1, 2).reshape(b, c, h, w)
@@ -1561,6 +1644,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
     dit_pos_embed = str(dit_pos_embed)
     if dit_pos_embed not in DIT_POS_EMBEDS:
         raise ValueError(f"unknown DiT positional embedding {dit_pos_embed!r}")
+    if dit_pos_embed == "rope2d" and flow_arch != "mmdit":
+        raise ValueError("rope2d positional embedding is only supported by MM-DiT")
     dit_head_width_mult = int(dit_head_width_mult)
     if dit_head_width_mult <= 0:
         raise ValueError("dit_head_width_mult must be positive")
@@ -5158,6 +5243,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "flow_checkpoint_blocks": bool(getattr(flow, "checkpoint_blocks", False)),
         "activation_checkpointing": bool(getattr(flow, "uses_activation_checkpointing", False)),
         "uses_2d_pos_embed": bool(getattr(flow, "uses_2d_pos_embed", False)),
+        "uses_rope2d_pos_embed": bool(getattr(flow, "uses_rope2d_pos_embed", False)),
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "zero_residual_gating": bool(getattr(flow, "uses_zero_residual_gating", False)),
@@ -6856,6 +6942,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_checkpoint_blocks": bool(getattr(flow, "checkpoint_blocks", False)),
         "activation_checkpointing": bool(getattr(flow, "uses_activation_checkpointing", False)),
         "uses_2d_pos_embed": bool(getattr(flow, "uses_2d_pos_embed", False)),
+        "uses_rope2d_pos_embed": bool(getattr(flow, "uses_rope2d_pos_embed", False)),
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "zero_residual_gating": bool(getattr(flow, "uses_zero_residual_gating", False)),
@@ -7216,12 +7303,15 @@ def selftest():
         text_cond_dim=8, sample_steps=1, time_sampling="logit-normal",
         flow_ema_decay=0.5, dit_head_width_mult=2, dit_qk_norm=True,
         dit_attn_impl=("sdpa" if hasattr(F, "scaled_dot_product_attention") else "auto"),
-        flow_checkpoint_blocks=True,
+        dit_pos_embed="rope2d", flow_checkpoint_blocks=True,
         return_conditioner=True)
     assert report5["flow_arch"] == "mmdit" and flow_uses_cond_tokens(flow5)
     assert report5["dit_head_width_mult"] == 2
     assert report5["dit_qk_norm"] is True
     assert report5["dit_attn_impl"] in ("sdpa", "auto")
+    assert report5["dit_pos_embed"] == "rope2d"
+    assert report5["uses_2d_pos_embed"] is True
+    assert report5["uses_rope2d_pos_embed"] is True
     assert report5["zero_residual_gating"] is True
     assert flow5.uses_zero_residual_gating is True
     assert report5["flow_checkpoint_blocks"] is True
@@ -7712,7 +7802,8 @@ def main(argv=None):
                     help="MM-DiT attention implementation: manual, sdpa, or auto")
     ap.add_argument("--dit-pos-embed", default="learned", choices=DIT_POS_EMBEDS,
                     dest="dit_pos_embed",
-                    help="image-token positional embedding for DiT/CrossDiT/MM-DiT flows")
+                    help=("image-token positional embedding for DiT/CrossDiT/MM-DiT flows; "
+                          "rope2d is MM-DiT-only"))
     ap.add_argument("--flow-checkpoint-blocks", action="store_true",
                     dest="flow_checkpoint_blocks",
                     help=("checkpoint DiT/CrossDiT/MM-DiT transformer blocks during "
@@ -8432,6 +8523,7 @@ def main(argv=None):
         "activation_checkpointing": report.get("activation_checkpointing", False),
         "zero_residual_gating": report.get("zero_residual_gating", False),
         "uses_2d_pos_embed": report.get("uses_2d_pos_embed", False),
+        "uses_rope2d_pos_embed": report.get("uses_rope2d_pos_embed", False),
         "cond_mode": args.cond_mode,
         "cond_dim": report["cond_dim"],
         "data_mode": report.get("data_mode", "synthetic_factors"),

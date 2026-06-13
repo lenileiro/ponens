@@ -109,6 +109,7 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --image-manifest data/images/train_clean.jsonl --image-root data/images \
     --caption-cond-source auto \
     --size 64 --ae-arch residual --latent-downsample 8 --latent-max-tokens 128 \
+    --dit-pos-embed rope2d \
     --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 \
     --image-text-align-w 0.1 --flow-text-align-w 0.05 --text-embed-dim 128 \
     --image-feature-align-w 0.1 --flow-feature-align-w 0.05 \
