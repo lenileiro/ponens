@@ -32,8 +32,10 @@ from scratchpad_model import CausalBlock, ScratchpadLM
 
 from .audio import (ENVELOPES, PITCH_NAMES, TIMBRES, render_tone, sample_clip, spectrogram)
 from .concepts import (
+    LatentConceptHead,
     SchemaConceptHead,
     SchemaConceptRefiner,
+    latent_concept_vicreg_loss,
     schema_concept_batch_centroid_loss,
     schema_concept_contrastive_loss,
     schema_concept_prototype_alignment_loss,
@@ -357,12 +359,17 @@ class MultimodalLM(nn.Module):
                  text_arch="transformer", concept_tokens=4, fusion_layers=1,
                  concept_prefix=False, concept_refine=False,
                  concept_refine_gate_init=-2.0,
-                 concept_mixer_layers=0, concept_mixer_gate_init=-2.0):
+                 concept_mixer_layers=0, concept_mixer_gate_init=-2.0,
+                 latent_concept_slots=0, latent_concept_layers=1):
         super().__init__()
         if img_tokens <= 0 or aud_tokens <= 0 or txt_tokens <= 0:
             raise ValueError("multimodal prefix token counts must be positive")
         if modality_dropout < 0.0 or modality_dropout > 1.0:
             raise ValueError("modality_dropout must be in [0, 1]")
+        if int(latent_concept_slots) < 0:
+            raise ValueError("latent concept slots must be non-negative")
+        if int(latent_concept_slots) > 0 and int(latent_concept_layers) <= 0:
+            raise ValueError("latent concept layers must be positive")
         trunk_arch = str(trunk_arch)
         text_arch = str(text_arch)
         if text_arch not in TEXT_TRUNK_ARCHES:
@@ -382,10 +389,14 @@ class MultimodalLM(nn.Module):
             "concept_refine_gate_init": float(concept_refine_gate_init),
             "concept_mixer_layers": int(concept_mixer_layers),
             "concept_mixer_gate_init": float(concept_mixer_gate_init),
+            "latent_concept_slots": int(latent_concept_slots),
+            "latent_concept_layers": int(latent_concept_layers),
         }
         self.modality_dropout = float(modality_dropout)
         self.concept_prefix = bool(concept_prefix)
         self.concept_refine = bool(concept_refine)
+        self.latent_concept_slots = int(latent_concept_slots)
+        self.latent_concept_layers = int(latent_concept_layers)
         self.lm = ScratchpadLM(vocab_size, d=d, layers=layers, heads=heads, max_len=max_len,
                                pad=pad, pointer=False, loop=False)
         img_pool = _grid_pool(img_tokens)
@@ -407,6 +418,34 @@ class MultimodalLM(nn.Module):
         self.concept_refiner = (SchemaConceptRefiner(
             d, heads=heads, gate_init=concept_refine_gate_init)
             if self.concept_refine else None)
+        self.latent_concepts = (LatentConceptHead(
+            self.latent_concept_slots, d, heads=heads,
+            mixer_layers=self.latent_concept_layers)
+            if self.latent_concept_slots > 0 else None)
+
+    def enable_latent_concepts(self, slots, heads=None, layers=1):
+        slots = int(slots)
+        latent_heads = int(heads or self.config["heads"])
+        latent_layers = int(layers)
+        if slots <= 0:
+            self.latent_concepts = None
+            self.latent_concept_slots = 0
+            self.config["latent_concept_slots"] = 0
+            return self
+        if (self.latent_concepts is None
+                or self.latent_concept_slots != slots
+                or getattr(self.latent_concepts, "heads", latent_heads) != latent_heads
+                or getattr(self.latent_concepts, "mixer_layers", latent_layers)
+                != latent_layers):
+            self.latent_concepts = LatentConceptHead(
+                slots, self.config["d"], heads=latent_heads,
+                mixer_layers=latent_layers)
+            self.latent_concepts.to(next(self.parameters()).device)
+        self.latent_concept_slots = slots
+        self.latent_concept_layers = latent_layers
+        self.config["latent_concept_slots"] = slots
+        self.config["latent_concept_layers"] = latent_layers
+        return self
 
     def _apply_modality_dropout(self, ip, ap, tp):
         if not self.training or self.modality_dropout <= 0.0:
@@ -474,6 +513,19 @@ class MultimodalLM(nn.Module):
         return self.factor_logits_from_states(
             self.factor_concept_states(img, aud, txt, mode=mode))
 
+    def latent_concept_states_from_prefix(self, prefix, view_dropout=0.0, project=False):
+        if self.latent_concepts is None:
+            return None
+        if self.training and view_dropout > 0.0:
+            prefix = F.dropout(prefix, p=float(view_dropout), training=True)
+        return self.latent_concepts(prefix, project=project)
+
+    def latent_concept_states(self, img, aud, txt, mode="full", view_dropout=0.0,
+                              project=False):
+        prefix, _concepts = self.encode_prefix(img, aud, txt, mode=mode)
+        return self.latent_concept_states_from_prefix(
+            prefix, view_dropout=view_dropout, project=project)
+
     def decoder_prefix_from_encoded(self, prefix, concepts, factor_state_tensor=None):
         if self.concept_prefix:
             if factor_state_tensor is None:
@@ -487,7 +539,8 @@ class MultimodalLM(nn.Module):
         return self.decoder_prefix_from_encoded(prefix, concepts)
 
     def mode_bundle(self, img, aud, txt, ids, mode="full", need_factor=False,
-                    need_geometry=False):
+                    need_geometry=False, need_latent=False,
+                    latent_view_dropout=0.0, latent_project=False):
         prefix, concepts = self.encode_prefix(img, aud, txt, mode=mode)
         source = self._source_from_prefix(prefix, concepts)
         factor_state_tensor = None
@@ -497,6 +550,9 @@ class MultimodalLM(nn.Module):
             prefix, concepts, factor_state_tensor=factor_state_tensor)
         logits = self.lm(ids, prefix=decoder_prefix)[:, decoder_prefix.shape[1]:]
         out = {"logits": logits, "prefix": prefix, "concepts": concepts}
+        if need_latent:
+            out["latent_concepts"] = self.latent_concept_states_from_prefix(
+                prefix, view_dropout=latent_view_dropout, project=latent_project)
         if need_factor or need_geometry:
             if factor_state_tensor is None:
                 factor_state_tensor = self.factor_concepts.state_tensor(source)
@@ -958,6 +1014,43 @@ def concept_factor_state_spread_loss(factor_geometry_states_by_mode, golds,
     return torch.stack(losses).mean()
 
 
+def latent_multimodal_concept_loss_from_views(views, invariance_w=25.0,
+                                              variance_w=25.0,
+                                              covariance_w=1.0,
+                                              variance_target=1.0):
+    views = {mode: slots for mode, slots in views.items() if slots is not None}
+    if not views:
+        return torch.tensor(0.0)
+    losses = []
+    modes = list(views)
+    for i in range(len(modes)):
+        for j in range(i + 1, len(modes)):
+            losses.append(latent_concept_vicreg_loss(
+                views[modes[i]], views[modes[j]],
+                invariance_weight=invariance_w,
+                variance_weight=variance_w,
+                covariance_weight=covariance_w,
+                variance_target=variance_target))
+    if not losses:
+        return next(iter(views.values())).sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def latent_multimodal_concept_loss(model, img, aud, txt, view_dropout=0.1,
+                                   invariance_w=25.0, variance_w=25.0,
+                                   covariance_w=1.0, variance_target=1.0):
+    if getattr(model, "latent_concepts", None) is None:
+        return img.sum() * 0.0
+    views = {
+        mode: model.latent_concept_states(
+            img, aud, txt, mode=mode, view_dropout=view_dropout, project=True)
+        for mode in MODES
+    }
+    return latent_multimodal_concept_loss_from_views(
+        views, invariance_w=invariance_w, variance_w=variance_w,
+        covariance_w=covariance_w, variance_target=variance_target)
+
+
 def concept_factor_agreement_loss(factor_logits_by_mode):
     items = list(factor_logits_by_mode.items())
     if len(items) < 2:
@@ -1092,6 +1185,10 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           concept_prefix=False, concept_refine=False,
           concept_refine_gate_init=-2.0,
           concept_mixer_layers=0, concept_mixer_gate_init=-2.0,
+          latent_concept_slots=0, latent_concept_layers=1,
+          latent_concept_w=0.0, latent_concept_view_dropout=0.1,
+          latent_concept_invariance_w=25.0, latent_concept_variance_w=25.0,
+          latent_concept_covariance_w=1.0, latent_concept_variance_target=1.0,
           concept_w=0.0, concept_agreement_w=0.0,
           concept_distill_w=0.0, concept_distill_temperature=1.0,
           concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
@@ -1104,6 +1201,10 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           concept_state_spread_w=0.0, concept_state_spread_variance=0.05,
           concept_state_spread_margin=0.2,
           concept_state_spread_covariance_w=0.05):
+    if latent_concept_w < 0.0:
+        raise ValueError("latent_concept_w must be non-negative")
+    if latent_concept_w > 0.0 and latent_concept_slots <= 0:
+        raise ValueError("latent_concept_w requires latent_concept_slots > 0")
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     surfaces = load_text_surfaces(surfaces_path)
@@ -1120,7 +1221,9 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                          concept_refine_gate_init=(
                              concept_refine_gate_init),
                          concept_mixer_layers=concept_mixer_layers,
-                         concept_mixer_gate_init=concept_mixer_gate_init).to(device)
+                         concept_mixer_gate_init=concept_mixer_gate_init,
+                         latent_concept_slots=latent_concept_slots,
+                         latent_concept_layers=latent_concept_layers).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     last_base = last_agreement = last_concept = 0.0
     last_concept_agreement = last_concept_distill = last_concept_rank_distill = 0.0
@@ -1128,6 +1231,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     last_concept_centroid = 0.0
     last_concept_prototype = last_concept_prototype_spread = 0.0
     last_concept_state_spread = 0.0
+    last_latent_concept = 0.0
     for st in range(1, steps + 1):
         model.train()
         img, aud, txt, ids, golds = _batch(batch, rng, vocab, device, surfaces,
@@ -1140,10 +1244,13 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         needs_geometry_batch = (
             concept_contrast_w or concept_centroid_w or concept_prototype_w
             or concept_state_spread_w)
+        needs_latent_batch = bool(latent_concept_w)
         bundles_by_mode = {
             mode: model.mode_bundle(
                 img, aud, txt, ids, mode=mode, need_factor=needs_factor_batch,
-                need_geometry=needs_geometry_batch)
+                need_geometry=needs_geometry_batch, need_latent=needs_latent_batch,
+                latent_view_dropout=latent_concept_view_dropout,
+                latent_project=True)
             for mode in MODES
         }
         logits_by_mode = {mode: bundle["logits"]
@@ -1216,6 +1323,15 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
             concept_centroid = base_loss * 0.0
             concept_prototype = base_loss * 0.0
             concept_state_spread = base_loss * 0.0
+        latent_concept = (
+            latent_multimodal_concept_loss_from_views(
+                {mode: bundle["latent_concepts"]
+                 for mode, bundle in bundles_by_mode.items()},
+                invariance_w=latent_concept_invariance_w,
+                variance_w=latent_concept_variance_w,
+                covariance_w=latent_concept_covariance_w,
+                variance_target=latent_concept_variance_target)
+            if latent_concept_w else base_loss * 0.0)
         concept_prototype_spread = (
             concept_factor_prototype_spread_loss(
                 model, margin=concept_prototype_spread_margin)
@@ -1230,7 +1346,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                 + float(concept_centroid_w) * concept_centroid
                 + float(concept_prototype_w) * concept_prototype
                 + float(concept_prototype_spread_w) * concept_prototype_spread
-                + float(concept_state_spread_w) * concept_state_spread)
+                + float(concept_state_spread_w) * concept_state_spread
+                + float(latent_concept_w) * latent_concept)
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -1246,6 +1363,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         last_concept_prototype = float(concept_prototype.detach())
         last_concept_prototype_spread = float(concept_prototype_spread.detach())
         last_concept_state_spread = float(concept_state_spread.detach())
+        last_latent_concept = float(latent_concept.detach())
         if st % log_every == 0 or st == steps:
             print(f"  m0 {st}/{steps} loss {loss.item():.3f} "
                   f"base {last_base:.3f} agree {last_agreement:.3f} "
@@ -1258,7 +1376,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                   f"concept-centroid {last_concept_centroid:.3f} "
                   f"concept-proto {last_concept_prototype:.3f} "
                   f"concept-proto-spread {last_concept_prototype_spread:.3f} "
-                  f"concept-state-spread {last_concept_state_spread:.3f}",
+                  f"concept-state-spread {last_concept_state_spread:.3f} "
+                  f"latent {last_latent_concept:.3f}",
                   flush=True)
     model.train_metrics = {"token_loss": last_base, "agreement_loss": last_agreement,
                            "concept_loss": last_concept,
@@ -1271,7 +1390,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                            "concept_prototype_loss": last_concept_prototype,
                            "concept_prototype_spread_loss": (
                                last_concept_prototype_spread),
-                           "concept_state_spread_loss": last_concept_state_spread}
+                           "concept_state_spread_loss": last_concept_state_spread,
+                           "latent_concept_loss": last_latent_concept}
     return model, vocab, surfaces
 
 
@@ -1298,6 +1418,10 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         concept_prefix=False, concept_refine=False,
         concept_refine_gate_init=-2.0,
         concept_mixer_layers=0, concept_mixer_gate_init=-2.0,
+        latent_concept_slots=0, latent_concept_layers=1,
+        latent_concept_w=0.0, latent_concept_view_dropout=0.1,
+        latent_concept_invariance_w=25.0, latent_concept_variance_w=25.0,
+        latent_concept_covariance_w=1.0, latent_concept_variance_target=1.0,
         concept_w=0.0, concept_agreement_w=0.0,
         concept_distill_w=0.0, concept_distill_temperature=1.0,
         concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
@@ -1325,6 +1449,18 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                    concept_refine_gate_init=concept_refine_gate_init,
                                    concept_mixer_layers=concept_mixer_layers,
                                    concept_mixer_gate_init=concept_mixer_gate_init,
+                                   latent_concept_slots=latent_concept_slots,
+                                   latent_concept_layers=latent_concept_layers,
+                                   latent_concept_w=latent_concept_w,
+                                   latent_concept_view_dropout=(
+                                       latent_concept_view_dropout),
+                                   latent_concept_invariance_w=(
+                                       latent_concept_invariance_w),
+                                   latent_concept_variance_w=latent_concept_variance_w,
+                                   latent_concept_covariance_w=(
+                                       latent_concept_covariance_w),
+                                   latent_concept_variance_target=(
+                                       latent_concept_variance_target),
                                    concept_w=concept_w,
                                    concept_agreement_w=concept_agreement_w,
                                    concept_distill_w=concept_distill_w,
@@ -1396,6 +1532,14 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
               "concept_refine_gate_init": float(concept_refine_gate_init),
               "concept_mixer_layers": int(concept_mixer_layers),
               "concept_mixer_gate_init": float(concept_mixer_gate_init),
+              "latent_concept_slots": int(latent_concept_slots),
+              "latent_concept_layers": int(latent_concept_layers),
+              "latent_concept_w": float(latent_concept_w),
+              "latent_concept_view_dropout": float(latent_concept_view_dropout),
+              "latent_concept_invariance_w": float(latent_concept_invariance_w),
+              "latent_concept_variance_w": float(latent_concept_variance_w),
+              "latent_concept_covariance_w": float(latent_concept_covariance_w),
+              "latent_concept_variance_target": float(latent_concept_variance_target),
               "concept_w": float(concept_w),
               "concept_agreement_w": float(concept_agreement_w),
               "concept_distill_w": float(concept_distill_w),
@@ -1500,6 +1644,10 @@ def selftest():
     masked_states = masked_head.state_tensor(masked_src, mask=masked)
     assert torch.isfinite(masked_states).all()
     assert torch.allclose(masked_states[0], torch.zeros_like(masked_states[0]))
+    latent_head = LatentConceptHead(2, 8, heads=2, mixer_layers=1)
+    latent_masked = latent_head(masked_src, mask=masked, project=True)
+    assert torch.isfinite(latent_masked).all()
+    assert torch.allclose(latent_masked[0], torch.zeros_like(latent_masked[0]))
     bundle = model.mode_bundle(x, a, tt, ids, mode="full", need_factor=True,
                                need_geometry=True)
     assert bundle["logits"].shape == logits.shape
@@ -1535,6 +1683,18 @@ def selftest():
     assert set(mixer_states) == set(VALUE_POS)
     assert any(name.startswith("factor_concepts.mixer.")
                for name, _param in mixer_model.named_parameters())
+    latent_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
+                                latent_concept_slots=3,
+                                latent_concept_layers=1).to("cpu")
+    latent_states = latent_model.latent_concept_states(
+        x, a, tt, mode="full", project=True)
+    assert latent_states.shape == (2, 3, 32)
+    latent_bundle = latent_model.mode_bundle(
+        x, a, tt, ids, mode="full", need_latent=True,
+        latent_view_dropout=0.1, latent_project=True)
+    assert latent_bundle["latent_concepts"].shape == (2, 3, 32)
+    assert torch.isfinite(latent_multimodal_concept_loss(
+        latent_model, x, a, tt, view_dropout=0.1))
     rel_txt_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
                                  text_arch="relational", text_layers=1).to("cpu")
     assert rel_txt_model.txt.arch == "relational"
@@ -1630,6 +1790,30 @@ def main(argv=None):
     ap.add_argument("--concept-mixer-gate-init", type=float, default=-2.0,
                     dest="concept_mixer_gate_init",
                     help="initial logit for the learned schema factor concept workspace gate")
+    ap.add_argument("--latent-concept-slots", type=int, default=0,
+                    dest="latent_concept_slots",
+                    help="schema-free latent concept slots aligned across modality views")
+    ap.add_argument("--latent-concept-layers", type=int, default=1,
+                    dest="latent_concept_layers",
+                    help="self-attention layers inside latent concept slots")
+    ap.add_argument("--latent-concept-w", type=float, default=0.0,
+                    dest="latent_concept_w",
+                    help="weight for schema-free latent multimodal concept loss")
+    ap.add_argument("--latent-concept-view-dropout", type=float, default=0.1,
+                    dest="latent_concept_view_dropout",
+                    help="feature dropout used for latent multimodal concept views")
+    ap.add_argument("--latent-concept-invariance-w", type=float, default=25.0,
+                    dest="latent_concept_invariance_w",
+                    help="invariance term weight inside latent concept loss")
+    ap.add_argument("--latent-concept-variance-w", type=float, default=25.0,
+                    dest="latent_concept_variance_w",
+                    help="anti-collapse variance term weight inside latent concept loss")
+    ap.add_argument("--latent-concept-covariance-w", type=float, default=1.0,
+                    dest="latent_concept_covariance_w",
+                    help="decorrelation term weight inside latent concept loss")
+    ap.add_argument("--latent-concept-variance-target", type=float, default=1.0,
+                    dest="latent_concept_variance_target",
+                    help="minimum per-dimension std target for latent concept slots")
     ap.add_argument("--concept-w", type=float, default=0.0, dest="concept_w",
                     help="supervised upstream concept-token factor loss weight")
     ap.add_argument("--concept-agreement-w", type=float, default=0.0,
@@ -1770,6 +1954,22 @@ def main(argv=None):
         ap.error("--concept-mixer-layers must be non-negative")
     if not math.isfinite(args.concept_mixer_gate_init):
         ap.error("--concept-mixer-gate-init must be finite")
+    if args.latent_concept_slots < 0:
+        ap.error("--latent-concept-slots must be non-negative")
+    if args.latent_concept_layers <= 0:
+        ap.error("--latent-concept-layers must be positive")
+    if args.latent_concept_w < 0.0:
+        ap.error("--latent-concept-w must be non-negative")
+    if args.latent_concept_w > 0.0 and args.latent_concept_slots <= 0:
+        ap.error("--latent-concept-w requires --latent-concept-slots > 0")
+    if args.latent_concept_view_dropout < 0.0 or args.latent_concept_view_dropout >= 1.0:
+        ap.error("--latent-concept-view-dropout must be in [0, 1)")
+    if (args.latent_concept_invariance_w < 0.0
+            or args.latent_concept_variance_w < 0.0
+            or args.latent_concept_covariance_w < 0.0):
+        ap.error("latent concept loss weights must be non-negative")
+    if args.latent_concept_variance_target < 0.0:
+        ap.error("--latent-concept-variance-target must be non-negative")
     if args.modality_dropout < 0.0 or args.modality_dropout > 1.0:
         ap.error("--modality-dropout must be in [0, 1]")
     if args.eval_n <= 0:
@@ -1794,6 +1994,14 @@ def main(argv=None):
                  concept_refine_gate_init=args.concept_refine_gate_init,
                  concept_mixer_layers=args.concept_mixer_layers,
                  concept_mixer_gate_init=args.concept_mixer_gate_init,
+                 latent_concept_slots=args.latent_concept_slots,
+                 latent_concept_layers=args.latent_concept_layers,
+                 latent_concept_w=args.latent_concept_w,
+                 latent_concept_view_dropout=args.latent_concept_view_dropout,
+                 latent_concept_invariance_w=args.latent_concept_invariance_w,
+                 latent_concept_variance_w=args.latent_concept_variance_w,
+                 latent_concept_covariance_w=args.latent_concept_covariance_w,
+                 latent_concept_variance_target=args.latent_concept_variance_target,
                  concept_w=args.concept_w,
                  concept_agreement_w=args.concept_agreement_w,
                  concept_distill_w=args.concept_distill_w,

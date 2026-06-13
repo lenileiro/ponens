@@ -9,6 +9,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _off_diagonal(x):
+    n, m = x.shape
+    if n != m:
+        raise ValueError("off-diagonal helper expects a square matrix")
+    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+
+
 class SchemaConceptMixer(nn.Module):
     """Self-attention workspace over data-defined schema concept states."""
 
@@ -39,6 +46,71 @@ class SchemaConceptMixer(nn.Module):
         mixed = self.ln(self.enc(h))
         gate = torch.sigmoid(self.gate_logit)
         return states + gate * (mixed - h)
+
+
+class LatentConceptHead(nn.Module):
+    """Schema-free concept slots read from a source sequence.
+
+    These slots are not tied to hand-authored keys or values. They are trainable
+    queries that must discover reusable factors from whatever source states the
+    caller gives them.
+    """
+
+    def __init__(self, slots, d, heads=4, mixer_layers=1, init_scale=0.02):
+        super().__init__()
+        self.slots = int(slots)
+        self.d = int(d)
+        self.heads = int(heads)
+        self.mixer_layers = int(mixer_layers)
+        if self.slots <= 0:
+            raise ValueError("latent concept slots must be positive")
+        if self.heads <= 0:
+            raise ValueError("latent concept heads must be positive")
+        if self.mixer_layers < 0:
+            raise ValueError("latent concept mixer layers must be non-negative")
+        if d % self.heads != 0:
+            raise ValueError("latent concept dimension must be divisible by heads")
+        self.queries = nn.Parameter(torch.randn(self.slots, d) * init_scale)
+        self.query_ln = nn.LayerNorm(d)
+        self.source_ln = nn.LayerNorm(d)
+        self.attn = nn.MultiheadAttention(d, self.heads, dropout=0.0, batch_first=True)
+        self.mixer = (SchemaConceptMixer(
+            self.slots, d, heads=self.heads, layers=self.mixer_layers)
+            if self.mixer_layers > 0 else None)
+        self.out_ln = nn.LayerNorm(d)
+        self.projector = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, d),
+            nn.GELU(),
+            nn.Linear(d, d, bias=False),
+        )
+
+    def forward(self, source, mask=None, project=False):
+        q = self.queries.unsqueeze(0).expand(source.shape[0], -1, -1)
+        key_padding_mask = None
+        all_masked = None
+        if mask is not None:
+            key_padding_mask = mask.to(device=source.device, dtype=torch.bool)
+            all_masked = key_padding_mask.all(dim=-1)
+            if bool(all_masked.any()):
+                key_padding_mask = key_padding_mask.clone()
+                key_padding_mask[all_masked] = False
+        slots, _weights = self.attn(
+            self.query_ln(q), self.source_ln(source), self.source_ln(source),
+            key_padding_mask=key_padding_mask, need_weights=False)
+        if all_masked is not None and bool(all_masked.any()):
+            slots = slots.masked_fill(all_masked[:, None, None], 0.0)
+        if self.mixer is not None:
+            slots = self.mixer(slots)
+        slots = self.out_ln(slots)
+        if all_masked is not None and bool(all_masked.any()):
+            slots = slots.masked_fill(all_masked[:, None, None], 0.0)
+        if project:
+            slots = self.projector(slots)
+            if all_masked is not None and bool(all_masked.any()):
+                slots = slots.masked_fill(all_masked[:, None, None], 0.0)
+            return slots
+        return slots
 
 
 class SchemaConceptHead(nn.Module):
@@ -201,6 +273,38 @@ def _zero_from_states(states_by_key):
     for states in states_by_key.values():
         return states.sum() * 0.0
     return torch.tensor(0.0)
+
+
+def latent_concept_vicreg_loss(slots_a, slots_b, invariance_weight=25.0,
+                               variance_weight=25.0, covariance_weight=1.0,
+                               variance_target=1.0):
+    """Self-supervised latent-concept invariance plus anti-collapse loss.
+
+    Two stochastic or cross-modal views of the same observation should keep the
+    same latent concept slots, while batch variance and covariance terms prevent
+    the slots from collapsing to a constant representation.
+    """
+    if slots_a.shape != slots_b.shape:
+        raise ValueError("latent concept views must have matching shapes")
+    x = slots_a.reshape(-1, slots_a.shape[-1])
+    y = slots_b.reshape(-1, slots_b.shape[-1])
+    inv = F.mse_loss(x, y)
+    if x.shape[0] < 2:
+        zero = (x.sum() + y.sum()) * 0.0
+        return float(invariance_weight) * inv + zero
+    var_target = float(variance_target)
+    x_std = torch.sqrt(x.var(dim=0, unbiased=False) + 1e-4)
+    y_std = torch.sqrt(y.var(dim=0, unbiased=False) + 1e-4)
+    var = F.relu(var_target - x_std).mean() + F.relu(var_target - y_std).mean()
+    x = x - x.mean(dim=0, keepdim=True)
+    y = y - y.mean(dim=0, keepdim=True)
+    cov_x = x.t().matmul(x) / (x.shape[0] - 1)
+    cov_y = y.t().matmul(y) / (y.shape[0] - 1)
+    cov = (_off_diagonal(cov_x).pow(2).sum() / x.shape[-1]
+           + _off_diagonal(cov_y).pow(2).sum() / y.shape[-1])
+    return (float(invariance_weight) * inv
+            + float(variance_weight) * var
+            + float(covariance_weight) * cov)
 
 
 def schema_concept_contrastive_loss(states_by_key, target_ids_by_key, temperature=0.1):

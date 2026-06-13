@@ -50,8 +50,10 @@ from device import get_device
 from scratchpad_model import CausalBlock, ScratchpadLM
 
 from .concepts import (
+    LatentConceptHead,
     SchemaConceptHead,
     SchemaConceptRefiner,
+    latent_concept_vicreg_loss,
     schema_concept_batch_centroid_loss,
     schema_concept_contrastive_loss,
     schema_concept_prototype_alignment_loss,
@@ -1090,7 +1092,8 @@ class TextFactLM(nn.Module):
                  text_encoder_arch="transformer", text_encoder_layers=1,
                  fact_concept_refine=False, fact_concept_refine_gate_init=-2.0,
                  fact_concept_mixer_layers=0,
-                 fact_concept_mixer_gate_init=-2.0):
+                 fact_concept_mixer_gate_init=-2.0,
+                 latent_concept_slots=0, latent_concept_layers=1):
         super().__init__()
         self.d = int(d)
         self.heads = int(heads)
@@ -1099,6 +1102,8 @@ class TextFactLM(nn.Module):
         self.fact_concept_refine_gate_init = float(fact_concept_refine_gate_init)
         self.fact_concept_mixer_layers = int(fact_concept_mixer_layers)
         self.fact_concept_mixer_gate_init = float(fact_concept_mixer_gate_init)
+        self.latent_concept_slots = int(latent_concept_slots)
+        self.latent_concept_layers = int(latent_concept_layers)
         self.text_encoder_arch = str(text_encoder_arch)
         self.text_encoder_layers = int(text_encoder_layers)
         self.txt = TextPrefix(vocab_size, d=d, pad=pad, heads=heads,
@@ -1118,6 +1123,10 @@ class TextFactLM(nn.Module):
         self.fact_schema = fact_schema
         self.fact_heads = nn.ModuleDict()
         self.fact_concept_refiner = None
+        self.latent_concepts = (LatentConceptHead(
+            self.latent_concept_slots, d, heads=heads,
+            mixer_layers=self.latent_concept_layers)
+            if self.latent_concept_slots > 0 else None)
         if fact_schema is not None:
             self.fact_query = nn.Parameter(torch.randn(len(fact_schema.keys), d) * 0.02)
             self.fact_concepts = SchemaConceptHead(
@@ -1160,9 +1169,32 @@ class TextFactLM(nn.Module):
         self.fact_concept_mixer_gate_init = float(gate_init)
         return self
 
-    def encode_text(self, txt):
+    def enable_latent_concepts(self, slots, heads=None, layers=1):
+        slots = int(slots)
+        latent_heads = int(heads or self.heads)
+        latent_layers = int(layers)
+        if slots <= 0:
+            self.latent_concepts = None
+            self.latent_concept_slots = 0
+            return self
+        if (self.latent_concepts is None
+                or self.latent_concept_slots != slots
+                or getattr(self.latent_concepts, "heads", latent_heads) != latent_heads
+                or getattr(self.latent_concepts, "mixer_layers", latent_layers)
+                != latent_layers):
+            self.latent_concepts = LatentConceptHead(
+                slots, self.d, heads=latent_heads, mixer_layers=latent_layers)
+            self.latent_concepts.to(next(self.parameters()).device)
+        self.latent_concept_slots = slots
+        self.latent_concept_layers = latent_layers
+        return self
+
+    def encode_text(self, txt, feature_dropout=0.0):
         mask = txt.eq(self.txt.pad)
         prefix = self.txt(txt)
+        if self.training and feature_dropout > 0.0:
+            prefix = F.dropout(prefix, p=float(feature_dropout), training=True)
+            prefix = prefix.masked_fill(mask.unsqueeze(-1), 0.0)
         if (self.fact_concept_refine and self.fact_concepts is not None
                 and self.fact_concept_refiner is not None):
             concepts = self.fact_concepts.state_tensor(prefix, mask=mask)
@@ -1170,6 +1202,12 @@ class TextFactLM(nn.Module):
         keep = (~mask).unsqueeze(-1)
         pooled = (prefix * keep).sum(1) / keep.sum(1).clamp(min=1)
         return prefix, pooled
+
+    def latent_concept_states(self, txt, feature_dropout=0.0, project=False):
+        if self.latent_concepts is None:
+            return None
+        prefix, _pooled = self.encode_text(txt, feature_dropout=feature_dropout)
+        return self.latent_concepts(prefix, mask=txt.eq(self.txt.pad), project=project)
 
     def forward(self, txt, ids):
         prefix = self.decoder_prefix(txt)
@@ -1611,6 +1649,18 @@ def fact_concept_state_spread_loss(model, txt, records, schema, variance_target=
     return schema_concept_state_spread_loss(
         states, targets, variance_target=variance_target,
         centroid_margin=centroid_margin, covariance_weight=covariance_weight)
+
+
+def latent_text_concept_loss(model, txt, view_dropout=0.1,
+                             invariance_w=25.0, variance_w=25.0,
+                             covariance_w=1.0, variance_target=1.0):
+    if getattr(model, "latent_concepts", None) is None:
+        return torch.tensor(0.0, device=txt.device)
+    a = model.latent_concept_states(txt, feature_dropout=view_dropout, project=True)
+    b = model.latent_concept_states(txt, feature_dropout=view_dropout, project=True)
+    return latent_concept_vicreg_loss(
+        a, b, invariance_weight=invariance_w, variance_weight=variance_w,
+        covariance_weight=covariance_w, variance_target=variance_target)
 
 
 def choice_loss(model, txt, records, answer_w=1.0, none_w=1.0,
@@ -3124,6 +3174,12 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               fact_concept_state_spread_variance=0.05,
               fact_concept_state_spread_margin=0.2,
               fact_concept_state_spread_covariance_w=0.05,
+              latent_concept_w=0.0,
+              latent_concept_view_dropout=0.1,
+              latent_concept_invariance_w=25.0,
+              latent_concept_variance_w=25.0,
+              latent_concept_covariance_w=1.0,
+              latent_concept_variance_target=1.0,
               prefix="text", decode_w=1.0, choice_w=0.0,
               choice_answer_w=1.0, choice_none_w=1.0,
               choice_answer_margin=0.0, choice_none_margin=0.0,
@@ -3175,6 +3231,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               choice_control_w=0.0, choice_control_contrast_w=0.0,
               choice_control_margin=0.0,
               choice_control_sides=None):
+    if latent_concept_w > 0.0 and getattr(model, "latent_concepts", None) is None:
+        raise ValueError("latent_concept_w requires latent concept slots")
     rng = np.random.default_rng(seed)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     train_records = [r for r in records if r.split == "train"]
@@ -3257,6 +3315,14 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 centroid_margin=fact_concept_state_spread_margin,
                 covariance_weight=fact_concept_state_spread_covariance_w)
             if fact_concept_state_spread_w else torch.tensor(0.0, device=device))
+        latent_loss = (
+            latent_text_concept_loss(
+                model, txt, view_dropout=latent_concept_view_dropout,
+                invariance_w=latent_concept_invariance_w,
+                variance_w=latent_concept_variance_w,
+                covariance_w=latent_concept_covariance_w,
+                variance_target=latent_concept_variance_target)
+            if latent_concept_w else torch.tensor(0.0, device=device))
         ch_loss = choice_loss(model, txt, rec_batch,
                               answer_w=choice_answer_w, none_w=choice_none_w,
                               answer_margin=choice_answer_margin,
@@ -3583,6 +3649,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 + fact_concept_prototype_w * concept_proto_loss
                 + fact_concept_prototype_spread_w * concept_proto_spread_loss
                 + fact_concept_state_spread_w * concept_state_spread_loss
+                + latent_concept_w * latent_loss
                 + choice_w * ch_loss
                 + choice_final_w * final_loss
                 + choice_final_control_w * final_control_loss
@@ -3622,6 +3689,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                   f"fact-proto {concept_proto_loss.item():.3f} "
                   f"fact-proto-spread {concept_proto_spread_loss.item():.3f} "
                   f"fact-state-spread {concept_state_spread_loss.item():.3f} "
+                  f"latent {latent_loss.item():.3f} "
                   f"choice {ch_loss.item():.3f} final {final_loss.item():.3f} "
                   f"final-control {final_control_loss.item():.3f} "
                   f"final-contrast {final_contrast_loss.item():.3f} "
@@ -3655,6 +3723,7 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4,
                 text_encoder_arch="transformer", text_encoder_layers=1,
                 fact_concept_refine=False, fact_concept_refine_gate_init=-2.0,
                 fact_concept_mixer_layers=0, fact_concept_mixer_gate_init=-2.0,
+                latent_concept_slots=0, latent_concept_layers=1,
                 lr=1e-3, seed=0, device=DEV, log_every=100,
                 semantic_w=0.5, balance_by="none",
                 fact_concept_w=0.0, fact_concept_contrast_w=0.0,
@@ -3670,6 +3739,12 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4,
                 fact_concept_state_spread_variance=0.05,
                 fact_concept_state_spread_margin=0.2,
                 fact_concept_state_spread_covariance_w=0.05,
+                latent_concept_w=0.0,
+                latent_concept_view_dropout=0.1,
+                latent_concept_invariance_w=25.0,
+                latent_concept_variance_w=25.0,
+                latent_concept_covariance_w=1.0,
+                latent_concept_variance_target=1.0,
                 decode_w=1.0, choice_w=0.0, choice_answer_w=1.0,
                 choice_none_w=1.0, choice_context_w=0.0,
                 choice_answer_margin=0.0, choice_none_margin=0.0,
@@ -3723,7 +3798,9 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4,
                            fact_concept_refine_gate_init),
                        fact_concept_mixer_layers=fact_concept_mixer_layers,
                        fact_concept_mixer_gate_init=(
-                           fact_concept_mixer_gate_init)).to(device)
+                           fact_concept_mixer_gate_init),
+                       latent_concept_slots=latent_concept_slots,
+                       latent_concept_layers=latent_concept_layers).to(device)
     return fit_model(model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
                      device=device, log_every=log_every, semantic_w=semantic_w,
                      balance_by=balance_by, fact_concept_w=fact_concept_w,
@@ -3744,6 +3821,12 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4,
                      fact_concept_state_spread_margin=fact_concept_state_spread_margin,
                      fact_concept_state_spread_covariance_w=(
                          fact_concept_state_spread_covariance_w),
+                     latent_concept_w=latent_concept_w,
+                     latent_concept_view_dropout=latent_concept_view_dropout,
+                     latent_concept_invariance_w=latent_concept_invariance_w,
+                     latent_concept_variance_w=latent_concept_variance_w,
+                     latent_concept_covariance_w=latent_concept_covariance_w,
+                     latent_concept_variance_target=latent_concept_variance_target,
                      prefix="text", decode_w=decode_w, choice_w=choice_w,
                      choice_answer_w=choice_answer_w,
                      choice_none_w=choice_none_w,
@@ -5057,7 +5140,11 @@ def load_checkpoint(path, device=DEV):
                        fact_concept_mixer_layers=int(
                            ckpt.get("fact_concept_mixer_layers", 0)),
                        fact_concept_mixer_gate_init=float(
-                           ckpt.get("fact_concept_mixer_gate_init", -2.0))).to(device)
+                           ckpt.get("fact_concept_mixer_gate_init", -2.0)),
+                       latent_concept_slots=int(
+                           ckpt.get("latent_concept_slots", 0)),
+                       latent_concept_layers=int(
+                           ckpt.get("latent_concept_layers", 1))).to(device)
     state = ckpt["state_dict"]
     model.load_state_dict(state, strict=False)
     model.has_fact_concept_state = any(k.startswith("fact_concepts.") for k in state)
@@ -5085,7 +5172,11 @@ def expanded_checkpoint_model(checkpoint, records, device=DEV):
                        fact_concept_mixer_layers=int(
                            ckpt.get("fact_concept_mixer_layers", 0)),
                        fact_concept_mixer_gate_init=float(
-                           ckpt.get("fact_concept_mixer_gate_init", -2.0))).to(device)
+                           ckpt.get("fact_concept_mixer_gate_init", -2.0)),
+                       latent_concept_slots=int(
+                           ckpt.get("latent_concept_slots", 0)),
+                       latent_concept_layers=int(
+                           ckpt.get("latent_concept_layers", 1))).to(device)
     copy_pretrained_text_weights(src_model, src_vocab, model, vocab)
     model.eval()
     return model, vocab, ckpt
@@ -5101,6 +5192,8 @@ def checkpoint_payload(model, vocab, d, layers, heads, report):
                 getattr(model, "fact_concept_mixer_layers", 0)),
             "fact_concept_mixer_gate_init": float(
                 getattr(model, "fact_concept_mixer_gate_init", -2.0)),
+            "latent_concept_slots": int(getattr(model, "latent_concept_slots", 0)),
+            "latent_concept_layers": int(getattr(model, "latent_concept_layers", 1)),
             "text_encoder_arch": getattr(model, "text_encoder_arch", "transformer"),
             "text_encoder_layers": int(getattr(model, "text_encoder_layers", 1)),
             "d": d, "layers": layers, "heads": heads, "fact_schema": {
@@ -5382,6 +5475,10 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         text_encoder_arch="transformer", text_encoder_layers=1,
         fact_concept_refine=False, fact_concept_refine_gate_init=-2.0,
         fact_concept_mixer_layers=0, fact_concept_mixer_gate_init=-2.0,
+        latent_concept_slots=0, latent_concept_layers=1,
+        latent_concept_w=0.0, latent_concept_view_dropout=0.1,
+        latent_concept_invariance_w=25.0, latent_concept_variance_w=25.0,
+        latent_concept_covariance_w=1.0, latent_concept_variance_target=1.0,
         fact_n=0, kind_fact_n=0, artifact_n=0, decode_w=1.0, choice_w=0.0,
         fact_concept_w=0.0, fact_concept_contrast_w=0.0,
         fact_concept_contrast_temperature=0.1,
@@ -5443,6 +5540,8 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                fact_concept_mixer_layers=fact_concept_mixer_layers,
                                fact_concept_mixer_gate_init=(
                                    fact_concept_mixer_gate_init),
+                               latent_concept_slots=latent_concept_slots,
+                               latent_concept_layers=latent_concept_layers,
                                seed=seed, device=device, semantic_w=semantic_w,
                                balance_by=balance_by, fact_concept_w=fact_concept_w,
                                fact_concept_contrast_w=fact_concept_contrast_w,
@@ -5465,6 +5564,13 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                    fact_concept_state_spread_margin),
                                fact_concept_state_spread_covariance_w=(
                                    fact_concept_state_spread_covariance_w),
+                               latent_concept_w=latent_concept_w,
+                               latent_concept_view_dropout=latent_concept_view_dropout,
+                               latent_concept_invariance_w=latent_concept_invariance_w,
+                               latent_concept_variance_w=latent_concept_variance_w,
+                               latent_concept_covariance_w=latent_concept_covariance_w,
+                               latent_concept_variance_target=(
+                                   latent_concept_variance_target),
                                decode_w=decode_w,
                                choice_w=choice_w, choice_answer_w=choice_answer_w,
                                choice_none_w=choice_none_w,
@@ -5557,6 +5663,14 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                   getattr(model, "fact_concept_mixer_layers", 0)),
               "fact_concept_mixer_gate_init": float(
                   getattr(model, "fact_concept_mixer_gate_init", -2.0)),
+              "latent_concept_slots": int(getattr(model, "latent_concept_slots", 0)),
+              "latent_concept_layers": int(getattr(model, "latent_concept_layers", 1)),
+              "latent_concept_w": float(latent_concept_w),
+              "latent_concept_view_dropout": float(latent_concept_view_dropout),
+              "latent_concept_invariance_w": float(latent_concept_invariance_w),
+              "latent_concept_variance_w": float(latent_concept_variance_w),
+              "latent_concept_covariance_w": float(latent_concept_covariance_w),
+              "latent_concept_variance_target": float(latent_concept_variance_target),
               "fact_concept_prototype_w": float(fact_concept_prototype_w),
               "fact_concept_prototype_spread_w": float(
                   fact_concept_prototype_spread_w),
@@ -5682,6 +5796,14 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      fact_concept_refine_gate_init=-2.0,
                      fact_concept_mixer_layers=0,
                      fact_concept_mixer_gate_init=-2.0,
+                     latent_concept_slots=0,
+                     latent_concept_layers=1,
+                     latent_concept_w=0.0,
+                     latent_concept_view_dropout=0.1,
+                     latent_concept_invariance_w=25.0,
+                     latent_concept_variance_w=25.0,
+                     latent_concept_covariance_w=1.0,
+                     latent_concept_variance_target=1.0,
                      fact_concept_prototype_w=0.0,
                      fact_concept_prototype_spread_w=0.0,
                      fact_concept_prototype_spread_margin=0.2,
@@ -5772,6 +5894,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
         model.enable_fact_concept_mixer(
             heads=heads, layers=fact_concept_mixer_layers,
             gate_init=fact_concept_mixer_gate_init)
+    if latent_concept_slots > 0:
+        model.enable_latent_concepts(
+            latent_concept_slots, heads=heads, layers=latent_concept_layers)
     old_schema = fact_schema_from_payload(ckpt.get("fact_schema"))
     old_fact_values = (sum(len(v) for v in old_schema.values) if old_schema is not None else 0)
     new_fact_values = sum(len(v) for v in model.fact_schema.values)
@@ -5840,6 +5965,14 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   getattr(model, "fact_concept_mixer_layers", 0)),
               "fact_concept_mixer_gate_init": float(
                   getattr(model, "fact_concept_mixer_gate_init", -2.0)),
+              "latent_concept_slots": int(getattr(model, "latent_concept_slots", 0)),
+              "latent_concept_layers": int(getattr(model, "latent_concept_layers", 1)),
+              "latent_concept_w": float(latent_concept_w),
+              "latent_concept_view_dropout": float(latent_concept_view_dropout),
+              "latent_concept_invariance_w": float(latent_concept_invariance_w),
+              "latent_concept_variance_w": float(latent_concept_variance_w),
+              "latent_concept_covariance_w": float(latent_concept_covariance_w),
+              "latent_concept_variance_target": float(latent_concept_variance_target),
               "fact_concept_prototype_w": float(fact_concept_prototype_w),
               "fact_concept_prototype_spread_w": float(
                   fact_concept_prototype_spread_w),
@@ -6205,6 +6338,12 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   fact_concept_state_spread_margin=fact_concept_state_spread_margin,
                   fact_concept_state_spread_covariance_w=(
                       fact_concept_state_spread_covariance_w),
+                  latent_concept_w=latent_concept_w,
+                  latent_concept_view_dropout=latent_concept_view_dropout,
+                  latent_concept_invariance_w=latent_concept_invariance_w,
+                  latent_concept_variance_w=latent_concept_variance_w,
+                  latent_concept_covariance_w=latent_concept_covariance_w,
+                  latent_concept_variance_target=latent_concept_variance_target,
                   prefix=f"study-r{round_i + 1}",
                   decode_w=decode_w, choice_w=choice_w,
                   choice_answer_w=choice_answer_w, choice_none_w=choice_none_w,
@@ -6558,6 +6697,14 @@ def selftest():
     assert mixed_states.shape == (len(choice_eval), len(choice_schema.keys), 32)
     assert any(name.startswith("fact_concepts.mixer.")
                for name, _param in mixer_model.named_parameters())
+    latent_model = TextFactLM(len(choice_vocab), d=32, layers=1, heads=4,
+                              pad=choice_vocab.pad, fact_schema=choice_schema,
+                              latent_concept_slots=3,
+                              latent_concept_layers=1).to("cpu")
+    latent_states = latent_model.latent_concept_states(choice_txt, project=True)
+    assert latent_states.shape == (len(choice_eval), 3, 32)
+    assert torch.isfinite(latent_text_concept_loss(
+        latent_model, choice_txt, view_dropout=0.1))
     rel_model = TextFactLM(len(choice_vocab), d=32, layers=1, heads=4,
                            pad=choice_vocab.pad, fact_schema=choice_schema,
                            text_encoder_arch="relational",
@@ -7139,6 +7286,30 @@ def main(argv=None):
     ap.add_argument("--fact-concept-mixer-gate-init", type=float, default=-2.0,
                     dest="fact_concept_mixer_gate_init",
                     help="initial logit for the learned schema concept workspace gate")
+    ap.add_argument("--latent-concept-slots", type=int, default=0,
+                    dest="latent_concept_slots",
+                    help="schema-free latent concept slots learned from reading views")
+    ap.add_argument("--latent-concept-layers", type=int, default=1,
+                    dest="latent_concept_layers",
+                    help="self-attention layers inside schema-free latent concept slots")
+    ap.add_argument("--latent-concept-w", type=float, default=0.0,
+                    dest="latent_concept_w",
+                    help="weight for schema-free self-supervised latent concept loss")
+    ap.add_argument("--latent-concept-view-dropout", type=float, default=0.1,
+                    dest="latent_concept_view_dropout",
+                    help="feature dropout used to create two reading views")
+    ap.add_argument("--latent-concept-invariance-w", type=float, default=25.0,
+                    dest="latent_concept_invariance_w",
+                    help="invariance term weight inside latent concept loss")
+    ap.add_argument("--latent-concept-variance-w", type=float, default=25.0,
+                    dest="latent_concept_variance_w",
+                    help="anti-collapse variance term weight inside latent concept loss")
+    ap.add_argument("--latent-concept-covariance-w", type=float, default=1.0,
+                    dest="latent_concept_covariance_w",
+                    help="decorrelation term weight inside latent concept loss")
+    ap.add_argument("--latent-concept-variance-target", type=float, default=1.0,
+                    dest="latent_concept_variance_target",
+                    help="minimum per-dimension std target for latent concept slots")
     ap.add_argument("--fact-concept-prototype-w", type=float, default=0.0,
                     dest="fact_concept_prototype_w",
                     help="weight for schema-generic learned concept prototype loss")
@@ -7446,6 +7617,22 @@ def main(argv=None):
         ap.error("--fact-concept-mixer-layers must be non-negative")
     if not math.isfinite(args.fact_concept_mixer_gate_init):
         ap.error("--fact-concept-mixer-gate-init must be finite")
+    if args.latent_concept_slots < 0:
+        ap.error("--latent-concept-slots must be non-negative")
+    if args.latent_concept_layers <= 0:
+        ap.error("--latent-concept-layers must be positive")
+    if args.latent_concept_w < 0.0:
+        ap.error("--latent-concept-w must be non-negative")
+    if args.latent_concept_w > 0.0 and args.latent_concept_slots <= 0:
+        ap.error("--latent-concept-w requires --latent-concept-slots > 0")
+    if args.latent_concept_view_dropout < 0.0 or args.latent_concept_view_dropout >= 1.0:
+        ap.error("--latent-concept-view-dropout must be in [0, 1)")
+    if (args.latent_concept_invariance_w < 0.0
+            or args.latent_concept_variance_w < 0.0
+            or args.latent_concept_covariance_w < 0.0):
+        ap.error("latent concept loss weights must be non-negative")
+    if args.latent_concept_variance_target < 0.0:
+        ap.error("--latent-concept-variance-target must be non-negative")
     if args.import_scan:
         import_scan(args.out, url=args.scan_url, max_records=args.scan_max,
                     eval_frac=args.scan_eval_frac, seed=args.seed)
@@ -7523,6 +7710,15 @@ def main(argv=None):
                          fact_concept_mixer_layers=args.fact_concept_mixer_layers,
                          fact_concept_mixer_gate_init=(
                              args.fact_concept_mixer_gate_init),
+                         latent_concept_slots=args.latent_concept_slots,
+                         latent_concept_layers=args.latent_concept_layers,
+                         latent_concept_w=args.latent_concept_w,
+                         latent_concept_view_dropout=args.latent_concept_view_dropout,
+                         latent_concept_invariance_w=args.latent_concept_invariance_w,
+                         latent_concept_variance_w=args.latent_concept_variance_w,
+                         latent_concept_covariance_w=args.latent_concept_covariance_w,
+                         latent_concept_variance_target=(
+                             args.latent_concept_variance_target),
                          fact_concept_prototype_w=args.fact_concept_prototype_w,
                          fact_concept_prototype_spread_w=(
                              args.fact_concept_prototype_spread_w),
@@ -7662,6 +7858,14 @@ def main(argv=None):
         fact_concept_refine_gate_init=args.fact_concept_refine_gate_init,
         fact_concept_mixer_layers=args.fact_concept_mixer_layers,
         fact_concept_mixer_gate_init=args.fact_concept_mixer_gate_init,
+        latent_concept_slots=args.latent_concept_slots,
+        latent_concept_layers=args.latent_concept_layers,
+        latent_concept_w=args.latent_concept_w,
+        latent_concept_view_dropout=args.latent_concept_view_dropout,
+        latent_concept_invariance_w=args.latent_concept_invariance_w,
+        latent_concept_variance_w=args.latent_concept_variance_w,
+        latent_concept_covariance_w=args.latent_concept_covariance_w,
+        latent_concept_variance_target=args.latent_concept_variance_target,
         fact_concept_prototype_w=args.fact_concept_prototype_w,
         fact_concept_prototype_spread_w=args.fact_concept_prototype_spread_w,
         fact_concept_prototype_spread_margin=(
