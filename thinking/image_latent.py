@@ -12,10 +12,12 @@ linearly usable after compression instead of becoming another entangled bottlene
 
   python -m thinking.image_latent --selftest
   python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-steps 400 \
-      --cond-drop 0.1 --cfg-scale 1.5 --sample-steps 8 --flow-semantic-w 0.25 \
+      --cond-drop 0.1 --cfg-scale 1.5 --cfg-rescale 0.7 \
+      --sample-steps 8 --flow-semantic-w 0.25 \
       --out runs/image_latent_dit.pt
   python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
-      --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
+      --cfg-scales 1.0,1.25,1.5,2.0 --cfg-rescales 0.0,0.7 \
+      --sample-steps-list 4,8,16 \
       --eval-seeds 1,2,3 --roundtrip-samples 2 --eval-out runs/image_latent_dit_sweep.json
   python -m thinking.image_latent --train --cond-mode text --flow-arch dit \
       --ae-steps 400 --flow-steps 400 --flow-semantic-w 0.25
@@ -2329,19 +2331,35 @@ def cached_caption_payload_condition(payload, conditioner, source="tokens", devi
 
 
 @torch.no_grad()
-def guided_velocity(flow, z, t, cond, cfg_scale=1.0):
+def rescale_guided_velocity(v_guided, v_cond, cfg_rescale=0.0, eps=1.0e-6):
+    cfg_rescale = float(cfg_rescale)
+    if cfg_rescale <= 0.0:
+        return v_guided
+    if cfg_rescale > 1.0:
+        raise ValueError("cfg_rescale must be in [0, 1]")
+    reduce_dims = tuple(range(1, v_guided.ndim))
+    guided_std = v_guided.float().std(dim=reduce_dims, keepdim=True, unbiased=False)
+    cond_std = v_cond.float().std(dim=reduce_dims, keepdim=True, unbiased=False)
+    v_rescaled = v_guided * (cond_std / guided_std.clamp_min(float(eps))).to(v_guided.dtype)
+    return cfg_rescale * v_rescaled + (1.0 - cfg_rescale) * v_guided
+
+
+@torch.no_grad()
+def guided_velocity(flow, z, t, cond, cfg_scale=1.0, cfg_rescale=0.0):
     """Classifier-free guidance in latent velocity space."""
     if cfg_scale == 1.0:
         return flow(z, t, cond)
     uncond = zero_condition(cond)
     v_uncond = flow(z, t, uncond)
     v_cond = flow(z, t, cond)
-    return v_uncond + cfg_scale * (v_cond - v_uncond)
+    guided = v_uncond + cfg_scale * (v_cond - v_uncond)
+    return rescale_guided_velocity(guided, v_cond, cfg_rescale=cfg_rescale)
 
 
 @torch.no_grad()
 def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0,
-                   cfg_scale=1.0, ae=None, semantic_cond=None, semantic_guidance_w=0.0,
+                   cfg_scale=1.0, cfg_rescale=0.0, ae=None,
+                   semantic_cond=None, semantic_guidance_w=0.0,
                    semantic_guidance_mode="decoded", sample_method="euler",
                    cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                    semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
@@ -2358,6 +2376,8 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         raise ValueError("semantic guidance requires ae")
     if sample_method not in SAMPLE_METHODS:
         raise ValueError(f"unknown sample method {sample_method!r}")
+    if cfg_rescale < 0.0 or cfg_rescale > 1.0:
+        raise ValueError("cfg_rescale must be in [0, 1]")
     cfg_interval = validate_guidance_interval(cfg_interval, name="cfg_interval")
     semantic_guidance_interval = validate_guidance_interval(
         semantic_guidance_interval, name="semantic_guidance_interval")
@@ -2368,14 +2388,16 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         dt = t_next_scalar - t_scalar
         t = torch.full((batch, 1, 1, 1), t_scalar, device=device)
         step_cfg = cfg_scale if interval_active(t_scalar, cfg_interval) else 1.0
-        v0 = guided_velocity(flow, z, t, cond, cfg_scale=step_cfg)
+        v0 = guided_velocity(flow, z, t, cond, cfg_scale=step_cfg,
+                             cfg_rescale=cfg_rescale)
         if sample_method == "euler":
             z = z + dt * v0
         else:
             z_pred = z + dt * v0
             t_next = torch.full((batch, 1, 1, 1), t_next_scalar, device=device)
             next_cfg = cfg_scale if interval_active(t_next_scalar, cfg_interval) else 1.0
-            v1 = guided_velocity(flow, z_pred, t_next, cond, cfg_scale=next_cfg)
+            v1 = guided_velocity(flow, z_pred, t_next, cond, cfg_scale=next_cfg,
+                                 cfg_rescale=cfg_rescale)
             z = z + 0.5 * dt * (v0 + v1)
         if (semantic_guidance_w > 0.0
                 and interval_active(t_scalar, semantic_guidance_interval)):
@@ -2389,13 +2411,15 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
 
 @torch.no_grad()
 def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0,
-                  cfg_scale=1.0, semantic_cond=None, semantic_guidance_w=0.0,
+                  cfg_scale=1.0, cfg_rescale=0.0,
+                  semantic_cond=None, semantic_guidance_w=0.0,
                   semantic_guidance_mode="decoded", sample_method="euler",
                   cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                   semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                   sample_time_shift=1.0):
     z = sample_latents(flow, cond, latent_shape=latent_shape, steps=steps, device=device,
-                       seed=seed, cfg_scale=cfg_scale, ae=ae, semantic_cond=semantic_cond,
+                       seed=seed, cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
+                       ae=ae, semantic_cond=semantic_cond,
                        semantic_guidance_w=semantic_guidance_w,
                        semantic_guidance_mode=semantic_guidance_mode,
                        sample_method=sample_method, cfg_interval=cfg_interval,
@@ -2464,7 +2488,8 @@ def make_condition_grid_specs(samples_per_combo=1):
 @torch.no_grad()
 def save_sample_grid(ae, flow, path, size=32, device=DEV, cond_mode="facts", conditioner=None,
                      prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
-                     cfg_scale=1.0, sample_steps=4, sample_method="euler",
+                     cfg_scale=1.0, cfg_rescale=0.0,
+                     sample_steps=4, sample_method="euler",
                      semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
                      cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                      semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
@@ -2483,6 +2508,7 @@ def save_sample_grid(ae, flow, path, size=32, device=DEV, cond_mode="facts", con
                            rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
     sample = sample_images(ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
+                           cfg_rescale=cfg_rescale,
                            semantic_cond=fact_cond, semantic_guidance_w=semantic_guidance_w,
                            semantic_guidance_mode=semantic_guidance_mode,
                            sample_method=sample_method, cfg_interval=cfg_interval,
@@ -2491,6 +2517,7 @@ def save_sample_grid(ae, flow, path, size=32, device=DEV, cond_mode="facts", con
     meta = write_ppm_grid(sample, path, rows=rows, cols=cols)
     meta.update({
         "sample_grid_cfg_scale": float(cfg_scale),
+        "sample_grid_cfg_rescale": float(cfg_rescale),
         "sample_grid_sample_steps": int(sample_steps),
         "sample_grid_sample_time_shift": float(sample_time_shift),
         "sample_grid_sample_method": sample_method,
@@ -2509,7 +2536,7 @@ def save_sample_grid(ae, flow, path, size=32, device=DEV, cond_mode="facts", con
 @torch.no_grad()
 def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, conditioner=None,
                              prompt_vocab=None, caption_max_len=64, cfg_scale=1.0,
-                             sample_steps=4, sample_method="euler",
+                             cfg_rescale=0.0, sample_steps=4, sample_method="euler",
                              cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                              samples=16, seed=0, caption_cond_source="tokens",
                              sample_time_shift=1.0):
@@ -2525,6 +2552,7 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
         max_len=caption_max_len, device=device, return_tokens=flow_uses_cond_tokens(flow))
     sample = sample_images(ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
+                           cfg_rescale=cfg_rescale,
                            sample_method=sample_method, cfg_interval=cfg_interval,
                            sample_time_shift=sample_time_shift)
     cols = int(np.ceil(np.sqrt(n)))
@@ -2532,6 +2560,7 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
     meta = write_ppm_grid(sample, path, rows=rows, cols=cols)
     meta.update({
         "sample_grid_cfg_scale": float(cfg_scale),
+        "sample_grid_cfg_rescale": float(cfg_rescale),
         "sample_grid_sample_steps": int(sample_steps),
         "sample_grid_sample_time_shift": float(sample_time_shift),
         "sample_grid_sample_method": sample_method,
@@ -2546,8 +2575,9 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
 
 
 @torch.no_grad()
-def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_steps=4,
-                          samples_per_combo=1, seed=20, cond_mode="facts", conditioner=None,
+def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, cfg_rescale=0.0,
+                          sample_steps=4, samples_per_combo=1, seed=20, cond_mode="facts",
+                          conditioner=None,
                           prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
                           semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
                           sample_method="euler", cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
@@ -2581,7 +2611,8 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_s
                                    return_tokens=flow_uses_cond_tokens(flow))
             sample = sample_images(ae, flow, cond, latent_shape=latent_shape, steps=sample_steps,
                                    device=device, seed=seed + ci * 101 + si * 17,
-                                   cfg_scale=cfg_scale, semantic_cond=fact_cond,
+                                   cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
+                                   semantic_cond=fact_cond,
                                    semantic_guidance_w=semantic_guidance_w,
                                    semantic_guidance_mode=semantic_guidance_mode,
                                    sample_method=sample_method, cfg_interval=cfg_interval,
@@ -2613,8 +2644,8 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, sample_s
 
 @torch.no_grad()
 def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=1.0,
-             sample_steps=4, roundtrip_samples=1, cond_mode="facts", conditioner=None,
-             prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
+             cfg_rescale=0.0, sample_steps=4, roundtrip_samples=1, cond_mode="facts",
+             conditioner=None, prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
              intervention_samples=0, semantic_guidance_w=0.0,
              semantic_guidance_mode="decoded", sample_method="euler",
              cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
@@ -2662,6 +2693,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
                            rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
     sample = sample_images(ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
+                           cfg_rescale=cfg_rescale,
                            semantic_cond=fact_cond, semantic_guidance_w=semantic_guidance_w,
                            semantic_guidance_mode=semantic_guidance_mode,
                            sample_method=sample_method, cfg_interval=cfg_interval,
@@ -2684,6 +2716,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
         "latent_endpoint_consistency_mse": float(np.mean(endpoint_consistency_mses)),
         "latent_endpoint_time_gap": float(np.mean(endpoint_time_gaps)),
         "cfg_scale": float(cfg_scale),
+        "cfg_rescale": float(cfg_rescale),
         "cfg_interval": list(validate_guidance_interval(cfg_interval)),
         "sample_steps": int(sample_steps),
         "sample_time_shift": float(sample_time_shift),
@@ -2701,6 +2734,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
             "latent_factor_orth_bases": float(np.mean(factor_orth_bases)),
         })
     report.update(conditional_roundtrip(ae, flow, size=size, device=device, cfg_scale=cfg_scale,
+                                        cfg_rescale=cfg_rescale,
                                         sample_steps=sample_steps,
                                         samples_per_combo=roundtrip_samples, seed=seed + 17,
                                         cond_mode=cond_mode, conditioner=conditioner,
@@ -2722,7 +2756,8 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
 @torch.no_grad()
 def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32, device=DEV,
                            conditioner=None, prompt_vocab=None, caption_max_len=64,
-                           cfg_scale=1.0, sample_steps=4, sample_method="euler",
+                           cfg_scale=1.0, cfg_rescale=0.0,
+                           sample_steps=4, sample_method="euler",
                            cfg_interval=DEFAULT_GUIDANCE_INTERVAL, text_aligner=None,
                            image_feature_aligner=None,
                            caption_cond_source="tokens", sample_time_shift=1.0,
@@ -2781,6 +2816,7 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
     sample = sample_images(ae, flow, sample_cond,
                            latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
+                           cfg_rescale=cfg_rescale,
                            sample_method=sample_method, cfg_interval=cfg_interval,
                            sample_time_shift=sample_time_shift)
     report = {
@@ -2796,6 +2832,7 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         "sample_max": float(sample.max().detach().cpu()),
         "caption_sample_mse": float(F.mse_loss(sample, sample_x[:sample.shape[0]]).detach().cpu()),
         "cfg_scale": float(cfg_scale),
+        "cfg_rescale": float(cfg_rescale),
         "cfg_interval": list(validate_guidance_interval(cfg_interval)),
         "sample_steps": int(sample_steps),
         "sample_time_shift": float(sample_time_shift),
@@ -3083,7 +3120,7 @@ def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                   cond_mode="facts", conditioner=None, prompt_vocab=None,
                   prompt_templates=DEFAULT_PROMPT_TEMPLATES, semantic_guidance_w=0.0,
                   semantic_guidance_weights=None, semantic_guidance_mode="decoded",
-                  sample_method="euler", sample_methods=None,
+                  sample_method="euler", sample_methods=None, cfg_rescales=(0.0,),
                   cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                   semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                   sample_time_shift=1.0, time_shift=1.0):
@@ -3091,31 +3128,34 @@ def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
         semantic_guidance_weights = (semantic_guidance_w,)
     if sample_methods is None:
         sample_methods = (sample_method,)
+    cfg_rescales = tuple(float(x) for x in cfg_rescales)
     rows = []
     for cfg_scale in cfg_scales:
-        for sample_steps in sample_steps_list:
-            for method in sample_methods:
-                for guidance_w in semantic_guidance_weights:
-                    row = evaluate(ae, flow, n=n, batch=batch, seed=seed, size=size,
-                                   device=device, cfg_scale=float(cfg_scale),
-                                   sample_steps=int(sample_steps), roundtrip_samples=roundtrip_samples,
-                                   cond_mode=cond_mode, conditioner=conditioner,
-                                   prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
-                                   semantic_guidance_w=float(guidance_w),
-                                   semantic_guidance_mode=semantic_guidance_mode,
-                                   sample_method=method,
-                                   cfg_interval=cfg_interval,
-                                   semantic_guidance_interval=semantic_guidance_interval,
-                                   sample_time_shift=sample_time_shift,
-                                   time_shift=time_shift)
-                    row["sweep_key"] = (
-                        f"cfg={float(cfg_scale):g};steps={int(sample_steps)};"
-                        f"method={method};sem={float(guidance_w):g};"
-                        f"shift={float(sample_time_shift):g};"
-                        f"cfgint={format_interval(cfg_interval)};"
-                        f"semint={format_interval(semantic_guidance_interval)}"
-                    )
-                    rows.append(row)
+        for cfg_rescale in cfg_rescales:
+            for sample_steps in sample_steps_list:
+                for method in sample_methods:
+                    for guidance_w in semantic_guidance_weights:
+                        row = evaluate(ae, flow, n=n, batch=batch, seed=seed, size=size,
+                                       device=device, cfg_scale=float(cfg_scale),
+                                       cfg_rescale=float(cfg_rescale),
+                                       sample_steps=int(sample_steps),
+                                       roundtrip_samples=roundtrip_samples,
+                                       cond_mode=cond_mode, conditioner=conditioner,
+                                       prompt_vocab=prompt_vocab,
+                                       prompt_templates=prompt_templates,
+                                       semantic_guidance_w=float(guidance_w),
+                                       semantic_guidance_mode=semantic_guidance_mode,
+                                       sample_method=method, cfg_interval=cfg_interval,
+                                       semantic_guidance_interval=semantic_guidance_interval,
+                                       sample_time_shift=sample_time_shift, time_shift=time_shift)
+                        row["sweep_key"] = (
+                            f"cfg={float(cfg_scale):g};rescale={float(cfg_rescale):g};"
+                            f"steps={int(sample_steps)};method={method};"
+                            f"sem={float(guidance_w):g};shift={float(sample_time_shift):g};"
+                            f"cfgint={format_interval(cfg_interval)};"
+                            f"semint={format_interval(semantic_guidance_interval)}"
+                        )
+                        rows.append(row)
     return rows
 
 
@@ -3123,34 +3163,39 @@ def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
 def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                        n=128, batch=64, seed=10, size=32, device=DEV, conditioner=None,
                        prompt_vocab=None, caption_max_len=64, sample_method="euler",
-                       sample_methods=None, cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
+                       sample_methods=None, cfg_rescales=(0.0,),
+                       cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                        text_aligner=None, image_feature_aligner=None,
                        caption_cond_source="tokens", sample_time_shift=1.0,
                        time_shift=1.0):
     if sample_methods is None:
         sample_methods = (sample_method,)
+    cfg_rescales = tuple(float(x) for x in cfg_rescales)
     rows = []
     for cfg_scale in cfg_scales:
-        for sample_steps in sample_steps_list:
-            for method in sample_methods:
-                row = evaluate_image_records(
-                    ae, flow, records, n=n, batch=batch, seed=seed, size=size,
-                    device=device, conditioner=conditioner, prompt_vocab=prompt_vocab,
-                    caption_max_len=caption_max_len, cfg_scale=float(cfg_scale),
-                    sample_steps=int(sample_steps), sample_method=method,
-                    cfg_interval=cfg_interval, text_aligner=text_aligner,
-                    image_feature_aligner=image_feature_aligner,
-                    caption_cond_source=caption_cond_source,
-                    sample_time_shift=sample_time_shift, time_shift=time_shift)
-                row["semantic_guidance_w"] = 0.0
-                row["semantic_guidance_mode"] = "none"
-                row["semantic_guidance_interval"] = list(DEFAULT_GUIDANCE_INTERVAL)
-                row["sweep_key"] = (
-                    f"cfg={float(cfg_scale):g};steps={int(sample_steps)};"
-                    f"method={method};shift={float(sample_time_shift):g};"
-                    f"cfgint={format_interval(cfg_interval)}"
-                )
-                rows.append(row)
+        for cfg_rescale in cfg_rescales:
+            for sample_steps in sample_steps_list:
+                for method in sample_methods:
+                    row = evaluate_image_records(
+                        ae, flow, records, n=n, batch=batch, seed=seed, size=size,
+                        device=device, conditioner=conditioner, prompt_vocab=prompt_vocab,
+                        caption_max_len=caption_max_len, cfg_scale=float(cfg_scale),
+                        cfg_rescale=float(cfg_rescale),
+                        sample_steps=int(sample_steps), sample_method=method,
+                        cfg_interval=cfg_interval, text_aligner=text_aligner,
+                        image_feature_aligner=image_feature_aligner,
+                        caption_cond_source=caption_cond_source,
+                        sample_time_shift=sample_time_shift, time_shift=time_shift)
+                    row["semantic_guidance_w"] = 0.0
+                    row["semantic_guidance_mode"] = "none"
+                    row["semantic_guidance_interval"] = list(DEFAULT_GUIDANCE_INTERVAL)
+                    row["sweep_key"] = (
+                        f"cfg={float(cfg_scale):g};rescale={float(cfg_rescale):g};"
+                        f"steps={int(sample_steps)};"
+                        f"method={method};shift={float(sample_time_shift):g};"
+                        f"cfgint={format_interval(cfg_interval)}"
+                    )
+                    rows.append(row)
     return rows
 
 
@@ -3227,6 +3272,7 @@ def eval_report_summary(report):
     keys = (
         "eval_weight_mode",
         "cfg_scale",
+        "cfg_rescale",
         "cfg_interval",
         "sample_steps",
         "sample_time_shift",
@@ -3275,6 +3321,7 @@ def aggregate_sweep_rows(rows):
         key = (float(row["cfg_scale"]), int(row["sample_steps"]),
                str(row.get("sample_method", "euler")),
                float(row.get("sample_time_shift", 1.0)),
+               float(row.get("cfg_rescale", 0.0)),
                float(row.get("semantic_guidance_w", 0.0)),
                str(row.get("semantic_guidance_mode", "decoded")),
                tuple(float(x) for x in row.get("cfg_interval", DEFAULT_GUIDANCE_INTERVAL)),
@@ -3282,17 +3329,20 @@ def aggregate_sweep_rows(rows):
                                                 DEFAULT_GUIDANCE_INTERVAL)))
         grouped.setdefault(key, []).append(row)
     out = []
-    for (cfg_scale, sample_steps, sample_method, sample_time_shift, semantic_guidance_w,
+    for (cfg_scale, sample_steps, sample_method, sample_time_shift, cfg_rescale,
+         semantic_guidance_w,
          semantic_guidance_mode, cfg_interval, semantic_guidance_interval), group in sorted(
              grouped.items()):
         agg = {
             "sweep_key": (
                 f"cfg={cfg_scale:g};steps={sample_steps};method={sample_method};"
-                f"shift={sample_time_shift:g};sem={semantic_guidance_w:g};"
+                f"shift={sample_time_shift:g};rescale={cfg_rescale:g};"
+                f"sem={semantic_guidance_w:g};"
                 f"cfgint={format_interval(cfg_interval)};"
                 f"semint={format_interval(semantic_guidance_interval)}"
             ),
             "cfg_scale": float(cfg_scale),
+            "cfg_rescale": float(cfg_rescale),
             "cfg_interval": list(cfg_interval),
             "sample_steps": int(sample_steps),
             "sample_method": sample_method,
@@ -3322,6 +3372,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         intervention_samples=0, semantic_guidance_w=0.0,
                         semantic_guidance_weights=None, semantic_guidance_mode="decoded",
                         sample_method="euler", sample_methods=None,
+                        cfg_rescales=(0.0,),
                         cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                         semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                         eval_image_manifest="", eval_image_root="", eval_image_split="eval",
@@ -3378,6 +3429,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         conditioner=conditioner, prompt_vocab=prompt_vocab,
                         caption_max_len=meta["caption_max_len"],
                         sample_method=sample_method, sample_methods=sample_methods,
+                        cfg_rescales=cfg_rescales,
                         cfg_interval=cfg_interval,
                         text_aligner=getattr(flow, "text_aligner", None),
                         image_feature_aligner=getattr(flow, "image_feature_aligner", None),
@@ -3399,6 +3451,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                 "image_size": int(eval_size),
                 "sample_method": sample_method,
                 "sample_methods": list(sample_methods or (sample_method,)),
+                "cfg_rescales": [float(x) for x in cfg_rescales],
                 "sample_time_shift": float(actual_sample_time_shift),
                 "time_shift": float(train_time_shift),
                 "cfg_interval": list(validate_guidance_interval(cfg_interval)),
@@ -3436,6 +3489,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                                      semantic_guidance_mode=semantic_guidance_mode,
                                      sample_method=sample_method,
                                      sample_methods=sample_methods,
+                                     cfg_rescales=cfg_rescales,
                                      cfg_interval=cfg_interval,
                                      sample_time_shift=actual_sample_time_shift,
                                      time_shift=train_time_shift,
@@ -3456,6 +3510,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             "roundtrip_samples": int(roundtrip_samples),
             "sample_method": sample_method,
             "sample_methods": list(sample_methods or (sample_method,)),
+            "cfg_rescales": [float(x) for x in cfg_rescales],
             "sample_time_shift": float(actual_sample_time_shift),
             "time_shift": float(train_time_shift),
             "cfg_interval": list(validate_guidance_interval(cfg_interval)),
@@ -3498,7 +3553,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
     return report
 
 
-def selected_grid_settings(report, fallback_cfg=1.0, fallback_steps=4,
+def selected_grid_settings(report, fallback_cfg=1.0, fallback_cfg_rescale=0.0, fallback_steps=4,
                            fallback_method="euler", fallback_semantic_w=0.0,
                            fallback_semantic_mode="decoded",
                            fallback_cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
@@ -3507,6 +3562,7 @@ def selected_grid_settings(report, fallback_cfg=1.0, fallback_steps=4,
     best = report.get("best") or report
     return {
         "cfg_scale": float(best.get("cfg_scale", fallback_cfg)),
+        "cfg_rescale": float(best.get("cfg_rescale", fallback_cfg_rescale)),
         "cfg_interval": tuple(best.get("cfg_interval", fallback_cfg_interval)),
         "sample_steps": int(best.get("sample_steps", fallback_steps)),
         "sample_time_shift": float(best.get("sample_time_shift",
@@ -3523,6 +3579,7 @@ def selected_grid_settings(report, fallback_cfg=1.0, fallback_steps=4,
 def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidden=64,
                       lr=2e-4, fact_w=1.0, seed=0, size=32, device=DEV, flow_arch="conv",
                       dit_depth=3, dit_heads=4, cond_drop=0.0, cfg_scale=1.0,
+                      cfg_rescale=0.0,
                       dit_head_width_mult=1, latent_max_tokens=256,
                       ae_arch="semantic", latent_downsample=4, ae_res_blocks=1,
                       ae_recon_loss="mse", ae_grad_w=0.0, ae_ms_w=0.0,
@@ -3561,6 +3618,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     rng = np.random.default_rng(seed)
     if cond_mode not in ("facts", "text"):
         raise ValueError(f"unknown condition mode {cond_mode!r}")
+    if cfg_rescale < 0.0 or cfg_rescale > 1.0:
+        raise ValueError("cfg_rescale must be in [0, 1]")
     image_records = None
     if image_manifest:
         if cond_mode != "text":
@@ -3939,7 +3998,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 conditioner.load_state_dict(raw_conditioner)
         if image_records is None:
             candidate = evaluate(ae, flow, seed=seed + 1, size=size, device=device,
-                                 cfg_scale=cfg_scale, sample_steps=sample_steps,
+                                 cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
+                                 sample_steps=sample_steps,
                                  roundtrip_samples=roundtrip_samples, cond_mode=cond_mode,
                                  conditioner=conditioner, prompt_vocab=prompt_vocab,
                                  prompt_templates=prompt_templates,
@@ -3956,6 +4016,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 ae, flow, image_records, seed=seed + 1, size=size, device=device,
                 conditioner=conditioner, prompt_vocab=prompt_vocab,
                 caption_max_len=caption_max_len, cfg_scale=cfg_scale,
+                cfg_rescale=cfg_rescale,
                 sample_steps=sample_steps, sample_method=sample_method,
                 cfg_interval=cfg_interval, text_aligner=text_aligner,
                 image_feature_aligner=image_feature_aligner,
@@ -4041,6 +4102,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "ae_intervention_w": float(ae_intervention_w),
         "ae_factor_orth_w": float(ae_factor_orth_w),
         "cond_drop": float(cond_drop),
+        "cfg_rescale": float(cfg_rescale),
         "cfg_interval": list(cfg_interval),
         "sample_method": sample_method,
         "semantic_guidance_w": float(semantic_guidance_w),
@@ -4131,20 +4193,24 @@ def selftest():
                         cfg_scale=1.5)
     assert img.shape == (1, 3, 32, 32)
     guided_img = sample_images(ae, flow, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
-                               seed=0, cfg_scale=1.0, semantic_cond=cond,
+                               seed=0, cfg_scale=1.5, cfg_rescale=0.7,
+                               semantic_cond=cond,
                                semantic_guidance_w=0.05,
                                semantic_guidance_interval=(0.0, 0.5))
     assert guided_img.shape == (1, 3, 32, 32)
     grid_path = "/tmp/image_latent_selftest_grid.ppm"
     grid_meta = save_sample_grid(ae, flow, grid_path, size=32, device="cpu",
-                                 sample_steps=1, samples_per_combo=1, seed=9)
+                                 sample_steps=1, samples_per_combo=1, seed=9,
+                                 cfg_rescale=0.4)
     assert grid_meta["sample_grid_n"] == len(COLORS) * len(SHAPES)
+    assert grid_meta["sample_grid_cfg_rescale"] == 0.4
     with open(grid_path, "rb") as f:
         assert f.read(2) == b"P6"
     ae2, flow2, report2 = train_latent_flow(ae_steps=1, flow_steps=1, batch=2, latent_ch=4,
                                             hidden=32, flow_arch="dit", dit_depth=1,
                                             dit_heads=2, seed=1, device="cpu", cond_drop=0.5,
-                                            cfg_scale=1.5, sample_steps=1,
+                                            cfg_scale=1.5, cfg_rescale=0.5,
+                                            sample_steps=1,
                                             flow_semantic_w=0.25, ae_intervention_w=0.1,
                                             ae_factor_orth_w=0.05,
                                             flow_consistency_w=0.1,
@@ -4156,6 +4222,7 @@ def selftest():
                                             semantic_guidance_interval=(0.0, 0.5))
     assert report2["flow_arch"] == "dit"
     assert report2["cond_drop"] == 0.5 and report2["cfg_scale"] == 1.5
+    assert report2["cfg_rescale"] == 0.5
     assert report2["flow_semantic_w"] == 0.25
     assert report2["flow_consistency_w"] == 0.1
     assert report2["flow_loss_weight"] == "min-snr-v"
@@ -4222,13 +4289,15 @@ def selftest():
     assert meta_res2["ae_arch"] == "residual"
     assert ae_latent_shape(ae_res2, 32) == (6, 4, 4)
     sweep = sampler_sweep(ae2, flow2, cfg_scales=(1.0, 1.5), sample_steps_list=(1,),
+                          cfg_rescales=(0.0, 0.7),
                           semantic_guidance_weights=(0.0, 0.05),
                           sample_methods=("euler", "heun"),
                           n=4, batch=2, seed=3, device="cpu")
-    assert len(sweep) == 8 and "sample_roundtrip_both_acc" in sweep[0]
+    assert len(sweep) == 16 and "sample_roundtrip_both_acc" in sweep[0]
     agg = aggregate_sweep_rows([dict(r, eval_seed=i) for i, r in enumerate(sweep)])
-    assert len(agg) == 8 and "sample_roundtrip_both_acc_mean" in agg[0]
+    assert len(agg) == 16 and "sample_roundtrip_both_acc_mean" in agg[0]
     assert "semantic_guidance_w" in agg[0] and "sample_method" in agg[0]
+    assert "cfg_rescale" in agg[0]
     ae3, flow3, conditioner3, vocab3, report3 = train_latent_flow(
         ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="dit",
         dit_depth=1, dit_heads=2, seed=2, device="cpu", cond_mode="text",
@@ -4543,6 +4612,8 @@ def main(argv=None):
                     help="MM-DiT attention implementation: manual, sdpa, or auto")
     ap.add_argument("--cond-drop", type=float, default=0.0, dest="cond_drop")
     ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
+    ap.add_argument("--cfg-rescale", type=float, default=0.0, dest="cfg_rescale",
+                    help="rescale guided velocity toward conditional velocity std; 0 disables")
     ap.add_argument("--cfg-interval", default="0.0,1.0", dest="cfg_interval",
                     help="CFG active interval over rectified-flow time, formatted start,end")
     ap.add_argument("--sample-steps", type=int, default=4, dest="sample_steps")
@@ -4566,6 +4637,8 @@ def main(argv=None):
                     help="semantic guidance active interval over flow time, formatted start,end")
     ap.add_argument("--cfg-scales", default="1.0,1.25,1.5,2.0", dest="cfg_scales",
                     help="comma-separated CFG scales for --eval-checkpoint")
+    ap.add_argument("--cfg-rescales", default="0.0", dest="cfg_rescales",
+                    help="comma-separated CFG rescale values for --eval-checkpoint")
     ap.add_argument("--sample-steps-list", default="4,8,16", dest="sample_steps_list",
                     help="comma-separated sampler step counts for --eval-checkpoint")
     ap.add_argument("--eval-seeds", default="", dest="eval_seeds",
@@ -4672,6 +4745,7 @@ def main(argv=None):
         report = evaluate_checkpoint(
             args.eval_checkpoint,
             cfg_scales=_parse_number_list(args.cfg_scales, float),
+            cfg_rescales=_parse_number_list(args.cfg_rescales, float),
             sample_steps_list=_parse_number_list(args.sample_steps_list, int),
             seed=args.seed,
             size=args.size,
@@ -4707,6 +4781,7 @@ def main(argv=None):
             settings = selected_grid_settings(
                 report,
                 fallback_cfg=args.cfg_scale,
+                fallback_cfg_rescale=args.cfg_rescale,
                 fallback_steps=args.sample_steps,
                 fallback_method=args.sample_method,
                 fallback_semantic_w=args.semantic_guidance_w,
@@ -4730,6 +4805,7 @@ def main(argv=None):
                     prompt_vocab=prompt_vocab, caption_max_len=meta["caption_max_len"],
                     size=grid_size,
                     cfg_scale=settings["cfg_scale"],
+                    cfg_rescale=settings["cfg_rescale"],
                     cfg_interval=settings["cfg_interval"],
                     sample_time_shift=settings["sample_time_shift"],
                     sample_steps=settings["sample_steps"],
@@ -4743,6 +4819,7 @@ def main(argv=None):
                     conditioner=conditioner, prompt_vocab=prompt_vocab,
                     prompt_templates=prompt_templates,
                     cfg_scale=settings["cfg_scale"],
+                    cfg_rescale=settings["cfg_rescale"],
                     cfg_interval=settings["cfg_interval"],
                     sample_steps=settings["sample_steps"],
                     sample_time_shift=settings["sample_time_shift"],
@@ -4774,6 +4851,7 @@ def main(argv=None):
         latent_ch=args.latent_ch, hidden=args.hidden, lr=args.lr, fact_w=args.fact_w,
         seed=args.seed, size=run_size, flow_arch=args.flow_arch, dit_depth=args.dit_depth,
         dit_heads=args.dit_heads, cond_drop=args.cond_drop, cfg_scale=args.cfg_scale,
+        cfg_rescale=args.cfg_rescale,
         dit_head_width_mult=args.dit_head_width_mult,
         dit_qk_norm=args.dit_qk_norm,
         dit_attn_impl=args.dit_attn_impl,
@@ -4841,6 +4919,7 @@ def main(argv=None):
         settings = selected_grid_settings(
             report,
             fallback_cfg=args.cfg_scale,
+            fallback_cfg_rescale=args.cfg_rescale,
             fallback_steps=args.sample_steps,
             fallback_method=args.sample_method,
             fallback_semantic_w=args.semantic_guidance_w,
@@ -4857,6 +4936,7 @@ def main(argv=None):
                 prompt_vocab=prompt_vocab, caption_max_len=args.caption_max_len,
                 size=run_size,
                 cfg_scale=settings["cfg_scale"],
+                cfg_rescale=settings["cfg_rescale"],
                 cfg_interval=settings["cfg_interval"],
                 sample_steps=settings["sample_steps"],
                 sample_time_shift=settings["sample_time_shift"],
@@ -4870,6 +4950,7 @@ def main(argv=None):
                 conditioner=conditioner,
                 prompt_vocab=prompt_vocab, prompt_templates=templates,
                 cfg_scale=settings["cfg_scale"],
+                cfg_rescale=settings["cfg_rescale"],
                 cfg_interval=settings["cfg_interval"],
                 sample_steps=settings["sample_steps"],
                 sample_time_shift=settings["sample_time_shift"],
@@ -4947,6 +5028,7 @@ def main(argv=None):
         "image_embedding_in_dim": report.get("image_embedding_in_dim", 0),
         "cond_drop": args.cond_drop,
         "cfg_scale": args.cfg_scale,
+        "cfg_rescale": args.cfg_rescale,
         "cfg_interval": list(cfg_interval),
         "sample_steps": args.sample_steps,
         "sample_method": args.sample_method,

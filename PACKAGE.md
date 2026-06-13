@@ -646,10 +646,12 @@ python -m thinking.image_flow --train --steps 400 --out runs/image_flow.pt
 python -m thinking.image_latent --train --ae-steps 400 --flow-steps 400 \
     --out runs/image_latent_flow.pt
 python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-steps 400 \
-    --cond-drop 0.1 --cfg-scale 1.5 --sample-steps 8 --flow-semantic-w 0.25 \
+    --cond-drop 0.1 --cfg-scale 1.5 --cfg-rescale 0.7 \
+    --sample-steps 8 --flow-semantic-w 0.25 \
     --out runs/image_latent_dit.pt
 python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --ae-steps 400 --flow-steps 400 --cond-drop 0.1 --cfg-scale 1.5 \
+    --cfg-rescale 0.7 \
     --sample-steps 8 --flow-semantic-w 0.25 --time-sampling logit-normal \
     --flow-ema-decay 0.999 --ae-intervention-w 0.1 --ae-factor-orth-w 0.05 \
     --semantic-guidance-w 2.0 \
@@ -680,22 +682,24 @@ python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
 python -m thinking.image_latent --eval-checkpoint runs/image_manifest_mmdit.pt \
     --eval-image-manifest data/images/train_clean.jsonl --eval-image-root data/images \
     --eval-image-split eval --size 64 --cfg-scales 1.0,1.25,1.5,2.0 \
-    --sample-steps-list 4,8,16 --eval-seeds 1,2,3 \
+    --cfg-rescales 0.0,0.7 --sample-steps-list 4,8,16 --eval-seeds 1,2,3 \
     --sample-grid-out runs/image_manifest_eval_grid.ppm \
     --eval-out runs/image_manifest_mmdit_sweep.json
 python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
-    --cfg-scales 1.0,1.25,1.5,2.0 --sample-steps-list 4,8,16 \
+    --cfg-scales 1.0,1.25,1.5,2.0 --cfg-rescales 0.0,0.7 \
+    --sample-steps-list 4,8,16 \
     --eval-seeds 1,2,3 --roundtrip-samples 2 --eval-out runs/image_latent_dit_sweep.json
 python -m thinking.audio --steps 500 --seeds 0,1,2 --out runs/audio1_fer.json
 python -m thinking.multimodal --steps 400 --out runs/m0_multimodal.json
 RUNPOD_API_KEY=... python runpod/launch_thinking.py --vision --vision-arch bottleneck \
     --image2 --image-flow --image-latent --image-latent-arch dit \
-    --image-cond-drop 0.1 --image-cfg-scale 1.5 --image-sample-steps 8 \
+    --image-cond-drop 0.1 --image-cfg-scale 1.5 --image-cfg-rescale 0.7 \
+    --image-sample-steps 8 \
     --image-flow-semantic-w 0.25 --image-eval-sweep \
     --audio --multimodal --fast --go
 RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-latent-arch mmdit \
     --image-cond-mode text --image-dit-head-width-mult 2 \
-    --image-cond-drop 0.1 --image-cfg-scale 1.5 \
+    --image-cond-drop 0.1 --image-cfg-scale 1.5 --image-cfg-rescale 0.7 \
     --image-sample-steps 8 --image-flow-semantic-w 0.25 \
     --image-flow-consistency-w 0.05 \
     --image-time-sampling logit-normal --image-flow-ema-decay 0.999 \
@@ -703,7 +707,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-cfg-interval 0.0,0.8 --image-semantic-guidance-interval 0.0,0.75 \
     --image-ae-intervention-w 0.1 --image-ae-factor-orth-w 0.05 \
     --image-semantic-guidance-w 2.0 --image-semantic-guidance-sweep 0.0,1.0,2.0 \
-    --image-sample-methods euler,heun \
+    --image-sample-methods euler,heun --image-cfg-rescale-sweep 0.0,0.7 \
     --image-sample-grid \
     --image-eval-sweep --fast --go
 RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-embed \
@@ -731,6 +735,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
     --image-sample-steps 8 --image-flow-consistency-w 0.05 \
     --image-time-sampling logit-normal --image-time-shift 3.0 \
     --image-flow-loss-weight min-snr-v --image-flow-loss-weight-gamma 5.0 \
+    --image-cfg-rescale 0.7 --image-cfg-rescale-sweep 0.0,0.7 \
     --image-latent-normalize channel --image-latent-stat-samples 4096 \
     --image-eval-sweep --image-eval-split eval --image-sample-grid --fast --go
 ```
@@ -1111,6 +1116,11 @@ but can reweight per-example velocity MSE by the data-time SNR with batch-mean n
 Reports/checkpoints record the weighting mode, gamma, and observed weight range; RunPod exposes the
 same controls as `--image-flow-loss-weight`, `--image-flow-loss-weight-gamma`, and
 `--image-no-flow-loss-weight-normalize`.
+
+Image-50 adds sampler-side CFG rescale. `--cfg-rescale` rescales guided latent velocities toward
+the conditional velocity standard deviation before blending, while `--cfg-rescales` makes it a
+checkpoint-sweep axis. RunPod exposes `--image-cfg-rescale` and
+`--image-cfg-rescale-sweep`. Default `0.0` preserves legacy CFG behavior.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

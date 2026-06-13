@@ -210,6 +210,7 @@ def payload(args):
                      f"--image-hflip-prob {args.image_hflip_prob} "
                      f"--cond-drop {args.image_cond_drop} "
                      f"--cfg-scale {args.image_cfg_scale} "
+                     f"--cfg-rescale {args.image_cfg_rescale} "
                      f"--cfg-interval {shlex_quote(args.image_cfg_interval)} "
                      f"--sample-steps {args.image_sample_steps} "
                      f"--sample-method {args.image_sample_method} "
@@ -256,6 +257,7 @@ def payload(args):
                           f"--size {args.image_size} "
                           f"--checkpoint-weight-mode {args.image_checkpoint_weight_mode} "
                           f"--cfg-scales {shlex_quote(args.image_cfg_sweep)} "
+                          f"--cfg-rescales {shlex_quote(args.image_cfg_rescale_sweep)} "
                           f"--sample-steps-list {shlex_quote(args.image_sample_steps_sweep)} "
                           f"--cfg-interval {shlex_quote(args.image_cfg_interval)} "
                           f"--sample-method {args.image_sample_method} "
@@ -701,6 +703,9 @@ def main():
                     help="condition dropout for classifier-free latent image guidance")
     ap.add_argument("--image-cfg-scale", type=float, default=1.0, dest="image_cfg_scale",
                     help="classifier-free guidance scale for latent image sampling")
+    ap.add_argument("--image-cfg-rescale", type=float, default=0.0,
+                    dest="image_cfg_rescale",
+                    help="latent image CFG rescale; 0 disables")
     ap.add_argument("--image-cfg-interval", default="0.0,1.0", dest="image_cfg_interval",
                     help="latent image CFG active interval formatted start,end")
     ap.add_argument("--image-sample-steps", type=int, default=4, dest="image_sample_steps",
@@ -792,6 +797,9 @@ def main():
     ap.add_argument("--image-cfg-sweep", default="1.0,1.25,1.5,2.0",
                     dest="image_cfg_sweep",
                     help="comma-separated CFG scales for --image-eval-sweep")
+    ap.add_argument("--image-cfg-rescale-sweep", default="0.0,0.7",
+                    dest="image_cfg_rescale_sweep",
+                    help="comma-separated latent image CFG rescale values for sweeps")
     ap.add_argument("--image-sample-steps-sweep", default="4,8,16",
                     dest="image_sample_steps_sweep",
                     help="comma-separated sampler step counts for --image-eval-sweep")
@@ -859,6 +867,18 @@ def main():
         sys.exit("ERROR: --image-embed-max-records must be non-negative")
     if args.image_hflip_prob < 0.0 or args.image_hflip_prob > 1.0:
         sys.exit("ERROR: --image-hflip-prob must be in [0, 1]")
+    if args.image_cfg_rescale < 0.0 or args.image_cfg_rescale > 1.0:
+        sys.exit("ERROR: --image-cfg-rescale must be in [0, 1]")
+    try:
+        for raw in str(args.image_cfg_rescale_sweep).split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            val = float(raw)
+            if val < 0.0 or val > 1.0:
+                raise ValueError(raw)
+    except ValueError:
+        sys.exit("ERROR: --image-cfg-rescale-sweep values must be in [0, 1]")
     if args.image_time_shift <= 0.0:
         sys.exit("ERROR: --image-time-shift must be positive")
     if args.image_flow_loss_weight_gamma <= 0.0:
