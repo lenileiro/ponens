@@ -2417,6 +2417,167 @@ def choice_concept_bridge_loss(model, txt, records, pair_ids, margin=0.0):
     return sum(losses) / len(losses)
 
 
+def choice_concept_prototype_batch(groups, rng, group_n, per_group=3):
+    if not groups or group_n <= 0:
+        return [], []
+    usable = [group for group in groups if len(group) >= 2]
+    if not usable:
+        return [], []
+    group_n = min(len(usable), max(1, int(group_n)))
+    if group_n < len(usable):
+        group_idx = rng.choice(len(usable), size=group_n, replace=False)
+        selected = [usable[int(i)] for i in group_idx]
+    else:
+        selected = list(usable)
+    rows = []
+    items = []
+    per_group = max(2, int(per_group))
+    for concept_idx, group in enumerate(selected):
+        member_n = min(len(group), per_group)
+        if member_n < len(group):
+            member_idx = rng.choice(len(group), size=member_n, replace=False)
+            members = [group[int(i)] for i in member_idx]
+        else:
+            members = list(group)
+        concept_id = f"concept_proto_{concept_idx}"
+        for member_idx, rec in enumerate(members):
+            target = qa_choice_target(rec)
+            if target is None or target == "none":
+                continue
+            rec_id = f"{rec.rec_id}:concept_proto:{concept_idx}:{member_idx}"
+            rows.append(TextRecord(rec_id=rec_id, split=rec.split, tokens=rec.tokens,
+                                   facts=rec.facts, group=rec.group, kind=rec.kind,
+                                   base_id=rec.base_id, changed=rec.changed,
+                                   meta=rec.meta))
+            items.append((rec_id, target, concept_id))
+    if len(items) < 2:
+        return [], []
+    return rows, items
+
+
+def choice_concept_neighborhood_prototype_batch(model, vocab, sources, rng, group_n,
+                                                per_group=3, device=DEV,
+                                                pool_size=64):
+    answer_sources = [r for r in sources
+                      if qa_choice_target(r) not in (None, "none")]
+    if len(answer_sources) < 2 or group_n <= 0:
+        return [], []
+    group_n = max(1, int(group_n))
+    per_group = max(2, int(per_group))
+    pool_n = min(len(answer_sources),
+                 max(per_group, int(pool_size), group_n * per_group * 2))
+    if pool_n < len(answer_sources):
+        idx = rng.choice(len(answer_sources), size=pool_n, replace=False)
+        pool = [answer_sources[int(i)] for i in idx]
+    else:
+        pool = list(answer_sources)
+    txt, _ids = pack(pool, vocab, device)
+    with torch.no_grad():
+        vectors = choice_candidate_concept_vectors(model, txt, pool)
+    items = []
+    for rec in pool:
+        target = qa_choice_target(rec)
+        row = vectors.get(rec.rec_id)
+        if row and target in row:
+            items.append((rec, target, row[target].detach()))
+    if len(items) < 2:
+        return [], []
+    rows = []
+    proto_items = []
+    used = set()
+    groups_built = 0
+    tries = 0
+    while groups_built < min(group_n, len(items)) and tries < group_n * 8:
+        anchor_i = int(rng.integers(len(items)))
+        if anchor_i in used:
+            tries += 1
+            continue
+        anchor_rec, _anchor_target, anchor_vec = items[anchor_i]
+        neighbors = []
+        for other_i, (other_rec, other_target, other_vec) in enumerate(items):
+            if other_i == anchor_i:
+                continue
+            score = float((anchor_vec * other_vec).sum().cpu())
+            neighbors.append((score, other_i, other_rec, other_target))
+        neighbors.sort(reverse=True, key=lambda row: row[0])
+        selected = [(anchor_i, anchor_rec, qa_choice_target(anchor_rec))]
+        for _score, other_i, other_rec, other_target in neighbors:
+            if len(selected) >= per_group:
+                break
+            selected.append((other_i, other_rec, other_target))
+        if len(selected) < 2:
+            tries += 1
+            continue
+        concept_idx = groups_built
+        concept_id = f"concept_neighbor_proto_{concept_idx}"
+        for member_idx, (item_i, rec, target) in enumerate(selected):
+            if target is None or target == "none":
+                continue
+            rec_id = f"{rec.rec_id}:concept_neighbor_proto:{concept_idx}:{member_idx}"
+            rows.append(TextRecord(rec_id=rec_id, split=rec.split, tokens=rec.tokens,
+                                   facts=rec.facts, group=rec.group, kind=rec.kind,
+                                   base_id=rec.base_id, changed=rec.changed,
+                                   meta=rec.meta))
+            proto_items.append((rec_id, target, concept_id))
+            used.add(item_i)
+        groups_built += 1
+        tries += 1
+    if len(proto_items) < 2:
+        return [], []
+    return rows, proto_items
+
+
+def _normalized_mean(vectors):
+    return F.normalize(torch.stack(vectors).mean(0), dim=0)
+
+
+def choice_concept_prototype_scores(model, txt, records, items):
+    vectors = choice_candidate_concept_vectors(model, txt, records)
+    by_concept = {}
+    rows = []
+    for rec_id, target, concept_id in items:
+        row = vectors.get(rec_id)
+        if not row or target not in row:
+            continue
+        target_vec = row[target]
+        rows.append((rec_id, target, concept_id, target_vec, row))
+        by_concept.setdefault(concept_id, []).append((rec_id, target_vec))
+    scores = []
+    for rec_id, target, concept_id, target_vec, candidate_row in rows:
+        own_members = [vec for other_id, vec in by_concept.get(concept_id, [])
+                       if other_id != rec_id]
+        if not own_members:
+            continue
+        positive_proto = _normalized_mean(own_members).detach()
+        positive = (target_vec * positive_proto).sum()
+        negatives = []
+        for other_concept, members in by_concept.items():
+            if other_concept == concept_id:
+                continue
+            other_proto = _normalized_mean([vec for _other_id, vec in members]).detach()
+            negatives.append((target_vec * other_proto).sum())
+        negatives.extend((target_vec * cand_vec).sum()
+                         for cand_id, cand_vec in candidate_row.items()
+                         if cand_id != target)
+        if negatives:
+            negative = torch.stack(negatives).max()
+        else:
+            negative = torch.full((), -1.0, dtype=positive.dtype, device=positive.device)
+        scores.append((positive, negative))
+    return scores
+
+
+def choice_concept_prototype_loss(model, txt, records, items, margin=0.0):
+    losses = []
+    margin_t = torch.tensor(float(margin), dtype=torch.float32, device=txt.device)
+    for positive, negative in choice_concept_prototype_scores(model, txt, records, items):
+        losses.append(F.softplus(margin_t - positive))
+        losses.append(F.softplus(negative + margin_t - positive))
+    if not losses:
+        return torch.tensor(0.0, device=txt.device)
+    return sum(losses) / len(losses)
+
+
 def choice_self_distill_loss(model, teacher_model, txt, records, temperature=1.0):
     """Preserve a frozen teacher's current QA choice distribution on mined records."""
     temp = max(float(temperature), 1e-6)
@@ -2567,6 +2728,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               choice_positive_anchor_margin=0.0,
               choice_concept_bridge_w=0.0,
               choice_concept_bridge_margin=0.0,
+              choice_concept_prototype_w=0.0,
+              choice_concept_prototype_margin=0.0,
               choice_concept_bridge_sources=None,
               choice_self_distill_w=0.0,
               choice_self_distill_temperature=1.0,
@@ -2604,7 +2767,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                               if choice_concept_bridge_sources is not None
                               else train_records)
     concept_groups = (choice_concept_groups(concept_source_records)
-                      if choice_concept_bridge_w else [])
+                      if (choice_concept_bridge_w or choice_concept_prototype_w)
+                      else [])
     distill_sources = list(choice_self_distill_sources or [])
     control_sources = (choice_control_source_records(train_records)
                        if (choice_control_w or choice_control_contrast_w
@@ -2809,6 +2973,27 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 concept_loss = torch.tensor(0.0, device=device)
         else:
             concept_loss = torch.tensor(0.0, device=device)
+        if choice_concept_prototype_w:
+            if concept_groups:
+                prototype_records, prototype_items = choice_concept_prototype_batch(
+                    concept_groups, rng, max(1, batch // 4), per_group=3)
+            else:
+                prototype_records, prototype_items = [], []
+            if (not prototype_records or not prototype_items) and concept_source_records:
+                prototype_records, prototype_items = (
+                    choice_concept_neighborhood_prototype_batch(
+                        model, vocab, concept_source_records, rng,
+                        max(1, batch // 4), per_group=3, device=device,
+                        pool_size=max(16, batch * 4)))
+            if prototype_records and prototype_items:
+                prototype_txt, _prototype_ids = pack(prototype_records, vocab, device)
+                prototype_loss = choice_concept_prototype_loss(
+                    model, prototype_txt, prototype_records, prototype_items,
+                    margin=choice_concept_prototype_margin)
+            else:
+                prototype_loss = torch.tensor(0.0, device=device)
+        else:
+            prototype_loss = torch.tensor(0.0, device=device)
         if (choice_self_distill_w and choice_self_distill_model is not None
                 and distill_sources):
             distill_records = batch_records(distill_sources, rng, max(1, batch // 2))
@@ -2924,6 +3109,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                    * replacement_ans_binding_loss)
                 + choice_positive_anchor_w * positive_anchor_loss
                 + choice_concept_bridge_w * concept_loss
+                + choice_concept_prototype_w * prototype_loss
                 + choice_self_distill_w * distill_loss
                 + choice_answerability_w * ans_loss
                 + choice_answerability_control_w * ans_control_loss
@@ -2953,6 +3139,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                   f"cand-repl-ans-bind {replacement_ans_binding_loss.item():.3f} "
                   f"pos-anchor {positive_anchor_loss.item():.3f} "
                   f"concept {concept_loss.item():.3f} "
+                  f"proto {prototype_loss.item():.3f} "
                   f"distill {distill_loss.item():.3f} "
                   f"ans {ans_loss.item():.3f} "
                   f"ans-control {ans_control_loss.item():.3f} "
@@ -2992,6 +3179,8 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                 choice_positive_anchor_margin=0.0,
                 choice_concept_bridge_w=0.0,
                 choice_concept_bridge_margin=0.0,
+                choice_concept_prototype_w=0.0,
+                choice_concept_prototype_margin=0.0,
                 choice_answerability_w=0.0, choice_answerability_control_w=0.0,
                 choice_answerability_margin=0.0,
                 choice_answerability_contrast_w=0.0,
@@ -3048,6 +3237,8 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                      choice_positive_anchor_margin=choice_positive_anchor_margin,
                      choice_concept_bridge_w=choice_concept_bridge_w,
                      choice_concept_bridge_margin=choice_concept_bridge_margin,
+                     choice_concept_prototype_w=choice_concept_prototype_w,
+                     choice_concept_prototype_margin=choice_concept_prototype_margin,
                      choice_answerability_w=choice_answerability_w,
                      choice_answerability_control_w=choice_answerability_control_w,
                      choice_answerability_margin=choice_answerability_margin,
@@ -3811,6 +4002,44 @@ def qa_concept_discovery_eval(model, vocab, records, device=DEV, n=0, seed=0):
 
 
 @torch.no_grad()
+def qa_concept_prototype_eval(model, vocab, records, device=DEV, n=0, seed=0):
+    all_eval = [r for r in records if r.split == "eval" and _is_qa_record(r)
+                and not _is_qa_negative_record(r)]
+    if n < 0:
+        return {"n": 0, "sampled": False, "skipped": True}
+    groups = choice_concept_groups(all_eval)
+    if not groups:
+        return {"n": 0, "sampled": False, "skipped": False,
+                "concept_groups": 0}
+    rng = np.random.default_rng(seed)
+    group_n = min(len(groups), int(n)) if n else min(len(groups), 128)
+    sampled = group_n < len(groups)
+    prototype_records, prototype_items = choice_concept_prototype_batch(
+        groups, rng, group_n, per_group=4)
+    if not prototype_records or not prototype_items:
+        return {"n": 0, "sampled": sampled, "skipped": False,
+                "concept_groups": len(groups)}
+    txt, _ids = pack(prototype_records, vocab, device)
+    scored = choice_concept_prototype_scores(model, txt, prototype_records,
+                                             prototype_items)
+    if not scored:
+        return {"n": 0, "sampled": sampled, "skipped": False,
+                "concept_groups": len(groups)}
+    positives = [float(pos.detach().cpu()) for pos, _neg in scored]
+    negatives = [float(neg.detach().cpu()) for _pos, neg in scored]
+    margins = [pos - neg for pos, neg in zip(positives, negatives)]
+    return {"n": len(scored),
+            "sampled": sampled,
+            "skipped": False,
+            "concept_groups": len(groups),
+            "prototype_records": len(prototype_records),
+            "positive_similarity": float(np.mean(positives)),
+            "negative_similarity": float(np.mean(negatives)),
+            "prototype_margin": float(np.mean(margins)),
+            "prototype_win_rate": float(np.mean([m > 0.0 for m in margins]))}
+
+
+@torch.no_grad()
 def greedy_facts(model, vocab, rec, device=DEV, max_new=80):
     model.eval()
     txt, _ids = pack([rec], vocab, device)
@@ -3929,6 +4158,8 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
         model, vocab, records, device=device, n=artifact_n, seed=seed + 31)
     qa_concept = qa_concept_discovery_eval(model, vocab, records, device=device,
                                            n=artifact_n, seed=seed + 32)
+    qa_proto = qa_concept_prototype_eval(model, vocab, records, device=device,
+                                         n=artifact_n, seed=seed + 33)
     by_kind = bucket_fact_eval(model, vocab, records, device=device, n=kind_fact_n,
                                seed=seed + 19)
     by_kind_free = (bucket_free_eval(model, vocab, records, device=device, max_new=max_new,
@@ -3966,7 +4197,10 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
                  or qa_repl_ans_binding["target_cover_drop"] >= 0.05)
             and (choice_head.get("skipped") or choice_head["n_records"] == 0
                  or qa_concept.get("skipped") or qa_concept["n"] == 0
-                 or qa_concept["discovery_margin"] >= 0.05))
+                 or qa_concept["discovery_margin"] >= 0.05)
+            and (choice_head.get("skipped") or choice_head["n_records"] == 0
+                 or qa_proto.get("skipped") or qa_proto["n"] == 0
+                 or qa_proto["prototype_margin"] >= 0.05))
     return {"teacher_forced": teacher, "free_decode": free,
             "semantic_head": semantic,
             "choice_head": choice_head,
@@ -3981,6 +4215,7 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
             "qa_candidate_replacement_answerability_binding_control": (
                 qa_repl_ans_binding),
             "qa_concept_discovery_control": qa_concept,
+            "qa_concept_prototype_control": qa_proto,
             "gate_thresholds": {"fact_value_acc": 0.80, "free_f1": 0.80,
                                 "semantic_fact_value_acc": 0.80,
                                 "choice_head_fact_value_acc": 0.80,
@@ -3996,7 +4231,8 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
                                 "qa_candidate_replacement_none_acc": 0.55,
                                 "qa_candidate_replacement_target_logit_drop": 0.05,
                                 "qa_candidate_replacement_target_cover_drop": 0.05,
-                                "qa_concept_discovery_margin": 0.05},
+                                "qa_concept_discovery_margin": 0.05,
+                                "qa_concept_prototype_margin": 0.05},
             "gate": gate}
 
 
@@ -4132,6 +4368,10 @@ def _control_gap_values(eval_report, metric="both"):
     if qa_concept.get("n", 0) and use_choice:
         gaps.append(("qa_choice_concept_discovery_margin",
                      float(qa_concept.get("discovery_margin", 0.0))))
+    qa_proto = eval_report.get("qa_concept_prototype_control") or {}
+    if qa_proto.get("n", 0) and use_choice:
+        gaps.append(("qa_choice_concept_prototype_margin",
+                     float(qa_proto.get("prototype_margin", 0.0))))
     return gaps
 
 
@@ -4323,6 +4563,8 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         choice_positive_anchor_margin=0.0,
         choice_concept_bridge_w=0.0,
         choice_concept_bridge_margin=0.0,
+        choice_concept_prototype_w=0.0,
+        choice_concept_prototype_margin=0.0,
         choice_answerability_w=0.0, choice_answerability_control_w=0.0,
         choice_answerability_margin=0.0,
         choice_answerability_contrast_w=0.0,
@@ -4380,6 +4622,9 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                choice_concept_bridge_w=choice_concept_bridge_w,
                                choice_concept_bridge_margin=(
                                    choice_concept_bridge_margin),
+                               choice_concept_prototype_w=choice_concept_prototype_w,
+                               choice_concept_prototype_margin=(
+                                   choice_concept_prototype_margin),
                                choice_answerability_w=choice_answerability_w,
                                choice_answerability_control_w=choice_answerability_control_w,
                                choice_answerability_margin=choice_answerability_margin,
@@ -4448,6 +4693,8 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
               "choice_positive_anchor_margin": float(choice_positive_anchor_margin),
               "choice_concept_bridge_w": float(choice_concept_bridge_w),
               "choice_concept_bridge_margin": float(choice_concept_bridge_margin),
+              "choice_concept_prototype_w": float(choice_concept_prototype_w),
+              "choice_concept_prototype_margin": float(choice_concept_prototype_margin),
               "choice_answerability_w": float(choice_answerability_w),
               "choice_answerability_control_w": float(choice_answerability_control_w),
               "choice_answerability_margin": float(choice_answerability_margin),
@@ -4535,6 +4782,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      choice_positive_anchor_margin=0.0,
                      choice_concept_bridge_w=0.0,
                      choice_concept_bridge_margin=0.0,
+                     choice_concept_prototype_w=0.0,
+                     choice_concept_prototype_margin=0.0,
                      choice_self_distill_w=0.0,
                      choice_self_distill_temperature=1.0,
                      choice_answerability_w=0.0, choice_answerability_control_w=0.0,
@@ -4663,6 +4912,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "choice_positive_anchor_margin": float(choice_positive_anchor_margin),
               "choice_concept_bridge_w": float(choice_concept_bridge_w),
               "choice_concept_bridge_margin": float(choice_concept_bridge_margin),
+              "choice_concept_prototype_w": float(choice_concept_prototype_w),
+              "choice_concept_prototype_margin": float(choice_concept_prototype_margin),
               "choice_self_distill_w": float(choice_self_distill_w),
               "choice_self_distill_temperature": float(choice_self_distill_temperature),
               "choice_answerability_w": float(choice_answerability_w),
@@ -4916,6 +5167,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   choice_positive_anchor_margin=choice_positive_anchor_margin,
                   choice_concept_bridge_w=choice_concept_bridge_w,
                   choice_concept_bridge_margin=choice_concept_bridge_margin,
+                  choice_concept_prototype_w=choice_concept_prototype_w,
+                  choice_concept_prototype_margin=choice_concept_prototype_margin,
                   choice_concept_bridge_sources=(discovery_records or None),
                   choice_self_distill_w=choice_self_distill_w,
                   choice_self_distill_temperature=choice_self_distill_temperature,
@@ -5302,6 +5555,12 @@ def selftest():
     concept_txt, _concept_ids = pack(concept_rows, choice_vocab, "cpu")
     assert torch.isfinite(choice_concept_bridge_loss(
         choice_model, concept_txt, concept_rows, concept_pairs))
+    prototype_rows, prototype_items = choice_concept_prototype_batch(
+        concept_groups, np.random.default_rng(23), group_n=1, per_group=2)
+    assert len(prototype_rows) == 2 and len(prototype_items) == 2
+    prototype_txt, _prototype_ids = pack(prototype_rows, choice_vocab, "cpu")
+    assert torch.isfinite(choice_concept_prototype_loss(
+        choice_model, prototype_txt, prototype_rows, prototype_items))
     neighbor_rows, neighbor_pairs = choice_concept_neighborhood_bridge_batch(
         choice_model, choice_vocab, bridge_eval, np.random.default_rng(19), pairs=1,
         device="cpu", pool_size=4)
@@ -5309,6 +5568,15 @@ def selftest():
     neighbor_txt, _neighbor_ids = pack(neighbor_rows, choice_vocab, "cpu")
     assert torch.isfinite(choice_concept_bridge_loss(
         choice_model, neighbor_txt, neighbor_rows, neighbor_pairs))
+    neighbor_proto_rows, neighbor_proto_items = (
+        choice_concept_neighborhood_prototype_batch(
+            choice_model, choice_vocab, bridge_eval, np.random.default_rng(25),
+            group_n=1, per_group=2, device="cpu", pool_size=4))
+    assert len(neighbor_proto_rows) == 2 and len(neighbor_proto_items) == 2
+    neighbor_proto_txt, _neighbor_proto_ids = pack(neighbor_proto_rows, choice_vocab,
+                                                  "cpu")
+    assert torch.isfinite(choice_concept_prototype_loss(
+        choice_model, neighbor_proto_txt, neighbor_proto_rows, neighbor_proto_items))
     choice_teacher = copy.deepcopy(choice_model).eval()
     assert torch.isfinite(choice_self_distill_loss(
         choice_model, choice_teacher, choice_txt, choice_eval, temperature=1.5))
@@ -5316,6 +5584,10 @@ def selftest():
         choice_model, choice_vocab, bridge_eval, device="cpu", n=1, seed=18)
     assert concept_eval["n"] == 1
     assert "discovery_margin" in concept_eval
+    prototype_eval = qa_concept_prototype_eval(
+        choice_model, choice_vocab, bridge_eval, device="cpu", n=1, seed=24)
+    assert prototype_eval["n"] >= 1
+    assert "prototype_margin" in prototype_eval
     squad_choice_neg, _neg_seen, neg_stats = _squad_records_from_payload(
         squad_payload, "train", 0, np.random.default_rng(2), "fixture",
         max_context_tokens=8, max_question_tokens=8, max_answer_tokens=3,
@@ -5584,7 +5856,8 @@ def selftest():
                            "qa_candidate_replacement_control",
                            "qa_candidate_replacement_binding_control",
                            "qa_candidate_replacement_answerability_binding_control",
-                           "qa_concept_discovery_control", "gate"}
+                           "qa_concept_discovery_control",
+                           "qa_concept_prototype_control", "gate"}
     print("text selftest OK")
 
 
@@ -5748,6 +6021,13 @@ def main(argv=None):
     ap.add_argument("--choice-concept-bridge-margin", type=float, default=0.0,
                     dest="choice_concept_bridge_margin",
                     help="margin for mined same-concept candidate bridge loss")
+    ap.add_argument("--choice-concept-prototype-w", type=float, default=0.0,
+                    dest="choice_concept_prototype_w",
+                    help=("weight for repeated-concept prototype clustering in "
+                          "QA candidate-vector space"))
+    ap.add_argument("--choice-concept-prototype-margin", type=float, default=0.0,
+                    dest="choice_concept_prototype_margin",
+                    help="margin for repeated-concept prototype clustering")
     ap.add_argument("--choice-self-distill-w", "--choice-distill-w",
                     type=float, default=0.0,
                     dest="choice_self_distill_w",
@@ -5986,6 +6266,10 @@ def main(argv=None):
                          choice_concept_bridge_w=args.choice_concept_bridge_w,
                          choice_concept_bridge_margin=(
                              args.choice_concept_bridge_margin),
+                         choice_concept_prototype_w=(
+                             args.choice_concept_prototype_w),
+                         choice_concept_prototype_margin=(
+                             args.choice_concept_prototype_margin),
                          choice_self_distill_w=args.choice_self_distill_w,
                          choice_self_distill_temperature=(
                              args.choice_self_distill_temperature),
@@ -6078,6 +6362,8 @@ def main(argv=None):
         choice_positive_anchor_margin=args.choice_positive_anchor_margin,
         choice_concept_bridge_w=args.choice_concept_bridge_w,
         choice_concept_bridge_margin=args.choice_concept_bridge_margin,
+        choice_concept_prototype_w=args.choice_concept_prototype_w,
+        choice_concept_prototype_margin=args.choice_concept_prototype_margin,
         choice_answerability_w=args.choice_answerability_w,
         choice_answerability_control_w=args.choice_answerability_control_w,
         choice_answerability_margin=args.choice_answerability_margin,

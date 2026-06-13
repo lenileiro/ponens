@@ -836,6 +836,25 @@ reader that reports and targets its own failed evidence routes, but the guarded 
 those experimental updates from replacing the checkpoint until they improve both retention and
 controls.
 
+`--choice-concept-prototype-w` adds a stricter version of the "light bulb" objective. The bridge
+loss can connect two examples, but mastery needs a reusable concept, so prototype training mines
+repeated answer concepts from the data or the current correct pool, builds leave-one-out prototypes
+in the model's candidate-vector space, and pulls the target toward its concept prototype while
+pushing it away from distractors and other prototypes. When exact repeated surfaces are sparse, it
+falls back to own-model nearest-neighbor prototype groups over currently correct examples, so the
+pressure can still activate without adding hand-authored facts. The new held-out
+`qa_concept_prototype_control` reports `prototype_margin` and the study selector treats margins
+below **0.05** as a control failure. This is still not a hand-authored English rule: the prototype
+clusters come from the reading task records and the model's own concept vectors.
+
+The guarded prototype smoke activated both discovery losses (`concept` **0.578**, `proto`
+**0.592**) and the held-out prototype margin was above threshold before/after (**0.098** ->
+**0.097**). The round still stayed rejected (`selected_round` **0**) because `squad_choice`
+regressed from **0.400** to **0.200** and candidate/discovery controls still failed. That is the
+right failure mode for this stage: the architecture can now train and gate reusable concept
+clusters, while selection still prevents a "concept-looking" update from counting as language
+mastery if answer retention and grounding controls do not improve.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
@@ -1618,8 +1637,8 @@ total prefix token count, and RunPod exposes the new controls as `--multimodal-f
 The adaptive text study loop above is intentionally upstream of this multimodal bridge. When the
 text reader fails shortcut controls, the next study attempt can focus the generated evidence
 routes that failed, while the selector blocks regressions. Multimodal can then consume a reader
-whose concept distributions are being improved by measured failures instead of by hard-coded
-English facts or hand-written rules.
+whose concept distributions are being improved by measured failures and reusable prototype
+controls instead of by hard-coded English facts or hand-written rules.
 
 M-0 local update (240 steps, value-token weighted loss, all-mode ablations every step): the
 tracked run now gates three paths separately. Teacher-forced full multimodal accuracy is color
