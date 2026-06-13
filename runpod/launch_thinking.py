@@ -181,6 +181,10 @@ def payload(args):
                     f" --sample-text-guidance-w {args.image_sample_text_guidance_w} "
                     f"--sample-text-guidance-interval "
                     f"{shlex_quote(args.image_sample_text_guidance_interval)}")
+                prompt_grid_args += (
+                    f" --sample-quality-guidance-w {args.image_sample_quality_guidance_w} "
+                    f"--sample-quality-guidance-interval "
+                    f"{shlex_quote(args.image_sample_quality_guidance_interval)}")
                 prompt_grid_args += f" --prompt-embed-backend {args.image_prompt_embed_backend}"
                 prompt_grid_args += f" --prompt-embed-model {shlex_quote(args.image_prompt_embed_model)}"
                 prompt_grid_args += f" --prompt-embed-device {shlex_quote(args.image_prompt_embed_device)}"
@@ -232,6 +236,8 @@ def payload(args):
                      f"--image-split {shlex_quote(args.image_split)} "
                      f"--image-max-records {args.image_max_records} "
                      f"--image-quality-weight {args.image_quality_weight} "
+                     f"--image-quality-score-w {args.image_quality_score_w} "
+                     f"--flow-quality-score-w {args.image_flow_quality_score_w} "
                      f"--caption-vocab-max {args.image_caption_vocab_max} "
                      f"--caption-max-len {args.image_caption_max_len} "
                      f"--caption-cond-source {args.image_caption_cond_source} "
@@ -734,6 +740,13 @@ def main():
                     dest="image_quality_weight",
                     help=("sample image manifest rows by normalized aesthetic/score/quality "
                           "metadata; 0 keeps uniform sampling"))
+    ap.add_argument("--image-quality-score-w", type=float, default=0.0,
+                    dest="image_quality_score_w",
+                    help="train a latent aesthetic/quality score head from image manifest metadata")
+    ap.add_argument("--image-flow-quality-score-w", type=float, default=0.0,
+                    dest="image_flow_quality_score_w",
+                    help=("preserve learned quality score on latent flow endpoints; "
+                          "requires --image-quality-score-w"))
     ap.add_argument("--image-max-records", type=int, default=0, dest="image_max_records",
                     help="cap image manifest records for GPU smoke tests; 0 means all")
     ap.add_argument("--image-eval-split", default="eval", dest="image_eval_split",
@@ -807,6 +820,13 @@ def main():
     ap.add_argument("--image-sample-text-guidance-interval", default="0.0,1.0",
                     dest="image_sample_text_guidance_interval",
                     help=("sample-prompt text guidance active interval over flow time, "
+                          "formatted start,end"))
+    ap.add_argument("--image-sample-quality-guidance-w", type=float, default=0.0,
+                    dest="image_sample_quality_guidance_w",
+                    help="sampling-time manifest quality guidance weight for latent image prompts")
+    ap.add_argument("--image-sample-quality-guidance-interval", default="0.0,1.0",
+                    dest="image_sample_quality_guidance_interval",
+                    help=("sample-prompt quality guidance active interval over flow time, "
                           "formatted start,end"))
     ap.add_argument("--image-prompt-embed-backend", default="stats",
                     choices=("stats", "hf"), dest="image_prompt_embed_backend",
@@ -1045,6 +1065,17 @@ def main():
         sys.exit("ERROR: --image-sample-text-guidance-w must be non-negative")
     if args.image_sample_text_guidance_w > 0.0 and not args.image_sample_prompts:
         sys.exit("ERROR: --image-sample-text-guidance-w requires --image-sample-prompts")
+    if args.image_sample_quality_guidance_w < 0.0:
+        sys.exit("ERROR: --image-sample-quality-guidance-w must be non-negative")
+    if args.image_sample_quality_guidance_w > 0.0 and not args.image_sample_prompts:
+        sys.exit("ERROR: --image-sample-quality-guidance-w requires --image-sample-prompts")
+    if args.image_quality_score_w < 0.0 or args.image_flow_quality_score_w < 0.0:
+        sys.exit("ERROR: image quality score weights must be non-negative")
+    if args.image_flow_quality_score_w > 0.0 and args.image_quality_score_w <= 0.0:
+        sys.exit("ERROR: --image-flow-quality-score-w requires --image-quality-score-w > 0")
+    if args.image_flow_quality_score_w > 0.0 and (
+            args.image_flow_cache_records > 0 or args.image_flow_cache_dir):
+        sys.exit("ERROR: --image-flow-quality-score-w is not compatible with flow cache yet")
     if (args.image_sample_prompts and args.image_prompt_embed_backend == "hf"
             and not args.image_prompt_embed_model):
         sys.exit("ERROR: --image-prompt-embed-backend hf requires --image-prompt-embed-model")

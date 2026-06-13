@@ -543,6 +543,73 @@ def quality_sampling_weights(records, strength=0.0):
     return weights.astype(np.float64), report
 
 
+def quality_score_stats(records):
+    vals = np.asarray([
+        float(rec.aesthetic) if rec.aesthetic is not None else np.nan
+        for rec in records
+    ], dtype=np.float64)
+    finite = np.isfinite(vals)
+    if not finite.any():
+        return {
+            "n": 0,
+            "missing": int(len(vals)),
+            "min": 0.0,
+            "mean": 0.0,
+            "max": 0.0,
+            "has_range": False,
+        }
+    valid = vals[finite]
+    lo = float(np.min(valid))
+    hi = float(np.max(valid))
+    return {
+        "n": int(finite.sum()),
+        "missing": int(len(vals) - int(finite.sum())),
+        "min": lo,
+        "mean": float(np.mean(valid)),
+        "max": hi,
+        "has_range": bool(hi > lo),
+    }
+
+
+def quality_target_tensor(records, stats, device=DEV):
+    vals = torch.tensor([
+        float(rec.aesthetic) if rec.aesthetic is not None else float("nan")
+        for rec in records
+    ], dtype=torch.float32, device=device)
+    mask = torch.isfinite(vals)
+    target = torch.zeros_like(vals)
+    if bool(mask.any()):
+        lo = float(stats.get("min", 0.0))
+        hi = float(stats.get("max", lo))
+        if hi > lo:
+            target[mask] = ((vals[mask] - lo) / max(hi - lo, 1.0e-12)).clamp(0.0, 1.0)
+        else:
+            target[mask] = 0.5
+    return target, mask
+
+
+def image_quality_score_loss(scorer, z, records, stats, prefix="quality_score"):
+    if scorer is None:
+        zero = z.sum() * 0.0
+        return zero, {}
+    target, mask = quality_target_tensor(records, stats, device=z.device)
+    n = int(mask.sum().detach().cpu())
+    if n <= 0:
+        zero = z.sum() * 0.0
+        return zero, {
+            f"{prefix}_loss": zero.detach(),
+            f"{prefix}_n": torch.tensor(0.0, device=z.device),
+        }
+    pred = scorer.score(z)
+    loss = F.mse_loss(pred[mask], target[mask])
+    return loss, {
+        f"{prefix}_loss": loss.detach(),
+        f"{prefix}_pred_mean": pred[mask].detach().mean(),
+        f"{prefix}_target_mean": target[mask].detach().mean(),
+        f"{prefix}_n": torch.tensor(float(n), device=z.device),
+    }
+
+
 def record_weight_lookup(records, weights):
     if weights is None:
         return None
@@ -718,6 +785,30 @@ class ImageFeatureAligner(nn.Module):
 
     def scale(self):
         return self.logit_scale.exp().clamp(max=100.0)
+
+
+class ImageQualityScorer(nn.Module):
+    """Predict normalized aesthetic/quality metadata from image latents."""
+
+    def __init__(self, latent_ch=16, hidden=64):
+        super().__init__()
+        self.latent_ch = int(latent_ch)
+        self.net = nn.Sequential(
+            nn.LayerNorm(self.latent_ch),
+            nn.Linear(self.latent_ch, int(hidden)),
+            nn.GELU(),
+            nn.Linear(int(hidden), 1),
+        )
+
+    def logits(self, z):
+        pooled = z.float().mean(dim=(2, 3))
+        return self.net(pooled).squeeze(-1)
+
+    def score(self, z):
+        return torch.sigmoid(self.logits(z))
+
+    def forward(self, z):
+        return self.score(z)
 
 
 class FlowFeatureAligner(nn.Module):
@@ -1280,6 +1371,14 @@ def attach_image_feature_aligner(flow, image_feature_aligner):
     if hasattr(flow, "_modules"):
         flow._modules.pop("image_feature_aligner", None)
     flow.__dict__["image_feature_aligner"] = image_feature_aligner
+    return flow
+
+
+def attach_image_quality_scorer(flow, image_quality_scorer):
+    # Keep the scorer available for eval/guidance without registering it in flow.state_dict().
+    if hasattr(flow, "_modules"):
+        flow._modules.pop("image_quality_scorer", None)
+    flow.__dict__["image_quality_scorer"] = image_quality_scorer
     return flow
 
 
@@ -2525,6 +2624,22 @@ def text_alignment_guidance_step(text_aligner, z, cond, weight=0.0, step_size=1.
     return guided.detach()
 
 
+def image_quality_guidance_step(scorer, z, weight=0.0, step_size=1.0, eps=1.0e-6):
+    """Sampling-time latent guidance toward a learned manifest quality score."""
+    if weight <= 0.0:
+        return z
+    if scorer is None:
+        raise ValueError("quality guidance requires a checkpoint image_quality_scorer")
+    z_var = z.detach().requires_grad_(True)
+    with torch.enable_grad():
+        objective = scorer.score(z_var).sum()
+        grad = torch.autograd.grad(objective, z_var, allow_unused=False)[0]
+    flat = grad.flatten(1)
+    denom = flat.norm(dim=1).view((-1,) + (1,) * (grad.ndim - 1)).clamp_min(float(eps))
+    guided = z_var + float(weight) * abs(float(step_size)) * grad / denom
+    return guided.detach()
+
+
 def semantic_fact_loss_from_logits(logits, cond, suffix="_endpoint_ce"):
     losses = {}
     for pred, idxs in FACT_GROUPS.items():
@@ -2804,7 +2919,9 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
                        flow_loss_weight_normalize=True,
                        text_aligner=None, text_align_w=0.0,
                        feature_aligner=None, image_features=None, feature_align_w=0.0,
-                       repa_aligner=None, repa_w=0.0):
+                       repa_aligner=None, repa_w=0.0,
+                       quality_scorer=None, quality_records=None, quality_stats=None,
+                       quality_w=0.0):
     latent_stats = flow_latent_stats(flow) if latent_stats is None else latent_stats
     z1_model = normalize_latent(z1, latent_stats)
     x0 = torch.randn_like(z1_model)
@@ -2875,6 +2992,16 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
             text_aligner, z_clean, cond_model, prefix="flow_caption_align", mask=keep)
         total = total + float(text_align_w) * text_align
         parts.update(text_parts)
+    if quality_scorer is not None and quality_w > 0.0:
+        if quality_records is None or quality_stats is None:
+            raise ValueError("flow quality loss requires quality records and stats")
+        if z_clean is None:
+            z_clean = denormalize_latent(zt + (1.0 - t) * pred, latent_stats)
+        quality_loss, quality_parts = image_quality_score_loss(
+            quality_scorer, z_clean, quality_records, quality_stats,
+            prefix="flow_quality_score")
+        total = total + float(quality_w) * quality_loss
+        parts.update(quality_parts)
     if feature_aligner is not None and feature_align_w > 0.0:
         if image_features is None:
             raise ValueError("flow feature alignment requires image_features")
@@ -3218,7 +3345,9 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                    sample_time_shift=1.0, sample_schedule="linear", cfg_uncond=None,
                    text_guidance_w=0.0, text_guidance_aligner=None,
                    text_guidance_cond=None,
-                   text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
+                   text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                   quality_guidance_w=0.0, quality_guidance_scorer=None,
+                   quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     batch = condition_batch(cond)
     if cfg_uncond is not None and condition_batch(cfg_uncond) != batch:
         raise ValueError("cfg_uncond batch must match cond batch")
@@ -3239,6 +3368,10 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         raise ValueError("text alignment guidance requires a checkpoint text_aligner")
     if text_guidance_cond is None:
         text_guidance_cond = cond
+    if quality_guidance_w < 0.0:
+        raise ValueError("quality_guidance_w must be non-negative")
+    if quality_guidance_w > 0.0 and quality_guidance_scorer is None:
+        raise ValueError("quality guidance requires a checkpoint image_quality_scorer")
     if sample_method not in SAMPLE_METHODS:
         raise ValueError(f"unknown sample method {sample_method!r}")
     if sample_schedule not in SAMPLE_SCHEDULES:
@@ -3250,6 +3383,8 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         semantic_guidance_interval, name="semantic_guidance_interval")
     text_guidance_interval = validate_guidance_interval(
         text_guidance_interval, name="text_guidance_interval")
+    quality_guidance_interval = validate_guidance_interval(
+        quality_guidance_interval, name="quality_guidance_interval")
     schedule = flow_time_schedule(
         steps, device=device, shift=sample_time_shift, schedule=sample_schedule)
     for i in range(steps):
@@ -3299,6 +3434,13 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                 text_guidance_aligner, z_raw, text_guidance_cond,
                 weight=text_guidance_w, step_size=dt)
             z = normalize_latent(z_raw, latent_stats)
+        if (quality_guidance_w > 0.0
+                and interval_active(t_scalar, quality_guidance_interval)):
+            z_raw = denormalize_latent(z, latent_stats)
+            z_raw = image_quality_guidance_step(
+                quality_guidance_scorer, z_raw,
+                weight=quality_guidance_w, step_size=dt)
+            z = normalize_latent(z_raw, latent_stats)
     return denormalize_latent(z, latent_stats)
 
 
@@ -3312,7 +3454,9 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
                   sample_time_shift=1.0, sample_schedule="linear", cfg_uncond=None,
                   text_guidance_w=0.0, text_guidance_aligner=None,
                   text_guidance_cond=None,
-                  text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
+                  text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                  quality_guidance_w=0.0, quality_guidance_scorer=None,
+                  quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     z = sample_latents(flow, cond, latent_shape=latent_shape, steps=steps, device=device,
                        seed=seed, cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
                        ae=ae, semantic_cond=semantic_cond,
@@ -3325,7 +3469,10 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
                        text_guidance_w=text_guidance_w,
                        text_guidance_aligner=text_guidance_aligner,
                        text_guidance_cond=text_guidance_cond,
-                       text_guidance_interval=text_guidance_interval)
+                       text_guidance_interval=text_guidance_interval,
+                       quality_guidance_w=quality_guidance_w,
+                       quality_guidance_scorer=quality_guidance_scorer,
+                       quality_guidance_interval=quality_guidance_interval)
     ae.eval()
     return ae.decode(z).clamp(-1.0, 1.0)
 
@@ -3537,7 +3684,9 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                                  prompt_embed_trust_remote_code=False,
                                  negative_prompts=(), candidates_per_prompt=1,
                                  text_guidance_w=0.0,
-                                 text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
+                                 text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                                 quality_guidance_w=0.0,
+                                 quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     ae.eval()
     flow.eval()
     prompts = tuple(str(p).strip() for p in prompts if str(p).strip())
@@ -3551,6 +3700,11 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         raise ValueError("text_guidance_w must be non-negative")
     text_guidance_interval = validate_guidance_interval(
         text_guidance_interval, name="text_guidance_interval")
+    quality_guidance_w = float(quality_guidance_w)
+    if quality_guidance_w < 0.0:
+        raise ValueError("quality_guidance_w must be non-negative")
+    quality_guidance_interval = validate_guidance_interval(
+        quality_guidance_interval, name="quality_guidance_interval")
     cond = text_prompt_condition(
         prompts, conditioner, prompt_vocab=prompt_vocab, caption_max_len=caption_max_len,
         source=caption_cond_source, device=device, return_tokens=flow_uses_cond_tokens(flow),
@@ -3572,6 +3726,7 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
     sample_cond = repeat_condition_rows(cond, candidates_per_prompt)
     sample_uncond = repeat_condition_rows(cfg_uncond, candidates_per_prompt)
     text_aligner = getattr(flow, "text_aligner", None)
+    quality_scorer = getattr(flow, "image_quality_scorer", None)
     sample = sample_images(ae, flow, sample_cond, latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            cfg_rescale=cfg_rescale,
@@ -3581,7 +3736,10 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                            text_guidance_w=text_guidance_w,
                            text_guidance_aligner=text_aligner,
                            text_guidance_cond=sample_cond,
-                           text_guidance_interval=text_guidance_interval)
+                           text_guidance_interval=text_guidance_interval,
+                           quality_guidance_w=quality_guidance_w,
+                           quality_guidance_scorer=quality_scorer,
+                           quality_guidance_interval=quality_guidance_interval)
     sample, selection_meta = select_prompt_candidates(
         ae, sample, sample_cond, prompts, candidates_per_prompt=candidates_per_prompt,
         text_aligner=text_aligner)
@@ -3601,6 +3759,11 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         "sample_grid_text_guidance_interval": list(text_guidance_interval),
         "sample_grid_text_guidance_scorer": (
             "text_aligner" if text_guidance_w > 0.0 else "none"
+        ),
+        "sample_grid_quality_guidance_w": float(quality_guidance_w),
+        "sample_grid_quality_guidance_interval": list(quality_guidance_interval),
+        "sample_grid_quality_guidance_scorer": (
+            "image_quality_scorer" if quality_guidance_w > 0.0 else "none"
         ),
         "sample_grid_cond_mode": "prompt",
         "sample_grid_caption_cond_source": caption_cond_source,
@@ -3819,6 +3982,7 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                            sample_steps=4, sample_method="euler",
                            cfg_interval=DEFAULT_GUIDANCE_INTERVAL, text_aligner=None,
                            image_feature_aligner=None,
+                           image_quality_scorer=None,
                            caption_cond_source="tokens", sample_time_shift=1.0,
                            sample_schedule="linear",
                            time_shift=1.0):
@@ -3831,6 +3995,7 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
     align_losses, align_i2t, align_t2i = [], [], []
     feature_losses, feature_i2f, feature_f2i = [], [], []
     ext_pair_cos, ext_pair_i2t, ext_pair_t2i = [], [], []
+    quality_scores = []
     score_external_text_image = can_score_external_text_image(records, image_feature_aligner)
     total = 0
     while total < n:
@@ -3871,6 +4036,8 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                     pair_parts["external_text_image_score_i2t_acc"].detach().cpu()))
                 ext_pair_t2i.append(float(
                     pair_parts["external_text_image_score_t2i_acc"].detach().cpu()))
+        if image_quality_scorer is not None:
+            quality_scores.append(float(image_quality_scorer.score(z).detach().mean().cpu()))
         flow_losses.append(float(latent_flow_loss(
             flow, z, cond, time_shift=time_shift).detach().cpu()))
         endpoint_metrics = flow_endpoint_metrics(flow, z, cond, time_shift=time_shift)
@@ -3989,6 +4156,14 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                     generated_pair_parts[
                         "generated_external_text_image_score_n"].detach().cpu()),
             })
+    if image_quality_scorer is not None:
+        sample_z = ae.encode(sample)
+        report.update({
+            "image_quality_score_pred_mean": float(np.mean(quality_scores))
+            if quality_scores else 0.0,
+            "generated_image_quality_score_pred_mean": float(
+                image_quality_scorer.score(sample_z).detach().mean().cpu()),
+        })
     report.update(summarize_records(records))
     return report
 
@@ -4074,6 +4249,10 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "image_embedding_in_dim", report.get("image_embedding_in_dim", 0)) or 0)
     image_feature_embed_dim = int(ckpt.get(
         "image_feature_embed_dim", report.get("image_feature_embed_dim", 128)) or 128)
+    image_quality_score_w = float(ckpt.get(
+        "image_quality_score_w", report.get("image_quality_score_w", 0.0)) or 0.0)
+    flow_quality_score_w = float(ckpt.get(
+        "flow_quality_score_w", report.get("flow_quality_score_w", 0.0)) or 0.0)
     flow_repa_embed_dim = int(ckpt.get(
         "flow_repa_embed_dim", report.get("flow_repa_embed_dim", 128)) or 128)
     ae_hf_model = str(ckpt.get("ae_hf_model", report.get("ae_hf_model", "")) or "")
@@ -4123,6 +4302,12 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
             embed_dim=image_feature_embed_dim).to(device)
         image_feature_aligner.load_state_dict(ckpt["image_feature_aligner_state_dict"])
         image_feature_aligner.eval()
+    image_quality_scorer = None
+    if ckpt.get("image_quality_scorer_state_dict"):
+        image_quality_scorer = ImageQualityScorer(
+            latent_ch=latent_ch, hidden=hidden).to(device)
+        image_quality_scorer.load_state_dict(ckpt["image_quality_scorer_state_dict"])
+        image_quality_scorer.eval()
     ae = make_autoencoder(ae_arch=ae_arch, latent_ch=latent_ch, hidden=hidden,
                           latent_downsample=latent_downsample,
                           ae_res_blocks=ae_res_blocks,
@@ -4164,6 +4349,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     flow_load = load_flow_state(flow, flow_state)
     attach_text_aligner(flow, text_aligner)
     attach_image_feature_aligner(flow, image_feature_aligner)
+    attach_image_quality_scorer(flow, image_quality_scorer)
     attach_flow_repa_aligner(flow, flow_repa_aligner)
     ae.eval()
     flow.eval()
@@ -4246,6 +4432,9 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "image_feature_aligner": image_feature_aligner is not None,
         "image_embedding_in_dim": int(image_embedding_in_dim),
         "image_feature_embed_dim": int(image_feature_embed_dim),
+        "image_quality_scorer": image_quality_scorer is not None,
+        "image_quality_score_w": float(image_quality_score_w),
+        "flow_quality_score_w": float(flow_quality_score_w),
         "flow_repa_aligner": flow_repa_aligner is not None,
         "flow_repa_embed_dim": int(flow_repa_embed_dim),
         "image_text_align_w": float(ckpt.get(
@@ -4323,6 +4512,7 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                        sample_schedule="linear", sample_schedules=None,
                        cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                        text_aligner=None, image_feature_aligner=None,
+                       image_quality_scorer=None,
                        caption_cond_source="tokens", sample_time_shift=1.0,
                        time_shift=1.0):
     if sample_methods is None:
@@ -4345,6 +4535,7 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                             sample_schedule=schedule,
                             cfg_interval=cfg_interval, text_aligner=text_aligner,
                             image_feature_aligner=image_feature_aligner,
+                            image_quality_scorer=image_quality_scorer,
                             caption_cond_source=caption_cond_source,
                             sample_time_shift=sample_time_shift, time_shift=time_shift)
                         row["semantic_guidance_w"] = 0.0
@@ -4384,6 +4575,8 @@ SWEEP_METRICS = (
     "generated_external_text_image_score_cos",
     "generated_external_text_image_score_i2t_acc",
     "generated_external_text_image_score_t2i_acc",
+    "image_quality_score_pred_mean",
+    "generated_image_quality_score_pred_mean",
     "sample_center_target_mse",
     "recon_mse",
     "latent_velocity_mse",
@@ -4405,6 +4598,7 @@ def report_selection_key(report):
         float(report.get("sample_roundtrip_shape_acc", 0.0)),
         float(report.get("sample_roundtrip_color_acc", 0.0)),
         float(report.get("generated_external_text_image_score_cos", 0.0)),
+        float(report.get("generated_image_quality_score_pred_mean", 0.0)),
         float(report.get("generated_image_feature_retrieval_i2f_acc", 0.0)),
         float(report.get("external_text_image_score_cos", 0.0)),
         float(report.get("image_feature_retrieval_i2f_acc", 0.0)),
@@ -4427,6 +4621,7 @@ def aggregate_selection_key(report):
         float(report.get("sample_roundtrip_shape_acc_mean", 0.0)),
         float(report.get("sample_roundtrip_color_acc_mean", 0.0)),
         float(report.get("generated_external_text_image_score_cos_mean", 0.0)),
+        float(report.get("generated_image_quality_score_pred_mean_mean", 0.0)),
         float(report.get("generated_image_feature_retrieval_i2f_acc_mean", 0.0)),
         float(report.get("external_text_image_score_cos_mean", 0.0)),
         float(report.get("image_feature_retrieval_i2f_acc_mean", 0.0)),
@@ -4469,6 +4664,8 @@ def eval_report_summary(report):
         "generated_image_feature_retrieval_f2i_acc",
         "external_text_image_score_cos",
         "generated_external_text_image_score_cos",
+        "image_quality_score_pred_mean",
+        "generated_image_quality_score_pred_mean",
         "sample_center_target_mse",
         "recon_mse",
         "latent_velocity_mse",
@@ -4613,6 +4810,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         cfg_interval=cfg_interval,
                         text_aligner=getattr(flow, "text_aligner", None),
                         image_feature_aligner=getattr(flow, "image_feature_aligner", None),
+                        image_quality_scorer=getattr(flow, "image_quality_scorer", None),
                         caption_cond_source=meta["caption_cond_source"],
                         sample_time_shift=actual_sample_time_shift,
                         time_shift=train_time_shift):
@@ -4791,6 +4989,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       image_manifest="", image_root="", image_split="train",
                       image_min_aesthetic=None, image_max_records=0,
                       image_quality_weight=0.0,
+                      image_quality_score_w=0.0, flow_quality_score_w=0.0,
                       caption_vocab_max=8192, caption_max_len=64,
                       caption_cond_source="tokens",
                       image_crop_mode="center", image_hflip_prob=0.0,
@@ -4886,6 +5085,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("image_quality_weight must be non-negative")
     if image_quality_weight > 0.0 and image_records is None:
         raise ValueError("image_quality_weight requires image_manifest training")
+    if image_quality_score_w < 0.0 or flow_quality_score_w < 0.0:
+        raise ValueError("quality score weights must be non-negative")
+    if (image_quality_score_w > 0.0 or flow_quality_score_w > 0.0) and image_records is None:
+        raise ValueError("quality score losses require image_manifest training")
+    if flow_quality_score_w > 0.0 and image_quality_score_w <= 0.0:
+        raise ValueError("flow_quality_score_w requires image_quality_score_w > 0")
+    if flow_quality_score_w > 0.0 and (flow_cache_latents or flow_cache_dir):
+        raise ValueError("flow_quality_score_w is not yet compatible with flow latent cache")
     if image_crop_mode not in ("center", "random", "none", "pad"):
         raise ValueError(f"unknown image crop mode {image_crop_mode!r}")
     if image_hflip_prob < 0.0 or image_hflip_prob > 1.0:
@@ -4978,6 +5185,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         image_sample_weights, image_quality_report = quality_sampling_weights(
             image_records, image_quality_weight)
         image_record_weights = record_weight_lookup(image_records, image_sample_weights)
+    image_quality_score_stats = (
+        quality_score_stats(image_records) if image_records is not None else
+        {"n": 0, "missing": 0, "min": 0.0, "mean": 0.0, "max": 0.0, "has_range": False}
+    )
+    if (image_quality_score_w > 0.0 or flow_quality_score_w > 0.0
+            ) and image_quality_score_stats["n"] <= 0:
+        raise ValueError("quality score losses require manifest aesthetic/score/quality values")
     if cond_mode == "text":
         prompt_vocab = (
             None if image_records is not None and caption_cond_source == "embedding"
@@ -5017,6 +5231,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         image_feature_aligner = ImageFeatureAligner(
             latent_ch=latent_ch, feature_dim=image_embedding_in_dim, hidden=hidden,
             embed_dim=image_feature_embed_dim).to(device)
+    image_quality_scorer = None
+    if image_records is not None and (image_quality_score_w > 0.0 or flow_quality_score_w > 0.0):
+        image_quality_scorer = ImageQualityScorer(latent_ch=latent_ch, hidden=hidden).to(device)
     latent_shape = ae_latent_shape(ae, size)
     latent_tokens = latent_shape[1] * latent_shape[2]
     train_latent_shapes = [ae_latent_shape(ae, bucket) for bucket in train_size_buckets]
@@ -5052,12 +5269,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             hidden=hidden, embed_dim=flow_repa_embed_dim).to(device)
     attach_text_aligner(flow, text_aligner)
     attach_image_feature_aligner(flow, image_feature_aligner)
+    attach_image_quality_scorer(flow, image_quality_scorer)
     attach_flow_repa_aligner(flow, flow_repa_aligner)
     ae_params = [p for p in ae.parameters() if p.requires_grad]
     if text_aligner is not None and image_text_align_w > 0.0:
         ae_params += list(conditioner.parameters()) + list(text_aligner.parameters())
     if image_feature_aligner is not None and image_feature_align_w > 0.0:
         ae_params += list(image_feature_aligner.parameters())
+    if image_quality_scorer is not None and image_quality_score_w > 0.0:
+        ae_params += list(image_quality_scorer.parameters())
     opt_ae = (
         torch.optim.AdamW(ae_params, lr=lr, weight_decay=0.01)
         if ae_params else None
@@ -5071,6 +5291,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         text_aligner.train()
     if image_feature_aligner is not None:
         image_feature_aligner.train()
+    if image_quality_scorer is not None:
+        image_quality_scorer.train()
     size_bucket_sample_counts = {image_size_key(bucket): 0 for bucket in train_size_buckets}
     last_ae = {}
     ae_train_steps_run = 0
@@ -5115,6 +5337,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                             prefix="image_feature_align")
                         loss = loss + float(image_feature_align_w) * feature_loss
                         parts.update(feature_parts)
+                    if image_quality_scorer is not None and image_quality_score_w > 0.0:
+                        quality_loss, quality_parts = image_quality_score_loss(
+                            image_quality_scorer, out["latent"], chosen_records,
+                            image_quality_score_stats, prefix="quality_score")
+                        loss = loss + float(image_quality_score_w) * quality_loss
+                        parts.update(quality_parts)
                 if image_records is None and ae_intervention_w > 0.0:
                     intervention, intervention_parts = latent_intervention_training_loss(
                         ae, out["latent"], fact_cond)
@@ -5148,6 +5376,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     ae.eval()
     for p in ae.parameters():
         p.requires_grad_(False)
+    if image_quality_scorer is not None:
+        image_quality_scorer.eval()
+        for p in image_quality_scorer.parameters():
+            p.requires_grad_(False)
     flow_cache = None
     if flow_cache_latents:
         flow_cache = build_image_latent_cache(
@@ -5248,6 +5480,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         text_aligner.train()
     if image_feature_aligner is not None:
         image_feature_aligner.train()
+    if image_quality_scorer is not None:
+        image_quality_scorer.eval()
     if flow_repa_aligner is not None:
         flow_repa_aligner.train()
     last_flow = {}
@@ -5265,12 +5499,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             if flow_cache is not None:
                 z1, cache_payload = sample_latent_cache(flow_cache, rng, batch, device=device)
                 fact_cond, specs = None, None
+                chosen_records = None
                 cond = cached_caption_payload_condition(
                     cache_payload, conditioner, source=caption_cond_source,
                     device=device, return_tokens=flow_uses_cond_tokens(flow))
                 image_features = cache_payload.get("image_embeddings")
             elif image_records is None:
                 image_features = None
+                chosen_records = None
                 x, fact_cond, _yc, _ys, specs = _batch(batch, rng, size=size, device=device,
                                                        return_specs=True)
                 with torch.no_grad(), amp_autocast(device, train_precision):
@@ -5310,7 +5546,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     text_aligner=text_aligner, text_align_w=flow_text_align_w,
                     feature_aligner=image_feature_aligner, image_features=image_features,
                     feature_align_w=flow_feature_align_w,
-                    repa_aligner=flow_repa_aligner, repa_w=active_flow_repa_w)
+                    repa_aligner=flow_repa_aligner, repa_w=active_flow_repa_w,
+                    quality_scorer=image_quality_scorer,
+                    quality_records=chosen_records,
+                    quality_stats=image_quality_score_stats,
+                    quality_w=flow_quality_score_w)
                 scaled_loss = loss / float(flow_accum_steps)
             scaler.scale(scaled_loss).backward()
             last_flow = {"total_loss": float(loss.detach().cpu())}
@@ -5365,6 +5605,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         flow.train()
         if conditioner is not None:
             conditioner.train()
+        if image_quality_scorer is not None:
+            image_quality_scorer.eval()
         for _distill_step in range(flow_distill_steps):
             opt_flow.zero_grad(set_to_none=True)
             for _micro in range(flow_accum_steps):
@@ -5408,6 +5650,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         text_aligner.eval()
     if image_feature_aligner is not None:
         image_feature_aligner.eval()
+    if image_quality_scorer is not None:
+        image_quality_scorer.eval()
     if flow_repa_aligner is not None:
         flow_repa_aligner.eval()
     raw_flow = clone_state_dict(flow)
@@ -5455,6 +5699,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 sample_schedule=sample_schedule,
                 cfg_interval=cfg_interval, text_aligner=text_aligner,
                 image_feature_aligner=image_feature_aligner,
+                image_quality_scorer=image_quality_scorer,
                 caption_cond_source=caption_cond_source,
                 sample_time_shift=effective_time_shift, time_shift=effective_time_shift)
         candidate["eval_weight_mode"] = mode
@@ -5611,6 +5856,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             float(image_min_aesthetic) if image_min_aesthetic is not None else None
         ),
         **image_quality_report,
+        "image_quality_score_w": float(image_quality_score_w),
+        "flow_quality_score_w": float(flow_quality_score_w),
+        "image_quality_scorer": image_quality_scorer is not None,
+        "image_quality_score_records": int(image_quality_score_stats["n"]),
+        "image_quality_score_missing": int(image_quality_score_stats["missing"]),
+        "image_quality_score_min": float(image_quality_score_stats["min"]),
+        "image_quality_score_mean": float(image_quality_score_stats["mean"]),
+        "image_quality_score_max": float(image_quality_score_stats["max"]),
+        "image_quality_score_has_range": bool(image_quality_score_stats["has_range"]),
         "image_crop_mode": image_crop_mode if image_records is not None else "",
         "image_hflip_prob": float(image_hflip_prob) if image_records is not None else 0.0,
         "caption_vocab_max": int(caption_vocab_max) if image_records is not None else 0,
@@ -5916,7 +6170,7 @@ def selftest():
             image_text_align_w=0.1, flow_text_align_w=0.1, text_embed_dim=12,
             image_feature_align_w=0.1, flow_feature_align_w=0.1,
             image_feature_embed_dim=10, flow_repa_w=0.1, flow_repa_embed_dim=11,
-            image_quality_weight=2.0,
+            image_quality_weight=2.0, image_quality_score_w=0.1,
             flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
             intervention_samples=0, return_conditioner=True, return_aligner=True)
         assert report6["data_mode"] == "image_manifest"
@@ -5936,6 +6190,9 @@ def selftest():
         assert report6["image_quality_weight_source"] == "aesthetic_score_quality"
         assert report6["image_quality_weight_records"] == 2
         assert report6["image_quality_weight_ratio"] > 1.0
+        assert report6["image_quality_scorer"] is True
+        assert report6["image_quality_score_records"] == 2
+        assert "quality_score_loss" in report6["last_ae"]
         assert report6["flow_cache_latents"] is True
         assert report6["flow_cache_backend"] == "memory"
         assert report6["flow_cache_weighted"] is True
@@ -5949,7 +6206,8 @@ def selftest():
             caption_cond_source="embedding", prompt_embed_backend="stats",
             prompt_embed_stats_dim=4, cfg_scale=1.25,
             negative_prompts=("low quality", "washed out"), candidates_per_prompt=2,
-            text_guidance_w=0.05, text_guidance_interval=(0.0, 1.0))
+            text_guidance_w=0.05, text_guidance_interval=(0.0, 1.0),
+            quality_guidance_w=0.05, quality_guidance_interval=(0.0, 1.0))
         assert embed_prompt_meta["sample_grid_cond_mode"] == "prompt"
         assert embed_prompt_meta["sample_grid_caption_cond_source"] == "embedding"
         assert embed_prompt_meta["sample_grid_prompt_embed_backend"] == "stats"
@@ -5960,6 +6218,19 @@ def selftest():
         assert "sample_grid_selection_score_mean" in embed_prompt_meta
         assert embed_prompt_meta["sample_grid_text_guidance_w"] == 0.05
         assert embed_prompt_meta["sample_grid_text_guidance_scorer"] == "text_aligner"
+        assert embed_prompt_meta["sample_grid_quality_guidance_w"] == 0.05
+        assert embed_prompt_meta["sample_grid_quality_guidance_scorer"] == "image_quality_scorer"
+        _ae_q, _flow_q, _cond_q, _vocab_q, report_q = train_latent_flow(
+            ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=16,
+            flow_arch="dit", dit_depth=1, dit_heads=2, seed=15,
+            device="cpu", cond_mode="text", text_cond_dim=8,
+            image_manifest=manifest, image_root=img_dir, image_split="train",
+            image_max_records=2, caption_max_len=8, sample_steps=1,
+            caption_cond_source="embedding", image_quality_score_w=0.1,
+            flow_quality_score_w=0.1, intervention_samples=0,
+            return_conditioner=True)
+        assert report_q["image_quality_scorer"] is True
+        assert "flow_quality_score_loss" in report_q["last_flow"]
         ae_rect, flow_rect, conditioner_rect, vocab_rect, report_rect = train_latent_flow(
             ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=16,
             flow_arch="dit", dit_depth=1, dit_heads=2, seed=14,
@@ -6099,6 +6370,9 @@ def selftest():
             "flow_repa_embed_dim": 11,
             "image_feature_align_w": 0.1,
             "flow_feature_align_w": 0.1,
+            "image_quality_score_w": 0.1,
+            "flow_quality_score_w": 0.0,
+            "image_quality_scorer": True,
             "flow_repa_w": 0.1,
             "flow_repa_steps": 0,
             "latent_stats": latent_stats_state(flow_latent_stats(flow6)),
@@ -6108,6 +6382,9 @@ def selftest():
             "text_aligner_state_dict": aligner6.state_dict(),
             "image_feature_aligner_state_dict": (
                 getattr(flow6, "image_feature_aligner").state_dict()
+            ),
+            "image_quality_scorer_state_dict": (
+                getattr(flow6, "image_quality_scorer").state_dict()
             ),
             "flow_repa_aligner_state_dict": (
                 getattr(flow6, "flow_repa_aligner").state_dict()
@@ -6124,10 +6401,12 @@ def selftest():
         assert eval6["best"]["caption_sample_mse_mean"] >= 0.0
         assert eval6["text_aligner"] is True
         assert eval6["image_feature_aligner"] is True
+        assert eval6["image_quality_scorer"] is True
         assert eval6["flow_repa_aligner"] is True
         assert "generated_caption_retrieval_i2t_acc_mean" in eval6["best"]
         assert "generated_image_feature_retrieval_i2f_acc_mean" in eval6["best"]
         assert "generated_external_text_image_score_cos_mean" in eval6["best"]
+        assert "generated_image_quality_score_pred_mean_mean" in eval6["best"]
     print("image_latent selftest OK")
 
 
@@ -6373,6 +6652,13 @@ def main(argv=None):
                     dest="image_quality_weight",
                     help=("sample manifest rows by normalized aesthetic/score/quality metadata; "
                           "0 keeps uniform sampling"))
+    ap.add_argument("--image-quality-score-w", type=float, default=0.0,
+                    dest="image_quality_score_w",
+                    help="train a latent aesthetic/quality score head on manifest metadata")
+    ap.add_argument("--flow-quality-score-w", type=float, default=0.0,
+                    dest="flow_quality_score_w",
+                    help=("preserve the learned quality score on predicted flow endpoints; "
+                          "requires --image-quality-score-w"))
     ap.add_argument("--image-max-records", type=int, default=0, dest="image_max_records",
                     help="cap manifest rows for smoke tests; 0 means all")
     ap.add_argument("--caption-vocab-max", type=int, default=8192, dest="caption_vocab_max",
@@ -6416,6 +6702,14 @@ def main(argv=None):
                     dest="sample_text_guidance_interval",
                     help=("text alignment guidance active interval over flow time, "
                           "formatted start,end"))
+    ap.add_argument("--sample-quality-guidance-w", type=float, default=0.0,
+                    dest="sample_quality_guidance_w",
+                    help=("sampling-time manifest quality guidance weight for "
+                          "--sample-prompts; requires a checkpoint image_quality_scorer"))
+    ap.add_argument("--sample-quality-guidance-interval", default="0.0,1.0",
+                    dest="sample_quality_guidance_interval",
+                    help=("quality guidance active interval over flow time, "
+                          "formatted start,end"))
     ap.add_argument("--prompt-embed-backend", default="stats",
                     choices=("stats", "hf"), dest="prompt_embed_backend",
                     help="text embedding backend used by --sample-prompts with embedding conditioning")
@@ -6448,6 +6742,8 @@ def main(argv=None):
         sample_prompts = parse_sample_prompts(args.sample_prompts)
         sample_negative_prompts = parse_sample_prompts(args.sample_negative_prompts)
         sample_text_guidance_interval = _parse_interval(args.sample_text_guidance_interval)
+        sample_quality_guidance_interval = _parse_interval(
+            args.sample_quality_guidance_interval)
         sample_schedules = (
             _parse_string_list(args.sample_schedules) if args.sample_schedules else None
         )
@@ -6468,6 +6764,10 @@ def main(argv=None):
         ap.error("--sample-text-guidance-w must be non-negative")
     if args.sample_text_guidance_w > 0.0 and not sample_prompts:
         ap.error("--sample-text-guidance-w requires --sample-prompts")
+    if args.sample_quality_guidance_w < 0.0:
+        ap.error("--sample-quality-guidance-w must be non-negative")
+    if args.sample_quality_guidance_w > 0.0 and not sample_prompts:
+        ap.error("--sample-quality-guidance-w requires --sample-prompts")
     if sample_prompts and args.prompt_embed_backend == "hf" and not args.prompt_embed_model:
         ap.error("--prompt-embed-backend hf requires --prompt-embed-model")
     if sample_schedules is not None:
@@ -6554,7 +6854,9 @@ def main(argv=None):
                     negative_prompts=sample_negative_prompts,
                     candidates_per_prompt=args.sample_candidates_per_prompt,
                     text_guidance_w=args.sample_text_guidance_w,
-                    text_guidance_interval=sample_text_guidance_interval)
+                    text_guidance_interval=sample_text_guidance_interval,
+                    quality_guidance_w=args.sample_quality_guidance_w,
+                    quality_guidance_interval=sample_quality_guidance_interval)
             elif report.get("experiment") == "image_latent_manifest_sampler_sweep":
                 grid_records = read_image_manifest(
                     report["eval_image_manifest"], root=report.get("eval_image_root", ""),
@@ -6647,6 +6949,8 @@ def main(argv=None):
         image_split=args.image_split, image_min_aesthetic=args.image_min_aesthetic,
         image_max_records=args.image_max_records,
         image_quality_weight=args.image_quality_weight,
+        image_quality_score_w=args.image_quality_score_w,
+        flow_quality_score_w=args.flow_quality_score_w,
         caption_vocab_max=args.caption_vocab_max,
         caption_max_len=args.caption_max_len, caption_cond_source=args.caption_cond_source,
         image_crop_mode=args.image_crop_mode, image_hflip_prob=args.image_hflip_prob,
@@ -6729,7 +7033,9 @@ def main(argv=None):
                 negative_prompts=sample_negative_prompts,
                 candidates_per_prompt=args.sample_candidates_per_prompt,
                 text_guidance_w=args.sample_text_guidance_w,
-                text_guidance_interval=sample_text_guidance_interval)
+                text_guidance_interval=sample_text_guidance_interval,
+                quality_guidance_w=args.sample_quality_guidance_w,
+                quality_guidance_interval=sample_quality_guidance_interval)
         elif args.image_manifest:
             grid_records = read_image_manifest(
                 args.image_manifest, root=args.image_root, split=args.image_split,
@@ -6838,6 +7144,9 @@ def main(argv=None):
         "image_min_aesthetic": args.image_min_aesthetic,
         "image_quality_weight": args.image_quality_weight,
         "image_quality_weighted": report.get("image_quality_weighted", False),
+        "image_quality_score_w": args.image_quality_score_w,
+        "flow_quality_score_w": args.flow_quality_score_w,
+        "image_quality_scorer": report.get("image_quality_scorer", False),
         "image_max_records": args.image_max_records,
         "image_crop_mode": report.get("image_crop_mode", ""),
         "image_hflip_prob": report.get("image_hflip_prob", 0.0),
@@ -6899,6 +7208,10 @@ def main(argv=None):
         "image_feature_aligner_state_dict": (
             getattr(flow, "image_feature_aligner", None).state_dict()
             if getattr(flow, "image_feature_aligner", None) is not None else {}
+        ),
+        "image_quality_scorer_state_dict": (
+            getattr(flow, "image_quality_scorer", None).state_dict()
+            if getattr(flow, "image_quality_scorer", None) is not None else {}
         ),
         "flow_repa_aligner_state_dict": (
             getattr(flow, "flow_repa_aligner", None).state_dict()

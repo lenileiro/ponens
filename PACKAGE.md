@@ -1326,6 +1326,14 @@ prompt/image alignment score. This is generic scorer guidance, not a renderer ru
 off. RunPod forwards `--image-sample-text-guidance-w` and
 `--image-sample-text-guidance-interval` for GPU prompt-grid runs.
 
+Image-66 adds a manifest quality scorer. `--image-quality-score-w` trains a latent scorer from
+generic `aesthetic` / `score` / `quality` manifest metadata, `--flow-quality-score-w` can preserve
+that score on predicted flow endpoints, and prompt grids can use
+`--sample-quality-guidance-w` to nudge samples toward higher learned quality. Checkpoints save the
+scorer separately from the flow, eval reports include generated quality-score means, and RunPod
+exposes the same training/guidance knobs. This turns quality metadata into a reusable model signal,
+not only a row-sampling weight.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
