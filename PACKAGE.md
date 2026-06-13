@@ -760,6 +760,19 @@ controls, and it regressed `squad_choice` from **0.300** to **0.100**. `selected
 **0**. This gives us a measurable discovery objective, but the current curriculum is still too weak
 to produce accepted language mastery.
 
+`--choice-candidate-replacement-binding-w` separates candidate-binding evidence from blunt
+replacement-to-`none` training. It uses the same generated original/corrupted pairs, but only asks
+the final QA head to lower the replaced target candidate's logit relative to the original target
+candidate. Eval now reports `qa_candidate_replacement_binding_control` with
+`target_logit_drop`, and the study selector treats drops below **0.05** as a control failure. On
+the current checkpoint, this exposes the failure directly: corrupted candidates start slightly
+higher than the real target (`target_logit_drop` **-0.004**). A guarded 2-step smoke with binding
+loss, positive anchors, and concept bridge activated the new pressure (`cand-repl-bind` **0.714**)
+and nudged the drop to **0.001**, but it still failed abstention/discovery/swap controls and
+regressed `squad_choice` to **0.100**, so `selected_round` stayed **0**. The useful progress is
+that candidate binding is now a separately measured internal relation, not only a final `none`
+accuracy side effect.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
