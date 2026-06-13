@@ -258,6 +258,7 @@ def payload(args):
                      f"--dit-head-width-mult {args.image_dit_head_width_mult} "
                      f"--dit-attn-impl {args.image_dit_attn_impl} "
                      f"--dit-pos-embed {args.image_dit_pos_embed} "
+                     f"--dit-residual-gate {args.image_dit_residual_gate} "
                      f"--ae-arch {args.image_ae_arch} "
                      f"--ae-hf-model {shlex_quote(args.image_ae_hf_model)} "
                      f"--ae-hf-subfolder {shlex_quote(args.image_ae_hf_subfolder)} "

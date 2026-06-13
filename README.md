@@ -93,7 +93,7 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
 .venv/bin/python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --ae-steps 40 --flow-steps 40 --cond-drop 0.1 --cfg-scale 1.5 \
     --sample-steps 4 --flow-semantic-w 0.25 --time-sampling logit-normal \
-    --flow-consistency-w 0.05 --flow-ema-decay 0.99 \
+    --flow-consistency-w 0.05 --flow-ema-decay 0.99 --dit-residual-gate zero \
     --out runs/image_latent_mmdit_text.pt
 .venv/bin/python -m thinking.image_embed --manifest data/images/train.jsonl \
     --root data/images --backend hf --model google/siglip-base-patch16-224 \

@@ -57,6 +57,7 @@ SAMPLE_METHODS = ("euler", "heun", "midpoint", "rk4")
 SAMPLE_SCHEDULES = ("linear", "quadratic", "sqrt", "cosine")
 MMDIT_ATTN_IMPLS = ("manual", "sdpa", "auto")
 DIT_POS_EMBEDS = ("learned", "sincos2d")
+DIT_RESIDUAL_GATES = ("legacy", "zero")
 FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
 TIME_SAMPLINGS = ("uniform", "logit-normal")
 TIME_SHIFT_MODES = ("manual", "dim")
@@ -1316,17 +1317,23 @@ class HeadRMSNorm(nn.Module):
 class MMDiTBlock(nn.Module):
     """Tiny dual-stream block with separate image/text projections and joint attention."""
 
-    def __init__(self, hidden=96, heads=4, qk_norm=False, attn_impl="manual"):
+    def __init__(self, hidden=96, heads=4, qk_norm=False, attn_impl="manual",
+                 residual_gate="legacy"):
         super().__init__()
         if hidden % heads:
             raise ValueError(f"hidden={hidden} must be divisible by heads={heads}")
         attn_impl = str(attn_impl)
         if attn_impl not in MMDIT_ATTN_IMPLS:
             raise ValueError(f"unknown MM-DiT attention implementation {attn_impl!r}")
+        residual_gate = str(residual_gate)
+        if residual_gate not in DIT_RESIDUAL_GATES:
+            raise ValueError(f"unknown MM-DiT residual gate mode {residual_gate!r}")
         self.heads = int(heads)
         self.head_dim = hidden // heads
         self.uses_qk_norm = bool(qk_norm)
         self.attn_impl = attn_impl
+        self.residual_gate = residual_gate
+        self.uses_zero_residual_gating = residual_gate == "zero"
         self.scale = self.head_dim ** -0.5
         self.img_norm = nn.LayerNorm(hidden)
         self.ctx_norm = nn.LayerNorm(hidden)
@@ -1396,6 +1403,11 @@ class MMDiTBlock(nn.Module):
             raise RuntimeError("scaled_dot_product_attention is unavailable in this torch build")
         return self._manual_attention(q, k, v, key_mask=key_mask)
 
+    def _branch_weight(self, gate):
+        if self.residual_gate == "legacy":
+            return 1.0 + gate
+        return gate
+
     def forward(self, img, ctx, cond_ctx, ctx_mask=None):
         b, n_img, h = img.shape
         n_ctx = ctx.shape[1]
@@ -1417,12 +1429,12 @@ class MMDiTBlock(nn.Module):
         mixed = self._joint_attention(q, k, v, key_mask=key_mask)
         mixed = mixed.transpose(1, 2).reshape(b, n_img + n_ctx, h)
         img_delta, ctx_delta = mixed[:, :n_img], mixed[:, n_img:]
-        img = img + (1.0 + img_attn_gate[:, None, :]) * self.img_out(img_delta)
-        ctx = ctx + (1.0 + ctx_attn_gate[:, None, :]) * self.ctx_out(ctx_delta)
+        img = img + self._branch_weight(img_attn_gate[:, None, :]) * self.img_out(img_delta)
+        ctx = ctx + self._branch_weight(ctx_attn_gate[:, None, :]) * self.ctx_out(ctx_delta)
         img_ff = self._modulate(self.img_ff_norm(img), img_ff_shift, img_ff_scale)
         ctx_ff = self._modulate(self.ctx_ff_norm(ctx), ctx_ff_shift, ctx_ff_scale)
-        img = img + (1.0 + img_ff_gate[:, None, :]) * self.img_ff(img_ff)
-        ctx = ctx + (1.0 + ctx_ff_gate[:, None, :]) * self.ctx_ff(ctx_ff)
+        img = img + self._branch_weight(img_ff_gate[:, None, :]) * self.img_ff(img_ff)
+        ctx = ctx + self._branch_weight(ctx_ff_gate[:, None, :]) * self.ctx_ff(ctx_ff)
         if ctx_mask is not None:
             ctx = ctx.masked_fill(ctx_mask[:, :, None], 0.0)
         return img, ctx
@@ -1437,7 +1449,7 @@ class LatentMMDiTFlowNet(nn.Module):
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256, head_width_mult=1, qk_norm=False,
-                 attn_impl="manual", pos_embed="learned"):
+                 attn_impl="manual", pos_embed="learned", residual_gate="legacy"):
         super().__init__()
         attn_impl = str(attn_impl)
         if attn_impl not in MMDIT_ATTN_IMPLS:
@@ -1445,6 +1457,9 @@ class LatentMMDiTFlowNet(nn.Module):
         pos_embed = str(pos_embed)
         if pos_embed not in DIT_POS_EMBEDS:
             raise ValueError(f"unknown DiT positional embedding {pos_embed!r}")
+        residual_gate = str(residual_gate)
+        if residual_gate not in DIT_RESIDUAL_GATES:
+            raise ValueError(f"unknown MM-DiT residual gate mode {residual_gate!r}")
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
         self.hidden = int(hidden)
@@ -1454,6 +1469,8 @@ class LatentMMDiTFlowNet(nn.Module):
         self.uses_qk_norm = bool(qk_norm)
         self.attn_impl = attn_impl
         self.dit_pos_embed = pos_embed
+        self.dit_residual_gate = residual_gate
+        self.uses_zero_residual_gating = residual_gate == "zero"
         self.uses_2d_pos_embed = pos_embed == "sincos2d"
         self.in_proj = nn.Linear(latent_ch, hidden)
         self.pos = (
@@ -1465,7 +1482,8 @@ class LatentMMDiTFlowNet(nn.Module):
         self.ctx_proj = nn.Linear(cond_dim, hidden)
         self.blocks = nn.ModuleList([
             MMDiTBlock(
-                hidden, heads, qk_norm=self.uses_qk_norm, attn_impl=self.attn_impl
+                hidden, heads, qk_norm=self.uses_qk_norm, attn_impl=self.attn_impl,
+                residual_gate=self.dit_residual_gate
             )
             for _ in range(depth)
         ])
@@ -1513,12 +1531,16 @@ class LatentMMDiTFlowNet(nn.Module):
 
 def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4,
               cond_dim=None, dit_head_width_mult=1, latent_max_tokens=256,
-              dit_qk_norm=False, dit_attn_impl="manual", dit_pos_embed="learned"):
+              dit_qk_norm=False, dit_attn_impl="manual", dit_pos_embed="learned",
+              dit_residual_gate="legacy"):
     if flow_arch == "conv":
         return LatentFlowNet(latent_ch=latent_ch, hidden=hidden, cond_dim=cond_dim)
     dit_pos_embed = str(dit_pos_embed)
     if dit_pos_embed not in DIT_POS_EMBEDS:
         raise ValueError(f"unknown DiT positional embedding {dit_pos_embed!r}")
+    dit_residual_gate = str(dit_residual_gate)
+    if dit_residual_gate not in DIT_RESIDUAL_GATES:
+        raise ValueError(f"unknown DiT residual gate mode {dit_residual_gate!r}")
     dit_head_width_mult = int(dit_head_width_mult)
     if dit_head_width_mult <= 0:
         raise ValueError("dit_head_width_mult must be positive")
@@ -1550,7 +1572,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                   max_tokens=latent_max_tokens,
                                   qk_norm=dit_qk_norm,
                                   attn_impl=dit_attn_impl,
-                                  pos_embed=dit_pos_embed)
+                                  pos_embed=dit_pos_embed,
+                                  residual_gate=dit_residual_gate)
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
@@ -4911,6 +4934,11 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                         or "learned")
     if dit_pos_embed not in DIT_POS_EMBEDS:
         raise ValueError(f"unknown DiT positional embedding {dit_pos_embed!r}")
+    dit_residual_gate = str(
+        ckpt.get("dit_residual_gate", report.get("dit_residual_gate", "legacy"))
+        or "legacy")
+    if dit_residual_gate not in DIT_RESIDUAL_GATES:
+        raise ValueError(f"unknown DiT residual gate mode {dit_residual_gate!r}")
     cond_mode = ckpt.get("cond_mode", report.get("cond_mode", "facts"))
     data_mode = ckpt.get("data_mode", report.get("data_mode", "synthetic_factors"))
     cond_dim = int(ckpt.get("cond_dim", report.get("cond_dim", len(FACT_VOCAB))))
@@ -4995,7 +5023,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                      latent_max_tokens=latent_max_tokens,
                      dit_qk_norm=dit_qk_norm,
                      dit_attn_impl=dit_attn_impl,
-                     dit_pos_embed=dit_pos_embed).to(device)
+                     dit_pos_embed=dit_pos_embed,
+                     dit_residual_gate=dit_residual_gate).to(device)
     flow_repa_aligner = None
     if ckpt.get("flow_repa_aligner_state_dict"):
         if image_embedding_in_dim <= 0:
@@ -5055,9 +5084,11 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "dit_qk_norm": bool(dit_qk_norm) if flow_arch == "mmdit" else False,
         "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
         "dit_pos_embed": dit_pos_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
+        "dit_residual_gate": dit_residual_gate if flow_arch == "mmdit" else "",
         "uses_2d_pos_embed": bool(getattr(flow, "uses_2d_pos_embed", False)),
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
+        "zero_residual_gating": bool(getattr(flow, "uses_zero_residual_gating", False)),
         "flow_load": flow_load,
         "ema_available": ema_available,
         "ema_loaded": ema_loaded,
@@ -5822,6 +5853,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       caption_cond_source="tokens",
                       image_crop_mode="center", image_hflip_prob=0.0,
                       dit_qk_norm=False, dit_attn_impl="manual",
+                      dit_residual_gate="zero",
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0, time_shift=1.0,
                       time_curriculum_frac=0.0,
@@ -6001,6 +6033,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     dit_pos_embed = str(dit_pos_embed)
     if dit_pos_embed not in DIT_POS_EMBEDS:
         raise ValueError(f"unknown DiT positional embedding {dit_pos_embed!r}")
+    dit_residual_gate = str(dit_residual_gate)
+    if dit_residual_gate not in DIT_RESIDUAL_GATES:
+        raise ValueError(f"unknown DiT residual gate mode {dit_residual_gate!r}")
     if latent_max_tokens <= 0:
         raise ValueError("latent_max_tokens must be positive")
     if flow_ema_decay < 0.0 or flow_ema_decay >= 1.0:
@@ -6120,7 +6155,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                      latent_max_tokens=latent_max_tokens,
                      dit_qk_norm=bool(dit_qk_norm),
                      dit_attn_impl=dit_attn_impl,
-                     dit_pos_embed=dit_pos_embed).to(device)
+                     dit_pos_embed=dit_pos_embed,
+                     dit_residual_gate=dit_residual_gate).to(device)
     flow_repa_aligner = None
     if image_records is not None and flow_repa_w > 0.0:
         hidden_feature_dim = flow_hidden_feature_dim(flow)
@@ -6461,7 +6497,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             dit_head_width_mult=dit_head_width_mult,
             latent_max_tokens=max_train_latent_tokens,
             dit_qk_norm=dit_qk_norm, dit_attn_impl=dit_attn_impl,
-            dit_pos_embed=dit_pos_embed).to(device)
+            dit_pos_embed=dit_pos_embed,
+            dit_residual_gate=dit_residual_gate).to(device)
         load_flow_state(teacher_flow, teacher_state)
         attach_latent_stats(teacher_flow, latent_stats)
         teacher_flow.eval()
@@ -6666,9 +6703,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "dit_qk_norm": bool(dit_qk_norm) if flow_arch == "mmdit" else False,
         "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
         "dit_pos_embed": dit_pos_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
+        "dit_residual_gate": dit_residual_gate if flow_arch == "mmdit" else "",
         "uses_2d_pos_embed": bool(getattr(flow, "uses_2d_pos_embed", False)),
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
+        "zero_residual_gating": bool(getattr(flow, "uses_zero_residual_gating", False)),
         "fact_w": float(fact_w),
         "ae_recon_loss": ae_recon_loss,
         "ae_grad_w": float(ae_grad_w),
@@ -7031,6 +7070,9 @@ def selftest():
     assert report5["dit_head_width_mult"] == 2
     assert report5["dit_qk_norm"] is True
     assert report5["dit_attn_impl"] in ("sdpa", "auto")
+    assert report5["dit_residual_gate"] == "zero"
+    assert report5["zero_residual_gating"] is True
+    assert flow5.uses_zero_residual_gating is True
     assert any("q_norm" in k for k in flow5.state_dict())
     assert report5["adaptive_modulation"] is True
     assert report5["residual_gating"] is True
@@ -7045,7 +7087,8 @@ def selftest():
     compat_flow = make_flow(flow_arch="mmdit", latent_ch=4, hidden=32, dit_depth=1,
                             dit_heads=2, cond_dim=8, dit_head_width_mult=2,
                             dit_qk_norm=True,
-                            dit_attn_impl=report5["dit_attn_impl"])
+                            dit_attn_impl=report5["dit_attn_impl"],
+                            dit_residual_gate=report5["dit_residual_gate"])
     compat_load = load_flow_state(compat_flow, legacy_state)
     assert compat_load["tolerated_missing"] and all(
         ".gate." in k for k in compat_load["tolerated_missing"])
@@ -7524,6 +7567,9 @@ def main(argv=None):
     ap.add_argument("--dit-pos-embed", default="learned", choices=DIT_POS_EMBEDS,
                     dest="dit_pos_embed",
                     help="image-token positional embedding for DiT/CrossDiT/MM-DiT flows")
+    ap.add_argument("--dit-residual-gate", default="zero", choices=DIT_RESIDUAL_GATES,
+                    dest="dit_residual_gate",
+                    help="MM-DiT residual branch gate: legacy uses 1+gate, zero starts as identity")
     ap.add_argument("--cond-drop", type=float, default=0.0, dest="cond_drop")
     ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
     ap.add_argument("--cfg-rescale", type=float, default=0.0, dest="cfg_rescale",
@@ -7982,6 +8028,7 @@ def main(argv=None):
         dit_qk_norm=args.dit_qk_norm,
         dit_attn_impl=args.dit_attn_impl,
         dit_pos_embed=args.dit_pos_embed,
+        dit_residual_gate=args.dit_residual_gate,
         latent_max_tokens=args.latent_max_tokens, ae_arch=args.ae_arch,
         latent_downsample=args.latent_downsample, ae_res_blocks=args.ae_res_blocks,
         ae_hf_model=args.ae_hf_model,
@@ -8201,6 +8248,8 @@ def main(argv=None):
         "dit_qk_norm": report.get("dit_qk_norm", False),
         "dit_attn_impl": report.get("dit_attn_impl", "manual"),
         "dit_pos_embed": report.get("dit_pos_embed", "") or args.dit_pos_embed,
+        "dit_residual_gate": report.get("dit_residual_gate", "") or args.dit_residual_gate,
+        "zero_residual_gating": report.get("zero_residual_gating", False),
         "uses_2d_pos_embed": report.get("uses_2d_pos_embed", False),
         "cond_mode": args.cond_mode,
         "cond_dim": report["cond_dim"],

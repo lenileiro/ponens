@@ -1540,6 +1540,13 @@ uniform samples afterward. Reports/checkpoints record the requested fraction, sw
 sampling mode, and last active training mode; RunPod exposes the same lever as
 `--image-time-curriculum-frac`. Default `0` preserves the static timestep sampler.
 
+Image-79 fixes the MM-DiT residual-gate semantics for new runs. The original gate projection was
+zero-initialized but applied as `1 + gate`, so blocks did not start as identity. New
+`thinking.image_latent --dit-residual-gate zero` runs use the AdaLN-zero-style branch multiplier
+directly, while `legacy` remains available and is used automatically for old checkpoints without
+gate-mode metadata. Reports/checkpoints record `dit_residual_gate` and `zero_residual_gating`, and
+RunPod exposes the same setting as `--image-dit-residual-gate`.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
