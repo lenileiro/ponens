@@ -37,6 +37,7 @@ class ImageTextRecord:
     width: int = 0
     height: int = 0
     text_embedding: tuple[float, ...] | None = None
+    text_embedding_sequence: tuple[tuple[float, ...], ...] | None = None
     image_embedding: tuple[float, ...] | None = None
 
 
@@ -58,8 +59,30 @@ def _coerce_float_embedding(raw):
     return vals
 
 
+def _coerce_float_embedding_sequence(raw):
+    if raw in ("", None):
+        return None
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+        raw = json.loads(raw)
+    rows = tuple(tuple(float(x) for x in row) for row in raw)
+    rows = tuple(row for row in rows if row)
+    if not rows:
+        return None
+    dims = {len(row) for row in rows}
+    if len(dims) != 1:
+        raise ValueError(f"text embedding sequence has mixed dimensions: {sorted(dims)}")
+    return rows
+
+
 def _coerce_text_embedding(raw):
     return _coerce_float_embedding(raw)
+
+
+def _coerce_text_embedding_sequence(raw):
+    return _coerce_float_embedding_sequence(raw)
 
 
 def _coerce_image_embedding(raw):
@@ -87,6 +110,13 @@ def _coerce_record(row, manifest_dir, root=""):
                 row.get("caption_embedding",
                         row.get("embedding", row.get("text_emb"))))
     )
+    text_embedding_sequence = _coerce_text_embedding_sequence(
+        row.get("text_embedding_sequence",
+                row.get("text_token_embeddings",
+                        row.get("caption_token_embeddings",
+                                row.get("token_embeddings",
+                                        row.get("text_tokens_embedding")))))
+    )
     image_embedding = _coerce_image_embedding(
         row.get("image_embedding",
                 row.get("visual_embedding",
@@ -104,6 +134,7 @@ def _coerce_record(row, manifest_dir, root=""):
         width=width,
         height=height,
         text_embedding=text_embedding,
+        text_embedding_sequence=text_embedding_sequence,
         image_embedding=image_embedding,
     )
 
@@ -161,6 +192,13 @@ def merge_embedding_sidecar(records, sidecar_path, root="", key="image", overwri
                     row.get("caption_embedding",
                             row.get("embedding", row.get("text_emb"))))
         )
+        text_embedding_sequence = _coerce_text_embedding_sequence(
+            row.get("text_embedding_sequence",
+                    row.get("text_token_embeddings",
+                            row.get("caption_token_embeddings",
+                                    row.get("token_embeddings",
+                                            row.get("text_tokens_embedding")))))
+        )
         image_embedding = _coerce_image_embedding(
             row.get("image_embedding",
                     row.get("visual_embedding",
@@ -170,18 +208,20 @@ def merge_embedding_sidecar(records, sidecar_path, root="", key="image", overwri
                                                     row.get("image_emb",
                                                             row.get("visual_emb")))))))
         )
-        if text_embedding is None and image_embedding is None:
+        if text_embedding is None and text_embedding_sequence is None and image_embedding is None:
             skipped_no_embedding += 1
             continue
         if row_key in index:
             duplicate_keys += 1
             continue
-        index[row_key] = (text_embedding, image_embedding)
+        index[row_key] = (text_embedding, text_embedding_sequence, image_embedding)
 
     merged = []
     matched = missing = 0
     text_added = image_added = 0
+    text_sequence_added = 0
     text_preserved = image_preserved = 0
+    text_sequence_preserved = 0
     for rec in records:
         rec_key = _embedding_key_from_record(rec, key=key)
         vals = index.get(rec_key)
@@ -190,8 +230,9 @@ def merge_embedding_sidecar(records, sidecar_path, root="", key="image", overwri
             merged.append(rec)
             continue
         matched += 1
-        text_embedding, image_embedding = vals
+        text_embedding, text_embedding_sequence, image_embedding = vals
         new_text = rec.text_embedding
+        new_text_sequence = rec.text_embedding_sequence
         new_image = rec.image_embedding
         if text_embedding is not None:
             if overwrite or rec.text_embedding is None:
@@ -200,6 +241,13 @@ def merge_embedding_sidecar(records, sidecar_path, root="", key="image", overwri
                 new_text = text_embedding
             else:
                 text_preserved += 1
+        if text_embedding_sequence is not None:
+            if overwrite or rec.text_embedding_sequence is None:
+                if rec.text_embedding_sequence != text_embedding_sequence:
+                    text_sequence_added += 1
+                new_text_sequence = text_embedding_sequence
+            else:
+                text_sequence_preserved += 1
         if image_embedding is not None:
             if overwrite or rec.image_embedding is None:
                 if rec.image_embedding != image_embedding:
@@ -207,10 +255,20 @@ def merge_embedding_sidecar(records, sidecar_path, root="", key="image", overwri
                 new_image = image_embedding
             else:
                 image_preserved += 1
-        merged.append(replace(rec, text_embedding=new_text, image_embedding=new_image))
+        merged.append(replace(
+            rec, text_embedding=new_text, text_embedding_sequence=new_text_sequence,
+            image_embedding=new_image))
 
     text_dims = sorted({len(v[0]) for v in index.values() if v[0] is not None})
-    image_dims = sorted({len(v[1]) for v in index.values() if v[1] is not None})
+    text_sequence_dims = sorted({
+        len(row)
+        for _flat, seq, _img in index.values() if seq is not None
+        for row in seq[:1]
+    })
+    text_sequence_lengths = [
+        len(seq) for _flat, seq, _img in index.values() if seq is not None
+    ]
+    image_dims = sorted({len(v[2]) for v in index.values() if v[2] is not None})
     report = {
         "embedding_sidecar": sidecar_path,
         "embedding_key": key,
@@ -222,13 +280,19 @@ def merge_embedding_sidecar(records, sidecar_path, root="", key="image", overwri
         "embedding_records_matched": int(matched),
         "embedding_records_missing": int(missing),
         "embedding_text_written": int(text_added),
+        "embedding_text_sequence_written": int(text_sequence_added),
         "embedding_image_written": int(image_added),
         "embedding_text_preserved": int(text_preserved),
+        "embedding_text_sequence_preserved": int(text_sequence_preserved),
         "embedding_image_preserved": int(image_preserved),
         "embedding_overwrite": bool(overwrite),
     }
     if text_dims:
         report["embedding_text_dims"] = text_dims
+    if text_sequence_dims:
+        report["embedding_text_sequence_dims"] = text_sequence_dims
+        report["embedding_text_sequence_len_min"] = int(min(text_sequence_lengths))
+        report["embedding_text_sequence_len_max"] = int(max(text_sequence_lengths))
     if image_dims:
         report["embedding_image_dims"] = image_dims
     return merged, report
@@ -297,11 +361,26 @@ def summarize_records(records: Iterable[ImageTextRecord]):
         "image_splits": splits,
         "caption_token_mean": float(np.mean(caption_lens)) if caption_lens else 0.0,
         "text_embedding_records": sum(1 for r in rows if r.text_embedding is not None),
+        "text_embedding_sequence_records": sum(
+            1 for r in rows if r.text_embedding_sequence is not None),
         "image_embedding_records": sum(1 for r in rows if r.image_embedding is not None),
     }
     dims = sorted({len(r.text_embedding) for r in rows if r.text_embedding is not None})
     if dims:
         out["text_embedding_dims"] = dims
+    seq_dims = sorted({
+        len(seq[0])
+        for r in rows if r.text_embedding_sequence is not None
+        for seq in (r.text_embedding_sequence,)
+        if seq
+    })
+    seq_lens = [len(r.text_embedding_sequence)
+                for r in rows if r.text_embedding_sequence is not None]
+    if seq_dims:
+        out["text_embedding_sequence_dims"] = seq_dims
+        out["text_embedding_sequence_len_mean"] = float(np.mean(seq_lens))
+        out["text_embedding_sequence_len_min"] = int(np.min(seq_lens))
+        out["text_embedding_sequence_len_max"] = int(np.max(seq_lens))
     image_dims = sorted({len(r.image_embedding) for r in rows if r.image_embedding is not None})
     if image_dims:
         out["image_embedding_dims"] = image_dims
@@ -539,6 +618,10 @@ def _record_to_manifest_row(rec: ImageTextRecord, root=""):
         row["height"] = int(rec.height)
     if rec.text_embedding is not None:
         row["text_embedding"] = [float(x) for x in rec.text_embedding]
+    if rec.text_embedding_sequence is not None:
+        row["text_embedding_sequence"] = [
+            [float(x) for x in seq_row] for seq_row in rec.text_embedding_sequence
+        ]
     if rec.image_embedding is not None:
         row["image_embedding"] = [float(x) for x in rec.image_embedding]
     return row
@@ -740,12 +823,14 @@ def selftest():
                 "caption": "red and green blocks",
                 "split": "train",
                 "text_embedding": [0.1, 0.2, 0.3],
+                "text_embedding_sequence": [[0.1, 0.0], [0.0, 0.2]],
                 "image_embedding": [0.4, 0.5, 0.6, 0.7],
                 "aesthetic": 7.5,
             }) + "\n")
         records = read_image_manifest(manifest)
         assert len(records) == 1 and records[0].caption.startswith("red")
         assert records[0].text_embedding == (0.1, 0.2, 0.3)
+        assert records[0].text_embedding_sequence == ((0.1, 0.0), (0.0, 0.2))
         assert records[0].image_embedding == (0.4, 0.5, 0.6, 0.7)
         x = load_image_tensor(records[0].path, size=4)
         assert x.shape == (3, 4, 4) and float(x.max()) <= 1.0 and float(x.min()) >= -1.0
@@ -779,12 +864,15 @@ def selftest():
         summary = summarize_records(records)
         assert summary["image_records"] == 1 and summary["image_splits"]["train"] == 1
         assert summary["text_embedding_records"] == 1 and summary["text_embedding_dims"] == [3]
+        assert summary["text_embedding_sequence_records"] == 1
+        assert summary["text_embedding_sequence_dims"] == [2]
         assert summary["image_embedding_records"] == 1 and summary["image_embedding_dims"] == [4]
         qa_manifest = os.path.join(td, "qa.jsonl")
         with open(qa_manifest, "w", encoding="utf-8") as f:
             for row in (
                     {"image": "sample.ppm", "caption": "red green blocks",
                      "split": "train", "text_embedding": [1.0, 0.0],
+                     "text_embedding_sequence": [[1.0, 0.0], [0.0, 1.0]],
                      "image_embedding": [0.0, 1.0]},
                     {"image": "sample.ppm", "caption": "duplicate patch", "split": "train"},
                     {"image": "missing.ppm", "caption": "x", "split": "train"},
@@ -804,25 +892,33 @@ def selftest():
             filtered_row = json.loads(f.readline())
         assert filtered_row["image"] == "sample.ppm"
         assert filtered_row["text_embedding"] == [1.0, 0.0]
+        assert filtered_row["text_embedding_sequence"] == [[1.0, 0.0], [0.0, 1.0]]
         assert filtered_row["image_embedding"] == [0.0, 1.0]
         sidecar = os.path.join(td, "embeddings.jsonl")
         with open(sidecar, "w", encoding="utf-8") as f:
             f.write(json.dumps({
                 "image": "sample.ppm",
                 "text_embedding": [9.0, 8.0],
+                "text_embedding_sequence": [[9.0, 0.0], [0.0, 8.0], [1.0, 1.0]],
                 "image_embedding": [7.0, 6.0, 5.0],
             }) + "\n")
         preserved, preserved_report = merge_embedding_sidecar(
             kept, sidecar, root=td, key="image", overwrite=False)
         assert preserved_report["embedding_records_matched"] == 1
         assert preserved_report["embedding_text_preserved"] == 1
+        assert preserved_report["embedding_text_sequence_preserved"] == 1
         assert preserved_report["embedding_image_preserved"] == 1
         assert preserved[0].text_embedding == (1.0, 0.0)
+        assert preserved[0].text_embedding_sequence == ((1.0, 0.0), (0.0, 1.0))
         overwritten, overwrite_report = merge_embedding_sidecar(
             kept, sidecar, root=td, key="image", overwrite=True)
         assert overwrite_report["embedding_text_written"] == 1
+        assert overwrite_report["embedding_text_sequence_written"] == 1
+        assert overwrite_report["embedding_text_sequence_dims"] == [2]
         assert overwrite_report["embedding_image_written"] == 1
         assert overwritten[0].text_embedding == (9.0, 8.0)
+        assert overwritten[0].text_embedding_sequence == (
+            (9.0, 0.0), (0.0, 8.0), (1.0, 1.0))
         assert overwritten[0].image_embedding == (7.0, 6.0, 5.0)
         reread = read_image_manifest(filtered, root=td, split="train")
         assert len(reread) == 1 and reread[0].width == 8 and reread[0].height == 6

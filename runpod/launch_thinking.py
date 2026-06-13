@@ -116,6 +116,7 @@ def payload(args):
                      f"--root {shlex_quote(args.image_root)} "
                      f"--backend {args.image_embed_backend} "
                      f"--features {args.image_embed_features} "
+                     f"--text-embed-mode {args.image_embed_text_mode} "
                      f"--batch {args.image_embed_batch} "
                      f"--device {args.image_embed_device} "
                      f"--dtype {args.image_embed_dtype} "
@@ -568,6 +569,9 @@ def main():
     ap.add_argument("--image-embed-features", default="both", choices=("both", "image", "text"),
                     dest="image_embed_features",
                     help="which embedding columns to write before manifest training")
+    ap.add_argument("--image-embed-text-mode", default="pooled",
+                    choices=("pooled", "tokens"), dest="image_embed_text_mode",
+                    help="write pooled text embeddings or token-level text embedding sequences")
     ap.add_argument("--image-embed-batch", type=int, default=64,
                     dest="image_embed_batch",
                     help="batch size for image embedding preprocessing")

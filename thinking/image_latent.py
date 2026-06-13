@@ -703,7 +703,17 @@ class PrecomputedTextConditioner(nn.Module):
         )
 
     def forward(self, embeddings, return_tokens=False):
-        vec = self.net(embeddings.float())
+        embeddings = embeddings.float()
+        if embeddings.ndim == 3:
+            tokens = self.net(embeddings)
+            mask = embeddings.abs().sum(dim=-1).eq(0)
+            keep = (~mask).to(tokens.dtype).unsqueeze(-1)
+            pooled = (tokens * keep).sum(dim=1) / keep.sum(dim=1).clamp_min(1.0)
+            if return_tokens:
+                return {"vec": pooled, "tokens": tokens.masked_fill(mask[:, :, None], 0.0),
+                        "mask": mask}
+            return pooled
+        vec = self.net(embeddings)
         if return_tokens:
             mask = torch.zeros((vec.shape[0], 1), dtype=torch.bool, device=vec.device)
             return {"vec": vec, "tokens": vec[:, None, :], "mask": mask}
@@ -2479,7 +2489,17 @@ def image_feature_alignment_loss(aligner, z, features, prefix="image_feature_ali
     }
 
 
+def pool_embedding_sequence(x):
+    if x.ndim != 3:
+        return x
+    mask = x.float().abs().sum(dim=-1).gt(0)
+    keep = mask.to(x.dtype).unsqueeze(-1)
+    return (x * keep).sum(dim=1) / keep.sum(dim=1).clamp_min(1.0)
+
+
 def embedding_pair_similarity(image_vec, text_vec, prefix="embedding_pair"):
+    image_vec = pool_embedding_sequence(image_vec)
+    text_vec = pool_embedding_sequence(text_vec)
     image_vec = F.normalize(image_vec.float(), dim=-1, eps=1.0e-8)
     text_vec = F.normalize(text_vec.float(), dim=-1, eps=1.0e-8)
     logits = image_vec.matmul(text_vec.t())
@@ -3233,12 +3253,19 @@ def text_prompt_condition(prompts, conditioner, prompt_vocab=None, caption_max_l
 
 def infer_text_embedding_dim(records):
     dims = {len(rec.text_embedding) for rec in records if rec.text_embedding is not None}
+    dims.update({
+        len(rec.text_embedding_sequence[0])
+        for rec in records
+        if rec.text_embedding_sequence is not None and len(rec.text_embedding_sequence) > 0
+    })
     if not dims:
         return 0
     if len(dims) != 1:
         raise ValueError(f"manifest text embeddings have mixed dimensions: {sorted(dims)}")
     dim = next(iter(dims))
-    missing = sum(1 for rec in records if rec.text_embedding is None)
+    missing = sum(
+        1 for rec in records
+        if rec.text_embedding is None and rec.text_embedding_sequence is None)
     if missing:
         raise ValueError(f"{missing} manifest records are missing text embeddings")
     return int(dim)
@@ -3280,8 +3307,23 @@ def record_text_embedding_tensor(records, device=DEV):
     dim = infer_text_embedding_dim(records)
     if dim <= 0:
         raise ValueError("records do not have text embeddings")
-    return torch.tensor([rec.text_embedding for rec in records], dtype=torch.float32,
-                        device=device)
+    has_sequence = any(rec.text_embedding_sequence is not None for rec in records)
+    if not has_sequence:
+        return torch.tensor([rec.text_embedding for rec in records], dtype=torch.float32,
+                            device=device)
+    rows = []
+    max_len = 1
+    for rec in records:
+        if rec.text_embedding_sequence is not None:
+            row = [list(x) for x in rec.text_embedding_sequence]
+        else:
+            row = [list(rec.text_embedding)]
+        rows.append(row)
+        max_len = max(max_len, len(row))
+    out = torch.zeros((len(rows), max_len, dim), dtype=torch.float32, device=device)
+    for i, row in enumerate(rows):
+        out[i, :len(row)] = torch.tensor(row, dtype=torch.float32, device=device)
+    return out
 
 
 def record_image_embedding_tensor(records, device=DEV):
@@ -5905,6 +5947,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "last_flow_loss": last_flow.get("velocity_mse"),
         "fact_vocab": [list(f) for f in FACT_VOCAB],
     })
+    if image_records is not None:
+        report.update(summarize_records(image_records))
     if return_ema:
         if return_conditioner:
             if return_aligner:
@@ -6179,6 +6223,10 @@ def selftest():
                          "split": split,
                          "aesthetic": float(i + 1),
                          "text_embedding": [float(i), float(i + 1), float(i % 2), 1.0],
+                         "text_embedding_sequence": [
+                             [float(i), float(i + 1), 0.0, 1.0],
+                             [float(i % 2), float(i + 2), 1.0, 0.0],
+                         ],
                          "image_embedding": [float(i), float(i + 2),
                                              float((i + 1) % 2), 1.0]})
         with open(manifest, "w", encoding="utf-8") as f:
@@ -6211,6 +6259,8 @@ def selftest():
         assert "flow_repa_h2f_acc" in report6["last_flow"]
         assert report6["image_embedding_in_dim"] == 4
         assert report6["text_embedding_in_dim"] == 4
+        assert report6["text_embedding_sequence_records"] == 2
+        assert report6["text_embedding_sequence_dims"] == [4]
         assert report6["flow_repa_embed_dim"] == 11
         assert "generated_external_text_image_score_cos" in report6
         assert report6["image_quality_weighted"] is True

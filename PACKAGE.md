@@ -800,6 +800,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-eval-sweep --fast --go
 RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-embed \
     --image-embed-model google/siglip-base-patch16-224 \
+    --image-embed-text-mode tokens \
     --image-clean-min-side 256 --image-clean-max-aspect 2.0 \
     --image-latent --image-latent-arch mmdit \
     --image-cond-mode text --image-dit-head-width-mult 2 --image-dit-qk-norm \
@@ -1127,9 +1128,11 @@ metric and loss without adding color/shape grammar or renderer-specific labels.
 Image-37 adds manifest-level precomputed text embedding conditioning. Rows may now include
 `text_embedding` / `caption_embedding` / `embedding` arrays, and `--caption-cond-source
 tokens|embedding|auto` chooses whether real-image training uses the local token encoder or projects
-those external embeddings into the conditioning stream. This is the hook for CLIP/T5/SigLIP-style
-frozen text features: the model can move toward stronger prompt understanding without baking in a
-specific provider or adding renderer-specific rules.
+those external embeddings into the conditioning stream. The embedding path now also accepts
+`text_embedding_sequence` token matrices, giving Cross-DiT/MM-DiT flows a full external text-token
+stream instead of only a pooled caption vector. This is the hook for CLIP/T5/SigLIP-style frozen
+text features: the model can move toward stronger prompt understanding without baking in a specific
+provider or adding renderer-specific rules.
 
 Image-38 adds disk-backed manifest latent caching. `--flow-cache-dir` writes AE latents,
 caption token IDs or text embeddings, and shard metadata to disk, then flow training samples from
@@ -1156,9 +1159,10 @@ CLIP/SigLIP/DINO/MAE preprocessing auditable and reproducible instead of implici
 Image-41 adds the generic preprocessing job itself. `thinking.image_embed` reads the same manifest
 format and writes sidecar JSONL rows with `text_embedding` and/or `image_embedding`; local smoke
 tests use a deterministic stats backend, while GPU jobs can use `--backend hf --model ...` for
-CLIP/SigLIP text-image encoders or DINO/MAE-style image encoders with `--features image`. The
-generator stays model-agnostic: feature extraction, manifest QA, and training remain separate
-auditable stages.
+CLIP/SigLIP text-image encoders or DINO/MAE-style image encoders with `--features image`. With
+`--text-embed-mode tokens`, the sidecar writes nested `text_embedding_sequence` rows and the
+generator conditions on those token streams directly. The generator stays model-agnostic: feature
+extraction, manifest QA, and training remain separate auditable stages.
 
 Image-42 wires that path into the GPU launcher. `runpod/launch_thinking.py --image-embed` now runs
 `thinking.image_embed`, merges the sidecar through `thinking.image_data`, writes
@@ -1340,6 +1344,14 @@ now resolves to `channel` when training on image manifests or an external HF VAE
 for synthetic factor-only runs. Reports/checkpoints store both `latent_normalize_requested` and
 the effective `latent_normalize`, so GPU runs can tell whether a model sampled from standardized
 latent coordinates. RunPod now defaults `--image-latent-normalize auto`.
+
+Image-68 adds token-level external text conditioning for real-image manifests. Manifest rows and
+embedding sidecars may include nested `text_embedding_sequence` / `text_token_embeddings` arrays;
+`PrecomputedTextConditioner` projects `B x T x D` inputs into masked condition tokens for
+Cross-DiT/MM-DiT while still producing a pooled vector for global conditioning and retrieval
+metrics. `thinking.image_embed --text-embed-mode tokens` emits those sequences, and RunPod exposes
+it as `--image-embed-text-mode tokens`. This closes a major prompt-understanding gap versus modern
+text-to-image systems without tying the model to a specific tokenizer or provider.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
