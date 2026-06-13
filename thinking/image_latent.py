@@ -35,7 +35,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .image_data import (build_caption_vocab, caption_ids, load_image_tensor,
-                         read_image_manifest, sample_image_text_batch, summarize_records)
+                         normalized_sampling_weights, read_image_manifest,
+                         sample_image_text_batch, summarize_records)
 from .image_flow import FACT_VOCAB, fact_condition
 from .vision import COLORS, SHAPES, DEV, ObjectSpec, object_facts, render_object, sample_object
 
@@ -403,18 +404,86 @@ def choose_image_size_bucket(rng, size_buckets):
     return buckets[int(rng.integers(len(buckets)))]
 
 
+def quality_sampling_weights(records, strength=0.0):
+    rows = list(records)
+    strength = float(strength)
+    if strength < 0.0:
+        raise ValueError("image_quality_weight must be non-negative")
+    report = {
+        "image_quality_weight": strength,
+        "image_quality_weighted": False,
+        "image_quality_weight_source": "",
+        "image_quality_weight_records": 0,
+        "image_quality_weight_missing": 0,
+    }
+    if strength <= 0.0 or not rows:
+        return None, report
+    vals = np.asarray([
+        float(rec.aesthetic) if rec.aesthetic is not None else np.nan
+        for rec in rows
+    ], dtype=np.float64)
+    finite = np.isfinite(vals)
+    missing = int(len(vals) - int(finite.sum()))
+    report["image_quality_weight_missing"] = missing
+    if not finite.any():
+        return None, report
+    valid = vals[finite]
+    lo = float(np.min(valid))
+    hi = float(np.max(valid))
+    mean = float(np.mean(valid))
+    report.update({
+        "image_quality_score_min": lo,
+        "image_quality_score_mean": mean,
+        "image_quality_score_max": hi,
+    })
+    if hi <= lo:
+        return None, report
+    fill = float(np.median(valid))
+    vals = np.where(finite, vals, fill)
+    score = np.clip((vals - lo) / max(hi - lo, 1.0e-12), 0.0, 1.0)
+    logw = strength * score
+    logw -= float(np.max(logw))
+    weights = np.exp(logw)
+    if not np.all(np.isfinite(weights)) or float(weights.sum()) <= 0.0:
+        return None, report
+    report.update({
+        "image_quality_weighted": True,
+        "image_quality_weight_source": "aesthetic_score_quality",
+        "image_quality_weight_records": int(len(rows)),
+        "image_quality_weight_min": float(np.min(weights)),
+        "image_quality_weight_mean": float(np.mean(weights)),
+        "image_quality_weight_max": float(np.max(weights)),
+        "image_quality_weight_ratio": float(np.max(weights) / max(np.min(weights), 1.0e-12)),
+    })
+    return weights.astype(np.float64), report
+
+
+def record_weight_lookup(records, weights):
+    if weights is None:
+        return None
+    return {id(rec): float(w) for rec, w in zip(records, weights)}
+
+
+def weights_for_records(records, record_weights):
+    if record_weights is None:
+        return None
+    weights = [float(record_weights.get(id(rec), 1.0)) for rec in records]
+    return np.asarray(weights, dtype=np.float64)
+
+
 def sample_bucketed_image_text_batch(records, rng, batch=32, size_buckets=(), bucket_records=None,
                                      device=DEV, return_records=False, crop_mode="center",
-                                     hflip_prob=0.0):
+                                     hflip_prob=0.0, record_weights=None):
     bucket = choose_image_size_bucket(rng, size_buckets)
     rows = list(records)
     if bucket_records is not None:
         rows = list(bucket_records.get(bucket) or rows)
     if not rows:
         rows = list(records)
+    weights = weights_for_records(rows, record_weights)
     payload = sample_image_text_batch(
         rows, rng, batch=batch, size=bucket, device=device, return_records=return_records,
-        crop_mode=crop_mode, hflip_prob=hflip_prob)
+        crop_mode=crop_mode, hflip_prob=hflip_prob, weights=weights)
     return (bucket,) + payload
 
 
@@ -1353,7 +1422,7 @@ def estimate_latent_stats(ae, n=512, batch=64, seed=123, size=32, device=DEV,
 @torch.no_grad()
 def estimate_latent_stats_records(ae, records, n=512, batch=64, seed=123, size=32, device=DEV,
                                   mode="none", eps=1.0e-6, crop_mode="center",
-                                  hflip_prob=0.0):
+                                  hflip_prob=0.0, weights=None):
     mode = str(mode)
     if mode == "none":
         return {"mode": "none", "n": 0}
@@ -1369,7 +1438,7 @@ def estimate_latent_stats_records(ae, records, n=512, batch=64, seed=123, size=3
         b = min(batch, n - seen)
         x, _captions = sample_image_text_batch(
             records, rng, batch=b, size=size, device=device,
-            crop_mode=crop_mode, hflip_prob=hflip_prob)
+            crop_mode=crop_mode, hflip_prob=hflip_prob, weights=weights)
         z = ae.encode(x).detach().float().cpu().double()
         if mode == "global":
             cur_sum = z.sum()
@@ -1407,7 +1476,7 @@ def estimate_latent_stats_records(ae, records, n=512, batch=64, seed=123, size=3
 def estimate_latent_stats_record_buckets(ae, records, size_buckets, bucket_records=None,
                                          n=512, batch=64, seed=123, device=DEV,
                                          mode="none", eps=1.0e-6, crop_mode="center",
-                                         hflip_prob=0.0):
+                                         hflip_prob=0.0, record_weights=None):
     mode = str(mode)
     if mode == "none":
         return {"mode": "none", "n": 0}
@@ -1426,7 +1495,8 @@ def estimate_latent_stats_record_buckets(ae, records, size_buckets, bucket_recor
         b = min(batch, n - seen)
         _bucket, x, _captions = sample_bucketed_image_text_batch(
             records, rng, batch=b, size_buckets=buckets, bucket_records=bucket_records,
-            device=device, crop_mode=crop_mode, hflip_prob=hflip_prob)
+            device=device, crop_mode=crop_mode, hflip_prob=hflip_prob,
+            record_weights=record_weights)
         z = ae.encode(x).detach().float().cpu().double()
         if mode == "global":
             cur_sum = z.sum()
@@ -1496,13 +1566,15 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                              batch=64, seed=0, size=32, device=DEV, precision="fp32",
                              cond_source="tokens", cache_dir="", shard_size=1024,
                              include_image_embeddings=False, crop_mode="center",
-                             hflip_prob=0.0, size_buckets=(), bucket_records=None):
+                             hflip_prob=0.0, size_buckets=(), bucket_records=None,
+                             record_weights=None):
     rows = list(records)
     if not rows:
         raise ValueError("cannot build latent cache from empty records")
     rng = np.random.default_rng(seed)
     if max_records and int(max_records) < len(rows):
-        chosen_idx = rng.choice(len(rows), size=int(max_records), replace=False)
+        probs = normalized_sampling_weights(weights_for_records(rows, record_weights), len(rows))
+        chosen_idx = rng.choice(len(rows), size=int(max_records), replace=False, p=probs)
         rows = [rows[int(i)] for i in chosen_idx]
     buckets = normalize_image_size_buckets(size_buckets)
     if len(buckets) > 1:
@@ -1511,6 +1583,8 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         total_bytes = 0
         total_records = 0
         total_shards = 0
+        total_weight = 0.0
+        weighted = bool(record_weights is not None)
         for bucket in buckets:
             bucket_key = image_size_key(bucket)
             bucket_rows = list(limited_bucket_records.get(bucket) or rows)
@@ -1521,15 +1595,18 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                 size=bucket, device=device, precision=precision, cond_source=cond_source,
                 cache_dir=bucket_dir, shard_size=shard_size,
                 include_image_embeddings=include_image_embeddings,
-                crop_mode=crop_mode, hflip_prob=hflip_prob)
+                crop_mode=crop_mode, hflip_prob=hflip_prob,
+                record_weights=record_weights)
             total_bytes += int(subcache.get("bytes", 0))
             total_records += int(subcache.get("records", 0))
             total_shards += int(subcache.get("shard_count", len(subcache.get("shards", []))))
+            total_weight += float(subcache.get("weight_sum", subcache.get("records", 0)))
             subcaches.append({
                 "key": bucket_key,
                 "size": image_size_pair_value(bucket),
                 "cache": subcache,
                 "records": int(subcache.get("records", 0)),
+                "weight_sum": float(subcache.get("weight_sum", subcache.get("records", 0))),
             })
         backend = "bucketed_disk" if cache_dir else "bucketed_memory"
         cache = {
@@ -1542,6 +1619,8 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             "bytes": int(total_bytes),
             "cond_source": cond_source,
             "has_image_embeddings": bool(include_image_embeddings),
+            "weighted": bool(weighted),
+            "weight_sum": float(total_weight),
         }
         if cache_dir:
             os.makedirs(cache["cache_dir"], exist_ok=True)
@@ -1551,7 +1630,12 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                     "format": "image_latent_cache_bucketed_v1",
                     "backend": backend,
                     "buckets": [
-                        {"key": b["key"], "size": b["size"], "records": b["records"]}
+                        {
+                            "key": b["key"],
+                            "size": b["size"],
+                            "records": b["records"],
+                            "weight_sum": b["weight_sum"],
+                        }
                         for b in subcaches
                     ],
                     "records": int(total_records),
@@ -1559,6 +1643,8 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                     "bytes": int(total_bytes),
                     "cond_source": cond_source,
                     "has_image_embeddings": bool(include_image_embeddings),
+                    "weighted": bool(weighted),
+                    "weight_sum": float(total_weight),
                 }, f, indent=1, sort_keys=True)
             os.replace(meta_path + ".tmp", meta_path)
             cache["meta_path"] = meta_path
@@ -1574,8 +1660,9 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             batch=batch, size=size, device=device, precision=precision,
             cond_source=cond_source, cache_dir=cache_dir, shard_size=shard_size,
             include_image_embeddings=include_image_embeddings, seed=seed,
-            crop_mode=crop_mode, hflip_prob=hflip_prob)
+            crop_mode=crop_mode, hflip_prob=hflip_prob, record_weights=record_weights)
     latents, captions, embeddings, image_embeddings = [], [], [], []
+    weights = weights_for_records(rows, record_weights)
     ae.eval()
     crop_rng = np.random.default_rng(seed + 17)
     for start in range(0, len(rows), max(1, int(batch))):
@@ -1614,7 +1701,14 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         "records": len(rows),
         "latent_shape": tuple(int(x) for x in latents[0].shape[1:]),
         "bytes": int(sum(z.numel() * z.element_size() for z in latents)),
+        "weights": (
+            torch.tensor(weights, dtype=torch.float32) if weights is not None else None
+        ),
+        "weighted": bool(weights is not None),
+        "weight_sum": float(np.sum(weights)) if weights is not None else float(len(rows)),
     }
+    if cache["weights"] is not None:
+        cache["bytes"] += int(cache["weights"].numel() * cache["weights"].element_size())
     if cache["text_embeddings"] is not None:
         cache["bytes"] += int(
             cache["text_embeddings"].numel() * cache["text_embeddings"].element_size()
@@ -1631,7 +1725,8 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
                                   size=32, device=DEV, precision="fp32",
                                   cond_source="tokens", cache_dir="", shard_size=1024,
                                   include_image_embeddings=False, seed=0,
-                                  crop_mode="center", hflip_prob=0.0):
+                                  crop_mode="center", hflip_prob=0.0,
+                                  record_weights=None):
     if not cache_dir:
         raise ValueError("cache_dir is required for disk latent cache")
     shard_size = int(shard_size)
@@ -1644,6 +1739,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
     os.makedirs(cache_dir, exist_ok=True)
     shards = []
     total_bytes = 0
+    total_weight = 0.0
     latent_shape = None
     ae.eval()
     crop_rng = np.random.default_rng(seed + 17)
@@ -1666,6 +1762,16 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
                 z = ae.encode(x)
             latents.append(z.detach().float().cpu())
         captions = [rec.caption for rec in chunk_rows]
+        chunk_weights = weights_for_records(chunk_rows, record_weights)
+        chunk_weight_tensor = (
+            torch.tensor(chunk_weights, dtype=torch.float32)
+            if chunk_weights is not None else None
+        )
+        chunk_weight_sum = (
+            float(np.sum(chunk_weights)) if chunk_weights is not None
+            else float(len(chunk_rows))
+        )
+        total_weight += chunk_weight_sum
         shard = {
             "latents": torch.cat(latents, dim=0).contiguous(),
             "captions": captions,
@@ -1683,6 +1789,9 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
             ),
             "cond_source": cond_source,
             "has_image_embeddings": bool(include_image_embeddings),
+            "weights": chunk_weight_tensor,
+            "weighted": bool(chunk_weight_tensor is not None),
+            "weight_sum": float(chunk_weight_sum),
             "start": int(start),
             "count": int(len(chunk_rows)),
         }
@@ -1696,7 +1805,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         file_bytes = int(os.path.getsize(path))
         total_bytes += file_bytes
         shards.append({"path": path, "file": name, "count": int(len(chunk_rows)),
-                       "bytes": file_bytes})
+                       "bytes": file_bytes, "weight_sum": float(chunk_weight_sum)})
     meta = {
         "format": "image_latent_cache_v1",
         "backend": "disk",
@@ -1707,10 +1816,17 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         "has_image_embeddings": bool(include_image_embeddings),
         "shard_size": int(shard_size),
         "shards": [
-            {"file": s["file"], "count": int(s["count"]), "bytes": int(s["bytes"])}
+            {
+                "file": s["file"],
+                "count": int(s["count"]),
+                "bytes": int(s["bytes"]),
+                "weight_sum": float(s["weight_sum"]),
+            }
             for s in shards
         ],
         "bytes": int(total_bytes),
+        "weighted": bool(record_weights is not None),
+        "weight_sum": float(total_weight),
     }
     meta_path = os.path.join(cache_dir, "meta.json")
     tmp_meta = meta_path + ".tmp"
@@ -1729,6 +1845,8 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         "shard_size": int(shard_size),
         "shards": shards,
         "bytes": int(total_bytes),
+        "weighted": bool(record_weights is not None),
+        "weight_sum": float(total_weight),
     }
 
 
@@ -1769,12 +1887,22 @@ def sample_latent_cache(cache, rng, batch, device=DEV):
         shards = list(cache.get("shards", []))
         if not shards:
             raise ValueError("disk latent cache has no shards")
-        counts = np.asarray([int(s["count"]) for s in shards], dtype=np.float64)
-        probs = counts / counts.sum()
+        shard_weights = np.asarray([
+            float(s.get("weight_sum", s["count"])) if cache.get("weighted")
+            else float(s["count"])
+            for s in shards
+        ], dtype=np.float64)
+        probs = normalized_sampling_weights(shard_weights, len(shards))
         shard_i = int(rng.choice(len(shards), p=probs))
         shard = _load_latent_cache_shard(shards[shard_i])
         n = int(shard["latents"].shape[0])
-        idx = torch.tensor(rng.integers(0, n, size=int(batch)), dtype=torch.long)
+        shard_probs = normalized_sampling_weights(
+            shard.get("weights"), n) if shard.get("weights") is not None else None
+        if shard_probs is None:
+            idx_np = rng.integers(0, n, size=int(batch))
+        else:
+            idx_np = rng.choice(n, size=int(batch), replace=True, p=shard_probs)
+        idx = torch.tensor(idx_np, dtype=torch.long)
         z1 = shard["latents"][idx].to(device=device)
         image_embs = (
             shard["image_embeddings"][idx] if shard.get("image_embeddings") is not None else None
@@ -1787,7 +1915,12 @@ def sample_latent_cache(cache, rng, batch, device=DEV):
             payload = _latent_cache_payload(
                 "tokens", ids=shard["caption_ids"][idx], image_embeddings=image_embs)
         return z1, payload
-    idx_np = rng.integers(0, int(cache["records"]), size=int(batch))
+    cache_probs = normalized_sampling_weights(
+        cache.get("weights"), int(cache["records"])) if cache.get("weights") is not None else None
+    if cache_probs is None:
+        idx_np = rng.integers(0, int(cache["records"]), size=int(batch))
+    else:
+        idx_np = rng.choice(int(cache["records"]), size=int(batch), replace=True, p=cache_probs)
     idx = torch.tensor(idx_np, dtype=torch.long)
     z1 = cache["latents"][idx].to(device=device)
     image_embs = (
@@ -1806,7 +1939,7 @@ def sample_latent_cache(cache, rng, batch, device=DEV):
 @torch.no_grad()
 def estimate_latent_stats_cache(cache, n=512, seed=123, mode="none"):
     backend = latent_cache_backend(cache)
-    if backend in ("bucketed_memory", "bucketed_disk"):
+    if backend in ("bucketed_memory", "bucketed_disk") or bool(cache.get("weighted")):
         if mode == "none":
             return {"mode": "none", "n": 0}
         if mode not in ("global", "channel"):
@@ -4092,6 +4225,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       size_buckets=(),
                       image_manifest="", image_root="", image_split="train",
                       image_min_aesthetic=None, image_max_records=0,
+                      image_quality_weight=0.0,
                       caption_vocab_max=8192, caption_max_len=64,
                       caption_cond_source="tokens",
                       image_crop_mode="center", image_hflip_prob=0.0,
@@ -4170,6 +4304,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("flow_loss_weight_gamma must be positive")
     if latent_normalize not in ("none", "global", "channel"):
         raise ValueError(f"unknown latent normalization mode {latent_normalize!r}")
+    if image_quality_weight < 0.0:
+        raise ValueError("image_quality_weight must be non-negative")
+    if image_quality_weight > 0.0 and image_records is None:
+        raise ValueError("image_quality_weight requires image_manifest training")
     if image_crop_mode not in ("center", "random", "none", "pad"):
         raise ValueError(f"unknown image crop mode {image_crop_mode!r}")
     if image_hflip_prob < 0.0 or image_hflip_prob > 1.0:
@@ -4234,6 +4372,19 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     if eval_weight_mode not in EVAL_WEIGHT_MODES:
         raise ValueError(f"unknown eval weight mode {eval_weight_mode!r}")
     prompt_vocab = None
+    image_sample_weights = None
+    image_record_weights = None
+    image_quality_report = {
+        "image_quality_weight": float(image_quality_weight),
+        "image_quality_weighted": False,
+        "image_quality_weight_source": "",
+        "image_quality_weight_records": 0,
+        "image_quality_weight_missing": 0,
+    }
+    if image_records is not None:
+        image_sample_weights, image_quality_report = quality_sampling_weights(
+            image_records, image_quality_weight)
+        image_record_weights = record_weight_lookup(image_records, image_sample_weights)
     if cond_mode == "text":
         prompt_vocab = (
             None if image_records is not None and caption_cond_source == "embedding"
@@ -4322,7 +4473,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 batch_size, x, captions, chosen_records = sample_bucketed_image_text_batch(
                     image_records, rng, batch=batch, size_buckets=train_size_buckets,
                     bucket_records=bucket_records, device=device, return_records=True,
-                    crop_mode=image_crop_mode, hflip_prob=image_hflip_prob)
+                    crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
+                    record_weights=image_record_weights)
                 size_bucket_sample_counts[image_size_key(batch_size)] += int(batch)
             with amp_autocast(device, train_precision):
                 out = ae(x)
@@ -4395,7 +4547,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             shard_size=flow_cache_shard_size,
             include_image_embeddings=flow_feature_align_w > 0.0 or flow_repa_w > 0.0,
             crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
-            size_buckets=train_size_buckets, bucket_records=bucket_records)
+            size_buckets=train_size_buckets, bucket_records=bucket_records,
+            record_weights=image_record_weights)
     if image_records is None:
         latent_stats = estimate_latent_stats(
             ae, n=latent_stat_samples, batch=batch, seed=seed + 97, size=size, device=device,
@@ -4407,12 +4560,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         latent_stats = estimate_latent_stats_record_buckets(
             ae, image_records, train_size_buckets, bucket_records=bucket_records,
             n=latent_stat_samples, batch=batch, seed=seed + 97, device=device,
-            mode=latent_normalize, crop_mode=image_crop_mode, hflip_prob=image_hflip_prob)
+            mode=latent_normalize, crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
+            record_weights=image_record_weights)
     else:
         latent_stats = estimate_latent_stats_records(
             ae, image_records, n=latent_stat_samples, batch=batch, seed=seed + 97,
             size=size, device=device, mode=latent_normalize,
-            crop_mode=image_crop_mode, hflip_prob=image_hflip_prob)
+            crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
+            weights=image_sample_weights)
     attach_latent_stats(flow, latent_stats)
     flow.train()
     if conditioner is not None:
@@ -4456,7 +4611,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 batch_size, x, captions, chosen_records = sample_bucketed_image_text_batch(
                     image_records, rng, batch=batch, size_buckets=train_size_buckets,
                     bucket_records=bucket_records, device=device, return_records=True,
-                    crop_mode=image_crop_mode, hflip_prob=image_hflip_prob)
+                    crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
+                    record_weights=image_record_weights)
                 size_bucket_sample_counts[image_size_key(batch_size)] += int(batch)
                 fact_cond, specs = None, None
                 with torch.no_grad(), amp_autocast(device, train_precision):
@@ -4585,6 +4741,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_cache_cond_source": (
             str(flow_cache["cond_source"]) if flow_cache is not None else caption_cond_source
         ),
+        "flow_cache_weighted": bool(
+            flow_cache.get("weighted", False) if flow_cache is not None else False
+        ),
         "ae_accum_steps": int(ae_accum_steps),
         "flow_accum_steps": int(flow_accum_steps),
         "ae_effective_batch": int(batch) * int(ae_accum_steps),
@@ -4687,6 +4846,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "image_min_aesthetic": (
             float(image_min_aesthetic) if image_min_aesthetic is not None else None
         ),
+        **image_quality_report,
         "image_crop_mode": image_crop_mode if image_records is not None else "",
         "image_hflip_prob": float(image_hflip_prob) if image_records is not None else 0.0,
         "caption_vocab_max": int(caption_vocab_max) if image_records is not None else 0,
@@ -4927,6 +5087,7 @@ def selftest():
                 f.write(arr.tobytes())
             rows.append({"image": name, "caption": f"{split} color patch {i}",
                          "split": split,
+                         "aesthetic": float(i + 1),
                          "text_embedding": [float(i), float(i + 1), float(i % 2), 1.0],
                          "image_embedding": [float(i), float(i + 2),
                                              float((i + 1) % 2), 1.0]})
@@ -4943,6 +5104,7 @@ def selftest():
             image_text_align_w=0.1, flow_text_align_w=0.1, text_embed_dim=12,
             image_feature_align_w=0.1, flow_feature_align_w=0.1,
             image_feature_embed_dim=10, flow_repa_w=0.1, flow_repa_embed_dim=11,
+            image_quality_weight=2.0,
             flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
             intervention_samples=0, return_conditioner=True, return_aligner=True)
         assert report6["data_mode"] == "image_manifest"
@@ -4958,8 +5120,13 @@ def selftest():
         assert report6["text_embedding_in_dim"] == 4
         assert report6["flow_repa_embed_dim"] == 11
         assert "generated_external_text_image_score_cos" in report6
+        assert report6["image_quality_weighted"] is True
+        assert report6["image_quality_weight_source"] == "aesthetic_score_quality"
+        assert report6["image_quality_weight_records"] == 2
+        assert report6["image_quality_weight_ratio"] > 1.0
         assert report6["flow_cache_latents"] is True
         assert report6["flow_cache_backend"] == "memory"
+        assert report6["flow_cache_weighted"] is True
         assert report6["flow_cache_records"] == 2 and report6["flow_cache_bytes"] > 0
         assert report6["flow_cache_shards"] == 0
         ae_rect, flow_rect, conditioner_rect, vocab_rect, report_rect = train_latent_flow(
@@ -5025,6 +5192,7 @@ def selftest():
                 size=(32, 32), size_buckets=((32, 32), (32, 48)),
                 ae_arch="residual", latent_downsample=8,
                 latent_max_tokens=32, image_crop_mode="pad",
+                image_quality_weight=1.0,
                 flow_cache_latents=True, flow_cache_records=2,
                 intervention_samples=0, return_conditioner=True))
         assert report_bucket["size_buckets"] == [[32, 32], [32, 48]]
@@ -5035,6 +5203,7 @@ def selftest():
         assert report_bucket["size_bucket_missing_dims"] == 2
         assert report_bucket["flow_cache_backend"] == "bucketed_memory"
         assert report_bucket["flow_cache_bucket_count"] == 2
+        assert report_bucket["flow_cache_weighted"] is True
         disk_cache_dir = os.path.join(td, "latent_cache")
         _ae_disk, _flow_disk, _cond_disk, _vocab_disk, _aligner_disk, report_disk = (
             train_latent_flow(
@@ -5047,6 +5216,7 @@ def selftest():
                 image_text_align_w=0.1, flow_text_align_w=0.1, text_embed_dim=12,
                 image_feature_align_w=0.1, flow_feature_align_w=0.1,
                 image_feature_embed_dim=10,
+                image_quality_weight=1.0,
                 flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
                 flow_cache_dir=disk_cache_dir, flow_cache_shard_size=1,
                 latent_normalize="channel", latent_stat_samples=2,
@@ -5054,6 +5224,7 @@ def selftest():
         assert report_disk["flow_cache_backend"] == "disk"
         assert report_disk["flow_cache_records"] == 2
         assert report_disk["flow_cache_shards"] == 2
+        assert report_disk["flow_cache_weighted"] is True
         assert report_disk["image_feature_aligner"] is True
         assert report_disk["flow_cache_bytes"] > 0
         assert os.path.exists(os.path.join(disk_cache_dir, "meta.json"))
@@ -5333,6 +5504,10 @@ def main(argv=None):
     ap.add_argument("--image-min-aesthetic", type=float, default=None,
                     dest="image_min_aesthetic",
                     help="optional minimum aesthetic/quality score for manifest rows")
+    ap.add_argument("--image-quality-weight", type=float, default=0.0,
+                    dest="image_quality_weight",
+                    help=("sample manifest rows by normalized aesthetic/score/quality metadata; "
+                          "0 keeps uniform sampling"))
     ap.add_argument("--image-max-records", type=int, default=0, dest="image_max_records",
                     help="cap manifest rows for smoke tests; 0 means all")
     ap.add_argument("--caption-vocab-max", type=int, default=8192, dest="caption_vocab_max",
@@ -5509,7 +5684,9 @@ def main(argv=None):
         text_cond_dim=args.text_cond_dim, prompt_templates=templates,
         image_manifest=args.image_manifest, image_root=args.image_root,
         image_split=args.image_split, image_min_aesthetic=args.image_min_aesthetic,
-        image_max_records=args.image_max_records, caption_vocab_max=args.caption_vocab_max,
+        image_max_records=args.image_max_records,
+        image_quality_weight=args.image_quality_weight,
+        caption_vocab_max=args.caption_vocab_max,
         caption_max_len=args.caption_max_len, caption_cond_source=args.caption_cond_source,
         image_crop_mode=args.image_crop_mode, image_hflip_prob=args.image_hflip_prob,
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
@@ -5641,6 +5818,7 @@ def main(argv=None):
         "flow_cache_shard_size": args.flow_cache_shard_size,
         "flow_cache_shards": report.get("flow_cache_shards", 0),
         "flow_cache_bytes": report.get("flow_cache_bytes", 0),
+        "flow_cache_weighted": report.get("flow_cache_weighted", False),
         "train_precision": args.train_precision,
         "train_amp_enabled": report.get("train_amp_enabled", False),
         "grad_clip": args.grad_clip,
@@ -5659,6 +5837,8 @@ def main(argv=None):
         "image_root": args.image_root,
         "image_split": args.image_split,
         "image_min_aesthetic": args.image_min_aesthetic,
+        "image_quality_weight": args.image_quality_weight,
+        "image_quality_weighted": report.get("image_quality_weighted", False),
         "image_max_records": args.image_max_records,
         "image_crop_mode": report.get("image_crop_mode", ""),
         "image_hflip_prob": report.get("image_hflip_prob", 0.0),

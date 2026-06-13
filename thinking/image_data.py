@@ -685,10 +685,31 @@ def write_image_manifest(records, path, root=""):
             f.write(json.dumps(_record_to_manifest_row(rec, root=root), sort_keys=True) + "\n")
 
 
+def normalized_sampling_weights(weights, n):
+    if weights is None:
+        return None
+    arr = np.asarray(weights, dtype=np.float64)
+    if arr.shape != (int(n),):
+        raise ValueError(f"sampling weights must have shape ({int(n)},), got {arr.shape}")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("sampling weights must be finite")
+    if np.any(arr < 0.0):
+        raise ValueError("sampling weights must be non-negative")
+    total = float(arr.sum())
+    if total <= 0.0:
+        raise ValueError("sampling weights must have positive sum")
+    return arr / total
+
+
 def sample_image_text_batch(records, rng, batch=32, size=256, device="cpu",
-                            return_records=False, crop_mode="center", hflip_prob=0.0):
+                            return_records=False, crop_mode="center", hflip_prob=0.0,
+                            weights=None):
     records = list(records)
-    idx = rng.integers(0, len(records), size=int(batch))
+    probs = normalized_sampling_weights(weights, len(records))
+    if probs is None:
+        idx = rng.integers(0, len(records), size=int(batch))
+    else:
+        idx = rng.choice(len(records), size=int(batch), replace=True, p=probs)
     chosen = [records[int(i)] for i in idx]
     hflip_prob = float(hflip_prob)
     imgs = [
@@ -750,6 +771,11 @@ def selftest():
             records, np.random.default_rng(1), batch=2, size=8,
             crop_mode="pad")
         assert xb_pad.shape == (2, 3, 8, 8) and captions_pad == captions
+        weighted_records = [records[0], replace(records[0], caption="weighted target")]
+        _xw, weighted_captions = sample_image_text_batch(
+            weighted_records, np.random.default_rng(2), batch=8, size=4,
+            weights=[0.0, 1.0])
+        assert weighted_captions == ["weighted target"] * 8
         summary = summarize_records(records)
         assert summary["image_records"] == 1 and summary["image_splits"]["train"] == 1
         assert summary["text_embedding_records"] == 1 and summary["text_embedding_dims"] == [3]

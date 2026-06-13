@@ -678,6 +678,7 @@ python -m thinking.image_data --manifest data/images/train.jsonl \
 python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --image-manifest data/images/train_clean.jsonl --image-root data/images \
     --caption-cond-source auto \
+    --image-quality-weight 1.5 \
     --size 64 --ae-arch residual --latent-downsample 8 --latent-max-tokens 128 \
     --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 \
     --image-text-align-w 0.1 --flow-text-align-w 0.05 --text-embed-dim 128 \
@@ -729,6 +730,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
     --image-manifest data/images/train.jsonl --image-root data/images \
     --image-caption-cond-source auto \
     --image-crop-mode pad --image-hflip-prob 0.5 \
+    --image-quality-weight 1.5 \
     --image-size 128x192 --image-size-buckets 128x128,128x192,192x128 \
     --image-ae-arch residual --image-latent-downsample 8 \
     --image-latent-max-tokens 384 \
@@ -1164,6 +1166,14 @@ same-width external `text_embedding` and `image_embedding` vectors, checkpoint s
 latents through the learned image-feature bridge and comparing them to the caption embedding. This
 keeps CLIP/SigLIP-style prompt alignment measurable without loading the external encoder during
 eval.
+
+Image-56 adds quality-weighted manifest sampling. `thinking.image_latent
+--image-quality-weight W` samples rows from normalized `aesthetic` / `score` / `quality` metadata
+instead of treating all kept rows equally; `W=0` is the exact legacy uniform behavior. The same
+weighting now reaches AE batches, latent-stat estimation, and memory/disk/bucketed flow latent
+caches, with reports/checkpoints exposing `image_quality_*` and `flow_cache_weighted` fields. This
+is a generic data-quality scaling lever: cleaned manifests can prefer better scored images without
+hard-coding visual labels, caption grammar, or dataset-specific rules.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

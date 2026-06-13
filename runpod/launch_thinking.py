@@ -205,6 +205,7 @@ def payload(args):
                      f"--image-root {shlex_quote(args.image_root)} "
                      f"--image-split {shlex_quote(args.image_split)} "
                      f"--image-max-records {args.image_max_records} "
+                     f"--image-quality-weight {args.image_quality_weight} "
                      f"--caption-vocab-max {args.image_caption_vocab_max} "
                      f"--caption-max-len {args.image_caption_max_len} "
                      f"--caption-cond-source {args.image_caption_cond_source} "
@@ -681,6 +682,10 @@ def main():
     ap.add_argument("--image-min-aesthetic", type=float, default=None,
                     dest="image_min_aesthetic",
                     help="optional minimum aesthetic/quality score for image manifest rows")
+    ap.add_argument("--image-quality-weight", type=float, default=0.0,
+                    dest="image_quality_weight",
+                    help=("sample image manifest rows by normalized aesthetic/score/quality "
+                          "metadata; 0 keeps uniform sampling"))
     ap.add_argument("--image-max-records", type=int, default=0, dest="image_max_records",
                     help="cap image manifest records for GPU smoke tests; 0 means all")
     ap.add_argument("--image-eval-split", default="eval", dest="image_eval_split",
