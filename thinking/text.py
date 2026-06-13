@@ -2882,6 +2882,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               choice_candidate_replacement_answerability_binding_margin=0.0,
               choice_positive_anchor_w=0.0,
               choice_positive_anchor_margin=0.0,
+              choice_positive_anchor_sources=None,
               choice_concept_bridge_w=0.0,
               choice_concept_bridge_margin=0.0,
               choice_concept_prototype_w=0.0,
@@ -2956,6 +2957,9 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                              or choice_answerability_contrast_w)
     swap_groups = (choice_question_swap_groups(control_sources)
                    if needs_swap_groups and control_sources else [])
+    positive_anchor_sources = (
+        list(choice_positive_anchor_sources)
+        if choice_positive_anchor_sources is not None else control_sources)
     for st in range(1, steps + 1):
         model.train()
         if balance_by == "none":
@@ -3102,9 +3106,9 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 replacement_ans_binding_loss = torch.tensor(0.0, device=device)
         else:
             replacement_ans_binding_loss = torch.tensor(0.0, device=device)
-        if choice_positive_anchor_w and control_sources:
+        if choice_positive_anchor_w and positive_anchor_sources:
             positive_anchor_records = choice_positive_anchor_batch_records(
-                control_sources, rng, max(1, batch // 2))
+                positive_anchor_sources, rng, max(1, batch // 2))
             if positive_anchor_records:
                 positive_anchor_txt, _positive_anchor_ids = pack(
                     positive_anchor_records, vocab, device)
@@ -5397,6 +5401,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
         discovery_counts = {}
         discovery_selection = {}
         discovery_source_records = []
+        positive_anchor_source_records = []
         if study_strategy == "errors":
             need_metric_correct = bool(
                 study_anchor_correct_per_kind
@@ -5498,6 +5503,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
             if discovery_records:
                 discovery_source_records = unique_records_by_id(
                     hard_records, discovery_records)
+            positive_anchor_source_records = (
+                list(anchor_records) if anchor_records else list(distill_records))
             hard_report = hard_report | {
                 "n_anchor_records": len(anchor_records),
                 "n_unique_anchor_records": sum(anchor_counts.values()),
@@ -5508,6 +5515,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                 "n_distill_records": len(distill_records),
                 "distill_records_by_kind": distill_counts,
                 "distill_selection": distill_selection,
+                "n_positive_anchor_source_records": len(positive_anchor_source_records),
                 "n_discovery_records": len(discovery_records),
                 "discovery_records_by_kind": discovery_counts,
                 "discovery_selection": discovery_selection,
@@ -5545,6 +5553,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                               "distill_records": len(distill_records),
                               "distill_records_by_kind": distill_counts,
                               "distill_selection": distill_selection,
+                              "positive_anchor_source_records": (
+                                  len(positive_anchor_source_records)),
                               "discovery_records": len(discovery_records),
                               "discovery_records_by_kind": discovery_counts,
                               "discovery_selection": discovery_selection,
@@ -5598,6 +5608,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                       choice_candidate_replacement_answerability_binding_margin),
                   choice_positive_anchor_w=choice_positive_anchor_w,
                   choice_positive_anchor_margin=choice_positive_anchor_margin,
+                  choice_positive_anchor_sources=(
+                      positive_anchor_source_records
+                      if positive_anchor_source_records else None),
                   choice_concept_bridge_w=choice_concept_bridge_w,
                   choice_concept_bridge_margin=choice_concept_bridge_margin,
                   choice_concept_prototype_w=choice_concept_prototype_w,

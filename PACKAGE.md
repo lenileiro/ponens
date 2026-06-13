@@ -926,6 +926,23 @@ remained below threshold, so `selected_round` stayed **0**. The useful result is
 fragile-memory curriculum; the unresolved gap is stronger positive answer retention under the
 control losses.
 
+The positive-anchor-source update routes those same fragile anchor records into
+`choice_positive_anchor_w` instead of sampling generic control sources. On the same smoke,
+`positive_anchor_source_records` was **46**, sampled `squad_choice` stayed at **0.400** while
+absent/swap negatives rose to **0.200 / 0.200**, kind regressions dropped to none, and round score
+became positive (**0.019**). The selector still kept `selected_round` at **0** because control gaps
+remained below threshold, so the next gap is control repair without sacrificing the retained
+positive answer path.
+
+A larger local MPS check imported **15k** SQuAD choice records from the official SQuAD URLs
+(**12k** train / **3k** eval with answer-present, answer-absent, and swapped-question records) and
+ran the same fragile-anchor-source update with bounded mining/eval. Against the pre-study
+checkpoint, sampled positive `squad_choice` improved from **0.233** to **0.333** and sampled
+semantic accuracy from **0.083** to **0.100**, while question/context-only choice gaps stayed
+positive. It still failed the language gate: absent/swap negatives stayed at **0.000**, candidate
+replacement abstention stayed **0.017**, and the swapped-question gap remained negative
+(**-0.017**). This is real weight movement on web data, not mastery yet.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
