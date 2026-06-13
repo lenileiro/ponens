@@ -3760,6 +3760,77 @@ def choice_neighbor_records_per_kind(model, vocab, hard_records, correct_records
     }
 
 
+def choice_fragile_correct_records_per_kind(model, vocab, correct_records, rng, per_kind,
+                                            device=DEV, pool_per_kind=0):
+    """Select currently-correct QA records with the smallest own-model target margin."""
+    if per_kind <= 0:
+        return [], {}, {"fragile": True, "reason": "disabled"}
+    candidates = [r for r in correct_records if qa_choice_target(r) is not None]
+    if not candidates:
+        return [], {}, {"fragile": False, "reason": "no_correct_choice_records"}
+    pool_per_kind = max(0, int(pool_per_kind))
+    if pool_per_kind:
+        pooled = []
+        by_kind = {}
+        for rec in candidates:
+            by_kind.setdefault(rec.kind, []).append(rec)
+        for rows in by_kind.values():
+            n = min(pool_per_kind, len(rows))
+            if n < len(rows):
+                idx = rng.choice(len(rows), size=n, replace=False)
+                pooled.extend(rows[int(i)] for i in idx)
+            else:
+                pooled.extend(rows)
+        candidates = pooled
+    scored = {}
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(candidates), 64):
+            batch = candidates[off:off + 64]
+            txt, _ids = pack(batch, vocab, device)
+            for rec, ids, logits in model.choice_logits(txt, batch):
+                target = qa_choice_target(rec)
+                if logits is None or target is None or target not in ids:
+                    continue
+                target_idx = ids.index(target)
+                if int(logits.argmax(-1)) != target_idx:
+                    continue
+                if logits.numel() < 2:
+                    margin = float("inf")
+                else:
+                    mask = torch.ones(logits.shape[0], dtype=torch.bool, device=device)
+                    mask[target_idx] = False
+                    margin = float((logits[target_idx] - logits[mask].max()).cpu())
+                scored.setdefault(rec.kind, []).append((margin, rec))
+    if not scored:
+        return [], {}, {"fragile": False, "reason": "no_scored_correct_records"}
+    out = []
+    counts = {}
+    margin_means = {}
+    margin_mins = {}
+    for kind, rows in sorted(scored.items()):
+        order = rng.permutation(len(rows)) if len(rows) > 1 else np.arange(len(rows))
+        shuffled = [rows[int(i)] for i in order]
+        shuffled.sort(key=lambda item: item[0])
+        picked_rows = shuffled[:min(int(per_kind), len(shuffled))]
+        picked = [rec for _margin, rec in picked_rows]
+        if picked:
+            out.extend(picked)
+            counts[kind] = len(picked)
+            margins = [margin for margin, _rec in picked_rows]
+            margin_means[kind] = float(np.mean(margins))
+            margin_mins[kind] = float(np.min(margins))
+    return out, counts, {
+        "fragile": True,
+        "reason": "lowest_correct_choice_margin",
+        "candidate_correct_records": len(candidates),
+        "selected_records": len(out),
+        "selected_by_kind": counts,
+        "selected_margin_mean_by_kind": margin_means,
+        "selected_margin_min_by_kind": margin_mins,
+    }
+
+
 def retention_anchor_records(records):
     out = []
     for i, rec in enumerate(records):
@@ -5097,6 +5168,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      study_anchor_retention_bucket=False,
                      study_distill_correct_per_kind=0,
                      study_discovery_correct_per_kind=0,
+                     study_fragile_correct_mining=False,
                      study_adaptive_correct_mining=False,
                      study_adaptive_correct_pool_per_kind=0,
                      study_discovery_transfer=False,
@@ -5248,6 +5320,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "study_anchor_retention_bucket": bool(study_anchor_retention_bucket),
               "study_distill_correct_per_kind": int(study_distill_correct_per_kind),
               "study_discovery_correct_per_kind": int(study_discovery_correct_per_kind),
+              "study_fragile_correct_mining": bool(study_fragile_correct_mining),
               "study_adaptive_correct_mining": bool(study_adaptive_correct_mining),
               "study_adaptive_correct_pool_per_kind": int(
                   study_adaptive_correct_pool_per_kind),
@@ -5316,6 +5389,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
         round_seed = seed + 1009 * round_i
         anchor_records = []
         anchor_counts = {}
+        anchor_selection = {}
         distill_records = []
         distill_counts = {}
         distill_selection = {}
@@ -5377,15 +5451,29 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                                              "n_error_records_used": len(hard_records)}
             if study_anchor_correct_per_kind and correct_records:
                 rng = np.random.default_rng(round_seed + 53)
-                anchor_records, anchor_counts = sample_records_per_kind(
-                    correct_records, rng, study_anchor_correct_per_kind)
+                if study_fragile_correct_mining and study_score_metric == "choice":
+                    anchor_records, anchor_counts, anchor_selection = (
+                        choice_fragile_correct_records_per_kind(
+                            model, vocab, correct_records, rng,
+                            study_anchor_correct_per_kind, device=device,
+                            pool_per_kind=study_adaptive_correct_pool_per_kind))
+                else:
+                    anchor_records, anchor_counts = sample_records_per_kind(
+                        correct_records, rng, study_anchor_correct_per_kind)
+                    anchor_selection = {"fragile": False, "reason": "random_per_kind"}
                 if study_anchor_retention_bucket:
                     anchor_records = retention_anchor_records(anchor_records)
                 if study_anchor_correct_repeat > 1:
                     anchor_records = anchor_records * study_anchor_correct_repeat
             if study_distill_correct_per_kind and choice_correct_records:
                 rng = np.random.default_rng(round_seed + 71)
-                if study_adaptive_correct_mining and hard_records:
+                if study_fragile_correct_mining:
+                    distill_records, distill_counts, distill_selection = (
+                        choice_fragile_correct_records_per_kind(
+                            model, vocab, choice_correct_records, rng,
+                            study_distill_correct_per_kind, device=device,
+                            pool_per_kind=study_adaptive_correct_pool_per_kind))
+                elif study_adaptive_correct_mining and hard_records:
                     distill_records, distill_counts, distill_selection = (
                         choice_neighbor_records_per_kind(
                             model, vocab, hard_records, choice_correct_records, rng,
@@ -5416,6 +5504,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                 "anchor_repeat": study_anchor_correct_repeat,
                 "anchor_retention_bucket": bool(study_anchor_retention_bucket),
                 "anchor_records_by_kind": anchor_counts,
+                "anchor_selection": anchor_selection,
                 "n_distill_records": len(distill_records),
                 "distill_records_by_kind": distill_counts,
                 "distill_selection": distill_selection,
@@ -5452,6 +5541,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                                                        - len(train_replay_records)),
                               "anchor_records": len(anchor_records),
                               "anchor_records_by_kind": anchor_counts,
+                              "anchor_selection": anchor_selection,
                               "distill_records": len(distill_records),
                               "distill_records_by_kind": distill_counts,
                               "distill_selection": distill_selection,
@@ -5934,6 +6024,12 @@ def selftest():
         choice_model, transfer_txt, transfer_rows, transfer_pairs))
     assert torch.isfinite(choice_concept_transfer_bridge_loss(
         choice_model, transfer_txt, transfer_rows, transfer_pairs))
+    fragile_rows, fragile_counts, fragile_selection = (
+        choice_fragile_correct_records_per_kind(
+            choice_model, choice_vocab, choice_eval, np.random.default_rng(27),
+            per_kind=2, device="cpu", pool_per_kind=0))
+    assert fragile_rows and fragile_counts
+    assert fragile_selection["reason"] == "lowest_correct_choice_margin"
     neighbor_proto_rows, neighbor_proto_items = (
         choice_concept_neighborhood_prototype_batch(
             choice_model, choice_vocab, bridge_eval, np.random.default_rng(25),
@@ -6523,6 +6619,9 @@ def main(argv=None):
     ap.add_argument("--study-discovery-correct-per-kind", type=int, default=0,
                     help=("for error self-study, use this many currently-correct "
                           "choice records per kind as concept-bridge discovery sources"))
+    ap.add_argument("--study-fragile-correct-mining", action="store_true",
+                    help=("select correct distillation records with the smallest "
+                          "own-model target margins"))
     ap.add_argument("--study-adaptive-correct-mining", action="store_true",
                     help=("select correct self-teaching records nearest to hard examples "
                           "in own-model concept space"))
@@ -6710,6 +6809,8 @@ def main(argv=None):
                              args.study_distill_correct_per_kind),
                          study_discovery_correct_per_kind=(
                              args.study_discovery_correct_per_kind),
+                         study_fragile_correct_mining=(
+                             args.study_fragile_correct_mining),
                          study_adaptive_correct_mining=(
                              args.study_adaptive_correct_mining),
                          study_adaptive_correct_pool_per_kind=(

@@ -911,6 +911,21 @@ smoke kept the transfer control improvements but still regressed held-out `squad
 **0.400** to **0.200**, leaving `selected_round` at **0**. That localizes the remaining retention
 damage to the broader study optimization, not just symmetric bridge gradients.
 
+`--study-fragile-correct-mining` adds a retention-oriented self-teaching source. Instead of sampling
+currently-correct records uniformly, it ranks them by the model's own target-vs-alternative choice
+margin and selects the lowest-margin records per kind for anchor replay and own-model
+distillation/rank retention. This is not a hand-written rule: fragile examples are discovered from
+current logits and the existing reading-task labels.
+
+The fragile-anchor transfer smoke selected **46** low-margin correct records (**20**
+`squad_choice`, **18** absent negatives, **8** swapped-question negatives), with `squad_choice`
+anchor mean margin only **0.027**. The round improved sampled held-out balance relative to direct
+transfer (`kind_scores` became **0.20 / 0.20 / 0.20**, round score **-0.146** vs **-0.281** for the
+transfer-only smoke), but `squad_choice` still regressed from **0.400** to **0.200** and controls
+remained below threshold, so `selected_round` stayed **0**. The useful result is a measurable
+fragile-memory curriculum; the unresolved gap is stronger positive answer retention under the
+control losses.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
