@@ -672,6 +672,18 @@ choice (**0.4875**) and held primary control gaps closer, but confirmation still
 control pressure reaches the evaluated head, but the next accepted update needs a
 positive-preserving calibration mechanism rather than stronger `none` pressure.
 
+A narrower final-logit contrast now avoids training controls directly as `none`:
+`--choice-final-control-contrast-w` reuses full-vs-ablation/swap pairs and only requires the
+full record's target final logit to outrank the control record's target final logit. With weight
+**0.25** and final-control none disabled, round 2 preserved more real-answer signal than the
+final-control-none probe (`squad_choice` **0.250** primary, **0.150** confirmation) and kept
+negatives usable (primary absent/swap **0.650** / **0.500**), but confirmation still failed all
+shortcut controls (`question_only` **-0.225**, `context_only` **-0.1125**, `question_swap`
+**-0.0769**) and regressed `squad_choice` from **0.250** to **0.150**. `selected_round` stayed
+**0**. This confirms the issue is not just scoring the final head; the next accepted update needs
+a representation/calibration method that improves shortcut dependence without making same-context
+controls overconfident.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
