@@ -53,7 +53,7 @@ FACT_GROUPS = {
     pred: tuple(i for i, fact in enumerate(FACT_VOCAB) if fact[0] == pred)
     for pred in sorted({fact[0] for fact in FACT_VOCAB})
 }
-SAMPLE_METHODS = ("euler", "heun")
+SAMPLE_METHODS = ("euler", "heun", "midpoint", "rk4")
 MMDIT_ATTN_IMPLS = ("manual", "sdpa", "auto")
 DIT_POS_EMBEDS = ("learned", "sincos2d")
 FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
@@ -3178,20 +3178,36 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
     for i in range(steps):
         t_scalar = float(schedule[i].detach().cpu())
         t_next_scalar = float(schedule[i + 1].detach().cpu())
+        t_mid_scalar = 0.5 * (t_scalar + t_next_scalar)
         dt = t_next_scalar - t_scalar
-        t = torch.full((batch, 1, 1, 1), t_scalar, device=device)
-        step_cfg = cfg_scale if interval_active(t_scalar, cfg_interval) else 1.0
-        v0 = guided_velocity(flow, z, t, cond, cfg_scale=step_cfg,
-                             cfg_rescale=cfg_rescale)
+
+        def velocity_at(z_in, raw_t):
+            t = torch.full((batch, 1, 1, 1), float(raw_t), device=device)
+            step_cfg = cfg_scale if interval_active(float(raw_t), cfg_interval) else 1.0
+            return guided_velocity(flow, z_in, t, cond, cfg_scale=step_cfg,
+                                   cfg_rescale=cfg_rescale)
+
+        v0 = velocity_at(z, t_scalar)
         if sample_method == "euler":
             z = z + dt * v0
-        else:
+        elif sample_method == "heun":
             z_pred = z + dt * v0
-            t_next = torch.full((batch, 1, 1, 1), t_next_scalar, device=device)
-            next_cfg = cfg_scale if interval_active(t_next_scalar, cfg_interval) else 1.0
-            v1 = guided_velocity(flow, z_pred, t_next, cond, cfg_scale=next_cfg,
-                                 cfg_rescale=cfg_rescale)
+            v1 = velocity_at(z_pred, t_next_scalar)
             z = z + 0.5 * dt * (v0 + v1)
+        elif sample_method == "midpoint":
+            z_mid = z + 0.5 * dt * v0
+            v_mid = velocity_at(z_mid, t_mid_scalar)
+            z = z + dt * v_mid
+        elif sample_method == "rk4":
+            z_k2 = z + 0.5 * dt * v0
+            v2 = velocity_at(z_k2, t_mid_scalar)
+            z_k3 = z + 0.5 * dt * v2
+            v3 = velocity_at(z_k3, t_mid_scalar)
+            z_k4 = z + dt * v3
+            v4 = velocity_at(z_k4, t_next_scalar)
+            z = z + (dt / 6.0) * (v0 + 2.0 * v2 + 2.0 * v3 + v4)
+        else:
+            raise ValueError(f"unknown sample method {sample_method!r}")
         if (semantic_guidance_w > 0.0
                 and interval_active(t_scalar, semantic_guidance_interval)):
             z_raw = denormalize_latent(z, latent_stats)
@@ -5544,13 +5560,14 @@ def selftest():
     sweep = sampler_sweep(ae2, flow2, cfg_scales=(1.0, 1.5), sample_steps_list=(1,),
                           cfg_rescales=(0.0, 0.7),
                           semantic_guidance_weights=(0.0, 0.05),
-                          sample_methods=("euler", "heun"),
+                          sample_methods=SAMPLE_METHODS,
                           n=4, batch=2, seed=3, device="cpu")
-    assert len(sweep) == 16 and "sample_roundtrip_both_acc" in sweep[0]
+    assert len(sweep) == 32 and "sample_roundtrip_both_acc" in sweep[0]
     agg = aggregate_sweep_rows([dict(r, eval_seed=i) for i, r in enumerate(sweep)])
-    assert len(agg) == 16 and "sample_roundtrip_both_acc_mean" in agg[0]
+    assert len(agg) == 32 and "sample_roundtrip_both_acc_mean" in agg[0]
     assert "semantic_guidance_w" in agg[0] and "sample_method" in agg[0]
     assert "cfg_rescale" in agg[0]
+    assert {row["sample_method"] for row in sweep} == set(SAMPLE_METHODS)
     ae3, flow3, conditioner3, vocab3, report3 = train_latent_flow(
         ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="dit",
         dit_depth=1, dit_heads=2, seed=2, device="cpu", cond_mode="text",

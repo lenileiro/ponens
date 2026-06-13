@@ -1253,6 +1253,13 @@ embedding width against `text_embedding_in_dim`, and is exposed on RunPod as
 `--image-sample-prompts` plus `--image-prompt-embed-*`. This closes the gap between embedding-based
 training and free-form prompt inspection after GPU runs.
 
+Image-61 broadens the rectified-flow solver sweep beyond Euler/Heun with `midpoint` and `rk4`
+sample methods. The midpoint solver adds a second-order Runge-Kutta trajectory check that can beat
+Euler on less-straight flows without changing training; RK4 is a higher-NFE diagnostic for finding
+whether sample quality is integration-limited. RunPod now accepts `--image-sample-method midpoint`
+or `rk4`, and its default sweep compares `euler,heun,midpoint` while leaving Euler as the single-run
+default for compatibility.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered

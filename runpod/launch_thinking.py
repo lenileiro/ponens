@@ -756,10 +756,11 @@ def main():
                     help="latent image CFG active interval formatted start,end")
     ap.add_argument("--image-sample-steps", type=int, default=4, dest="image_sample_steps",
                     help="ODE sampling steps for latent image evaluation")
-    ap.add_argument("--image-sample-method", default="euler", choices=("euler", "heun"),
+    ap.add_argument("--image-sample-method", default="euler",
+                    choices=("euler", "heun", "midpoint", "rk4"),
                     dest="image_sample_method",
                     help="latent image ODE sampler method")
-    ap.add_argument("--image-sample-methods", default="euler,heun",
+    ap.add_argument("--image-sample-methods", default="euler,heun,midpoint",
                     dest="image_sample_methods",
                     help="comma-separated latent image sampler methods for sweeps")
     ap.add_argument("--image-sample-grid", action="store_true",
