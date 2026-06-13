@@ -546,6 +546,21 @@ class MultimodalLM(nn.Module):
         logits_by_key = self.factor_concepts.logits_from_states(states_by_key)
         return {factor: logits_by_key[FACTOR_KEYS[factor]] for factor in VALUE_POS}
 
+    def latent_factor_state_tensor_from_slots(self, latent_slots):
+        if latent_slots is None:
+            return None
+        return self.factor_concepts.state_tensor(latent_slots)
+
+    def latent_factor_logits_from_slots(self, latent_slots):
+        state_tensor = self.latent_factor_state_tensor_from_slots(latent_slots)
+        if state_tensor is None:
+            return {}
+        return self.factor_logits_from_state_tensor(state_tensor)
+
+    def latent_factor_logits(self, img, aud, txt, mode="full"):
+        latent = self.latent_concept_states(img, aud, txt, mode=mode)
+        return self.latent_factor_logits_from_slots(latent)
+
     def factor_logits(self, img, aud, txt, mode="full"):
         return self.factor_logits_from_states(
             self.factor_concept_states(img, aud, txt, mode=mode))
@@ -585,7 +600,8 @@ class MultimodalLM(nn.Module):
 
     def mode_bundle(self, img, aud, txt, ids, mode="full", need_factor=False,
                     need_geometry=False, need_latent=False,
-                    latent_view_dropout=0.0, latent_project=False):
+                    need_latent_factor=False, latent_view_dropout=0.0,
+                    latent_project=False):
         prefix, concepts = self.encode_prefix(img, aud, txt, mode=mode)
         source = self._source_from_prefix(prefix, concepts)
         factor_state_tensor = None
@@ -602,6 +618,11 @@ class MultimodalLM(nn.Module):
         if need_latent:
             out["latent_concepts"] = self.latent_concept_states_from_prefix(
                 prefix, view_dropout=latent_view_dropout, project=latent_project)
+        if need_latent_factor:
+            if latent_state_tensor is None and self.latent_concepts is not None:
+                latent_state_tensor = self.latent_concepts(prefix)
+            out["latent_factor_logits"] = self.latent_factor_logits_from_slots(
+                latent_state_tensor)
         if need_factor or need_geometry:
             if factor_state_tensor is None:
                 factor_state_tensor = self.factor_concepts.state_tensor(source)
@@ -1100,6 +1121,12 @@ def latent_multimodal_concept_loss(model, img, aud, txt, view_dropout=0.1,
         covariance_w=covariance_w, variance_target=variance_target)
 
 
+def latent_factor_loss(latent_factor_logits_by_mode, golds):
+    if not latent_factor_logits_by_mode:
+        return torch.tensor(0.0)
+    return concept_factor_loss(latent_factor_logits_by_mode, golds)
+
+
 def concept_factor_agreement_loss(factor_logits_by_mode):
     items = list(factor_logits_by_mode.items())
     if len(items) < 2:
@@ -1240,6 +1267,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           latent_concept_w=0.0, latent_concept_view_dropout=0.1,
           latent_concept_invariance_w=25.0, latent_concept_variance_w=25.0,
           latent_concept_covariance_w=1.0, latent_concept_variance_target=1.0,
+          latent_concept_factor_w=0.0,
           concept_w=0.0, concept_agreement_w=0.0,
           concept_distill_w=0.0, concept_distill_temperature=1.0,
           concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
@@ -1252,10 +1280,11 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           concept_state_spread_w=0.0, concept_state_spread_variance=0.05,
           concept_state_spread_margin=0.2,
           concept_state_spread_covariance_w=0.05):
-    if latent_concept_w < 0.0:
-        raise ValueError("latent_concept_w must be non-negative")
-    if latent_concept_w > 0.0 and latent_concept_slots <= 0:
-        raise ValueError("latent_concept_w requires latent_concept_slots > 0")
+    if latent_concept_w < 0.0 or latent_concept_factor_w < 0.0:
+        raise ValueError("latent concept loss weights must be non-negative")
+    if ((latent_concept_w > 0.0 or latent_concept_factor_w > 0.0)
+            and latent_concept_slots <= 0):
+        raise ValueError("latent concept losses require latent_concept_slots > 0")
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     surfaces = load_text_surfaces(surfaces_path)
@@ -1287,6 +1316,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     last_concept_prototype = last_concept_prototype_spread = 0.0
     last_concept_state_spread = 0.0
     last_latent_concept = 0.0
+    last_latent_factor = 0.0
     for st in range(1, steps + 1):
         model.train()
         img, aud, txt, ids, golds = _batch(batch, rng, vocab, device, surfaces,
@@ -1300,10 +1330,12 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
             concept_contrast_w or concept_centroid_w or concept_prototype_w
             or concept_state_spread_w)
         needs_latent_batch = bool(latent_concept_w)
+        needs_latent_factor_batch = bool(latent_concept_factor_w)
         bundles_by_mode = {
             mode: model.mode_bundle(
                 img, aud, txt, ids, mode=mode, need_factor=needs_factor_batch,
                 need_geometry=needs_geometry_batch, need_latent=needs_latent_batch,
+                need_latent_factor=needs_latent_factor_batch,
                 latent_view_dropout=latent_concept_view_dropout,
                 latent_project=True)
             for mode in MODES
@@ -1387,6 +1419,12 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                 covariance_w=latent_concept_covariance_w,
                 variance_target=latent_concept_variance_target)
             if latent_concept_w else base_loss * 0.0)
+        latent_factor = (
+            latent_factor_loss(
+                {mode: bundle["latent_factor_logits"]
+                 for mode, bundle in bundles_by_mode.items()},
+                golds)
+            if latent_concept_factor_w else base_loss * 0.0)
         concept_prototype_spread = (
             concept_factor_prototype_spread_loss(
                 model, margin=concept_prototype_spread_margin)
@@ -1402,7 +1440,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                 + float(concept_prototype_w) * concept_prototype
                 + float(concept_prototype_spread_w) * concept_prototype_spread
                 + float(concept_state_spread_w) * concept_state_spread
-                + float(latent_concept_w) * latent_concept)
+                + float(latent_concept_w) * latent_concept
+                + float(latent_concept_factor_w) * latent_factor)
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -1419,6 +1458,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         last_concept_prototype_spread = float(concept_prototype_spread.detach())
         last_concept_state_spread = float(concept_state_spread.detach())
         last_latent_concept = float(latent_concept.detach())
+        last_latent_factor = float(latent_factor.detach())
         if st % log_every == 0 or st == steps:
             print(f"  m0 {st}/{steps} loss {loss.item():.3f} "
                   f"base {last_base:.3f} agree {last_agreement:.3f} "
@@ -1432,7 +1472,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                   f"concept-proto {last_concept_prototype:.3f} "
                   f"concept-proto-spread {last_concept_prototype_spread:.3f} "
                   f"concept-state-spread {last_concept_state_spread:.3f} "
-                  f"latent {last_latent_concept:.3f}",
+                  f"latent {last_latent_concept:.3f} "
+                  f"latent-factor {last_latent_factor:.3f}",
                   flush=True)
     model.train_metrics = {"token_loss": last_base, "agreement_loss": last_agreement,
                            "concept_loss": last_concept,
@@ -1446,7 +1487,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                            "concept_prototype_spread_loss": (
                                last_concept_prototype_spread),
                            "concept_state_spread_loss": last_concept_state_spread,
-                           "latent_concept_loss": last_latent_concept}
+                           "latent_concept_loss": last_latent_concept,
+                           "latent_factor_loss": last_latent_factor}
     return model, vocab, surfaces
 
 
@@ -1479,6 +1521,7 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         latent_concept_w=0.0, latent_concept_view_dropout=0.1,
         latent_concept_invariance_w=25.0, latent_concept_variance_w=25.0,
         latent_concept_covariance_w=1.0, latent_concept_variance_target=1.0,
+        latent_concept_factor_w=0.0,
         concept_w=0.0, concept_agreement_w=0.0,
         concept_distill_w=0.0, concept_distill_temperature=1.0,
         concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
@@ -1522,6 +1565,7 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                        latent_concept_covariance_w),
                                    latent_concept_variance_target=(
                                        latent_concept_variance_target),
+                                   latent_concept_factor_w=latent_concept_factor_w,
                                    concept_w=concept_w,
                                    concept_agreement_w=concept_agreement_w,
                                    concept_distill_w=concept_distill_w,
@@ -1608,6 +1652,7 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
               "latent_concept_variance_w": float(latent_concept_variance_w),
               "latent_concept_covariance_w": float(latent_concept_covariance_w),
               "latent_concept_variance_target": float(latent_concept_variance_target),
+              "latent_concept_factor_w": float(latent_concept_factor_w),
               "concept_w": float(concept_w),
               "concept_agreement_w": float(concept_agreement_w),
               "concept_distill_w": float(concept_distill_w),
@@ -1772,6 +1817,11 @@ def selftest():
     latent_prefix_dec = latent_prefix_model.decoder_prefix(x, a, tt, mode="full")
     assert latent_prefix_dec.shape[1] == latent_prefix_base.shape[1] + 3
     assert latent_prefix_model(x, a, tt, ids).shape == logits.shape
+    latent_factor_logits = latent_prefix_model.latent_factor_logits(
+        x, a, tt, mode="full")
+    assert set(latent_factor_logits) == set(VALUE_POS)
+    assert torch.isfinite(latent_factor_loss(
+        {"full": latent_factor_logits}, golds))
     rel_txt_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
                                  text_arch="relational", text_layers=1).to("cpu")
     assert rel_txt_model.txt.arch == "relational"
@@ -1900,6 +1950,10 @@ def main(argv=None):
     ap.add_argument("--latent-concept-variance-target", type=float, default=1.0,
                     dest="latent_concept_variance_target",
                     help="minimum per-dimension std target for latent concept slots")
+    ap.add_argument("--latent-concept-factor-w", type=float, default=0.0,
+                    dest="latent_concept_factor_w",
+                    help=("weight for predicting data-defined multimodal factors "
+                          "from schema-free latent slots"))
     ap.add_argument("--concept-w", type=float, default=0.0, dest="concept_w",
                     help="supervised upstream concept-token factor loss weight")
     ap.add_argument("--concept-agreement-w", type=float, default=0.0,
@@ -2048,6 +2102,10 @@ def main(argv=None):
         ap.error("--latent-concept-w must be non-negative")
     if args.latent_concept_w > 0.0 and args.latent_concept_slots <= 0:
         ap.error("--latent-concept-w requires --latent-concept-slots > 0")
+    if args.latent_concept_factor_w < 0.0:
+        ap.error("--latent-concept-factor-w must be non-negative")
+    if args.latent_concept_factor_w > 0.0 and args.latent_concept_slots <= 0:
+        ap.error("--latent-concept-factor-w requires --latent-concept-slots > 0")
     if ((args.latent_concept_prefix or args.latent_concept_refine)
             and args.latent_concept_slots <= 0):
         ap.error("latent concept prefix/refine require --latent-concept-slots > 0")
@@ -2096,6 +2154,7 @@ def main(argv=None):
                  latent_concept_variance_w=args.latent_concept_variance_w,
                  latent_concept_covariance_w=args.latent_concept_covariance_w,
                  latent_concept_variance_target=args.latent_concept_variance_target,
+                 latent_concept_factor_w=args.latent_concept_factor_w,
                  concept_w=args.concept_w,
                  concept_agreement_w=args.concept_agreement_w,
                  concept_distill_w=args.concept_distill_w,

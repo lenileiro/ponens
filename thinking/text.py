@@ -1300,6 +1300,25 @@ class TextFactLM(nn.Module):
         prefix, _pooled = self.encode_text(txt)
         return self.fact_concepts(prefix, mask=txt.eq(self.txt.pad))
 
+    def latent_fact_concept_state_tensor(self, txt):
+        if self.fact_concepts is None or self.latent_concepts is None:
+            return None
+        prefix, _pooled = self.encode_text(txt)
+        latent = self.latent_concepts(prefix, mask=txt.eq(self.txt.pad))
+        return self.fact_concepts.state_tensor(latent)
+
+    def latent_fact_concept_states(self, txt):
+        state_tensor = self.latent_fact_concept_state_tensor(txt)
+        if state_tensor is None:
+            return {}
+        return {key: state_tensor[:, i] for i, key in enumerate(self.fact_concepts.keys)}
+
+    def latent_fact_concept_logits(self, txt):
+        state_tensor = self.latent_fact_concept_state_tensor(txt)
+        if state_tensor is None:
+            return {}
+        return self.fact_concepts.logits_from_state_tensor(state_tensor)
+
     def _choice_question(self, prefix, pooled, row, q_start, q_end):
         if q_start < q_end:
             q_tokens = self.choice_query(prefix[row, q_start:q_end])
@@ -1700,6 +1719,23 @@ def latent_text_concept_loss(model, txt, view_dropout=0.1,
     return latent_concept_vicreg_loss(
         a, b, invariance_weight=invariance_w, variance_weight=variance_w,
         covariance_weight=covariance_w, variance_target=variance_target)
+
+
+def latent_fact_concept_loss(model, txt, records, schema):
+    if (schema is None or getattr(model, "fact_concepts", None) is None
+            or getattr(model, "latent_concepts", None) is None):
+        return torch.tensor(0.0, device=txt.device)
+    logits = model.latent_fact_concept_logits(txt)
+    targets_by_key = fact_concept_target_ids(records, schema, txt.device)
+    losses = []
+    for key in schema.keys:
+        row = logits.get(key)
+        targets = targets_by_key[key]
+        if row is not None and targets.ge(0).any() and row.shape[-1] > 1:
+            losses.append(F.cross_entropy(row, targets, ignore_index=-1))
+    if not losses:
+        return torch.tensor(0.0, device=txt.device)
+    return sum(losses) / len(losses)
 
 
 def choice_loss(model, txt, records, answer_w=1.0, none_w=1.0,
@@ -3219,6 +3255,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               latent_concept_variance_w=25.0,
               latent_concept_covariance_w=1.0,
               latent_concept_variance_target=1.0,
+              latent_concept_fact_w=0.0,
               prefix="text", decode_w=1.0, choice_w=0.0,
               choice_answer_w=1.0, choice_none_w=1.0,
               choice_answer_margin=0.0, choice_none_margin=0.0,
@@ -3270,8 +3307,9 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               choice_control_w=0.0, choice_control_contrast_w=0.0,
               choice_control_margin=0.0,
               choice_control_sides=None):
-    if latent_concept_w > 0.0 and getattr(model, "latent_concepts", None) is None:
-        raise ValueError("latent_concept_w requires latent concept slots")
+    if ((latent_concept_w > 0.0 or latent_concept_fact_w > 0.0)
+            and getattr(model, "latent_concepts", None) is None):
+        raise ValueError("latent concept losses require latent concept slots")
     rng = np.random.default_rng(seed)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     train_records = [r for r in records if r.split == "train"]
@@ -3362,6 +3400,9 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 covariance_w=latent_concept_covariance_w,
                 variance_target=latent_concept_variance_target)
             if latent_concept_w else torch.tensor(0.0, device=device))
+        latent_fact_loss = (
+            latent_fact_concept_loss(model, txt, rec_batch, model.fact_schema)
+            if latent_concept_fact_w else torch.tensor(0.0, device=device))
         ch_loss = choice_loss(model, txt, rec_batch,
                               answer_w=choice_answer_w, none_w=choice_none_w,
                               answer_margin=choice_answer_margin,
@@ -3689,6 +3730,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 + fact_concept_prototype_spread_w * concept_proto_spread_loss
                 + fact_concept_state_spread_w * concept_state_spread_loss
                 + latent_concept_w * latent_loss
+                + latent_concept_fact_w * latent_fact_loss
                 + choice_w * ch_loss
                 + choice_final_w * final_loss
                 + choice_final_control_w * final_control_loss
@@ -3729,6 +3771,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                   f"fact-proto-spread {concept_proto_spread_loss.item():.3f} "
                   f"fact-state-spread {concept_state_spread_loss.item():.3f} "
                   f"latent {latent_loss.item():.3f} "
+                  f"latent-fact {latent_fact_loss.item():.3f} "
                   f"choice {ch_loss.item():.3f} final {final_loss.item():.3f} "
                   f"final-control {final_control_loss.item():.3f} "
                   f"final-contrast {final_contrast_loss.item():.3f} "
@@ -3787,6 +3830,7 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4,
                 latent_concept_variance_w=25.0,
                 latent_concept_covariance_w=1.0,
                 latent_concept_variance_target=1.0,
+                latent_concept_fact_w=0.0,
                 decode_w=1.0, choice_w=0.0, choice_answer_w=1.0,
                 choice_none_w=1.0, choice_context_w=0.0,
                 choice_answer_margin=0.0, choice_none_margin=0.0,
@@ -3873,6 +3917,7 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4,
                      latent_concept_variance_w=latent_concept_variance_w,
                      latent_concept_covariance_w=latent_concept_covariance_w,
                      latent_concept_variance_target=latent_concept_variance_target,
+                     latent_concept_fact_w=latent_concept_fact_w,
                      prefix="text", decode_w=decode_w, choice_w=choice_w,
                      choice_answer_w=choice_answer_w,
                      choice_none_w=choice_none_w,
@@ -5546,6 +5591,7 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         latent_concept_w=0.0, latent_concept_view_dropout=0.1,
         latent_concept_invariance_w=25.0, latent_concept_variance_w=25.0,
         latent_concept_covariance_w=1.0, latent_concept_variance_target=1.0,
+        latent_concept_fact_w=0.0,
         fact_n=0, kind_fact_n=0, artifact_n=0, decode_w=1.0, choice_w=0.0,
         fact_concept_w=0.0, fact_concept_contrast_w=0.0,
         fact_concept_contrast_temperature=0.1,
@@ -5642,6 +5688,7 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                latent_concept_covariance_w=latent_concept_covariance_w,
                                latent_concept_variance_target=(
                                    latent_concept_variance_target),
+                               latent_concept_fact_w=latent_concept_fact_w,
                                decode_w=decode_w,
                                choice_w=choice_w, choice_answer_w=choice_answer_w,
                                choice_none_w=choice_none_w,
@@ -5748,6 +5795,7 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
               "latent_concept_variance_w": float(latent_concept_variance_w),
               "latent_concept_covariance_w": float(latent_concept_covariance_w),
               "latent_concept_variance_target": float(latent_concept_variance_target),
+              "latent_concept_fact_w": float(latent_concept_fact_w),
               "fact_concept_prototype_w": float(fact_concept_prototype_w),
               "fact_concept_prototype_spread_w": float(
                   fact_concept_prototype_spread_w),
@@ -5884,6 +5932,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      latent_concept_variance_w=25.0,
                      latent_concept_covariance_w=1.0,
                      latent_concept_variance_target=1.0,
+                     latent_concept_fact_w=0.0,
                      fact_concept_prototype_w=0.0,
                      fact_concept_prototype_spread_w=0.0,
                      fact_concept_prototype_spread_margin=0.2,
@@ -6064,6 +6113,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "latent_concept_variance_w": float(latent_concept_variance_w),
               "latent_concept_covariance_w": float(latent_concept_covariance_w),
               "latent_concept_variance_target": float(latent_concept_variance_target),
+              "latent_concept_fact_w": float(latent_concept_fact_w),
               "fact_concept_prototype_w": float(fact_concept_prototype_w),
               "fact_concept_prototype_spread_w": float(
                   fact_concept_prototype_spread_w),
@@ -6435,6 +6485,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   latent_concept_variance_w=latent_concept_variance_w,
                   latent_concept_covariance_w=latent_concept_covariance_w,
                   latent_concept_variance_target=latent_concept_variance_target,
+                  latent_concept_fact_w=latent_concept_fact_w,
                   prefix=f"study-r{round_i + 1}",
                   decode_w=decode_w, choice_w=choice_w,
                   choice_answer_w=choice_answer_w, choice_none_w=choice_none_w,
@@ -6804,6 +6855,10 @@ def selftest():
     latent_decoder_prefix = latent_prefix_model.decoder_prefix(choice_txt)
     assert latent_decoder_prefix.shape[1] == latent_prefix.shape[1] + 3
     assert latent_prefix_model(choice_txt, _choice_ids).shape[:2] == _choice_ids.shape
+    latent_fact_logits = latent_prefix_model.latent_fact_concept_logits(choice_txt)
+    assert set(latent_fact_logits) == set(choice_schema.keys)
+    assert torch.isfinite(latent_fact_concept_loss(
+        latent_prefix_model, choice_txt, choice_eval, choice_schema))
     rel_model = TextFactLM(len(choice_vocab), d=32, layers=1, heads=4,
                            pad=choice_vocab.pad, fact_schema=choice_schema,
                            text_encoder_arch="relational",
@@ -7418,6 +7473,10 @@ def main(argv=None):
     ap.add_argument("--latent-concept-variance-target", type=float, default=1.0,
                     dest="latent_concept_variance_target",
                     help="minimum per-dimension std target for latent concept slots")
+    ap.add_argument("--latent-concept-fact-w", type=float, default=0.0,
+                    dest="latent_concept_fact_w",
+                    help=("weight for predicting data-defined fact concepts from "
+                          "schema-free latent slots"))
     ap.add_argument("--fact-concept-prototype-w", type=float, default=0.0,
                     dest="fact_concept_prototype_w",
                     help="weight for schema-generic learned concept prototype loss")
@@ -7733,6 +7792,10 @@ def main(argv=None):
         ap.error("--latent-concept-w must be non-negative")
     if args.latent_concept_w > 0.0 and args.latent_concept_slots <= 0:
         ap.error("--latent-concept-w requires --latent-concept-slots > 0")
+    if args.latent_concept_fact_w < 0.0:
+        ap.error("--latent-concept-fact-w must be non-negative")
+    if args.latent_concept_fact_w > 0.0 and args.latent_concept_slots <= 0:
+        ap.error("--latent-concept-fact-w requires --latent-concept-slots > 0")
     if ((args.latent_concept_prefix or args.latent_concept_refine)
             and args.latent_concept_slots <= 0):
         ap.error("latent concept prefix/refine require --latent-concept-slots > 0")
@@ -7836,6 +7899,7 @@ def main(argv=None):
                          latent_concept_covariance_w=args.latent_concept_covariance_w,
                          latent_concept_variance_target=(
                              args.latent_concept_variance_target),
+                         latent_concept_fact_w=args.latent_concept_fact_w,
                          fact_concept_prototype_w=args.fact_concept_prototype_w,
                          fact_concept_prototype_spread_w=(
                              args.fact_concept_prototype_spread_w),
@@ -7986,6 +8050,7 @@ def main(argv=None):
         latent_concept_variance_w=args.latent_concept_variance_w,
         latent_concept_covariance_w=args.latent_concept_covariance_w,
         latent_concept_variance_target=args.latent_concept_variance_target,
+        latent_concept_fact_w=args.latent_concept_fact_w,
         fact_concept_prototype_w=args.fact_concept_prototype_w,
         fact_concept_prototype_spread_w=args.fact_concept_prototype_spread_w,
         fact_concept_prototype_spread_margin=(
