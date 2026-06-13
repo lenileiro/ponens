@@ -55,6 +55,7 @@ SAMPLE_METHODS = ("euler", "heun")
 MMDIT_ATTN_IMPLS = ("manual", "sdpa", "auto")
 DIT_POS_EMBEDS = ("learned", "sincos2d")
 FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
+TIME_SHIFT_MODES = ("manual", "dim")
 DEFAULT_GUIDANCE_INTERVAL = (0.0, 1.0)
 
 
@@ -1276,6 +1277,53 @@ def apply_flow_time_shift(t, shift=1.0):
     if shift == 1.0:
         return t
     return t / (shift + (1.0 - shift) * t).clamp_min(1.0e-12)
+
+
+def latent_effective_dim(latent_shape):
+    dim = 1
+    for value in tuple(latent_shape):
+        dim *= int(value)
+    return int(dim)
+
+
+def resolve_time_shift(time_shift=1.0, mode="manual", latent_shape=None,
+                       ref_dim=1024.0, dim_power=0.5):
+    mode = str(mode)
+    if mode not in TIME_SHIFT_MODES:
+        raise ValueError(f"unknown time shift mode {mode!r}")
+    base = float(time_shift)
+    if base <= 0.0:
+        raise ValueError("time_shift must be positive")
+    ref_dim = float(ref_dim)
+    if ref_dim <= 0.0:
+        raise ValueError("time_shift_ref_dim must be positive")
+    dim_power = float(dim_power)
+    if mode == "manual":
+        effective_dim = latent_effective_dim(latent_shape) if latent_shape is not None else 0
+        return {
+            "time_shift": base,
+            "time_shift_requested": base,
+            "time_shift_mode": mode,
+            "time_shift_ref_dim": float(ref_dim),
+            "time_shift_dim_power": float(dim_power),
+            "latent_effective_dim": int(effective_dim),
+            "time_shift_dim_scale": 1.0,
+        }
+    if latent_shape is None:
+        raise ValueError("dimension-aware time shift requires a latent shape")
+    effective_dim = latent_effective_dim(latent_shape)
+    scale = (float(effective_dim) / ref_dim) ** dim_power
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("dimension-aware time shift produced a non-positive scale")
+    return {
+        "time_shift": float(base * scale),
+        "time_shift_requested": base,
+        "time_shift_mode": mode,
+        "time_shift_ref_dim": float(ref_dim),
+        "time_shift_dim_power": float(dim_power),
+        "latent_effective_dim": int(effective_dim),
+        "time_shift_dim_scale": float(scale),
+    }
 
 
 def flow_time_schedule(steps, device=DEV, shift=1.0):
@@ -3684,6 +3732,19 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "flow_consistency_w": float(ckpt.get(
             "flow_consistency_w", report.get("flow_consistency_w", 0.0))),
         "time_shift": float(ckpt.get("time_shift", report.get("time_shift", 1.0))),
+        "time_shift_requested": float(ckpt.get(
+            "time_shift_requested", report.get(
+                "time_shift_requested", ckpt.get("time_shift", report.get("time_shift", 1.0))))),
+        "time_shift_mode": str(ckpt.get(
+            "time_shift_mode", report.get("time_shift_mode", "manual"))),
+        "time_shift_ref_dim": float(ckpt.get(
+            "time_shift_ref_dim", report.get("time_shift_ref_dim", 1024.0))),
+        "time_shift_dim_power": float(ckpt.get(
+            "time_shift_dim_power", report.get("time_shift_dim_power", 0.5))),
+        "latent_effective_dim": int(ckpt.get(
+            "latent_effective_dim", report.get("latent_effective_dim", 0)) or 0),
+        "time_shift_dim_scale": float(ckpt.get(
+            "time_shift_dim_scale", report.get("time_shift_dim_scale", 1.0))),
         "flow_loss_weight": str(ckpt.get(
             "flow_loss_weight", report.get("flow_loss_weight", "none"))),
         "flow_loss_weight_gamma": float(ckpt.get(
@@ -4232,6 +4293,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       dit_qk_norm=False, dit_attn_impl="manual",
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0, time_shift=1.0,
+                      time_shift_mode="manual", time_shift_ref_dim=1024.0,
+                      time_shift_dim_power=0.5,
                       flow_loss_weight="none", flow_loss_weight_gamma=5.0,
                       flow_loss_weight_normalize=True,
                       latent_normalize="none", latent_stat_samples=512,
@@ -4298,6 +4361,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
     if time_shift <= 0.0:
         raise ValueError("time_shift must be positive")
+    if time_shift_mode not in TIME_SHIFT_MODES:
+        raise ValueError(f"unknown time shift mode {time_shift_mode!r}")
+    if time_shift_ref_dim <= 0.0:
+        raise ValueError("time_shift_ref_dim must be positive")
     if flow_loss_weight not in FLOW_LOSS_WEIGHTS:
         raise ValueError(f"unknown flow loss weighting mode {flow_loss_weight!r}")
     if flow_loss_weight_gamma <= 0.0:
@@ -4424,6 +4491,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     max_train_latent_tokens = max(shape[1] * shape[2] for shape in train_latent_shapes)
     max_train_latent_shape = max(
         train_latent_shapes, key=lambda shape: shape[1] * shape[2])
+    time_shift_report = resolve_time_shift(
+        time_shift, mode=time_shift_mode, latent_shape=max_train_latent_shape,
+        ref_dim=time_shift_ref_dim, dim_power=time_shift_dim_power)
+    effective_time_shift = float(time_shift_report["time_shift"])
     max_required_latent_tokens = max(int(latent_tokens), int(max_train_latent_tokens))
     if flow_arch in ("dit", "crossdit", "mmdit") and max_required_latent_tokens > int(
             latent_max_tokens):
@@ -4630,7 +4701,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     flow, z1, cond, cond_drop=cond_drop, ae=ae,
                     semantic_w=flow_semantic_w, semantic_cond=fact_cond,
                     time_sampling=time_sampling, time_logit_mean=time_logit_mean,
-                    time_logit_std=time_logit_std, time_shift=time_shift,
+                    time_logit_std=time_logit_std, time_shift=effective_time_shift,
                     flow_loss_weight=flow_loss_weight,
                     flow_loss_weight_gamma=flow_loss_weight_gamma,
                     flow_loss_weight_normalize=flow_loss_weight_normalize,
@@ -4697,8 +4768,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                                  sample_method=sample_method,
                                  cfg_interval=cfg_interval,
                                  semantic_guidance_interval=semantic_guidance_interval,
-                                 sample_time_shift=time_shift,
-                                 time_shift=time_shift)
+                                 sample_time_shift=effective_time_shift,
+                                 time_shift=effective_time_shift)
         else:
             candidate = evaluate_image_records(
                 ae, flow, image_records, seed=seed + 1, size=size, device=device,
@@ -4709,7 +4780,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 cfg_interval=cfg_interval, text_aligner=text_aligner,
                 image_feature_aligner=image_feature_aligner,
                 caption_cond_source=caption_cond_source,
-                sample_time_shift=time_shift, time_shift=time_shift)
+                sample_time_shift=effective_time_shift, time_shift=effective_time_shift)
         candidate["eval_weight_mode"] = mode
         candidate_reports[mode] = candidate
     selected_eval_weights = max(candidate_reports, key=lambda mode: report_selection_key(
@@ -4831,11 +4902,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "time_sampling": time_sampling,
         "time_logit_mean": float(time_logit_mean),
         "time_logit_std": float(time_logit_std),
-        "time_shift": float(time_shift),
+        **time_shift_report,
         "flow_loss_weight": flow_loss_weight,
         "flow_loss_weight_gamma": float(flow_loss_weight_gamma),
         "flow_loss_weight_normalize": bool(flow_loss_weight_normalize),
-        "sample_time_shift": float(time_shift),
+        "sample_time_shift": float(effective_time_shift),
         "latent_stat_samples": int(latent_stat_samples),
         **latent_stats_report(latent_stats),
         "cond_mode": cond_mode,
@@ -4957,7 +5028,8 @@ def selftest():
         ae_arch="residual", latent_downsample=8, ae_res_blocks=1,
         latent_max_tokens=32, ae_recon_loss="hybrid", ae_grad_w=0.1, ae_ms_w=0.1,
         ae_latent_reg_w=0.01, train_precision="bf16", ae_accum_steps=2,
-        flow_accum_steps=2, grad_clip=1.0, intervention_samples=0)
+        flow_accum_steps=2, grad_clip=1.0, intervention_samples=0,
+        time_shift_mode="dim", time_shift_ref_dim=24.0)
     assert report_res["ae_arch"] == "residual"
     assert report_res["ae_recon_loss"] == "hybrid"
     assert report_res["ae_accum_steps"] == 2 and report_res["flow_accum_steps"] == 2
@@ -4966,6 +5038,12 @@ def selftest():
     assert report_res["grad_clip"] == 1.0
     assert report_res["latent_downsample"] == 8
     assert report_res["latent_h"] == 4 and report_res["latent_tokens"] == 16
+    assert report_res["time_shift_mode"] == "dim"
+    assert report_res["latent_effective_dim"] == 96
+    assert report_res["time_shift_requested"] == 1.0
+    assert abs(report_res["time_shift_dim_scale"] - 2.0) < 1.0e-6
+    assert abs(report_res["time_shift"] - 2.0) < 1.0e-6
+    assert report_res["last_flow"]["time_shift"] == 2.0
     assert "recon_grad_l1" in report_res["last_ae"]
     assert "recon_multiscale_l1" in report_res["last_ae"]
     assert "latent_l2" in report_res["last_ae"]
@@ -5473,6 +5551,15 @@ def main(argv=None):
                     help="stddev for --time-sampling logit-normal")
     ap.add_argument("--time-shift", type=float, default=1.0, dest="time_shift",
                     help="rectified-flow data-time shift; >1 biases training toward noise")
+    ap.add_argument("--time-shift-mode", default="manual", choices=TIME_SHIFT_MODES,
+                    dest="time_shift_mode",
+                    help="manual uses --time-shift as-is; dim scales it by latent dimension")
+    ap.add_argument("--time-shift-ref-dim", type=float, default=1024.0,
+                    dest="time_shift_ref_dim",
+                    help="reference latent element count for --time-shift-mode dim")
+    ap.add_argument("--time-shift-dim-power", type=float, default=0.5,
+                    dest="time_shift_dim_power",
+                    help="power used for dimension-aware time-shift scaling")
     ap.add_argument("--flow-loss-weight", default="none", choices=FLOW_LOSS_WEIGHTS,
                     dest="flow_loss_weight",
                     help="per-timestep velocity loss weighting")
@@ -5692,6 +5779,9 @@ def main(argv=None):
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
         time_logit_std=args.time_logit_std,
         time_shift=args.time_shift,
+        time_shift_mode=args.time_shift_mode,
+        time_shift_ref_dim=args.time_shift_ref_dim,
+        time_shift_dim_power=args.time_shift_dim_power,
         flow_loss_weight=args.flow_loss_weight,
         flow_loss_weight_gamma=args.flow_loss_weight_gamma,
         flow_loss_weight_normalize=not args.no_flow_loss_weight_normalize,
@@ -5869,11 +5959,17 @@ def main(argv=None):
         "time_sampling": args.time_sampling,
         "time_logit_mean": args.time_logit_mean,
         "time_logit_std": args.time_logit_std,
-        "time_shift": args.time_shift,
+        "time_shift": report.get("time_shift", args.time_shift),
+        "time_shift_requested": args.time_shift,
+        "time_shift_mode": args.time_shift_mode,
+        "time_shift_ref_dim": args.time_shift_ref_dim,
+        "time_shift_dim_power": args.time_shift_dim_power,
+        "latent_effective_dim": report.get("latent_effective_dim", 0),
+        "time_shift_dim_scale": report.get("time_shift_dim_scale", 1.0),
         "flow_loss_weight": args.flow_loss_weight,
         "flow_loss_weight_gamma": args.flow_loss_weight_gamma,
         "flow_loss_weight_normalize": not args.no_flow_loss_weight_normalize,
-        "sample_time_shift": report.get("sample_time_shift", args.time_shift),
+        "sample_time_shift": report.get("sample_time_shift", report.get("time_shift", args.time_shift)),
         "latent_normalize": args.latent_normalize,
         "latent_stat_samples": args.latent_stat_samples,
         "latent_stats": latent_stats_state(flow_latent_stats(flow)),

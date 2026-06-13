@@ -233,6 +233,9 @@ def payload(args):
                      f"--time-logit-mean {args.image_time_logit_mean} "
                      f"--time-logit-std {args.image_time_logit_std} "
                      f"--time-shift {args.image_time_shift} "
+                     f"--time-shift-mode {args.image_time_shift_mode} "
+                     f"--time-shift-ref-dim {args.image_time_shift_ref_dim} "
+                     f"--time-shift-dim-power {args.image_time_shift_dim_power} "
                      f"--flow-loss-weight {args.image_flow_loss_weight} "
                      f"--flow-loss-weight-gamma {args.image_flow_loss_weight_gamma} "
                      f"--latent-normalize {args.image_latent_normalize} "
@@ -785,6 +788,15 @@ def main():
     ap.add_argument("--image-time-shift", type=float, default=1.0,
                     dest="image_time_shift",
                     help="latent image RF data-time shift; >1 biases training toward noise")
+    ap.add_argument("--image-time-shift-mode", default="manual",
+                    choices=("manual", "dim"), dest="image_time_shift_mode",
+                    help="manual uses --image-time-shift as-is; dim scales it by latent dimension")
+    ap.add_argument("--image-time-shift-ref-dim", type=float, default=1024.0,
+                    dest="image_time_shift_ref_dim",
+                    help="reference latent element count for dimension-aware image time shift")
+    ap.add_argument("--image-time-shift-dim-power", type=float, default=0.5,
+                    dest="image_time_shift_dim_power",
+                    help="power used for dimension-aware image time-shift scaling")
     ap.add_argument("--image-flow-loss-weight", default="none",
                     choices=("none", "min-snr-v", "soft-min-snr-v"),
                     dest="image_flow_loss_weight",
@@ -893,6 +905,8 @@ def main():
         sys.exit("ERROR: --image-cfg-rescale-sweep values must be in [0, 1]")
     if args.image_time_shift <= 0.0:
         sys.exit("ERROR: --image-time-shift must be positive")
+    if args.image_time_shift_ref_dim <= 0.0:
+        sys.exit("ERROR: --image-time-shift-ref-dim must be positive")
     if args.image_flow_loss_weight_gamma <= 0.0:
         sys.exit("ERROR: --image-flow-loss-weight-gamma must be positive")
     if args.upload_image_data:

@@ -759,7 +759,8 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
     --image-flow-cache-latents --image-flow-cache-dir runs/image_manifest_cache \
     --image-flow-cache-shard-size 2048 --image-flow-cache-batch 64 \
     --image-sample-steps 8 --image-flow-consistency-w 0.05 \
-    --image-time-sampling logit-normal --image-time-shift 3.0 \
+    --image-time-sampling logit-normal --image-time-shift 1.25 \
+    --image-time-shift-mode dim --image-time-shift-ref-dim 1024 \
     --image-flow-loss-weight min-snr-v --image-flow-loss-weight-gamma 5.0 \
     --image-cfg-rescale 0.7 --image-cfg-rescale-sweep 0.0,0.7 \
     --image-latent-normalize channel --image-latent-stat-samples 4096 \
@@ -1187,6 +1188,13 @@ weighting now reaches AE batches, latent-stat estimation, and memory/disk/bucket
 caches, with reports/checkpoints exposing `image_quality_*` and `flow_cache_weighted` fields. This
 is a generic data-quality scaling lever: cleaned manifests can prefer better scored images without
 hard-coding visual labels, caption grammar, or dataset-specific rules.
+
+Image-57 adds dimension-aware rectified-flow time shifting for RAE-style latents.
+`--time-shift-mode dim` scales the requested `--time-shift` by
+`(latent_ch * latent_h * latent_w / --time-shift-ref-dim) ** --time-shift-dim-power`, using the
+largest active aspect bucket. Reports/checkpoints now record requested shift, effective shift,
+latent effective dimension, reference dimension, scale, and mode. This keeps the manual schedule
+available while making high-dimensional semantic latents less dependent on hand-retuned constants.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
