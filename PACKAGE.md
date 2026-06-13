@@ -746,6 +746,20 @@ direction is clear: paired candidate-corruption is the right kind of data-derive
 self-study curriculum needs stronger positive-retention anchors or staged calibration before it can
 be accepted.
 
+`--choice-positive-anchor-w` and `--choice-concept-bridge-w` add the next non-hardcoded calibration
+pieces. The positive anchor samples answer-present QA records from the same data and keeps the final
+choice head from drifting into `none`. The concept bridge mines repeated gold candidate surfaces
+from the records, pairs different records that share that discovered candidate, and trains their
+question/context/candidate latent vectors to be closer to each other than to distractor choices.
+Eval now reports `qa_concept_discovery_control` with unique held-out bridge pairs and requires
+`qa_concept_discovery_margin >= 0.05`, so a “light bulb” connection has to show up as reusable
+latent structure rather than an output-only coincidence. In the guarded 2-step smoke, the bridge
+loss was active (`concept` **0.548**) and moved the unique-pair discovery margin from **-0.023** to
+**-0.014**, but it still failed the discovery threshold, candidate replacement, and question-swap
+controls, and it regressed `squad_choice` from **0.300** to **0.100**. `selected_round` stayed
+**0**. This gives us a measurable discovery objective, but the current curriculum is still too weak
+to produce accepted language mastery.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
