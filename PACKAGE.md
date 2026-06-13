@@ -1046,12 +1046,13 @@ old linear head for checkpoint compatibility; setting the multiplier above 1 giv
 a wider projection head for semantically rich latents. This follows the RAE/REPA direction: improve
 the model's capacity to operate in representation space without adding renderer-specific rules.
 
-Image-26 adds checkpointed latent normalization (`--latent-normalize none|global|channel`;
+Image-26 adds checkpointed latent normalization (`--latent-normalize none|global|channel|auto`;
 RunPod: `--image-latent-normalize`). The flow can now train and sample in normalized AE latent
 coordinates while semantic losses, guidance, decoding, and visual grids still operate in raw AE
 latent space. This is a generic scale fix for semantically rich/high-dimensional latents: it
 stabilizes coordinate scale without hard-coding visual factors or renderer rules, and old
-checkpoints default to `none`.
+checkpoints default to `none`. The current default is `auto`, which preserves `none` for synthetic
+factor runs and resolves to channel statistics for real-image/external-VAE runs.
 
 Image-27 adds guidance intervals (`--cfg-interval`, `--semantic-guidance-interval`; RunPod:
 `--image-cfg-interval`, `--image-semantic-guidance-interval`). CFG and semantic AE guidance can
@@ -1333,6 +1334,12 @@ that score on predicted flow endpoints, and prompt grids can use
 scorer separately from the flow, eval reports include generated quality-score means, and RunPod
 exposes the same training/guidance knobs. This turns quality metadata into a reusable model signal,
 not only a row-sampling weight.
+
+Image-67 makes latent normalization safe by default for scale runs. `--latent-normalize auto`
+now resolves to `channel` when training on image manifests or an external HF VAE, and to `none`
+for synthetic factor-only runs. Reports/checkpoints store both `latent_normalize_requested` and
+the effective `latent_normalize`, so GPU runs can tell whether a model sampled from standardized
+latent coordinates. RunPod now defaults `--image-latent-normalize auto`.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

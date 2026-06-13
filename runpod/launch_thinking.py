@@ -931,9 +931,11 @@ def main():
     ap.add_argument("--image-no-flow-loss-weight-normalize", action="store_true",
                     dest="image_no_flow_loss_weight_normalize",
                     help="do not normalize weighted latent image velocity loss to batch mean 1")
-    ap.add_argument("--image-latent-normalize", default="none",
-                    choices=("none", "global", "channel"), dest="image_latent_normalize",
-                    help="normalize semantic AE latents before latent image flow training")
+    ap.add_argument("--image-latent-normalize", default="auto",
+                    choices=("none", "global", "channel", "auto"),
+                    dest="image_latent_normalize",
+                    help=("normalize image latents before latent image flow training; auto uses "
+                          "channel stats for real-image/external-VAE runs"))
     ap.add_argument("--image-latent-stat-samples", type=int, default=512,
                     dest="image_latent_stat_samples",
                     help="samples used to estimate latent image normalization stats")

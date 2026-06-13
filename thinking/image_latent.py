@@ -62,6 +62,7 @@ TIME_SHIFT_MODES = ("manual", "dim")
 AE_ARCHES = ("semantic", "residual", "hf-vae")
 FLOW_DISTILL_TEACHERS = ("raw", "ema", "auto")
 DEFAULT_GUIDANCE_INTERVAL = (0.0, 1.0)
+LATENT_NORMALIZE_MODES = ("none", "global", "channel", "auto")
 
 
 def _batch(n, rng, size=32, device=DEV, return_specs=False):
@@ -2278,6 +2279,18 @@ def latent_stats_report(stats):
     }
 
 
+def resolve_latent_normalize(mode, image_records=None, ae_arch="semantic"):
+    """Choose the effective latent normalization mode for a training run."""
+    mode = str(mode or "none")
+    if mode not in LATENT_NORMALIZE_MODES:
+        raise ValueError(f"unknown latent normalization mode {mode!r}")
+    if mode != "auto":
+        return mode
+    if image_records is not None or ae_arch == "hf-vae":
+        return "channel"
+    return "none"
+
+
 AE_RECON_LOSSES = ("mse", "l1", "hybrid")
 TRAIN_PRECISIONS = ("fp32", "bf16", "fp16")
 
@@ -4417,6 +4430,11 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                                          report.get("flow_ema_warmup", False))),
         "flow_ema_effective_decay": float(ckpt.get(
             "flow_ema_effective_decay", report.get("flow_ema_effective_decay", 0.0))),
+        "latent_normalize_requested": str(ckpt.get(
+            "latent_normalize_requested",
+            report.get("latent_normalize_requested",
+                       ckpt.get("latent_normalize",
+                                report.get("latent_normalize", "none"))))),
         **latent_stats_report(latent_stats),
         "cond_mode": cond_mode,
         "data_mode": data_mode,
@@ -5000,7 +5018,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       time_shift_dim_power=0.5,
                       flow_loss_weight="none", flow_loss_weight_gamma=5.0,
                       flow_loss_weight_normalize=True,
-                      latent_normalize="none", latent_stat_samples=512,
+                      latent_normalize="auto", latent_stat_samples=512,
                       ae_intervention_w=0.0, ae_factor_orth_w=0.0,
                       semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
                       cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
@@ -5079,8 +5097,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError(f"unknown flow loss weighting mode {flow_loss_weight!r}")
     if flow_loss_weight_gamma <= 0.0:
         raise ValueError("flow_loss_weight_gamma must be positive")
-    if latent_normalize not in ("none", "global", "channel"):
-        raise ValueError(f"unknown latent normalization mode {latent_normalize!r}")
+    requested_latent_normalize = str(latent_normalize or "none")
+    effective_latent_normalize = resolve_latent_normalize(
+        requested_latent_normalize, image_records=image_records, ae_arch=ae_arch)
     if image_quality_weight < 0.0:
         raise ValueError("image_quality_weight must be non-negative")
     if image_quality_weight > 0.0 and image_records is None:
@@ -5395,20 +5414,21 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     if image_records is None:
         latent_stats = estimate_latent_stats(
             ae, n=latent_stat_samples, batch=batch, seed=seed + 97, size=size, device=device,
-            mode=latent_normalize)
+            mode=effective_latent_normalize)
     elif flow_cache is not None:
         latent_stats = estimate_latent_stats_cache(
-            flow_cache, n=latent_stat_samples, seed=seed + 97, mode=latent_normalize)
+            flow_cache, n=latent_stat_samples, seed=seed + 97,
+            mode=effective_latent_normalize)
     elif len(train_size_buckets) > 1:
         latent_stats = estimate_latent_stats_record_buckets(
             ae, image_records, train_size_buckets, bucket_records=bucket_records,
             n=latent_stat_samples, batch=batch, seed=seed + 97, device=device,
-            mode=latent_normalize, crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
-            record_weights=image_record_weights)
+            mode=effective_latent_normalize, crop_mode=image_crop_mode,
+            hflip_prob=image_hflip_prob, record_weights=image_record_weights)
     else:
         latent_stats = estimate_latent_stats_records(
             ae, image_records, n=latent_stat_samples, batch=batch, seed=seed + 97,
-            size=size, device=device, mode=latent_normalize,
+            size=size, device=device, mode=effective_latent_normalize,
             crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
             weights=image_sample_weights)
     attach_latent_stats(flow, latent_stats)
@@ -5846,6 +5866,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_loss_weight_normalize": bool(flow_loss_weight_normalize),
         "sample_time_shift": float(effective_time_shift),
         "latent_stat_samples": int(latent_stat_samples),
+        "latent_normalize_requested": requested_latent_normalize,
         **latent_stats_report(latent_stats),
         "cond_mode": cond_mode,
         "data_mode": "image_manifest" if image_records is not None else "synthetic_factors",
@@ -5909,6 +5930,8 @@ def selftest():
     assert "latent_endpoint_consistency_mse" in report
     assert "latent_intervention_score" in report and report["latent_intervention_n"] > 0
     assert "latent_factor_orth_loss" in report
+    assert report["latent_normalize_requested"] == "auto"
+    assert report["latent_normalize"] == "none"
     shifted = flow_time_schedule(4, device="cpu", shift=4.0)
     assert torch.allclose(shifted[[0, -1]], torch.tensor([0.0, 1.0]))
     assert 0.0 < float(shifted[1]) < 0.25
@@ -5982,6 +6005,7 @@ def selftest():
     assert "pos" not in flow2.state_dict()
     assert report2["ae_intervention_w"] == 0.1
     assert report2["ae_factor_orth_w"] == 0.05
+    assert report2["latent_normalize_requested"] == "channel"
     assert report2["latent_normalize"] == "channel" and report2["latent_norm_n"] == 8
     assert report2["cfg_interval"] == [0.0, 0.5]
     assert report2["semantic_guidance_interval"] == [0.0, 0.5]
@@ -6174,6 +6198,9 @@ def selftest():
             flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
             intervention_samples=0, return_conditioner=True, return_aligner=True)
         assert report6["data_mode"] == "image_manifest"
+        assert report6["latent_normalize_requested"] == "auto"
+        assert report6["latent_normalize"] == "channel"
+        assert report6["latent_norm_n"] == 2
         assert report6["text_aligner"] is True and aligner6 is not None
         assert report6["image_feature_aligner"] is True
         assert report6["flow_repa_aligner"] is True
@@ -6230,6 +6257,8 @@ def selftest():
             flow_quality_score_w=0.1, intervention_samples=0,
             return_conditioner=True)
         assert report_q["image_quality_scorer"] is True
+        assert report_q["latent_normalize_requested"] == "auto"
+        assert report_q["latent_normalize"] == "channel"
         assert "flow_quality_score_loss" in report_q["last_flow"]
         ae_rect, flow_rect, conditioner_rect, vocab_rect, report_rect = train_latent_flow(
             ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=16,
@@ -6241,6 +6270,8 @@ def selftest():
             latent_max_tokens=32, image_crop_mode="pad",
             intervention_samples=0, return_conditioner=True)
         assert report_rect["image_size"] == [32, 48]
+        assert report_rect["latent_normalize_requested"] == "auto"
+        assert report_rect["latent_normalize"] == "channel"
         assert report_rect["image_h"] == 32 and report_rect["image_w"] == 48
         assert report_rect["latent_h"] == 4 and report_rect["latent_w"] == 6
         assert report_rect["latent_tokens"] == 24
@@ -6283,6 +6314,7 @@ def selftest():
             load_checkpoint(rect_ckpt, device="cpu", prefer_ema=False))
         assert meta_rect2["image_size"] == [32, 48]
         assert meta_rect2["image_h"] == 32 and meta_rect2["image_w"] == 48
+        assert meta_rect2["latent_normalize"] == "channel"
         assert ae_latent_shape(ae_rect2, meta_rect2["image_size"]) == (4, 4, 6)
         _ae_bucket, _flow_bucket, _conditioner_bucket, _vocab_bucket, report_bucket = (
             train_latent_flow(
@@ -6298,6 +6330,8 @@ def selftest():
                 flow_cache_latents=True, flow_cache_records=2,
                 intervention_samples=0, return_conditioner=True))
         assert report_bucket["size_buckets"] == [[32, 32], [32, 48]]
+        assert report_bucket["latent_normalize_requested"] == "auto"
+        assert report_bucket["latent_normalize"] == "channel"
         assert report_bucket["size_bucket_count"] == 2
         assert report_bucket["max_train_latent_tokens"] == 24
         assert set(report_bucket["size_bucket_sample_counts"]) == {"32x32", "32x48"}
@@ -6629,9 +6663,10 @@ def main(argv=None):
     ap.add_argument("--sample-time-shift", type=float, default=None,
                     dest="sample_time_shift",
                     help="override checkpoint sample-time shift; omitted uses checkpoint metadata")
-    ap.add_argument("--latent-normalize", default="none",
-                    choices=("none", "global", "channel"), dest="latent_normalize",
-                    help="normalize AE latents before flow training/sampling")
+    ap.add_argument("--latent-normalize", default="auto",
+                    choices=LATENT_NORMALIZE_MODES, dest="latent_normalize",
+                    help=("normalize AE latents before flow training/sampling; auto uses "
+                          "channel stats for real-image/external-VAE runs"))
     ap.add_argument("--latent-stat-samples", type=int, default=512,
                     dest="latent_stat_samples",
                     help="number of AE samples used to estimate latent normalization stats")
@@ -7196,7 +7231,8 @@ def main(argv=None):
         "flow_loss_weight_gamma": args.flow_loss_weight_gamma,
         "flow_loss_weight_normalize": not args.no_flow_loss_weight_normalize,
         "sample_time_shift": report.get("sample_time_shift", report.get("time_shift", args.time_shift)),
-        "latent_normalize": args.latent_normalize,
+        "latent_normalize": report.get("latent_normalize", args.latent_normalize),
+        "latent_normalize_requested": args.latent_normalize,
         "latent_stat_samples": args.latent_stat_samples,
         "latent_stats": latent_stats_state(flow_latent_stats(flow)),
         "prompt_templates": list(templates) if args.cond_mode == "text" else [],
