@@ -1114,6 +1114,16 @@ class TextFactLM(nn.Module):
         pair = torch.matmul(q_tokens, ctx_src.t()) * scale
         return torch.logsumexp(pair, 0) - math.log(max(1, q_tokens.shape[0]))
 
+    def _choice_candidate_question_context(self, q_tokens, span, ctx_src):
+        if q_tokens is None or ctx_src is None or not ctx_src.numel():
+            return None, None
+        scale = ctx_src.shape[-1] ** -0.5
+        q_route = torch.matmul(q_tokens, span) * scale
+        cand_q_vec = (q_route.softmax(0).unsqueeze(-1) * q_tokens).sum(0)
+        ctx_scores = ((ctx_src * cand_q_vec).sum(-1)
+                      + (ctx_src * span).sum(-1)) * scale
+        return cand_q_vec, ctx_scores
+
     def _choice_context_mass_score(self, rec, start, end, q_ctx_scores):
         if q_ctx_scores is None:
             return None
@@ -1159,8 +1169,8 @@ class TextFactLM(nn.Module):
                     logits = logits + self._choice_answerability_scaled(cover_scores)
                 else:
                     logits = logits + self._choice_answerability_scaled(ans_score)
-            ids = list(ids) + ["none"]
-            logits = torch.cat([logits, self.choice_threshold.reshape(1)])
+            ids = ["none"] + list(ids)
+            logits = torch.cat([self.choice_threshold.reshape(1), logits])
             out.append((rec, ids, logits))
         return out
 
@@ -1176,17 +1186,24 @@ class TextFactLM(nn.Module):
                 out.append((rec, None, [], None))
                 continue
             ctx_start, ctx_end, q_start, q_end = qa_context_question_spans(rec)
-            q_tokens, q_vec = self._choice_question(prefix, pooled, r, q_start, q_end)
+            q_tokens, _q_vec = self._choice_question(prefix, pooled, r, q_start, q_end)
             ctx_src = context_values[r, ctx_start:ctx_end] if ctx_start < ctx_end else None
-            q_ctx_scores = self._choice_question_context_scores(q_tokens, ctx_src)
-            answer_vec = self._choice_answer_vec(q_vec, q_ctx_scores, ctx_src)
-            answer_proj = self.choice_answer(answer_vec)
             ids = []
             cover_scores = []
             for choice_id, start, end in choices:
                 span = values[r, start:end].mean(0)
+                _cand_q_vec, cand_ctx_scores = self._choice_candidate_question_context(
+                    q_tokens, span, ctx_src)
+                if cand_ctx_scores is None:
+                    answer_proj = torch.zeros_like(span)
+                    mass_scores = None
+                else:
+                    weights = cand_ctx_scores.softmax(-1)
+                    answer_vec = (weights.unsqueeze(-1) * ctx_src).sum(0)
+                    answer_proj = self.choice_answer(answer_vec)
+                    mass_scores = cand_ctx_scores
                 cover = (answer_proj * self.choice_cover(span)).sum() * scale
-                mass_score = self._choice_context_mass_score(rec, start, end, q_ctx_scores)
+                mass_score = self._choice_context_mass_score(rec, start, end, mass_scores)
                 if mass_score is not None:
                     cover = cover + F.softplus(self.choice_context_mass_scale) * mass_score
                 cover_scores.append(cover)
@@ -1213,23 +1230,22 @@ class TextFactLM(nn.Module):
             ctx_start, ctx_end, q_start, q_end = qa_context_question_spans(rec)
             q_tokens, q_vec = self._choice_question(prefix, pooled, r, q_start, q_end)
             ctx_src = context_values[r, ctx_start:ctx_end] if ctx_start < ctx_end else None
-            q_ctx_scores = self._choice_question_context_scores(q_tokens, ctx_src)
-            fallback_ctx = self.choice_context(pooled[r])
             logits = []
             ids = []
             for choice_id, start, end in choices:
                 span = values[r, start:end].mean(0)
-                if ctx_src is not None and ctx_src.numel():
-                    attn = (ctx_src * span).sum(-1) * scale
-                    if q_ctx_scores is not None:
-                        attn = attn + q_ctx_scores
-                    ctx_vec = (attn.softmax(-1).unsqueeze(-1) * ctx_src).sum(0)
+                cand_q_vec, cand_ctx_scores = self._choice_candidate_question_context(
+                    q_tokens, span, ctx_src)
+                if cand_ctx_scores is not None:
+                    ctx_vec = (cand_ctx_scores.softmax(-1).unsqueeze(-1) * ctx_src).sum(0)
+                    route_vec = cand_q_vec
                 else:
-                    ctx_vec = fallback_ctx
-                logits.append(((q_vec * span).sum()
-                               + (ctx_vec * span).sum()
-                               + (q_vec * ctx_vec).sum()) * scale)
-                mass_score = self._choice_context_mass_score(rec, start, end, q_ctx_scores)
+                    ctx_vec = torch.zeros_like(q_vec)
+                    route_vec = q_vec
+                logits.append(((ctx_vec * span).sum()
+                               + (route_vec * ctx_vec).sum()) * scale)
+                mass_score = self._choice_context_mass_score(rec, start, end,
+                                                             cand_ctx_scores)
                 if mass_score is not None:
                     logits[-1] = logits[-1] + F.softplus(
                         self.choice_context_mass_scale) * mass_score
@@ -1566,7 +1582,6 @@ def choice_context_attention_loss(model, txt, records):
     prefix, pooled = model.encode_text(txt)
     context_values = model.choice_context(prefix)
     values = model.choice_value(prefix)
-    scale = prefix.shape[-1] ** -0.5
     losses = []
     for r, rec in enumerate(records):
         target = qa_choice_target(rec)
@@ -1583,11 +1598,13 @@ def choice_context_attention_loss(model, txt, records):
         positions = choice_target_context_positions(rec)
         if not positions:
             continue
-        _q_tokens, q_vec = model._choice_question(prefix, pooled, r, q_start, q_end)
+        q_tokens, _q_vec = model._choice_question(prefix, pooled, r, q_start, q_end)
         span = values[r, choice_start:choice_end].mean(0)
         ctx_src = context_values[r, ctx_start:ctx_end]
-        cand_query = q_vec + span
-        attn = (ctx_src * cand_query).sum(-1) * scale
+        _cand_q_vec, attn = model._choice_candidate_question_context(
+            q_tokens, span, ctx_src)
+        if attn is None:
+            continue
         target_idx = torch.tensor(positions, dtype=torch.long, device=txt.device)
         losses.append(torch.logsumexp(attn, 0) - torch.logsumexp(attn[target_idx], 0))
     if not losses:
@@ -1599,7 +1616,6 @@ def choice_candidate_context_contrast_loss(model, txt, records, margin=0.0):
     prefix, pooled = model.encode_text(txt)
     context_values = model.choice_context(prefix)
     values = model.choice_value(prefix)
-    scale = prefix.shape[-1] ** -0.5
     losses = []
     margin_t = torch.tensor(float(margin), dtype=torch.float32, device=txt.device)
     for r, rec in enumerate(records):
@@ -1616,14 +1632,16 @@ def choice_candidate_context_contrast_loss(model, txt, records, margin=0.0):
         positions = choice_target_context_positions(rec)
         if not positions:
             continue
-        _q_tokens, q_vec = model._choice_question(prefix, pooled, r, q_start, q_end)
+        q_tokens, _q_vec = model._choice_question(prefix, pooled, r, q_start, q_end)
         ctx_src = context_values[r, ctx_start:ctx_end]
         target_idx = torch.tensor(positions, dtype=torch.long, device=txt.device)
         span_masses = {}
         for choice_id, (start, end) in choices.items():
             span = values[r, start:end].mean(0)
-            cand_query = q_vec + span
-            attn = (ctx_src * cand_query).sum(-1) * scale
+            _cand_q_vec, attn = model._choice_candidate_question_context(
+                q_tokens, span, ctx_src)
+            if attn is None:
+                continue
             span_masses[choice_id] = (torch.logsumexp(attn[target_idx], 0)
                                       - torch.logsumexp(attn, 0))
         pos_mass = span_masses.get(target)
@@ -2808,7 +2826,8 @@ def _qa_question_swap_record(rec, donor):
 
 
 def qa_ablation_eval(model, vocab, records, device=DEV, n=0, seed=0):
-    all_eval = [r for r in records if r.split == "eval" and _is_qa_record(r)]
+    all_eval = [r for r in records if r.split == "eval" and _is_qa_record(r)
+                and not _is_qa_negative_record(r)]
     if n < 0:
         return {"n": 0, "sampled": False, "skipped": True}
     if not all_eval:
