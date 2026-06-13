@@ -723,6 +723,16 @@ this as a control failure (`qa_candidate_replacement_none_acc` must reach **0.55
 accepted reading updates have to learn question-context-candidate binding rather than just pass
 the older shortcut probes.
 
+`--choice-candidate-replacement-w` now exposes that pressure as a dedicated self-study loss on the
+evaluated final QA head. It samples the same generated corrupted-candidate records during training
+and asks the model to choose `none`; `--choice-candidate-replacement-margin` controls the margin.
+A 2-step smoke verified the loss is active (`cand-repl` **1.623**) and can move the new control
+fast: candidate-replacement abstention improved from **0.000** to **0.750** on the trained round.
+The round was still rejected because the pressure overcorrected into `none`, raising aggregate
+choice to **0.600** while collapsing real-answer `squad_choice` from **0.300** to **0.000** and
+leaving question-swap control failed. The next target is calibration/anchoring that preserves
+positive answers while keeping this candidate-corruption abstention.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
