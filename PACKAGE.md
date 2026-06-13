@@ -1353,6 +1353,12 @@ metrics. `thinking.image_embed --text-embed-mode tokens` emits those sequences, 
 it as `--image-embed-text-mode tokens`. This closes a major prompt-understanding gap versus modern
 text-to-image systems without tying the model to a specific tokenizer or provider.
 
+Image-69 hardens token-sequence conditioning for cached flow training. In-memory latent caches now
+pad variable-length `text_embedding_sequence` chunks before concatenation, and memory/disk cache
+reports include `flow_cache_text_embedding_*` shape fields. This keeps large manifest runs from
+failing only after a cache chunk happens to contain longer captions than earlier chunks, and makes
+GPU reports show whether training used pooled vectors or token streams.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered

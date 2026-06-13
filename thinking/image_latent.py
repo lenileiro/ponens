@@ -624,6 +624,31 @@ def weights_for_records(records, record_weights):
     return np.asarray(weights, dtype=np.float64)
 
 
+def cat_text_embedding_tensors(chunks):
+    chunks = [x for x in chunks if x is not None]
+    if not chunks:
+        return None
+    if all(x.ndim == 2 for x in chunks):
+        return torch.cat(chunks, dim=0).contiguous()
+    dims = {int(x.shape[-1]) for x in chunks}
+    if len(dims) != 1:
+        raise ValueError(f"text embedding chunks have mixed dimensions: {sorted(dims)}")
+    max_len = max(int(x.shape[1]) if x.ndim == 3 else 1 for x in chunks)
+    padded = []
+    for x in chunks:
+        if x.ndim == 2:
+            x = x[:, None, :]
+        elif x.ndim != 3:
+            raise ValueError(f"expected text embeddings as B,D or B,T,D, got {tuple(x.shape)}")
+        if int(x.shape[1]) < max_len:
+            pad = torch.zeros(
+                (int(x.shape[0]), max_len - int(x.shape[1]), int(x.shape[2])),
+                dtype=x.dtype, device=x.device)
+            x = torch.cat([x, pad], dim=1)
+        padded.append(x)
+    return torch.cat(padded, dim=0).contiguous()
+
+
 def sample_bucketed_image_text_batch(records, rng, batch=32, size_buckets=(), bucket_records=None,
                                      device=DEV, return_records=False, crop_mode="center",
                                      hflip_prob=0.0, record_weights=None):
@@ -1943,9 +1968,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             caption_ids(captions, prompt_vocab, max_len=caption_max_len, device="cpu")
             if cond_source == "tokens" else None
         ),
-        "text_embeddings": (
-            torch.cat(embeddings, dim=0).contiguous() if embeddings else None
-        ),
+        "text_embeddings": cat_text_embedding_tensors(embeddings),
         "image_embeddings": (
             torch.cat(image_embeddings, dim=0).contiguous() if image_embeddings else None
         ),
@@ -1960,6 +1983,10 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         "weighted": bool(weights is not None),
         "weight_sum": float(np.sum(weights)) if weights is not None else float(len(rows)),
     }
+    if cache["text_embeddings"] is not None:
+        cache["text_embedding_shape"] = [
+            int(x) for x in cache["text_embeddings"].shape
+        ]
     if cache["weights"] is not None:
         cache["bytes"] += int(cache["weights"].numel() * cache["weights"].element_size())
     if cache["text_embeddings"] is not None:
@@ -2048,6 +2075,10 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
             "start": int(start),
             "count": int(len(chunk_rows)),
         }
+        if shard["text_embeddings"] is not None:
+            shard["text_embedding_shape"] = [
+                int(x) for x in shard["text_embeddings"].shape
+            ]
         if latent_shape is None:
             latent_shape = tuple(int(x) for x in shard["latents"].shape[1:])
         name = f"shard_{shard_i:06d}.pt"
@@ -2058,7 +2089,8 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         file_bytes = int(os.path.getsize(path))
         total_bytes += file_bytes
         shards.append({"path": path, "file": name, "count": int(len(chunk_rows)),
-                       "bytes": file_bytes, "weight_sum": float(chunk_weight_sum)})
+                       "bytes": file_bytes, "weight_sum": float(chunk_weight_sum),
+                       "text_embedding_shape": shard.get("text_embedding_shape", [])})
     meta = {
         "format": "image_latent_cache_v1",
         "backend": "disk",
@@ -2074,6 +2106,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
                 "count": int(s["count"]),
                 "bytes": int(s["bytes"]),
                 "weight_sum": float(s["weight_sum"]),
+                "text_embedding_shape": list(s.get("text_embedding_shape", [])),
             }
             for s in shards
         ],
@@ -2105,6 +2138,50 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
 
 def latent_cache_backend(cache):
     return str((cache or {}).get("backend", "memory" if cache is not None else ""))
+
+
+def latent_cache_text_embedding_shapes(cache):
+    if cache is None:
+        return []
+    backend = latent_cache_backend(cache)
+    if backend in ("bucketed_memory", "bucketed_disk"):
+        shapes = []
+        for bucket in cache.get("buckets", []):
+            shapes.extend(latent_cache_text_embedding_shapes(bucket.get("cache")))
+        return shapes
+    if backend == "disk":
+        return [
+            [int(x) for x in shard.get("text_embedding_shape", [])]
+            for shard in cache.get("shards", [])
+            if shard.get("text_embedding_shape")
+        ]
+    shape = cache.get("text_embedding_shape")
+    if shape:
+        return [[int(x) for x in shape]]
+    tensor = cache.get("text_embeddings")
+    if torch.is_tensor(tensor):
+        return [[int(x) for x in tensor.shape]]
+    return []
+
+
+def latent_cache_text_embedding_report(cache):
+    shapes = latent_cache_text_embedding_shapes(cache)
+    if not shapes:
+        return {
+            "flow_cache_text_embedding_ndim": 0,
+            "flow_cache_text_embedding_dim": 0,
+            "flow_cache_text_embedding_seq_len": 0,
+            "flow_cache_text_embedding_shapes": [],
+        }
+    ndim = max(len(shape) for shape in shapes)
+    dim = max(int(shape[-1]) for shape in shapes if shape)
+    seq_len = max(int(shape[1]) if len(shape) == 3 else 1 for shape in shapes)
+    return {
+        "flow_cache_text_embedding_ndim": int(ndim),
+        "flow_cache_text_embedding_dim": int(dim),
+        "flow_cache_text_embedding_seq_len": int(seq_len),
+        "flow_cache_text_embedding_shapes": shapes,
+    }
 
 
 def _latent_cache_shard_offsets(cache):
@@ -5801,6 +5878,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_cache_weighted": bool(
             flow_cache.get("weighted", False) if flow_cache is not None else False
         ),
+        **latent_cache_text_embedding_report(flow_cache),
         "ae_accum_steps": int(ae_accum_steps),
         "flow_accum_steps": int(flow_accum_steps),
         "ae_effective_batch": int(batch) * int(ae_accum_steps),
@@ -6226,7 +6304,7 @@ def selftest():
                          "text_embedding_sequence": [
                              [float(i), float(i + 1), 0.0, 1.0],
                              [float(i % 2), float(i + 2), 1.0, 0.0],
-                         ],
+                         ] + ([[float(i + 3), 0.0, 1.0, 1.0]] if i % 2 else []),
                          "image_embedding": [float(i), float(i + 2),
                                              float((i + 1) % 2), 1.0]})
         with open(manifest, "w", encoding="utf-8") as f:
@@ -6261,6 +6339,8 @@ def selftest():
         assert report6["text_embedding_in_dim"] == 4
         assert report6["text_embedding_sequence_records"] == 2
         assert report6["text_embedding_sequence_dims"] == [4]
+        assert report6["flow_cache_text_embedding_ndim"] == 3
+        assert report6["flow_cache_text_embedding_seq_len"] == 3
         assert report6["flow_repa_embed_dim"] == 11
         assert "generated_external_text_image_score_cos" in report6
         assert report6["image_quality_weighted"] is True
@@ -6411,6 +6491,8 @@ def selftest():
         assert report_disk["flow_cache_records"] == 2
         assert report_disk["flow_cache_shards"] == 2
         assert report_disk["flow_cache_weighted"] is True
+        assert report_disk["flow_cache_text_embedding_ndim"] == 3
+        assert report_disk["flow_cache_text_embedding_seq_len"] == 3
         assert report_disk["image_feature_aligner"] is True
         assert report_disk["flow_cache_bytes"] > 0
         assert os.path.exists(os.path.join(disk_cache_dir, "meta.json"))
