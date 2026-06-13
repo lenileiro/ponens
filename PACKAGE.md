@@ -354,7 +354,7 @@ python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
     --out runs/text_study_squad_choice_contextloc025_pair_2round_smoke.json
 python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
     --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_choice_answerability_anscontrast_confirm1_qctx_2round_smoke.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_answerability_anspair_confirm1_qctx_2round_smoke.pt \
     --study-replay-data data/text_grounded.jsonl \
     --steps 10 --study-rounds 2 --study-strategy errors --study-select-best --study-confirm-n 1 \
     --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
@@ -362,13 +362,14 @@ python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
     --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
     --choice-answerability-w 0.5 --choice-answerability-control-w 0.5 \
     --choice-answerability-contrast-w 0.5 --choice-answerability-contrast-margin 0.0 \
+    --choice-answerability-pair-w 0.5 --choice-answerability-pair-margin 0.0 \
     --choice-context-w 0.25 --choice-question-context-w 0.25 \
     --choice-question-context-contrast-w 0.10 --choice-question-context-margin 0.0 \
     --choice-pair-w 1.0 --choice-pair-margin 0.0 \
     --choice-control-w 0 --choice-control-contrast-w 0 --choice-control-margin 0.0 \
     --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_squad_choice_answerability_anscontrast_confirm1_qctx_2round_smoke.json
+    --out runs/text_study_squad_choice_answerability_anspair_confirm1_qctx_2round_smoke.json
 ```
 
 Current local Text-0 SNLI baseline (20k train / 1k dev, 1.5k steps, d=192, 4 layers, 6 heads,
@@ -631,6 +632,18 @@ score **-0.0525** and keeping selected round **0**. This is not language mastery
 stronger reading-update gate: a candidate update must now retain prior grounded facts, pass
 shortcut controls, and preserve answerable examples across independent held-out samples before it
 can be accepted.
+
+The answerability head now also has a paired contrast (`--choice-answerability-pair-w`) over
+SQuAD records that share a `base_id`: answer-present examples must score above their
+answer-absent or swapped-question partners. This is the answerability analogue of
+`--choice-pair-w`, and it uses only imported record structure. In the confirmation-gated smoke,
+the pair loss optimized (`ans-pair` fell from **0.648** in round 1 to **0.129** in round 2), but
+the selector still kept `selected_round` **0**. Primary round 2 reached **0.2625** sampled choice
+accuracy with `squad_choice` **0.300**, absent **0.350**, and swap **0.500**, but confirmation
+seed **7936** exposed a `squad_choice` regression from **0.250** to **0.050** and a failed
+question-swap control. The learned objective is aligned, but it is not sufficient; the next text
+step needs candidate-span binding that keeps real answers stable under independent held-out
+samples.
 
 ## 3b. Image grounding: synthetic visual factors first
 
