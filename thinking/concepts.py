@@ -9,10 +9,43 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class SchemaConceptMixer(nn.Module):
+    """Self-attention workspace over data-defined schema concept states."""
+
+    def __init__(self, n_concepts, d, heads=4, layers=1, gate_init=-2.0):
+        super().__init__()
+        if n_concepts <= 0:
+            raise ValueError("concept mixer requires at least one concept")
+        if layers <= 0:
+            raise ValueError("concept mixer layers must be positive")
+        if d % heads != 0:
+            raise ValueError("concept mixer dimension must be divisible by heads")
+        self.n_concepts = int(n_concepts)
+        self.layers = int(layers)
+        self.key_pos = nn.Parameter(torch.randn(self.n_concepts, d) * 0.02)
+        layer = nn.TransformerEncoderLayer(
+            d_model=d, nhead=heads, dim_feedforward=4 * d, dropout=0.0,
+            activation="gelu", batch_first=True)
+        self.enc = nn.TransformerEncoder(
+            layer, num_layers=self.layers, enable_nested_tensor=False)
+        self.ln = nn.LayerNorm(d)
+        self.gate_logit = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def forward(self, states):
+        if states.shape[1] == 0:
+            return states
+        pos = self.key_pos[:states.shape[1]].unsqueeze(0)
+        h = states + pos
+        mixed = self.ln(self.enc(h))
+        gate = torch.sigmoid(self.gate_logit)
+        return states + gate * (mixed - h)
+
+
 class SchemaConceptHead(nn.Module):
     """Attend over source states and score values for each schema key."""
 
-    def __init__(self, keys, values, d, init_scale=0.02):
+    def __init__(self, keys, values, d, init_scale=0.02, mixer_layers=0,
+                 mixer_heads=4, mixer_gate_init=-2.0):
         super().__init__()
         self.keys = tuple(tuple(k) if isinstance(k, (list, tuple)) else (str(k),)
                           for k in keys)
@@ -33,6 +66,29 @@ class SchemaConceptHead(nn.Module):
         self.geometry_prototypes = nn.ParameterList([
             nn.Parameter(torch.randn(len(vs), d) * init_scale) for vs in self.values
         ])
+        self.mixer_layers = int(mixer_layers)
+        self.mixer_gate_init = float(mixer_gate_init)
+        if self.mixer_layers < 0:
+            raise ValueError("concept mixer layers must be non-negative")
+        self.mixer = (SchemaConceptMixer(
+            len(self.keys), d, heads=mixer_heads, layers=self.mixer_layers,
+            gate_init=self.mixer_gate_init)
+            if self.mixer_layers > 0 and len(self.keys) > 0 else None)
+
+    def enable_mixer(self, heads=4, layers=1, gate_init=-2.0):
+        if int(layers) <= 0:
+            raise ValueError("concept mixer layers must be positive")
+        if not self.keys:
+            self.mixer = None
+            self.mixer_layers = 0
+            return self
+        if self.mixer is None or int(layers) != self.mixer.layers:
+            self.mixer = SchemaConceptMixer(
+                len(self.keys), self.key_query.shape[-1], heads=heads,
+                layers=int(layers), gate_init=gate_init)
+        self.mixer_layers = int(layers)
+        self.mixer_gate_init = float(gate_init)
+        return self
 
     def state_tensor(self, source, mask=None):
         if not self.keys:
@@ -46,7 +102,10 @@ class SchemaConceptHead(nn.Module):
         if mask is not None:
             weights = weights.masked_fill(mask[:, None, :], 0.0)
             weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-12)
-        return torch.einsum("bkt,btd->bkd", weights, source)
+        states = torch.einsum("bkt,btd->bkd", weights, source)
+        if self.mixer is not None:
+            states = self.mixer(states)
+        return states
 
     def states(self, source, mask=None):
         state_tensor = self.state_tensor(source, mask=mask)

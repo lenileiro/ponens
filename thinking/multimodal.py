@@ -356,7 +356,8 @@ class MultimodalLM(nn.Module):
                  trunk_width=64, trunk_depth=1, text_layers=1, modality_dropout=0.0,
                  text_arch="transformer", concept_tokens=4, fusion_layers=1,
                  concept_prefix=False, concept_refine=False,
-                 concept_refine_gate_init=-2.0):
+                 concept_refine_gate_init=-2.0,
+                 concept_mixer_layers=0, concept_mixer_gate_init=-2.0):
         super().__init__()
         if img_tokens <= 0 or aud_tokens <= 0 or txt_tokens <= 0:
             raise ValueError("multimodal prefix token counts must be positive")
@@ -379,6 +380,8 @@ class MultimodalLM(nn.Module):
             "concept_prefix": bool(concept_prefix),
             "concept_refine": bool(concept_refine),
             "concept_refine_gate_init": float(concept_refine_gate_init),
+            "concept_mixer_layers": int(concept_mixer_layers),
+            "concept_mixer_gate_init": float(concept_mixer_gate_init),
         }
         self.modality_dropout = float(modality_dropout)
         self.concept_prefix = bool(concept_prefix)
@@ -399,7 +402,8 @@ class MultimodalLM(nn.Module):
         self.factor_concepts = SchemaConceptHead(
             [FACTOR_KEYS[factor] for factor in VALUE_POS],
             [FACTOR_VALUES[factor] for factor in VALUE_POS],
-            d)
+            d, mixer_layers=int(concept_mixer_layers), mixer_heads=heads,
+            mixer_gate_init=float(concept_mixer_gate_init))
         self.concept_refiner = (SchemaConceptRefiner(
             d, heads=heads, gate_init=concept_refine_gate_init)
             if self.concept_refine else None)
@@ -1087,6 +1091,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           concept_tokens=4, fusion_layers=1,
           concept_prefix=False, concept_refine=False,
           concept_refine_gate_init=-2.0,
+          concept_mixer_layers=0, concept_mixer_gate_init=-2.0,
           concept_w=0.0, concept_agreement_w=0.0,
           concept_distill_w=0.0, concept_distill_temperature=1.0,
           concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
@@ -1113,7 +1118,9 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                          concept_prefix=concept_prefix,
                          concept_refine=concept_refine,
                          concept_refine_gate_init=(
-                             concept_refine_gate_init)).to(device)
+                             concept_refine_gate_init),
+                         concept_mixer_layers=concept_mixer_layers,
+                         concept_mixer_gate_init=concept_mixer_gate_init).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     last_base = last_agreement = last_concept = 0.0
     last_concept_agreement = last_concept_distill = last_concept_rank_distill = 0.0
@@ -1290,6 +1297,7 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         concept_tokens=4, fusion_layers=1,
         concept_prefix=False, concept_refine=False,
         concept_refine_gate_init=-2.0,
+        concept_mixer_layers=0, concept_mixer_gate_init=-2.0,
         concept_w=0.0, concept_agreement_w=0.0,
         concept_distill_w=0.0, concept_distill_temperature=1.0,
         concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
@@ -1315,6 +1323,8 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                    concept_prefix=concept_prefix,
                                    concept_refine=concept_refine,
                                    concept_refine_gate_init=concept_refine_gate_init,
+                                   concept_mixer_layers=concept_mixer_layers,
+                                   concept_mixer_gate_init=concept_mixer_gate_init,
                                    concept_w=concept_w,
                                    concept_agreement_w=concept_agreement_w,
                                    concept_distill_w=concept_distill_w,
@@ -1384,6 +1394,8 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
               "concept_prefix": bool(concept_prefix),
               "concept_refine": bool(concept_refine),
               "concept_refine_gate_init": float(concept_refine_gate_init),
+              "concept_mixer_layers": int(concept_mixer_layers),
+              "concept_mixer_gate_init": float(concept_mixer_gate_init),
               "concept_w": float(concept_w),
               "concept_agreement_w": float(concept_agreement_w),
               "concept_distill_w": float(concept_distill_w),
@@ -1517,6 +1529,12 @@ def selftest():
     assert any(name.startswith("concept_refiner.")
                for name, _param in refine_model.named_parameters())
     assert refine_model(x, a, tt, ids).shape == logits.shape
+    mixer_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
+                               concept_mixer_layers=1).to("cpu")
+    mixer_states = mixer_model.factor_concept_states(x, a, tt, mode="full")
+    assert set(mixer_states) == set(VALUE_POS)
+    assert any(name.startswith("factor_concepts.mixer.")
+               for name, _param in mixer_model.named_parameters())
     rel_txt_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
                                  text_arch="relational", text_layers=1).to("cpu")
     assert rel_txt_model.txt.arch == "relational"
@@ -1606,6 +1624,12 @@ def main(argv=None):
     ap.add_argument("--concept-refine-gate-init", type=float, default=-2.0,
                     dest="concept_refine_gate_init",
                     help="initial logit for the learned concept-refinement residual gate")
+    ap.add_argument("--concept-mixer-layers", type=int, default=0,
+                    dest="concept_mixer_layers",
+                    help="self-attention layers for the schema factor concept workspace")
+    ap.add_argument("--concept-mixer-gate-init", type=float, default=-2.0,
+                    dest="concept_mixer_gate_init",
+                    help="initial logit for the learned schema factor concept workspace gate")
     ap.add_argument("--concept-w", type=float, default=0.0, dest="concept_w",
                     help="supervised upstream concept-token factor loss weight")
     ap.add_argument("--concept-agreement-w", type=float, default=0.0,
@@ -1742,6 +1766,10 @@ def main(argv=None):
         ap.error("--concept-state-spread-covariance-w must be non-negative")
     if not math.isfinite(args.concept_refine_gate_init):
         ap.error("--concept-refine-gate-init must be finite")
+    if args.concept_mixer_layers < 0:
+        ap.error("--concept-mixer-layers must be non-negative")
+    if not math.isfinite(args.concept_mixer_gate_init):
+        ap.error("--concept-mixer-gate-init must be finite")
     if args.modality_dropout < 0.0 or args.modality_dropout > 1.0:
         ap.error("--modality-dropout must be in [0, 1]")
     if args.eval_n <= 0:
@@ -1764,6 +1792,8 @@ def main(argv=None):
                  fusion_layers=args.fusion_layers, concept_prefix=args.concept_prefix,
                  concept_refine=args.concept_refine,
                  concept_refine_gate_init=args.concept_refine_gate_init,
+                 concept_mixer_layers=args.concept_mixer_layers,
+                 concept_mixer_gate_init=args.concept_mixer_gate_init,
                  concept_w=args.concept_w,
                  concept_agreement_w=args.concept_agreement_w,
                  concept_distill_w=args.concept_distill_w,
