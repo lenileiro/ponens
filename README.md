@@ -338,20 +338,21 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --out runs/text_study_squad_choice_contextloc025_pair_2round_smoke.json
 .venv/bin/python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
     --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_choice_answerability_swapctrl_qctx_2round_smoke.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_answerability_anscontrast_qctx_2round_smoke.pt \
     --study-replay-data data/text_grounded.jsonl \
     --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
     --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
     --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
     --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
     --choice-answerability-w 0.5 --choice-answerability-control-w 0.5 \
+    --choice-answerability-contrast-w 0.5 --choice-answerability-contrast-margin 0.0 \
     --choice-context-w 0.25 --choice-question-context-w 0.25 \
     --choice-question-context-contrast-w 0.10 --choice-question-context-margin 0.0 \
     --choice-pair-w 1.0 --choice-pair-margin 0.0 \
     --choice-control-w 0 --choice-control-contrast-w 0 --choice-control-margin 0.0 \
     --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_squad_choice_answerability_swapctrl_qctx_2round_smoke.json
+    --out runs/text_study_squad_choice_answerability_anscontrast_qctx_2round_smoke.json
 .venv/bin/python -m thinking.multimodal --steps 240 --eval-n 120 --free-n 20 \
     --counterfactual-n 40 --free-counterfactual-n 20 \
     --out runs/m0_multimodal.json --checkpoint runs/m0_multimodal.pt

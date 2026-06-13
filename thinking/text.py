@@ -1407,6 +1407,15 @@ def choice_answerability_loss(model, txt, records, answer_w=1.0, none_w=1.0,
     return sum(w * loss for w, loss in zip(weights, groups)) / max(1e-9, sum(weights))
 
 
+def choice_answerability_scores(model, txt, records, scaled=False):
+    scores = {}
+    for rec, score, _ids, _cover_scores in model.choice_answerability_logits(txt, records):
+        if score is None:
+            continue
+        scores[rec.rec_id] = model._choice_answerability_scaled(score) if scaled else score
+    return scores
+
+
 def _subsequence_token_positions(tokens, pattern):
     return _subsequence_positions(tokens, pattern)
 
@@ -1644,6 +1653,36 @@ def choice_answerability_control_batch_records(sources, rng, n, swap_groups=None
     return rows
 
 
+def choice_answerability_contrast_batch(sources, rng, pairs, swap_groups=None):
+    if not sources or pairs <= 0:
+        return [], []
+    groups = swap_groups if swap_groups is not None else choice_question_swap_groups(sources)
+    if not groups:
+        return [], []
+    rows = []
+    ids = []
+    tries = 0
+    while len(ids) < int(pairs) and tries < int(pairs) * 4:
+        rec, donors = groups[int(rng.integers(len(groups)))]
+        donor = donors[int(rng.integers(len(donors)))]
+        swapped = _qa_question_swap_record(rec, donor)
+        if swapped is not None:
+            full_id = f"{rec.rec_id}:ans_full:{len(ids)}"
+            swap_id = f"{rec.rec_id}:ans_swap:{len(ids)}"
+            full = TextRecord(rec_id=full_id, split=rec.split, tokens=rec.tokens,
+                              facts=rec.facts, group=rec.group, kind=rec.kind,
+                              base_id=rec.base_id, changed=rec.changed, meta=rec.meta)
+            swapped = TextRecord(rec_id=swap_id, split=rec.split,
+                                 tokens=swapped.tokens, facts=rec.facts,
+                                 group=rec.group, kind=swapped.kind,
+                                 base_id=rec.rec_id, changed=rec.changed,
+                                 meta=rec.meta)
+            rows.extend([full, swapped])
+            ids.append((full_id, swap_id))
+        tries += 1
+    return rows, ids
+
+
 def choice_candidate_token_tuples(rec):
     return {choice_id: tuple(rec.tokens[start:end])
             for choice_id, start, end in qa_choice_spans(rec)}
@@ -1809,13 +1848,28 @@ def choice_question_context_contrast_loss(model, txt, records, pair_ids, margin=
     return sum(losses) / len(losses)
 
 
+def choice_answerability_contrast_loss(model, txt, records, pair_ids, margin=0.0):
+    scores = choice_answerability_scores(model, txt, records, scaled=False)
+    losses = []
+    margin_t = torch.tensor(float(margin), dtype=torch.float32, device=txt.device)
+    for full_id, swap_id in pair_ids:
+        full_score = scores.get(full_id)
+        swap_score = scores.get(swap_id)
+        if full_score is not None and swap_score is not None:
+            losses.append(F.softplus(swap_score + margin_t - full_score))
+    if not losses:
+        return torch.tensor(0.0, device=txt.device)
+    return sum(losses) / len(losses)
+
+
 def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               device=DEV, log_every=100, semantic_w=0.5, balance_by="none",
               prefix="text", decode_w=1.0, choice_w=0.0,
               choice_answer_w=1.0, choice_none_w=1.0,
               choice_answer_margin=0.0, choice_none_margin=0.0,
               choice_answerability_w=0.0, choice_answerability_control_w=0.0,
-              choice_answerability_margin=0.0,
+              choice_answerability_margin=0.0, choice_answerability_contrast_w=0.0,
+              choice_answerability_contrast_margin=0.0,
               choice_context_w=0.0, choice_question_context_w=0.0,
               choice_question_context_contrast_w=0.0,
               choice_question_context_margin=0.0,
@@ -1832,13 +1886,14 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
     control_sources = (choice_control_source_records(train_records)
                        if (choice_control_w or choice_control_contrast_w
                            or choice_question_context_contrast_w
-                           or choice_answerability_control_w) else [])
+                           or choice_answerability_control_w
+                           or choice_answerability_contrast_w) else [])
+    needs_swap_groups = bool(choice_control_contrast_w
+                             or choice_question_context_contrast_w
+                             or choice_answerability_control_w
+                             or choice_answerability_contrast_w)
     swap_groups = (choice_question_swap_groups(control_sources)
-                   if ((choice_control_contrast_w
-                        or choice_question_context_contrast_w
-                        or choice_answerability_control_w)
-                       and control_sources)
-                   else [])
+                   if needs_swap_groups and control_sources else [])
     for st in range(1, steps + 1):
         model.train()
         if balance_by == "none":
@@ -1895,6 +1950,20 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 ans_control_loss = torch.tensor(0.0, device=device)
         else:
             ans_control_loss = torch.tensor(0.0, device=device)
+        if choice_answerability_contrast_w and control_sources and swap_groups:
+            ans_contrast_records, ans_contrast_pairs = choice_answerability_contrast_batch(
+                control_sources, rng, max(1, batch // 2),
+                swap_groups=swap_groups)
+            if ans_contrast_records and ans_contrast_pairs:
+                ans_contrast_txt, _ans_contrast_ids = pack(ans_contrast_records,
+                                                           vocab, device)
+                ans_contrast_loss = choice_answerability_contrast_loss(
+                    model, ans_contrast_txt, ans_contrast_records,
+                    ans_contrast_pairs, margin=choice_answerability_contrast_margin)
+            else:
+                ans_contrast_loss = torch.tensor(0.0, device=device)
+        else:
+            ans_contrast_loss = torch.tensor(0.0, device=device)
         if choice_control_contrast_w and control_sources:
             contrast_records, contrast_pairs = choice_control_contrast_batch(
                 control_sources, rng, max(1, batch // 2),
@@ -1925,6 +1994,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
         loss = (decode_w * dec_loss + semantic_w * sem_loss + choice_w * ch_loss
                 + choice_answerability_w * ans_loss
                 + choice_answerability_control_w * ans_control_loss
+                + choice_answerability_contrast_w * ans_contrast_loss
                 + choice_context_w * ctx_loss
                 + choice_question_context_w * qctx_loss
                 + choice_question_context_contrast_w * qctx_contrast_loss
@@ -1938,6 +2008,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                   f"dec {dec_loss.item():.3f} sem {sem_loss.item():.3f} "
                   f"choice {ch_loss.item():.3f} ans {ans_loss.item():.3f} "
                   f"ans-control {ans_control_loss.item():.3f} "
+                  f"ans-contrast {ans_contrast_loss.item():.3f} "
                   f"ctx {ctx_loss.item():.3f} "
                   f"qctx {qctx_loss.item():.3f} "
                   f"qctx-contrast {qctx_contrast_loss.item():.3f} "
@@ -1954,6 +2025,8 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                 choice_answer_margin=0.0, choice_none_margin=0.0,
                 choice_answerability_w=0.0, choice_answerability_control_w=0.0,
                 choice_answerability_margin=0.0,
+                choice_answerability_contrast_w=0.0,
+                choice_answerability_contrast_margin=0.0,
                 choice_question_context_w=0.0,
                 choice_question_context_contrast_w=0.0,
                 choice_question_context_margin=0.0,
@@ -1975,6 +2048,9 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                      choice_answerability_w=choice_answerability_w,
                      choice_answerability_control_w=choice_answerability_control_w,
                      choice_answerability_margin=choice_answerability_margin,
+                     choice_answerability_contrast_w=choice_answerability_contrast_w,
+                     choice_answerability_contrast_margin=(
+                         choice_answerability_contrast_margin),
                      choice_context_w=choice_context_w,
                      choice_question_context_w=choice_question_context_w,
                      choice_question_context_contrast_w=choice_question_context_contrast_w,
@@ -2937,6 +3013,8 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         choice_answer_margin=0.0, choice_none_margin=0.0,
         choice_answerability_w=0.0, choice_answerability_control_w=0.0,
         choice_answerability_margin=0.0,
+        choice_answerability_contrast_w=0.0,
+        choice_answerability_contrast_margin=0.0,
         choice_context_w=0.0, choice_question_context_w=0.0,
         choice_question_context_contrast_w=0.0,
         choice_question_context_margin=0.0,
@@ -2954,6 +3032,10 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                choice_answerability_w=choice_answerability_w,
                                choice_answerability_control_w=choice_answerability_control_w,
                                choice_answerability_margin=choice_answerability_margin,
+                               choice_answerability_contrast_w=(
+                                   choice_answerability_contrast_w),
+                               choice_answerability_contrast_margin=(
+                                   choice_answerability_contrast_margin),
                                choice_context_w=choice_context_w,
                                choice_question_context_w=choice_question_context_w,
                                choice_question_context_contrast_w=(
@@ -2975,6 +3057,9 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
               "choice_answerability_w": float(choice_answerability_w),
               "choice_answerability_control_w": float(choice_answerability_control_w),
               "choice_answerability_margin": float(choice_answerability_margin),
+              "choice_answerability_contrast_w": float(choice_answerability_contrast_w),
+              "choice_answerability_contrast_margin": float(
+                  choice_answerability_contrast_margin),
               "choice_context_w": float(choice_context_w),
               "choice_question_context_w": float(choice_question_context_w),
               "choice_question_context_contrast_w": float(
@@ -3027,6 +3112,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      choice_answer_margin=0.0, choice_none_margin=0.0,
                      choice_answerability_w=0.0, choice_answerability_control_w=0.0,
                      choice_answerability_margin=0.0,
+                     choice_answerability_contrast_w=0.0,
+                     choice_answerability_contrast_margin=0.0,
                      choice_context_w=0.0, choice_question_context_w=0.0,
                      choice_question_context_contrast_w=0.0,
                      choice_question_context_margin=0.0,
@@ -3081,6 +3168,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "choice_answerability_w": float(choice_answerability_w),
               "choice_answerability_control_w": float(choice_answerability_control_w),
               "choice_answerability_margin": float(choice_answerability_margin),
+              "choice_answerability_contrast_w": float(choice_answerability_contrast_w),
+              "choice_answerability_contrast_margin": float(
+                  choice_answerability_contrast_margin),
               "choice_context_w": float(choice_context_w),
               "choice_question_context_w": float(choice_question_context_w),
               "choice_question_context_contrast_w": float(
@@ -3214,6 +3304,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   choice_answerability_w=choice_answerability_w,
                   choice_answerability_control_w=choice_answerability_control_w,
                   choice_answerability_margin=choice_answerability_margin,
+                  choice_answerability_contrast_w=choice_answerability_contrast_w,
+                  choice_answerability_contrast_margin=(
+                      choice_answerability_contrast_margin),
                   choice_context_w=choice_context_w,
                   choice_question_context_w=choice_question_context_w,
                   choice_question_context_contrast_w=choice_question_context_contrast_w,
@@ -3527,6 +3620,10 @@ def selftest():
             control_sources, np.random.default_rng(8), pairs=2,
             swap_groups=swap_groups)
         assert len(qctx_rows) == 4 and len(qctx_pairs) == 2
+        ans_contrast_rows, ans_contrast_pairs = choice_answerability_contrast_batch(
+            control_sources, np.random.default_rng(11), pairs=2,
+            swap_groups=swap_groups)
+        assert len(ans_contrast_rows) == 4 and len(ans_contrast_pairs) == 2
         assert any("question_swap" in r.kind for r in ans_control_rows)
     pair_vocab = build_vocab(pair_rows)
     pair_schema = build_fact_schema(pair_rows)
@@ -3561,6 +3658,19 @@ def selftest():
         assert set(qctx_scores).issubset({r.rec_id for r in qctx_rows})
         assert torch.isfinite(choice_question_context_contrast_loss(
             qctx_model, qctx_txt, qctx_rows, qctx_pairs))
+        ans_contrast_vocab = build_vocab(ans_contrast_rows)
+        ans_contrast_schema = build_fact_schema(ans_contrast_rows)
+        ans_contrast_model = TextFactLM(len(ans_contrast_vocab), d=32, layers=1,
+                                        heads=4, pad=ans_contrast_vocab.pad,
+                                        fact_schema=ans_contrast_schema).to("cpu")
+        ans_contrast_txt, _ans_contrast_ids = pack(ans_contrast_rows,
+                                                   ans_contrast_vocab, "cpu")
+        ans_scores = choice_answerability_scores(
+            ans_contrast_model, ans_contrast_txt, ans_contrast_rows)
+        assert set(ans_scores).issubset({r.rec_id for r in ans_contrast_rows})
+        assert torch.isfinite(choice_answerability_contrast_loss(
+            ans_contrast_model, ans_contrast_txt, ans_contrast_rows,
+            ans_contrast_pairs))
     grounded = grounded_records(max_train=4, max_eval=3, counterfactual_n=2, seed=0)
     assert any(r["split"] == "train" and len(r["facts"]) > 1
                for r in grounded)
@@ -3787,6 +3897,12 @@ def main(argv=None):
     ap.add_argument("--choice-answerability-margin", type=float, default=0.0,
                     dest="choice_answerability_margin",
                     help="margin for learned QA answerability coverage loss")
+    ap.add_argument("--choice-answerability-contrast-w", type=float, default=0.0,
+                    dest="choice_answerability_contrast_w",
+                    help="weight for full-vs-swapped question answerability contrast")
+    ap.add_argument("--choice-answerability-contrast-margin", type=float, default=0.0,
+                    dest="choice_answerability_contrast_margin",
+                    help="margin for full-vs-swapped question answerability contrast")
     ap.add_argument("--choice-context-w", type=float, default=0.0, dest="choice_context_w",
                     help="weight for target-choice context span localization loss")
     ap.add_argument("--choice-question-context-w", type=float, default=0.0,
@@ -3924,6 +4040,10 @@ def main(argv=None):
                          choice_answerability_control_w=(
                              args.choice_answerability_control_w),
                          choice_answerability_margin=args.choice_answerability_margin,
+                         choice_answerability_contrast_w=(
+                             args.choice_answerability_contrast_w),
+                         choice_answerability_contrast_margin=(
+                             args.choice_answerability_contrast_margin),
                          choice_context_w=args.choice_context_w,
                          choice_question_context_w=args.choice_question_context_w,
                          choice_question_context_contrast_w=(
@@ -3959,6 +4079,8 @@ def main(argv=None):
         choice_answerability_w=args.choice_answerability_w,
         choice_answerability_control_w=args.choice_answerability_control_w,
         choice_answerability_margin=args.choice_answerability_margin,
+        choice_answerability_contrast_w=args.choice_answerability_contrast_w,
+        choice_answerability_contrast_margin=args.choice_answerability_contrast_margin,
         choice_context_w=args.choice_context_w,
         choice_question_context_w=args.choice_question_context_w,
         choice_question_context_contrast_w=args.choice_question_context_contrast_w,
