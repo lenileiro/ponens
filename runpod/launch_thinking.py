@@ -177,6 +177,7 @@ def payload(args):
                      f"--train-precision {args.image_train_precision} "
                      f"--grad-clip {args.image_grad_clip} "
                      f"--size {args.image_size} "
+                     f"--size-buckets {shlex_quote(args.image_size_buckets)} "
                      f"--hidden {args.dim or 64} --flow-arch {args.image_latent_arch} "
                      f"--dit-head-width-mult {args.image_dit_head_width_mult} "
                      f"--dit-attn-impl {args.image_dit_attn_impl} "
@@ -571,6 +572,8 @@ def main():
                     help="do not reject duplicate image paths during pod-side manifest cleaning")
     ap.add_argument("--image-size", default="32", dest="image_size",
                     help="image size as SIZE or HxW for latent image train/eval/sample grids")
+    ap.add_argument("--image-size-buckets", default="", dest="image_size_buckets",
+                    help="optional manifest train buckets, e.g. 128x128,128x192,192x128")
     ap.add_argument("--image-ae-accum-steps", type=int, default=1,
                     dest="image_ae_accum_steps",
                     help="AE gradient accumulation microsteps")

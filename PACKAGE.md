@@ -729,7 +729,8 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
     --image-manifest data/images/train.jsonl --image-root data/images \
     --image-caption-cond-source auto \
     --image-crop-mode pad --image-hflip-prob 0.5 \
-    --image-size 128x192 --image-ae-arch residual --image-latent-downsample 8 \
+    --image-size 128x192 --image-size-buckets 128x128,128x192,192x128 \
+    --image-ae-arch residual --image-latent-downsample 8 \
     --image-latent-max-tokens 384 \
     --image-ae-recon-loss hybrid --image-ae-grad-w 0.1 --image-ae-ms-w 0.1 \
     --image-text-align-w 0.1 --image-flow-text-align-w 0.05 \
@@ -1149,6 +1150,13 @@ Image-53 adds rectangular manifest resolution support. `thinking.image_latent --
 `image_h`/`image_w`, and latent token limits use the real `latent_h * latent_w` grid. Synthetic
 factor renders remain square-only and fail early if given a rectangular size, while real-image
 manifest runs can pair `--image-crop-mode pad` with rectangular canvases.
+
+Image-54 adds aspect-bucketed manifest training. `thinking.image_latent --size-buckets
+128x128,128x192,192x128` keeps each batch on one efficient canvas while letting different batches
+use different aspect ratios; RunPod exposes the same setting as `--image-size-buckets`. Reports
+record the bucket list, per-bucket sample counts, missing manifest dimensions, and max train latent
+tokens. Cached flow training now stores one fixed-shape subcache per bucket, so the recommended
+RunPod recipe can combine aspect buckets with `--image-flow-cache-latents`.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

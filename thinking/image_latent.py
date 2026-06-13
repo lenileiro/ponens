@@ -304,6 +304,57 @@ def image_size_value(size):
     return int(h) if h == w else [int(h), int(w)]
 
 
+def image_size_pair_value(size):
+    h, w = image_hw(size)
+    return [int(h), int(w)]
+
+
+def image_size_key(size):
+    h, w = image_hw(size)
+    return f"{int(h)}x{int(w)}"
+
+
+def normalize_image_size_buckets(sizes):
+    if sizes is None or sizes == "":
+        return ()
+    if isinstance(sizes, str):
+        raw = sizes.strip()
+        if raw.lower() in ("", "0", "none"):
+            return ()
+        if ";" in raw:
+            parts = raw.split(";")
+        elif "|" in raw:
+            parts = raw.split("|")
+        elif any(ch.isspace() for ch in raw):
+            parts = raw.split()
+        elif "," in raw and ("x" in raw.lower() or ":" in raw):
+            parts = raw.split(",")
+        else:
+            parts = [raw]
+    else:
+        if (isinstance(sizes, (tuple, list)) and len(sizes) == 2
+                and all(isinstance(x, (int, float, np.integer)) for x in sizes)):
+            parts = [sizes]
+        else:
+            parts = list(sizes)
+    buckets = []
+    seen = set()
+    for part in parts:
+        if isinstance(part, str) and not part.strip():
+            continue
+        bucket = image_hw(part)
+        key = image_size_key(bucket)
+        if key in seen:
+            continue
+        seen.add(key)
+        buckets.append(bucket)
+    return tuple(buckets)
+
+
+def image_size_buckets_value(buckets):
+    return [image_size_pair_value(size) for size in buckets]
+
+
 def image_hw(size, default=32):
     return normalize_image_size(size, default=default)
 
@@ -313,6 +364,58 @@ def image_side(size, name="image size"):
     if h != w:
         raise ValueError(f"{name} must be square for synthetic factor renders; got {h}x{w}")
     return int(h)
+
+
+def image_size_aspect(size):
+    h, w = image_hw(size)
+    return float(w) / max(1.0, float(h))
+
+
+def bucket_records_by_aspect(records, size_buckets):
+    buckets = tuple(size_buckets)
+    groups = {bucket: [] for bucket in buckets}
+    missing_dims = 0
+    if len(buckets) <= 1:
+        if buckets:
+            groups[buckets[0]] = list(records)
+        return groups, missing_dims
+    bucket_aspects = {bucket: image_size_aspect(bucket) for bucket in buckets}
+    for rec in records:
+        width = int(getattr(rec, "width", 0) or 0)
+        height = int(getattr(rec, "height", 0) or 0)
+        if width <= 0 or height <= 0:
+            missing_dims += 1
+            continue
+        aspect = float(width) / max(1.0, float(height))
+        bucket = min(
+            buckets,
+            key=lambda b: abs(math.log(max(aspect, 1.0e-8) / max(bucket_aspects[b], 1.0e-8))))
+        groups[bucket].append(rec)
+    return groups, missing_dims
+
+
+def choose_image_size_bucket(rng, size_buckets):
+    buckets = tuple(size_buckets)
+    if not buckets:
+        raise ValueError("no image size buckets configured")
+    if len(buckets) == 1:
+        return buckets[0]
+    return buckets[int(rng.integers(len(buckets)))]
+
+
+def sample_bucketed_image_text_batch(records, rng, batch=32, size_buckets=(), bucket_records=None,
+                                     device=DEV, return_records=False, crop_mode="center",
+                                     hflip_prob=0.0):
+    bucket = choose_image_size_bucket(rng, size_buckets)
+    rows = list(records)
+    if bucket_records is not None:
+        rows = list(bucket_records.get(bucket) or rows)
+    if not rows:
+        rows = list(records)
+    payload = sample_image_text_batch(
+        rows, rng, batch=batch, size=bucket, device=device, return_records=return_records,
+        crop_mode=crop_mode, hflip_prob=hflip_prob)
+    return (bucket,) + payload
 
 
 def ae_latent_shape(ae, size):
@@ -1301,6 +1404,63 @@ def estimate_latent_stats_records(ae, records, n=512, batch=64, seed=123, size=3
 
 
 @torch.no_grad()
+def estimate_latent_stats_record_buckets(ae, records, size_buckets, bucket_records=None,
+                                         n=512, batch=64, seed=123, device=DEV,
+                                         mode="none", eps=1.0e-6, crop_mode="center",
+                                         hflip_prob=0.0):
+    mode = str(mode)
+    if mode == "none":
+        return {"mode": "none", "n": 0}
+    if mode not in ("global", "channel"):
+        raise ValueError(f"unknown latent normalization mode {mode!r}")
+    buckets = tuple(size_buckets)
+    if not buckets:
+        raise ValueError("latent stats buckets require at least one image size")
+    n = max(1, int(n))
+    rng = np.random.default_rng(seed)
+    ae.eval()
+    count = 0
+    seen = 0
+    sums = sums2 = None
+    while seen < n:
+        b = min(batch, n - seen)
+        _bucket, x, _captions = sample_bucketed_image_text_batch(
+            records, rng, batch=b, size_buckets=buckets, bucket_records=bucket_records,
+            device=device, crop_mode=crop_mode, hflip_prob=hflip_prob)
+        z = ae.encode(x).detach().float().cpu().double()
+        if mode == "global":
+            cur_sum = z.sum()
+            cur_sum2 = z.pow(2).sum()
+            cur_count = z.numel()
+        else:
+            cur_sum = z.sum(dim=(0, 2, 3))
+            cur_sum2 = z.pow(2).sum(dim=(0, 2, 3))
+            cur_count = z.shape[0] * z.shape[2] * z.shape[3]
+        if sums is None:
+            sums = torch.zeros_like(cur_sum)
+            sums2 = torch.zeros_like(cur_sum2)
+        sums += cur_sum
+        sums2 += cur_sum2
+        count += int(cur_count)
+        seen += b
+    mean = sums / max(1, count)
+    var = (sums2 / max(1, count) - mean.pow(2)).clamp_min(float(eps) ** 2)
+    std = var.sqrt()
+    if mode == "global":
+        mean = mean.view(1, 1, 1, 1)
+        std = std.view(1, 1, 1, 1)
+    else:
+        mean = mean.view(1, -1, 1, 1)
+        std = std.view(1, -1, 1, 1)
+    return {
+        "mode": mode,
+        "n": int(seen),
+        "mean": mean.float(),
+        "std": std.float(),
+    }
+
+
+@torch.no_grad()
 def estimate_latent_stats_tensor(latents, n=512, seed=123, mode="none", eps=1.0e-6):
     mode = str(mode)
     if mode == "none":
@@ -1336,7 +1496,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                              batch=64, seed=0, size=32, device=DEV, precision="fp32",
                              cond_source="tokens", cache_dir="", shard_size=1024,
                              include_image_embeddings=False, crop_mode="center",
-                             hflip_prob=0.0):
+                             hflip_prob=0.0, size_buckets=(), bucket_records=None):
     rows = list(records)
     if not rows:
         raise ValueError("cannot build latent cache from empty records")
@@ -1344,6 +1504,66 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
     if max_records and int(max_records) < len(rows):
         chosen_idx = rng.choice(len(rows), size=int(max_records), replace=False)
         rows = [rows[int(i)] for i in chosen_idx]
+    buckets = normalize_image_size_buckets(size_buckets)
+    if len(buckets) > 1:
+        limited_bucket_records, _missing_dims = bucket_records_by_aspect(rows, buckets)
+        subcaches = []
+        total_bytes = 0
+        total_records = 0
+        total_shards = 0
+        for bucket in buckets:
+            bucket_key = image_size_key(bucket)
+            bucket_rows = list(limited_bucket_records.get(bucket) or rows)
+            bucket_dir = os.path.join(cache_dir, bucket_key) if cache_dir else ""
+            subcache = build_image_latent_cache(
+                ae, bucket_rows, prompt_vocab, caption_max_len=caption_max_len,
+                max_records=0, batch=batch, seed=seed + len(subcaches) * 997,
+                size=bucket, device=device, precision=precision, cond_source=cond_source,
+                cache_dir=bucket_dir, shard_size=shard_size,
+                include_image_embeddings=include_image_embeddings,
+                crop_mode=crop_mode, hflip_prob=hflip_prob)
+            total_bytes += int(subcache.get("bytes", 0))
+            total_records += int(subcache.get("records", 0))
+            total_shards += int(subcache.get("shard_count", len(subcache.get("shards", []))))
+            subcaches.append({
+                "key": bucket_key,
+                "size": image_size_pair_value(bucket),
+                "cache": subcache,
+                "records": int(subcache.get("records", 0)),
+            })
+        backend = "bucketed_disk" if cache_dir else "bucketed_memory"
+        cache = {
+            "backend": backend,
+            "cache_dir": os.path.abspath(cache_dir) if cache_dir else "",
+            "buckets": subcaches,
+            "records": int(total_records),
+            "bucket_count": int(len(subcaches)),
+            "shard_count": int(total_shards),
+            "bytes": int(total_bytes),
+            "cond_source": cond_source,
+            "has_image_embeddings": bool(include_image_embeddings),
+        }
+        if cache_dir:
+            os.makedirs(cache["cache_dir"], exist_ok=True)
+            meta_path = os.path.join(cache["cache_dir"], "meta.json")
+            with open(meta_path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump({
+                    "format": "image_latent_cache_bucketed_v1",
+                    "backend": backend,
+                    "buckets": [
+                        {"key": b["key"], "size": b["size"], "records": b["records"]}
+                        for b in subcaches
+                    ],
+                    "records": int(total_records),
+                    "shard_count": int(total_shards),
+                    "bytes": int(total_bytes),
+                    "cond_source": cond_source,
+                    "has_image_embeddings": bool(include_image_embeddings),
+                }, f, indent=1, sort_keys=True)
+            os.replace(meta_path + ".tmp", meta_path)
+            cache["meta_path"] = meta_path
+            cache["bytes"] += int(os.path.getsize(meta_path))
+        return cache
     if cond_source == "embedding":
         infer_text_embedding_dim(rows)
     if include_image_embeddings:
@@ -1539,6 +1759,12 @@ def _latent_cache_payload(source, ids=None, embeddings=None, image_embeddings=No
 
 def sample_latent_cache(cache, rng, batch, device=DEV):
     backend = latent_cache_backend(cache)
+    if backend in ("bucketed_memory", "bucketed_disk"):
+        buckets = list(cache.get("buckets", []))
+        if not buckets:
+            raise ValueError("bucketed latent cache has no buckets")
+        bucket_i = int(rng.integers(len(buckets)))
+        return sample_latent_cache(buckets[bucket_i]["cache"], rng, batch, device=device)
     if backend == "disk":
         shards = list(cache.get("shards", []))
         if not shards:
@@ -1580,6 +1806,53 @@ def sample_latent_cache(cache, rng, batch, device=DEV):
 @torch.no_grad()
 def estimate_latent_stats_cache(cache, n=512, seed=123, mode="none"):
     backend = latent_cache_backend(cache)
+    if backend in ("bucketed_memory", "bucketed_disk"):
+        if mode == "none":
+            return {"mode": "none", "n": 0}
+        if mode not in ("global", "channel"):
+            raise ValueError(f"unknown latent normalization mode {mode!r}")
+        total = int(cache["records"])
+        if total <= 0:
+            raise ValueError("latent cache is empty")
+        n = min(max(1, int(n)), total)
+        rng = np.random.default_rng(seed)
+        count = 0
+        seen = 0
+        sums = sums2 = None
+        while seen < n:
+            b = min(64, n - seen)
+            z, _payload = sample_latent_cache(cache, rng, b, device="cpu")
+            z = z.detach().float().cpu().double()
+            if mode == "global":
+                cur_sum = z.sum()
+                cur_sum2 = z.pow(2).sum()
+                cur_count = z.numel()
+            else:
+                cur_sum = z.sum(dim=(0, 2, 3))
+                cur_sum2 = z.pow(2).sum(dim=(0, 2, 3))
+                cur_count = z.shape[0] * z.shape[2] * z.shape[3]
+            if sums is None:
+                sums = torch.zeros_like(cur_sum)
+                sums2 = torch.zeros_like(cur_sum2)
+            sums += cur_sum
+            sums2 += cur_sum2
+            count += int(cur_count)
+            seen += b
+        mean = sums / max(1, count)
+        var = (sums2 / max(1, count) - mean.pow(2)).clamp_min(1.0e-6 ** 2)
+        std = var.sqrt()
+        if mode == "global":
+            mean = mean.view(1, 1, 1, 1)
+            std = std.view(1, 1, 1, 1)
+        else:
+            mean = mean.view(1, -1, 1, 1)
+            std = std.view(1, -1, 1, 1)
+        return {
+            "mode": mode,
+            "n": int(seen),
+            "mean": mean.float(),
+            "std": std.float(),
+        }
     if backend != "disk":
         return estimate_latent_stats_tensor(cache["latents"], n=n, seed=seed, mode=mode)
     if mode == "none":
@@ -3186,6 +3459,9 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "image_size": image_size_value(image_size),
         "image_h": int(image_size[0]),
         "image_w": int(image_size[1]),
+        "size_buckets": report.get("size_buckets", []),
+        "size_bucket_count": int(report.get(
+            "size_bucket_count", len(report.get("size_buckets", [])))),
         "latent_ch": latent_ch,
         "ae_arch": ae_arch,
         "latent_downsample": int(getattr(ae, "downsample", latent_downsample)),
@@ -3737,6 +4013,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       sample_steps=4, roundtrip_samples=1, flow_semantic_w=0.0,
                       flow_consistency_w=0.0,
                       cond_mode="facts", text_cond_dim=0,
+                      size_buckets=(),
                       image_manifest="", image_root="", image_split="train",
                       image_min_aesthetic=None, image_max_records=0,
                       caption_vocab_max=8192, caption_max_len=64,
@@ -3763,6 +4040,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     size = image_hw(size, default=32)
+    requested_size_buckets = normalize_image_size_buckets(size_buckets)
     if cond_mode not in ("facts", "text"):
         raise ValueError(f"unknown condition mode {cond_mode!r}")
     if cfg_rescale < 0.0 or cfg_rescale > 1.0:
@@ -3796,7 +4074,16 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         caption_cond_source, text_embedding_in_dim = "tokens", 0
         image_embedding_in_dim = 0
     if image_records is None:
+        if requested_size_buckets:
+            raise ValueError("size_buckets require image_manifest training")
         image_side(size)
+        train_size_buckets = (size,)
+        bucket_records = None
+        bucket_missing_dims = 0
+    else:
+        train_size_buckets = requested_size_buckets or (size,)
+        bucket_records, bucket_missing_dims = bucket_records_by_aspect(
+            image_records, train_size_buckets)
     if time_sampling not in ("uniform", "logit-normal"):
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
     if time_shift <= 0.0:
@@ -3906,9 +4193,16 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             embed_dim=image_feature_embed_dim).to(device)
     latent_shape = ae_latent_shape(ae, size)
     latent_tokens = latent_shape[1] * latent_shape[2]
-    if flow_arch in ("dit", "crossdit", "mmdit") and latent_tokens > int(latent_max_tokens):
+    train_latent_shapes = [ae_latent_shape(ae, bucket) for bucket in train_size_buckets]
+    max_train_latent_tokens = max(shape[1] * shape[2] for shape in train_latent_shapes)
+    max_train_latent_shape = max(
+        train_latent_shapes, key=lambda shape: shape[1] * shape[2])
+    max_required_latent_tokens = max(int(latent_tokens), int(max_train_latent_tokens))
+    if flow_arch in ("dit", "crossdit", "mmdit") and max_required_latent_tokens > int(
+            latent_max_tokens):
         raise ValueError(
-            f"latent token count {latent_tokens} exceeds latent_max_tokens={latent_max_tokens}; "
+            f"latent token count {max_required_latent_tokens} exceeds "
+            f"latent_max_tokens={latent_max_tokens}; "
             "increase --latent-max-tokens or use a larger --latent-downsample"
         )
     flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
@@ -3941,6 +4235,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         text_aligner.train()
     if image_feature_aligner is not None:
         image_feature_aligner.train()
+    size_bucket_sample_counts = {image_size_key(bucket): 0 for bucket in train_size_buckets}
     last_ae = {}
     for _ in range(ae_steps):
         opt_ae.zero_grad(set_to_none=True)
@@ -3948,10 +4243,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             if image_records is None:
                 x, fact_cond, yc, ys = _batch(batch, rng, size=size, device=device)
             else:
-                x, captions, chosen_records = sample_image_text_batch(
-                    image_records, rng, batch=batch, size=size, device=device,
-                    return_records=True, crop_mode=image_crop_mode,
-                    hflip_prob=image_hflip_prob)
+                batch_size, x, captions, chosen_records = sample_bucketed_image_text_batch(
+                    image_records, rng, batch=batch, size_buckets=train_size_buckets,
+                    bucket_records=bucket_records, device=device, return_records=True,
+                    crop_mode=image_crop_mode, hflip_prob=image_hflip_prob)
+                size_bucket_sample_counts[image_size_key(batch_size)] += int(batch)
             with amp_autocast(device, train_precision):
                 out = ae(x)
                 if image_records is None:
@@ -4022,7 +4318,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             cond_source=caption_cond_source, cache_dir=flow_cache_dir,
             shard_size=flow_cache_shard_size,
             include_image_embeddings=flow_feature_align_w > 0.0 or flow_repa_w > 0.0,
-            crop_mode=image_crop_mode, hflip_prob=image_hflip_prob)
+            crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
+            size_buckets=train_size_buckets, bucket_records=bucket_records)
     if image_records is None:
         latent_stats = estimate_latent_stats(
             ae, n=latent_stat_samples, batch=batch, seed=seed + 97, size=size, device=device,
@@ -4030,6 +4327,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     elif flow_cache is not None:
         latent_stats = estimate_latent_stats_cache(
             flow_cache, n=latent_stat_samples, seed=seed + 97, mode=latent_normalize)
+    elif len(train_size_buckets) > 1:
+        latent_stats = estimate_latent_stats_record_buckets(
+            ae, image_records, train_size_buckets, bucket_records=bucket_records,
+            n=latent_stat_samples, batch=batch, seed=seed + 97, device=device,
+            mode=latent_normalize, crop_mode=image_crop_mode, hflip_prob=image_hflip_prob)
     else:
         latent_stats = estimate_latent_stats_records(
             ae, image_records, n=latent_stat_samples, batch=batch, seed=seed + 97,
@@ -4075,10 +4377,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
                     rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
             else:
-                x, captions, chosen_records = sample_image_text_batch(
-                    image_records, rng, batch=batch, size=size, device=device,
-                    return_records=True, crop_mode=image_crop_mode,
-                    hflip_prob=image_hflip_prob)
+                batch_size, x, captions, chosen_records = sample_bucketed_image_text_batch(
+                    image_records, rng, batch=batch, size_buckets=train_size_buckets,
+                    bucket_records=bucket_records, device=device, return_records=True,
+                    crop_mode=image_crop_mode, hflip_prob=image_hflip_prob)
+                size_bucket_sample_counts[image_size_key(batch_size)] += int(batch)
                 fact_cond, specs = None, None
                 with torch.no_grad(), amp_autocast(device, train_precision):
                     z1 = ae.encode(x)
@@ -4197,8 +4500,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_cache_batch": int(flow_cache_batch),
         "flow_cache_shard_size": int(flow_cache_shard_size),
         "flow_cache_shards": (
-            len(flow_cache.get("shards", [])) if flow_cache is not None else 0
+            int(flow_cache.get("shard_count", len(flow_cache.get("shards", []))))
+            if flow_cache is not None else 0
         ),
+        "flow_cache_bucket_count": int(flow_cache.get("bucket_count", 0))
+        if flow_cache is not None else 0,
         "flow_cache_bytes": int(flow_cache["bytes"]) if flow_cache is not None else 0,
         "flow_cache_cond_source": (
             str(flow_cache["cond_source"]) if flow_cache is not None else caption_cond_source
@@ -4214,6 +4520,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "image_size": image_size_value(size),
         "image_h": int(size[0]),
         "image_w": int(size[1]),
+        "size_buckets": image_size_buckets_value(train_size_buckets),
+        "size_bucket_count": int(len(train_size_buckets)),
+        "size_bucket_sample_counts": dict(sorted(size_bucket_sample_counts.items())),
+        "size_bucket_missing_dims": int(bucket_missing_dims),
         "latent_ch": int(latent_ch),
         "ae_arch": ae_arch,
         "latent_downsample": int(getattr(ae, "downsample", latent_downsample)),
@@ -4221,6 +4531,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "latent_h": int(latent_shape[1]),
         "latent_w": int(latent_shape[2]),
         "latent_tokens": int(latent_tokens),
+        "max_train_latent_h": int(max_train_latent_shape[1]),
+        "max_train_latent_w": int(max_train_latent_shape[2]),
+        "max_train_latent_tokens": int(max_train_latent_tokens),
         "latent_max_tokens": int(latent_max_tokens),
         "hidden": int(hidden),
         "flow_arch": flow_arch,
@@ -4624,6 +4937,26 @@ def selftest():
         assert meta_rect2["image_size"] == [32, 48]
         assert meta_rect2["image_h"] == 32 and meta_rect2["image_w"] == 48
         assert ae_latent_shape(ae_rect2, meta_rect2["image_size"]) == (4, 4, 6)
+        _ae_bucket, _flow_bucket, _conditioner_bucket, _vocab_bucket, report_bucket = (
+            train_latent_flow(
+                ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=16,
+                flow_arch="dit", dit_depth=1, dit_heads=2, seed=15,
+                device="cpu", cond_mode="text", text_cond_dim=8,
+                image_manifest=manifest, image_root=img_dir, image_split="train",
+                image_max_records=2, caption_max_len=8, sample_steps=1,
+                size=(32, 32), size_buckets=((32, 32), (32, 48)),
+                ae_arch="residual", latent_downsample=8,
+                latent_max_tokens=32, image_crop_mode="pad",
+                flow_cache_latents=True, flow_cache_records=2,
+                intervention_samples=0, return_conditioner=True))
+        assert report_bucket["size_buckets"] == [[32, 32], [32, 48]]
+        assert report_bucket["size_bucket_count"] == 2
+        assert report_bucket["max_train_latent_tokens"] == 24
+        assert set(report_bucket["size_bucket_sample_counts"]) == {"32x32", "32x48"}
+        assert sum(report_bucket["size_bucket_sample_counts"].values()) == 2
+        assert report_bucket["size_bucket_missing_dims"] == 2
+        assert report_bucket["flow_cache_backend"] == "bucketed_memory"
+        assert report_bucket["flow_cache_bucket_count"] == 2
         disk_cache_dir = os.path.join(td, "latent_cache")
         _ae_disk, _flow_disk, _cond_disk, _vocab_disk, _aligner_disk, report_disk = (
             train_latent_flow(
@@ -4759,6 +5092,9 @@ def main(argv=None):
                     help="clip AE/flow gradient norm after accumulation; 0 disables")
     ap.add_argument("--size", default="0",
                     help="image size as SIZE or HxW; 0 means 32 for train or checkpoint size for eval")
+    ap.add_argument("--size-buckets", default="", dest="size_buckets",
+                    help=("manifest training buckets as comma/space/semicolon separated HxW values; "
+                          "omitted uses --size"))
     ap.add_argument("--latent-ch", type=int, default=16, dest="latent_ch")
     ap.add_argument("--ae-arch", default="semantic", choices=("semantic", "residual"),
                     dest="ae_arch",
@@ -4953,6 +5289,7 @@ def main(argv=None):
         cfg_interval = _parse_interval(args.cfg_interval)
         semantic_guidance_interval = _parse_interval(args.semantic_guidance_interval)
         cli_size = normalize_image_size(args.size, default=None)
+        cli_size_buckets = normalize_image_size_buckets(args.size_buckets)
     except ValueError as e:
         ap.error(str(e))
     if args.selftest:
@@ -5088,7 +5425,7 @@ def main(argv=None):
         flow_repa_embed_dim=args.flow_repa_embed_dim,
         sample_steps=args.sample_steps, roundtrip_samples=args.roundtrip_samples,
         flow_semantic_w=args.flow_semantic_w, cond_mode=args.cond_mode,
-        flow_consistency_w=args.flow_consistency_w,
+        flow_consistency_w=args.flow_consistency_w, size_buckets=cli_size_buckets,
         text_cond_dim=args.text_cond_dim, prompt_templates=templates,
         image_manifest=args.image_manifest, image_root=args.image_root,
         image_split=args.image_split, image_min_aesthetic=args.image_min_aesthetic,
@@ -5193,6 +5530,8 @@ def main(argv=None):
         "image_size": image_size_value(run_size),
         "image_h": int(run_size[0]),
         "image_w": int(run_size[1]),
+        "size_buckets": report.get("size_buckets", []),
+        "size_bucket_count": report.get("size_bucket_count", 0),
         "ae_arch": args.ae_arch,
         "latent_downsample": report.get("latent_downsample", args.latent_downsample),
         "ae_res_blocks": report.get("ae_res_blocks", args.ae_res_blocks),
