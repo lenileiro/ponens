@@ -3066,6 +3066,23 @@ def sample_records_per_kind(records, rng, per_kind):
     return out, counts
 
 
+def retention_anchor_records(records):
+    out = []
+    for i, rec in enumerate(records):
+        meta = rec.meta | {"retention_anchor": True} if isinstance(rec.meta, dict) else {
+            "retention_anchor": True}
+        out.append(TextRecord(rec_id=f"{rec.rec_id}:retention_anchor:{i}",
+                              split=rec.split,
+                              tokens=rec.tokens,
+                              facts=rec.facts,
+                              group=rec.group,
+                              kind=f"{rec.kind}:retention_anchor",
+                              base_id=rec.base_id,
+                              changed=rec.changed,
+                              meta=meta))
+    return out
+
+
 def semantic_record_outcomes(model, vocab, records, device=DEV, n=0, seed=0):
     errors, report = semantic_record_errors(model, vocab, records, device=device,
                                             n=n, seed=seed)
@@ -4241,6 +4258,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      choice_control_margin=0.0, study_rounds=1,
                      study_strategy="all", study_probe_n=0, study_hard_max=0,
                      study_anchor_correct_per_kind=0,
+                     study_anchor_correct_repeat=1,
+                     study_anchor_retention_bucket=False,
                      study_select_best=False, study_score_metric="both",
                      study_retention_w=1.0, study_control_w=1.0,
                      study_kind_w=1.0, study_require_positive_score=True,
@@ -4264,6 +4283,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
     new_fact_values = sum(len(v) for v in model.fact_schema.values)
     study_confirm_n = max(0, int(study_confirm_n))
     study_confirm_seed_stride = max(1, int(study_confirm_seed_stride))
+    study_anchor_correct_repeat = max(1, int(study_anchor_correct_repeat))
     eval_kwargs = dict(device=device, max_new=max_new, free_n=free_n,
                        paraphrase_n=paraphrase_n, counterfactual_n=counterfactual_n,
                        kind_free_n=kind_free_n, fact_n=fact_n,
@@ -4360,6 +4380,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "study_probe_n": int(study_probe_n),
               "study_hard_max": int(study_hard_max),
               "study_anchor_correct_per_kind": int(study_anchor_correct_per_kind),
+              "study_anchor_correct_repeat": int(study_anchor_correct_repeat),
+              "study_anchor_retention_bucket": bool(study_anchor_retention_bucket),
               "study_select_best": bool(study_select_best),
               "study_score_metric": study_score_metric,
               "study_retention_w": float(study_retention_w),
@@ -4457,8 +4479,15 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                 rng = np.random.default_rng(round_seed + 53)
                 anchor_records, anchor_counts = sample_records_per_kind(
                     correct_records, rng, study_anchor_correct_per_kind)
+                if study_anchor_retention_bucket:
+                    anchor_records = retention_anchor_records(anchor_records)
+                if study_anchor_correct_repeat > 1:
+                    anchor_records = anchor_records * study_anchor_correct_repeat
             hard_report = hard_report | {
                 "n_anchor_records": len(anchor_records),
+                "n_unique_anchor_records": sum(anchor_counts.values()),
+                "anchor_repeat": study_anchor_correct_repeat,
+                "anchor_retention_bucket": bool(study_anchor_retention_bucket),
                 "anchor_records_by_kind": anchor_counts,
             }
             round_fit_records = hard_records + anchor_records + train_replay_records
@@ -4912,6 +4941,11 @@ def selftest():
     anchors, anchor_counts = sample_records_per_kind(pair_norm, np.random.default_rng(9),
                                                      per_kind=1)
     assert anchors and all(n == 1 for n in anchor_counts.values())
+    retention_anchors = retention_anchor_records(anchors)
+    assert retention_anchors and all(r.kind.endswith(":retention_anchor")
+                                     for r in retention_anchors)
+    assert all(qa_choice_target(a) == qa_choice_target(r)
+               for a, r in zip(anchors, retention_anchors))
     pair_groups = choice_pair_groups(pair_norm)
     assert len(pair_groups) == 3
     pair_rows = choice_pair_batch_records(pair_groups, np.random.default_rng(4), pairs=2)
@@ -5385,6 +5419,12 @@ def main(argv=None):
     ap.add_argument("--study-anchor-correct-per-kind", type=int, default=0,
                     help=("for error self-study, mix in this many currently-correct "
                           "study records per kind as retention anchors"))
+    ap.add_argument("--study-anchor-correct-repeat", type=int, default=1,
+                    help=("repeat selected currently-correct retention anchors this "
+                          "many times in each study round"))
+    ap.add_argument("--study-anchor-retention-bucket", action="store_true",
+                    help=("put selected correct retention anchors in their own "
+                          "training kind buckets when balancing by kind"))
     ap.add_argument("--study-select-best", action="store_true",
                     help="evaluate each study round and restore the best scoring weights")
     ap.add_argument("--study-score-metric", choices=("semantic", "teacher", "both", "min",
@@ -5538,6 +5578,9 @@ def main(argv=None):
                          study_probe_n=args.study_probe_n,
                          study_hard_max=args.study_hard_max,
                          study_anchor_correct_per_kind=args.study_anchor_correct_per_kind,
+                         study_anchor_correct_repeat=args.study_anchor_correct_repeat,
+                         study_anchor_retention_bucket=(
+                             args.study_anchor_retention_bucket),
                          study_select_best=args.study_select_best,
                          study_score_metric=args.study_score_metric,
                          study_retention_w=args.study_retention_w,

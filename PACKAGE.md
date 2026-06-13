@@ -773,6 +773,18 @@ regressed `squad_choice` to **0.100**, so `selected_round` stayed **0**. The use
 that candidate binding is now a separately measured internal relation, not only a final `none`
 accuracy side effect.
 
+`--study-anchor-correct-repeat` and `--study-anchor-retention-bucket` expose the next curriculum
+knobs for that positive-regression problem. The anchors are not hand-authored examples: they are
+currently-correct records mined by the model during error self-study. Repeating them upweights
+retention, and the retention-bucket option gives them separate `:retention_anchor` training kinds
+so `--balance-by kind` can sample them deliberately. In the guarded 2-step smoke, repeating 15
+unique correct anchors **50x** added **750** retention rows and raised aggregate choice from
+**0.150** to **0.200**, but `squad_choice` still regressed to **0.100**. Isolating those anchors in
+retention buckets raised aggregate choice to **0.225** but worsened discovery/binding/swap controls
+and still failed retention, so `selected_round` stayed **0**. This confirms the next needed change
+is not merely more anchor mass; the learning objective has to bind question-conditioned evidence
+without stealing capacity from real answer choices.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
