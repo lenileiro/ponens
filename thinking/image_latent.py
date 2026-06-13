@@ -2091,6 +2091,29 @@ def image_feature_alignment_loss(aligner, z, features, prefix="image_feature_ali
     }
 
 
+def embedding_pair_similarity(image_vec, text_vec, prefix="embedding_pair"):
+    image_vec = F.normalize(image_vec.float(), dim=-1, eps=1.0e-8)
+    text_vec = F.normalize(text_vec.float(), dim=-1, eps=1.0e-8)
+    logits = image_vec.matmul(text_vec.t())
+    targets = torch.arange(logits.shape[0], device=logits.device)
+    return {
+        f"{prefix}_cos": logits.diag().mean().detach(),
+        f"{prefix}_i2t_acc": logits.argmax(dim=1).eq(targets).float().mean().detach(),
+        f"{prefix}_t2i_acc": logits.argmax(dim=0).eq(targets).float().mean().detach(),
+        f"{prefix}_n": torch.tensor(float(logits.shape[0]), device=logits.device),
+    }
+
+
+def can_score_external_text_image(records, image_feature_aligner):
+    if image_feature_aligner is None:
+        return False
+    try:
+        text_dim = infer_text_embedding_dim(records)
+    except ValueError:
+        return False
+    return int(text_dim) == int(getattr(image_feature_aligner, "feature_dim", 0) or 0)
+
+
 def flow_hidden_feature_alignment_loss(aligner, hidden_tokens, features, prefix="flow_repa",
                                        mask=None):
     if aligner is None:
@@ -3171,6 +3194,8 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
     latent_means, latent_stds = [], []
     align_losses, align_i2t, align_t2i = [], [], []
     feature_losses, feature_i2f, feature_f2i = [], [], []
+    ext_pair_cos, ext_pair_i2t, ext_pair_t2i = [], [], []
+    score_external_text_image = can_score_external_text_image(records, image_feature_aligner)
     total = 0
     while total < n:
         b = min(batch, n - total)
@@ -3198,6 +3223,18 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                 float(feature_parts["image_feature_retrieval_i2f_acc"].detach().cpu()))
             feature_f2i.append(
                 float(feature_parts["image_feature_retrieval_f2i_acc"].detach().cpu()))
+            if score_external_text_image:
+                text_features = record_text_embedding_tensor(chosen_records, device=device)
+                pair_parts = embedding_pair_similarity(
+                    image_feature_aligner.encode_image(z),
+                    image_feature_aligner.encode_feature(text_features),
+                    prefix="external_text_image_score")
+                ext_pair_cos.append(float(
+                    pair_parts["external_text_image_score_cos"].detach().cpu()))
+                ext_pair_i2t.append(float(
+                    pair_parts["external_text_image_score_i2t_acc"].detach().cpu()))
+                ext_pair_t2i.append(float(
+                    pair_parts["external_text_image_score_t2i_acc"].detach().cpu()))
         flow_losses.append(float(latent_flow_loss(
             flow, z, cond, time_shift=time_shift).detach().cpu()))
         endpoint_metrics = flow_endpoint_metrics(flow, z, cond, time_shift=time_shift)
@@ -3277,6 +3314,12 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                 "image_feature_retrieval_i2f_acc": float(np.mean(feature_i2f)),
                 "image_feature_retrieval_f2i_acc": float(np.mean(feature_f2i)),
             })
+        if ext_pair_cos:
+            report.update({
+                "external_text_image_score_cos": float(np.mean(ext_pair_cos)),
+                "external_text_image_score_i2t_acc": float(np.mean(ext_pair_i2t)),
+                "external_text_image_score_t2i_acc": float(np.mean(ext_pair_t2i)),
+            })
         report.update({
             "generated_image_feature_retrieval_loss": float(
                 sample_feature_parts["generated_image_feature_retrieval_loss"].detach().cpu()),
@@ -3287,6 +3330,27 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
             "generated_image_feature_retrieval_n": int(
                 sample_feature_parts["generated_image_feature_retrieval_n"].detach().cpu()),
         })
+        if score_external_text_image:
+            sample_text_features = record_text_embedding_tensor(
+                sample_records[:sample.shape[0]], device=device)
+            generated_pair_parts = embedding_pair_similarity(
+                image_feature_aligner.encode_image(sample_z),
+                image_feature_aligner.encode_feature(sample_text_features),
+                prefix="generated_external_text_image_score")
+            report.update({
+                "generated_external_text_image_score_cos": float(
+                    generated_pair_parts[
+                        "generated_external_text_image_score_cos"].detach().cpu()),
+                "generated_external_text_image_score_i2t_acc": float(
+                    generated_pair_parts[
+                        "generated_external_text_image_score_i2t_acc"].detach().cpu()),
+                "generated_external_text_image_score_t2i_acc": float(
+                    generated_pair_parts[
+                        "generated_external_text_image_score_t2i_acc"].detach().cpu()),
+                "generated_external_text_image_score_n": int(
+                    generated_pair_parts[
+                        "generated_external_text_image_score_n"].detach().cpu()),
+            })
     report.update(summarize_records(records))
     return report
 
@@ -3634,6 +3698,12 @@ SWEEP_METRICS = (
     "generated_image_feature_retrieval_loss",
     "generated_image_feature_retrieval_i2f_acc",
     "generated_image_feature_retrieval_f2i_acc",
+    "external_text_image_score_cos",
+    "external_text_image_score_i2t_acc",
+    "external_text_image_score_t2i_acc",
+    "generated_external_text_image_score_cos",
+    "generated_external_text_image_score_i2t_acc",
+    "generated_external_text_image_score_t2i_acc",
     "sample_center_target_mse",
     "recon_mse",
     "latent_velocity_mse",
@@ -3654,7 +3724,9 @@ def report_selection_key(report):
         float(report.get("sample_roundtrip_both_acc", 0.0)),
         float(report.get("sample_roundtrip_shape_acc", 0.0)),
         float(report.get("sample_roundtrip_color_acc", 0.0)),
+        float(report.get("generated_external_text_image_score_cos", 0.0)),
         float(report.get("generated_image_feature_retrieval_i2f_acc", 0.0)),
+        float(report.get("external_text_image_score_cos", 0.0)),
         float(report.get("image_feature_retrieval_i2f_acc", 0.0)),
         float(report.get("generated_caption_retrieval_i2t_acc", 0.0)),
         float(report.get("caption_retrieval_i2t_acc", 0.0)),
@@ -3674,7 +3746,9 @@ def aggregate_selection_key(report):
         float(report.get("sample_roundtrip_both_acc_mean", 0.0)),
         float(report.get("sample_roundtrip_shape_acc_mean", 0.0)),
         float(report.get("sample_roundtrip_color_acc_mean", 0.0)),
+        float(report.get("generated_external_text_image_score_cos_mean", 0.0)),
         float(report.get("generated_image_feature_retrieval_i2f_acc_mean", 0.0)),
+        float(report.get("external_text_image_score_cos_mean", 0.0)),
         float(report.get("image_feature_retrieval_i2f_acc_mean", 0.0)),
         float(report.get("generated_caption_retrieval_i2t_acc_mean", 0.0)),
         float(report.get("caption_retrieval_i2t_acc_mean", 0.0)),
@@ -3712,6 +3786,8 @@ def eval_report_summary(report):
         "image_feature_retrieval_f2i_acc",
         "generated_image_feature_retrieval_i2f_acc",
         "generated_image_feature_retrieval_f2i_acc",
+        "external_text_image_score_cos",
+        "generated_external_text_image_score_cos",
         "sample_center_target_mse",
         "recon_mse",
         "latent_velocity_mse",
@@ -4851,7 +4927,7 @@ def selftest():
                 f.write(arr.tobytes())
             rows.append({"image": name, "caption": f"{split} color patch {i}",
                          "split": split,
-                         "text_embedding": [float(i), float(i + 1), float(i % 2)],
+                         "text_embedding": [float(i), float(i + 1), float(i % 2), 1.0],
                          "image_embedding": [float(i), float(i + 2),
                                              float((i + 1) % 2), 1.0]})
         with open(manifest, "w", encoding="utf-8") as f:
@@ -4879,7 +4955,9 @@ def selftest():
         assert "flow_image_feature_align_i2f_acc" in report6["last_flow"]
         assert "flow_repa_h2f_acc" in report6["last_flow"]
         assert report6["image_embedding_in_dim"] == 4
+        assert report6["text_embedding_in_dim"] == 4
         assert report6["flow_repa_embed_dim"] == 11
+        assert "generated_external_text_image_score_cos" in report6
         assert report6["flow_cache_latents"] is True
         assert report6["flow_cache_backend"] == "memory"
         assert report6["flow_cache_records"] == 2 and report6["flow_cache_bytes"] > 0
@@ -4991,6 +5069,7 @@ def selftest():
         assert "caption_sample_mse_mean" in img_agg[0]
         assert "generated_caption_retrieval_i2t_acc_mean" in img_agg[0]
         assert "generated_image_feature_retrieval_i2f_acc_mean" in img_agg[0]
+        assert "generated_external_text_image_score_cos_mean" in img_agg[0]
         ckpt = os.path.join(td, "manifest.pt")
         torch.save({
             "autoencoder_state_dict": ae6.state_dict(),
@@ -5011,7 +5090,7 @@ def selftest():
             "image_split": "train",
             "caption_max_len": 8,
             "caption_cond_source": "embedding",
-            "text_embedding_in_dim": 3,
+            "text_embedding_in_dim": 4,
             "text_embed_dim": 12,
             "image_embedding_in_dim": 4,
             "image_feature_embed_dim": 10,
@@ -5046,6 +5125,7 @@ def selftest():
         assert eval6["flow_repa_aligner"] is True
         assert "generated_caption_retrieval_i2t_acc_mean" in eval6["best"]
         assert "generated_image_feature_retrieval_i2f_acc_mean" in eval6["best"]
+        assert "generated_external_text_image_score_cos_mean" in eval6["best"]
     print("image_latent selftest OK")
 
 

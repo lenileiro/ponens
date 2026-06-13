@@ -1158,6 +1158,13 @@ record the bucket list, per-bucket sample counts, missing manifest dimensions, a
 tokens. Cached flow training now stores one fixed-shape subcache per bucket, so the recommended
 RunPod recipe can combine aspect buckets with `--image-flow-cache-latents`.
 
+Image-55 adds a generated text-image embedding score for real-image eval. When manifest rows carry
+same-width external `text_embedding` and `image_embedding` vectors, checkpoint sweeps now report
+`generated_external_text_image_score_cos` and retrieval accuracies by projecting generated image
+latents through the learned image-feature bridge and comparing them to the caption embedding. This
+keeps CLIP/SigLIP-style prompt alignment measurable without loading the external encoder during
+eval.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
