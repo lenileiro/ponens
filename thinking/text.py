@@ -2173,6 +2173,40 @@ def choice_candidate_replacement_binding_loss(model, txt, records, pair_ids,
     return sum(losses) / len(losses)
 
 
+def choice_candidate_replacement_answerability_binding_scores(model, txt, records,
+                                                              pair_ids):
+    rows = {}
+    for rec, _score, ids, cover_scores in model.choice_answerability_logits(txt, records):
+        if cover_scores is not None:
+            rows[rec.rec_id] = (ids, cover_scores)
+    out = []
+    for full_id, repl_id, target in pair_ids:
+        full_row = rows.get(full_id)
+        repl_row = rows.get(repl_id)
+        if full_row is None or repl_row is None:
+            continue
+        full_ids, full_scores = full_row
+        repl_ids, repl_scores = repl_row
+        if target not in full_ids or target not in repl_ids:
+            continue
+        full_score = full_scores[full_ids.index(target)]
+        repl_score = repl_scores[repl_ids.index(target)]
+        out.append((full_score, repl_score))
+    return out
+
+
+def choice_candidate_replacement_answerability_binding_loss(model, txt, records,
+                                                            pair_ids, margin=0.0):
+    losses = []
+    margin_t = torch.tensor(float(margin), dtype=torch.float32, device=txt.device)
+    for full_score, repl_score in choice_candidate_replacement_answerability_binding_scores(
+            model, txt, records, pair_ids):
+        losses.append(F.softplus(repl_score + margin_t - full_score))
+    if not losses:
+        return torch.tensor(0.0, device=txt.device)
+    return sum(losses) / len(losses)
+
+
 def choice_concept_groups(records):
     groups = {}
     for rec in records:
@@ -2401,6 +2435,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               choice_candidate_replacement_pair_margin=0.0,
               choice_candidate_replacement_binding_w=0.0,
               choice_candidate_replacement_binding_margin=0.0,
+              choice_candidate_replacement_answerability_binding_w=0.0,
+              choice_candidate_replacement_answerability_binding_margin=0.0,
               choice_positive_anchor_w=0.0,
               choice_positive_anchor_margin=0.0,
               choice_concept_bridge_w=0.0,
@@ -2439,6 +2475,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                            or choice_candidate_replacement_w
                            or choice_candidate_replacement_pair_w
                            or choice_candidate_replacement_binding_w
+                           or choice_candidate_replacement_answerability_binding_w
                            or choice_positive_anchor_w
                            or choice_final_control_w
                            or choice_final_control_contrast_w
@@ -2582,6 +2619,25 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 replacement_binding_loss = torch.tensor(0.0, device=device)
         else:
             replacement_binding_loss = torch.tensor(0.0, device=device)
+        if (choice_candidate_replacement_answerability_binding_w
+                and control_sources):
+            replacement_ans_binding_records, replacement_ans_binding_pairs = (
+                choice_candidate_replacement_pair_batch(
+                    control_sources, rng, max(1, batch // 2)))
+            if replacement_ans_binding_records and replacement_ans_binding_pairs:
+                replacement_ans_binding_txt, _replacement_ans_binding_ids = pack(
+                    replacement_ans_binding_records, vocab, device)
+                replacement_ans_binding_loss = (
+                    choice_candidate_replacement_answerability_binding_loss(
+                        model, replacement_ans_binding_txt,
+                        replacement_ans_binding_records,
+                        replacement_ans_binding_pairs,
+                        margin=(
+                            choice_candidate_replacement_answerability_binding_margin)))
+            else:
+                replacement_ans_binding_loss = torch.tensor(0.0, device=device)
+        else:
+            replacement_ans_binding_loss = torch.tensor(0.0, device=device)
         if choice_positive_anchor_w and control_sources:
             positive_anchor_records = choice_positive_anchor_batch_records(
                 control_sources, rng, max(1, batch // 2))
@@ -2710,6 +2766,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 + choice_candidate_replacement_w * replacement_loss
                 + choice_candidate_replacement_pair_w * replacement_pair_loss
                 + choice_candidate_replacement_binding_w * replacement_binding_loss
+                + (choice_candidate_replacement_answerability_binding_w
+                   * replacement_ans_binding_loss)
                 + choice_positive_anchor_w * positive_anchor_loss
                 + choice_concept_bridge_w * concept_loss
                 + choice_answerability_w * ans_loss
@@ -2737,6 +2795,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                   f"cand-repl {replacement_loss.item():.3f} "
                   f"cand-repl-pair {replacement_pair_loss.item():.3f} "
                   f"cand-repl-bind {replacement_binding_loss.item():.3f} "
+                  f"cand-repl-ans-bind {replacement_ans_binding_loss.item():.3f} "
                   f"pos-anchor {positive_anchor_loss.item():.3f} "
                   f"concept {concept_loss.item():.3f} "
                   f"ans {ans_loss.item():.3f} "
@@ -2771,6 +2830,8 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                 choice_candidate_replacement_pair_margin=0.0,
                 choice_candidate_replacement_binding_w=0.0,
                 choice_candidate_replacement_binding_margin=0.0,
+                choice_candidate_replacement_answerability_binding_w=0.0,
+                choice_candidate_replacement_answerability_binding_margin=0.0,
                 choice_positive_anchor_w=0.0,
                 choice_positive_anchor_margin=0.0,
                 choice_concept_bridge_w=0.0,
@@ -2823,6 +2884,10 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                          choice_candidate_replacement_binding_w),
                      choice_candidate_replacement_binding_margin=(
                          choice_candidate_replacement_binding_margin),
+                     choice_candidate_replacement_answerability_binding_w=(
+                         choice_candidate_replacement_answerability_binding_w),
+                     choice_candidate_replacement_answerability_binding_margin=(
+                         choice_candidate_replacement_answerability_binding_margin),
                      choice_positive_anchor_w=choice_positive_anchor_w,
                      choice_positive_anchor_margin=choice_positive_anchor_margin,
                      choice_concept_bridge_w=choice_concept_bridge_w,
@@ -3471,6 +3536,59 @@ def qa_candidate_replacement_binding_eval(model, vocab, records, device=DEV, n=0
 
 
 @torch.no_grad()
+def qa_candidate_replacement_answerability_binding_eval(model, vocab, records,
+                                                        device=DEV, n=0, seed=0):
+    all_eval = [r for r in records if r.split == "eval" and _is_qa_record(r)
+                and not _is_qa_negative_record(r)]
+    if n < 0:
+        return {"n": 0, "sampled": False, "skipped": True}
+    if not all_eval:
+        return {"n": 0, "sampled": False, "skipped": False}
+    eval_records_ = all_eval
+    sampled = bool(n and n < len(eval_records_))
+    rng = np.random.default_rng(seed)
+    if sampled:
+        idx = rng.choice(len(eval_records_), size=n, replace=False)
+        eval_records_ = [eval_records_[int(i)] for i in idx]
+    rows = []
+    pair_ids = []
+    for rec in eval_records_:
+        target = qa_choice_target(rec)
+        repl = _choice_candidate_replacement_record(rec, rng)
+        if repl is None or target is None or target == "none":
+            continue
+        pair_idx = len(pair_ids)
+        full_id = f"{rec.rec_id}:candidate_ans_binding_full:{pair_idx}"
+        repl_id = f"{rec.rec_id}:candidate_ans_binding_repl:{pair_idx}"
+        rows.extend([
+            TextRecord(rec_id=full_id, split=rec.split, tokens=rec.tokens,
+                       facts=rec.facts, group=rec.group, kind=rec.kind,
+                       base_id=rec.base_id, changed=rec.changed, meta=rec.meta),
+            TextRecord(rec_id=repl_id, split=rec.split, tokens=repl.tokens,
+                       facts=repl.facts, group=rec.group, kind=repl.kind,
+                       base_id=rec.rec_id, changed=repl.changed, meta=repl.meta),
+        ])
+        pair_ids.append((full_id, repl_id, target))
+    if not rows or not pair_ids:
+        return {"n": 0, "sampled": sampled, "skipped": False}
+    txt, _ids = pack(rows, vocab, device)
+    scores = choice_candidate_replacement_answerability_binding_scores(
+        model, txt, rows, pair_ids)
+    if not scores:
+        return {"n": 0, "sampled": sampled, "skipped": False}
+    full_scores = [float(full.detach().cpu()) for full, _repl in scores]
+    repl_scores = [float(repl.detach().cpu()) for _full, repl in scores]
+    drops = [full - repl for full, repl in zip(full_scores, repl_scores)]
+    return {"n": len(scores),
+            "sampled": sampled,
+            "skipped": False,
+            "full_target_cover": float(np.mean(full_scores)),
+            "replacement_target_cover": float(np.mean(repl_scores)),
+            "target_cover_drop": float(np.mean(drops)),
+            "target_cover_drop_rate": float(np.mean([d > 0.0 for d in drops]))}
+
+
+@torch.no_grad()
 def qa_concept_discovery_eval(model, vocab, records, device=DEV, n=0, seed=0):
     all_eval = [r for r in records if r.split == "eval" and _is_qa_record(r)
                 and not _is_qa_negative_record(r)]
@@ -3651,8 +3769,10 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
                                             n=artifact_n, seed=seed + 29)
     qa_repl_binding = qa_candidate_replacement_binding_eval(
         model, vocab, records, device=device, n=artifact_n, seed=seed + 30)
+    qa_repl_ans_binding = qa_candidate_replacement_answerability_binding_eval(
+        model, vocab, records, device=device, n=artifact_n, seed=seed + 31)
     qa_concept = qa_concept_discovery_eval(model, vocab, records, device=device,
-                                           n=artifact_n, seed=seed + 31)
+                                           n=artifact_n, seed=seed + 32)
     by_kind = bucket_fact_eval(model, vocab, records, device=device, n=kind_fact_n,
                                seed=seed + 19)
     by_kind_free = (bucket_free_eval(model, vocab, records, device=device, max_new=max_new,
@@ -3685,6 +3805,10 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
                  or qa_repl_binding.get("skipped") or qa_repl_binding["n"] == 0
                  or qa_repl_binding["target_logit_drop"] >= 0.05)
             and (choice_head.get("skipped") or choice_head["n_records"] == 0
+                 or qa_repl_ans_binding.get("skipped")
+                 or qa_repl_ans_binding["n"] == 0
+                 or qa_repl_ans_binding["target_cover_drop"] >= 0.05)
+            and (choice_head.get("skipped") or choice_head["n_records"] == 0
                  or qa_concept.get("skipped") or qa_concept["n"] == 0
                  or qa_concept["discovery_margin"] >= 0.05))
     return {"teacher_forced": teacher, "free_decode": free,
@@ -3698,6 +3822,8 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
             "qa_question_swap_control": qa_swap,
             "qa_candidate_replacement_control": qa_repl,
             "qa_candidate_replacement_binding_control": qa_repl_binding,
+            "qa_candidate_replacement_answerability_binding_control": (
+                qa_repl_ans_binding),
             "qa_concept_discovery_control": qa_concept,
             "gate_thresholds": {"fact_value_acc": 0.80, "free_f1": 0.80,
                                 "semantic_fact_value_acc": 0.80,
@@ -3713,6 +3839,7 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
                                 "qa_choice_full_minus_question_swap": 0.05,
                                 "qa_candidate_replacement_none_acc": 0.55,
                                 "qa_candidate_replacement_target_logit_drop": 0.05,
+                                "qa_candidate_replacement_target_cover_drop": 0.05,
                                 "qa_concept_discovery_margin": 0.05},
             "gate": gate}
 
@@ -3840,6 +3967,11 @@ def _control_gap_values(eval_report, metric="both"):
     if qa_repl_binding.get("n", 0) and use_choice:
         gaps.append(("qa_choice_candidate_replacement_target_drop",
                      float(qa_repl_binding.get("target_logit_drop", 0.0))))
+    qa_repl_ans_binding = (
+        eval_report.get("qa_candidate_replacement_answerability_binding_control") or {})
+    if qa_repl_ans_binding.get("n", 0) and use_choice:
+        gaps.append(("qa_choice_candidate_replacement_target_cover_drop",
+                     float(qa_repl_ans_binding.get("target_cover_drop", 0.0))))
     qa_concept = eval_report.get("qa_concept_discovery_control") or {}
     if qa_concept.get("n", 0) and use_choice:
         gaps.append(("qa_choice_concept_discovery_margin",
@@ -4029,6 +4161,8 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         choice_candidate_replacement_pair_margin=0.0,
         choice_candidate_replacement_binding_w=0.0,
         choice_candidate_replacement_binding_margin=0.0,
+        choice_candidate_replacement_answerability_binding_w=0.0,
+        choice_candidate_replacement_answerability_binding_margin=0.0,
         choice_positive_anchor_w=0.0,
         choice_positive_anchor_margin=0.0,
         choice_concept_bridge_w=0.0,
@@ -4080,6 +4214,10 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                    choice_candidate_replacement_binding_w),
                                choice_candidate_replacement_binding_margin=(
                                    choice_candidate_replacement_binding_margin),
+                               choice_candidate_replacement_answerability_binding_w=(
+                                   choice_candidate_replacement_answerability_binding_w),
+                               choice_candidate_replacement_answerability_binding_margin=(
+                                   choice_candidate_replacement_answerability_binding_margin),
                                choice_positive_anchor_w=choice_positive_anchor_w,
                                choice_positive_anchor_margin=(
                                    choice_positive_anchor_margin),
@@ -4146,6 +4284,10 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                   choice_candidate_replacement_binding_w),
               "choice_candidate_replacement_binding_margin": float(
                   choice_candidate_replacement_binding_margin),
+              "choice_candidate_replacement_answerability_binding_w": float(
+                  choice_candidate_replacement_answerability_binding_w),
+              "choice_candidate_replacement_answerability_binding_margin": float(
+                  choice_candidate_replacement_answerability_binding_margin),
               "choice_positive_anchor_w": float(choice_positive_anchor_w),
               "choice_positive_anchor_margin": float(choice_positive_anchor_margin),
               "choice_concept_bridge_w": float(choice_concept_bridge_w),
@@ -4231,6 +4373,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      choice_candidate_replacement_pair_margin=0.0,
                      choice_candidate_replacement_binding_w=0.0,
                      choice_candidate_replacement_binding_margin=0.0,
+                     choice_candidate_replacement_answerability_binding_w=0.0,
+                     choice_candidate_replacement_answerability_binding_margin=0.0,
                      choice_positive_anchor_w=0.0,
                      choice_positive_anchor_margin=0.0,
                      choice_concept_bridge_w=0.0,
@@ -4339,6 +4483,10 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   choice_candidate_replacement_binding_w),
               "choice_candidate_replacement_binding_margin": float(
                   choice_candidate_replacement_binding_margin),
+              "choice_candidate_replacement_answerability_binding_w": float(
+                  choice_candidate_replacement_answerability_binding_w),
+              "choice_candidate_replacement_answerability_binding_margin": float(
+                  choice_candidate_replacement_answerability_binding_margin),
               "choice_positive_anchor_w": float(choice_positive_anchor_w),
               "choice_positive_anchor_margin": float(choice_positive_anchor_margin),
               "choice_concept_bridge_w": float(choice_concept_bridge_w),
@@ -4533,6 +4681,10 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                       choice_candidate_replacement_binding_w),
                   choice_candidate_replacement_binding_margin=(
                       choice_candidate_replacement_binding_margin),
+                  choice_candidate_replacement_answerability_binding_w=(
+                      choice_candidate_replacement_answerability_binding_w),
+                  choice_candidate_replacement_answerability_binding_margin=(
+                      choice_candidate_replacement_answerability_binding_margin),
                   choice_positive_anchor_w=choice_positive_anchor_w,
                   choice_positive_anchor_margin=choice_positive_anchor_margin,
                   choice_concept_bridge_w=choice_concept_bridge_w,
@@ -4884,10 +5036,16 @@ def selftest():
         choice_model, repl_pair_txt, repl_pair_rows, repl_pair_ids))
     assert torch.isfinite(choice_candidate_replacement_binding_loss(
         choice_model, repl_pair_txt, repl_pair_rows, repl_pair_ids))
+    assert torch.isfinite(choice_candidate_replacement_answerability_binding_loss(
+        choice_model, repl_pair_txt, repl_pair_rows, repl_pair_ids))
     repl_binding_eval = qa_candidate_replacement_binding_eval(
         choice_model, choice_vocab, choice_eval, device="cpu")
     assert repl_binding_eval["n"] > 0
     assert "target_logit_drop" in repl_binding_eval
+    repl_ans_binding_eval = qa_candidate_replacement_answerability_binding_eval(
+        choice_model, choice_vocab, choice_eval, device="cpu")
+    assert repl_ans_binding_eval["n"] > 0
+    assert "target_cover_drop" in repl_ans_binding_eval
     pos_anchor_rows = choice_positive_anchor_batch_records(
         choice_eval, np.random.default_rng(16), n=3)
     assert pos_anchor_rows and all(qa_choice_target(r) != "none"
@@ -5168,6 +5326,7 @@ def selftest():
                            "qa_question_swap_control",
                            "qa_candidate_replacement_control",
                            "qa_candidate_replacement_binding_control",
+                           "qa_candidate_replacement_answerability_binding_control",
                            "qa_concept_discovery_control", "gate"}
     print("text selftest OK")
 
@@ -5309,6 +5468,15 @@ def main(argv=None):
                     default=0.0,
                     dest="choice_candidate_replacement_binding_margin",
                     help="margin for candidate-corruption target-evidence drop")
+    ap.add_argument("--choice-candidate-replacement-answerability-binding-w",
+                    type=float, default=0.0,
+                    dest="choice_candidate_replacement_answerability_binding_w",
+                    help=("weight for candidate-corruption target-coverage drop "
+                          "on QA answerability logits"))
+    ap.add_argument("--choice-candidate-replacement-answerability-binding-margin",
+                    type=float, default=0.0,
+                    dest="choice_candidate_replacement_answerability_binding_margin",
+                    help="margin for candidate-corruption target-coverage drop")
     ap.add_argument("--choice-positive-anchor-w", type=float, default=0.0,
                     dest="choice_positive_anchor_w",
                     help=("weight for answer-present positive anchor loss on final "
@@ -5533,6 +5701,10 @@ def main(argv=None):
                              args.choice_candidate_replacement_binding_w),
                          choice_candidate_replacement_binding_margin=(
                              args.choice_candidate_replacement_binding_margin),
+                         choice_candidate_replacement_answerability_binding_w=(
+                             args.choice_candidate_replacement_answerability_binding_w),
+                         choice_candidate_replacement_answerability_binding_margin=(
+                             args.choice_candidate_replacement_answerability_binding_margin),
                          choice_positive_anchor_w=args.choice_positive_anchor_w,
                          choice_positive_anchor_margin=(
                              args.choice_positive_anchor_margin),
@@ -5615,6 +5787,10 @@ def main(argv=None):
             args.choice_candidate_replacement_binding_w),
         choice_candidate_replacement_binding_margin=(
             args.choice_candidate_replacement_binding_margin),
+        choice_candidate_replacement_answerability_binding_w=(
+            args.choice_candidate_replacement_answerability_binding_w),
+        choice_candidate_replacement_answerability_binding_margin=(
+            args.choice_candidate_replacement_answerability_binding_margin),
         choice_positive_anchor_w=args.choice_positive_anchor_w,
         choice_positive_anchor_margin=args.choice_positive_anchor_margin,
         choice_concept_bridge_w=args.choice_concept_bridge_w,

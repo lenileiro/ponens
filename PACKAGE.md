@@ -773,6 +773,18 @@ regressed `squad_choice` to **0.100**, so `selected_round` stayed **0**. The use
 that candidate binding is now a separately measured internal relation, not only a final `none`
 accuracy side effect.
 
+`--choice-candidate-replacement-answerability-binding-w` adds the same target-drop pressure at the
+candidate coverage layer. The held-out `qa_candidate_replacement_answerability_binding_control`
+reports `target_cover_drop`, catching cases where the final logit changes but the model still
+believes the corrupted target is covered by the context. On the same checkpoint, the corrupted
+candidate also starts slightly higher in coverage (`target_cover_drop` **-0.0029**). A guarded
+2-step smoke activated the new loss (`cand-repl-ans-bind` **0.683**) and moved that internal
+relation positive (**0.0044**) while preserving `squad_choice` better (**0.200** vs **0.100** in
+the previous binding smoke). The round still failed the **0.05** cover-drop threshold, abstention,
+discovery, and swap controls, so `selected_round` stayed **0**. This is a better direction:
+coverage binding improves the right internal relation with less positive-answer damage, but the
+effect is still too small for an accepted self-study update.
+
 `--study-anchor-correct-repeat` and `--study-anchor-retention-bucket` expose the next curriculum
 knobs for that positive-regression problem. The anchors are not hand-authored examples: they are
 currently-correct records mined by the model during error self-study. Repeating them upweights
