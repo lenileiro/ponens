@@ -141,6 +141,57 @@ def schema_concept_contrastive_loss(states_by_key, target_ids_by_key, temperatur
     return torch.stack(losses).mean()
 
 
+def schema_concept_batch_centroid_loss(states_by_key, target_ids_by_key, temperature=0.1,
+                                       margin=0.0):
+    """Align concept states to value centroids discovered inside the current batch.
+
+    Unlike learned prototype rows, these centroids are computed from repeated observations in
+    the data. The objective is still schema-generic: it only knows that matching ids inside a
+    key should share a reusable representation, while different ids for the same key should be
+    separated by a margin.
+    """
+    temp = max(float(temperature), 1e-6)
+    margin_t = float(margin)
+    losses = []
+    for key, states in states_by_key.items():
+        targets = target_ids_by_key.get(key)
+        if targets is None:
+            continue
+        targets = targets.to(device=states.device, dtype=torch.long)
+        valid = targets.ge(0)
+        if int(valid.sum()) < 2:
+            continue
+        z = F.normalize(states[valid], dim=-1)
+        labels = targets[valid]
+        unique = labels.unique(sorted=True)
+        if unique.numel() < 2:
+            continue
+        centers = []
+        center_labels = []
+        for label in unique:
+            rows = labels.eq(label)
+            if int(rows.sum()) < 1:
+                continue
+            centers.append(F.normalize(z[rows].mean(dim=0), dim=0))
+            center_labels.append(int(label.item()))
+        if len(centers) < 2:
+            continue
+        centers = torch.stack(centers, dim=0)
+        label_to_center = {label: i for i, label in enumerate(center_labels)}
+        mapped = torch.tensor([label_to_center[int(label.item())] for label in labels],
+                              dtype=torch.long, device=states.device)
+        sim = z.matmul(centers.t())
+        losses.append(F.cross_entropy(sim / temp, mapped))
+        target_sim = sim.gather(1, mapped[:, None]).squeeze(1)
+        other_sim = sim.masked_fill(
+            F.one_hot(mapped, num_classes=centers.shape[0]).bool(),
+            -float("inf")).max(-1).values
+        losses.append(F.relu(other_sim + margin_t - target_sim).mean())
+    if not losses:
+        return _zero_from_states(states_by_key)
+    return torch.stack(losses).mean()
+
+
 def schema_concept_prototype_loss(logits_by_key, target_ids_by_key):
     """Classify projected concept states against learned prototypes for each schema key."""
     losses = []

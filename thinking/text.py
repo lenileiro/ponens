@@ -51,6 +51,7 @@ from scratchpad_model import ScratchpadLM
 
 from .concepts import (
     SchemaConceptHead,
+    schema_concept_batch_centroid_loss,
     schema_concept_contrastive_loss,
     schema_concept_prototype_alignment_loss,
     schema_concept_prototype_spread_loss,
@@ -1060,8 +1061,9 @@ class TextFactLM(nn.Module):
     """Text prefix -> canonical fact trace decoder."""
 
     def __init__(self, vocab_size, d=96, layers=3, heads=4, pad=0, max_len=512,
-                 fact_schema=None):
+                 fact_schema=None, fact_concept_prefix=False):
         super().__init__()
+        self.fact_concept_prefix = bool(fact_concept_prefix)
         self.txt = TextPrefix(vocab_size, d=d, pad=pad, heads=heads)
         self.lm = ScratchpadLM(vocab_size, d=d, layers=layers, heads=heads, max_len=max_len,
                                pad=pad, pointer=False, loop=False)
@@ -1092,9 +1094,16 @@ class TextFactLM(nn.Module):
         return prefix, pooled
 
     def forward(self, txt, ids):
-        prefix, _pooled = self.encode_text(txt)
+        prefix = self.decoder_prefix(txt)
         logits = self.lm(ids, prefix=prefix)
         return logits[:, prefix.shape[1]:]
+
+    def decoder_prefix(self, txt):
+        prefix, _pooled = self.encode_text(txt)
+        if self.fact_concept_prefix and self.fact_concepts is not None:
+            concepts = self.fact_concepts.state_tensor(prefix, mask=txt.eq(self.txt.pad))
+            prefix = torch.cat([concepts, prefix], dim=1)
+        return prefix
 
     def semantic_logits(self, txt):
         if self.fact_schema is None:
@@ -1468,6 +1477,16 @@ def fact_concept_contrastive_loss(model, txt, records, schema, temperature=0.1):
     states = model.fact_concept_geometry_states(txt)
     targets = fact_concept_target_ids(records, schema, txt.device)
     return schema_concept_contrastive_loss(states, targets, temperature=temperature)
+
+
+def fact_concept_batch_centroid_loss(model, txt, records, schema, temperature=0.1,
+                                     margin=0.0):
+    if schema is None or getattr(model, "fact_concepts", None) is None:
+        return torch.tensor(0.0, device=txt.device)
+    states = model.fact_concept_geometry_states(txt)
+    targets = fact_concept_target_ids(records, schema, txt.device)
+    return schema_concept_batch_centroid_loss(
+        states, targets, temperature=temperature, margin=margin)
 
 
 def fact_concept_prototype_loss(model, txt, records, schema, temperature=0.1):
@@ -3002,6 +3021,9 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               device=DEV, log_every=100, semantic_w=0.5, balance_by="none",
               fact_concept_w=0.0, fact_concept_contrast_w=0.0,
               fact_concept_contrast_temperature=0.1,
+              fact_concept_centroid_w=0.0,
+              fact_concept_centroid_temperature=0.1,
+              fact_concept_centroid_margin=0.0,
               fact_concept_prototype_w=0.0,
               fact_concept_prototype_spread_w=0.0,
               fact_concept_prototype_spread_margin=0.2,
@@ -3120,6 +3142,12 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 model, txt, rec_batch, model.fact_schema,
                 temperature=fact_concept_contrast_temperature)
             if fact_concept_contrast_w else torch.tensor(0.0, device=device))
+        concept_centroid_loss = (
+            fact_concept_batch_centroid_loss(
+                model, txt, rec_batch, model.fact_schema,
+                temperature=fact_concept_centroid_temperature,
+                margin=fact_concept_centroid_margin)
+            if fact_concept_centroid_w else torch.tensor(0.0, device=device))
         concept_proto_loss = (
             fact_concept_prototype_loss(
                 model, txt, rec_batch, model.fact_schema,
@@ -3458,6 +3486,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
         loss = (decode_w * dec_loss + semantic_w * sem_loss
                 + fact_concept_w * concept_fact_loss
                 + fact_concept_contrast_w * concept_contrast_loss
+                + fact_concept_centroid_w * concept_centroid_loss
                 + fact_concept_prototype_w * concept_proto_loss
                 + fact_concept_prototype_spread_w * concept_proto_spread_loss
                 + fact_concept_state_spread_w * concept_state_spread_loss
@@ -3496,6 +3525,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                   f"dec {dec_loss.item():.3f} sem {sem_loss.item():.3f} "
                   f"fact-concept {concept_fact_loss.item():.3f} "
                   f"fact-contrast {concept_contrast_loss.item():.3f} "
+                  f"fact-centroid {concept_centroid_loss.item():.3f} "
                   f"fact-proto {concept_proto_loss.item():.3f} "
                   f"fact-proto-spread {concept_proto_spread_loss.item():.3f} "
                   f"fact-state-spread {concept_state_spread_loss.item():.3f} "
@@ -3532,6 +3562,10 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                 device=DEV, log_every=100, semantic_w=0.5, balance_by="none",
                 fact_concept_w=0.0, fact_concept_contrast_w=0.0,
                 fact_concept_contrast_temperature=0.1,
+                fact_concept_centroid_w=0.0,
+                fact_concept_centroid_temperature=0.1,
+                fact_concept_centroid_margin=0.0,
+                fact_concept_prefix=False,
                 fact_concept_prototype_w=0.0,
                 fact_concept_prototype_spread_w=0.0,
                 fact_concept_prototype_spread_margin=0.2,
@@ -3583,13 +3617,18 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
     vocab = build_vocab(records)
     schema = build_fact_schema(records)
     model = TextFactLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
-                       fact_schema=schema).to(device)
+                       fact_schema=schema,
+                       fact_concept_prefix=fact_concept_prefix).to(device)
     return fit_model(model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
                      device=device, log_every=log_every, semantic_w=semantic_w,
                      balance_by=balance_by, fact_concept_w=fact_concept_w,
                      fact_concept_contrast_w=fact_concept_contrast_w,
                      fact_concept_contrast_temperature=(
                          fact_concept_contrast_temperature),
+                     fact_concept_centroid_w=fact_concept_centroid_w,
+                     fact_concept_centroid_temperature=(
+                         fact_concept_centroid_temperature),
+                     fact_concept_centroid_margin=fact_concept_centroid_margin,
                      fact_concept_prototype_w=fact_concept_prototype_w,
                      fact_concept_prototype_spread_w=fact_concept_prototype_spread_w,
                      fact_concept_prototype_spread_margin=(
@@ -4900,7 +4939,9 @@ def load_checkpoint(path, device=DEV):
     model = TextFactLM(len(vocab), d=int(ckpt.get("d", 96)),
                        layers=int(ckpt.get("layers", 3)),
                        heads=int(ckpt.get("heads", 4)), pad=vocab.pad,
-                       fact_schema=schema).to(device)
+                       fact_schema=schema,
+                       fact_concept_prefix=bool(
+                           ckpt.get("fact_concept_prefix", False))).to(device)
     state = ckpt["state_dict"]
     model.load_state_dict(state, strict=False)
     model.has_fact_concept_state = any(k.startswith("fact_concepts.") for k in state)
@@ -4915,7 +4956,9 @@ def expanded_checkpoint_model(checkpoint, records, device=DEV):
     model = TextFactLM(len(vocab), d=int(ckpt.get("d", 96)),
                        layers=int(ckpt.get("layers", 3)),
                        heads=int(ckpt.get("heads", 4)), pad=vocab.pad,
-                       fact_schema=schema).to(device)
+                       fact_schema=schema,
+                       fact_concept_prefix=bool(
+                           ckpt.get("fact_concept_prefix", False))).to(device)
     copy_pretrained_text_weights(src_model, src_vocab, model, vocab)
     model.eval()
     return model, vocab, ckpt
@@ -4923,6 +4966,7 @@ def expanded_checkpoint_model(checkpoint, records, device=DEV):
 
 def checkpoint_payload(model, vocab, d, layers, heads, report):
     return {"state_dict": model.state_dict(), "vocab": vocab.itos,
+            "fact_concept_prefix": bool(getattr(model, "fact_concept_prefix", False)),
             "d": d, "layers": layers, "heads": heads, "fact_schema": {
                 "keys": model.fact_schema.keys,
                 "values": model.fact_schema.values,
@@ -5202,6 +5246,8 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         fact_n=0, kind_fact_n=0, artifact_n=0, decode_w=1.0, choice_w=0.0,
         fact_concept_w=0.0, fact_concept_contrast_w=0.0,
         fact_concept_contrast_temperature=0.1,
+        fact_concept_centroid_w=0.0, fact_concept_centroid_temperature=0.1,
+        fact_concept_centroid_margin=0.0, fact_concept_prefix=False,
         fact_concept_prototype_w=0.0, fact_concept_prototype_spread_w=0.0,
         fact_concept_prototype_spread_margin=0.2,
         fact_concept_state_spread_w=0.0, fact_concept_state_spread_variance=0.05,
@@ -5254,6 +5300,11 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                fact_concept_contrast_w=fact_concept_contrast_w,
                                fact_concept_contrast_temperature=(
                                    fact_concept_contrast_temperature),
+                               fact_concept_centroid_w=fact_concept_centroid_w,
+                               fact_concept_centroid_temperature=(
+                                   fact_concept_centroid_temperature),
+                               fact_concept_centroid_margin=fact_concept_centroid_margin,
+                               fact_concept_prefix=fact_concept_prefix,
                                fact_concept_prototype_w=fact_concept_prototype_w,
                                fact_concept_prototype_spread_w=(
                                    fact_concept_prototype_spread_w),
@@ -5343,6 +5394,11 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
               "fact_concept_contrast_w": float(fact_concept_contrast_w),
               "fact_concept_contrast_temperature": float(
                   fact_concept_contrast_temperature),
+              "fact_concept_centroid_w": float(fact_concept_centroid_w),
+              "fact_concept_centroid_temperature": float(
+                  fact_concept_centroid_temperature),
+              "fact_concept_centroid_margin": float(fact_concept_centroid_margin),
+              "fact_concept_prefix": bool(getattr(model, "fact_concept_prefix", False)),
               "fact_concept_prototype_w": float(fact_concept_prototype_w),
               "fact_concept_prototype_spread_w": float(
                   fact_concept_prototype_spread_w),
@@ -5460,6 +5516,10 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      artifact_n=0, decode_w=1.0, choice_w=0.0,
                      fact_concept_w=0.0, fact_concept_contrast_w=0.0,
                      fact_concept_contrast_temperature=0.1,
+                     fact_concept_centroid_w=0.0,
+                     fact_concept_centroid_temperature=0.1,
+                     fact_concept_centroid_margin=0.0,
+                     fact_concept_prefix=False,
                      fact_concept_prototype_w=0.0,
                      fact_concept_prototype_spread_w=0.0,
                      fact_concept_prototype_spread_margin=0.2,
@@ -5538,6 +5598,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
     fit_records = study_records + replay_records
     torch.manual_seed(seed)
     model, vocab, ckpt = expanded_checkpoint_model(checkpoint, fit_records, device=device)
+    if fact_concept_prefix:
+        model.fact_concept_prefix = True
     d = int(ckpt.get("d", 96))
     layers = int(ckpt.get("layers", 3))
     heads = int(ckpt.get("heads", 4))
@@ -5595,6 +5657,11 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "fact_concept_contrast_w": float(fact_concept_contrast_w),
               "fact_concept_contrast_temperature": float(
                   fact_concept_contrast_temperature),
+              "fact_concept_centroid_w": float(fact_concept_centroid_w),
+              "fact_concept_centroid_temperature": float(
+                  fact_concept_centroid_temperature),
+              "fact_concept_centroid_margin": float(fact_concept_centroid_margin),
+              "fact_concept_prefix": bool(getattr(model, "fact_concept_prefix", False)),
               "fact_concept_prototype_w": float(fact_concept_prototype_w),
               "fact_concept_prototype_spread_w": float(
                   fact_concept_prototype_spread_w),
@@ -5946,6 +6013,10 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   fact_concept_contrast_w=fact_concept_contrast_w,
                   fact_concept_contrast_temperature=(
                       fact_concept_contrast_temperature),
+                  fact_concept_centroid_w=fact_concept_centroid_w,
+                  fact_concept_centroid_temperature=(
+                      fact_concept_centroid_temperature),
+                  fact_concept_centroid_margin=fact_concept_centroid_margin,
                   fact_concept_prototype_w=fact_concept_prototype_w,
                   fact_concept_prototype_spread_w=fact_concept_prototype_spread_w,
                   fact_concept_prototype_spread_margin=(
@@ -6273,6 +6344,8 @@ def selftest():
         choice_model, choice_txt, choice_eval, choice_schema))
     assert torch.isfinite(fact_concept_contrastive_loss(
         choice_model, choice_txt, choice_eval, choice_schema))
+    assert torch.isfinite(fact_concept_batch_centroid_loss(
+        choice_model, choice_txt, choice_eval, choice_schema))
     assert torch.isfinite(fact_concept_prototype_loss(
         choice_model, choice_txt, choice_eval, choice_schema))
     assert torch.isfinite(fact_concept_prototype_spread_loss(choice_model))
@@ -6284,6 +6357,12 @@ def selftest():
     concept_geometry_report = fact_concept_geometry_eval(
         choice_model, choice_vocab, choice_eval, device="cpu")
     assert set(concept_geometry_report) >= {"nearest_same_acc", "margin"}
+    prefix_model = TextFactLM(len(choice_vocab), d=32, layers=1, heads=4,
+                              pad=choice_vocab.pad, fact_schema=choice_schema,
+                              fact_concept_prefix=True).to("cpu")
+    raw_prefix, _pooled = prefix_model.encode_text(choice_txt)
+    decoder_prefix = prefix_model.decoder_prefix(choice_txt)
+    assert decoder_prefix.shape[1] == raw_prefix.shape[1] + len(choice_schema.keys)
     assert torch.isfinite(choice_loss(choice_model, choice_txt, choice_eval))
     assert torch.isfinite(choice_loss(choice_model, choice_txt, choice_eval,
                                       answer_margin=0.25, none_margin=0.25))
@@ -6826,6 +6905,18 @@ def main(argv=None):
     ap.add_argument("--fact-concept-contrast-temperature", type=float, default=0.1,
                     dest="fact_concept_contrast_temperature",
                     help="temperature for schema concept geometry contrastive loss")
+    ap.add_argument("--fact-concept-centroid-w", type=float, default=0.0,
+                    dest="fact_concept_centroid_w",
+                    help="weight for batch-discovered same-value concept centroid loss")
+    ap.add_argument("--fact-concept-centroid-temperature", type=float, default=0.1,
+                    dest="fact_concept_centroid_temperature",
+                    help="temperature for batch-discovered concept centroid loss")
+    ap.add_argument("--fact-concept-centroid-margin", type=float, default=0.0,
+                    dest="fact_concept_centroid_margin",
+                    help="minimum margin between own centroid and other value centroids")
+    ap.add_argument("--fact-concept-prefix", action="store_true",
+                    dest="fact_concept_prefix",
+                    help="prepend schema concept states to the text decoder prefix")
     ap.add_argument("--fact-concept-prototype-w", type=float, default=0.0,
                     dest="fact_concept_prototype_w",
                     help="weight for schema-generic learned concept prototype loss")
@@ -7096,12 +7187,17 @@ def main(argv=None):
         selftest()
         return
     if (args.fact_concept_w < 0.0 or args.fact_concept_contrast_w < 0.0
+            or args.fact_concept_centroid_w < 0.0
             or args.fact_concept_prototype_w < 0.0
             or args.fact_concept_prototype_spread_w < 0.0
             or args.fact_concept_state_spread_w < 0.0):
         ap.error("fact concept loss weights must be non-negative")
     if args.fact_concept_contrast_temperature <= 0.0:
         ap.error("--fact-concept-contrast-temperature must be positive")
+    if args.fact_concept_centroid_temperature <= 0.0:
+        ap.error("--fact-concept-centroid-temperature must be positive")
+    if args.fact_concept_centroid_margin < 0.0:
+        ap.error("--fact-concept-centroid-margin must be non-negative")
     if args.fact_concept_prototype_spread_margin < -1.0:
         ap.error("--fact-concept-prototype-spread-margin must be >= -1")
     if args.fact_concept_state_spread_variance < 0.0:
@@ -7175,6 +7271,12 @@ def main(argv=None):
                          fact_concept_contrast_w=args.fact_concept_contrast_w,
                          fact_concept_contrast_temperature=(
                              args.fact_concept_contrast_temperature),
+                         fact_concept_centroid_w=args.fact_concept_centroid_w,
+                         fact_concept_centroid_temperature=(
+                             args.fact_concept_centroid_temperature),
+                         fact_concept_centroid_margin=(
+                             args.fact_concept_centroid_margin),
+                         fact_concept_prefix=args.fact_concept_prefix,
                          fact_concept_prototype_w=args.fact_concept_prototype_w,
                          fact_concept_prototype_spread_w=(
                              args.fact_concept_prototype_spread_w),
@@ -7304,6 +7406,10 @@ def main(argv=None):
         decode_w=args.decode_w, fact_concept_w=args.fact_concept_w,
         fact_concept_contrast_w=args.fact_concept_contrast_w,
         fact_concept_contrast_temperature=args.fact_concept_contrast_temperature,
+        fact_concept_centroid_w=args.fact_concept_centroid_w,
+        fact_concept_centroid_temperature=args.fact_concept_centroid_temperature,
+        fact_concept_centroid_margin=args.fact_concept_centroid_margin,
+        fact_concept_prefix=args.fact_concept_prefix,
         fact_concept_prototype_w=args.fact_concept_prototype_w,
         fact_concept_prototype_spread_w=args.fact_concept_prototype_spread_w,
         fact_concept_prototype_spread_margin=(

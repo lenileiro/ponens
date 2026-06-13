@@ -33,6 +33,7 @@ from scratchpad_model import ScratchpadLM
 from .audio import (ENVELOPES, PITCH_NAMES, TIMBRES, render_tone, sample_clip, spectrogram)
 from .concepts import (
     SchemaConceptHead,
+    schema_concept_batch_centroid_loss,
     schema_concept_contrastive_loss,
     schema_concept_prototype_alignment_loss,
     schema_concept_prototype_spread_loss,
@@ -335,7 +336,7 @@ class MultimodalLM(nn.Module):
     def __init__(self, vocab_size, d=96, layers=3, heads=4, pad=0, max_len=128,
                  img_tokens=4, aud_tokens=8, txt_tokens=8, trunk_arch="conv",
                  trunk_width=64, trunk_depth=1, text_layers=1, modality_dropout=0.0,
-                 concept_tokens=4, fusion_layers=1):
+                 concept_tokens=4, fusion_layers=1, concept_prefix=False):
         super().__init__()
         if img_tokens <= 0 or aud_tokens <= 0 or txt_tokens <= 0:
             raise ValueError("multimodal prefix token counts must be positive")
@@ -351,8 +352,10 @@ class MultimodalLM(nn.Module):
             "text_layers": int(text_layers), "modality_dropout": float(modality_dropout),
             "fusion": "concept", "concept_tokens": int(concept_tokens),
             "fusion_layers": int(fusion_layers),
+            "concept_prefix": bool(concept_prefix),
         }
         self.modality_dropout = float(modality_dropout)
+        self.concept_prefix = bool(concept_prefix)
         self.lm = ScratchpadLM(vocab_size, d=d, layers=layers, heads=heads, max_len=max_len,
                                pad=pad, pointer=False, loop=False)
         img_pool = _grid_pool(img_tokens)
@@ -422,8 +425,16 @@ class MultimodalLM(nn.Module):
         return self.factor_logits_from_states(
             self.factor_concept_states(img, aud, txt, mode=mode))
 
+    def decoder_prefix(self, img, aud, txt, mode="full"):
+        prefix, concepts = self.encode_prefix(img, aud, txt, mode=mode)
+        if self.concept_prefix:
+            source = concepts if concepts is not None else prefix
+            factor_states = self.factor_concepts.state_tensor(source)
+            prefix = torch.cat([factor_states, prefix], dim=1)
+        return prefix
+
     def forward(self, img, aud, txt, ids, mode="full"):
-        prefix, _concepts = self.encode_prefix(img, aud, txt, mode=mode)
+        prefix = self.decoder_prefix(img, aud, txt, mode=mode)
         logits = self.lm(ids, prefix=prefix)
         return logits[:, prefix.shape[1]:]                  # token positions only
 
@@ -802,6 +813,24 @@ def concept_factor_contrastive_loss(factor_states_by_mode, golds, temperature=0.
     return torch.stack(losses).mean()
 
 
+def concept_factor_centroid_loss(factor_geometry_states_by_mode, golds, temperature=0.1,
+                                 margin=0.0):
+    if not factor_geometry_states_by_mode:
+        return torch.tensor(0.0)
+    first_mode = next(iter(factor_geometry_states_by_mode.values()))
+    first_factor = next(iter(first_mode.values()))
+    device = first_factor.device
+    targets = concept_factor_target_ids(golds, device)
+    losses = [
+        schema_concept_batch_centroid_loss(
+            states, targets, temperature=temperature, margin=margin)
+        for states in factor_geometry_states_by_mode.values()
+    ]
+    if not losses:
+        return torch.tensor(0.0, device=device)
+    return torch.stack(losses).mean()
+
+
 def concept_factor_prototype_loss(model, factor_geometry_states_by_mode, golds,
                                   temperature=0.1):
     if not factor_geometry_states_by_mode:
@@ -983,11 +1012,13 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           surfaces_path=None, layers=3, heads=4, max_len=128, img_tokens=4, aud_tokens=8,
           txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
           modality_dropout=0.0, agreement_w=0.0, concept_tokens=4, fusion_layers=1,
-          concept_w=0.0, concept_agreement_w=0.0,
+          concept_prefix=False, concept_w=0.0, concept_agreement_w=0.0,
           concept_distill_w=0.0, concept_distill_temperature=1.0,
           concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
           concept_transfer_w=0.0, concept_transfer_margin=0.0,
           concept_contrast_w=0.0, concept_contrast_temperature=0.1,
+          concept_centroid_w=0.0, concept_centroid_temperature=0.1,
+          concept_centroid_margin=0.0,
           concept_prototype_w=0.0, concept_prototype_spread_w=0.0,
           concept_prototype_spread_margin=0.2,
           concept_state_spread_w=0.0, concept_state_spread_variance=0.05,
@@ -1002,11 +1033,13 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                          txt_tokens=txt_tokens, trunk_arch=trunk_arch, trunk_width=trunk_width,
                          trunk_depth=trunk_depth, text_layers=text_layers,
                          modality_dropout=modality_dropout, concept_tokens=concept_tokens,
-                         fusion_layers=fusion_layers).to(device)
+                         fusion_layers=fusion_layers,
+                         concept_prefix=concept_prefix).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     last_base = last_agreement = last_concept = 0.0
     last_concept_agreement = last_concept_distill = last_concept_rank_distill = 0.0
     last_concept_transfer = last_concept_contrast = 0.0
+    last_concept_centroid = 0.0
     last_concept_prototype = last_concept_prototype_spread = 0.0
     last_concept_state_spread = 0.0
     for st in range(1, steps + 1):
@@ -1022,7 +1055,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         needs_factor_batch = (
             concept_w or concept_agreement_w or concept_distill_w
             or concept_rank_distill_w or concept_transfer_w
-            or concept_contrast_w or concept_prototype_w or concept_state_spread_w)
+            or concept_contrast_w or concept_centroid_w or concept_prototype_w
+            or concept_state_spread_w)
         if needs_factor_batch:
             factor_states_by_mode = {
                 mode: model.factor_concept_states(img, aud, txt, mode=mode)
@@ -1054,13 +1088,19 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
             factor_geometry_states_by_mode = (
                 {mode: model.factor_geometry_from_states(states)
                  for mode, states in factor_states_by_mode.items()}
-                if (concept_contrast_w or concept_prototype_w
+                if (concept_contrast_w or concept_centroid_w or concept_prototype_w
                     or concept_state_spread_w) else {})
             concept_contrast = (
                 concept_factor_contrastive_loss(
                     factor_geometry_states_by_mode, golds,
                     temperature=concept_contrast_temperature)
                 if concept_contrast_w else base_loss * 0.0)
+            concept_centroid = (
+                concept_factor_centroid_loss(
+                    factor_geometry_states_by_mode, golds,
+                    temperature=concept_centroid_temperature,
+                    margin=concept_centroid_margin)
+                if concept_centroid_w else base_loss * 0.0)
             concept_prototype = (
                 concept_factor_prototype_loss(
                     model, factor_geometry_states_by_mode, golds,
@@ -1080,6 +1120,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
             concept_rank_distill = base_loss * 0.0
             concept_transfer = base_loss * 0.0
             concept_contrast = base_loss * 0.0
+            concept_centroid = base_loss * 0.0
             concept_prototype = base_loss * 0.0
             concept_state_spread = base_loss * 0.0
         concept_prototype_spread = (
@@ -1093,6 +1134,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                 + float(concept_rank_distill_w) * concept_rank_distill
                 + float(concept_transfer_w) * concept_transfer
                 + float(concept_contrast_w) * concept_contrast
+                + float(concept_centroid_w) * concept_centroid
                 + float(concept_prototype_w) * concept_prototype
                 + float(concept_prototype_spread_w) * concept_prototype_spread
                 + float(concept_state_spread_w) * concept_state_spread)
@@ -1107,6 +1149,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         last_concept_rank_distill = float(concept_rank_distill.detach())
         last_concept_transfer = float(concept_transfer.detach())
         last_concept_contrast = float(concept_contrast.detach())
+        last_concept_centroid = float(concept_centroid.detach())
         last_concept_prototype = float(concept_prototype.detach())
         last_concept_prototype_spread = float(concept_prototype_spread.detach())
         last_concept_state_spread = float(concept_state_spread.detach())
@@ -1119,6 +1162,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                   f"concept-rank {last_concept_rank_distill:.3f} "
                   f"concept-transfer {last_concept_transfer:.3f} "
                   f"concept-contrast {last_concept_contrast:.3f} "
+                  f"concept-centroid {last_concept_centroid:.3f} "
                   f"concept-proto {last_concept_prototype:.3f} "
                   f"concept-proto-spread {last_concept_prototype_spread:.3f} "
                   f"concept-state-spread {last_concept_state_spread:.3f}",
@@ -1130,6 +1174,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                            "concept_rank_distill_loss": last_concept_rank_distill,
                            "concept_transfer_loss": last_concept_transfer,
                            "concept_contrast_loss": last_concept_contrast,
+                           "concept_centroid_loss": last_concept_centroid,
                            "concept_prototype_loss": last_concept_prototype,
                            "concept_prototype_spread_loss": (
                                last_concept_prototype_spread),
@@ -1156,11 +1201,13 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         batch=32, d=96, lr=1e-3, layers=3, heads=4, max_len=128, img_tokens=4, aud_tokens=8,
         txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
         modality_dropout=0.0, agreement_w=0.0, concept_tokens=4, fusion_layers=1,
-        concept_w=0.0, concept_agreement_w=0.0,
+        concept_prefix=False, concept_w=0.0, concept_agreement_w=0.0,
         concept_distill_w=0.0, concept_distill_temperature=1.0,
         concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
         concept_transfer_w=0.0, concept_transfer_margin=0.0,
         concept_contrast_w=0.0, concept_contrast_temperature=0.1,
+        concept_centroid_w=0.0, concept_centroid_temperature=0.1,
+        concept_centroid_margin=0.0,
         concept_prototype_w=0.0, concept_prototype_spread_w=0.0,
         concept_prototype_spread_margin=0.2,
         concept_state_spread_w=0.0, concept_state_spread_variance=0.05,
@@ -1175,7 +1222,8 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                    text_layers=text_layers,
                                    modality_dropout=modality_dropout,
                                    agreement_w=agreement_w, concept_tokens=concept_tokens,
-                                   fusion_layers=fusion_layers, concept_w=concept_w,
+                                   fusion_layers=fusion_layers,
+                                   concept_prefix=concept_prefix, concept_w=concept_w,
                                    concept_agreement_w=concept_agreement_w,
                                    concept_distill_w=concept_distill_w,
                                    concept_distill_temperature=(
@@ -1186,6 +1234,9 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                    concept_transfer_margin=concept_transfer_margin,
                                    concept_contrast_w=concept_contrast_w,
                                    concept_contrast_temperature=concept_contrast_temperature,
+                                   concept_centroid_w=concept_centroid_w,
+                                   concept_centroid_temperature=concept_centroid_temperature,
+                                   concept_centroid_margin=concept_centroid_margin,
                                    concept_prototype_w=concept_prototype_w,
                                    concept_prototype_spread_w=concept_prototype_spread_w,
                                    concept_prototype_spread_margin=(
@@ -1229,10 +1280,15 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
     architecture["img_pool"] = list(model.img.pool)
     architecture["aud_pool"] = list(model.aud.pool)
     architecture["reader_prefix_tokens"] = int(img_tokens) + int(aud_tokens) + int(txt_tokens)
-    architecture["prefix_tokens"] = architecture["reader_prefix_tokens"] + int(concept_tokens)
+    architecture["schema_concept_prefix_tokens"] = (
+        len(VALUE_POS) if bool(concept_prefix) else 0)
+    architecture["prefix_tokens"] = (
+        architecture["reader_prefix_tokens"] + int(concept_tokens)
+        + architecture["schema_concept_prefix_tokens"])
     report = {"experiment": "m0_multimodal_bridge", "steps": steps, "batch": int(batch),
               "lr": float(lr), "value_w": float(value_w),
               "agreement_w": float(agreement_w),
+              "concept_prefix": bool(concept_prefix),
               "concept_w": float(concept_w),
               "concept_agreement_w": float(concept_agreement_w),
               "concept_distill_w": float(concept_distill_w),
@@ -1243,6 +1299,9 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
               "concept_transfer_margin": float(concept_transfer_margin),
               "concept_contrast_w": float(concept_contrast_w),
               "concept_contrast_temperature": float(concept_contrast_temperature),
+              "concept_centroid_w": float(concept_centroid_w),
+              "concept_centroid_temperature": float(concept_centroid_temperature),
+              "concept_centroid_margin": float(concept_centroid_margin),
               "concept_prototype_w": float(concept_prototype_w),
               "concept_prototype_spread_w": float(concept_prototype_spread_w),
               "concept_prototype_spread_margin": float(
@@ -1334,6 +1393,14 @@ def selftest():
     assert concepts is not None and concepts.shape == (2, model.config["concept_tokens"], 32)
     assert prefix.shape[1] == (model.config["img_tokens"] + model.config["aud_tokens"]
                                + model.config["txt_tokens"] + model.config["concept_tokens"])
+    assert model.decoder_prefix(x, a, tt, mode="full").shape[1] == prefix.shape[1]
+    prefix_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
+                                concept_prefix=True).to("cpu")
+    prefix_base, _prefix_concepts = prefix_model.encode_prefix(x, a, tt, mode="full")
+    prefix_decoder = prefix_model.decoder_prefix(x, a, tt, mode="full")
+    assert prefix_model.config["concept_prefix"] is True
+    assert prefix_decoder.shape[1] == prefix_base.shape[1] + len(VALUE_POS)
+    assert prefix_model(x, a, tt, ids).shape == logits.shape
     factor_logits = {mode: model.factor_logits(x, a, tt, mode=mode) for mode in MODES}
     factor_states = {mode: model.factor_concept_states(x, a, tt, mode=mode) for mode in MODES}
     factor_geometry_states = {
@@ -1346,6 +1413,8 @@ def selftest():
     concept_loss = concept_factor_loss(factor_logits, golds)
     assert torch.isfinite(concept_loss), concept_loss
     assert torch.isfinite(concept_factor_contrastive_loss(
+        factor_geometry_states, golds, temperature=0.2))
+    assert torch.isfinite(concept_factor_centroid_loss(
         factor_geometry_states, golds, temperature=0.2))
     assert torch.isfinite(concept_factor_prototype_loss(
         model, factor_geometry_states, golds, temperature=0.2))
@@ -1407,6 +1476,8 @@ def main(argv=None):
                     help="shared concept tokens prepended before the decoder in concept fusion")
     ap.add_argument("--fusion-layers", type=int, default=1, dest="fusion_layers",
                     help="transformer layers used by concept prefix fusion")
+    ap.add_argument("--concept-prefix", action="store_true", dest="concept_prefix",
+                    help="prepend schema concept states to the decoder prefix")
     ap.add_argument("--concept-w", type=float, default=0.0, dest="concept_w",
                     help="supervised upstream concept-token factor loss weight")
     ap.add_argument("--concept-agreement-w", type=float, default=0.0,
@@ -1437,6 +1508,15 @@ def main(argv=None):
     ap.add_argument("--concept-contrast-temperature", type=float, default=0.1,
                     dest="concept_contrast_temperature",
                     help="temperature for same-value concept-state contrastive loss")
+    ap.add_argument("--concept-centroid-w", type=float, default=0.0,
+                    dest="concept_centroid_w",
+                    help="batch-discovered same-value concept centroid loss weight")
+    ap.add_argument("--concept-centroid-temperature", type=float, default=0.1,
+                    dest="concept_centroid_temperature",
+                    help="temperature for batch-discovered concept centroid loss")
+    ap.add_argument("--concept-centroid-margin", type=float, default=0.0,
+                    dest="concept_centroid_margin",
+                    help="minimum margin between own centroid and other value centroids")
     ap.add_argument("--concept-prototype-w", type=float, default=0.0,
                     dest="concept_prototype_w",
                     help="prototype classification loss weight for concept geometry states")
@@ -1501,7 +1581,8 @@ def main(argv=None):
     if (args.agreement_w < 0.0 or args.concept_w < 0.0
             or args.concept_agreement_w < 0.0 or args.concept_distill_w < 0.0
             or args.concept_rank_distill_w < 0.0 or args.concept_transfer_w < 0.0
-            or args.concept_contrast_w < 0.0 or args.concept_prototype_w < 0.0
+            or args.concept_contrast_w < 0.0 or args.concept_centroid_w < 0.0
+            or args.concept_prototype_w < 0.0
             or args.concept_prototype_spread_w < 0.0
             or args.concept_state_spread_w < 0.0):
         ap.error("agreement/concept loss weights must be non-negative")
@@ -1513,6 +1594,10 @@ def main(argv=None):
         ap.error("--concept-distill-temperature must be positive")
     if args.concept_contrast_temperature <= 0.0:
         ap.error("--concept-contrast-temperature must be positive")
+    if args.concept_centroid_temperature <= 0.0:
+        ap.error("--concept-centroid-temperature must be positive")
+    if args.concept_centroid_margin < 0.0:
+        ap.error("--concept-centroid-margin must be non-negative")
     if args.concept_prototype_spread_margin < 0.0:
         ap.error("--concept-prototype-spread-margin must be non-negative")
     if args.concept_state_spread_variance < 0.0:
@@ -1539,7 +1624,7 @@ def main(argv=None):
                  trunk_width=args.trunk_width, trunk_depth=args.trunk_depth,
                  text_layers=args.text_layers, modality_dropout=args.modality_dropout,
                  agreement_w=args.agreement_w, concept_tokens=args.concept_tokens,
-                 fusion_layers=args.fusion_layers,
+                 fusion_layers=args.fusion_layers, concept_prefix=args.concept_prefix,
                  concept_w=args.concept_w,
                  concept_agreement_w=args.concept_agreement_w,
                  concept_distill_w=args.concept_distill_w,
@@ -1550,6 +1635,9 @@ def main(argv=None):
                  concept_transfer_margin=args.concept_transfer_margin,
                  concept_contrast_w=args.concept_contrast_w,
                  concept_contrast_temperature=args.concept_contrast_temperature,
+                 concept_centroid_w=args.concept_centroid_w,
+                 concept_centroid_temperature=args.concept_centroid_temperature,
+                 concept_centroid_margin=args.concept_centroid_margin,
                  concept_prototype_w=args.concept_prototype_w,
                  concept_prototype_spread_w=args.concept_prototype_spread_w,
                  concept_prototype_spread_margin=(
