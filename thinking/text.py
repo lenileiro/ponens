@@ -47,7 +47,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from device import get_device
-from scratchpad_model import ScratchpadLM
+from scratchpad_model import CausalBlock, ScratchpadLM
 
 from .concepts import (
     SchemaConceptHead,
@@ -1034,18 +1034,38 @@ def fact_schema_from_payload(payload):
     )
 
 
+TEXT_ENCODER_ARCHES = ("transformer", "standard", "relational", "abstractor")
+
+
 class TextPrefix(nn.Module):
     """Bidirectional text encoder producing continuous prefix embeddings."""
 
-    def __init__(self, vocab_size, d, pad=0, heads=4, max_len=256):
+    def __init__(self, vocab_size, d, pad=0, heads=4, max_len=256, layers=1,
+                 arch="transformer"):
         super().__init__()
         self.pad = pad
+        self.arch = str(arch)
+        self.layers = int(layers)
+        if self.arch not in TEXT_ENCODER_ARCHES:
+            raise ValueError(f"unknown text encoder architecture {self.arch!r}")
+        if self.layers <= 0:
+            raise ValueError("text encoder layers must be positive")
         self.emb = nn.Embedding(vocab_size, d, padding_idx=pad)
         self.pos = nn.Embedding(max_len, d)
-        layer = nn.TransformerEncoderLayer(
-            d_model=d, nhead=heads, dim_feedforward=4 * d, dropout=0.0,
-            activation="gelu", batch_first=True)
-        self.enc = nn.TransformerEncoder(layer, num_layers=1, enable_nested_tensor=False)
+        if self.arch == "transformer":
+            layer = nn.TransformerEncoderLayer(
+                d_model=d, nhead=heads, dim_feedforward=4 * d, dropout=0.0,
+                activation="gelu", batch_first=True)
+            self.enc = nn.TransformerEncoder(
+                layer, num_layers=self.layers, enable_nested_tensor=False)
+            self.blocks = None
+        else:
+            self.enc = None
+            self.blocks = nn.ModuleList([
+                CausalBlock(d, heads, arch=self.arch, vocab=vocab_size,
+                            pos_mode="none", causal=False)
+                for _ in range(self.layers)
+            ])
         self.ln = nn.LayerNorm(d)
 
     def forward(self, ids):
@@ -1053,7 +1073,11 @@ class TextPrefix(nn.Module):
         pos = torch.arange(L, device=ids.device).clamp_max(self.pos.num_embeddings - 1)
         mask = ids.eq(self.pad)
         h = self.emb(ids) + self.pos(pos)[None]
-        h = self.enc(h, src_key_padding_mask=mask)
+        if self.enc is not None:
+            h = self.enc(h, src_key_padding_mask=mask)
+        else:
+            for block in self.blocks:
+                h = block(h, ids, mask)
         return self.ln(h).masked_fill(mask.unsqueeze(-1), 0.0)
 
 
@@ -1061,10 +1085,15 @@ class TextFactLM(nn.Module):
     """Text prefix -> canonical fact trace decoder."""
 
     def __init__(self, vocab_size, d=96, layers=3, heads=4, pad=0, max_len=512,
-                 fact_schema=None, fact_concept_prefix=False):
+                 fact_schema=None, fact_concept_prefix=False,
+                 text_encoder_arch="transformer", text_encoder_layers=1):
         super().__init__()
         self.fact_concept_prefix = bool(fact_concept_prefix)
-        self.txt = TextPrefix(vocab_size, d=d, pad=pad, heads=heads)
+        self.text_encoder_arch = str(text_encoder_arch)
+        self.text_encoder_layers = int(text_encoder_layers)
+        self.txt = TextPrefix(vocab_size, d=d, pad=pad, heads=heads,
+                              layers=self.text_encoder_layers,
+                              arch=self.text_encoder_arch)
         self.lm = ScratchpadLM(vocab_size, d=d, layers=layers, heads=heads, max_len=max_len,
                                pad=pad, pointer=False, loop=False)
         self.choice_query = nn.Linear(d, d, bias=False)
@@ -3558,8 +3587,10 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
     return model, vocab
 
 
-def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, seed=0,
-                device=DEV, log_every=100, semantic_w=0.5, balance_by="none",
+def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4,
+                text_encoder_arch="transformer", text_encoder_layers=1,
+                lr=1e-3, seed=0, device=DEV, log_every=100,
+                semantic_w=0.5, balance_by="none",
                 fact_concept_w=0.0, fact_concept_contrast_w=0.0,
                 fact_concept_contrast_temperature=0.1,
                 fact_concept_centroid_w=0.0,
@@ -3618,7 +3649,9 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
     schema = build_fact_schema(records)
     model = TextFactLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
                        fact_schema=schema,
-                       fact_concept_prefix=fact_concept_prefix).to(device)
+                       fact_concept_prefix=fact_concept_prefix,
+                       text_encoder_arch=text_encoder_arch,
+                       text_encoder_layers=text_encoder_layers).to(device)
     return fit_model(model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
                      device=device, log_every=log_every, semantic_w=semantic_w,
                      balance_by=balance_by, fact_concept_w=fact_concept_w,
@@ -4941,7 +4974,10 @@ def load_checkpoint(path, device=DEV):
                        heads=int(ckpt.get("heads", 4)), pad=vocab.pad,
                        fact_schema=schema,
                        fact_concept_prefix=bool(
-                           ckpt.get("fact_concept_prefix", False))).to(device)
+                           ckpt.get("fact_concept_prefix", False)),
+                       text_encoder_arch=ckpt.get("text_encoder_arch", "transformer"),
+                       text_encoder_layers=int(
+                           ckpt.get("text_encoder_layers", 1))).to(device)
     state = ckpt["state_dict"]
     model.load_state_dict(state, strict=False)
     model.has_fact_concept_state = any(k.startswith("fact_concepts.") for k in state)
@@ -4958,7 +4994,10 @@ def expanded_checkpoint_model(checkpoint, records, device=DEV):
                        heads=int(ckpt.get("heads", 4)), pad=vocab.pad,
                        fact_schema=schema,
                        fact_concept_prefix=bool(
-                           ckpt.get("fact_concept_prefix", False))).to(device)
+                           ckpt.get("fact_concept_prefix", False)),
+                       text_encoder_arch=ckpt.get("text_encoder_arch", "transformer"),
+                       text_encoder_layers=int(
+                           ckpt.get("text_encoder_layers", 1))).to(device)
     copy_pretrained_text_weights(src_model, src_vocab, model, vocab)
     model.eval()
     return model, vocab, ckpt
@@ -4967,6 +5006,8 @@ def expanded_checkpoint_model(checkpoint, records, device=DEV):
 def checkpoint_payload(model, vocab, d, layers, heads, report):
     return {"state_dict": model.state_dict(), "vocab": vocab.itos,
             "fact_concept_prefix": bool(getattr(model, "fact_concept_prefix", False)),
+            "text_encoder_arch": getattr(model, "text_encoder_arch", "transformer"),
+            "text_encoder_layers": int(getattr(model, "text_encoder_layers", 1)),
             "d": d, "layers": layers, "heads": heads, "fact_schema": {
                 "keys": model.fact_schema.keys,
                 "values": model.fact_schema.values,
@@ -5243,6 +5284,7 @@ def eval_checkpoint(checkpoint, data, out=None, device=DEV, max_new=160, free_n=
 def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, out=None,
         checkpoint=None, max_new=160, semantic_w=0.5, free_n=0, paraphrase_n=0,
         counterfactual_n=0, kind_free_n=0, balance_by="none",
+        text_encoder_arch="transformer", text_encoder_layers=1,
         fact_n=0, kind_fact_n=0, artifact_n=0, decode_w=1.0, choice_w=0.0,
         fact_concept_w=0.0, fact_concept_contrast_w=0.0,
         fact_concept_contrast_temperature=0.1,
@@ -5295,7 +5337,10 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         choice_control_contrast_w=0.0, choice_control_margin=0.0):
     records = load_records(data)
     model, vocab = train_model(records, steps=steps, batch=batch, d=d, layers=layers,
-                               heads=heads, seed=seed, device=device, semantic_w=semantic_w,
+                               heads=heads,
+                               text_encoder_arch=text_encoder_arch,
+                               text_encoder_layers=text_encoder_layers,
+                               seed=seed, device=device, semantic_w=semantic_w,
                                balance_by=balance_by, fact_concept_w=fact_concept_w,
                                fact_concept_contrast_w=fact_concept_contrast_w,
                                fact_concept_contrast_temperature=(
@@ -5389,6 +5434,9 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                choice_control_margin=choice_control_margin)
     report = {"experiment": "text0_semantic_extraction", "data": data, "steps": steps,
               "d": int(d), "layers": int(layers), "heads": int(heads),
+              "text_encoder_arch": getattr(model, "text_encoder_arch", text_encoder_arch),
+              "text_encoder_layers": int(getattr(
+                  model, "text_encoder_layers", text_encoder_layers)),
               "decode_w": float(decode_w), "semantic_w": float(semantic_w),
               "fact_concept_w": float(fact_concept_w),
               "fact_concept_contrast_w": float(fact_concept_contrast_w),
@@ -5651,6 +5699,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "steps": int(steps),
               "batch": int(batch),
               "lr": float(lr),
+              "text_encoder_arch": getattr(model, "text_encoder_arch", "transformer"),
+              "text_encoder_layers": int(getattr(model, "text_encoder_layers", 1)),
               "decode_w": float(decode_w),
               "semantic_w": float(semantic_w),
               "fact_concept_w": float(fact_concept_w),
@@ -6363,6 +6413,14 @@ def selftest():
     raw_prefix, _pooled = prefix_model.encode_text(choice_txt)
     decoder_prefix = prefix_model.decoder_prefix(choice_txt)
     assert decoder_prefix.shape[1] == raw_prefix.shape[1] + len(choice_schema.keys)
+    rel_model = TextFactLM(len(choice_vocab), d=32, layers=1, heads=4,
+                           pad=choice_vocab.pad, fact_schema=choice_schema,
+                           text_encoder_arch="relational",
+                           text_encoder_layers=1).to("cpu")
+    rel_logits = rel_model(choice_txt, _choice_ids)
+    assert rel_logits.shape[:2] == _choice_ids.shape
+    assert torch.isfinite(fact_concept_loss(
+        rel_model, choice_txt, choice_eval, choice_schema))
     assert torch.isfinite(choice_loss(choice_model, choice_txt, choice_eval))
     assert torch.isfinite(choice_loss(choice_model, choice_txt, choice_eval,
                                       answer_margin=0.25, none_margin=0.25))
@@ -6874,6 +6932,12 @@ def main(argv=None):
     ap.add_argument("--d", type=int, default=96)
     ap.add_argument("--layers", type=int, default=3)
     ap.add_argument("--heads", type=int, default=4)
+    ap.add_argument("--text-encoder-arch", choices=TEXT_ENCODER_ARCHES,
+                    default="transformer",
+                    help=("text encoder architecture: transformer keeps the legacy encoder; "
+                          "relational/abstractor use symbolic-value attention"))
+    ap.add_argument("--text-encoder-layers", type=int, default=1,
+                    help="number of bidirectional text encoder layers before concept heads")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-new", type=int, default=160, dest="max_new")
     ap.add_argument("--free-n", type=int, default=0, dest="free_n",
@@ -7186,6 +7250,18 @@ def main(argv=None):
     if args.selftest:
         selftest()
         return
+    for name, value in {
+        "--steps": args.steps, "--batch": args.batch, "--d": args.d,
+        "--layers": args.layers, "--heads": args.heads,
+        "--text-encoder-layers": args.text_encoder_layers,
+    }.items():
+        if value <= 0:
+            ap.error(f"{name} must be positive")
+    if args.d % args.heads != 0:
+        ap.error("--d must be divisible by --heads")
+    if (args.text_encoder_arch in ("relational", "abstractor")
+            and args.heads % 2 != 0):
+        ap.error("--text-encoder-arch relational/abstractor require an even --heads value")
     if (args.fact_concept_w < 0.0 or args.fact_concept_contrast_w < 0.0
             or args.fact_concept_centroid_w < 0.0
             or args.fact_concept_prototype_w < 0.0
@@ -7398,7 +7474,9 @@ def main(argv=None):
                          study_confirm_seed_stride=args.study_confirm_seed_stride)
         return
     run(args.data, steps=args.steps, batch=args.batch, d=args.d, layers=args.layers,
-        heads=args.heads, seed=args.seed, out=args.out, checkpoint=args.checkpoint,
+        heads=args.heads, text_encoder_arch=args.text_encoder_arch,
+        text_encoder_layers=args.text_encoder_layers,
+        seed=args.seed, out=args.out, checkpoint=args.checkpoint,
         max_new=args.max_new, semantic_w=args.semantic_w, free_n=args.free_n,
         paraphrase_n=args.paraphrase_n, counterfactual_n=args.counterfactual_n,
         kind_free_n=args.kind_free_n, balance_by=args.balance_by,

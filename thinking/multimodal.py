@@ -28,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from device import get_device
-from scratchpad_model import ScratchpadLM
+from scratchpad_model import CausalBlock, ScratchpadLM
 
 from .audio import (ENVELOPES, PITCH_NAMES, TIMBRES, render_tone, sample_clip, spectrogram)
 from .concepts import (
@@ -48,6 +48,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_SURFACES = os.path.join(ROOT, "data", "multimodal_transcripts.json")
 MODES = ("full", "sensor_only", "text_only")
 TRUNK_ARCHES = ("conv", "residual")
+TEXT_TRUNK_ARCHES = ("transformer", "standard", "relational", "abstractor")
 FACTOR_VALUES = {
     "color": COLOR_NAMES,
     "shape": SHAPES,
@@ -273,20 +274,32 @@ class TextTrunk(nn.Module):
     """Transcript encoder -> per-token prefix embeddings.  Pads are zeroed after encoding."""
 
     def __init__(self, vocab_size, d, pad=0, n_tokens=8, heads=4, layers=1, modality=2,
-                 n_modalities=3, max_len=64):
+                 n_modalities=3, max_len=64, arch="transformer"):
         super().__init__()
         self.pad = pad
         self.modality = modality
         self.n_tokens = int(n_tokens)
         self.layers = int(layers)
+        self.arch = str(arch)
+        if self.arch not in TEXT_TRUNK_ARCHES:
+            raise ValueError(f"unknown text trunk architecture {self.arch!r}")
         if self.n_tokens <= 0 or self.layers <= 0:
             raise ValueError("text trunk token/layer counts must be positive")
         self.emb = nn.Embedding(vocab_size, d, padding_idx=pad)
         self.pos = nn.Embedding(max_len, d)
-        enc = nn.TransformerEncoderLayer(d_model=d, nhead=heads, dim_feedforward=4 * d,
-                                         dropout=0.0, activation="gelu", batch_first=True)
-        self.enc = nn.TransformerEncoder(enc, num_layers=self.layers,
-                                         enable_nested_tensor=False)
+        if self.arch == "transformer":
+            enc = nn.TransformerEncoderLayer(d_model=d, nhead=heads, dim_feedforward=4 * d,
+                                             dropout=0.0, activation="gelu", batch_first=True)
+            self.enc = nn.TransformerEncoder(enc, num_layers=self.layers,
+                                             enable_nested_tensor=False)
+            self.blocks = None
+        else:
+            self.enc = None
+            self.blocks = nn.ModuleList([
+                CausalBlock(d, heads, arch=self.arch, vocab=vocab_size,
+                            pos_mode="none", causal=False)
+                for _ in range(self.layers)
+            ])
         self.mod = nn.Embedding(n_modalities, d)
         self.ln = nn.LayerNorm(d)
 
@@ -295,7 +308,11 @@ class TextTrunk(nn.Module):
         pos = torch.arange(L, device=ids.device).clamp_max(self.pos.num_embeddings - 1)
         pad_mask = ids.eq(self.pad)
         h = self.emb(ids) + self.pos(pos)[None]
-        h = self.enc(h, src_key_padding_mask=pad_mask)
+        if self.enc is not None:
+            h = self.enc(h, src_key_padding_mask=pad_mask)
+        else:
+            for block in self.blocks:
+                h = block(h, ids, pad_mask)
         h = self.ln(h + self.mod.weight[self.modality])
         h = h.masked_fill(pad_mask.unsqueeze(-1), 0.0)
         if h.shape[1] > self.n_tokens:
@@ -336,20 +353,25 @@ class MultimodalLM(nn.Module):
     def __init__(self, vocab_size, d=96, layers=3, heads=4, pad=0, max_len=128,
                  img_tokens=4, aud_tokens=8, txt_tokens=8, trunk_arch="conv",
                  trunk_width=64, trunk_depth=1, text_layers=1, modality_dropout=0.0,
-                 concept_tokens=4, fusion_layers=1, concept_prefix=False):
+                 text_arch="transformer", concept_tokens=4, fusion_layers=1,
+                 concept_prefix=False):
         super().__init__()
         if img_tokens <= 0 or aud_tokens <= 0 or txt_tokens <= 0:
             raise ValueError("multimodal prefix token counts must be positive")
         if modality_dropout < 0.0 or modality_dropout > 1.0:
             raise ValueError("modality_dropout must be in [0, 1]")
         trunk_arch = str(trunk_arch)
+        text_arch = str(text_arch)
+        if text_arch not in TEXT_TRUNK_ARCHES:
+            raise ValueError(f"unknown text trunk architecture {text_arch!r}")
         self.config = {
             "vocab_size": int(vocab_size), "d": int(d), "layers": int(layers),
             "heads": int(heads), "pad": int(pad), "max_len": int(max_len),
             "img_tokens": int(img_tokens), "aud_tokens": int(aud_tokens),
             "txt_tokens": int(txt_tokens), "trunk_arch": trunk_arch,
             "trunk_width": int(trunk_width), "trunk_depth": int(trunk_depth),
-            "text_layers": int(text_layers), "modality_dropout": float(modality_dropout),
+            "text_layers": int(text_layers), "text_arch": text_arch,
+            "modality_dropout": float(modality_dropout),
             "fusion": "concept", "concept_tokens": int(concept_tokens),
             "fusion_layers": int(fusion_layers),
             "concept_prefix": bool(concept_prefix),
@@ -366,7 +388,7 @@ class MultimodalLM(nn.Module):
                               pool=(aud_tokens, 1), arch=trunk_arch,
                               width=trunk_width, depth=trunk_depth)
         self.txt = TextTrunk(vocab_size, d, pad=pad, n_tokens=txt_tokens, heads=heads,
-                             layers=text_layers, modality=2)
+                             layers=text_layers, modality=2, arch=text_arch)
         self.fusion = ConceptFusion(d, heads=heads, concept_tokens=concept_tokens,
                                     layers=fusion_layers)
         self.factor_concepts = SchemaConceptHead(
@@ -1011,7 +1033,8 @@ def concept_state_transfer_loss(factor_states_by_mode, factor_logits_by_mode, go
 def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100, value_w=6.0,
           surfaces_path=None, layers=3, heads=4, max_len=128, img_tokens=4, aud_tokens=8,
           txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
-          modality_dropout=0.0, agreement_w=0.0, concept_tokens=4, fusion_layers=1,
+          text_arch="transformer", modality_dropout=0.0, agreement_w=0.0,
+          concept_tokens=4, fusion_layers=1,
           concept_prefix=False, concept_w=0.0, concept_agreement_w=0.0,
           concept_distill_w=0.0, concept_distill_temperature=1.0,
           concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
@@ -1032,7 +1055,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                          max_len=max_len, img_tokens=img_tokens, aud_tokens=aud_tokens,
                          txt_tokens=txt_tokens, trunk_arch=trunk_arch, trunk_width=trunk_width,
                          trunk_depth=trunk_depth, text_layers=text_layers,
-                         modality_dropout=modality_dropout, concept_tokens=concept_tokens,
+                         text_arch=text_arch, modality_dropout=modality_dropout,
+                         concept_tokens=concept_tokens,
                          fusion_layers=fusion_layers,
                          concept_prefix=concept_prefix).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
@@ -1200,7 +1224,8 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         counterfactual_n=40, free_counterfactual_n=20, surfaces_path=None, checkpoint=None,
         batch=32, d=96, lr=1e-3, layers=3, heads=4, max_len=128, img_tokens=4, aud_tokens=8,
         txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
-        modality_dropout=0.0, agreement_w=0.0, concept_tokens=4, fusion_layers=1,
+        text_arch="transformer", modality_dropout=0.0, agreement_w=0.0,
+        concept_tokens=4, fusion_layers=1,
         concept_prefix=False, concept_w=0.0, concept_agreement_w=0.0,
         concept_distill_w=0.0, concept_distill_temperature=1.0,
         concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
@@ -1220,7 +1245,7 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                    txt_tokens=txt_tokens, trunk_arch=trunk_arch,
                                    trunk_width=trunk_width, trunk_depth=trunk_depth,
                                    text_layers=text_layers,
-                                   modality_dropout=modality_dropout,
+                                   text_arch=text_arch, modality_dropout=modality_dropout,
                                    agreement_w=agreement_w, concept_tokens=concept_tokens,
                                    fusion_layers=fusion_layers,
                                    concept_prefix=concept_prefix, concept_w=concept_w,
@@ -1288,6 +1313,7 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
     report = {"experiment": "m0_multimodal_bridge", "steps": steps, "batch": int(batch),
               "lr": float(lr), "value_w": float(value_w),
               "agreement_w": float(agreement_w),
+              "text_arch": text_arch,
               "concept_prefix": bool(concept_prefix),
               "concept_w": float(concept_w),
               "concept_agreement_w": float(concept_agreement_w),
@@ -1401,6 +1427,10 @@ def selftest():
     assert prefix_model.config["concept_prefix"] is True
     assert prefix_decoder.shape[1] == prefix_base.shape[1] + len(VALUE_POS)
     assert prefix_model(x, a, tt, ids).shape == logits.shape
+    rel_txt_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
+                                 text_arch="relational", text_layers=1).to("cpu")
+    assert rel_txt_model.txt.arch == "relational"
+    assert rel_txt_model(x, a, tt, ids, mode="text_only").shape == logits.shape
     factor_logits = {mode: model.factor_logits(x, a, tt, mode=mode) for mode in MODES}
     factor_states = {mode: model.factor_concept_states(x, a, tt, mode=mode) for mode in MODES}
     factor_geometry_states = {
@@ -1432,10 +1462,12 @@ def selftest():
     res_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
                              img_tokens=4, aud_tokens=8, txt_tokens=6,
                              trunk_arch="residual", trunk_width=32, trunk_depth=1,
-                             text_layers=2, modality_dropout=0.1, concept_tokens=3,
+                             text_layers=2, text_arch="relational",
+                             modality_dropout=0.1, concept_tokens=3,
                              fusion_layers=2).to("cpu")
     assert res_model.img.arch == "residual" and res_model.img.pool == (2, 2)
     assert res_model.txt.layers == 2 and res_model.txt.n_tokens == 6
+    assert res_model.txt.arch == "relational"
     assert res_model.config["fusion_layers"] == 2
     res_logits = {mode: res_model(x, a, tt, ids, mode=mode) for mode in MODES}
     assert all(v.shape == logits.shape for v in res_logits.values())
@@ -1545,6 +1577,10 @@ def main(argv=None):
     ap.add_argument("--trunk-width", type=int, default=64, dest="trunk_width")
     ap.add_argument("--trunk-depth", type=int, default=1, dest="trunk_depth")
     ap.add_argument("--text-layers", type=int, default=1, dest="text_layers")
+    ap.add_argument("--text-arch", choices=TEXT_TRUNK_ARCHES, default="transformer",
+                    dest="text_arch",
+                    help=("transcript encoder architecture: transformer keeps the legacy "
+                          "encoder; relational/abstractor use symbolic-value attention"))
     ap.add_argument("--modality-dropout", type=float, default=0.0, dest="modality_dropout")
     ap.add_argument("--eval-n", type=int, default=200, dest="eval_n")
     ap.add_argument("--free-n", type=int, default=40, dest="free_n")
@@ -1578,6 +1614,8 @@ def main(argv=None):
         ap.error("--dim must be divisible by --heads")
     if (args.d // args.heads) % 2 != 0:
         ap.error("--dim / --heads must be even for rope attention")
+    if args.text_arch in ("relational", "abstractor") and args.heads % 2 != 0:
+        ap.error("--text-arch relational/abstractor require an even --heads value")
     if (args.agreement_w < 0.0 or args.concept_w < 0.0
             or args.concept_agreement_w < 0.0 or args.concept_distill_w < 0.0
             or args.concept_rank_distill_w < 0.0 or args.concept_transfer_w < 0.0
@@ -1622,7 +1660,8 @@ def main(argv=None):
                  img_tokens=args.img_tokens, aud_tokens=args.aud_tokens,
                  txt_tokens=args.txt_tokens, trunk_arch=args.trunk_arch,
                  trunk_width=args.trunk_width, trunk_depth=args.trunk_depth,
-                 text_layers=args.text_layers, modality_dropout=args.modality_dropout,
+                 text_layers=args.text_layers, text_arch=args.text_arch,
+                 modality_dropout=args.modality_dropout,
                  agreement_w=args.agreement_w, concept_tokens=args.concept_tokens,
                  fusion_layers=args.fusion_layers, concept_prefix=args.concept_prefix,
                  concept_w=args.concept_w,
