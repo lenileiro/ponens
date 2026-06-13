@@ -1499,6 +1499,14 @@ normal eval batch size, and RunPod exposes the same control as `--image-eval-gen
 This makes one-step solver smokes useful without weakening full-sample quality metrics, and lets
 GPU sweeps spend eval budget on statistically meaningful generated sets.
 
+Image-78 adds opt-in timestep curriculum training for latent rectified flows. Recent flow-matching
+training recipes use non-uniform timestep sampling early, then switch toward uniform coverage for
+later refinement; `thinking.image_latent --time-sampling logit-normal
+--time-curriculum-frac 0.5` now uses logit-normal samples for the first half of flow training and
+uniform samples afterward. Reports/checkpoints record the requested fraction, switch step, final
+sampling mode, and last active training mode; RunPod exposes the same lever as
+`--image-time-curriculum-frac`. Default `0` preserves the static timestep sampler.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered

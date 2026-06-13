@@ -319,6 +319,7 @@ def payload(args):
                      f"--time-sampling {args.image_time_sampling} "
                      f"--time-logit-mean {args.image_time_logit_mean} "
                      f"--time-logit-std {args.image_time_logit_std} "
+                     f"--time-curriculum-frac {args.image_time_curriculum_frac} "
                      f"--time-shift {args.image_time_shift} "
                      f"--time-shift-mode {args.image_time_shift_mode} "
                      f"--time-shift-ref-dim {args.image_time_shift_ref_dim} "
@@ -995,6 +996,10 @@ def main():
     ap.add_argument("--image-time-logit-std", type=float, default=1.0,
                     dest="image_time_logit_std",
                     help="stddev for --image-time-sampling logit-normal")
+    ap.add_argument("--image-time-curriculum-frac", type=float, default=0.0,
+                    dest="image_time_curriculum_frac",
+                    help=("fraction of image flow training using --image-time-sampling before "
+                          "switching timestep sampling to uniform; 0 disables"))
     ap.add_argument("--image-time-shift", type=float, default=1.0,
                     dest="image_time_shift",
                     help="latent image RF data-time shift; >1 biases training toward noise")
@@ -1148,6 +1153,8 @@ def main():
         )
     if args.image_time_shift <= 0.0:
         sys.exit("ERROR: --image-time-shift must be positive")
+    if args.image_time_curriculum_frac < 0.0 or args.image_time_curriculum_frac > 1.0:
+        sys.exit("ERROR: --image-time-curriculum-frac must be in [0, 1]")
     if args.image_time_shift_ref_dim <= 0.0:
         sys.exit("ERROR: --image-time-shift-ref-dim must be positive")
     if args.image_flow_loss_weight_gamma <= 0.0:

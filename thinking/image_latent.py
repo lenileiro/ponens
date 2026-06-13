@@ -58,6 +58,7 @@ SAMPLE_SCHEDULES = ("linear", "quadratic", "sqrt", "cosine")
 MMDIT_ATTN_IMPLS = ("manual", "sdpa", "auto")
 DIT_POS_EMBEDS = ("learned", "sincos2d")
 FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
+TIME_SAMPLINGS = ("uniform", "logit-normal")
 TIME_SHIFT_MODES = ("manual", "dim")
 AE_ARCHES = ("semantic", "residual", "hf-vae")
 FLOW_DISTILL_TEACHERS = ("raw", "ema", "auto")
@@ -1736,6 +1737,29 @@ def sample_flow_times(batch, device=DEV, mode="uniform", logit_mean=0.0, logit_s
     else:
         raise ValueError(f"unknown time sampling mode {mode!r}")
     return apply_flow_time_shift(t, shift=time_shift)
+
+
+def time_curriculum_switch_step(flow_steps, frac=0.0):
+    frac = float(frac)
+    if frac < 0.0 or frac > 1.0:
+        raise ValueError("time_curriculum_frac must be in [0, 1]")
+    if frac <= 0.0:
+        return 0
+    steps = int(flow_steps)
+    if steps <= 0:
+        return 0
+    return min(steps, max(1, int(math.ceil(float(steps) * frac))))
+
+
+def active_time_sampling_mode(time_sampling, flow_step=0, flow_steps=0,
+                              time_curriculum_frac=0.0):
+    mode = str(time_sampling)
+    if mode not in TIME_SAMPLINGS:
+        raise ValueError(f"unknown time sampling mode {mode!r}")
+    switch_step = time_curriculum_switch_step(flow_steps, time_curriculum_frac)
+    if switch_step <= 0:
+        return mode
+    return mode if int(flow_step) < switch_step else "uniform"
 
 
 def flow_loss_time_weights(t, mode="none", gamma=5.0, normalize=True, eps=1.0e-5):
@@ -5040,6 +5064,14 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "flow_ema_decay": float(ckpt.get("flow_ema_decay", report.get("flow_ema_decay", 0.0))),
         "flow_consistency_w": float(ckpt.get(
             "flow_consistency_w", report.get("flow_consistency_w", 0.0))),
+        "time_sampling": str(ckpt.get("time_sampling", report.get("time_sampling", "uniform"))),
+        "time_curriculum_frac": float(ckpt.get(
+            "time_curriculum_frac", report.get("time_curriculum_frac", 0.0))),
+        "time_curriculum_switch_step": int(ckpt.get(
+            "time_curriculum_switch_step", report.get("time_curriculum_switch_step", 0))),
+        "time_curriculum_final_sampling": str(ckpt.get(
+            "time_curriculum_final_sampling",
+            report.get("time_curriculum_final_sampling", "uniform"))),
         "time_shift": float(ckpt.get("time_shift", report.get("time_shift", 1.0))),
         "time_shift_requested": float(ckpt.get(
             "time_shift_requested", report.get(
@@ -5792,6 +5824,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       dit_qk_norm=False, dit_attn_impl="manual",
                       prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0, time_shift=1.0,
+                      time_curriculum_frac=0.0,
                       time_shift_mode="manual", time_shift_ref_dim=1024.0,
                       time_shift_dim_power=0.5,
                       flow_loss_weight="none", flow_loss_weight_gamma=5.0,
@@ -5863,8 +5896,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         train_size_buckets = requested_size_buckets or (size,)
         bucket_records, bucket_missing_dims = bucket_records_by_aspect(
             image_records, train_size_buckets)
-    if time_sampling not in ("uniform", "logit-normal"):
+    if time_sampling not in TIME_SAMPLINGS:
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
+    time_curriculum_frac = float(time_curriculum_frac)
+    if time_curriculum_frac < 0.0 or time_curriculum_frac > 1.0:
+        raise ValueError("time_curriculum_frac must be in [0, 1]")
     if time_shift <= 0.0:
         raise ValueError("time_shift must be positive")
     if time_shift_mode not in TIME_SHIFT_MODES:
@@ -6318,11 +6354,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                        if flow_ema_decay > 0.0 and conditioner is not None else None)
     ema_updates = 0
     last_ema_decay = 0.0
+    curriculum_switch_step = time_curriculum_switch_step(flow_steps, time_curriculum_frac)
     for flow_step in range(flow_steps):
         opt_flow.zero_grad(set_to_none=True)
         active_flow_repa_w = float(flow_repa_w)
         if flow_repa_steps > 0 and flow_step >= int(flow_repa_steps):
             active_flow_repa_w = 0.0
+        active_time_sampling = active_time_sampling_mode(
+            time_sampling, flow_step=flow_step, flow_steps=flow_steps,
+            time_curriculum_frac=time_curriculum_frac)
         for _micro in range(flow_accum_steps):
             if flow_cache is not None:
                 z1, cache_payload = sample_latent_cache(flow_cache, rng, batch, device=device)
@@ -6365,7 +6405,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 loss, parts = latent_flow_losses(
                     flow, z1, cond, cond_drop=cond_drop, ae=ae,
                     semantic_w=flow_semantic_w, semantic_cond=fact_cond,
-                    time_sampling=time_sampling, time_logit_mean=time_logit_mean,
+                    time_sampling=active_time_sampling, time_logit_mean=time_logit_mean,
                     time_logit_std=time_logit_std, time_shift=effective_time_shift,
                     flow_loss_weight=flow_loss_weight,
                     flow_loss_weight_gamma=flow_loss_weight_gamma,
@@ -6383,6 +6423,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             scaler.scale(scaled_loss).backward()
             last_flow = {"total_loss": float(loss.detach().cpu())}
             last_flow.update({k: float(v.detach().cpu()) for k, v in parts.items()})
+            last_flow["time_sampling"] = active_time_sampling
+            last_flow["time_curriculum_step"] = int(flow_step)
         if grad_clip > 0.0:
             scaler.unscale_(opt_flow)
             grad_norm = torch.nn.utils.clip_grad_norm_(flow_params, float(grad_clip))
@@ -6401,6 +6443,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_distill_steps_run = 0
     flow_distill_teacher_used = ""
     if flow_distill_steps > 0 and flow_distill_w > 0.0:
+        distill_time_sampling = active_time_sampling_mode(
+            time_sampling, flow_step=flow_steps, flow_steps=flow_steps,
+            time_curriculum_frac=time_curriculum_frac)
         if flow_distill_teacher == "ema":
             flow_distill_teacher_used = "ema"
         elif flow_distill_teacher == "auto" and flow_ema is not None:
@@ -6443,7 +6488,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 with amp_autocast(device, train_precision):
                     loss, parts = latent_flow_self_distill_losses(
                         flow, teacher_flow, z1, cond, teacher_cond=teacher_cond,
-                        time_sampling=time_sampling,
+                        time_sampling=distill_time_sampling,
                         time_logit_mean=time_logit_mean, time_logit_std=time_logit_std,
                         time_shift=effective_time_shift, latent_stats=latent_stats,
                         time_gap=flow_distill_time_gap)
@@ -6453,6 +6498,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     "total_loss": float((float(flow_distill_w) * loss).detach().cpu()),
                     "flow_distill_w": float(flow_distill_w),
                     "teacher": flow_distill_teacher_used,
+                    "time_sampling": distill_time_sampling,
                 }
                 last_distill.update({
                     k: float(v.detach().cpu()) for k, v in parts.items()
@@ -6676,6 +6722,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             for mode, candidate in candidate_reports.items()
         },
         "time_sampling": time_sampling,
+        "time_curriculum_frac": float(time_curriculum_frac),
+        "time_curriculum_switch_step": int(curriculum_switch_step),
+        "time_curriculum_final_sampling": (
+            "uniform" if curriculum_switch_step > 0 and curriculum_switch_step < int(flow_steps)
+            else time_sampling
+        ),
         "time_logit_mean": float(time_logit_mean),
         "time_logit_std": float(time_logit_std),
         **time_shift_report,
@@ -6801,7 +6853,7 @@ def selftest():
     assert grid_meta["sample_grid_cfg_rescale"] == 0.4
     with open(grid_path, "rb") as f:
         assert f.read(2) == b"P6"
-    ae2, flow2, report2 = train_latent_flow(ae_steps=1, flow_steps=1, batch=2, latent_ch=4,
+    ae2, flow2, report2 = train_latent_flow(ae_steps=1, flow_steps=2, batch=2, latent_ch=4,
                                             hidden=32, flow_arch="dit", dit_depth=1,
                                             dit_heads=2, seed=1, device="cpu", cond_drop=0.5,
                                             cfg_scale=1.5, cfg_rescale=0.5,
@@ -6813,6 +6865,8 @@ def selftest():
                                             flow_distill_w=0.5,
                                             flow_distill_time_gap=0.25,
                                             flow_distill_teacher="raw",
+                                            time_sampling="logit-normal",
+                                            time_curriculum_frac=0.5,
                                             flow_loss_weight="min-snr-v",
                                             flow_loss_weight_gamma=5.0,
                                             latent_normalize="channel",
@@ -6829,6 +6883,11 @@ def selftest():
     assert report2["flow_distill_steps_run"] == 1
     assert report2["flow_distill_w"] == 0.5
     assert report2["flow_distill_teacher_used"] == "raw"
+    assert report2["time_sampling"] == "logit-normal"
+    assert report2["time_curriculum_frac"] == 0.5
+    assert report2["time_curriculum_switch_step"] == 1
+    assert report2["time_curriculum_final_sampling"] == "uniform"
+    assert report2["last_flow"]["time_sampling"] == "uniform"
     assert report2["flow_loss_weight"] == "min-snr-v"
     assert report2["flow_loss_weight_gamma"] == 5.0
     assert report2["flow_loss_weight_normalize"] is True
@@ -6845,6 +6904,7 @@ def selftest():
     assert "semantic_endpoint_ce" in report2["last_flow"]
     assert "endpoint_consistency_mse" in report2["last_flow"]
     assert "distill_endpoint_mse" in report2["last_distill"]
+    assert report2["last_distill"]["time_sampling"] == "uniform"
     assert "velocity_mse_unweighted" in report2["last_flow"]
     assert report2["last_flow"]["velocity_weight_max"] >= report2["last_flow"]["velocity_weight_min"]
     img2 = sample_images(ae2, flow2, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
@@ -7545,13 +7605,17 @@ def main(argv=None):
                     help="which weights to use for the final train report")
     ap.add_argument("--no-ema-eval", action="store_true", dest="no_ema_eval",
                     help="compatibility alias for --ema-eval-mode raw")
-    ap.add_argument("--time-sampling", default="uniform", choices=("uniform", "logit-normal"),
+    ap.add_argument("--time-sampling", default="uniform", choices=TIME_SAMPLINGS,
                     dest="time_sampling",
                     help="rectified-flow training timestep distribution")
     ap.add_argument("--time-logit-mean", type=float, default=0.0, dest="time_logit_mean",
                     help="mean for --time-sampling logit-normal")
     ap.add_argument("--time-logit-std", type=float, default=1.0, dest="time_logit_std",
                     help="stddev for --time-sampling logit-normal")
+    ap.add_argument("--time-curriculum-frac", type=float, default=0.0,
+                    dest="time_curriculum_frac",
+                    help=("fraction of flow training that uses --time-sampling before "
+                          "switching timestep sampling to uniform; 0 disables"))
     ap.add_argument("--time-shift", type=float, default=1.0, dest="time_shift",
                     help="rectified-flow data-time shift; >1 biases training toward noise")
     ap.add_argument("--time-shift-mode", default="manual", choices=TIME_SHIFT_MODES,
@@ -7755,6 +7819,8 @@ def main(argv=None):
         ap.error("--sample-quality-guidance-w must be non-negative")
     if args.sample_quality_guidance_w > 0.0 and not sample_prompts:
         ap.error("--sample-quality-guidance-w requires --sample-prompts")
+    if args.time_curriculum_frac < 0.0 or args.time_curriculum_frac > 1.0:
+        ap.error("--time-curriculum-frac must be in [0, 1]")
     if sample_prompts and args.prompt_embed_backend == "hf" and not args.prompt_embed_model:
         ap.error("--prompt-embed-backend hf requires --prompt-embed-model")
     if sample_schedules is not None:
@@ -7952,6 +8018,7 @@ def main(argv=None):
         image_crop_mode=args.image_crop_mode, image_hflip_prob=args.image_hflip_prob,
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
         time_logit_std=args.time_logit_std,
+        time_curriculum_frac=args.time_curriculum_frac,
         time_shift=args.time_shift,
         time_shift_mode=args.time_shift_mode,
         time_shift_ref_dim=args.time_shift_ref_dim,
@@ -8187,6 +8254,10 @@ def main(argv=None):
         "eval_weight_mode": report.get("eval_weight_mode", "raw"),
         "selected_eval_weights": report.get("selected_eval_weights", "raw"),
         "time_sampling": args.time_sampling,
+        "time_curriculum_frac": report.get("time_curriculum_frac", args.time_curriculum_frac),
+        "time_curriculum_switch_step": report.get("time_curriculum_switch_step", 0),
+        "time_curriculum_final_sampling": report.get(
+            "time_curriculum_final_sampling", args.time_sampling),
         "time_logit_mean": args.time_logit_mean,
         "time_logit_std": args.time_logit_std,
         "time_shift": report.get("time_shift", args.time_shift),
