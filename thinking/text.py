@@ -2495,6 +2495,43 @@ def choice_concept_bridge_loss(model, txt, records, pair_ids, margin=0.0):
     return sum(losses) / len(losses)
 
 
+def choice_concept_transfer_bridge_scores(model, txt, records, pair_ids):
+    vectors = choice_candidate_concept_vectors(model, txt, records)
+    scores = []
+    for hard_id, correct_id, hard_target, correct_target in pair_ids:
+        hard = vectors.get(hard_id)
+        correct = vectors.get(correct_id)
+        if (not hard or not correct or hard_target not in hard
+                or correct_target not in correct):
+            continue
+        hard_vec = hard[hard_target]
+        correct_vec = correct[correct_target].detach()
+        positive = (hard_vec * correct_vec).sum()
+        negatives = []
+        negatives.extend((hard_vec * v.detach()).sum()
+                         for cid, v in correct.items() if cid != correct_target)
+        negatives.extend((v * correct_vec).sum()
+                         for cid, v in hard.items() if cid != hard_target)
+        if negatives:
+            negative = torch.stack(negatives).max()
+        else:
+            negative = torch.full((), -1.0, dtype=positive.dtype, device=positive.device)
+        scores.append((positive, negative))
+    return scores
+
+
+def choice_concept_transfer_bridge_loss(model, txt, records, pair_ids, margin=0.0):
+    losses = []
+    margin_t = torch.tensor(float(margin), dtype=torch.float32, device=txt.device)
+    for positive, negative in choice_concept_transfer_bridge_scores(
+            model, txt, records, pair_ids):
+        losses.append(F.softplus(margin_t - positive))
+        losses.append(F.softplus(negative + margin_t - positive))
+    if not losses:
+        return torch.tensor(0.0, device=txt.device)
+    return sum(losses) / len(losses)
+
+
 def choice_concept_prototype_batch(groups, rng, group_n, per_group=3):
     if not groups or group_n <= 0:
         return [], []
@@ -3080,25 +3117,34 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
         else:
             positive_anchor_loss = torch.tensor(0.0, device=device)
         if choice_concept_bridge_w:
+            concept_transfer_pairing = False
             if concept_hard_records and concept_correct_records:
                 concept_records, concept_pairs = choice_concept_transfer_bridge_batch(
                     model, vocab, concept_hard_records, concept_correct_records, rng,
                     max(1, batch // 2), device=device,
                     pool_per_side=max(16, batch * 4))
+                concept_transfer_pairing = bool(concept_records and concept_pairs)
             else:
                 concept_records, concept_pairs = [], []
             if (not concept_records or not concept_pairs) and concept_groups:
                 concept_records, concept_pairs = choice_concept_bridge_batch(
                     concept_groups, rng, max(1, batch // 2))
+                concept_transfer_pairing = False
             if (not concept_records or not concept_pairs) and concept_source_records:
                 concept_records, concept_pairs = choice_concept_neighborhood_bridge_batch(
                     model, vocab, concept_source_records, rng, max(1, batch // 2),
                     device=device, pool_size=max(16, batch * 4))
+                concept_transfer_pairing = False
             if concept_records and concept_pairs:
                 concept_txt, _concept_ids = pack(concept_records, vocab, device)
-                concept_loss = choice_concept_bridge_loss(
-                    model, concept_txt, concept_records, concept_pairs,
-                    margin=choice_concept_bridge_margin)
+                if concept_transfer_pairing:
+                    concept_loss = choice_concept_transfer_bridge_loss(
+                        model, concept_txt, concept_records, concept_pairs,
+                        margin=choice_concept_bridge_margin)
+                else:
+                    concept_loss = choice_concept_bridge_loss(
+                        model, concept_txt, concept_records, concept_pairs,
+                        margin=choice_concept_bridge_margin)
             else:
                 concept_loss = torch.tensor(0.0, device=device)
         else:
@@ -5386,6 +5432,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                     if study_discovery_transfer and discovery_source_records
                     else ("hard_aware_neighborhood" if discovery_source_records
                           else "default")),
+                "discovery_transfer_variant": (
+                    "correct_detached" if study_discovery_transfer else "none"),
             }
             round_fit_records = hard_records + anchor_records + train_replay_records
             if not hard_records:
@@ -5417,6 +5465,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                                       and discovery_source_records)
                                   else ("hard_aware_neighborhood"
                                         if discovery_source_records else "default")),
+                              "discovery_transfer_variant": (
+                                  "correct_detached"
+                                  if study_discovery_transfer else "none"),
                               "control_focus_sides": list(focused_control_sides),
                               "control_sampling_sides": list(focused_sampling_sides),
                               "replay_fit_records": len(train_replay_records),
@@ -5880,6 +5931,8 @@ def selftest():
     assert len(transfer_rows) == 2 and len(transfer_pairs) == 1
     transfer_txt, _transfer_ids = pack(transfer_rows, choice_vocab, "cpu")
     assert torch.isfinite(choice_concept_bridge_loss(
+        choice_model, transfer_txt, transfer_rows, transfer_pairs))
+    assert torch.isfinite(choice_concept_transfer_bridge_loss(
         choice_model, transfer_txt, transfer_rows, transfer_pairs))
     neighbor_proto_rows, neighbor_proto_items = (
         choice_concept_neighborhood_prototype_batch(

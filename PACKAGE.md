@@ -905,6 +905,12 @@ hard-to-correct pairing and improved several failed control gaps (`question_swap
 held-out `squad_choice` regressed from **0.400** to **0.200**. So transfer is now an available
 "light bulb" pressure, but it remains opt-in until retention catches up.
 
+The asymmetric transfer update detaches the currently-correct neighbor inside that transfer loss,
+so the hard example moves toward a stable concept without directly dragging the correct example. A
+smoke kept the transfer control improvements but still regressed held-out `squad_choice` from
+**0.400** to **0.200**, leaving `selected_round` at **0**. That localizes the remaining retention
+damage to the broader study optimization, not just symmetric bridge gradients.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
@@ -1697,6 +1703,25 @@ predicts the labeled factor value correctly. This is not a renderer rule or a ha
 fact: the teacher signal is the model's detached full-path concept distribution, filtered by the
 batch labels that already supervise the trace. RunPod exposes the same lever as
 `--multimodal-concept-rank-distill-w` with `--multimodal-concept-rank-distill-margin`.
+
+M-4 moves the latest text-study transfer idea into the upstream multimodal architecture.
+`--concept-transfer-w` aligns sensor-only and text-only concept state vectors toward detached
+full-path concept states on rows where the full path is already correct, preferring current
+partial-mode errors when they exist. The stable side is detached, so the hard partial reader moves
+toward the discovered concept without dragging the full reader backward. This is vector-level
+concept transfer before decoding, not token prediction and not a hard-coded fact table. RunPod
+exposes the same path as `--multimodal-concept-transfer-w` and
+`--multimodal-concept-transfer-margin`.
+
+M-4 real local run (`runs/m0_multimodal_transfer_real.json`, 240 steps on MPS) gates both the
+decoder and upstream concept head with `--concept-transfer-w 0.1`: `gate=true`,
+`concept_gate=true`, token loss **0.059**, concept loss **0.193**, transfer loss **0.527**. Full
+teacher-forced accuracy is color **1.00**, shape **0.97**, pitch **0.93**, timbre **0.99**, env
+**1.00**; sensor-only is **1.00 / 1.00 / 0.83 / 0.99 / 1.00**; text-only held-out phrasings are
+**0.77 / 0.80 / 0.64 / 0.95 / 1.00**. Free text-only exact is **0.35**, and free counterfactual
+mean target/collateral are **0.83 / 0.80**. So the upstream transfer path works and improves the
+concept/sensor bridge enough to gate, but it is not a language-mastery claim: free exact and some
+text-only factors still need better retention/curriculum work.
 
 The adaptive text study loop above is intentionally upstream of this multimodal bridge. When the
 text reader fails shortcut controls, the next study attempt can focus the generated evidence

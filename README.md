@@ -365,8 +365,10 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --concept-tokens 4 --fusion-layers 1 \
     --concept-w 0.25 --concept-agreement-w 0.1 --concept-distill-w 0.1 \
     --concept-rank-distill-w 0.1 --concept-rank-distill-margin 0.05 \
+    --concept-transfer-w 0.1 --concept-transfer-margin 0.05 \
     --modality-dropout 0.05 \
-    --out runs/m0_multimodal.json --checkpoint runs/m0_multimodal.pt
+    --out runs/m0_multimodal_transfer_real.json \
+    --checkpoint runs/m0_multimodal_transfer_real.pt
 ```
 
 GPU runs: `runpod/launch_thinking.py` (see the package docs).
