@@ -2734,6 +2734,28 @@ def text_alignment_guidance_step(text_aligner, z, cond, weight=0.0, step_size=1.
     return guided.detach()
 
 
+def image_feature_guidance_step(image_feature_aligner, z, features, weight=0.0,
+                                step_size=1.0, eps=1.0e-6):
+    """Sampling-time latent guidance toward an external image/text feature target."""
+    if weight <= 0.0:
+        return z
+    if image_feature_aligner is None:
+        raise ValueError("image feature guidance requires a checkpoint image_feature_aligner")
+    features = pool_embedding_sequence(features).to(device=z.device)
+    z_var = z.detach().requires_grad_(True)
+    with torch.enable_grad():
+        img_emb, feat_emb = image_feature_aligner(z_var, features)
+        score = image_feature_aligner.scale().to(img_emb.dtype) * (
+            img_emb * feat_emb
+        ).sum(dim=-1)
+        objective = score.sum()
+        grad = torch.autograd.grad(objective, z_var, allow_unused=False)[0]
+    flat = grad.flatten(1)
+    denom = flat.norm(dim=1).view((-1,) + (1,) * (grad.ndim - 1)).clamp_min(float(eps))
+    guided = z_var + float(weight) * abs(float(step_size)) * grad / denom
+    return guided.detach()
+
+
 def image_quality_guidance_step(scorer, z, weight=0.0, step_size=1.0, eps=1.0e-6):
     """Sampling-time latent guidance toward a learned manifest quality score."""
     if weight <= 0.0:
@@ -3485,6 +3507,9 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                    text_guidance_w=0.0, text_guidance_aligner=None,
                    text_guidance_cond=None,
                    text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                   feature_guidance_w=0.0, feature_guidance_aligner=None,
+                   feature_guidance_features=None,
+                   feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                    quality_guidance_w=0.0, quality_guidance_scorer=None,
                    quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     batch = condition_batch(cond)
@@ -3507,6 +3532,23 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         raise ValueError("text alignment guidance requires a checkpoint text_aligner")
     if text_guidance_cond is None:
         text_guidance_cond = cond
+    if feature_guidance_w < 0.0:
+        raise ValueError("feature_guidance_w must be non-negative")
+    if feature_guidance_w > 0.0:
+        if feature_guidance_aligner is None:
+            raise ValueError("image feature guidance requires a checkpoint image_feature_aligner")
+        if feature_guidance_features is None:
+            raise ValueError("image feature guidance requires prompt/image feature targets")
+        feature_guidance_features = pool_embedding_sequence(
+            feature_guidance_features).to(device=device)
+        if int(feature_guidance_features.shape[0]) != batch:
+            raise ValueError("feature guidance feature batch must match cond batch")
+        feature_dim = int(getattr(feature_guidance_aligner, "feature_dim", 0) or 0)
+        if int(feature_guidance_features.shape[-1]) != feature_dim:
+            raise ValueError(
+                f"feature guidance dim {int(feature_guidance_features.shape[-1])} "
+                f"does not match checkpoint image_embedding_in_dim {feature_dim}"
+            )
     if quality_guidance_w < 0.0:
         raise ValueError("quality_guidance_w must be non-negative")
     if quality_guidance_w > 0.0 and quality_guidance_scorer is None:
@@ -3522,6 +3564,8 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         semantic_guidance_interval, name="semantic_guidance_interval")
     text_guidance_interval = validate_guidance_interval(
         text_guidance_interval, name="text_guidance_interval")
+    feature_guidance_interval = validate_guidance_interval(
+        feature_guidance_interval, name="feature_guidance_interval")
     quality_guidance_interval = validate_guidance_interval(
         quality_guidance_interval, name="quality_guidance_interval")
     schedule = flow_time_schedule(
@@ -3573,6 +3617,13 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                 text_guidance_aligner, z_raw, text_guidance_cond,
                 weight=text_guidance_w, step_size=dt)
             z = normalize_latent(z_raw, latent_stats)
+        if (feature_guidance_w > 0.0
+                and interval_active(t_scalar, feature_guidance_interval)):
+            z_raw = denormalize_latent(z, latent_stats)
+            z_raw = image_feature_guidance_step(
+                feature_guidance_aligner, z_raw, feature_guidance_features,
+                weight=feature_guidance_w, step_size=dt)
+            z = normalize_latent(z_raw, latent_stats)
         if (quality_guidance_w > 0.0
                 and interval_active(t_scalar, quality_guidance_interval)):
             z_raw = denormalize_latent(z, latent_stats)
@@ -3594,6 +3645,9 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
                   text_guidance_w=0.0, text_guidance_aligner=None,
                   text_guidance_cond=None,
                   text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                  feature_guidance_w=0.0, feature_guidance_aligner=None,
+                  feature_guidance_features=None,
+                  feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                   quality_guidance_w=0.0, quality_guidance_scorer=None,
                   quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     z = sample_latents(flow, cond, latent_shape=latent_shape, steps=steps, device=device,
@@ -3609,6 +3663,10 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
                        text_guidance_aligner=text_guidance_aligner,
                        text_guidance_cond=text_guidance_cond,
                        text_guidance_interval=text_guidance_interval,
+                       feature_guidance_w=feature_guidance_w,
+                       feature_guidance_aligner=feature_guidance_aligner,
+                       feature_guidance_features=feature_guidance_features,
+                       feature_guidance_interval=feature_guidance_interval,
                        quality_guidance_w=quality_guidance_w,
                        quality_guidance_scorer=quality_guidance_scorer,
                        quality_guidance_interval=quality_guidance_interval)
@@ -3849,6 +3907,8 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                                  negative_prompts=(), candidates_per_prompt=1,
                                  text_guidance_w=0.0,
                                  text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                                 feature_guidance_w=0.0,
+                                 feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                                  quality_guidance_w=0.0,
                                  quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     ae.eval()
@@ -3864,6 +3924,11 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         raise ValueError("text_guidance_w must be non-negative")
     text_guidance_interval = validate_guidance_interval(
         text_guidance_interval, name="text_guidance_interval")
+    feature_guidance_w = float(feature_guidance_w)
+    if feature_guidance_w < 0.0:
+        raise ValueError("feature_guidance_w must be non-negative")
+    feature_guidance_interval = validate_guidance_interval(
+        feature_guidance_interval, name="feature_guidance_interval")
     quality_guidance_w = float(quality_guidance_w)
     if quality_guidance_w < 0.0:
         raise ValueError("quality_guidance_w must be non-negative")
@@ -3892,6 +3957,10 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
     text_aligner = getattr(flow, "text_aligner", None)
     image_feature_aligner = getattr(flow, "image_feature_aligner", None)
     quality_scorer = getattr(flow, "image_quality_scorer", None)
+    sample_prompt_features = (
+        prompt_features.repeat_interleave(candidates_per_prompt, dim=0)
+        if torch.is_tensor(prompt_features) else None
+    )
     sample = sample_images(ae, flow, sample_cond, latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            cfg_rescale=cfg_rescale,
@@ -3902,6 +3971,10 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                            text_guidance_aligner=text_aligner,
                            text_guidance_cond=sample_cond,
                            text_guidance_interval=text_guidance_interval,
+                           feature_guidance_w=feature_guidance_w,
+                           feature_guidance_aligner=image_feature_aligner,
+                           feature_guidance_features=sample_prompt_features,
+                           feature_guidance_interval=feature_guidance_interval,
                            quality_guidance_w=quality_guidance_w,
                            quality_guidance_scorer=quality_scorer,
                            quality_guidance_interval=quality_guidance_interval)
@@ -3925,6 +3998,11 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         "sample_grid_text_guidance_interval": list(text_guidance_interval),
         "sample_grid_text_guidance_scorer": (
             "text_aligner" if text_guidance_w > 0.0 else "none"
+        ),
+        "sample_grid_feature_guidance_w": float(feature_guidance_w),
+        "sample_grid_feature_guidance_interval": list(feature_guidance_interval),
+        "sample_grid_feature_guidance_scorer": (
+            "image_feature_aligner" if feature_guidance_w > 0.0 else "none"
         ),
         "sample_grid_quality_guidance_w": float(quality_guidance_w),
         "sample_grid_quality_guidance_interval": list(quality_guidance_interval),
@@ -6400,6 +6478,7 @@ def selftest():
             prompt_embed_stats_dim=4, cfg_scale=1.25,
             negative_prompts=("low quality", "washed out"), candidates_per_prompt=2,
             text_guidance_w=0.05, text_guidance_interval=(0.0, 1.0),
+            feature_guidance_w=0.05, feature_guidance_interval=(0.0, 1.0),
             quality_guidance_w=0.05, quality_guidance_interval=(0.0, 1.0))
         assert embed_prompt_meta["sample_grid_cond_mode"] == "prompt"
         assert embed_prompt_meta["sample_grid_caption_cond_source"] == "embedding"
@@ -6413,6 +6492,8 @@ def selftest():
         assert "sample_grid_selection_score_mean" in embed_prompt_meta
         assert embed_prompt_meta["sample_grid_text_guidance_w"] == 0.05
         assert embed_prompt_meta["sample_grid_text_guidance_scorer"] == "text_aligner"
+        assert embed_prompt_meta["sample_grid_feature_guidance_w"] == 0.05
+        assert embed_prompt_meta["sample_grid_feature_guidance_scorer"] == "image_feature_aligner"
         assert embed_prompt_meta["sample_grid_quality_guidance_w"] == 0.05
         assert embed_prompt_meta["sample_grid_quality_guidance_scorer"] == "image_quality_scorer"
         _ae_q, _flow_q, _cond_q, _vocab_q, report_q = train_latent_flow(
@@ -6897,8 +6978,8 @@ def main(argv=None):
                           "--sample-prompts CFG baselines"))
     ap.add_argument("--sample-candidates-per-prompt", type=int, default=1,
                     dest="sample_candidates_per_prompt",
-                    help=("number of candidates to draw per sample prompt; when a text-image "
-                          "aligner is available the best candidate is selected"))
+                    help=("number of candidates to draw per sample prompt; when compatible "
+                          "aligners are available the best candidate is selected"))
     ap.add_argument("--sample-text-guidance-w", type=float, default=0.0,
                     dest="sample_text_guidance_w",
                     help=("sampling-time text-image alignment guidance weight for "
@@ -6906,6 +6987,15 @@ def main(argv=None):
     ap.add_argument("--sample-text-guidance-interval", default="0.0,1.0",
                     dest="sample_text_guidance_interval",
                     help=("text alignment guidance active interval over flow time, "
+                          "formatted start,end"))
+    ap.add_argument("--sample-feature-guidance-w", type=float, default=0.0,
+                    dest="sample_feature_guidance_w",
+                    help=("sampling-time external feature guidance weight for "
+                          "--sample-prompts; requires prompt embeddings and a checkpoint "
+                          "image_feature_aligner"))
+    ap.add_argument("--sample-feature-guidance-interval", default="0.0,1.0",
+                    dest="sample_feature_guidance_interval",
+                    help=("external feature guidance active interval over flow time, "
                           "formatted start,end"))
     ap.add_argument("--sample-quality-guidance-w", type=float, default=0.0,
                     dest="sample_quality_guidance_w",
@@ -6947,6 +7037,8 @@ def main(argv=None):
         sample_prompts = parse_sample_prompts(args.sample_prompts)
         sample_negative_prompts = parse_sample_prompts(args.sample_negative_prompts)
         sample_text_guidance_interval = _parse_interval(args.sample_text_guidance_interval)
+        sample_feature_guidance_interval = _parse_interval(
+            args.sample_feature_guidance_interval)
         sample_quality_guidance_interval = _parse_interval(
             args.sample_quality_guidance_interval)
         sample_schedules = (
@@ -6969,6 +7061,10 @@ def main(argv=None):
         ap.error("--sample-text-guidance-w must be non-negative")
     if args.sample_text_guidance_w > 0.0 and not sample_prompts:
         ap.error("--sample-text-guidance-w requires --sample-prompts")
+    if args.sample_feature_guidance_w < 0.0:
+        ap.error("--sample-feature-guidance-w must be non-negative")
+    if args.sample_feature_guidance_w > 0.0 and not sample_prompts:
+        ap.error("--sample-feature-guidance-w requires --sample-prompts")
     if args.sample_quality_guidance_w < 0.0:
         ap.error("--sample-quality-guidance-w must be non-negative")
     if args.sample_quality_guidance_w > 0.0 and not sample_prompts:
@@ -7060,6 +7156,8 @@ def main(argv=None):
                     candidates_per_prompt=args.sample_candidates_per_prompt,
                     text_guidance_w=args.sample_text_guidance_w,
                     text_guidance_interval=sample_text_guidance_interval,
+                    feature_guidance_w=args.sample_feature_guidance_w,
+                    feature_guidance_interval=sample_feature_guidance_interval,
                     quality_guidance_w=args.sample_quality_guidance_w,
                     quality_guidance_interval=sample_quality_guidance_interval)
             elif report.get("experiment") == "image_latent_manifest_sampler_sweep":
@@ -7239,6 +7337,8 @@ def main(argv=None):
                 candidates_per_prompt=args.sample_candidates_per_prompt,
                 text_guidance_w=args.sample_text_guidance_w,
                 text_guidance_interval=sample_text_guidance_interval,
+                feature_guidance_w=args.sample_feature_guidance_w,
+                feature_guidance_interval=sample_feature_guidance_interval,
                 quality_guidance_w=args.sample_quality_guidance_w,
                 quality_guidance_interval=sample_quality_guidance_interval)
         elif args.image_manifest:

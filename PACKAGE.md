@@ -1380,6 +1380,13 @@ means CLIP/SigLIP-style sidecars can help choose the best generated candidate fo
 when the strongest training signal came from image-feature or REPA alignment rather than the
 internal caption aligner alone.
 
+Image-71 adds sampling-time external feature guidance. Prompt grids can now pass
+`--sample-feature-guidance-w` / `--sample-feature-guidance-interval`; when the live prompt
+embedding shares the sidecar image-feature dimension, the sampler nudges generated latents toward
+that external text/image feature target using the checkpoint's `image_feature_aligner`. This turns
+CLIP/SigLIP-style sidecars into both a training/eval signal and an inference-time guidance signal,
+without adding caption- or domain-specific rules.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered

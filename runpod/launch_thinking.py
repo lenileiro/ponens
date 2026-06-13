@@ -183,6 +183,10 @@ def payload(args):
                     f"--sample-text-guidance-interval "
                     f"{shlex_quote(args.image_sample_text_guidance_interval)}")
                 prompt_grid_args += (
+                    f" --sample-feature-guidance-w {args.image_sample_feature_guidance_w} "
+                    f"--sample-feature-guidance-interval "
+                    f"{shlex_quote(args.image_sample_feature_guidance_interval)}")
+                prompt_grid_args += (
                     f" --sample-quality-guidance-w {args.image_sample_quality_guidance_w} "
                     f"--sample-quality-guidance-interval "
                     f"{shlex_quote(args.image_sample_quality_guidance_interval)}")
@@ -816,7 +820,7 @@ def main():
     ap.add_argument("--image-sample-candidates-per-prompt", type=int, default=1,
                     dest="image_sample_candidates_per_prompt",
                     help=("number of candidates to draw per latent image sample prompt; "
-                          "best is selected when the checkpoint has a text-image aligner"))
+                          "best is selected when the checkpoint has compatible aligners"))
     ap.add_argument("--image-sample-text-guidance-w", type=float, default=0.0,
                     dest="image_sample_text_guidance_w",
                     help=("sampling-time text-image alignment guidance weight for latent "
@@ -825,6 +829,14 @@ def main():
                     dest="image_sample_text_guidance_interval",
                     help=("sample-prompt text guidance active interval over flow time, "
                           "formatted start,end"))
+    ap.add_argument("--image-sample-feature-guidance-w", type=float, default=0.0,
+                    dest="image_sample_feature_guidance_w",
+                    help=("sampling-time external image-feature guidance weight for latent "
+                          "image sample prompts"))
+    ap.add_argument("--image-sample-feature-guidance-interval", default="0.0,1.0",
+                    dest="image_sample_feature_guidance_interval",
+                    help=("sample-prompt external feature guidance active interval over flow "
+                          "time, formatted start,end"))
     ap.add_argument("--image-sample-quality-guidance-w", type=float, default=0.0,
                     dest="image_sample_quality_guidance_w",
                     help="sampling-time manifest quality guidance weight for latent image prompts")
@@ -1071,6 +1083,10 @@ def main():
         sys.exit("ERROR: --image-sample-text-guidance-w must be non-negative")
     if args.image_sample_text_guidance_w > 0.0 and not args.image_sample_prompts:
         sys.exit("ERROR: --image-sample-text-guidance-w requires --image-sample-prompts")
+    if args.image_sample_feature_guidance_w < 0.0:
+        sys.exit("ERROR: --image-sample-feature-guidance-w must be non-negative")
+    if args.image_sample_feature_guidance_w > 0.0 and not args.image_sample_prompts:
+        sys.exit("ERROR: --image-sample-feature-guidance-w requires --image-sample-prompts")
     if args.image_sample_quality_guidance_w < 0.0:
         sys.exit("ERROR: --image-sample-quality-guidance-w must be non-negative")
     if args.image_sample_quality_guidance_w > 0.0 and not args.image_sample_prompts:
