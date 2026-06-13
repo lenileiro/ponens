@@ -1450,6 +1450,14 @@ unweighted runs keep the previous uniform bucket sampling. Bucketed latent cache
 This prevents rectangular training from silently undoing curated/source/quality weighting just
 because high-weight records cluster in one aspect ratio.
 
+Image-75 adds generated-vs-real feature distribution metrics for manifest eval. When an
+`image_feature_aligner` is available, generated samples and their paired real sidecar image
+features are compared in the learned external-feature space with matched cosine/L2, mean-gap,
+covariance Frobenius distance, Frechet-style distance, and RBF MMD. These metrics aggregate in
+checkpoint sweeps and participate in best-run selection as lower-is-better distribution distances.
+This gives guidance/source/quality sweeps a generic quality signal closer to FID/KID-style model
+selection without depending on a hard-coded dataset or a heavyweight eval package.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered

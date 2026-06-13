@@ -2771,6 +2771,86 @@ def embedding_pair_similarity(image_vec, text_vec, prefix="embedding_pair"):
     }
 
 
+def _embedding_covariance(x):
+    x = x.float()
+    d = int(x.shape[-1])
+    if int(x.shape[0]) <= 1:
+        return torch.zeros((d, d), dtype=x.dtype, device=x.device)
+    centered = x - x.mean(dim=0, keepdim=True)
+    return centered.t().matmul(centered) / float(int(x.shape[0]) - 1)
+
+
+def _trace_sqrt_product(a, b):
+    prod = a.matmul(b)
+    vals = torch.linalg.eigvals(prod).real.clamp_min(0.0).sqrt()
+    return vals.sum()
+
+
+def _rbf_mmd(x, y, eps=1.0e-8):
+    z = torch.cat([x, y], dim=0)
+    if int(z.shape[0]) <= 1:
+        sigma2 = torch.tensor(1.0, dtype=x.dtype, device=x.device)
+    else:
+        dists = torch.pdist(z.float(), p=2).pow(2)
+        positive = dists[dists > eps]
+        sigma2 = (
+            positive.median() if int(positive.numel()) else
+            torch.tensor(1.0, dtype=x.dtype, device=x.device)
+        ).clamp_min(eps)
+    kxx = torch.exp(-torch.cdist(x.float(), x.float()).pow(2) / (2.0 * sigma2)).mean()
+    kyy = torch.exp(-torch.cdist(y.float(), y.float()).pow(2) / (2.0 * sigma2)).mean()
+    kxy = torch.exp(-torch.cdist(x.float(), y.float()).pow(2) / (2.0 * sigma2)).mean()
+    return (kxx + kyy - 2.0 * kxy).clamp_min(0.0), sigma2
+
+
+def embedding_distribution_metrics(generated_vec, real_vec, prefix="embedding_distribution"):
+    generated_vec = F.normalize(pool_embedding_sequence(generated_vec).float(), dim=-1, eps=1.0e-8)
+    real_vec = F.normalize(pool_embedding_sequence(real_vec).float(), dim=-1, eps=1.0e-8)
+    if int(generated_vec.shape[-1]) != int(real_vec.shape[-1]):
+        raise ValueError(
+            f"generated/real embedding dims differ: "
+            f"{int(generated_vec.shape[-1])} vs {int(real_vec.shape[-1])}"
+        )
+    n = min(int(generated_vec.shape[0]), int(real_vec.shape[0]))
+    if n <= 0:
+        return {
+            f"{prefix}_n": 0,
+            f"{prefix}_matched_cos": 0.0,
+            f"{prefix}_mean_l2": 0.0,
+            f"{prefix}_mean_sq": 0.0,
+            f"{prefix}_mean_gap_l2": 0.0,
+            f"{prefix}_cov_fro": 0.0,
+            f"{prefix}_frechet": 0.0,
+            f"{prefix}_mmd_rbf": 0.0,
+            f"{prefix}_mmd_rbf_sigma2": 1.0,
+        }
+    generated_vec = generated_vec[:n]
+    real_vec = real_vec[:n]
+    diff = generated_vec - real_vec
+    mean_diff = generated_vec.mean(dim=0) - real_vec.mean(dim=0)
+    gen_cov = _embedding_covariance(generated_vec)
+    real_cov = _embedding_covariance(real_vec)
+    cov_diff = gen_cov - real_cov
+    frechet = (
+        mean_diff.pow(2).sum()
+        + torch.trace(gen_cov)
+        + torch.trace(real_cov)
+        - 2.0 * _trace_sqrt_product(gen_cov, real_cov)
+    ).clamp_min(0.0)
+    mmd, sigma2 = _rbf_mmd(generated_vec, real_vec)
+    return {
+        f"{prefix}_n": int(n),
+        f"{prefix}_matched_cos": float((generated_vec * real_vec).sum(dim=-1).mean().detach().cpu()),
+        f"{prefix}_mean_l2": float(diff.norm(dim=-1).mean().detach().cpu()),
+        f"{prefix}_mean_sq": float(diff.pow(2).sum(dim=-1).mean().detach().cpu()),
+        f"{prefix}_mean_gap_l2": float(mean_diff.norm().detach().cpu()),
+        f"{prefix}_cov_fro": float(cov_diff.norm().detach().cpu()),
+        f"{prefix}_frechet": float(frechet.detach().cpu()),
+        f"{prefix}_mmd_rbf": float(mmd.detach().cpu()),
+        f"{prefix}_mmd_rbf_sigma2": float(sigma2.detach().cpu()),
+    }
+
+
 def can_score_external_text_image(records, image_feature_aligner):
     if image_feature_aligner is None:
         return False
@@ -4587,6 +4667,8 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         sample_z = ae.encode(sample)
         sample_features = record_image_embedding_tensor(
             sample_records[:sample.shape[0]], device=device)
+        generated_feature_emb = image_feature_aligner.encode_image(sample_z)
+        real_feature_emb = image_feature_aligner.encode_feature(sample_features)
         _sample_feature_loss, sample_feature_parts = image_feature_alignment_loss(
             image_feature_aligner, sample_z, sample_features,
             prefix="generated_image_feature_retrieval")
@@ -4612,11 +4694,14 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
             "generated_image_feature_retrieval_n": int(
                 sample_feature_parts["generated_image_feature_retrieval_n"].detach().cpu()),
         })
+        report.update(embedding_distribution_metrics(
+            generated_feature_emb, real_feature_emb,
+            prefix="generated_image_feature_distribution"))
         if score_external_text_image:
             sample_text_features = record_text_embedding_tensor(
                 sample_records[:sample.shape[0]], device=device)
             generated_pair_parts = embedding_pair_similarity(
-                image_feature_aligner.encode_image(sample_z),
+                generated_feature_emb,
                 image_feature_aligner.encode_feature(sample_text_features),
                 prefix="generated_external_text_image_score")
             report.update({
@@ -5081,6 +5166,13 @@ SWEEP_METRICS = (
     "generated_image_feature_retrieval_loss",
     "generated_image_feature_retrieval_i2f_acc",
     "generated_image_feature_retrieval_f2i_acc",
+    "generated_image_feature_distribution_matched_cos",
+    "generated_image_feature_distribution_mean_l2",
+    "generated_image_feature_distribution_mean_sq",
+    "generated_image_feature_distribution_mean_gap_l2",
+    "generated_image_feature_distribution_cov_fro",
+    "generated_image_feature_distribution_frechet",
+    "generated_image_feature_distribution_mmd_rbf",
     "external_text_image_score_cos",
     "external_text_image_score_i2t_acc",
     "external_text_image_score_t2i_acc",
@@ -5112,6 +5204,8 @@ def report_selection_key(report):
         float(report.get("generated_external_text_image_score_cos", 0.0)),
         float(report.get("generated_image_quality_score_pred_mean", 0.0)),
         float(report.get("generated_image_feature_retrieval_i2f_acc", 0.0)),
+        -float(report.get("generated_image_feature_distribution_frechet", inf)),
+        -float(report.get("generated_image_feature_distribution_mmd_rbf", inf)),
         float(report.get("external_text_image_score_cos", 0.0)),
         float(report.get("image_feature_retrieval_i2f_acc", 0.0)),
         float(report.get("generated_caption_retrieval_i2t_acc", 0.0)),
@@ -5135,6 +5229,8 @@ def aggregate_selection_key(report):
         float(report.get("generated_external_text_image_score_cos_mean", 0.0)),
         float(report.get("generated_image_quality_score_pred_mean_mean", 0.0)),
         float(report.get("generated_image_feature_retrieval_i2f_acc_mean", 0.0)),
+        -float(report.get("generated_image_feature_distribution_frechet_mean", inf)),
+        -float(report.get("generated_image_feature_distribution_mmd_rbf_mean", inf)),
         float(report.get("external_text_image_score_cos_mean", 0.0)),
         float(report.get("image_feature_retrieval_i2f_acc_mean", 0.0)),
         float(report.get("generated_caption_retrieval_i2t_acc_mean", 0.0)),
@@ -5180,6 +5276,13 @@ def eval_report_summary(report):
         "image_feature_retrieval_f2i_acc",
         "generated_image_feature_retrieval_i2f_acc",
         "generated_image_feature_retrieval_f2i_acc",
+        "generated_image_feature_distribution_matched_cos",
+        "generated_image_feature_distribution_mean_l2",
+        "generated_image_feature_distribution_mean_sq",
+        "generated_image_feature_distribution_mean_gap_l2",
+        "generated_image_feature_distribution_cov_fro",
+        "generated_image_feature_distribution_frechet",
+        "generated_image_feature_distribution_mmd_rbf",
         "external_text_image_score_cos",
         "generated_external_text_image_score_cos",
         "image_quality_score_pred_mean",
@@ -6835,6 +6938,8 @@ def selftest():
         assert report6["flow_cache_text_embedding_seq_len"] == 3
         assert report6["flow_repa_embed_dim"] == 11
         assert "generated_external_text_image_score_cos" in report6
+        assert "generated_image_feature_distribution_frechet" in report6
+        assert report6["generated_image_feature_distribution_n"] >= 1
         assert report6["image_quality_weighted"] is True
         assert report6["image_quality_weight_source"] == "aesthetic_score_quality"
         assert report6["image_quality_weight_records"] == 2
@@ -7019,6 +7124,7 @@ def selftest():
         assert "caption_sample_mse_mean" in img_agg[0]
         assert "generated_caption_retrieval_i2t_acc_mean" in img_agg[0]
         assert "generated_image_feature_retrieval_i2f_acc_mean" in img_agg[0]
+        assert "generated_image_feature_distribution_frechet_mean" in img_agg[0]
         assert "generated_external_text_image_score_cos_mean" in img_agg[0]
         ckpt = os.path.join(td, "manifest.pt")
         torch.save({
@@ -7095,6 +7201,7 @@ def selftest():
         assert any(row["quality_guidance_w"] > 0.0 for row in eval6["rows"])
         assert "generated_caption_retrieval_i2t_acc_mean" in eval6["best"]
         assert "generated_image_feature_retrieval_i2f_acc_mean" in eval6["best"]
+        assert "generated_image_feature_distribution_frechet_mean" in eval6["best"]
         assert "generated_external_text_image_score_cos_mean" in eval6["best"]
         assert "generated_image_quality_score_pred_mean_mean" in eval6["best"]
     print("image_latent selftest OK")
