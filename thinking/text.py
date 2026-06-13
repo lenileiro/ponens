@@ -2406,6 +2406,84 @@ def choice_concept_neighborhood_bridge_batch(model, vocab, sources, rng, pairs, 
     return rows, pair_ids
 
 
+def choice_concept_transfer_bridge_batch(model, vocab, hard_sources, correct_sources, rng,
+                                         pairs, device=DEV, pool_per_side=64):
+    """Pair current hard QA targets with nearest currently-correct target concepts."""
+    hard_answer_sources = [r for r in hard_sources
+                           if qa_choice_target(r) not in (None, "none")]
+    correct_answer_sources = [r for r in correct_sources
+                              if qa_choice_target(r) not in (None, "none")]
+    if not hard_answer_sources or not correct_answer_sources or pairs <= 0:
+        return [], []
+    pool_per_side = max(1, int(pool_per_side))
+    hard_n = min(len(hard_answer_sources), max(int(pairs) * 2, pool_per_side))
+    correct_n = min(len(correct_answer_sources), max(int(pairs) * 2, pool_per_side))
+    if hard_n < len(hard_answer_sources):
+        idx = rng.choice(len(hard_answer_sources), size=hard_n, replace=False)
+        hard_pool = [hard_answer_sources[int(i)] for i in idx]
+    else:
+        hard_pool = list(hard_answer_sources)
+    if correct_n < len(correct_answer_sources):
+        idx = rng.choice(len(correct_answer_sources), size=correct_n, replace=False)
+        correct_pool = [correct_answer_sources[int(i)] for i in idx]
+    else:
+        correct_pool = list(correct_answer_sources)
+    pool = unique_records_by_id(hard_pool, correct_pool)
+    txt, _ids = pack(pool, vocab, device)
+    with torch.no_grad():
+        vectors = choice_candidate_concept_vectors(model, txt, pool)
+    hard_items = []
+    for rec in hard_pool:
+        target = qa_choice_target(rec)
+        row = vectors.get(rec.rec_id)
+        if row and target in row:
+            hard_items.append((rec, target, row[target].detach()))
+    correct_items = []
+    for rec in correct_pool:
+        target = qa_choice_target(rec)
+        row = vectors.get(rec.rec_id)
+        if row and target in row:
+            correct_items.append((rec, target, row[target].detach()))
+    if not hard_items or not correct_items:
+        return [], []
+    hard_order = rng.permutation(len(hard_items)) if len(hard_items) > 1 else [0]
+    rows = []
+    pair_ids = []
+    used = set()
+    for hard_i in hard_order:
+        if len(pair_ids) >= int(pairs):
+            break
+        hard_rec, hard_target, hard_vec = hard_items[int(hard_i)]
+        best = None
+        for correct_rec, correct_target, correct_vec in correct_items:
+            key = (hard_rec.rec_id, correct_rec.rec_id)
+            if key in used:
+                continue
+            score = float((hard_vec * correct_vec).sum().cpu())
+            if best is None or score > best[0]:
+                best = (score, correct_rec, correct_target, key)
+        if best is None:
+            continue
+        _score, correct_rec, correct_target, key = best
+        used.add(key)
+        pair_idx = len(pair_ids)
+        hard_id = f"{hard_rec.rec_id}:concept_transfer_hard:{pair_idx}"
+        correct_id = f"{correct_rec.rec_id}:concept_transfer_correct:{pair_idx}"
+        rows.extend([
+            TextRecord(rec_id=hard_id, split=hard_rec.split, tokens=hard_rec.tokens,
+                       facts=hard_rec.facts, group=hard_rec.group, kind=hard_rec.kind,
+                       base_id=hard_rec.base_id, changed=hard_rec.changed,
+                       meta=hard_rec.meta),
+            TextRecord(rec_id=correct_id, split=correct_rec.split,
+                       tokens=correct_rec.tokens, facts=correct_rec.facts,
+                       group=correct_rec.group, kind=correct_rec.kind,
+                       base_id=correct_rec.base_id, changed=correct_rec.changed,
+                       meta=correct_rec.meta),
+        ])
+        pair_ids.append((hard_id, correct_id, hard_target, correct_target))
+    return rows, pair_ids
+
+
 def choice_concept_bridge_loss(model, txt, records, pair_ids, margin=0.0):
     losses = []
     margin_t = torch.tensor(float(margin), dtype=torch.float32, device=txt.device)
@@ -2772,6 +2850,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               choice_concept_prototype_w=0.0,
               choice_concept_prototype_margin=0.0,
               choice_concept_bridge_sources=None,
+              choice_concept_hard_sources=None,
+              choice_concept_correct_sources=None,
               choice_self_distill_w=0.0,
               choice_self_distill_temperature=1.0,
               choice_self_rank_distill_w=0.0,
@@ -2809,6 +2889,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
     concept_source_records = (list(choice_concept_bridge_sources)
                               if choice_concept_bridge_sources is not None
                               else train_records)
+    concept_hard_records = list(choice_concept_hard_sources or [])
+    concept_correct_records = list(choice_concept_correct_sources or [])
     concept_groups = (choice_concept_groups(concept_source_records)
                       if (choice_concept_bridge_w or choice_concept_prototype_w)
                       else [])
@@ -2998,11 +3080,16 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
         else:
             positive_anchor_loss = torch.tensor(0.0, device=device)
         if choice_concept_bridge_w:
-            if concept_groups:
-                concept_records, concept_pairs = choice_concept_bridge_batch(
-                    concept_groups, rng, max(1, batch // 2))
+            if concept_hard_records and concept_correct_records:
+                concept_records, concept_pairs = choice_concept_transfer_bridge_batch(
+                    model, vocab, concept_hard_records, concept_correct_records, rng,
+                    max(1, batch // 2), device=device,
+                    pool_per_side=max(16, batch * 4))
             else:
                 concept_records, concept_pairs = [], []
+            if (not concept_records or not concept_pairs) and concept_groups:
+                concept_records, concept_pairs = choice_concept_bridge_batch(
+                    concept_groups, rng, max(1, batch // 2))
             if (not concept_records or not concept_pairs) and concept_source_records:
                 concept_records, concept_pairs = choice_concept_neighborhood_bridge_batch(
                     model, vocab, concept_source_records, rng, max(1, batch // 2),
@@ -4966,6 +5053,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      study_discovery_correct_per_kind=0,
                      study_adaptive_correct_mining=False,
                      study_adaptive_correct_pool_per_kind=0,
+                     study_discovery_transfer=False,
                      study_focus_control_failures=False,
                      study_select_best=False, study_score_metric="both",
                      study_retention_w=1.0, study_control_w=1.0,
@@ -5117,6 +5205,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "study_adaptive_correct_mining": bool(study_adaptive_correct_mining),
               "study_adaptive_correct_pool_per_kind": int(
                   study_adaptive_correct_pool_per_kind),
+              "study_discovery_transfer": bool(study_discovery_transfer),
               "study_focus_control_failures": bool(study_focus_control_failures),
               "study_control_focus_sides": list(focused_control_sides),
               "study_control_sampling_sides": list(focused_sampling_sides),
@@ -5290,6 +5379,13 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                 "n_discovery_source_records": len(discovery_source_records),
                 "n_discovery_source_hard_records": (
                     len(hard_records) if discovery_source_records else 0),
+                "n_discovery_source_correct_records": (
+                    len(discovery_records) if discovery_source_records else 0),
+                "discovery_pairing": (
+                    "hard_to_correct_transfer"
+                    if study_discovery_transfer and discovery_source_records
+                    else ("hard_aware_neighborhood" if discovery_source_records
+                          else "default")),
             }
             round_fit_records = hard_records + anchor_records + train_replay_records
             if not hard_records:
@@ -5315,6 +5411,12 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                               "discovery_records_by_kind": discovery_counts,
                               "discovery_selection": discovery_selection,
                               "discovery_source_records": len(discovery_source_records),
+                              "discovery_pairing": (
+                                  "hard_to_correct_transfer"
+                                  if (study_discovery_transfer
+                                      and discovery_source_records)
+                                  else ("hard_aware_neighborhood"
+                                        if discovery_source_records else "default")),
                               "control_focus_sides": list(focused_control_sides),
                               "control_sampling_sides": list(focused_sampling_sides),
                               "replay_fit_records": len(train_replay_records),
@@ -5361,6 +5463,10 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   choice_concept_prototype_margin=choice_concept_prototype_margin,
                   choice_concept_bridge_sources=(
                       discovery_source_records or discovery_records or None),
+                  choice_concept_hard_sources=(
+                      hard_records
+                      if study_discovery_transfer and discovery_records else None),
+                  choice_concept_correct_sources=(discovery_records or None),
                   choice_self_distill_w=choice_self_distill_w,
                   choice_self_distill_temperature=choice_self_distill_temperature,
                   choice_self_rank_distill_w=choice_self_rank_distill_w,
@@ -5768,6 +5874,13 @@ def selftest():
     neighbor_txt, _neighbor_ids = pack(neighbor_rows, choice_vocab, "cpu")
     assert torch.isfinite(choice_concept_bridge_loss(
         choice_model, neighbor_txt, neighbor_rows, neighbor_pairs))
+    transfer_rows, transfer_pairs = choice_concept_transfer_bridge_batch(
+        choice_model, choice_vocab, choice_eval[:1], choice_eval[1:],
+        np.random.default_rng(21), pairs=1, device="cpu", pool_per_side=2)
+    assert len(transfer_rows) == 2 and len(transfer_pairs) == 1
+    transfer_txt, _transfer_ids = pack(transfer_rows, choice_vocab, "cpu")
+    assert torch.isfinite(choice_concept_bridge_loss(
+        choice_model, transfer_txt, transfer_rows, transfer_pairs))
     neighbor_proto_rows, neighbor_proto_items = (
         choice_concept_neighborhood_prototype_batch(
             choice_model, choice_vocab, bridge_eval, np.random.default_rng(25),
@@ -6363,6 +6476,9 @@ def main(argv=None):
     ap.add_argument("--study-adaptive-correct-pool-per-kind", type=int, default=0,
                     help=("cap correct-record candidates per kind before adaptive mining; "
                           "0 = use all currently-correct candidates"))
+    ap.add_argument("--study-discovery-transfer", action="store_true",
+                    help=("during study, pair current hard QA examples with nearest "
+                          "currently-correct concept neighbors for bridge training"))
     ap.add_argument("--study-focus-control-failures", action="store_true",
                     help=("during study, focus generated controls on control families "
                           "that failed the initial gate"))
@@ -6545,6 +6661,7 @@ def main(argv=None):
                              args.study_adaptive_correct_mining),
                          study_adaptive_correct_pool_per_kind=(
                              args.study_adaptive_correct_pool_per_kind),
+                         study_discovery_transfer=args.study_discovery_transfer,
                          study_focus_control_failures=args.study_focus_control_failures,
                          study_select_best=args.study_select_best,
                          study_score_metric=args.study_score_metric,

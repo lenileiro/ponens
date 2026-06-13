@@ -896,6 +896,15 @@ still rejected the round (`selected_round` **0**) because candidate replacement 
 discovery controls remained below threshold. This is the right shape: self-discovery now trains on
 hard examples connected to model-mined neighbors, while the gate prevents a premature update.
 
+`--study-discovery-transfer` makes that connection explicit: each concept bridge batch pairs hard
+QA examples with their nearest currently-correct target concepts instead of sampling the combined
+source pool as an undifferentiated neighborhood. The transfer smoke activated that direct
+hard-to-correct pairing and improved several failed control gaps (`question_swap` **-0.200 ->
+0.050**, candidate replacement abstention **-0.500 -> -0.400**, target-logit drop **-0.0349 ->
+-0.0254**, concept discovery **-0.0235 -> -0.0217**). The selector still rejected the round because
+held-out `squad_choice` regressed from **0.400** to **0.200**. So transfer is now an available
+"light bulb" pressure, but it remains opt-in until retention catches up.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
