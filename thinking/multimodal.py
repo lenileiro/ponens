@@ -731,12 +731,51 @@ def concept_full_distill_loss(factor_logits_by_mode, temperature=1.0):
     return torch.stack(losses).mean()
 
 
+def concept_full_rank_distill_loss(factor_logits_by_mode, golds, margin=0.0):
+    """Preserve full-path correct concept winners and margins in partial modes."""
+    if "full" not in factor_logits_by_mode:
+        return next(iter(next(iter(factor_logits_by_mode.values())).values())).sum() * 0.0
+    full = factor_logits_by_mode["full"]
+    device = next(iter(full.values())).device
+    margin_t = torch.tensor(float(margin), dtype=torch.float32, device=device)
+    losses = []
+    for factor in VALUE_POS:
+        teacher_logits = full[factor].detach()
+        if teacher_logits.shape[-1] < 2:
+            continue
+        targets = concept_factor_targets(golds, factor, device)
+        correct = teacher_logits.argmax(-1).eq(targets)
+        if not bool(correct.any()):
+            continue
+        teacher_rows = teacher_logits[correct]
+        target_rows = targets[correct]
+        row_idx = torch.arange(target_rows.shape[0], device=device)
+        other_mask = torch.ones_like(teacher_rows, dtype=torch.bool)
+        other_mask[row_idx, target_rows] = False
+        teacher_target = teacher_rows[row_idx, target_rows]
+        teacher_other = teacher_rows.masked_fill(~other_mask, -float("inf")).max(-1).values
+        teacher_margin = (teacher_target - teacher_other).clamp_min(0.0)
+        desired_margin = torch.maximum(teacher_margin, margin_t.expand_as(teacher_margin))
+        for mode, logits_by_factor in factor_logits_by_mode.items():
+            if mode == "full":
+                continue
+            student_rows = logits_by_factor[factor][correct]
+            student_target = student_rows[row_idx, target_rows]
+            student_other = student_rows.masked_fill(~other_mask, -float("inf")).max(-1).values
+            losses.append(F.cross_entropy(student_rows, target_rows))
+            losses.append(F.softplus(student_other + desired_margin - student_target).mean())
+    if not losses:
+        return next(iter(full.values())).sum() * 0.0
+    return torch.stack(losses).mean()
+
+
 def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100, value_w=6.0,
           surfaces_path=None, layers=3, heads=4, max_len=128, img_tokens=4, aud_tokens=8,
           txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
           modality_dropout=0.0, agreement_w=0.0, fusion_arch="concept", concept_tokens=4,
           fusion_layers=1, concept_w=0.0, concept_agreement_w=0.0,
-          concept_distill_w=0.0, concept_distill_temperature=1.0):
+          concept_distill_w=0.0, concept_distill_temperature=1.0,
+          concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     surfaces = load_text_surfaces(surfaces_path)
@@ -749,7 +788,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                          concept_tokens=concept_tokens, fusion_layers=fusion_layers).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     last_base = last_agreement = last_concept = 0.0
-    last_concept_agreement = last_concept_distill = 0.0
+    last_concept_agreement = last_concept_distill = last_concept_rank_distill = 0.0
     for st in range(1, steps + 1):
         model.train()
         img, aud, txt, ids, golds = _batch(batch, rng, vocab, device, surfaces,
@@ -760,7 +799,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         base_loss = sum(losses) / len(losses)
         agreement = (value_agreement_loss(logits_by_mode, vocab)
                      if agreement_w else base_loss * 0.0)
-        if concept_w or concept_agreement_w or concept_distill_w:
+        if (concept_w or concept_agreement_w or concept_distill_w
+                or concept_rank_distill_w):
             factor_logits_by_mode = {
                 mode: model.factor_logits(img, aud, txt, mode=mode) for mode in MODES
             }
@@ -768,14 +808,18 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
             concept_agreement = concept_factor_agreement_loss(factor_logits_by_mode)
             concept_distill = concept_full_distill_loss(
                 factor_logits_by_mode, temperature=concept_distill_temperature)
+            concept_rank_distill = concept_full_rank_distill_loss(
+                factor_logits_by_mode, golds, margin=concept_rank_distill_margin)
         else:
             concept_loss = base_loss * 0.0
             concept_agreement = base_loss * 0.0
             concept_distill = base_loss * 0.0
+            concept_rank_distill = base_loss * 0.0
         loss = (base_loss + float(agreement_w) * agreement
                 + float(concept_w) * concept_loss
                 + float(concept_agreement_w) * concept_agreement
-                + float(concept_distill_w) * concept_distill)
+                + float(concept_distill_w) * concept_distill
+                + float(concept_rank_distill_w) * concept_rank_distill)
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -784,16 +828,19 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         last_concept = float(concept_loss.detach())
         last_concept_agreement = float(concept_agreement.detach())
         last_concept_distill = float(concept_distill.detach())
+        last_concept_rank_distill = float(concept_rank_distill.detach())
         if st % log_every == 0 or st == steps:
             print(f"  m0 {st}/{steps} loss {loss.item():.3f} "
                   f"base {last_base:.3f} agree {last_agreement:.3f} "
                   f"concept {last_concept:.3f} "
                   f"concept-agree {last_concept_agreement:.3f} "
-                  f"concept-distill {last_concept_distill:.3f}", flush=True)
+                  f"concept-distill {last_concept_distill:.3f} "
+                  f"concept-rank {last_concept_rank_distill:.3f}", flush=True)
     model.train_metrics = {"token_loss": last_base, "agreement_loss": last_agreement,
                            "concept_loss": last_concept,
                            "concept_agreement_loss": last_concept_agreement,
-                           "concept_distill_loss": last_concept_distill}
+                           "concept_distill_loss": last_concept_distill,
+                           "concept_rank_distill_loss": last_concept_rank_distill}
     return model, vocab, surfaces
 
 
@@ -817,7 +864,8 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
         modality_dropout=0.0, agreement_w=0.0, fusion_arch="concept", concept_tokens=4,
         fusion_layers=1, concept_w=0.0, concept_agreement_w=0.0,
-        concept_distill_w=0.0, concept_distill_temperature=1.0, log_every=100):
+        concept_distill_w=0.0, concept_distill_temperature=1.0,
+        concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0, log_every=100):
     model, vocab, surfaces = train(steps=steps, seed=seed, device=device, value_w=value_w,
                                    surfaces_path=surfaces_path, batch=batch, d=d, lr=lr,
                                    layers=layers, heads=heads, max_len=max_len,
@@ -833,6 +881,8 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                    concept_distill_w=concept_distill_w,
                                    concept_distill_temperature=(
                                        concept_distill_temperature),
+                                   concept_rank_distill_w=concept_rank_distill_w,
+                                   concept_rank_distill_margin=concept_rank_distill_margin,
                                    log_every=log_every)
     full = evaluate(model, vocab, surfaces, n=eval_n, device=device, text_split="eval",
                     mode="full")
@@ -868,6 +918,8 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
               "concept_agreement_w": float(concept_agreement_w),
               "concept_distill_w": float(concept_distill_w),
               "concept_distill_temperature": float(concept_distill_temperature),
+              "concept_rank_distill_w": float(concept_rank_distill_w),
+              "concept_rank_distill_margin": float(concept_rank_distill_margin),
               "train_metrics": getattr(model, "train_metrics", {}),
               "architecture": architecture,
               "eval_n": int(eval_n), "free_n": int(free_n),
@@ -952,6 +1004,7 @@ def selftest():
     assert torch.isfinite(concept_loss), concept_loss
     assert torch.isfinite(concept_factor_agreement_loss(factor_logits))
     assert torch.isfinite(concept_full_distill_loss(factor_logits, temperature=1.25))
+    assert torch.isfinite(concept_full_rank_distill_loss(factor_logits, golds, margin=0.05))
     concat_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
                                 fusion_arch="concat").to("cpu")
     concat_prefix, concat_concepts = concat_model.encode_prefix(x, a, tt, mode="full")
@@ -1018,6 +1071,12 @@ def main(argv=None):
     ap.add_argument("--concept-distill-temperature", type=float, default=1.0,
                     dest="concept_distill_temperature",
                     help="temperature for full-to-partial upstream concept distillation")
+    ap.add_argument("--concept-rank-distill-w", type=float, default=0.0,
+                    dest="concept_rank_distill_w",
+                    help="preserve full-path correct concept winners and margins in partial modes")
+    ap.add_argument("--concept-rank-distill-margin", type=float, default=0.0,
+                    dest="concept_rank_distill_margin",
+                    help="minimum margin for full-to-partial concept rank distillation")
     ap.add_argument("--img-tokens", type=int, default=4, dest="img_tokens")
     ap.add_argument("--aud-tokens", type=int, default=8, dest="aud_tokens")
     ap.add_argument("--txt-tokens", type=int, default=8, dest="txt_tokens")
@@ -1059,8 +1118,11 @@ def main(argv=None):
     if (args.d // args.heads) % 2 != 0:
         ap.error("--dim / --heads must be even for rope attention")
     if (args.agreement_w < 0.0 or args.concept_w < 0.0
-            or args.concept_agreement_w < 0.0 or args.concept_distill_w < 0.0):
+            or args.concept_agreement_w < 0.0 or args.concept_distill_w < 0.0
+            or args.concept_rank_distill_w < 0.0):
         ap.error("agreement/concept loss weights must be non-negative")
+    if args.concept_rank_distill_margin < 0.0:
+        ap.error("--concept-rank-distill-margin must be non-negative")
     if args.concept_distill_temperature <= 0.0:
         ap.error("--concept-distill-temperature must be positive")
     if args.modality_dropout < 0.0 or args.modality_dropout > 1.0:
@@ -1086,6 +1148,8 @@ def main(argv=None):
                  concept_agreement_w=args.concept_agreement_w,
                  concept_distill_w=args.concept_distill_w,
                  concept_distill_temperature=args.concept_distill_temperature,
+                 concept_rank_distill_w=args.concept_rank_distill_w,
+                 concept_rank_distill_margin=args.concept_rank_distill_margin,
                  log_every=args.log_every,
                  device=args.device)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)

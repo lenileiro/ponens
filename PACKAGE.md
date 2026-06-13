@@ -1656,6 +1656,14 @@ total prefix token count, and RunPod exposes the new controls as `--multimodal-f
 `--multimodal-concept-tokens`, `--multimodal-fusion-layers`, `--multimodal-concept-w`,
 `--multimodal-concept-agreement-w`, and `--multimodal-concept-distill-w`.
 
+M-3 carries the text rank-retention idea into the multimodal concept fusion path.
+`--concept-rank-distill-w` preserves full-path concept winners and target-over-alternative margins
+inside sensor-only and text-only modes, but only on rows where the full multimodal path already
+predicts the labeled factor value correctly. This is not a renderer rule or a hand-authored English
+fact: the teacher signal is the model's detached full-path concept distribution, filtered by the
+batch labels that already supervise the trace. RunPod exposes the same lever as
+`--multimodal-concept-rank-distill-w` with `--multimodal-concept-rank-distill-margin`.
+
 The adaptive text study loop above is intentionally upstream of this multimodal bridge. When the
 text reader fails shortcut controls, the next study attempt can focus the generated evidence
 routes that failed, while the selector blocks regressions. Multimodal can then consume a reader

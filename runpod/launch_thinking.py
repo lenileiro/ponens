@@ -440,6 +440,9 @@ def payload(args):
                 f"--concept-distill-w {args.multimodal_concept_distill_w} "
                 f"--concept-distill-temperature "
                 f"{args.multimodal_concept_distill_temperature} "
+                f"--concept-rank-distill-w {args.multimodal_concept_rank_distill_w} "
+                f"--concept-rank-distill-margin "
+                f"{args.multimodal_concept_rank_distill_margin} "
                 f"--img-tokens {args.multimodal_img_tokens} "
                 f"--aud-tokens {args.multimodal_aud_tokens} "
                 f"--txt-tokens {args.multimodal_txt_tokens} "
@@ -1145,6 +1148,12 @@ def main():
                     help="M-0 full-to-partial upstream concept distillation weight")
     ap.add_argument("--multimodal-concept-distill-temperature", type=float, default=1.0,
                     dest="multimodal_concept_distill_temperature")
+    ap.add_argument("--multimodal-concept-rank-distill-w", type=float, default=0.0,
+                    dest="multimodal_concept_rank_distill_w",
+                    help="M-0 full-correct concept rank distillation weight")
+    ap.add_argument("--multimodal-concept-rank-distill-margin", type=float, default=0.0,
+                    dest="multimodal_concept_rank_distill_margin",
+                    help="minimum margin for M-0 full-to-partial concept rank distillation")
     ap.add_argument("--multimodal-img-tokens", type=int, default=4,
                     dest="multimodal_img_tokens")
     ap.add_argument("--multimodal-aud-tokens", type=int, default=8,
@@ -1382,10 +1391,13 @@ def main():
         if (args.multimodal_value_w < 0.0 or args.multimodal_agreement_w < 0.0
                 or args.multimodal_concept_w < 0.0
                 or args.multimodal_concept_agreement_w < 0.0
-                or args.multimodal_concept_distill_w < 0.0):
+                or args.multimodal_concept_distill_w < 0.0
+                or args.multimodal_concept_rank_distill_w < 0.0):
             sys.exit("ERROR: multimodal loss weights must be non-negative")
         if args.multimodal_concept_distill_temperature <= 0.0:
             sys.exit("ERROR: --multimodal-concept-distill-temperature must be positive")
+        if args.multimodal_concept_rank_distill_margin < 0.0:
+            sys.exit("ERROR: --multimodal-concept-rank-distill-margin must be non-negative")
         if args.multimodal_dropout < 0.0 or args.multimodal_dropout > 1.0:
             sys.exit("ERROR: --multimodal-dropout must be in [0, 1]")
         if (args.multimodal_free_n < 0 or args.multimodal_counterfactual_n < 0

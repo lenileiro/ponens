@@ -363,6 +363,7 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --trunk-width 96 --trunk-depth 2 --txt-tokens 12 --agreement-w 0.1 \
     --fusion-arch concept --concept-tokens 4 --fusion-layers 1 \
     --concept-w 0.25 --concept-agreement-w 0.1 --concept-distill-w 0.1 \
+    --concept-rank-distill-w 0.1 --concept-rank-distill-margin 0.05 \
     --modality-dropout 0.05 \
     --out runs/m0_multimodal.json --checkpoint runs/m0_multimodal.pt
 ```
