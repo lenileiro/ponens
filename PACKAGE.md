@@ -1564,6 +1564,12 @@ uses the AdaLN-zero-style branch multiplier directly; there is no alternate resi
 the CLI or RunPod wrapper. Reports/checkpoints record `dit_residual_gate="zero"` and
 `zero_residual_gating` as fixed architecture metadata.
 
+Image-80 adds opt-in activation checkpointing for latent DiT/CrossDiT/MM-DiT flow blocks.
+`thinking.image_latent --flow-checkpoint-blocks` recomputes transformer blocks during backward to
+reduce activation memory for deeper or higher-resolution image runs. The state dict is unchanged;
+reports and checkpoints record `flow_checkpoint_blocks` and `activation_checkpointing`, and RunPod
+exposes the same training knob as `--image-flow-checkpoint-blocks`.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered

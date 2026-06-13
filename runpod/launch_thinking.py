@@ -337,6 +337,8 @@ def payload(args):
                 train += " --no-ema-warmup"
             if args.image_dit_qk_norm:
                 train += " --dit-qk-norm"
+            if args.image_flow_checkpoint_blocks:
+                train += " --flow-checkpoint-blocks"
             if args.image_flow_cache_latents:
                 train += " --flow-cache-latents"
             if args.image_no_flow_loss_weight_normalize:
@@ -752,6 +754,9 @@ def main():
     ap.add_argument("--image-dit-pos-embed", default="learned",
                     choices=("learned", "sincos2d"), dest="image_dit_pos_embed",
                     help="latent image DiT positional embedding")
+    ap.add_argument("--image-flow-checkpoint-blocks", action="store_true",
+                    dest="image_flow_checkpoint_blocks",
+                    help="checkpoint latent image transformer blocks during flow training")
     ap.add_argument("--image-ae-arch", default="semantic",
                     choices=("semantic", "residual", "hf-vae"),
                     dest="image_ae_arch",

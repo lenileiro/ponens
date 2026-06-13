@@ -34,6 +34,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_activation_checkpoint
 
 from .image_data import (ImageTextRecord, build_caption_vocab, caption_ids,
                          load_image_tensor, normalized_sampling_weights,
@@ -64,6 +65,19 @@ AE_ARCHES = ("semantic", "residual", "hf-vae")
 FLOW_DISTILL_TEACHERS = ("raw", "ema", "auto")
 DEFAULT_GUIDANCE_INTERVAL = (0.0, 1.0)
 LATENT_NORMALIZE_MODES = ("none", "global", "channel", "auto")
+
+
+def activation_checkpoint(fn, *args):
+    """Checkpoint a module call with the non-reentrant implementation when available."""
+    try:
+        return torch_activation_checkpoint(fn, *args, use_reentrant=False)
+    except TypeError:
+        return torch_activation_checkpoint(fn, *args)
+
+
+def should_checkpoint_blocks(module):
+    return bool(getattr(module, "checkpoint_blocks", False)
+                and module.training and torch.is_grad_enabled())
 
 
 def _batch(n, rng, size=32, device=DEV, return_specs=False):
@@ -1136,7 +1150,8 @@ class LatentDiTFlowNet(nn.Module):
     """
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
-                 max_tokens=256, head_width_mult=1, pos_embed="learned"):
+                 max_tokens=256, head_width_mult=1, pos_embed="learned",
+                 checkpoint_blocks=False):
         super().__init__()
         pos_embed = str(pos_embed)
         if pos_embed not in DIT_POS_EMBEDS:
@@ -1149,6 +1164,8 @@ class LatentDiTFlowNet(nn.Module):
         self.head_width_mult = int(head_width_mult)
         self.dit_pos_embed = pos_embed
         self.uses_2d_pos_embed = pos_embed == "sincos2d"
+        self.checkpoint_blocks = bool(checkpoint_blocks)
+        self.uses_activation_checkpointing = self.checkpoint_blocks
         self.in_proj = nn.Linear(latent_ch, hidden)
         self.pos = (
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
@@ -1191,7 +1208,13 @@ class LatentDiTFlowNet(nn.Module):
         ctx = self.cond(torch.cat([cond, t.to(cond.dtype)], dim=1))[:, None, :]
         x = self.in_proj(toks)
         x = x + self.image_pos(h, w, x.device, x.dtype) + ctx
-        x = self.blocks(x)
+        if should_checkpoint_blocks(self):
+            for layer in self.blocks.layers:
+                x = activation_checkpoint(layer, x)
+            if self.blocks.norm is not None:
+                x = self.blocks.norm(x)
+        else:
+            x = self.blocks(x)
         features = self.norm(x)
         v = self.out_proj(features)
         velocity = v.transpose(1, 2).reshape(b, c, h, w)
@@ -1231,7 +1254,8 @@ class LatentCrossDiTFlowNet(nn.Module):
     uses_cond_tokens = True
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
-                 max_tokens=256, head_width_mult=1, pos_embed="learned"):
+                 max_tokens=256, head_width_mult=1, pos_embed="learned",
+                 checkpoint_blocks=False):
         super().__init__()
         pos_embed = str(pos_embed)
         if pos_embed not in DIT_POS_EMBEDS:
@@ -1244,6 +1268,8 @@ class LatentCrossDiTFlowNet(nn.Module):
         self.head_width_mult = int(head_width_mult)
         self.dit_pos_embed = pos_embed
         self.uses_2d_pos_embed = pos_embed == "sincos2d"
+        self.checkpoint_blocks = bool(checkpoint_blocks)
+        self.uses_activation_checkpointing = self.checkpoint_blocks
         self.in_proj = nn.Linear(latent_ch, hidden)
         self.pos = (
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
@@ -1289,7 +1315,12 @@ class LatentCrossDiTFlowNet(nn.Module):
         x = self.in_proj(toks)
         x = x + self.image_pos(h, w, x.device, x.dtype) + global_ctx
         for block in self.blocks:
-            x = block(x, ctx, ctx_mask=ctx_mask)
+            if should_checkpoint_blocks(self):
+                def block_forward(x_arg, ctx_arg, block=block):
+                    return block(x_arg, ctx_arg, ctx_mask=ctx_mask)
+                x = activation_checkpoint(block_forward, x, ctx)
+            else:
+                x = block(x, ctx, ctx_mask=ctx_mask)
         features = self.norm(x)
         v = self.out_proj(features)
         velocity = v.transpose(1, 2).reshape(b, c, h, w)
@@ -1438,7 +1469,7 @@ class LatentMMDiTFlowNet(nn.Module):
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256, head_width_mult=1, qk_norm=False,
-                 attn_impl="manual", pos_embed="learned"):
+                 attn_impl="manual", pos_embed="learned", checkpoint_blocks=False):
         super().__init__()
         attn_impl = str(attn_impl)
         if attn_impl not in MMDIT_ATTN_IMPLS:
@@ -1458,6 +1489,8 @@ class LatentMMDiTFlowNet(nn.Module):
         self.dit_residual_gate = "zero"
         self.uses_zero_residual_gating = True
         self.uses_2d_pos_embed = pos_embed == "sincos2d"
+        self.checkpoint_blocks = bool(checkpoint_blocks)
+        self.uses_activation_checkpointing = self.checkpoint_blocks
         self.in_proj = nn.Linear(latent_ch, hidden)
         self.pos = (
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
@@ -1505,7 +1538,12 @@ class LatentMMDiTFlowNet(nn.Module):
         img = img + cond_ctx[:, None, :]
         ctx, ctx_mask = self._context(cond)
         for block in self.blocks:
-            img, ctx = block(img, ctx, cond_ctx, ctx_mask=ctx_mask)
+            if should_checkpoint_blocks(self):
+                def block_forward(img_arg, ctx_arg, cond_arg, block=block):
+                    return block(img_arg, ctx_arg, cond_arg, ctx_mask=ctx_mask)
+                img, ctx = activation_checkpoint(block_forward, img, ctx, cond_ctx)
+            else:
+                img, ctx = block(img, ctx, cond_ctx, ctx_mask=ctx_mask)
         features = self.norm(img)
         v = self.out_proj(features)
         velocity = v.transpose(1, 2).reshape(b, c, h, w)
@@ -1516,7 +1554,8 @@ class LatentMMDiTFlowNet(nn.Module):
 
 def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4,
               cond_dim=None, dit_head_width_mult=1, latent_max_tokens=256,
-              dit_qk_norm=False, dit_attn_impl="manual", dit_pos_embed="learned"):
+              dit_qk_norm=False, dit_attn_impl="manual", dit_pos_embed="learned",
+              flow_checkpoint_blocks=False):
     if flow_arch == "conv":
         return LatentFlowNet(latent_ch=latent_ch, hidden=hidden, cond_dim=cond_dim)
     dit_pos_embed = str(dit_pos_embed)
@@ -1533,7 +1572,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                 cond_dim=cond_dim,
                                 head_width_mult=dit_head_width_mult,
                                 max_tokens=latent_max_tokens,
-                                pos_embed=dit_pos_embed)
+                                pos_embed=dit_pos_embed,
+                                checkpoint_blocks=flow_checkpoint_blocks)
     if flow_arch == "crossdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
@@ -1542,7 +1582,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                      heads=heads, cond_dim=cond_dim,
                                      head_width_mult=dit_head_width_mult,
                                      max_tokens=latent_max_tokens,
-                                     pos_embed=dit_pos_embed)
+                                     pos_embed=dit_pos_embed,
+                                     checkpoint_blocks=flow_checkpoint_blocks)
     if flow_arch == "mmdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
@@ -1553,7 +1594,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                   max_tokens=latent_max_tokens,
                                   qk_norm=dit_qk_norm,
                                   attn_impl=dit_attn_impl,
-                                  pos_embed=dit_pos_embed)
+                                  pos_embed=dit_pos_embed,
+                                  checkpoint_blocks=flow_checkpoint_blocks)
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
@@ -4914,6 +4956,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                         or "learned")
     if dit_pos_embed not in DIT_POS_EMBEDS:
         raise ValueError(f"unknown DiT positional embedding {dit_pos_embed!r}")
+    flow_checkpoint_blocks = bool(ckpt.get(
+        "flow_checkpoint_blocks", report.get("flow_checkpoint_blocks", False)))
     cond_mode = ckpt.get("cond_mode", report.get("cond_mode", "facts"))
     data_mode = ckpt.get("data_mode", report.get("data_mode", "synthetic_factors"))
     cond_dim = int(ckpt.get("cond_dim", report.get("cond_dim", len(FACT_VOCAB))))
@@ -4998,7 +5042,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                      latent_max_tokens=latent_max_tokens,
                      dit_qk_norm=dit_qk_norm,
                      dit_attn_impl=dit_attn_impl,
-                     dit_pos_embed=dit_pos_embed).to(device)
+                     dit_pos_embed=dit_pos_embed,
+                     flow_checkpoint_blocks=flow_checkpoint_blocks).to(device)
     flow_repa_aligner = None
     if ckpt.get("flow_repa_aligner_state_dict"):
         if image_embedding_in_dim <= 0:
@@ -5059,6 +5104,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
         "dit_pos_embed": dit_pos_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
         "dit_residual_gate": "zero" if flow_arch == "mmdit" else "",
+        "flow_checkpoint_blocks": bool(getattr(flow, "checkpoint_blocks", False)),
+        "activation_checkpointing": bool(getattr(flow, "uses_activation_checkpointing", False)),
         "uses_2d_pos_embed": bool(getattr(flow, "uses_2d_pos_embed", False)),
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
@@ -5804,6 +5851,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       cfg_rescale=0.0,
                       dit_head_width_mult=1, latent_max_tokens=256,
                       dit_pos_embed="learned",
+                      flow_checkpoint_blocks=False,
                       ae_arch="semantic", latent_downsample=4, ae_res_blocks=1,
                       ae_hf_model="", ae_hf_subfolder="", ae_hf_scaling_factor=0.0,
                       ae_recon_loss="mse", ae_grad_w=0.0, ae_ms_w=0.0,
@@ -6006,6 +6054,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     dit_pos_embed = str(dit_pos_embed)
     if dit_pos_embed not in DIT_POS_EMBEDS:
         raise ValueError(f"unknown DiT positional embedding {dit_pos_embed!r}")
+    flow_checkpoint_blocks = bool(flow_checkpoint_blocks)
     if latent_max_tokens <= 0:
         raise ValueError("latent_max_tokens must be positive")
     if flow_ema_decay < 0.0 or flow_ema_decay >= 1.0:
@@ -6125,7 +6174,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                      latent_max_tokens=latent_max_tokens,
                      dit_qk_norm=bool(dit_qk_norm),
                      dit_attn_impl=dit_attn_impl,
-                     dit_pos_embed=dit_pos_embed).to(device)
+                     dit_pos_embed=dit_pos_embed,
+                     flow_checkpoint_blocks=flow_checkpoint_blocks).to(device)
     flow_repa_aligner = None
     if image_records is not None and flow_repa_w > 0.0:
         hidden_feature_dim = flow_hidden_feature_dim(flow)
@@ -6466,7 +6516,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             dit_head_width_mult=dit_head_width_mult,
             latent_max_tokens=max_train_latent_tokens,
             dit_qk_norm=dit_qk_norm, dit_attn_impl=dit_attn_impl,
-            dit_pos_embed=dit_pos_embed).to(device)
+            dit_pos_embed=dit_pos_embed,
+            flow_checkpoint_blocks=flow_checkpoint_blocks).to(device)
         load_flow_state(teacher_flow, teacher_state)
         attach_latent_stats(teacher_flow, latent_stats)
         teacher_flow.eval()
@@ -6672,6 +6723,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
         "dit_pos_embed": dit_pos_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
         "dit_residual_gate": "zero" if flow_arch == "mmdit" else "",
+        "flow_checkpoint_blocks": bool(getattr(flow, "checkpoint_blocks", False)),
+        "activation_checkpointing": bool(getattr(flow, "uses_activation_checkpointing", False)),
         "uses_2d_pos_embed": bool(getattr(flow, "uses_2d_pos_embed", False)),
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
@@ -7033,6 +7086,7 @@ def selftest():
         text_cond_dim=8, sample_steps=1, time_sampling="logit-normal",
         flow_ema_decay=0.5, dit_head_width_mult=2, dit_qk_norm=True,
         dit_attn_impl=("sdpa" if hasattr(F, "scaled_dot_product_attention") else "auto"),
+        flow_checkpoint_blocks=True,
         return_conditioner=True)
     assert report5["flow_arch"] == "mmdit" and flow_uses_cond_tokens(flow5)
     assert report5["dit_head_width_mult"] == 2
@@ -7041,6 +7095,9 @@ def selftest():
     assert report5["dit_residual_gate"] == "zero"
     assert report5["zero_residual_gating"] is True
     assert flow5.uses_zero_residual_gating is True
+    assert report5["flow_checkpoint_blocks"] is True
+    assert report5["activation_checkpointing"] is True
+    assert flow5.uses_activation_checkpointing is True
     assert any("q_norm" in k for k in flow5.state_dict())
     assert report5["adaptive_modulation"] is True
     assert report5["residual_gating"] is True
@@ -7534,6 +7591,10 @@ def main(argv=None):
     ap.add_argument("--dit-pos-embed", default="learned", choices=DIT_POS_EMBEDS,
                     dest="dit_pos_embed",
                     help="image-token positional embedding for DiT/CrossDiT/MM-DiT flows")
+    ap.add_argument("--flow-checkpoint-blocks", action="store_true",
+                    dest="flow_checkpoint_blocks",
+                    help=("checkpoint DiT/CrossDiT/MM-DiT transformer blocks during "
+                          "flow training to reduce activation memory"))
     ap.add_argument("--cond-drop", type=float, default=0.0, dest="cond_drop")
     ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
     ap.add_argument("--cfg-rescale", type=float, default=0.0, dest="cfg_rescale",
@@ -7992,6 +8053,7 @@ def main(argv=None):
         dit_qk_norm=args.dit_qk_norm,
         dit_attn_impl=args.dit_attn_impl,
         dit_pos_embed=args.dit_pos_embed,
+        flow_checkpoint_blocks=args.flow_checkpoint_blocks,
         latent_max_tokens=args.latent_max_tokens, ae_arch=args.ae_arch,
         latent_downsample=args.latent_downsample, ae_res_blocks=args.ae_res_blocks,
         ae_hf_model=args.ae_hf_model,
@@ -8212,6 +8274,8 @@ def main(argv=None):
         "dit_attn_impl": report.get("dit_attn_impl", "manual"),
         "dit_pos_embed": report.get("dit_pos_embed", "") or args.dit_pos_embed,
         "dit_residual_gate": report.get("dit_residual_gate", ""),
+        "flow_checkpoint_blocks": report.get("flow_checkpoint_blocks", False),
+        "activation_checkpointing": report.get("activation_checkpointing", False),
         "zero_residual_gating": report.get("zero_residual_gating", False),
         "uses_2d_pos_embed": report.get("uses_2d_pos_embed", False),
         "cond_mode": args.cond_mode,
