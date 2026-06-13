@@ -4554,7 +4554,8 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                            feature_guidance_w=0.0,
                            feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                            quality_guidance_w=0.0,
-                           quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
+                           quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                           generated_eval_n=0):
     rng = np.random.default_rng(seed)
     ae.eval()
     flow.eval()
@@ -4572,6 +4573,9 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         feature_guidance_interval, name="feature_guidance_interval")
     quality_guidance_interval = validate_guidance_interval(
         quality_guidance_interval, name="quality_guidance_interval")
+    generated_eval_n = int(generated_eval_n)
+    if generated_eval_n < 0:
+        raise ValueError("generated_eval_n must be non-negative")
     if text_guidance_w < 0.0:
         raise ValueError("text_guidance_w must be non-negative")
     if text_guidance_w > 0.0 and text_aligner is None:
@@ -4641,34 +4645,58 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         latent_stds.append(float(z.std().detach().cpu()))
         total += b
 
-    sample_x, sample_captions, sample_records = sample_image_text_batch(
-        records, np.random.default_rng(seed + 17), batch=min(batch, max(1, sample_steps)),
-        size=size, device=device, return_records=True)
+    sample_target_n = (
+        int(generated_eval_n) if generated_eval_n > 0
+        else min(int(batch), max(1, int(sample_steps)))
+    )
+    sample_target_n = max(1, sample_target_n)
+    sample_batch = max(1, int(batch))
+    sample_rng = np.random.default_rng(seed + 17)
+    sample_parts, sample_x_parts, sample_captions, sample_records = [], [], [], []
+    sample_done = 0
+    while sample_done < sample_target_n:
+        sample_b = min(sample_batch, sample_target_n - sample_done)
+        chunk_x, chunk_captions, chunk_records = sample_image_text_batch(
+            records, sample_rng, batch=sample_b, size=size, device=device,
+            return_records=True)
+        chunk_cond = caption_record_condition(
+            chunk_captions, chunk_records, conditioner, prompt_vocab,
+            source=caption_cond_source, max_len=caption_max_len, device=device,
+            return_tokens=flow_uses_cond_tokens(flow))
+        chunk_text_features = (
+            record_text_embedding_tensor(chunk_records, device=device)
+            if feature_guidance_w > 0.0 else None
+        )
+        sample_parts.append(sample_images(
+            ae, flow, chunk_cond,
+            latent_shape=ae_latent_shape(ae, size),
+            steps=sample_steps, device=device,
+            seed=(seed if sample_done == 0 else seed + sample_done),
+            cfg_scale=cfg_scale,
+            cfg_rescale=cfg_rescale,
+            sample_method=sample_method, cfg_interval=cfg_interval,
+            sample_time_shift=sample_time_shift,
+            sample_schedule=sample_schedule,
+            text_guidance_w=text_guidance_w,
+            text_guidance_aligner=text_aligner,
+            text_guidance_cond=chunk_cond,
+            text_guidance_interval=text_guidance_interval,
+            feature_guidance_w=feature_guidance_w,
+            feature_guidance_aligner=image_feature_aligner,
+            feature_guidance_features=chunk_text_features,
+            feature_guidance_interval=feature_guidance_interval,
+            quality_guidance_w=quality_guidance_w,
+            quality_guidance_scorer=image_quality_scorer,
+            quality_guidance_interval=quality_guidance_interval))
+        sample_x_parts.append(chunk_x)
+        sample_captions.extend(chunk_captions)
+        sample_records.extend(chunk_records)
+        sample_done += sample_b
+    sample = torch.cat(sample_parts, dim=0)
+    sample_x = torch.cat(sample_x_parts, dim=0)
     sample_cond = caption_record_condition(
         sample_captions, sample_records, conditioner, prompt_vocab, source=caption_cond_source,
         max_len=caption_max_len, device=device, return_tokens=flow_uses_cond_tokens(flow))
-    sample_text_features = (
-        record_text_embedding_tensor(sample_records, device=device)
-        if feature_guidance_w > 0.0 else None
-    )
-    sample = sample_images(ae, flow, sample_cond,
-                           latent_shape=ae_latent_shape(ae, size),
-                           steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
-                           cfg_rescale=cfg_rescale,
-                           sample_method=sample_method, cfg_interval=cfg_interval,
-                           sample_time_shift=sample_time_shift,
-                           sample_schedule=sample_schedule,
-                           text_guidance_w=text_guidance_w,
-                           text_guidance_aligner=text_aligner,
-                           text_guidance_cond=sample_cond,
-                           text_guidance_interval=text_guidance_interval,
-                           feature_guidance_w=feature_guidance_w,
-                           feature_guidance_aligner=image_feature_aligner,
-                           feature_guidance_features=sample_text_features,
-                           feature_guidance_interval=feature_guidance_interval,
-                           quality_guidance_w=quality_guidance_w,
-                           quality_guidance_scorer=image_quality_scorer,
-                           quality_guidance_interval=quality_guidance_interval)
     report = {
         "n": int(total),
         "recon_mse": float(np.mean(recon_losses)),
@@ -4685,6 +4713,9 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         "cfg_rescale": float(cfg_rescale),
         "cfg_interval": list(validate_guidance_interval(cfg_interval)),
         "sample_steps": int(sample_steps),
+        "generated_eval_n": int(sample.shape[0]),
+        "generated_eval_n_requested": int(generated_eval_n),
+        "generated_eval_batch": int(sample_batch),
         "sample_time_shift": float(sample_time_shift),
         "time_shift": float(time_shift),
         "sample_method": sample_method,
@@ -5144,7 +5175,8 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                        feature_guidance_weights=(0.0,),
                        feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                        quality_guidance_weights=(0.0,),
-                       quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
+                       quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                       generated_eval_n=0):
     if sample_methods is None:
         sample_methods = (sample_method,)
     if sample_schedules is None:
@@ -5182,7 +5214,8 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                                         feature_guidance_w=float(feature_w),
                                         feature_guidance_interval=feature_guidance_interval,
                                         quality_guidance_w=float(quality_w),
-                                        quality_guidance_interval=quality_guidance_interval)
+                                        quality_guidance_interval=quality_guidance_interval,
+                                        generated_eval_n=generated_eval_n)
                                     row["semantic_guidance_w"] = 0.0
                                     row["semantic_guidance_mode"] = "none"
                                     row["semantic_guidance_interval"] = list(
@@ -5323,6 +5356,8 @@ def eval_report_summary(report):
         "cfg_rescale",
         "cfg_interval",
         "sample_steps",
+        "generated_eval_n",
+        "generated_eval_n_requested",
         "sample_time_shift",
         "time_shift",
         "sample_method",
@@ -5484,7 +5519,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                         eval_image_manifest="", eval_image_root="", eval_image_split="eval",
                         eval_image_min_aesthetic=None, eval_image_max_records=0,
-                        sample_time_shift=None):
+                        sample_time_shift=None, generated_eval_n=0):
     if weight_mode is None:
         weight_mode = "ema" if prefer_ema else "raw"
     if weight_mode not in EVAL_WEIGHT_MODES:
@@ -5493,12 +5528,15 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
     text_guidance_weights = tuple(float(x) for x in (text_guidance_weights or (0.0,)))
     feature_guidance_weights = tuple(float(x) for x in (feature_guidance_weights or (0.0,)))
     quality_guidance_weights = tuple(float(x) for x in (quality_guidance_weights or (0.0,)))
+    generated_eval_n = int(generated_eval_n)
     if any(w < 0.0 for w in text_guidance_weights):
         raise ValueError("text guidance weights must be non-negative")
     if any(w < 0.0 for w in feature_guidance_weights):
         raise ValueError("feature guidance weights must be non-negative")
     if any(w < 0.0 for w in quality_guidance_weights):
         raise ValueError("quality guidance weights must be non-negative")
+    if generated_eval_n < 0:
+        raise ValueError("generated_eval_n must be non-negative")
 
     def run_mode(mode):
         ae, flow, conditioner, prompt_vocab, prompt_templates, meta = load_checkpoint(
@@ -5559,7 +5597,8 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         feature_guidance_weights=feature_guidance_weights,
                         feature_guidance_interval=feature_guidance_interval,
                         quality_guidance_weights=quality_guidance_weights,
-                        quality_guidance_interval=quality_guidance_interval):
+                        quality_guidance_interval=quality_guidance_interval,
+                        generated_eval_n=generated_eval_n):
                     row["eval_seed"] = int(eval_seed)
                     row["checkpoint_weight_mode"] = actual_mode
                     rows.append(row)
@@ -5579,6 +5618,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                 "sample_methods": list(sample_methods or (sample_method,)),
                 "sample_schedule": sample_schedule,
                 "sample_schedules": list(sample_schedules or (sample_schedule,)),
+                "generated_eval_n_requested": int(generated_eval_n),
                 "cfg_rescales": [float(x) for x in cfg_rescales],
                 "sample_time_shift": float(actual_sample_time_shift),
                 "time_shift": float(train_time_shift),
@@ -7202,8 +7242,11 @@ def selftest():
             n=2, batch=2, seed=10, device="cpu", conditioner=conditioner6,
             prompt_vocab=vocab6, caption_max_len=8, text_aligner=aligner6,
             image_feature_aligner=getattr(flow6, "image_feature_aligner", None),
-            caption_cond_source="embedding")
+            caption_cond_source="embedding", generated_eval_n=3)
         img_agg = aggregate_sweep_rows([dict(r, eval_seed=10) for r in img_sweep])
+        assert img_sweep[0]["sample_steps"] == 1
+        assert img_sweep[0]["generated_eval_n"] == 3
+        assert img_sweep[0]["generated_eval_n_requested"] == 3
         assert "caption_sample_mse_mean" in img_agg[0]
         assert "generated_caption_retrieval_i2t_acc_mean" in img_agg[0]
         assert "generated_image_feature_retrieval_i2f_acc_mean" in img_agg[0]
@@ -7266,8 +7309,13 @@ def selftest():
             eval_image_split="eval",
             text_guidance_weights=(0.0, 0.01),
             feature_guidance_weights=(0.0, 0.01),
-            quality_guidance_weights=(0.0, 0.01))
+            quality_guidance_weights=(0.0, 0.01),
+            generated_eval_n=3)
         assert eval6["experiment"] == "image_latent_manifest_sampler_sweep"
+        assert eval6["generated_eval_n_requested"] == 3
+        assert all(row["sample_steps"] == 1 for row in eval6["rows"])
+        assert all(row["generated_eval_n"] == 3 for row in eval6["rows"])
+        assert all(row["generated_eval_n_requested"] == 3 for row in eval6["rows"])
         assert eval6["best"]["caption_sample_mse_mean"] >= 0.0
         assert eval6["text_aligner"] is True
         assert eval6["image_feature_aligner"] is True
@@ -7310,6 +7358,10 @@ def main(argv=None):
     ap.add_argument("--eval-image-max-records", type=int, default=0,
                     dest="eval_image_max_records",
                     help="cap eval manifest records for smoke tests; 0 means all")
+    ap.add_argument("--eval-generated-samples", type=int, default=0,
+                    dest="eval_generated_samples",
+                    help=("generated manifest samples per eval row; 0 keeps legacy "
+                          "min(batch,sample_steps) behavior"))
     ap.add_argument("--ae-steps", type=int, default=200, dest="ae_steps")
     ap.add_argument("--flow-steps", type=int, default=200, dest="flow_steps")
     ap.add_argument("--batch", type=int, default=64)
@@ -7683,6 +7735,8 @@ def main(argv=None):
         ap.error("--sample-candidates-per-prompt must be positive")
     if args.sample_candidates_per_prompt > 1 and not sample_prompts:
         ap.error("--sample-candidates-per-prompt > 1 requires --sample-prompts")
+    if args.eval_generated_samples < 0:
+        ap.error("--eval-generated-samples must be non-negative")
     if args.sample_text_guidance_w < 0.0:
         ap.error("--sample-text-guidance-w must be non-negative")
     if args.sample_text_guidance_w > 0.0 and not sample_prompts:
@@ -7745,6 +7799,7 @@ def main(argv=None):
             eval_image_min_aesthetic=args.eval_image_min_aesthetic,
             eval_image_max_records=args.eval_image_max_records,
             sample_time_shift=args.sample_time_shift,
+            generated_eval_n=args.eval_generated_samples,
         )
         if args.sample_grid_out:
             selected_weights = report.get("selected_checkpoint_weights",

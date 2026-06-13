@@ -1479,6 +1479,14 @@ cover the real sidecar feature support. Best-run selection now prefers high supp
 and a generated/real diversity ratio near one, while keeping the metrics generic to any external
 image embedding sidecar.
 
+Image-77 decouples generated manifest eval count from sampler step count. `thinking.image_latent
+--eval-checkpoint ... --eval-generated-samples N` now controls how many generated images feed the
+caption retrieval, feature-distribution, diversity, coverage, and quality metrics for each sweep
+row; `0` keeps the legacy `min(batch,sample_steps)` smoke behavior. Generation is chunked by the
+normal eval batch size, and RunPod exposes the same control as `--image-eval-generated-samples`.
+This makes one-step solver smokes useful without weakening full-sample quality metrics, and lets
+GPU sweeps spend eval budget on statistically meaningful generated sets.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered

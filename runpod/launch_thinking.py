@@ -367,6 +367,8 @@ def payload(args):
                                  f"--eval-image-root {shlex_quote(args.image_root)} "
                                  f"--eval-image-split {shlex_quote(args.image_eval_split)} "
                                  f"--eval-image-max-records {args.image_eval_max_records} "
+                                 f"--eval-generated-samples "
+                                 f"{args.image_eval_generated_samples} "
                                  f"--eval-text-guidance-weights "
                                  f"{shlex_quote(args.image_eval_text_guidance_sweep)} "
                                  f"--eval-feature-guidance-weights "
@@ -817,6 +819,10 @@ def main():
     ap.add_argument("--image-eval-max-records", type=int, default=0,
                     dest="image_eval_max_records",
                     help="cap image eval manifest records for GPU smoke tests; 0 means all")
+    ap.add_argument("--image-eval-generated-samples", type=int, default=0,
+                    dest="image_eval_generated_samples",
+                    help=("generated manifest samples per eval row; 0 keeps legacy "
+                          "min(batch,sample_steps) behavior"))
     ap.add_argument("--image-caption-vocab-max", type=int, default=8192,
                     dest="image_caption_vocab_max",
                     help="maximum caption vocabulary size for image manifest training")
@@ -1095,6 +1101,8 @@ def main():
         sys.exit("ERROR: --image-embed-batch must be positive")
     if args.image_embed_max_records < 0:
         sys.exit("ERROR: --image-embed-max-records must be non-negative")
+    if args.image_eval_generated_samples < 0:
+        sys.exit("ERROR: --image-eval-generated-samples must be non-negative")
     if args.image_hflip_prob < 0.0 or args.image_hflip_prob > 1.0:
         sys.exit("ERROR: --image-hflip-prob must be in [0, 1]")
     try:
