@@ -357,7 +357,9 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
     --out runs/text_study_squad_choice_answerability_candctx025_confirm1_qctx_2round_smoke.json
 .venv/bin/python -m thinking.multimodal --steps 240 --eval-n 120 --free-n 20 \
-    --counterfactual-n 40 --free-counterfactual-n 20 \
+    --counterfactual-n 40 --free-counterfactual-n 20 --trunk-arch residual \
+    --trunk-width 96 --trunk-depth 2 --txt-tokens 12 --agreement-w 0.1 \
+    --modality-dropout 0.05 \
     --out runs/m0_multimodal.json --checkpoint runs/m0_multimodal.pt
 ```
 

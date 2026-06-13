@@ -402,8 +402,30 @@ def payload(args):
                         f"--seeds {shlex_quote(args.seeds)} --out runs/audio1_fer.json")
         if args.multimodal:                                # M-0: image+audio -> canonical facts
             MM = PY.replace("thinking.cli", "thinking.multimodal")
-            cmds.append(f"{MM} --steps {args.train_steps or 400} "
-                        f"--out runs/m0_multimodal.json")
+            mm_dim = args.multimodal_dim or args.dim or 96
+            mm_cmd = (
+                f"{MM} --steps {args.train_steps or 400} "
+                f"--batch {args.multimodal_batch} --dim {mm_dim} "
+                f"--layers {args.multimodal_layers} --heads {args.multimodal_heads} "
+                f"--lr {args.multimodal_lr} --log-every {args.multimodal_log_every} "
+                f"--value-w {args.multimodal_value_w} "
+                f"--agreement-w {args.multimodal_agreement_w} "
+                f"--img-tokens {args.multimodal_img_tokens} "
+                f"--aud-tokens {args.multimodal_aud_tokens} "
+                f"--txt-tokens {args.multimodal_txt_tokens} "
+                f"--trunk-arch {args.multimodal_trunk_arch} "
+                f"--trunk-width {args.multimodal_trunk_width} "
+                f"--trunk-depth {args.multimodal_trunk_depth} "
+                f"--text-layers {args.multimodal_text_layers} "
+                f"--modality-dropout {args.multimodal_dropout} "
+                f"--eval-n {args.multimodal_eval_n} --free-n {args.multimodal_free_n} "
+                f"--counterfactual-n {args.multimodal_counterfactual_n} "
+                f"--free-counterfactual-n {args.multimodal_free_counterfactual_n} "
+                f"--out runs/m0_multimodal.json --checkpoint runs/m0_multimodal.pt"
+            )
+            if args.multimodal_surfaces:
+                mm_cmd += f" --surfaces {shlex_quote(args.multimodal_surfaces)}"
+            cmds.append(mm_cmd)
         return " && ".join(cmds)
     if args.eval_only_run:
         run = shlex_quote(args.eval_only_run)
@@ -1050,6 +1072,45 @@ def main():
                     help="AUDIO-1: train synthetic audio factor FER experiment")
     ap.add_argument("--multimodal", action="store_true",
                     help="M-0: train one prefix-conditioned LM on image+audio extraction")
+    ap.add_argument("--multimodal-dim", type=int, default=0, dest="multimodal_dim",
+                    help="M-0 decoder width; default uses --dim or 96")
+    ap.add_argument("--multimodal-layers", type=int, default=3, dest="multimodal_layers")
+    ap.add_argument("--multimodal-heads", type=int, default=4, dest="multimodal_heads")
+    ap.add_argument("--multimodal-batch", type=int, default=32, dest="multimodal_batch")
+    ap.add_argument("--multimodal-lr", type=float, default=1e-3, dest="multimodal_lr")
+    ap.add_argument("--multimodal-log-every", type=int, default=100,
+                    dest="multimodal_log_every")
+    ap.add_argument("--multimodal-value-w", type=float, default=6.0,
+                    dest="multimodal_value_w")
+    ap.add_argument("--multimodal-agreement-w", type=float, default=0.0,
+                    dest="multimodal_agreement_w",
+                    help="M-0 cross-mode factor-value agreement loss weight")
+    ap.add_argument("--multimodal-img-tokens", type=int, default=4,
+                    dest="multimodal_img_tokens")
+    ap.add_argument("--multimodal-aud-tokens", type=int, default=8,
+                    dest="multimodal_aud_tokens")
+    ap.add_argument("--multimodal-txt-tokens", type=int, default=8,
+                    dest="multimodal_txt_tokens")
+    ap.add_argument("--multimodal-trunk-arch", default="conv", choices=("conv", "residual"),
+                    dest="multimodal_trunk_arch",
+                    help="M-0 sensory reader trunk architecture")
+    ap.add_argument("--multimodal-trunk-width", type=int, default=64,
+                    dest="multimodal_trunk_width")
+    ap.add_argument("--multimodal-trunk-depth", type=int, default=1,
+                    dest="multimodal_trunk_depth")
+    ap.add_argument("--multimodal-text-layers", type=int, default=1,
+                    dest="multimodal_text_layers")
+    ap.add_argument("--multimodal-dropout", type=float, default=0.0,
+                    dest="multimodal_dropout",
+                    help="drop full-mode modality prefixes during M-0 training")
+    ap.add_argument("--multimodal-eval-n", type=int, default=200, dest="multimodal_eval_n")
+    ap.add_argument("--multimodal-free-n", type=int, default=40, dest="multimodal_free_n")
+    ap.add_argument("--multimodal-counterfactual-n", type=int, default=40,
+                    dest="multimodal_counterfactual_n")
+    ap.add_argument("--multimodal-free-counterfactual-n", type=int, default=20,
+                    dest="multimodal_free_counterfactual_n")
+    ap.add_argument("--multimodal-surfaces", default="", dest="multimodal_surfaces",
+                    help="optional transcript surface JSON path passed to thinking.multimodal")
     ap.add_argument("--lengen", action="store_true", help="rung L: depth generalization")
     ap.add_argument("--deep-ancestor-rule-aux", action="store_true",
                     help="train the forward ancestor run with rule/action and contrastive losses")
@@ -1201,6 +1262,39 @@ def main():
         sys.exit("ERROR: --image-prompt-embed-backend hf requires --image-prompt-embed-model")
     if args.image_ae_arch == "hf-vae" and not args.image_ae_hf_model:
         sys.exit("ERROR: --image-ae-arch hf-vae requires --image-ae-hf-model")
+    if args.multimodal:
+        positive = {
+            "--multimodal-layers": args.multimodal_layers,
+            "--multimodal-heads": args.multimodal_heads,
+            "--multimodal-batch": args.multimodal_batch,
+            "--multimodal-log-every": args.multimodal_log_every,
+            "--multimodal-img-tokens": args.multimodal_img_tokens,
+            "--multimodal-aud-tokens": args.multimodal_aud_tokens,
+            "--multimodal-txt-tokens": args.multimodal_txt_tokens,
+            "--multimodal-trunk-width": args.multimodal_trunk_width,
+            "--multimodal-trunk-depth": args.multimodal_trunk_depth,
+            "--multimodal-text-layers": args.multimodal_text_layers,
+            "--multimodal-eval-n": args.multimodal_eval_n,
+        }
+        for name, value in positive.items():
+            if value <= 0:
+                sys.exit(f"ERROR: {name} must be positive")
+        if args.multimodal_dim < 0:
+            sys.exit("ERROR: --multimodal-dim must be non-negative")
+        mm_dim = args.multimodal_dim or args.dim or 96
+        if mm_dim % args.multimodal_heads != 0:
+            sys.exit("ERROR: multimodal width must be divisible by --multimodal-heads")
+        if (mm_dim // args.multimodal_heads) % 2 != 0:
+            sys.exit("ERROR: multimodal head dimension must be even for rope attention")
+        if args.multimodal_lr <= 0.0:
+            sys.exit("ERROR: --multimodal-lr must be positive")
+        if args.multimodal_value_w < 0.0 or args.multimodal_agreement_w < 0.0:
+            sys.exit("ERROR: multimodal loss weights must be non-negative")
+        if args.multimodal_dropout < 0.0 or args.multimodal_dropout > 1.0:
+            sys.exit("ERROR: --multimodal-dropout must be in [0, 1]")
+        if (args.multimodal_free_n < 0 or args.multimodal_counterfactual_n < 0
+                or args.multimodal_free_counterfactual_n < 0):
+            sys.exit("ERROR: multimodal eval counts must be non-negative")
     if args.upload_image_data:
         if not args.image_manifest:
             sys.exit("ERROR: --upload-image-data requires --image-manifest")

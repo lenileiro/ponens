@@ -1541,6 +1541,15 @@ facts before the checker/reasoner sees it. Image generation stays connected thro
 semantic latent path (`image -> latent -> facts/generation`) rather than becoming a detached
 pixel model.
 
+M-1 architecture update: the multimodal bridge now inherits the upstream reader improvements
+instead of freezing M-0 as a toy fixed prefix. `thinking.multimodal` exposes decoder width/depth,
+image/audio/text prefix token counts, residual sensory trunks, trunk width/depth, deeper transcript
+encoders, modality dropout, and a cross-mode factor-value agreement loss. Image prefixes use a
+near-square adaptive pool as token count grows; audio keeps frequency-preserving bands. Reports and
+checkpoints record the full architecture, and RunPod forwards the same levers through
+`--multimodal-trunk-arch`, `--multimodal-img-tokens`, `--multimodal-txt-tokens`,
+`--multimodal-dropout`, and `--multimodal-agreement-w`.
+
 M-0 local update (240 steps, value-token weighted loss, all-mode ablations every step): the
 tracked run now gates three paths separately. Teacher-forced full multimodal accuracy is color
 **1.00**, shape **1.00**, pitch **0.79**, timbre **0.94**, envelope **1.00**. Text-only held-out

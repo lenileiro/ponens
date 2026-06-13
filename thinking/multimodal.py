@@ -18,6 +18,7 @@ prefix and must map to the same canonical facts with image/audio zeroed.
 """
 import argparse
 import json
+import math
 import os
 import string
 
@@ -38,6 +39,7 @@ COLOR_NAMES = tuple(COLORS)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_SURFACES = os.path.join(ROOT, "data", "multimodal_transcripts.json")
 MODES = ("full", "sensor_only", "text_only")
+TRUNK_ARCHES = ("conv", "residual")
 FACTOR_VALUES = {
     "color": COLOR_NAMES,
     "shape": SHAPES,
@@ -173,25 +175,75 @@ def mutate_factor(gold, factor, rng):
     return {**gold, factor: choices[int(rng.integers(len(choices)))]}
 
 
+def _grid_pool(n_tokens):
+    n = int(n_tokens)
+    if n <= 0:
+        raise ValueError("prefix token count must be positive")
+    h = int(math.sqrt(n))
+    while h > 1 and n % h:
+        h -= 1
+    return h, n // h
+
+
+class ResidualConvBlock(nn.Module):
+    """Small residual conv block for multimodal sensory prefix encoders."""
+
+    def __init__(self, ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.GroupNorm(1, ch),
+            nn.GELU(),
+            nn.Conv2d(ch, ch, 3, padding=1),
+            nn.GroupNorm(1, ch),
+            nn.GELU(),
+            nn.Conv2d(ch, ch, 3, padding=1),
+        )
+
+    def forward(self, x):
+        return x + self.net(x)
+
+
 class PatchTrunk(nn.Module):
     """Conv trunk -> a short sequence of d-dim prefix embeddings + modality embedding."""
 
-    def __init__(self, in_ch, d, n_tokens=4, modality=0, n_modalities=3, pool=(2, 2)):
+    def __init__(self, in_ch, d, n_tokens=4, modality=0, n_modalities=3, pool=(2, 2),
+                 arch="conv", width=64, depth=1):
         """pool: trunk output cells -> prefix tokens. Audio needs FREQUENCY-preserving pooling
         ((8,1): 8 frequency bands x collapsed time) -- 2x2 pooling crushed the frequency axis
         and pitch accuracy with it (0.32; every other factor >=0.93)."""
         super().__init__()
-        self.n_tokens = n_tokens
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, 24, 3, padding=1), nn.GELU(), nn.MaxPool2d(2),
-            nn.Conv2d(24, 48, 3, padding=1), nn.GELU(), nn.MaxPool2d(2),
-            nn.Conv2d(48, 64, 3, padding=1), nn.GELU(),
-            nn.AdaptiveAvgPool2d(pool),
-        )
-        self.proj = nn.Linear(64, d)
+        arch = str(arch)
+        if arch not in TRUNK_ARCHES:
+            raise ValueError(f"unknown multimodal trunk arch {arch!r}")
+        self.n_tokens = int(n_tokens)
+        self.arch = arch
+        self.width = int(width)
+        self.depth = int(depth)
+        self.pool = (int(pool[0]), int(pool[1]))
+        if self.width <= 0 or self.depth <= 0:
+            raise ValueError("multimodal trunk width/depth must be positive")
+        if self.n_tokens != self.pool[0] * self.pool[1]:
+            raise ValueError("n_tokens must match the configured trunk pool cells")
+        if arch == "conv":
+            self.conv = nn.Sequential(
+                nn.Conv2d(in_ch, 24, 3, padding=1), nn.GELU(), nn.MaxPool2d(2),
+                nn.Conv2d(24, 48, 3, padding=1), nn.GELU(), nn.MaxPool2d(2),
+                nn.Conv2d(48, self.width, 3, padding=1), nn.GELU(),
+                nn.AdaptiveAvgPool2d(self.pool),
+            )
+        else:
+            blocks = [
+                nn.Conv2d(in_ch, self.width, 3, padding=1), nn.GELU(), nn.MaxPool2d(2),
+                nn.Conv2d(self.width, self.width, 3, padding=1), nn.GELU(), nn.MaxPool2d(2),
+            ]
+            for _ in range(self.depth):
+                blocks.append(ResidualConvBlock(self.width))
+            blocks.append(nn.AdaptiveAvgPool2d(self.pool))
+            self.conv = nn.Sequential(*blocks)
+        self.proj = nn.Linear(self.width, d)
         self.mod = nn.Embedding(n_modalities, d)
         self.modality = modality
-        self.posn = nn.Parameter(torch.zeros(n_tokens, d))
+        self.posn = nn.Parameter(torch.zeros(self.n_tokens, d))
 
     def forward(self, x):
         h = self.conv(x)                                    # B,64,2,2
@@ -202,16 +254,21 @@ class PatchTrunk(nn.Module):
 class TextTrunk(nn.Module):
     """Transcript encoder -> per-token prefix embeddings.  Pads are zeroed after encoding."""
 
-    def __init__(self, vocab_size, d, pad=0, n_tokens=8, heads=4, modality=2, n_modalities=3,
-                 max_len=64):
+    def __init__(self, vocab_size, d, pad=0, n_tokens=8, heads=4, layers=1, modality=2,
+                 n_modalities=3, max_len=64):
         super().__init__()
         self.pad = pad
         self.modality = modality
+        self.n_tokens = int(n_tokens)
+        self.layers = int(layers)
+        if self.n_tokens <= 0 or self.layers <= 0:
+            raise ValueError("text trunk token/layer counts must be positive")
         self.emb = nn.Embedding(vocab_size, d, padding_idx=pad)
         self.pos = nn.Embedding(max_len, d)
         enc = nn.TransformerEncoderLayer(d_model=d, nhead=heads, dim_feedforward=4 * d,
                                          dropout=0.0, activation="gelu", batch_first=True)
-        self.enc = nn.TransformerEncoder(enc, num_layers=1, enable_nested_tensor=False)
+        self.enc = nn.TransformerEncoder(enc, num_layers=self.layers,
+                                         enable_nested_tensor=False)
         self.mod = nn.Embedding(n_modalities, d)
         self.ln = nn.LayerNorm(d)
 
@@ -222,19 +279,61 @@ class TextTrunk(nn.Module):
         h = self.emb(ids) + self.pos(pos)[None]
         h = self.enc(h, src_key_padding_mask=pad_mask)
         h = self.ln(h + self.mod.weight[self.modality])
-        return h.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+        h = h.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+        if h.shape[1] > self.n_tokens:
+            return h[:, :self.n_tokens]
+        if h.shape[1] < self.n_tokens:
+            pad = torch.zeros(h.shape[0], self.n_tokens - h.shape[1], h.shape[2],
+                              dtype=h.dtype, device=h.device)
+            h = torch.cat([h, pad], dim=1)
+        return h
 
 
 class MultimodalLM(nn.Module):
     """Image, audio, and transcript readers feeding one trace decoder."""
 
-    def __init__(self, vocab_size, d=96, layers=3, heads=4, pad=0, max_len=128):
+    def __init__(self, vocab_size, d=96, layers=3, heads=4, pad=0, max_len=128,
+                 img_tokens=4, aud_tokens=8, txt_tokens=8, trunk_arch="conv",
+                 trunk_width=64, trunk_depth=1, text_layers=1, modality_dropout=0.0):
         super().__init__()
+        if img_tokens <= 0 or aud_tokens <= 0 or txt_tokens <= 0:
+            raise ValueError("multimodal prefix token counts must be positive")
+        if modality_dropout < 0.0 or modality_dropout > 1.0:
+            raise ValueError("modality_dropout must be in [0, 1]")
+        trunk_arch = str(trunk_arch)
+        self.config = {
+            "vocab_size": int(vocab_size), "d": int(d), "layers": int(layers),
+            "heads": int(heads), "pad": int(pad), "max_len": int(max_len),
+            "img_tokens": int(img_tokens), "aud_tokens": int(aud_tokens),
+            "txt_tokens": int(txt_tokens), "trunk_arch": trunk_arch,
+            "trunk_width": int(trunk_width), "trunk_depth": int(trunk_depth),
+            "text_layers": int(text_layers), "modality_dropout": float(modality_dropout),
+        }
+        self.modality_dropout = float(modality_dropout)
         self.lm = ScratchpadLM(vocab_size, d=d, layers=layers, heads=heads, max_len=max_len,
                                pad=pad, pointer=False, loop=False)
-        self.img = PatchTrunk(3, d, n_tokens=4, modality=0, pool=(2, 2))
-        self.aud = PatchTrunk(1, d, n_tokens=8, modality=1, pool=(8, 1))
-        self.txt = TextTrunk(vocab_size, d, pad=pad, n_tokens=8, heads=heads, modality=2)
+        img_pool = _grid_pool(img_tokens)
+        self.img = PatchTrunk(3, d, n_tokens=img_tokens, modality=0,
+                              pool=img_pool, arch=trunk_arch,
+                              width=trunk_width, depth=trunk_depth)
+        self.aud = PatchTrunk(1, d, n_tokens=aud_tokens, modality=1,
+                              pool=(aud_tokens, 1), arch=trunk_arch,
+                              width=trunk_width, depth=trunk_depth)
+        self.txt = TextTrunk(vocab_size, d, pad=pad, n_tokens=txt_tokens, heads=heads,
+                             layers=text_layers, modality=2)
+
+    def _apply_modality_dropout(self, ip, ap, tp):
+        if not self.training or self.modality_dropout <= 0.0:
+            return ip, ap, tp
+        keep = 1.0 - self.modality_dropout
+        if keep <= 0.0:
+            return ip * 0.0, ap * 0.0, tp * 0.0
+        masks = [
+            torch.rand(ip.shape[0], 1, 1, device=ip.device).lt(keep).to(ip.dtype) / keep,
+            torch.rand(ap.shape[0], 1, 1, device=ap.device).lt(keep).to(ap.dtype) / keep,
+            torch.rand(tp.shape[0], 1, 1, device=tp.device).lt(keep).to(tp.dtype) / keep,
+        ]
+        return ip * masks[0], ap * masks[1], tp * masks[2]
 
     def forward(self, img, aud, txt, ids, mode="full"):
         ip, ap, tp = self.img(img), self.aud(aud), self.txt(txt)
@@ -244,6 +343,8 @@ class MultimodalLM(nn.Module):
             tp = tp * 0.0
         elif mode != "full":
             raise ValueError(f"unknown multimodal mode {mode!r}")
+        elif self.modality_dropout > 0.0:
+            ip, ap, tp = self._apply_modality_dropout(ip, ap, tp)
         prefix = torch.cat([ip, ap, tp], dim=1)
         logits = self.lm(ids, prefix=prefix)
         return logits[:, prefix.shape[1]:]                  # token positions only
@@ -466,25 +567,69 @@ def token_loss(logits, ids, value_w=6.0):
     return (raw * weights).sum() / weights.sum()
 
 
+def _candidate_ids(vocab, factor, device):
+    return torch.tensor([vocab.stoi[v] for v in FACTOR_VALUES[factor]],
+                        dtype=torch.long, device=device)
+
+
+def value_agreement_loss(logits_by_mode, vocab):
+    """Align factor-value distributions across full, sensor-only, and text-only paths."""
+    items = list(logits_by_mode.items())
+    if len(items) < 2:
+        return next(iter(logits_by_mode.values())).sum() * 0.0
+    losses = []
+    device = items[0][1].device
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            _mode_a, logits_a = items[i]
+            _mode_b, logits_b = items[j]
+            for factor, pos in VALUE_POS.items():
+                cand = _candidate_ids(vocab, factor, device)
+                a = logits_a[:, pos - 1].index_select(-1, cand)
+                b = logits_b[:, pos - 1].index_select(-1, cand)
+                losses.append(0.5 * (
+                    F.kl_div(F.log_softmax(a, dim=-1), F.softmax(b.detach(), dim=-1),
+                             reduction="batchmean")
+                    + F.kl_div(F.log_softmax(b, dim=-1), F.softmax(a.detach(), dim=-1),
+                               reduction="batchmean")
+                ))
+    return torch.stack(losses).mean()
+
+
 def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100, value_w=6.0,
-          surfaces_path=None):
+          surfaces_path=None, layers=3, heads=4, max_len=128, img_tokens=4, aud_tokens=8,
+          txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
+          modality_dropout=0.0, agreement_w=0.0):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     surfaces = load_text_surfaces(surfaces_path)
     vocab = build_vocab(surfaces)
-    model = MultimodalLM(len(vocab), d=d, pad=vocab.pad).to(device)
+    model = MultimodalLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
+                         max_len=max_len, img_tokens=img_tokens, aud_tokens=aud_tokens,
+                         txt_tokens=txt_tokens, trunk_arch=trunk_arch, trunk_width=trunk_width,
+                         trunk_depth=trunk_depth, text_layers=text_layers,
+                         modality_dropout=modality_dropout).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    last_base = last_agreement = 0.0
     for st in range(1, steps + 1):
         model.train()
         img, aud, txt, ids, _ = _batch(batch, rng, vocab, device, surfaces, text_split="train")
-        losses = [token_loss(model(img, aud, txt, ids, mode=mode), ids, value_w=value_w)
-                  for mode in MODES]
-        loss = sum(losses) / len(losses)
+        logits_by_mode = {mode: model(img, aud, txt, ids, mode=mode) for mode in MODES}
+        losses = [token_loss(logits, ids, value_w=value_w)
+                  for logits in logits_by_mode.values()]
+        base_loss = sum(losses) / len(losses)
+        agreement = (value_agreement_loss(logits_by_mode, vocab)
+                     if agreement_w else base_loss * 0.0)
+        loss = base_loss + float(agreement_w) * agreement
         opt.zero_grad()
         loss.backward()
         opt.step()
+        last_base = float(base_loss.detach())
+        last_agreement = float(agreement.detach())
         if st % log_every == 0 or st == steps:
-            print(f"  m0 {st}/{steps} loss {loss.item():.3f}", flush=True)
+            print(f"  m0 {st}/{steps} loss {loss.item():.3f} "
+                  f"base {last_base:.3f} agree {last_agreement:.3f}", flush=True)
+    model.train_metrics = {"token_loss": last_base, "agreement_loss": last_agreement}
     return model, vocab, surfaces
 
 
@@ -503,9 +648,19 @@ def gate_thresholds(chance=CHANCE, gap_frac=0.40):
 
 
 def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
-        counterfactual_n=40, free_counterfactual_n=20, surfaces_path=None, checkpoint=None):
+        counterfactual_n=40, free_counterfactual_n=20, surfaces_path=None, checkpoint=None,
+        batch=32, d=96, lr=1e-3, layers=3, heads=4, max_len=128, img_tokens=4, aud_tokens=8,
+        txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
+        modality_dropout=0.0, agreement_w=0.0, log_every=100):
     model, vocab, surfaces = train(steps=steps, seed=seed, device=device, value_w=value_w,
-                                   surfaces_path=surfaces_path)
+                                   surfaces_path=surfaces_path, batch=batch, d=d, lr=lr,
+                                   layers=layers, heads=heads, max_len=max_len,
+                                   img_tokens=img_tokens, aud_tokens=aud_tokens,
+                                   txt_tokens=txt_tokens, trunk_arch=trunk_arch,
+                                   trunk_width=trunk_width, trunk_depth=trunk_depth,
+                                   text_layers=text_layers,
+                                   modality_dropout=modality_dropout,
+                                   agreement_w=agreement_w, log_every=log_every)
     full = evaluate(model, vocab, surfaces, n=eval_n, device=device, text_split="eval",
                     mode="full")
     text = evaluate(model, vocab, surfaces, n=eval_n, device=device, text_split="eval",
@@ -520,7 +675,15 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         model, vocab, surfaces, n=free_counterfactual_n, device=device
     ) if free_counterfactual_n else {}
     thresholds = gate_thresholds()
-    report = {"experiment": "m0_multimodal_bridge", "steps": steps, "value_w": float(value_w),
+    architecture = dict(model.config)
+    architecture["img_pool"] = list(model.img.pool)
+    architecture["aud_pool"] = list(model.aud.pool)
+    architecture["prefix_tokens"] = int(img_tokens) + int(aud_tokens) + int(txt_tokens)
+    report = {"experiment": "m0_multimodal_bridge", "steps": steps, "batch": int(batch),
+              "lr": float(lr), "value_w": float(value_w),
+              "agreement_w": float(agreement_w),
+              "train_metrics": getattr(model, "train_metrics", {}),
+              "architecture": architecture,
               "eval_n": int(eval_n), "free_n": int(free_n),
               "counterfactual_n": int(counterfactual_n),
               "free_counterfactual_n": int(free_counterfactual_n),
@@ -547,7 +710,7 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
     if checkpoint:
         os.makedirs(os.path.dirname(checkpoint) or ".", exist_ok=True)
         torch.save({"state_dict": model.state_dict(), "vocab": vocab.itos,
-                    "d": model.lm.tok.embedding_dim,
+                    "d": model.lm.tok.embedding_dim, "model_config": model.config,
                     "text_surfaces": report["text_surfaces"], "report": report}, checkpoint)
         report["checkpoint"] = checkpoint
     print(json.dumps(report, indent=1), flush=True)
@@ -580,10 +743,21 @@ def selftest():
     assert all(t in ex_vocab.stoi for t in ex_txt + ex_toks)
     model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad).to("cpu")
     x, a, tt, ids, _ = _batch(2, rng, vocab, "cpu", surfaces)
+    assert _grid_pool(4) == (2, 2) and _grid_pool(8) == (2, 4)
     logits = model(x, a, tt, ids)
     assert logits.shape == (2, ids.shape[1], len(vocab)), logits.shape
     logits_text = model(x, a, tt, ids, mode="text_only")
     assert logits_text.shape == logits.shape
+    res_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
+                             img_tokens=4, aud_tokens=8, txt_tokens=6,
+                             trunk_arch="residual", trunk_width=32, trunk_depth=1,
+                             text_layers=2, modality_dropout=0.1).to("cpu")
+    assert res_model.img.arch == "residual" and res_model.img.pool == (2, 2)
+    assert res_model.txt.layers == 2 and res_model.txt.n_tokens == 6
+    res_logits = {mode: res_model(x, a, tt, ids, mode=mode) for mode in MODES}
+    assert all(v.shape == logits.shape for v in res_logits.values())
+    agree = value_agreement_loss(res_logits, vocab)
+    assert torch.isfinite(agree), agree
     th = gate_thresholds()
     assert all(CHANCE[k] < th[k] < 1.0 for k in CHANCE), th
     loss = token_loss(logits, ids)
@@ -604,7 +778,25 @@ def main(argv=None):
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--device", default=DEV)
+    ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--dim", type=int, default=96, dest="d")
+    ap.add_argument("--layers", type=int, default=3)
+    ap.add_argument("--heads", type=int, default=4)
+    ap.add_argument("--max-len", type=int, default=128, dest="max_len")
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--log-every", type=int, default=100, dest="log_every")
     ap.add_argument("--value-w", type=float, default=6.0, dest="value_w")
+    ap.add_argument("--agreement-w", type=float, default=0.0, dest="agreement_w",
+                    help="cross-mode factor-value distribution agreement loss weight")
+    ap.add_argument("--img-tokens", type=int, default=4, dest="img_tokens")
+    ap.add_argument("--aud-tokens", type=int, default=8, dest="aud_tokens")
+    ap.add_argument("--txt-tokens", type=int, default=8, dest="txt_tokens")
+    ap.add_argument("--trunk-arch", default="conv", choices=TRUNK_ARCHES, dest="trunk_arch")
+    ap.add_argument("--trunk-width", type=int, default=64, dest="trunk_width")
+    ap.add_argument("--trunk-depth", type=int, default=1, dest="trunk_depth")
+    ap.add_argument("--text-layers", type=int, default=1, dest="text_layers")
+    ap.add_argument("--modality-dropout", type=float, default=0.0, dest="modality_dropout")
     ap.add_argument("--eval-n", type=int, default=200, dest="eval_n")
     ap.add_argument("--free-n", type=int, default=40, dest="free_n")
     ap.add_argument("--counterfactual-n", type=int, default=40, dest="counterfactual_n")
@@ -619,12 +811,44 @@ def main(argv=None):
     if args.selftest:
         selftest()
         return
+    positive = {
+        "--steps": args.steps, "--batch": args.batch, "--dim": args.d,
+        "--layers": args.layers, "--heads": args.heads, "--max-len": args.max_len,
+        "--log-every": args.log_every, "--img-tokens": args.img_tokens,
+        "--aud-tokens": args.aud_tokens, "--txt-tokens": args.txt_tokens,
+        "--trunk-width": args.trunk_width, "--trunk-depth": args.trunk_depth,
+        "--text-layers": args.text_layers,
+    }
+    for name, value in positive.items():
+        if value <= 0:
+            ap.error(f"{name} must be positive")
+    if args.lr <= 0.0:
+        ap.error("--lr must be positive")
+    if args.d % args.heads != 0:
+        ap.error("--dim must be divisible by --heads")
+    if (args.d // args.heads) % 2 != 0:
+        ap.error("--dim / --heads must be even for rope attention")
+    if args.agreement_w < 0.0:
+        ap.error("--agreement-w must be non-negative")
+    if args.modality_dropout < 0.0 or args.modality_dropout > 1.0:
+        ap.error("--modality-dropout must be in [0, 1]")
+    if args.eval_n <= 0:
+        ap.error("--eval-n must be positive")
+    if args.free_n < 0 or args.counterfactual_n < 0 or args.free_counterfactual_n < 0:
+        ap.error("free/counterfactual eval counts must be non-negative")
     report = run(steps=args.steps, seed=args.seed, value_w=args.value_w,
                  eval_n=args.eval_n, free_n=args.free_n,
                  counterfactual_n=args.counterfactual_n,
                  free_counterfactual_n=args.free_counterfactual_n,
                  surfaces_path=args.surfaces,
-                 checkpoint=args.checkpoint)
+                 checkpoint=args.checkpoint, batch=args.batch, d=args.d, lr=args.lr,
+                 layers=args.layers, heads=args.heads, max_len=args.max_len,
+                 img_tokens=args.img_tokens, aud_tokens=args.aud_tokens,
+                 txt_tokens=args.txt_tokens, trunk_arch=args.trunk_arch,
+                 trunk_width=args.trunk_width, trunk_depth=args.trunk_depth,
+                 text_layers=args.text_layers, modality_dropout=args.modality_dropout,
+                 agreement_w=args.agreement_w, log_every=args.log_every,
+                 device=args.device)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(report, f, indent=1)
