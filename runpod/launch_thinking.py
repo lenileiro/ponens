@@ -569,8 +569,8 @@ def main():
     ap.add_argument("--image-clean-keep-duplicate-paths", action="store_true",
                     dest="image_clean_keep_duplicate_paths",
                     help="do not reject duplicate image paths during pod-side manifest cleaning")
-    ap.add_argument("--image-size", type=int, default=32, dest="image_size",
-                    help="square image size for latent image train/eval/sample grids")
+    ap.add_argument("--image-size", default="32", dest="image_size",
+                    help="image size as SIZE or HxW for latent image train/eval/sample grids")
     ap.add_argument("--image-ae-accum-steps", type=int, default=1,
                     dest="image_ae_accum_steps",
                     help="AE gradient accumulation microsteps")

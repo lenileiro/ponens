@@ -59,10 +59,11 @@ DEFAULT_GUIDANCE_INTERVAL = (0.0, 1.0)
 
 def _batch(n, rng, size=32, device=DEV, return_specs=False):
     imgs, conds, yc, ys, specs = [], [], [], [], []
+    side = image_side(size)
     for _ in range(n):
         spec = sample_object(rng)
         specs.append(spec)
-        imgs.append(render_object(spec, size=size) * 2.0 - 1.0)
+        imgs.append(render_object(spec, size=side) * 2.0 - 1.0)
         conds.append(fact_condition(object_facts(spec), device="cpu").numpy())
         yc.append(COLOR_NAMES.index(spec.color))
         ys.append(SHAPES.index(spec.shape))
@@ -265,12 +266,63 @@ def make_autoencoder(ae_arch="semantic", latent_ch=16, hidden=64, latent_downsam
     raise ValueError(f"unknown autoencoder architecture {ae_arch!r}")
 
 
+def normalize_image_size(size, default=None):
+    if size is None or (isinstance(size, str) and size == ""):
+        if default is None:
+            return None
+        return normalize_image_size(default)
+    if isinstance(size, str):
+        raw = size.strip().lower()
+        if raw in ("", "0", "none"):
+            if default is None:
+                return None
+            return normalize_image_size(default)
+        for sep in ("x", ",", ":"):
+            if sep in raw:
+                parts = [p.strip() for p in raw.split(sep)]
+                if len(parts) != 2:
+                    raise ValueError(f"image size {size!r} must be SIZE or HxW")
+                h, w = int(parts[0]), int(parts[1])
+                break
+        else:
+            h = w = int(raw)
+    elif isinstance(size, (tuple, list)):
+        if len(size) != 2:
+            raise ValueError("image size tuple must be (height, width)")
+        h, w = int(size[0]), int(size[1])
+    else:
+        h = w = int(size)
+    if h <= 0 or w <= 0:
+        if (h == 0 or w == 0) and default is not None:
+            return normalize_image_size(default)
+        raise ValueError("image size must be positive")
+    return h, w
+
+
+def image_size_value(size):
+    h, w = normalize_image_size(size, default=32)
+    return int(h) if h == w else [int(h), int(w)]
+
+
+def image_hw(size, default=32):
+    return normalize_image_size(size, default=default)
+
+
+def image_side(size, name="image size"):
+    h, w = image_hw(size)
+    if h != w:
+        raise ValueError(f"{name} must be square for synthetic factor renders; got {h}x{w}")
+    return int(h)
+
+
 def ae_latent_shape(ae, size):
     downsample = int(getattr(ae, "downsample", 4))
-    if int(size) % downsample:
-        raise ValueError(f"image size {size} must be divisible by AE downsample {downsample}")
-    side = int(size) // downsample
-    return int(ae.latent_ch), side, side
+    h, w = image_hw(size)
+    if h % downsample or w % downsample:
+        raise ValueError(
+            f"image size {h}x{w} must be divisible by AE downsample {downsample}"
+        )
+    return int(ae.latent_ch), int(h) // downsample, int(w) // downsample
 
 
 class PromptConditioner(nn.Module):
@@ -2671,6 +2723,7 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, cfg_resc
     flow.eval()
     got_c = got_s = got_both = total = 0
     mses = []
+    side = image_side(size)
     latent_shape = ae_latent_shape(ae, size)
     for ci, color in enumerate(COLORS):
         for si, shape in enumerate(SHAPES):
@@ -2703,7 +2756,7 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, cfg_resc
             got_s += int(ok_s.sum())
             got_both += int((ok_c & ok_s).sum())
             total += samples_per_combo
-            target = torch.tensor(render_object(spec, size=size) * 2.0 - 1.0,
+            target = torch.tensor(render_object(spec, size=side) * 2.0 - 1.0,
                                   dtype=torch.float32, device=device)[None]
             target = target.expand_as(sample)
             mses.append(float(F.mse_loss(sample, target).detach().cpu()))
@@ -2734,6 +2787,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
     factor_orth_losses, factor_orth_pairs, factor_orth_bases = [], [], []
     got_c = got_s = total = 0
     latent_means, latent_stds = [], []
+    side = image_side(size)
     while total < n:
         b = min(batch, n - total)
         x, fact_cond, yc, ys, specs = _batch(b, rng, size=size, device=device, return_specs=True)
@@ -2773,7 +2827,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
                            sample_method=sample_method, cfg_interval=cfg_interval,
                            semantic_guidance_interval=semantic_guidance_interval,
                            sample_time_shift=sample_time_shift)
-    target = torch.tensor(render_object(spec, size=size) * 2.0 - 1.0,
+    target = torch.tensor(render_object(spec, size=side) * 2.0 - 1.0,
                           dtype=torch.float32, device=device)[None]
     report = {
         "n": int(total),
@@ -3007,7 +3061,12 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     ckpt = torch.load(path, map_location=device)
     report = ckpt.get("report", {})
     latent_ch = int(ckpt.get("latent_ch", report.get("latent_ch", 16)))
-    image_size = int(ckpt.get("image_size", report.get("image_size", 32)))
+    raw_image_size = ckpt.get("image_size", report.get("image_size", None))
+    missing_size = raw_image_size is None or (
+        isinstance(raw_image_size, str) and raw_image_size == "")
+    if missing_size and ckpt.get("image_h") and ckpt.get("image_w"):
+        raw_image_size = (ckpt["image_h"], ckpt["image_w"])
+    image_size = image_hw(raw_image_size, default=32)
     hidden = int(ckpt.get("hidden", report.get("hidden", 64)))
     flow_arch = ckpt.get("flow_arch", report.get("flow_arch", "conv"))
     ae_arch = ckpt.get("ae_arch", report.get("ae_arch", "semantic"))
@@ -3124,7 +3183,9 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     return ae, flow, conditioner, prompt_vocab, prompt_templates, {
         "checkpoint": path,
         "checkpoint_report": report,
-        "image_size": image_size,
+        "image_size": image_size_value(image_size),
+        "image_h": int(image_size[0]),
+        "image_w": int(image_size[1]),
         "latent_ch": latent_ch,
         "ae_arch": ae_arch,
         "latent_downsample": int(getattr(ae, "downsample", latent_downsample)),
@@ -3468,7 +3529,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
         ae, flow, conditioner, prompt_vocab, prompt_templates, meta = load_checkpoint(
             path, device=device, prefer_ema=(mode == "ema"))
         actual_mode = "ema" if meta["ema_loaded"] else "raw"
-        eval_size = int(size or meta.get("image_size", 32) or 32)
+        eval_size = image_hw(size, default=meta.get("image_size", 32) or 32)
         actual_sample_time_shift = (
             float(meta.get("sample_time_shift", meta.get("time_shift", 1.0)))
             if sample_time_shift is None else float(sample_time_shift)
@@ -3528,7 +3589,9 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                 "requested_checkpoint_weight_mode": weight_mode,
                 "selected_checkpoint_weights": actual_mode,
                 "n": int(n),
-                "image_size": int(eval_size),
+                "image_size": image_size_value(eval_size),
+                "image_h": int(eval_size[0]),
+                "image_w": int(eval_size[1]),
                 "sample_method": sample_method,
                 "sample_methods": list(sample_methods or (sample_method,)),
                 "cfg_rescales": [float(x) for x in cfg_rescales],
@@ -3586,7 +3649,9 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             "requested_checkpoint_weight_mode": weight_mode,
             "selected_checkpoint_weights": actual_mode,
             "n": int(n),
-            "image_size": int(eval_size),
+            "image_size": image_size_value(eval_size),
+            "image_h": int(eval_size[0]),
+            "image_w": int(eval_size[1]),
             "roundtrip_samples": int(roundtrip_samples),
             "sample_method": sample_method,
             "sample_methods": list(sample_methods or (sample_method,)),
@@ -3697,6 +3762,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       return_conditioner=False, return_ema=False, return_aligner=False):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
+    size = image_hw(size, default=32)
     if cond_mode not in ("facts", "text"):
         raise ValueError(f"unknown condition mode {cond_mode!r}")
     if cfg_rescale < 0.0 or cfg_rescale > 1.0:
@@ -3729,6 +3795,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     else:
         caption_cond_source, text_embedding_in_dim = "tokens", 0
         image_embedding_in_dim = 0
+    if image_records is None:
+        image_side(size)
     if time_sampling not in ("uniform", "logit-normal"):
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
     if time_shift <= 0.0:
@@ -4143,7 +4211,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "train_amp_enabled": bool(amp_cfg["enabled"]),
         "train_amp_dtype": amp_cfg["dtype_name"],
         "grad_clip": float(grad_clip),
-        "image_size": int(size),
+        "image_size": image_size_value(size),
+        "image_h": int(size[0]),
+        "image_w": int(size[1]),
         "latent_ch": int(latent_ch),
         "ae_arch": ae_arch,
         "latent_downsample": int(getattr(ae, "downsample", latent_downsample)),
@@ -4501,6 +4571,59 @@ def selftest():
         assert report6["flow_cache_backend"] == "memory"
         assert report6["flow_cache_records"] == 2 and report6["flow_cache_bytes"] > 0
         assert report6["flow_cache_shards"] == 0
+        ae_rect, flow_rect, conditioner_rect, vocab_rect, report_rect = train_latent_flow(
+            ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=16,
+            flow_arch="dit", dit_depth=1, dit_heads=2, seed=14,
+            device="cpu", cond_mode="text", text_cond_dim=8,
+            image_manifest=manifest, image_root=img_dir, image_split="train",
+            image_max_records=2, caption_max_len=8, sample_steps=1,
+            size=(32, 48), ae_arch="residual", latent_downsample=8,
+            latent_max_tokens=32, image_crop_mode="pad",
+            intervention_samples=0, return_conditioner=True)
+        assert report_rect["image_size"] == [32, 48]
+        assert report_rect["image_h"] == 32 and report_rect["image_w"] == 48
+        assert report_rect["latent_h"] == 4 and report_rect["latent_w"] == 6
+        assert report_rect["latent_tokens"] == 24
+        assert ae_latent_shape(ae_rect, (32, 48)) == (4, 4, 6)
+        rect_ckpt = os.path.join(td, "rect.pt")
+        torch.save({
+            "autoencoder_state_dict": ae_rect.state_dict(),
+            "flow_state_dict": flow_rect.state_dict(),
+            "report": report_rect,
+            "fact_vocab": FACT_VOCAB,
+            "latent_ch": 4,
+            "image_size": report_rect["image_size"],
+            "image_h": report_rect["image_h"],
+            "image_w": report_rect["image_w"],
+            "ae_arch": "residual",
+            "latent_downsample": 8,
+            "ae_res_blocks": 1,
+            "latent_max_tokens": 32,
+            "hidden": 16,
+            "flow_arch": "dit",
+            "dit_depth": 1,
+            "dit_heads": 2,
+            "dit_head_width_mult": 1,
+            "cond_mode": "text",
+            "cond_dim": report_rect["cond_dim"],
+            "data_mode": "image_manifest",
+            "image_manifest": manifest,
+            "image_root": img_dir,
+            "image_split": "train",
+            "caption_max_len": 8,
+            "caption_cond_source": "tokens",
+            "latent_stats": latent_stats_state(flow_latent_stats(flow_rect)),
+            "prompt_templates": [],
+            "prompt_vocab": vocab_rect,
+            "conditioner_state_dict": conditioner_rect.state_dict(),
+            "flow_ema_state_dict": {},
+            "conditioner_ema_state_dict": {},
+        }, rect_ckpt)
+        ae_rect2, _flow_rect2, _cond_rect2, _vocab_rect2, _tpl_rect2, meta_rect2 = (
+            load_checkpoint(rect_ckpt, device="cpu", prefer_ema=False))
+        assert meta_rect2["image_size"] == [32, 48]
+        assert meta_rect2["image_h"] == 32 and meta_rect2["image_w"] == 48
+        assert ae_latent_shape(ae_rect2, meta_rect2["image_size"]) == (4, 4, 6)
         disk_cache_dir = os.path.join(td, "latent_cache")
         _ae_disk, _flow_disk, _cond_disk, _vocab_disk, _aligner_disk, report_disk = (
             train_latent_flow(
@@ -4634,8 +4757,8 @@ def main(argv=None):
                     help="training precision; bf16/fp16 AMP is enabled on CUDA")
     ap.add_argument("--grad-clip", type=float, default=0.0, dest="grad_clip",
                     help="clip AE/flow gradient norm after accumulation; 0 disables")
-    ap.add_argument("--size", type=int, default=0,
-                    help="square image size; 0 means 32 for train or checkpoint size for eval")
+    ap.add_argument("--size", default="0",
+                    help="image size as SIZE or HxW; 0 means 32 for train or checkpoint size for eval")
     ap.add_argument("--latent-ch", type=int, default=16, dest="latent_ch")
     ap.add_argument("--ae-arch", default="semantic", choices=("semantic", "residual"),
                     dest="ae_arch",
@@ -4829,6 +4952,7 @@ def main(argv=None):
     try:
         cfg_interval = _parse_interval(args.cfg_interval)
         semantic_guidance_interval = _parse_interval(args.semantic_guidance_interval)
+        cli_size = normalize_image_size(args.size, default=None)
     except ValueError as e:
         ap.error(str(e))
     if args.selftest:
@@ -4841,7 +4965,7 @@ def main(argv=None):
             cfg_rescales=_parse_number_list(args.cfg_rescales, float),
             sample_steps_list=_parse_number_list(args.sample_steps_list, int),
             seed=args.seed,
-            size=args.size,
+            size=cli_size,
             eval_seeds=(_parse_number_list(args.eval_seeds, int) if args.eval_seeds else None),
             roundtrip_samples=args.roundtrip_samples,
             prefer_ema=not args.no_ema_checkpoint,
@@ -4885,8 +5009,8 @@ def main(argv=None):
                     args.sample_time_shift if args.sample_time_shift is not None
                     else report.get("sample_time_shift", 1.0)
                 ))
-            grid_size = int(args.size or report.get("image_size", meta.get("image_size", 32))
-                            or 32)
+            grid_size = image_hw(
+                cli_size, default=report.get("image_size", meta.get("image_size", 32)) or 32)
             if report.get("experiment") == "image_latent_manifest_sampler_sweep":
                 grid_records = read_image_manifest(
                     report["eval_image_manifest"], root=report.get("eval_image_root", ""),
@@ -4937,7 +5061,7 @@ def main(argv=None):
     if not args.train:
         ap.error("use --selftest, --train, or --eval-checkpoint")
     templates = _parse_templates(args.prompt_templates)
-    run_size = int(args.size or 32)
+    run_size = cli_size or (32, 32)
     (ae, flow, conditioner, prompt_vocab, text_aligner, report,
      flow_ema, conditioner_ema) = train_latent_flow(
         ae_steps=args.ae_steps, flow_steps=args.flow_steps, batch=args.batch,
@@ -5066,7 +5190,9 @@ def main(argv=None):
         "report": report,
         "fact_vocab": FACT_VOCAB,
         "latent_ch": args.latent_ch,
-        "image_size": run_size,
+        "image_size": image_size_value(run_size),
+        "image_h": int(run_size[0]),
+        "image_w": int(run_size[1]),
         "ae_arch": args.ae_arch,
         "latent_downsample": report.get("latent_downsample", args.latent_downsample),
         "ae_res_blocks": report.get("ae_res_blocks", args.ae_res_blocks),

@@ -721,8 +721,8 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
     --image-manifest data/images/train.jsonl --image-root data/images \
     --image-caption-cond-source auto \
     --image-crop-mode pad --image-hflip-prob 0.5 \
-    --image-size 128 --image-ae-arch residual --image-latent-downsample 8 \
-    --image-latent-max-tokens 256 \
+    --image-size 128x192 --image-ae-arch residual --image-latent-downsample 8 \
+    --image-latent-max-tokens 384 \
     --image-ae-recon-loss hybrid --image-ae-grad-w 0.1 --image-ae-ms-w 0.1 \
     --image-text-align-w 0.1 --image-flow-text-align-w 0.05 \
     --image-text-embed-dim 128 \
@@ -1135,6 +1135,12 @@ learned 1D tables by default, but new high-resolution DiT/CrossDiT/MM-DiT runs c
 2D sinusoidal image-token positions. RunPod exposes this as `--image-dit-pos-embed`. This removes a
 fixed-token-table assumption from the transformer path and is a better default for resolution and
 aspect-ratio scaling experiments.
+
+Image-53 adds rectangular manifest resolution support. `thinking.image_latent --size` and RunPod
+`--image-size` now accept `HxW` as well as square `SIZE`; checkpoints and reports preserve
+`image_h`/`image_w`, and latent token limits use the real `latent_h * latent_w` grid. Synthetic
+factor renders remain square-only and fail early if given a rectangular size, while real-image
+manifest runs can pair `--image-crop-mode pad` with rectangular canvases.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
