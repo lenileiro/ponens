@@ -709,6 +709,20 @@ contrast can preserve real answers on the primary sample, but the representation
 across held-out samples; the next route needs a question-evidence router that generalizes, not just
 a stronger pairwise margin.
 
+The QA gate now includes a candidate-replacement control. For each positive SQuAD choice record,
+the control replaces the gold candidate span with another same-length span from the same context
+and changes the target to `answer choice none`; no English facts or answer rules are embedded in
+the code. The same generated controls are available to the existing choice/final/answerability
+control losses, and eval reports `qa_candidate_replacement_control` with
+`candidate_replacement_none_acc`. On the current guarded SQuAD-choice checkpoint, the eval-only
+smoke exposed a hard failure: full sampled choice accuracy was **0.1125**, positive-only ablation
+choice gaps were healthy (`question_only` / `context_only` **0.275** / **0.275**), but candidate
+replacement abstention was **0.000**. That means the present head can still accept a corrupted
+candidate instead of proving the candidate is the answer to the question. The selector now treats
+this as a control failure (`qa_candidate_replacement_none_acc` must reach **0.55**), so future
+accepted reading updates have to learn question-context-candidate binding rather than just pass
+the older shortcut probes.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels

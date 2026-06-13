@@ -1749,8 +1749,67 @@ def choice_control_source_records(records):
             and not _is_qa_negative_record(r)]
 
 
+def _choice_candidate_replacement_tokens(rec):
+    target = qa_choice_target(rec)
+    if target is None or target == "none":
+        return []
+    choices = choice_candidate_token_tuples(rec)
+    gold = choices.get(target)
+    if not gold:
+        return []
+    ctx_start, ctx_end, _q_start, _q_end = qa_context_question_spans(rec)
+    if ctx_start >= ctx_end:
+        return []
+    blocked = set(choices.values())
+    ctx = tuple(rec.tokens[ctx_start:ctx_end])
+    span_len = len(gold)
+    replacements = []
+    for i in range(0, len(ctx) - span_len + 1):
+        cand = tuple(ctx[i:i + span_len])
+        if cand and cand not in blocked:
+            replacements.append(cand)
+    return _unique_token_tuples(replacements)
+
+
+def _choice_candidate_replacement_record(rec, rng, facts=None, suffix="candidate_replace"):
+    target = qa_choice_target(rec)
+    if target is None or target == "none":
+        return None
+    choices = {choice_id: (start, end)
+               for choice_id, start, end in qa_choice_spans(rec)}
+    if target not in choices:
+        return None
+    replacements = _choice_candidate_replacement_tokens(rec)
+    if not replacements:
+        return None
+    repl = replacements[int(rng.integers(len(replacements)))]
+    start, end = choices[target]
+    toks = tuple(list(rec.tokens[:start]) + list(repl) + list(rec.tokens[end:]))
+    out_facts = tuple(facts) if facts is not None else (("answer", "choice", "none"),)
+    control_meta = {"negative": suffix,
+                    "source_record_id": rec.rec_id,
+                    "replaced_choice": target,
+                    "replacement_text": " ".join(repl)}
+    meta = rec.meta | control_meta if isinstance(rec.meta, dict) else control_meta
+    return TextRecord(rec_id=f"{rec.rec_id}:{suffix}",
+                      split=rec.split,
+                      tokens=toks,
+                      facts=out_facts,
+                      group=rec.group,
+                      kind=f"{rec.kind}:{suffix}",
+                      base_id=rec.rec_id,
+                      changed=((("answer", "choice", "none"),)
+                               if out_facts != rec.facts else rec.changed),
+                      meta=meta)
+
+
 def _choice_control_record(rec, side):
-    ablated = _qa_ablation_record(rec, side)
+    if side == "candidate_replace":
+        seed = sum((i + 1) * ord(ch) for i, ch in enumerate(rec.rec_id))
+        ablated = _choice_candidate_replacement_record(
+            rec, np.random.default_rng(seed % (2 ** 32)))
+    else:
+        ablated = _qa_ablation_record(rec, side)
     if ablated is None:
         return None
     return TextRecord(rec_id=f"{rec.rec_id}:choice_control:{side}",
@@ -1772,12 +1831,15 @@ def choice_control_batch_records(sources, rng, n):
     if not sources or n <= 0:
         return []
     rows = []
-    sides = ("question", "context")
+    sides = ("question", "context", "candidate_replace")
     tries = 0
     while len(rows) < int(n) and tries < int(n) * 4:
         rec = sources[int(rng.integers(len(sources)))]
         side = sides[int(rng.integers(len(sides)))]
-        ctrl = _choice_control_record(rec, side)
+        if side == "candidate_replace":
+            ctrl = _choice_candidate_replacement_record(rec, rng)
+        else:
+            ctrl = _choice_control_record(rec, side)
         if ctrl is not None:
             rows.append(ctrl)
         tries += 1
@@ -1788,7 +1850,7 @@ def choice_answerability_control_batch_records(sources, rng, n, swap_groups=None
     if not sources or n <= 0:
         return []
     rows = []
-    sides = ["question", "context"]
+    sides = ["question", "context", "candidate_replace"]
     if swap_groups:
         sides.append("question_swap")
     tries = 0
@@ -1798,6 +1860,9 @@ def choice_answerability_control_batch_records(sources, rng, n, swap_groups=None
             rec, donors = swap_groups[int(rng.integers(len(swap_groups)))]
             donor = donors[int(rng.integers(len(donors)))]
             ablated = _qa_question_swap_record(rec, donor)
+        elif side == "candidate_replace":
+            rec = sources[int(rng.integers(len(sources)))]
+            ablated = _choice_candidate_replacement_record(rec, rng)
         else:
             rec = sources[int(rng.integers(len(sources)))]
             ablated = _qa_ablation_record(rec, side)
@@ -1897,7 +1962,7 @@ def choice_control_contrast_batch(sources, rng, pairs, swap_groups=None):
         return [], []
     rows = []
     ids = []
-    sides = ["question", "context"]
+    sides = ["question", "context", "candidate_replace"]
     if swap_groups:
         sides.append("question_swap")
     tries = 0
@@ -1907,6 +1972,10 @@ def choice_control_contrast_batch(sources, rng, pairs, swap_groups=None):
             rec, donors = swap_groups[int(rng.integers(len(swap_groups)))]
             donor = donors[int(rng.integers(len(donors)))]
             ablated = _qa_question_swap_record(rec, donor)
+        elif side == "candidate_replace":
+            rec = sources[int(rng.integers(len(sources)))]
+            ablated = _choice_candidate_replacement_record(
+                rec, rng, facts=rec.facts, suffix="candidate_replace_contrast")
         else:
             rec = sources[int(rng.integers(len(sources)))]
             ablated = _qa_ablation_record(rec, side)
@@ -2946,6 +3015,39 @@ def qa_question_swap_eval(model, vocab, records, device=DEV, n=0, seed=0):
             "choice_full_minus_question_swap": full_choice - swap_choice}
 
 
+def qa_candidate_replacement_eval(model, vocab, records, device=DEV, n=0, seed=0):
+    all_eval = [r for r in records if r.split == "eval" and _is_qa_record(r)
+                and not _is_qa_negative_record(r)]
+    if n < 0:
+        return {"n": 0, "sampled": False, "skipped": True}
+    if not all_eval:
+        return {"n": 0, "sampled": False, "skipped": False}
+    eval_records_ = all_eval
+    sampled = bool(n and n < len(eval_records_))
+    rng = np.random.default_rng(seed)
+    if sampled:
+        idx = rng.choice(len(eval_records_), size=n, replace=False)
+        eval_records_ = [eval_records_[int(i)] for i in idx]
+    original = []
+    replaced = []
+    for rec in eval_records_:
+        repl = _choice_candidate_replacement_record(rec, rng)
+        if repl is not None:
+            original.append(rec)
+            replaced.append(repl)
+    if not replaced:
+        return {"n": 0, "sampled": sampled, "skipped": False}
+    full_choice = choice_head_eval(model, vocab, original, device=device)["fact_value_acc"]
+    repl_choice = choice_head_eval(model, vocab, replaced, device=device)["fact_value_acc"]
+    return {"n": len(replaced),
+            "sampled": sampled,
+            "skipped": False,
+            "full_choice_fact_value_acc": full_choice,
+            "candidate_replacement_none_acc": repl_choice,
+            "candidate_replacement_error_rate": 1.0 - repl_choice,
+            "choice_binding_score": min(full_choice, repl_choice)}
+
+
 @torch.no_grad()
 def greedy_facts(model, vocab, rec, device=DEV, max_new=80):
     model.eval()
@@ -3057,6 +3159,8 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
                                   seed=seed + 17)
     qa_swap = qa_question_swap_eval(model, vocab, records, device=device, n=artifact_n,
                                     seed=seed + 23)
+    qa_repl = qa_candidate_replacement_eval(model, vocab, records, device=device,
+                                            n=artifact_n, seed=seed + 29)
     by_kind = bucket_fact_eval(model, vocab, records, device=device, n=kind_fact_n,
                                seed=seed + 19)
     by_kind_free = (bucket_free_eval(model, vocab, records, device=device, max_new=max_new,
@@ -3081,7 +3185,10 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
                      and qa_control["choice_full_minus_context_only"] >= 0.05))
             and (choice_head.get("skipped") or choice_head["n_records"] == 0
                  or qa_swap.get("skipped") or qa_swap["n"] == 0
-                 or qa_swap["choice_full_minus_question_swap"] >= 0.05))
+                 or qa_swap["choice_full_minus_question_swap"] >= 0.05)
+            and (choice_head.get("skipped") or choice_head["n_records"] == 0
+                 or qa_repl.get("skipped") or qa_repl["n"] == 0
+                 or qa_repl["candidate_replacement_none_acc"] >= 0.55))
     return {"teacher_forced": teacher, "free_decode": free,
             "semantic_head": semantic,
             "choice_head": choice_head,
@@ -3091,6 +3198,7 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
             "nli_artifact_control": artifact,
             "qa_ablation_control": qa_control,
             "qa_question_swap_control": qa_swap,
+            "qa_candidate_replacement_control": qa_repl,
             "gate_thresholds": {"fact_value_acc": 0.80, "free_f1": 0.80,
                                 "semantic_fact_value_acc": 0.80,
                                 "choice_head_fact_value_acc": 0.80,
@@ -3102,7 +3210,8 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
                                 "qa_full_minus_question_swap": 0.05,
                                 "qa_choice_full_minus_question_only": 0.05,
                                 "qa_choice_full_minus_context_only": 0.05,
-                                "qa_choice_full_minus_question_swap": 0.05},
+                                "qa_choice_full_minus_question_swap": 0.05,
+                                "qa_candidate_replacement_none_acc": 0.55},
             "gate": gate}
 
 
@@ -3221,6 +3330,10 @@ def _control_gap_values(eval_report, metric="both"):
         if use_choice:
             gaps.append(("qa_choice_full_minus_question_swap",
                          float(qa_swap.get("choice_full_minus_question_swap", 0.0))))
+    qa_repl = eval_report.get("qa_candidate_replacement_control") or {}
+    if qa_repl.get("n", 0) and use_choice:
+        gaps.append(("qa_choice_candidate_replacement_abstain_margin",
+                     float(qa_repl.get("candidate_replacement_none_acc", 0.0)) - 0.5))
     return gaps
 
 
@@ -4139,6 +4252,16 @@ def selftest():
     c_ctx_start, c_ctx_end, c_q_start, c_q_end = qa_context_question_spans(c_only)
     assert q_ctx_start == q_ctx_end and q_q_start < q_q_end
     assert c_ctx_start < c_ctx_end and c_q_start == c_q_end == 0
+    replaced_choice = _choice_candidate_replacement_record(
+        choice_norm[0], np.random.default_rng(13))
+    assert replaced_choice is not None
+    assert qa_choice_target(replaced_choice) == "none"
+    assert qa_choice_spans(replaced_choice)
+    assert replaced_choice.tokens != choice_norm[0].tokens
+    repl_eval = qa_candidate_replacement_eval(
+        choice_model, choice_vocab, choice_eval, device="cpu")
+    assert repl_eval["n"] > 0
+    assert "candidate_replacement_none_acc" in repl_eval
     squad_choice_neg, _neg_seen, neg_stats = _squad_records_from_payload(
         squad_payload, "train", 0, np.random.default_rng(2), "fixture",
         max_context_tokens=8, max_question_tokens=8, max_answer_tokens=3,
@@ -4384,7 +4507,8 @@ def selftest():
     assert set(report) >= {"teacher_forced", "free_decode", "paraphrase_consistency",
                            "counterfactual", "semantic_head", "choice_head", "by_kind",
                            "free_decode_by_kind", "qa_ablation_control",
-                           "qa_question_swap_control", "gate"}
+                           "qa_question_swap_control",
+                           "qa_candidate_replacement_control", "gate"}
     print("text selftest OK")
 
 
