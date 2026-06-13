@@ -886,6 +886,16 @@ still rejected the round (`selected_round` **0**) because aggregate held-out cho
 remained negative. The useful progress is a measured local-retention curriculum; the next pressure
 has to make candidate replacement and discovery margins improve, not merely select relevant memory.
 
+The hard-aware discovery update makes that pressure act on the actual failures. When
+`--study-discovery-correct-per-kind` supplies mined correct neighbors, the concept bridge/prototype
+source pool now combines those neighbors with the current hard examples before fitting. The smoke
+confirmed **2,100** discovery source records (**2,080** hard + **20** mined correct), activated the
+same concept/prototype losses (`concept` **0.536**, `proto` **0.555**), improved the round score
+from **-0.126** to **-0.095**, and preserved held-out `squad_choice` at **0.400**. The selector
+still rejected the round (`selected_round` **0**) because candidate replacement and concept
+discovery controls remained below threshold. This is the right shape: self-discovery now trains on
+hard examples connected to model-mined neighbors, while the gate prevents a premature update.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels

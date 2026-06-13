@@ -3533,6 +3533,18 @@ def sample_records_per_kind(records, rng, per_kind):
     return out, counts
 
 
+def unique_records_by_id(*record_lists):
+    out = []
+    seen = set()
+    for records in record_lists:
+        for rec in records:
+            if rec.rec_id in seen:
+                continue
+            seen.add(rec.rec_id)
+            out.append(rec)
+    return out
+
+
 def choice_neighbor_records_per_kind(model, vocab, hard_records, correct_records, rng,
                                      per_kind, device=DEV, pool_per_kind=0):
     """Select correct QA records nearest to current hard records in model concept space."""
@@ -5175,6 +5187,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
         discovery_records = []
         discovery_counts = {}
         discovery_selection = {}
+        discovery_source_records = []
         if study_strategy == "errors":
             need_metric_correct = bool(
                 study_anchor_correct_per_kind
@@ -5259,6 +5272,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                     discovery_records, discovery_counts = sample_records_per_kind(
                         choice_correct_records, rng, study_discovery_correct_per_kind)
                     discovery_selection = {"adaptive": False, "reason": "random_per_kind"}
+            if discovery_records:
+                discovery_source_records = unique_records_by_id(
+                    hard_records, discovery_records)
             hard_report = hard_report | {
                 "n_anchor_records": len(anchor_records),
                 "n_unique_anchor_records": sum(anchor_counts.values()),
@@ -5271,6 +5287,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                 "n_discovery_records": len(discovery_records),
                 "discovery_records_by_kind": discovery_counts,
                 "discovery_selection": discovery_selection,
+                "n_discovery_source_records": len(discovery_source_records),
+                "n_discovery_source_hard_records": (
+                    len(hard_records) if discovery_source_records else 0),
             }
             round_fit_records = hard_records + anchor_records + train_replay_records
             if not hard_records:
@@ -5295,6 +5314,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                               "discovery_records": len(discovery_records),
                               "discovery_records_by_kind": discovery_counts,
                               "discovery_selection": discovery_selection,
+                              "discovery_source_records": len(discovery_source_records),
                               "control_focus_sides": list(focused_control_sides),
                               "control_sampling_sides": list(focused_sampling_sides),
                               "replay_fit_records": len(train_replay_records),
@@ -5339,7 +5359,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   choice_concept_bridge_margin=choice_concept_bridge_margin,
                   choice_concept_prototype_w=choice_concept_prototype_w,
                   choice_concept_prototype_margin=choice_concept_prototype_margin,
-                  choice_concept_bridge_sources=(discovery_records or None),
+                  choice_concept_bridge_sources=(
+                      discovery_source_records or discovery_records or None),
                   choice_self_distill_w=choice_self_distill_w,
                   choice_self_distill_temperature=choice_self_distill_temperature,
                   choice_self_rank_distill_w=choice_self_rank_distill_w,
@@ -5659,6 +5680,7 @@ def selftest():
     assert neighbor_rows and sum(neighbor_counts.values()) == len(neighbor_rows)
     assert neighbor_report["adaptive"] and neighbor_report["selected_records"] == len(
         neighbor_rows)
+    assert len(unique_records_by_id(choice_eval[:2], choice_eval[1:])) == 3
     swap_rec = _qa_question_swap_record(choice_norm[0], choice_norm[1])
     assert swap_rec is not None and swap_rec.facts == choice_norm[0].facts
     donor_q = tuple(choice_norm[1].tokens[
