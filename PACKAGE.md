@@ -354,7 +354,7 @@ python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
     --out runs/text_study_squad_choice_contextloc025_pair_2round_smoke.json
 python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
     --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_choice_answerability_anspair_confirm1_qctx_2round_smoke.pt \
+    --study-out-checkpoint runs/text_study_squad_choice_answerability_candctx025_confirm1_qctx_2round_smoke.pt \
     --study-replay-data data/text_grounded.jsonl \
     --steps 10 --study-rounds 2 --study-strategy errors --study-select-best --study-confirm-n 1 \
     --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
@@ -363,13 +363,15 @@ python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
     --choice-answerability-w 0.5 --choice-answerability-control-w 0.5 \
     --choice-answerability-contrast-w 0.5 --choice-answerability-contrast-margin 0.0 \
     --choice-answerability-pair-w 0.5 --choice-answerability-pair-margin 0.0 \
-    --choice-context-w 0.25 --choice-question-context-w 0.25 \
+    --choice-context-w 0.25 \
+    --choice-candidate-context-w 0.25 --choice-candidate-context-margin 0.0 \
+    --choice-question-context-w 0.25 \
     --choice-question-context-contrast-w 0.10 --choice-question-context-margin 0.0 \
     --choice-pair-w 1.0 --choice-pair-margin 0.0 \
     --choice-control-w 0 --choice-control-contrast-w 0 --choice-control-margin 0.0 \
     --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_squad_choice_answerability_anspair_confirm1_qctx_2round_smoke.json
+    --out runs/text_study_squad_choice_answerability_candctx025_confirm1_qctx_2round_smoke.json
 ```
 
 Current local Text-0 SNLI baseline (20k train / 1k dev, 1.5k steps, d=192, 4 layers, 6 heads,
@@ -644,6 +646,17 @@ seed **7936** exposed a `squad_choice` regression from **0.250** to **0.050** an
 question-swap control. The learned objective is aligned, but it is not sufficient; the next text
 step needs candidate-span binding that keeps real answers stable under independent held-out
 samples.
+
+Candidate-span binding is now explicit via `--choice-candidate-context-w`: for answer-present
+SQuAD choice records, the correct candidate must localize the answer span better than the
+distractor candidates. This is still span supervision from the imported reading record, not a
+hand-authored English rule. With weight **0.25**, the confirmation-gated smoke improved the failure
+mode: primary round 2 moved `squad_choice` to **0.450**, and confirmation seed **7936** preserved
+`squad_choice` at its **0.250** baseline with no kind regressions. The update is still rejected
+because controls failed (`question_only` **0.0250**, `question_swap` **-0.0769**), so
+`selected_round` remains **0**. That narrows the remaining gap: the model can now retain answerable
+choices better, but it must still prove that the answer depends on both the actual question and
+the actual context before a reading update can be accepted.
 
 ## 3b. Image grounding: synthetic visual factors first
 
