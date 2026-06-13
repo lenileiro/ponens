@@ -30,6 +30,9 @@ class SchemaConceptHead(nn.Module):
             nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d, bias=False))
             for _ in self.keys
         ])
+        self.geometry_prototypes = nn.ParameterList([
+            nn.Parameter(torch.randn(len(vs), d) * init_scale) for vs in self.values
+        ])
 
     def state_tensor(self, source, mask=None):
         if not self.keys:
@@ -58,6 +61,19 @@ class SchemaConceptHead(nn.Module):
     def geometry_states(self, source, mask=None):
         state_tensor = self.geometry_state_tensor(source, mask=mask)
         return {key: state_tensor[:, i] for i, key in enumerate(self.keys)}
+
+    def geometry_logits_from_states(self, states, temperature=0.1):
+        out = {}
+        temp = max(float(temperature), 1e-6)
+        for i, key in enumerate(self.keys):
+            state = F.normalize(states[key], dim=-1)
+            prototypes = F.normalize(self.geometry_prototypes[i], dim=-1)
+            out[key] = state.matmul(prototypes.t()) / temp
+        return out
+
+    def geometry_logits(self, source, mask=None, temperature=0.1):
+        return self.geometry_logits_from_states(
+            self.geometry_states(source, mask=mask), temperature=temperature)
 
     def logits_from_state_tensor(self, state_tensor):
         out = {}
@@ -122,4 +138,71 @@ def schema_concept_contrastive_loss(states_by_key, target_ids_by_key, temperatur
         losses.append(-positive_log_prob[row_has_positive].mean())
     if not losses:
         return _zero_from_states(states_by_key)
+    return torch.stack(losses).mean()
+
+
+def schema_concept_prototype_loss(logits_by_key, target_ids_by_key):
+    """Classify projected concept states against learned prototypes for each schema key."""
+    losses = []
+    for key, logits in logits_by_key.items():
+        targets = target_ids_by_key.get(key)
+        if targets is None:
+            continue
+        targets = targets.to(device=logits.device, dtype=torch.long)
+        if targets.ge(0).any() and logits.shape[-1] > 1:
+            losses.append(F.cross_entropy(logits, targets, ignore_index=-1))
+    if not losses:
+        for logits in logits_by_key.values():
+            return logits.sum() * 0.0
+        return torch.tensor(0.0)
+    return torch.stack(losses).mean()
+
+
+def schema_concept_prototype_alignment_loss(states_by_key, target_ids_by_key,
+                                            prototypes_by_key, temperature=0.1,
+                                            margin=0.2):
+    """Pull states to their target prototype and rank it above other prototypes."""
+    temp = max(float(temperature), 1e-6)
+    margin_t = float(margin)
+    losses = []
+    for key, states in states_by_key.items():
+        targets = target_ids_by_key.get(key)
+        prototypes = prototypes_by_key.get(key)
+        if targets is None or prototypes is None:
+            continue
+        targets = targets.to(device=states.device, dtype=torch.long)
+        valid = targets.ge(0)
+        if not bool(valid.any()) or prototypes.shape[0] < 2:
+            continue
+        state = F.normalize(states[valid], dim=-1)
+        labels = targets[valid]
+        proto = F.normalize(prototypes.to(device=states.device), dim=-1)
+        sim = state.matmul(proto.t())
+        losses.append(F.cross_entropy(sim / temp, labels))
+        target_sim = sim.gather(1, labels[:, None]).squeeze(1)
+        losses.append((1.0 - target_sim).mean())
+        other_sim = sim.masked_fill(
+            F.one_hot(labels, num_classes=proto.shape[0]).bool(),
+            -float("inf")).max(-1).values
+        losses.append(F.relu(other_sim + margin_t - target_sim).mean())
+    if not losses:
+        return _zero_from_states(states_by_key)
+    return torch.stack(losses).mean()
+
+
+def schema_concept_prototype_spread_loss(prototypes_by_key, margin=0.2):
+    """Keep value prototypes for the same schema key from collapsing together."""
+    margin = float(margin)
+    losses = []
+    for prototypes in prototypes_by_key.values():
+        if prototypes.shape[0] < 2:
+            continue
+        z = F.normalize(prototypes, dim=-1)
+        sim = z.matmul(z.t())
+        eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+        losses.append(F.relu(sim.masked_select(~eye) - margin).mean())
+    if not losses:
+        for prototypes in prototypes_by_key.values():
+            return prototypes.sum() * 0.0
+        return torch.tensor(0.0)
     return torch.stack(losses).mean()

@@ -49,7 +49,12 @@ import torch.nn.functional as F
 from device import get_device
 from scratchpad_model import ScratchpadLM
 
-from .concepts import SchemaConceptHead, schema_concept_contrastive_loss
+from .concepts import (
+    SchemaConceptHead,
+    schema_concept_contrastive_loss,
+    schema_concept_prototype_alignment_loss,
+    schema_concept_prototype_spread_loss,
+)
 from .trace import Vocab
 
 DEV = get_device()
@@ -1117,6 +1122,13 @@ class TextFactLM(nn.Module):
         prefix, _pooled = self.encode_text(txt)
         return self.fact_concepts.geometry_states(prefix, mask=txt.eq(self.txt.pad))
 
+    def fact_concept_geometry_logits(self, txt, temperature=0.1):
+        if self.fact_concepts is None:
+            return {}
+        prefix, _pooled = self.encode_text(txt)
+        return self.fact_concepts.geometry_logits(
+            prefix, mask=txt.eq(self.txt.pad), temperature=temperature)
+
     def fact_concept_logits(self, txt):
         if self.fact_concepts is None:
             return {}
@@ -1380,6 +1392,11 @@ def copy_pretrained_text_weights(src_model, src_vocab, dst_model, dst_vocab):
                             src_model.fact_concepts.value_embeds[src_i][src_v])
                         dst_model.fact_concepts.value_biases[dst_i][dst_v].copy_(
                             src_model.fact_concepts.value_biases[src_i][src_v])
+                        src_proto_prefix = (
+                            f"fact_concepts.geometry_prototypes.{src_i}.")
+                        if any(name.startswith(src_proto_prefix) for name in src_state):
+                            dst_model.fact_concepts.geometry_prototypes[dst_i][dst_v].copy_(
+                                src_model.fact_concepts.geometry_prototypes[src_i][src_v])
                     src_proj_prefix = f"fact_concepts.state_projectors.{src_i}."
                     if any(name.startswith(src_proj_prefix) for name in src_state):
                         dst_model.fact_concepts.state_projectors[dst_i].load_state_dict(
@@ -1450,6 +1467,26 @@ def fact_concept_contrastive_loss(model, txt, records, schema, temperature=0.1):
     states = model.fact_concept_geometry_states(txt)
     targets = fact_concept_target_ids(records, schema, txt.device)
     return schema_concept_contrastive_loss(states, targets, temperature=temperature)
+
+
+def fact_concept_prototype_loss(model, txt, records, schema, temperature=0.1):
+    if schema is None or getattr(model, "fact_concepts", None) is None:
+        return torch.tensor(0.0, device=txt.device)
+    states = model.fact_concept_geometry_states(txt)
+    targets = fact_concept_target_ids(records, schema, txt.device)
+    prototypes = {key: model.fact_concepts.geometry_prototypes[i]
+                  for i, key in enumerate(model.fact_concepts.keys)}
+    return schema_concept_prototype_alignment_loss(
+        states, targets, prototypes, temperature=temperature)
+
+
+def fact_concept_prototype_spread_loss(model, margin=0.2):
+    head = getattr(model, "fact_concepts", None)
+    if head is None:
+        device = next(model.parameters()).device
+        return torch.tensor(0.0, device=device)
+    prototypes = {key: head.geometry_prototypes[i] for i, key in enumerate(head.keys)}
+    return schema_concept_prototype_spread_loss(prototypes, margin=margin)
 
 
 def choice_loss(model, txt, records, answer_w=1.0, none_w=1.0,
@@ -2953,6 +2990,9 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               device=DEV, log_every=100, semantic_w=0.5, balance_by="none",
               fact_concept_w=0.0, fact_concept_contrast_w=0.0,
               fact_concept_contrast_temperature=0.1,
+              fact_concept_prototype_w=0.0,
+              fact_concept_prototype_spread_w=0.0,
+              fact_concept_prototype_spread_margin=0.2,
               prefix="text", decode_w=1.0, choice_w=0.0,
               choice_answer_w=1.0, choice_none_w=1.0,
               choice_answer_margin=0.0, choice_none_margin=0.0,
@@ -3064,6 +3104,15 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 model, txt, rec_batch, model.fact_schema,
                 temperature=fact_concept_contrast_temperature)
             if fact_concept_contrast_w else torch.tensor(0.0, device=device))
+        concept_proto_loss = (
+            fact_concept_prototype_loss(
+                model, txt, rec_batch, model.fact_schema,
+                temperature=fact_concept_contrast_temperature)
+            if fact_concept_prototype_w else torch.tensor(0.0, device=device))
+        concept_proto_spread_loss = (
+            fact_concept_prototype_spread_loss(
+                model, margin=fact_concept_prototype_spread_margin)
+            if fact_concept_prototype_spread_w else torch.tensor(0.0, device=device))
         ch_loss = choice_loss(model, txt, rec_batch,
                               answer_w=choice_answer_w, none_w=choice_none_w,
                               answer_margin=choice_answer_margin,
@@ -3386,6 +3435,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
         loss = (decode_w * dec_loss + semantic_w * sem_loss
                 + fact_concept_w * concept_fact_loss
                 + fact_concept_contrast_w * concept_contrast_loss
+                + fact_concept_prototype_w * concept_proto_loss
+                + fact_concept_prototype_spread_w * concept_proto_spread_loss
                 + choice_w * ch_loss
                 + choice_final_w * final_loss
                 + choice_final_control_w * final_control_loss
@@ -3421,6 +3472,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                   f"dec {dec_loss.item():.3f} sem {sem_loss.item():.3f} "
                   f"fact-concept {concept_fact_loss.item():.3f} "
                   f"fact-contrast {concept_contrast_loss.item():.3f} "
+                  f"fact-proto {concept_proto_loss.item():.3f} "
+                  f"fact-proto-spread {concept_proto_spread_loss.item():.3f} "
                   f"choice {ch_loss.item():.3f} final {final_loss.item():.3f} "
                   f"final-control {final_control_loss.item():.3f} "
                   f"final-contrast {final_contrast_loss.item():.3f} "
@@ -3454,6 +3507,9 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                 device=DEV, log_every=100, semantic_w=0.5, balance_by="none",
                 fact_concept_w=0.0, fact_concept_contrast_w=0.0,
                 fact_concept_contrast_temperature=0.1,
+                fact_concept_prototype_w=0.0,
+                fact_concept_prototype_spread_w=0.0,
+                fact_concept_prototype_spread_margin=0.2,
                 decode_w=1.0, choice_w=0.0, choice_answer_w=1.0,
                 choice_none_w=1.0, choice_context_w=0.0,
                 choice_answer_margin=0.0, choice_none_margin=0.0,
@@ -3505,6 +3561,10 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                      fact_concept_contrast_w=fact_concept_contrast_w,
                      fact_concept_contrast_temperature=(
                          fact_concept_contrast_temperature),
+                     fact_concept_prototype_w=fact_concept_prototype_w,
+                     fact_concept_prototype_spread_w=fact_concept_prototype_spread_w,
+                     fact_concept_prototype_spread_margin=(
+                         fact_concept_prototype_spread_margin),
                      prefix="text", decode_w=decode_w, choice_w=choice_w,
                      choice_answer_w=choice_answer_w,
                      choice_none_w=choice_none_w,
@@ -5107,6 +5167,8 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         fact_n=0, kind_fact_n=0, artifact_n=0, decode_w=1.0, choice_w=0.0,
         fact_concept_w=0.0, fact_concept_contrast_w=0.0,
         fact_concept_contrast_temperature=0.1,
+        fact_concept_prototype_w=0.0, fact_concept_prototype_spread_w=0.0,
+        fact_concept_prototype_spread_margin=0.2,
         choice_answer_w=1.0, choice_none_w=1.0,
         choice_answer_margin=0.0, choice_none_margin=0.0,
         choice_final_w=0.0, choice_final_control_w=0.0,
@@ -5154,6 +5216,11 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                fact_concept_contrast_w=fact_concept_contrast_w,
                                fact_concept_contrast_temperature=(
                                    fact_concept_contrast_temperature),
+                               fact_concept_prototype_w=fact_concept_prototype_w,
+                               fact_concept_prototype_spread_w=(
+                                   fact_concept_prototype_spread_w),
+                               fact_concept_prototype_spread_margin=(
+                                   fact_concept_prototype_spread_margin),
                                decode_w=decode_w,
                                choice_w=choice_w, choice_answer_w=choice_answer_w,
                                choice_none_w=choice_none_w,
@@ -5231,6 +5298,11 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
               "fact_concept_contrast_w": float(fact_concept_contrast_w),
               "fact_concept_contrast_temperature": float(
                   fact_concept_contrast_temperature),
+              "fact_concept_prototype_w": float(fact_concept_prototype_w),
+              "fact_concept_prototype_spread_w": float(
+                  fact_concept_prototype_spread_w),
+              "fact_concept_prototype_spread_margin": float(
+                  fact_concept_prototype_spread_margin),
               "choice_w": float(choice_w),
               "choice_answer_w": float(choice_answer_w),
               "choice_none_w": float(choice_none_w),
@@ -5336,6 +5408,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      artifact_n=0, decode_w=1.0, choice_w=0.0,
                      fact_concept_w=0.0, fact_concept_contrast_w=0.0,
                      fact_concept_contrast_temperature=0.1,
+                     fact_concept_prototype_w=0.0,
+                     fact_concept_prototype_spread_w=0.0,
+                     fact_concept_prototype_spread_margin=0.2,
                      choice_answer_w=1.0, choice_none_w=1.0,
                      choice_answer_margin=0.0, choice_none_margin=0.0,
                      choice_final_w=0.0, choice_final_control_w=0.0,
@@ -5464,6 +5539,11 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "fact_concept_contrast_w": float(fact_concept_contrast_w),
               "fact_concept_contrast_temperature": float(
                   fact_concept_contrast_temperature),
+              "fact_concept_prototype_w": float(fact_concept_prototype_w),
+              "fact_concept_prototype_spread_w": float(
+                  fact_concept_prototype_spread_w),
+              "fact_concept_prototype_spread_margin": float(
+                  fact_concept_prototype_spread_margin),
               "choice_w": float(choice_w),
               "choice_answer_w": float(choice_answer_w),
               "choice_none_w": float(choice_none_w),
@@ -5803,6 +5883,10 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   fact_concept_contrast_w=fact_concept_contrast_w,
                   fact_concept_contrast_temperature=(
                       fact_concept_contrast_temperature),
+                  fact_concept_prototype_w=fact_concept_prototype_w,
+                  fact_concept_prototype_spread_w=fact_concept_prototype_spread_w,
+                  fact_concept_prototype_spread_margin=(
+                      fact_concept_prototype_spread_margin),
                   prefix=f"study-r{round_i + 1}",
                   decode_w=decode_w, choice_w=choice_w,
                   choice_answer_w=choice_answer_w, choice_none_w=choice_none_w,
@@ -6120,6 +6204,9 @@ def selftest():
         choice_model, choice_txt, choice_eval, choice_schema))
     assert torch.isfinite(fact_concept_contrastive_loss(
         choice_model, choice_txt, choice_eval, choice_schema))
+    assert torch.isfinite(fact_concept_prototype_loss(
+        choice_model, choice_txt, choice_eval, choice_schema))
+    assert torch.isfinite(fact_concept_prototype_spread_loss(choice_model))
     concept_eval_report = fact_concept_eval(
         choice_model, choice_vocab, choice_eval, device="cpu")
     assert concept_eval_report["n_records"] == len(choice_eval)
@@ -6668,6 +6755,15 @@ def main(argv=None):
     ap.add_argument("--fact-concept-contrast-temperature", type=float, default=0.1,
                     dest="fact_concept_contrast_temperature",
                     help="temperature for schema concept geometry contrastive loss")
+    ap.add_argument("--fact-concept-prototype-w", type=float, default=0.0,
+                    dest="fact_concept_prototype_w",
+                    help="weight for schema-generic learned concept prototype loss")
+    ap.add_argument("--fact-concept-prototype-spread-w", type=float, default=0.0,
+                    dest="fact_concept_prototype_spread_w",
+                    help="weight for separating learned concept prototypes per schema key")
+    ap.add_argument("--fact-concept-prototype-spread-margin", type=float, default=0.2,
+                    dest="fact_concept_prototype_spread_margin",
+                    help="maximum allowed cosine similarity between value prototypes")
     ap.add_argument("--decode-w", type=float, default=1.0, dest="decode_w",
                     help="weight for canonical trace decoder loss; set 0 for semantic-only study")
     ap.add_argument("--choice-w", type=float, default=0.0, dest="choice_w",
@@ -6916,10 +7012,14 @@ def main(argv=None):
     if args.selftest:
         selftest()
         return
-    if args.fact_concept_w < 0.0 or args.fact_concept_contrast_w < 0.0:
+    if (args.fact_concept_w < 0.0 or args.fact_concept_contrast_w < 0.0
+            or args.fact_concept_prototype_w < 0.0
+            or args.fact_concept_prototype_spread_w < 0.0):
         ap.error("fact concept loss weights must be non-negative")
     if args.fact_concept_contrast_temperature <= 0.0:
         ap.error("--fact-concept-contrast-temperature must be positive")
+    if args.fact_concept_prototype_spread_margin < -1.0:
+        ap.error("--fact-concept-prototype-spread-margin must be >= -1")
     if args.import_scan:
         import_scan(args.out, url=args.scan_url, max_records=args.scan_max,
                     eval_frac=args.scan_eval_frac, seed=args.seed)
@@ -6985,6 +7085,11 @@ def main(argv=None):
                          fact_concept_contrast_w=args.fact_concept_contrast_w,
                          fact_concept_contrast_temperature=(
                              args.fact_concept_contrast_temperature),
+                         fact_concept_prototype_w=args.fact_concept_prototype_w,
+                         fact_concept_prototype_spread_w=(
+                             args.fact_concept_prototype_spread_w),
+                         fact_concept_prototype_spread_margin=(
+                             args.fact_concept_prototype_spread_margin),
                          choice_w=args.choice_w,
                          choice_answer_w=args.choice_answer_w,
                          choice_none_w=args.choice_none_w,
@@ -7102,6 +7207,10 @@ def main(argv=None):
         decode_w=args.decode_w, fact_concept_w=args.fact_concept_w,
         fact_concept_contrast_w=args.fact_concept_contrast_w,
         fact_concept_contrast_temperature=args.fact_concept_contrast_temperature,
+        fact_concept_prototype_w=args.fact_concept_prototype_w,
+        fact_concept_prototype_spread_w=args.fact_concept_prototype_spread_w,
+        fact_concept_prototype_spread_margin=(
+            args.fact_concept_prototype_spread_margin),
         choice_w=args.choice_w,
         choice_answer_w=args.choice_answer_w, choice_none_w=args.choice_none_w,
         choice_answer_margin=args.choice_answer_margin,
