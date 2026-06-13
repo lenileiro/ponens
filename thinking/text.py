@@ -1494,6 +1494,35 @@ def choice_answerability_scores(model, txt, records, scaled=False):
     return scores
 
 
+def choice_candidate_answerability_scores(model, txt, records):
+    scores = {}
+    for rec, _score, ids, cover_scores in model.choice_answerability_logits(txt, records):
+        target = qa_choice_target(rec)
+        if target is None or target == "none" or cover_scores is None:
+            continue
+        try:
+            target_idx = ids.index(target)
+        except ValueError:
+            continue
+        scores[rec.rec_id] = cover_scores[target_idx]
+    return scores
+
+
+def choice_candidate_answerability_contrast_loss(model, txt, records, pair_ids,
+                                                margin=0.0):
+    scores = choice_candidate_answerability_scores(model, txt, records)
+    losses = []
+    margin_t = torch.tensor(float(margin), dtype=torch.float32, device=txt.device)
+    for full_id, ablated_id in pair_ids:
+        full_score = scores.get(full_id)
+        ablated_score = scores.get(ablated_id)
+        if full_score is not None and ablated_score is not None:
+            losses.append(F.softplus(ablated_score + margin_t - full_score))
+    if not losses:
+        return torch.tensor(0.0, device=txt.device)
+    return sum(losses) / len(losses)
+
+
 def _subsequence_token_positions(tokens, pattern):
     return _subsequence_positions(tokens, pattern)
 
@@ -2053,6 +2082,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               choice_candidate_answerability_w=0.0,
               choice_candidate_answerability_control_w=0.0,
               choice_candidate_answerability_margin=0.0,
+              choice_candidate_answerability_contrast_w=0.0,
+              choice_candidate_answerability_contrast_margin=0.0,
               choice_answerability_pair_w=0.0,
               choice_answerability_pair_margin=0.0,
               choice_context_w=0.0,
@@ -2079,6 +2110,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                            or choice_question_context_contrast_w
                            or choice_answerability_control_w
                            or choice_candidate_answerability_control_w
+                           or choice_candidate_answerability_contrast_w
                            or choice_answerability_contrast_w) else [])
     needs_swap_groups = bool(choice_control_contrast_w
                              or choice_final_control_w
@@ -2086,6 +2118,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                              or choice_question_context_contrast_w
                              or choice_answerability_control_w
                              or choice_candidate_answerability_control_w
+                             or choice_candidate_answerability_contrast_w
                              or choice_answerability_contrast_w)
     swap_groups = (choice_question_swap_groups(control_sources)
                    if needs_swap_groups and control_sources else [])
@@ -2200,6 +2233,21 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 cand_ans_control_loss = torch.tensor(0.0, device=device)
         else:
             cand_ans_control_loss = torch.tensor(0.0, device=device)
+        if choice_candidate_answerability_contrast_w and control_sources:
+            cand_ans_contrast_records, cand_ans_contrast_pairs = choice_control_contrast_batch(
+                control_sources, rng, max(1, batch // 2),
+                swap_groups=swap_groups)
+            if cand_ans_contrast_records and cand_ans_contrast_pairs:
+                cand_ans_contrast_txt, _cand_ans_contrast_ids = pack(
+                    cand_ans_contrast_records, vocab, device)
+                cand_ans_contrast_loss = choice_candidate_answerability_contrast_loss(
+                    model, cand_ans_contrast_txt, cand_ans_contrast_records,
+                    cand_ans_contrast_pairs,
+                    margin=choice_candidate_answerability_contrast_margin)
+            else:
+                cand_ans_contrast_loss = torch.tensor(0.0, device=device)
+        else:
+            cand_ans_contrast_loss = torch.tensor(0.0, device=device)
         if choice_answerability_contrast_w and control_sources and swap_groups:
             ans_contrast_records, ans_contrast_pairs = choice_answerability_contrast_batch(
                 control_sources, rng, max(1, batch // 2),
@@ -2258,6 +2306,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 + choice_answerability_control_w * ans_control_loss
                 + choice_candidate_answerability_w * cand_ans_loss
                 + choice_candidate_answerability_control_w * cand_ans_control_loss
+                + choice_candidate_answerability_contrast_w * cand_ans_contrast_loss
                 + choice_answerability_contrast_w * ans_contrast_loss
                 + choice_answerability_pair_w * ans_pair_loss
                 + choice_context_w * ctx_loss
@@ -2279,6 +2328,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                   f"ans-control {ans_control_loss.item():.3f} "
                   f"cand-ans {cand_ans_loss.item():.3f} "
                   f"cand-ans-control {cand_ans_control_loss.item():.3f} "
+                  f"cand-ans-contrast {cand_ans_contrast_loss.item():.3f} "
                   f"ans-contrast {ans_contrast_loss.item():.3f} "
                   f"ans-pair {ans_pair_loss.item():.3f} "
                   f"ctx {ctx_loss.item():.3f} "
@@ -2307,6 +2357,8 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                 choice_candidate_answerability_w=0.0,
                 choice_candidate_answerability_control_w=0.0,
                 choice_candidate_answerability_margin=0.0,
+                choice_candidate_answerability_contrast_w=0.0,
+                choice_candidate_answerability_contrast_margin=0.0,
                 choice_answerability_pair_w=0.0,
                 choice_answerability_pair_margin=0.0,
                 choice_candidate_context_w=0.0,
@@ -2346,6 +2398,10 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                          choice_candidate_answerability_control_w),
                      choice_candidate_answerability_margin=(
                          choice_candidate_answerability_margin),
+                     choice_candidate_answerability_contrast_w=(
+                         choice_candidate_answerability_contrast_w),
+                     choice_candidate_answerability_contrast_margin=(
+                         choice_candidate_answerability_contrast_margin),
                      choice_answerability_pair_w=choice_answerability_pair_w,
                      choice_answerability_pair_margin=choice_answerability_pair_margin,
                      choice_context_w=choice_context_w,
@@ -3332,6 +3388,8 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         choice_candidate_answerability_w=0.0,
         choice_candidate_answerability_control_w=0.0,
         choice_candidate_answerability_margin=0.0,
+        choice_candidate_answerability_contrast_w=0.0,
+        choice_candidate_answerability_contrast_margin=0.0,
         choice_answerability_pair_w=0.0,
         choice_answerability_pair_margin=0.0,
         choice_context_w=0.0,
@@ -3371,6 +3429,10 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                    choice_candidate_answerability_control_w),
                                choice_candidate_answerability_margin=(
                                    choice_candidate_answerability_margin),
+                               choice_candidate_answerability_contrast_w=(
+                                   choice_candidate_answerability_contrast_w),
+                               choice_candidate_answerability_contrast_margin=(
+                                   choice_candidate_answerability_contrast_margin),
                                choice_answerability_pair_w=choice_answerability_pair_w,
                                choice_answerability_pair_margin=(
                                    choice_answerability_pair_margin),
@@ -3414,6 +3476,10 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                   choice_candidate_answerability_control_w),
               "choice_candidate_answerability_margin": float(
                   choice_candidate_answerability_margin),
+              "choice_candidate_answerability_contrast_w": float(
+                  choice_candidate_answerability_contrast_w),
+              "choice_candidate_answerability_contrast_margin": float(
+                  choice_candidate_answerability_contrast_margin),
               "choice_answerability_pair_w": float(choice_answerability_pair_w),
               "choice_answerability_pair_margin": float(
                   choice_answerability_pair_margin),
@@ -3480,6 +3546,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      choice_candidate_answerability_w=0.0,
                      choice_candidate_answerability_control_w=0.0,
                      choice_candidate_answerability_margin=0.0,
+                     choice_candidate_answerability_contrast_w=0.0,
+                     choice_candidate_answerability_contrast_margin=0.0,
                      choice_answerability_pair_w=0.0,
                      choice_answerability_pair_margin=0.0,
                      choice_context_w=0.0,
@@ -3572,6 +3640,10 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   choice_candidate_answerability_control_w),
               "choice_candidate_answerability_margin": float(
                   choice_candidate_answerability_margin),
+              "choice_candidate_answerability_contrast_w": float(
+                  choice_candidate_answerability_contrast_w),
+              "choice_candidate_answerability_contrast_margin": float(
+                  choice_candidate_answerability_contrast_margin),
               "choice_answerability_pair_w": float(choice_answerability_pair_w),
               "choice_answerability_pair_margin": float(
                   choice_answerability_pair_margin),
@@ -3737,6 +3809,10 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                       choice_candidate_answerability_control_w),
                   choice_candidate_answerability_margin=(
                       choice_candidate_answerability_margin),
+                  choice_candidate_answerability_contrast_w=(
+                      choice_candidate_answerability_contrast_w),
+                  choice_candidate_answerability_contrast_margin=(
+                      choice_candidate_answerability_contrast_margin),
                   choice_answerability_pair_w=choice_answerability_pair_w,
                   choice_answerability_pair_margin=choice_answerability_pair_margin,
                   choice_context_w=choice_context_w,
@@ -4140,6 +4216,11 @@ def selftest():
         contrast_model, contrast_txt, contrast_rows, contrast_pairs))
     assert torch.isfinite(choice_final_control_contrast_loss(
         contrast_model, contrast_txt, contrast_rows, contrast_pairs))
+    cand_ans_scores = choice_candidate_answerability_scores(
+        contrast_model, contrast_txt, contrast_rows)
+    assert set(cand_ans_scores).issubset({r.rec_id for r in contrast_rows})
+    assert torch.isfinite(choice_candidate_answerability_contrast_loss(
+        contrast_model, contrast_txt, contrast_rows, contrast_pairs))
     if swap_groups:
         qctx_vocab = build_vocab(qctx_rows)
         qctx_schema = build_fact_schema(qctx_rows)
@@ -4427,6 +4508,14 @@ def main(argv=None):
     ap.add_argument("--choice-candidate-answerability-margin", type=float, default=0.0,
                     dest="choice_candidate_answerability_margin",
                     help="margin for candidate-specific QA answerability coverage loss")
+    ap.add_argument("--choice-candidate-answerability-contrast-w", type=float, default=0.0,
+                    dest="choice_candidate_answerability_contrast_w",
+                    help=("weight for full-vs-control candidate-answerability "
+                          "coverage contrast"))
+    ap.add_argument("--choice-candidate-answerability-contrast-margin", type=float,
+                    default=0.0,
+                    dest="choice_candidate_answerability_contrast_margin",
+                    help="margin for full-vs-control candidate-answerability coverage")
     ap.add_argument("--choice-answerability-pair-w", type=float, default=0.0,
                     dest="choice_answerability_pair_w",
                     help=("weight for paired answer-present vs answer-absent "
@@ -4601,6 +4690,10 @@ def main(argv=None):
                              args.choice_candidate_answerability_control_w),
                          choice_candidate_answerability_margin=(
                              args.choice_candidate_answerability_margin),
+                         choice_candidate_answerability_contrast_w=(
+                             args.choice_candidate_answerability_contrast_w),
+                         choice_candidate_answerability_contrast_margin=(
+                             args.choice_candidate_answerability_contrast_margin),
                          choice_answerability_pair_w=args.choice_answerability_pair_w,
                          choice_answerability_pair_margin=(
                              args.choice_answerability_pair_margin),
@@ -4656,6 +4749,10 @@ def main(argv=None):
         choice_candidate_answerability_control_w=(
             args.choice_candidate_answerability_control_w),
         choice_candidate_answerability_margin=args.choice_candidate_answerability_margin,
+        choice_candidate_answerability_contrast_w=(
+            args.choice_candidate_answerability_contrast_w),
+        choice_candidate_answerability_contrast_margin=(
+            args.choice_candidate_answerability_contrast_margin),
         choice_answerability_pair_w=args.choice_answerability_pair_w,
         choice_answerability_pair_margin=args.choice_answerability_pair_margin,
         choice_context_w=args.choice_context_w,

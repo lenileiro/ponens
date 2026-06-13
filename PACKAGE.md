@@ -697,6 +697,18 @@ absent **0.600**, swap **0.750**) and failed shortcut controls (`question_only` 
 question-conditioned evidence routing: coverage must depend on the actual question tokens enough to
 drop under question-only and swapped-question controls.
 
+`--choice-candidate-answerability-contrast-w` adds that missing pressure at the coverage level:
+for generated full-vs-ablation/swap pairs, the full record's target candidate coverage must outrank
+the same target coverage under the control input. With weight **0.25**, the guarded 2-round smoke
+made primary round 2 less negative-collapsed (`squad_choice` **0.250**, absent **0.600**, swap
+**0.750**) and logged active contrast (`cand-ans-contrast` **0.653 -> 0.662**), but it still failed
+primary controls (`question_only` **-0.100**, `context_only` **0.0375**, `question_swap`
+**-0.1154**) and confirmation dropped `squad_choice` to **0.050** with all shortcut controls
+negative. `selected_round` again stayed **0**. The useful result is that same-target coverage
+contrast can preserve real answers on the primary sample, but the representation is still unstable
+across held-out samples; the next route needs a question-evidence router that generalizes, not just
+a stronger pairwise margin.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
