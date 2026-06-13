@@ -955,6 +955,13 @@ A concept-only SNLI check with decoder and old semantic-head losses disabled
 after 40 local MPS steps. This is not language mastery; it is the model-side insertion point for
 understanding-oriented training rather than a harness-specific QA branch.
 
+The same concept head now has a schema-generic contrastive geometry objective. Text reading runs
+can add `--fact-concept-contrast-w` so records sharing a data-supplied concept value pull the same
+slot states together while other values for that slot separate; reports expose
+`fact_concept_geometry` nearest-same accuracy and same-vs-different cosine margin. The multimodal
+bridge exposes the same mechanism as `--concept-contrast-w`, so color/shape/sound factors and text
+facts improve through one learned concept geometry rather than through task-specific QA handling.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels

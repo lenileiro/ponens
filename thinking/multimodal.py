@@ -31,7 +31,7 @@ from device import get_device
 from scratchpad_model import ScratchpadLM
 
 from .audio import (ENVELOPES, PITCH_NAMES, TIMBRES, render_tone, sample_clip, spectrogram)
-from .concepts import SchemaConceptHead
+from .concepts import SchemaConceptHead, schema_concept_contrastive_loss
 from .vision import COLORS, SHAPES, ObjectSpec, render_object, sample_object
 from .trace import Vocab
 
@@ -396,6 +396,17 @@ class MultimodalLM(nn.Module):
         states_by_key = self.factor_concepts.states(source)
         return {factor: states_by_key[FACTOR_KEYS[factor]] for factor in VALUE_POS}
 
+    def factor_concept_geometry_states(self, img, aud, txt, mode="full"):
+        prefix, concepts = self.encode_prefix(img, aud, txt, mode=mode)
+        source = concepts if concepts is not None else prefix
+        states_by_key = self.factor_concepts.geometry_states(source)
+        return {factor: states_by_key[FACTOR_KEYS[factor]] for factor in VALUE_POS}
+
+    def factor_geometry_from_states(self, states):
+        state_tensor = torch.stack([states[factor] for factor in VALUE_POS], dim=1)
+        projected = self.factor_concepts.geometry_state_tensor_from_states(state_tensor)
+        return {factor: projected[:, i] for i, factor in enumerate(VALUE_POS)}
+
     def factor_logits_from_states(self, states):
         states_by_key = {FACTOR_KEYS[factor]: states[factor] for factor in VALUE_POS}
         logits_by_key = self.factor_concepts.logits_from_states(states_by_key)
@@ -488,6 +499,76 @@ def concept_evaluate(model, vocab, surfaces, n=200, seed=11, device=DEV, text_sp
                 for r in range(b):
                     hits[factor] += int(values[int(pred[r])] == golds[r][factor])
     return {k: v / n for k, v in hits.items()}
+
+
+def concept_geometry_evaluate(model, vocab, surfaces, n=200, seed=13, device=DEV,
+                              text_split="eval", mode="full"):
+    """Same-value geometry diagnostic for schema concept states.
+
+    This mirrors the text fact-concept geometry eval: states for the same factor value should be
+    nearest neighbors more often than chance and have higher cosine similarity than different
+    values for the same factor.
+    """
+    rng = np.random.default_rng(seed)
+    model.eval()
+    nearest_correct = {k: 0 for k in VALUE_POS}
+    nearest_total = {k: 0 for k in VALUE_POS}
+    same_sum = {k: 0.0 for k in VALUE_POS}
+    diff_sum = {k: 0.0 for k in VALUE_POS}
+    same_pairs = {k: 0 for k in VALUE_POS}
+    diff_pairs = {k: 0 for k in VALUE_POS}
+    with torch.no_grad():
+        for off in range(0, n, 50):
+            b = min(50, n - off)
+            img, aud, txt, _ids, golds = _batch(b, rng, vocab, device, surfaces,
+                                                text_split=text_split)
+            states = model.factor_concept_geometry_states(img, aud, txt, mode=mode)
+            for factor, state in states.items():
+                labels = concept_factor_targets(golds, factor, state.device)
+                if int(labels.shape[0]) < 2:
+                    continue
+                z = F.normalize(state, dim=-1)
+                sim = z.matmul(z.t())
+                count = int(labels.shape[0])
+                eye = torch.eye(count, dtype=torch.bool, device=sim.device)
+                same = labels[:, None].eq(labels[None, :]) & ~eye
+                diff = labels[:, None].ne(labels[None, :])
+                if bool(same.any()):
+                    same_sum[factor] += float(sim[same].sum())
+                    same_pairs[factor] += int(same.sum())
+                if bool(diff.any()):
+                    diff_sum[factor] += float(sim[diff].sum())
+                    diff_pairs[factor] += int(diff.sum())
+                rows = same.any(-1) & diff.any(-1)
+                if bool(rows.any()):
+                    nearest = sim.masked_fill(eye, -float("inf")).argmax(-1)
+                    nearest_correct[factor] += int(labels[nearest][rows].eq(labels[rows]).sum())
+                    nearest_total[factor] += int(rows.sum())
+    by_factor = {}
+    for factor in VALUE_POS:
+        same_mean = same_sum[factor] / max(1, same_pairs[factor])
+        diff_mean = diff_sum[factor] / max(1, diff_pairs[factor])
+        by_factor[factor] = {
+            "nearest_same_acc": nearest_correct[factor] / max(1, nearest_total[factor]),
+            "same_mean": same_mean,
+            "diff_mean": diff_mean,
+            "margin": same_mean - diff_mean,
+            "n_nearest": int(nearest_total[factor]),
+            "same_pairs": int(same_pairs[factor]),
+            "diff_pairs": int(diff_pairs[factor]),
+        }
+    return {
+        "by_factor": by_factor,
+        "mean": {
+            "nearest_same_acc": float(np.mean([
+                row["nearest_same_acc"] for row in by_factor.values()
+            ])),
+            "margin": float(np.mean([row["margin"] for row in by_factor.values()])),
+            "same_mean": float(np.mean([row["same_mean"] for row in by_factor.values()])),
+            "diff_mean": float(np.mean([row["diff_mean"] for row in by_factor.values()])),
+        },
+        "n_records": int(n),
+    }
 
 
 def parse_facts(tokens):
@@ -679,6 +760,10 @@ def concept_factor_targets(golds, factor, device):
                         dtype=torch.long, device=device)
 
 
+def concept_factor_target_ids(golds, device):
+    return {factor: concept_factor_targets(golds, factor, device) for factor in VALUE_POS}
+
+
 def concept_factor_loss(factor_logits_by_mode, golds):
     if not factor_logits_by_mode:
         return torch.tensor(0.0)
@@ -690,6 +775,22 @@ def concept_factor_loss(factor_logits_by_mode, golds):
         for factor, logits in logits_by_factor.items():
             targets = concept_factor_targets(golds, factor, device)
             losses.append(F.cross_entropy(logits, targets))
+    if not losses:
+        return torch.tensor(0.0, device=device)
+    return torch.stack(losses).mean()
+
+
+def concept_factor_contrastive_loss(factor_states_by_mode, golds, temperature=0.1):
+    if not factor_states_by_mode:
+        return torch.tensor(0.0)
+    first_mode = next(iter(factor_states_by_mode.values()))
+    first_factor = next(iter(first_mode.values()))
+    device = first_factor.device
+    targets = concept_factor_target_ids(golds, device)
+    losses = [
+        schema_concept_contrastive_loss(states, targets, temperature=temperature)
+        for states in factor_states_by_mode.values()
+    ]
     if not losses:
         return torch.tensor(0.0, device=device)
     return torch.stack(losses).mean()
@@ -828,7 +929,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           concept_w=0.0, concept_agreement_w=0.0,
           concept_distill_w=0.0, concept_distill_temperature=1.0,
           concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
-          concept_transfer_w=0.0, concept_transfer_margin=0.0):
+          concept_transfer_w=0.0, concept_transfer_margin=0.0,
+          concept_contrast_w=0.0, concept_contrast_temperature=0.1):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     surfaces = load_text_surfaces(surfaces_path)
@@ -842,7 +944,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     last_base = last_agreement = last_concept = 0.0
     last_concept_agreement = last_concept_distill = last_concept_rank_distill = 0.0
-    last_concept_transfer = 0.0
+    last_concept_transfer = last_concept_contrast = 0.0
     for st in range(1, steps + 1):
         model.train()
         img, aud, txt, ids, golds = _batch(batch, rng, vocab, device, surfaces,
@@ -854,7 +956,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         agreement = (value_agreement_loss(logits_by_mode, vocab)
                      if agreement_w else base_loss * 0.0)
         if (concept_w or concept_agreement_w or concept_distill_w
-                or concept_rank_distill_w or concept_transfer_w):
+                or concept_rank_distill_w or concept_transfer_w or concept_contrast_w):
             factor_states_by_mode = {
                 mode: model.factor_concept_states(img, aud, txt, mode=mode)
                 for mode in MODES
@@ -872,18 +974,27 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
             concept_transfer = concept_state_transfer_loss(
                 factor_states_by_mode, factor_logits_by_mode, golds,
                 margin=concept_transfer_margin)
+            factor_geometry_states_by_mode = (
+                {mode: model.factor_geometry_from_states(states)
+                 for mode, states in factor_states_by_mode.items()}
+                if concept_contrast_w else factor_states_by_mode)
+            concept_contrast = concept_factor_contrastive_loss(
+                factor_geometry_states_by_mode, golds,
+                temperature=concept_contrast_temperature)
         else:
             concept_loss = base_loss * 0.0
             concept_agreement = base_loss * 0.0
             concept_distill = base_loss * 0.0
             concept_rank_distill = base_loss * 0.0
             concept_transfer = base_loss * 0.0
+            concept_contrast = base_loss * 0.0
         loss = (base_loss + float(agreement_w) * agreement
                 + float(concept_w) * concept_loss
                 + float(concept_agreement_w) * concept_agreement
                 + float(concept_distill_w) * concept_distill
                 + float(concept_rank_distill_w) * concept_rank_distill
-                + float(concept_transfer_w) * concept_transfer)
+                + float(concept_transfer_w) * concept_transfer
+                + float(concept_contrast_w) * concept_contrast)
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -894,6 +1005,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         last_concept_distill = float(concept_distill.detach())
         last_concept_rank_distill = float(concept_rank_distill.detach())
         last_concept_transfer = float(concept_transfer.detach())
+        last_concept_contrast = float(concept_contrast.detach())
         if st % log_every == 0 or st == steps:
             print(f"  m0 {st}/{steps} loss {loss.item():.3f} "
                   f"base {last_base:.3f} agree {last_agreement:.3f} "
@@ -901,13 +1013,15 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                   f"concept-agree {last_concept_agreement:.3f} "
                   f"concept-distill {last_concept_distill:.3f} "
                   f"concept-rank {last_concept_rank_distill:.3f} "
-                  f"concept-transfer {last_concept_transfer:.3f}", flush=True)
+                  f"concept-transfer {last_concept_transfer:.3f} "
+                  f"concept-contrast {last_concept_contrast:.3f}", flush=True)
     model.train_metrics = {"token_loss": last_base, "agreement_loss": last_agreement,
                            "concept_loss": last_concept,
                            "concept_agreement_loss": last_concept_agreement,
                            "concept_distill_loss": last_concept_distill,
                            "concept_rank_distill_loss": last_concept_rank_distill,
-                           "concept_transfer_loss": last_concept_transfer}
+                           "concept_transfer_loss": last_concept_transfer,
+                           "concept_contrast_loss": last_concept_contrast}
     return model, vocab, surfaces
 
 
@@ -933,7 +1047,9 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         concept_w=0.0, concept_agreement_w=0.0,
         concept_distill_w=0.0, concept_distill_temperature=1.0,
         concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
-        concept_transfer_w=0.0, concept_transfer_margin=0.0, log_every=100):
+        concept_transfer_w=0.0, concept_transfer_margin=0.0,
+        concept_contrast_w=0.0, concept_contrast_temperature=0.1,
+        log_every=100):
     model, vocab, surfaces = train(steps=steps, seed=seed, device=device, value_w=value_w,
                                    surfaces_path=surfaces_path, batch=batch, d=d, lr=lr,
                                    layers=layers, heads=heads, max_len=max_len,
@@ -952,6 +1068,8 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                    concept_rank_distill_margin=concept_rank_distill_margin,
                                    concept_transfer_w=concept_transfer_w,
                                    concept_transfer_margin=concept_transfer_margin,
+                                   concept_contrast_w=concept_contrast_w,
+                                   concept_contrast_temperature=concept_contrast_temperature,
                                    log_every=log_every)
     full = evaluate(model, vocab, surfaces, n=eval_n, device=device, text_split="eval",
                     mode="full")
@@ -965,6 +1083,14 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                     text_split="eval", mode="text_only")
     concept_sensor = concept_evaluate(model, vocab, surfaces, n=eval_n, device=device,
                                       text_split="eval", mode="sensor_only")
+    concept_geometry_full = concept_geometry_evaluate(
+        model, vocab, surfaces, n=eval_n, device=device, text_split="eval", mode="full")
+    concept_geometry_text = concept_geometry_evaluate(
+        model, vocab, surfaces, n=eval_n, device=device, text_split="eval",
+        mode="text_only")
+    concept_geometry_sensor = concept_geometry_evaluate(
+        model, vocab, surfaces, n=eval_n, device=device, text_split="eval",
+        mode="sensor_only")
     free_text = free_evaluate(model, vocab, surfaces, n=free_n, device=device, text_split="eval",
                               mode="text_only") if free_n else {}
     counterfactual = counterfactual_text_evaluate(
@@ -989,6 +1115,8 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
               "concept_rank_distill_margin": float(concept_rank_distill_margin),
               "concept_transfer_w": float(concept_transfer_w),
               "concept_transfer_margin": float(concept_transfer_margin),
+              "concept_contrast_w": float(concept_contrast_w),
+              "concept_contrast_temperature": float(concept_contrast_temperature),
               "concept_transfer_variant": "full_correct_detached_vector",
               "train_metrics": getattr(model, "train_metrics", {}),
               "architecture": architecture,
@@ -1005,6 +1133,9 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
               "concept_head": {"full": concept_full,
                                "text_only_eval_phrasings": concept_text,
                                "sensor_only": concept_sensor},
+              "concept_geometry": {"full": concept_geometry_full,
+                                   "text_only_eval_phrasings": concept_geometry_text,
+                                   "sensor_only": concept_geometry_sensor},
               "free_text_only_eval_phrasings": free_text,
               "counterfactual_text_only_eval_phrasings": counterfactual,
               "free_counterfactual_text_only_eval_phrasings": free_counterfactual,
@@ -1070,16 +1201,26 @@ def selftest():
                                + model.config["txt_tokens"] + model.config["concept_tokens"])
     factor_logits = {mode: model.factor_logits(x, a, tt, mode=mode) for mode in MODES}
     factor_states = {mode: model.factor_concept_states(x, a, tt, mode=mode) for mode in MODES}
+    factor_geometry_states = {
+        mode: model.factor_geometry_from_states(states)
+        for mode, states in factor_states.items()
+    }
     assert set(factor_logits["full"]) == set(VALUE_POS)
     assert set(factor_states["full"]) == set(VALUE_POS)
     assert factor_states["full"]["color"].shape == (2, 32)
     concept_loss = concept_factor_loss(factor_logits, golds)
     assert torch.isfinite(concept_loss), concept_loss
+    assert torch.isfinite(concept_factor_contrastive_loss(
+        factor_geometry_states, golds, temperature=0.2))
     assert torch.isfinite(concept_factor_agreement_loss(factor_logits))
     assert torch.isfinite(concept_full_distill_loss(factor_logits, temperature=1.25))
     assert torch.isfinite(concept_full_rank_distill_loss(factor_logits, golds, margin=0.05))
     assert torch.isfinite(concept_state_transfer_loss(factor_states, factor_logits, golds,
                                                        margin=0.05))
+    geom_eval = concept_geometry_evaluate(
+        model, vocab, surfaces, n=4, seed=5, device="cpu", mode="full")
+    assert set(geom_eval["by_factor"]) == set(VALUE_POS)
+    assert set(geom_eval["mean"]) >= {"nearest_same_acc", "margin"}
     res_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
                              img_tokens=4, aud_tokens=8, txt_tokens=6,
                              trunk_arch="residual", trunk_width=32, trunk_depth=1,
@@ -1151,6 +1292,12 @@ def main(argv=None):
     ap.add_argument("--concept-transfer-margin", type=float, default=0.0,
                     dest="concept_transfer_margin",
                     help="minimum margin for upstream concept vector transfer")
+    ap.add_argument("--concept-contrast-w", type=float, default=0.0,
+                    dest="concept_contrast_w",
+                    help="same-value concept-state contrastive geometry loss weight")
+    ap.add_argument("--concept-contrast-temperature", type=float, default=0.1,
+                    dest="concept_contrast_temperature",
+                    help="temperature for same-value concept-state contrastive loss")
     ap.add_argument("--img-tokens", type=int, default=4, dest="img_tokens")
     ap.add_argument("--aud-tokens", type=int, default=8, dest="aud_tokens")
     ap.add_argument("--txt-tokens", type=int, default=8, dest="txt_tokens")
@@ -1193,7 +1340,8 @@ def main(argv=None):
         ap.error("--dim / --heads must be even for rope attention")
     if (args.agreement_w < 0.0 or args.concept_w < 0.0
             or args.concept_agreement_w < 0.0 or args.concept_distill_w < 0.0
-            or args.concept_rank_distill_w < 0.0 or args.concept_transfer_w < 0.0):
+            or args.concept_rank_distill_w < 0.0 or args.concept_transfer_w < 0.0
+            or args.concept_contrast_w < 0.0):
         ap.error("agreement/concept loss weights must be non-negative")
     if args.concept_rank_distill_margin < 0.0:
         ap.error("--concept-rank-distill-margin must be non-negative")
@@ -1201,6 +1349,8 @@ def main(argv=None):
         ap.error("--concept-transfer-margin must be non-negative")
     if args.concept_distill_temperature <= 0.0:
         ap.error("--concept-distill-temperature must be positive")
+    if args.concept_contrast_temperature <= 0.0:
+        ap.error("--concept-contrast-temperature must be positive")
     if args.modality_dropout < 0.0 or args.modality_dropout > 1.0:
         ap.error("--modality-dropout must be in [0, 1]")
     if args.eval_n <= 0:
@@ -1228,6 +1378,8 @@ def main(argv=None):
                  concept_rank_distill_margin=args.concept_rank_distill_margin,
                  concept_transfer_w=args.concept_transfer_w,
                  concept_transfer_margin=args.concept_transfer_margin,
+                 concept_contrast_w=args.concept_contrast_w,
+                 concept_contrast_temperature=args.concept_contrast_temperature,
                  log_every=args.log_every,
                  device=args.device)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
