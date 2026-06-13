@@ -1093,7 +1093,10 @@ class TextFactLM(nn.Module):
                  fact_concept_refine=False, fact_concept_refine_gate_init=-2.0,
                  fact_concept_mixer_layers=0,
                  fact_concept_mixer_gate_init=-2.0,
-                 latent_concept_slots=0, latent_concept_layers=1):
+                 latent_concept_slots=0, latent_concept_layers=1,
+                 latent_concept_prefix=False,
+                 latent_concept_refine=False,
+                 latent_concept_refine_gate_init=-2.0):
         super().__init__()
         self.d = int(d)
         self.heads = int(heads)
@@ -1104,6 +1107,12 @@ class TextFactLM(nn.Module):
         self.fact_concept_mixer_gate_init = float(fact_concept_mixer_gate_init)
         self.latent_concept_slots = int(latent_concept_slots)
         self.latent_concept_layers = int(latent_concept_layers)
+        self.latent_concept_prefix = bool(latent_concept_prefix)
+        self.latent_concept_refine = bool(latent_concept_refine)
+        self.latent_concept_refine_gate_init = float(latent_concept_refine_gate_init)
+        if ((self.latent_concept_prefix or self.latent_concept_refine)
+                and self.latent_concept_slots <= 0):
+            raise ValueError("latent concept prefix/refine require latent slots")
         self.text_encoder_arch = str(text_encoder_arch)
         self.text_encoder_layers = int(text_encoder_layers)
         self.txt = TextPrefix(vocab_size, d=d, pad=pad, heads=heads,
@@ -1123,10 +1132,14 @@ class TextFactLM(nn.Module):
         self.fact_schema = fact_schema
         self.fact_heads = nn.ModuleDict()
         self.fact_concept_refiner = None
+        self.latent_concept_refiner = None
         self.latent_concepts = (LatentConceptHead(
             self.latent_concept_slots, d, heads=heads,
             mixer_layers=self.latent_concept_layers)
             if self.latent_concept_slots > 0 else None)
+        if self.latent_concept_refine and self.latent_concepts is not None:
+            self.latent_concept_refiner = SchemaConceptRefiner(
+                d, heads=heads, gate_init=self.latent_concept_refine_gate_init)
         if fact_schema is not None:
             self.fact_query = nn.Parameter(torch.randn(len(fact_schema.keys), d) * 0.02)
             self.fact_concepts = SchemaConceptHead(
@@ -1176,6 +1189,9 @@ class TextFactLM(nn.Module):
         if slots <= 0:
             self.latent_concepts = None
             self.latent_concept_slots = 0
+            self.latent_concept_prefix = False
+            self.latent_concept_refine = False
+            self.latent_concept_refiner = None
             return self
         if (self.latent_concepts is None
                 or self.latent_concept_slots != slots
@@ -1189,7 +1205,19 @@ class TextFactLM(nn.Module):
         self.latent_concept_layers = latent_layers
         return self
 
-    def encode_text(self, txt, feature_dropout=0.0):
+    def enable_latent_concept_refiner(self, heads=None, gate_init=-2.0):
+        if self.latent_concepts is None:
+            self.latent_concept_refine = False
+            return self
+        if self.latent_concept_refiner is None:
+            self.latent_concept_refiner = SchemaConceptRefiner(
+                self.d, heads=int(heads or self.heads), gate_init=gate_init)
+            self.latent_concept_refiner.to(next(self.parameters()).device)
+            self.latent_concept_refine_gate_init = float(gate_init)
+        self.latent_concept_refine = True
+        return self
+
+    def encode_text(self, txt, feature_dropout=0.0, use_latent_refine=True):
         mask = txt.eq(self.txt.pad)
         prefix = self.txt(txt)
         if self.training and feature_dropout > 0.0:
@@ -1199,6 +1227,11 @@ class TextFactLM(nn.Module):
                 and self.fact_concept_refiner is not None):
             concepts = self.fact_concepts.state_tensor(prefix, mask=mask)
             prefix = self.fact_concept_refiner(prefix, concepts, mask=mask)
+        if (use_latent_refine and self.latent_concept_refine
+                and self.latent_concepts is not None
+                and self.latent_concept_refiner is not None):
+            latent = self.latent_concepts(prefix, mask=mask)
+            prefix = self.latent_concept_refiner(prefix, latent, mask=mask)
         keep = (~mask).unsqueeze(-1)
         pooled = (prefix * keep).sum(1) / keep.sum(1).clamp(min=1)
         return prefix, pooled
@@ -1206,7 +1239,8 @@ class TextFactLM(nn.Module):
     def latent_concept_states(self, txt, feature_dropout=0.0, project=False):
         if self.latent_concepts is None:
             return None
-        prefix, _pooled = self.encode_text(txt, feature_dropout=feature_dropout)
+        prefix, _pooled = self.encode_text(
+            txt, feature_dropout=feature_dropout, use_latent_refine=False)
         return self.latent_concepts(prefix, mask=txt.eq(self.txt.pad), project=project)
 
     def forward(self, txt, ids):
@@ -1216,9 +1250,14 @@ class TextFactLM(nn.Module):
 
     def decoder_prefix(self, txt):
         prefix, _pooled = self.encode_text(txt)
+        extra = []
+        mask = txt.eq(self.txt.pad)
+        if self.latent_concept_prefix and self.latent_concepts is not None:
+            extra.append(self.latent_concepts(prefix, mask=mask))
         if self.fact_concept_prefix and self.fact_concepts is not None:
-            concepts = self.fact_concepts.state_tensor(prefix, mask=txt.eq(self.txt.pad))
-            prefix = torch.cat([concepts, prefix], dim=1)
+            extra.append(self.fact_concepts.state_tensor(prefix, mask=mask))
+        if extra:
+            prefix = torch.cat(extra + [prefix], dim=1)
         return prefix
 
     def semantic_logits(self, txt):
@@ -3724,6 +3763,9 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4,
                 fact_concept_refine=False, fact_concept_refine_gate_init=-2.0,
                 fact_concept_mixer_layers=0, fact_concept_mixer_gate_init=-2.0,
                 latent_concept_slots=0, latent_concept_layers=1,
+                latent_concept_prefix=False,
+                latent_concept_refine=False,
+                latent_concept_refine_gate_init=-2.0,
                 lr=1e-3, seed=0, device=DEV, log_every=100,
                 semantic_w=0.5, balance_by="none",
                 fact_concept_w=0.0, fact_concept_contrast_w=0.0,
@@ -3800,7 +3842,11 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4,
                        fact_concept_mixer_gate_init=(
                            fact_concept_mixer_gate_init),
                        latent_concept_slots=latent_concept_slots,
-                       latent_concept_layers=latent_concept_layers).to(device)
+                       latent_concept_layers=latent_concept_layers,
+                       latent_concept_prefix=latent_concept_prefix,
+                       latent_concept_refine=latent_concept_refine,
+                       latent_concept_refine_gate_init=(
+                           latent_concept_refine_gate_init)).to(device)
     return fit_model(model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
                      device=device, log_every=log_every, semantic_w=semantic_w,
                      balance_by=balance_by, fact_concept_w=fact_concept_w,
@@ -5144,7 +5190,13 @@ def load_checkpoint(path, device=DEV):
                        latent_concept_slots=int(
                            ckpt.get("latent_concept_slots", 0)),
                        latent_concept_layers=int(
-                           ckpt.get("latent_concept_layers", 1))).to(device)
+                           ckpt.get("latent_concept_layers", 1)),
+                       latent_concept_prefix=bool(
+                           ckpt.get("latent_concept_prefix", False)),
+                       latent_concept_refine=bool(
+                           ckpt.get("latent_concept_refine", False)),
+                       latent_concept_refine_gate_init=float(
+                           ckpt.get("latent_concept_refine_gate_init", -2.0))).to(device)
     state = ckpt["state_dict"]
     model.load_state_dict(state, strict=False)
     model.has_fact_concept_state = any(k.startswith("fact_concepts.") for k in state)
@@ -5176,7 +5228,13 @@ def expanded_checkpoint_model(checkpoint, records, device=DEV):
                        latent_concept_slots=int(
                            ckpt.get("latent_concept_slots", 0)),
                        latent_concept_layers=int(
-                           ckpt.get("latent_concept_layers", 1))).to(device)
+                           ckpt.get("latent_concept_layers", 1)),
+                       latent_concept_prefix=bool(
+                           ckpt.get("latent_concept_prefix", False)),
+                       latent_concept_refine=bool(
+                           ckpt.get("latent_concept_refine", False)),
+                       latent_concept_refine_gate_init=float(
+                           ckpt.get("latent_concept_refine_gate_init", -2.0))).to(device)
     copy_pretrained_text_weights(src_model, src_vocab, model, vocab)
     model.eval()
     return model, vocab, ckpt
@@ -5194,6 +5252,12 @@ def checkpoint_payload(model, vocab, d, layers, heads, report):
                 getattr(model, "fact_concept_mixer_gate_init", -2.0)),
             "latent_concept_slots": int(getattr(model, "latent_concept_slots", 0)),
             "latent_concept_layers": int(getattr(model, "latent_concept_layers", 1)),
+            "latent_concept_prefix": bool(
+                getattr(model, "latent_concept_prefix", False)),
+            "latent_concept_refine": bool(
+                getattr(model, "latent_concept_refine", False)),
+            "latent_concept_refine_gate_init": float(
+                getattr(model, "latent_concept_refine_gate_init", -2.0)),
             "text_encoder_arch": getattr(model, "text_encoder_arch", "transformer"),
             "text_encoder_layers": int(getattr(model, "text_encoder_layers", 1)),
             "d": d, "layers": layers, "heads": heads, "fact_schema": {
@@ -5476,6 +5540,9 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         fact_concept_refine=False, fact_concept_refine_gate_init=-2.0,
         fact_concept_mixer_layers=0, fact_concept_mixer_gate_init=-2.0,
         latent_concept_slots=0, latent_concept_layers=1,
+        latent_concept_prefix=False,
+        latent_concept_refine=False,
+        latent_concept_refine_gate_init=-2.0,
         latent_concept_w=0.0, latent_concept_view_dropout=0.1,
         latent_concept_invariance_w=25.0, latent_concept_variance_w=25.0,
         latent_concept_covariance_w=1.0, latent_concept_variance_target=1.0,
@@ -5542,6 +5609,10 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                    fact_concept_mixer_gate_init),
                                latent_concept_slots=latent_concept_slots,
                                latent_concept_layers=latent_concept_layers,
+                               latent_concept_prefix=latent_concept_prefix,
+                               latent_concept_refine=latent_concept_refine,
+                               latent_concept_refine_gate_init=(
+                                   latent_concept_refine_gate_init),
                                seed=seed, device=device, semantic_w=semantic_w,
                                balance_by=balance_by, fact_concept_w=fact_concept_w,
                                fact_concept_contrast_w=fact_concept_contrast_w,
@@ -5665,6 +5736,12 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                   getattr(model, "fact_concept_mixer_gate_init", -2.0)),
               "latent_concept_slots": int(getattr(model, "latent_concept_slots", 0)),
               "latent_concept_layers": int(getattr(model, "latent_concept_layers", 1)),
+              "latent_concept_prefix": bool(
+                  getattr(model, "latent_concept_prefix", False)),
+              "latent_concept_refine": bool(
+                  getattr(model, "latent_concept_refine", False)),
+              "latent_concept_refine_gate_init": float(
+                  getattr(model, "latent_concept_refine_gate_init", -2.0)),
               "latent_concept_w": float(latent_concept_w),
               "latent_concept_view_dropout": float(latent_concept_view_dropout),
               "latent_concept_invariance_w": float(latent_concept_invariance_w),
@@ -5798,6 +5875,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      fact_concept_mixer_gate_init=-2.0,
                      latent_concept_slots=0,
                      latent_concept_layers=1,
+                     latent_concept_prefix=False,
+                     latent_concept_refine=False,
+                     latent_concept_refine_gate_init=-2.0,
                      latent_concept_w=0.0,
                      latent_concept_view_dropout=0.1,
                      latent_concept_invariance_w=25.0,
@@ -5897,6 +5977,11 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
     if latent_concept_slots > 0:
         model.enable_latent_concepts(
             latent_concept_slots, heads=heads, layers=latent_concept_layers)
+    if latent_concept_prefix and getattr(model, "latent_concepts", None) is not None:
+        model.latent_concept_prefix = True
+    if latent_concept_refine:
+        model.enable_latent_concept_refiner(
+            heads=heads, gate_init=latent_concept_refine_gate_init)
     old_schema = fact_schema_from_payload(ckpt.get("fact_schema"))
     old_fact_values = (sum(len(v) for v in old_schema.values) if old_schema is not None else 0)
     new_fact_values = sum(len(v) for v in model.fact_schema.values)
@@ -5967,6 +6052,12 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   getattr(model, "fact_concept_mixer_gate_init", -2.0)),
               "latent_concept_slots": int(getattr(model, "latent_concept_slots", 0)),
               "latent_concept_layers": int(getattr(model, "latent_concept_layers", 1)),
+              "latent_concept_prefix": bool(
+                  getattr(model, "latent_concept_prefix", False)),
+              "latent_concept_refine": bool(
+                  getattr(model, "latent_concept_refine", False)),
+              "latent_concept_refine_gate_init": float(
+                  getattr(model, "latent_concept_refine_gate_init", -2.0)),
               "latent_concept_w": float(latent_concept_w),
               "latent_concept_view_dropout": float(latent_concept_view_dropout),
               "latent_concept_invariance_w": float(latent_concept_invariance_w),
@@ -6705,6 +6796,14 @@ def selftest():
     assert latent_states.shape == (len(choice_eval), 3, 32)
     assert torch.isfinite(latent_text_concept_loss(
         latent_model, choice_txt, view_dropout=0.1))
+    latent_prefix_model = TextFactLM(
+        len(choice_vocab), d=32, layers=1, heads=4, pad=choice_vocab.pad,
+        fact_schema=choice_schema, latent_concept_slots=3,
+        latent_concept_prefix=True, latent_concept_refine=True).to("cpu")
+    latent_prefix, _latent_pooled = latent_prefix_model.encode_text(choice_txt)
+    latent_decoder_prefix = latent_prefix_model.decoder_prefix(choice_txt)
+    assert latent_decoder_prefix.shape[1] == latent_prefix.shape[1] + 3
+    assert latent_prefix_model(choice_txt, _choice_ids).shape[:2] == _choice_ids.shape
     rel_model = TextFactLM(len(choice_vocab), d=32, layers=1, heads=4,
                            pad=choice_vocab.pad, fact_schema=choice_schema,
                            text_encoder_arch="relational",
@@ -7292,6 +7391,15 @@ def main(argv=None):
     ap.add_argument("--latent-concept-layers", type=int, default=1,
                     dest="latent_concept_layers",
                     help="self-attention layers inside schema-free latent concept slots")
+    ap.add_argument("--latent-concept-prefix", action="store_true",
+                    dest="latent_concept_prefix",
+                    help="prepend schema-free latent concept slots to the decoder prefix")
+    ap.add_argument("--latent-concept-refine", action="store_true",
+                    dest="latent_concept_refine",
+                    help="refine upstream text states with schema-free latent concept slots")
+    ap.add_argument("--latent-concept-refine-gate-init", type=float, default=-2.0,
+                    dest="latent_concept_refine_gate_init",
+                    help="initial logit for the latent concept refinement residual gate")
     ap.add_argument("--latent-concept-w", type=float, default=0.0,
                     dest="latent_concept_w",
                     help="weight for schema-free self-supervised latent concept loss")
@@ -7625,6 +7733,11 @@ def main(argv=None):
         ap.error("--latent-concept-w must be non-negative")
     if args.latent_concept_w > 0.0 and args.latent_concept_slots <= 0:
         ap.error("--latent-concept-w requires --latent-concept-slots > 0")
+    if ((args.latent_concept_prefix or args.latent_concept_refine)
+            and args.latent_concept_slots <= 0):
+        ap.error("latent concept prefix/refine require --latent-concept-slots > 0")
+    if not math.isfinite(args.latent_concept_refine_gate_init):
+        ap.error("--latent-concept-refine-gate-init must be finite")
     if args.latent_concept_view_dropout < 0.0 or args.latent_concept_view_dropout >= 1.0:
         ap.error("--latent-concept-view-dropout must be in [0, 1)")
     if (args.latent_concept_invariance_w < 0.0
@@ -7712,6 +7825,10 @@ def main(argv=None):
                              args.fact_concept_mixer_gate_init),
                          latent_concept_slots=args.latent_concept_slots,
                          latent_concept_layers=args.latent_concept_layers,
+                         latent_concept_prefix=args.latent_concept_prefix,
+                         latent_concept_refine=args.latent_concept_refine,
+                         latent_concept_refine_gate_init=(
+                             args.latent_concept_refine_gate_init),
                          latent_concept_w=args.latent_concept_w,
                          latent_concept_view_dropout=args.latent_concept_view_dropout,
                          latent_concept_invariance_w=args.latent_concept_invariance_w,
@@ -7860,6 +7977,9 @@ def main(argv=None):
         fact_concept_mixer_gate_init=args.fact_concept_mixer_gate_init,
         latent_concept_slots=args.latent_concept_slots,
         latent_concept_layers=args.latent_concept_layers,
+        latent_concept_prefix=args.latent_concept_prefix,
+        latent_concept_refine=args.latent_concept_refine,
+        latent_concept_refine_gate_init=args.latent_concept_refine_gate_init,
         latent_concept_w=args.latent_concept_w,
         latent_concept_view_dropout=args.latent_concept_view_dropout,
         latent_concept_invariance_w=args.latent_concept_invariance_w,

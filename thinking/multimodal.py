@@ -360,7 +360,10 @@ class MultimodalLM(nn.Module):
                  concept_prefix=False, concept_refine=False,
                  concept_refine_gate_init=-2.0,
                  concept_mixer_layers=0, concept_mixer_gate_init=-2.0,
-                 latent_concept_slots=0, latent_concept_layers=1):
+                 latent_concept_slots=0, latent_concept_layers=1,
+                 latent_concept_prefix=False,
+                 latent_concept_refine=False,
+                 latent_concept_refine_gate_init=-2.0):
         super().__init__()
         if img_tokens <= 0 or aud_tokens <= 0 or txt_tokens <= 0:
             raise ValueError("multimodal prefix token counts must be positive")
@@ -370,6 +373,8 @@ class MultimodalLM(nn.Module):
             raise ValueError("latent concept slots must be non-negative")
         if int(latent_concept_slots) > 0 and int(latent_concept_layers) <= 0:
             raise ValueError("latent concept layers must be positive")
+        if (latent_concept_prefix or latent_concept_refine) and int(latent_concept_slots) <= 0:
+            raise ValueError("latent concept prefix/refine require latent slots")
         trunk_arch = str(trunk_arch)
         text_arch = str(text_arch)
         if text_arch not in TEXT_TRUNK_ARCHES:
@@ -391,12 +396,17 @@ class MultimodalLM(nn.Module):
             "concept_mixer_gate_init": float(concept_mixer_gate_init),
             "latent_concept_slots": int(latent_concept_slots),
             "latent_concept_layers": int(latent_concept_layers),
+            "latent_concept_prefix": bool(latent_concept_prefix),
+            "latent_concept_refine": bool(latent_concept_refine),
+            "latent_concept_refine_gate_init": float(latent_concept_refine_gate_init),
         }
         self.modality_dropout = float(modality_dropout)
         self.concept_prefix = bool(concept_prefix)
         self.concept_refine = bool(concept_refine)
         self.latent_concept_slots = int(latent_concept_slots)
         self.latent_concept_layers = int(latent_concept_layers)
+        self.latent_concept_prefix = bool(latent_concept_prefix)
+        self.latent_concept_refine = bool(latent_concept_refine)
         self.lm = ScratchpadLM(vocab_size, d=d, layers=layers, heads=heads, max_len=max_len,
                                pad=pad, pointer=False, loop=False)
         img_pool = _grid_pool(img_tokens)
@@ -422,6 +432,9 @@ class MultimodalLM(nn.Module):
             self.latent_concept_slots, d, heads=heads,
             mixer_layers=self.latent_concept_layers)
             if self.latent_concept_slots > 0 else None)
+        self.latent_concept_refiner = (SchemaConceptRefiner(
+            d, heads=heads, gate_init=latent_concept_refine_gate_init)
+            if self.latent_concept_refine and self.latent_concepts is not None else None)
 
     def enable_latent_concepts(self, slots, heads=None, layers=1):
         slots = int(slots)
@@ -430,7 +443,12 @@ class MultimodalLM(nn.Module):
         if slots <= 0:
             self.latent_concepts = None
             self.latent_concept_slots = 0
+            self.latent_concept_prefix = False
+            self.latent_concept_refine = False
+            self.latent_concept_refiner = None
             self.config["latent_concept_slots"] = 0
+            self.config["latent_concept_prefix"] = False
+            self.config["latent_concept_refine"] = False
             return self
         if (self.latent_concepts is None
                 or self.latent_concept_slots != slots
@@ -445,6 +463,21 @@ class MultimodalLM(nn.Module):
         self.latent_concept_layers = latent_layers
         self.config["latent_concept_slots"] = slots
         self.config["latent_concept_layers"] = latent_layers
+        return self
+
+    def enable_latent_concept_refiner(self, heads=None, gate_init=-2.0):
+        if self.latent_concepts is None:
+            self.latent_concept_refine = False
+            self.config["latent_concept_refine"] = False
+            return self
+        if self.latent_concept_refiner is None:
+            self.latent_concept_refiner = SchemaConceptRefiner(
+                self.config["d"], heads=int(heads or self.config["heads"]),
+                gate_init=gate_init)
+            self.latent_concept_refiner.to(next(self.parameters()).device)
+            self.config["latent_concept_refine_gate_init"] = float(gate_init)
+        self.latent_concept_refine = True
+        self.config["latent_concept_refine"] = True
         return self
 
     def _apply_modality_dropout(self, ip, ap, tp):
@@ -475,6 +508,10 @@ class MultimodalLM(nn.Module):
             source = self._source_from_prefix(prefix, concepts)
             factor_state_tensor = self.factor_concepts.state_tensor(source)
             prefix = self.concept_refiner(prefix, factor_state_tensor)
+            concepts = prefix[:, :self.fusion.concept_tokens]
+        if self.latent_concept_refiner is not None and self.latent_concepts is not None:
+            latent = self.latent_concepts(prefix)
+            prefix = self.latent_concept_refiner(prefix, latent)
             concepts = prefix[:, :self.fusion.concept_tokens]
         return prefix, concepts
 
@@ -526,12 +563,20 @@ class MultimodalLM(nn.Module):
         return self.latent_concept_states_from_prefix(
             prefix, view_dropout=view_dropout, project=project)
 
-    def decoder_prefix_from_encoded(self, prefix, concepts, factor_state_tensor=None):
+    def decoder_prefix_from_encoded(self, prefix, concepts, factor_state_tensor=None,
+                                    latent_state_tensor=None):
+        extra = []
+        if self.latent_concept_prefix and self.latent_concepts is not None:
+            if latent_state_tensor is None:
+                latent_state_tensor = self.latent_concepts(prefix)
+            extra.append(latent_state_tensor)
         if self.concept_prefix:
             if factor_state_tensor is None:
                 source = self._source_from_prefix(prefix, concepts)
                 factor_state_tensor = self.factor_concepts.state_tensor(source)
-            prefix = torch.cat([factor_state_tensor, prefix], dim=1)
+            extra.append(factor_state_tensor)
+        if extra:
+            prefix = torch.cat(extra + [prefix], dim=1)
         return prefix
 
     def decoder_prefix(self, img, aud, txt, mode="full"):
@@ -544,10 +589,14 @@ class MultimodalLM(nn.Module):
         prefix, concepts = self.encode_prefix(img, aud, txt, mode=mode)
         source = self._source_from_prefix(prefix, concepts)
         factor_state_tensor = None
+        latent_state_tensor = None
         if self.concept_prefix or need_factor or need_geometry:
             factor_state_tensor = self.factor_concepts.state_tensor(source)
+        if self.latent_concept_prefix and self.latent_concepts is not None:
+            latent_state_tensor = self.latent_concepts(prefix)
         decoder_prefix = self.decoder_prefix_from_encoded(
-            prefix, concepts, factor_state_tensor=factor_state_tensor)
+            prefix, concepts, factor_state_tensor=factor_state_tensor,
+            latent_state_tensor=latent_state_tensor)
         logits = self.lm(ids, prefix=decoder_prefix)[:, decoder_prefix.shape[1]:]
         out = {"logits": logits, "prefix": prefix, "concepts": concepts}
         if need_latent:
@@ -1186,6 +1235,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           concept_refine_gate_init=-2.0,
           concept_mixer_layers=0, concept_mixer_gate_init=-2.0,
           latent_concept_slots=0, latent_concept_layers=1,
+          latent_concept_prefix=False, latent_concept_refine=False,
+          latent_concept_refine_gate_init=-2.0,
           latent_concept_w=0.0, latent_concept_view_dropout=0.1,
           latent_concept_invariance_w=25.0, latent_concept_variance_w=25.0,
           latent_concept_covariance_w=1.0, latent_concept_variance_target=1.0,
@@ -1223,7 +1274,11 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                          concept_mixer_layers=concept_mixer_layers,
                          concept_mixer_gate_init=concept_mixer_gate_init,
                          latent_concept_slots=latent_concept_slots,
-                         latent_concept_layers=latent_concept_layers).to(device)
+                         latent_concept_layers=latent_concept_layers,
+                         latent_concept_prefix=latent_concept_prefix,
+                         latent_concept_refine=latent_concept_refine,
+                         latent_concept_refine_gate_init=(
+                             latent_concept_refine_gate_init)).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     last_base = last_agreement = last_concept = 0.0
     last_concept_agreement = last_concept_distill = last_concept_rank_distill = 0.0
@@ -1419,6 +1474,8 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         concept_refine_gate_init=-2.0,
         concept_mixer_layers=0, concept_mixer_gate_init=-2.0,
         latent_concept_slots=0, latent_concept_layers=1,
+        latent_concept_prefix=False, latent_concept_refine=False,
+        latent_concept_refine_gate_init=-2.0,
         latent_concept_w=0.0, latent_concept_view_dropout=0.1,
         latent_concept_invariance_w=25.0, latent_concept_variance_w=25.0,
         latent_concept_covariance_w=1.0, latent_concept_variance_target=1.0,
@@ -1451,6 +1508,10 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                    concept_mixer_gate_init=concept_mixer_gate_init,
                                    latent_concept_slots=latent_concept_slots,
                                    latent_concept_layers=latent_concept_layers,
+                                   latent_concept_prefix=latent_concept_prefix,
+                                   latent_concept_refine=latent_concept_refine,
+                                   latent_concept_refine_gate_init=(
+                                       latent_concept_refine_gate_init),
                                    latent_concept_w=latent_concept_w,
                                    latent_concept_view_dropout=(
                                        latent_concept_view_dropout),
@@ -1520,9 +1581,12 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
     architecture["reader_prefix_tokens"] = int(img_tokens) + int(aud_tokens) + int(txt_tokens)
     architecture["schema_concept_prefix_tokens"] = (
         len(VALUE_POS) if bool(concept_prefix) else 0)
+    architecture["latent_concept_prefix_tokens"] = (
+        int(latent_concept_slots) if bool(latent_concept_prefix) else 0)
     architecture["prefix_tokens"] = (
         architecture["reader_prefix_tokens"] + int(concept_tokens)
-        + architecture["schema_concept_prefix_tokens"])
+        + architecture["schema_concept_prefix_tokens"]
+        + architecture["latent_concept_prefix_tokens"])
     report = {"experiment": "m0_multimodal_bridge", "steps": steps, "batch": int(batch),
               "lr": float(lr), "value_w": float(value_w),
               "agreement_w": float(agreement_w),
@@ -1534,6 +1598,10 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
               "concept_mixer_gate_init": float(concept_mixer_gate_init),
               "latent_concept_slots": int(latent_concept_slots),
               "latent_concept_layers": int(latent_concept_layers),
+              "latent_concept_prefix": bool(latent_concept_prefix),
+              "latent_concept_refine": bool(latent_concept_refine),
+              "latent_concept_refine_gate_init": float(
+                  latent_concept_refine_gate_init),
               "latent_concept_w": float(latent_concept_w),
               "latent_concept_view_dropout": float(latent_concept_view_dropout),
               "latent_concept_invariance_w": float(latent_concept_invariance_w),
@@ -1695,6 +1763,15 @@ def selftest():
     assert latent_bundle["latent_concepts"].shape == (2, 3, 32)
     assert torch.isfinite(latent_multimodal_concept_loss(
         latent_model, x, a, tt, view_dropout=0.1))
+    latent_prefix_model = MultimodalLM(
+        len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
+        latent_concept_slots=3, latent_concept_prefix=True,
+        latent_concept_refine=True).to("cpu")
+    latent_prefix_base, _latent_prefix_concepts = (
+        latent_prefix_model.encode_prefix(x, a, tt, mode="full"))
+    latent_prefix_dec = latent_prefix_model.decoder_prefix(x, a, tt, mode="full")
+    assert latent_prefix_dec.shape[1] == latent_prefix_base.shape[1] + 3
+    assert latent_prefix_model(x, a, tt, ids).shape == logits.shape
     rel_txt_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
                                  text_arch="relational", text_layers=1).to("cpu")
     assert rel_txt_model.txt.arch == "relational"
@@ -1796,6 +1873,15 @@ def main(argv=None):
     ap.add_argument("--latent-concept-layers", type=int, default=1,
                     dest="latent_concept_layers",
                     help="self-attention layers inside latent concept slots")
+    ap.add_argument("--latent-concept-prefix", action="store_true",
+                    dest="latent_concept_prefix",
+                    help="prepend schema-free latent concept slots to the decoder prefix")
+    ap.add_argument("--latent-concept-refine", action="store_true",
+                    dest="latent_concept_refine",
+                    help="refine fused multimodal prefix states with latent concept slots")
+    ap.add_argument("--latent-concept-refine-gate-init", type=float, default=-2.0,
+                    dest="latent_concept_refine_gate_init",
+                    help="initial logit for latent concept refinement residual gate")
     ap.add_argument("--latent-concept-w", type=float, default=0.0,
                     dest="latent_concept_w",
                     help="weight for schema-free latent multimodal concept loss")
@@ -1962,6 +2048,11 @@ def main(argv=None):
         ap.error("--latent-concept-w must be non-negative")
     if args.latent_concept_w > 0.0 and args.latent_concept_slots <= 0:
         ap.error("--latent-concept-w requires --latent-concept-slots > 0")
+    if ((args.latent_concept_prefix or args.latent_concept_refine)
+            and args.latent_concept_slots <= 0):
+        ap.error("latent concept prefix/refine require --latent-concept-slots > 0")
+    if not math.isfinite(args.latent_concept_refine_gate_init):
+        ap.error("--latent-concept-refine-gate-init must be finite")
     if args.latent_concept_view_dropout < 0.0 or args.latent_concept_view_dropout >= 1.0:
         ap.error("--latent-concept-view-dropout must be in [0, 1)")
     if (args.latent_concept_invariance_w < 0.0
@@ -1996,6 +2087,9 @@ def main(argv=None):
                  concept_mixer_gate_init=args.concept_mixer_gate_init,
                  latent_concept_slots=args.latent_concept_slots,
                  latent_concept_layers=args.latent_concept_layers,
+                 latent_concept_prefix=args.latent_concept_prefix,
+                 latent_concept_refine=args.latent_concept_refine,
+                 latent_concept_refine_gate_init=args.latent_concept_refine_gate_init,
                  latent_concept_w=args.latent_concept_w,
                  latent_concept_view_dropout=args.latent_concept_view_dropout,
                  latent_concept_invariance_w=args.latent_concept_invariance_w,
