@@ -180,6 +180,7 @@ def payload(args):
                      f"--hidden {args.dim or 64} --flow-arch {args.image_latent_arch} "
                      f"--dit-head-width-mult {args.image_dit_head_width_mult} "
                      f"--dit-attn-impl {args.image_dit_attn_impl} "
+                     f"--dit-pos-embed {args.image_dit_pos_embed} "
                      f"--ae-arch {args.image_ae_arch} "
                      f"--latent-downsample {args.image_latent_downsample} "
                      f"--ae-res-blocks {args.image_ae_res_blocks} "
@@ -608,6 +609,9 @@ def main():
     ap.add_argument("--image-dit-attn-impl", default="manual",
                     choices=("manual", "sdpa", "auto"), dest="image_dit_attn_impl",
                     help="latent image MM-DiT attention implementation")
+    ap.add_argument("--image-dit-pos-embed", default="learned",
+                    choices=("learned", "sincos2d"), dest="image_dit_pos_embed",
+                    help="latent image DiT positional embedding")
     ap.add_argument("--image-ae-arch", default="semantic", choices=("semantic", "residual"),
                     dest="image_ae_arch",
                     help="autoencoder architecture for latent image generation")

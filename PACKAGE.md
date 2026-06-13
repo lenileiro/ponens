@@ -717,7 +717,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
     --image-clean-min-side 256 --image-clean-max-aspect 2.0 \
     --image-latent --image-latent-arch mmdit \
     --image-cond-mode text --image-dit-head-width-mult 2 --image-dit-qk-norm \
-    --image-dit-attn-impl sdpa \
+    --image-dit-attn-impl sdpa --image-dit-pos-embed sincos2d \
     --image-manifest data/images/train.jsonl --image-root data/images \
     --image-caption-cond-source auto \
     --image-crop-mode pad --image-hflip-prob 0.5 \
@@ -1129,6 +1129,12 @@ the requested canvas and pads the remaining area instead of square-cropping or d
 is the minimal data-pipeline step toward mixed-aspect high-resolution training: captioned objects
 stay in frame while the current fixed-shape AE/flow code can still batch tensors locally and on
 RunPod.
+
+Image-52 adds geometry-aware latent DiT positions. `--dit-pos-embed learned|sincos2d` keeps legacy
+learned 1D tables by default, but new high-resolution DiT/CrossDiT/MM-DiT runs can use deterministic
+2D sinusoidal image-token positions. RunPod exposes this as `--image-dit-pos-embed`. This removes a
+fixed-token-table assumption from the transformer path and is a better default for resolution and
+aspect-ratio scaling experiments.
 
 ## 3c. Multimodal bridge: image + audio into the same trace language
 

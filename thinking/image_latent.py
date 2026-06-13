@@ -52,6 +52,7 @@ FACT_GROUPS = {
 }
 SAMPLE_METHODS = ("euler", "heun")
 MMDIT_ATTN_IMPLS = ("manual", "sdpa", "auto")
+DIT_POS_EMBEDS = ("learned", "sincos2d")
 FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
 DEFAULT_GUIDANCE_INTERVAL = (0.0, 1.0)
 
@@ -505,6 +506,31 @@ def make_velocity_head(hidden, latent_ch, width_mult=1):
     )
 
 
+def sinusoidal_1d_positions(length, dim, device=None, dtype=None):
+    dim = int(dim)
+    if dim <= 0:
+        return torch.empty((int(length), 0), device=device, dtype=dtype or torch.float32)
+    pos = torch.arange(int(length), device=device, dtype=torch.float32)[:, None]
+    freqs = torch.arange(0, dim, 2, device=device, dtype=torch.float32)
+    freqs = torch.exp(-math.log(10000.0) * freqs / float(max(1, dim)))
+    angles = pos * freqs[None, :]
+    out = torch.zeros((int(length), dim), device=device, dtype=torch.float32)
+    out[:, 0::2] = torch.sin(angles)
+    out[:, 1::2] = torch.cos(angles[:, :out[:, 1::2].shape[1]])
+    return out.to(dtype=dtype) if dtype is not None else out
+
+
+def sinusoidal_2d_positions(height, width, dim, device=None, dtype=None):
+    dim = int(dim)
+    h_dim = dim // 2
+    w_dim = dim - h_dim
+    y = sinusoidal_1d_positions(height, h_dim, device=device, dtype=dtype)
+    x = sinusoidal_1d_positions(width, w_dim, device=device, dtype=dtype)
+    y = y[:, None, :].expand(int(height), int(width), h_dim)
+    x = x[None, :, :].expand(int(height), int(width), w_dim)
+    return torch.cat([y, x], dim=-1).reshape(1, int(height) * int(width), dim)
+
+
 class LatentDiTFlowNet(nn.Module):
     """Patch-token transformer velocity field over semantic image latents.
 
@@ -514,16 +540,24 @@ class LatentDiTFlowNet(nn.Module):
     """
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
-                 max_tokens=256, head_width_mult=1):
+                 max_tokens=256, head_width_mult=1, pos_embed="learned"):
         super().__init__()
+        pos_embed = str(pos_embed)
+        if pos_embed not in DIT_POS_EMBEDS:
+            raise ValueError(f"unknown DiT positional embedding {pos_embed!r}")
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
         self.hidden = int(hidden)
         self.hidden_feature_dim = int(hidden)
         self.max_tokens = int(max_tokens)
         self.head_width_mult = int(head_width_mult)
+        self.dit_pos_embed = pos_embed
+        self.uses_2d_pos_embed = pos_embed == "sincos2d"
         self.in_proj = nn.Linear(latent_ch, hidden)
-        self.pos = nn.Parameter(torch.zeros(1, max_tokens, hidden))
+        self.pos = (
+            nn.Parameter(torch.zeros(1, max_tokens, hidden))
+            if pos_embed == "learned" else None
+        )
         self.cond = nn.Sequential(
             nn.Linear(cond_dim + 1, hidden),
             nn.GELU(),
@@ -542,6 +576,11 @@ class LatentDiTFlowNet(nn.Module):
         self.norm = nn.LayerNorm(hidden)
         self.out_proj = make_velocity_head(hidden, latent_ch, self.head_width_mult)
 
+    def image_pos(self, h, w, device, dtype):
+        if self.dit_pos_embed == "learned":
+            return self.pos[:, :int(h) * int(w)].to(device=device, dtype=dtype)
+        return sinusoidal_2d_positions(h, w, self.hidden, device=device, dtype=dtype)
+
     def forward(self, z, t, cond, return_features=False):
         cond = condition_vector(cond)
         if t.ndim > 2:
@@ -554,7 +593,8 @@ class LatentDiTFlowNet(nn.Module):
             raise ValueError(f"latent token count {n} exceeds max_tokens={self.max_tokens}")
         toks = z.flatten(2).transpose(1, 2)                  # B,N,C
         ctx = self.cond(torch.cat([cond, t.to(cond.dtype)], dim=1))[:, None, :]
-        x = self.in_proj(toks) + self.pos[:, :n] + ctx
+        x = self.in_proj(toks)
+        x = x + self.image_pos(h, w, x.device, x.dtype) + ctx
         x = self.blocks(x)
         features = self.norm(x)
         v = self.out_proj(features)
@@ -595,16 +635,24 @@ class LatentCrossDiTFlowNet(nn.Module):
     uses_cond_tokens = True
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
-                 max_tokens=256, head_width_mult=1):
+                 max_tokens=256, head_width_mult=1, pos_embed="learned"):
         super().__init__()
+        pos_embed = str(pos_embed)
+        if pos_embed not in DIT_POS_EMBEDS:
+            raise ValueError(f"unknown DiT positional embedding {pos_embed!r}")
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
         self.hidden = int(hidden)
         self.hidden_feature_dim = int(hidden)
         self.max_tokens = int(max_tokens)
         self.head_width_mult = int(head_width_mult)
+        self.dit_pos_embed = pos_embed
+        self.uses_2d_pos_embed = pos_embed == "sincos2d"
         self.in_proj = nn.Linear(latent_ch, hidden)
-        self.pos = nn.Parameter(torch.zeros(1, max_tokens, hidden))
+        self.pos = (
+            nn.Parameter(torch.zeros(1, max_tokens, hidden))
+            if pos_embed == "learned" else None
+        )
         self.cond = nn.Sequential(
             nn.Linear(cond_dim + 1, hidden),
             nn.GELU(),
@@ -614,6 +662,11 @@ class LatentCrossDiTFlowNet(nn.Module):
         self.blocks = nn.ModuleList([CrossDiTBlock(hidden, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(hidden)
         self.out_proj = make_velocity_head(hidden, latent_ch, self.head_width_mult)
+
+    def image_pos(self, h, w, device, dtype):
+        if self.dit_pos_embed == "learned":
+            return self.pos[:, :int(h) * int(w)].to(device=device, dtype=dtype)
+        return sinusoidal_2d_positions(h, w, self.hidden, device=device, dtype=dtype)
 
     def _context(self, cond):
         if isinstance(cond, dict):
@@ -637,7 +690,8 @@ class LatentCrossDiTFlowNet(nn.Module):
         toks = z.flatten(2).transpose(1, 2)
         global_ctx = self.cond(torch.cat([cond_vec, t.to(cond_vec.dtype)], dim=1))[:, None, :]
         ctx, ctx_mask = self._context(cond)
-        x = self.in_proj(toks) + self.pos[:, :n] + global_ctx
+        x = self.in_proj(toks)
+        x = x + self.image_pos(h, w, x.device, x.dtype) + global_ctx
         for block in self.blocks:
             x = block(x, ctx, ctx_mask=ctx_mask)
         features = self.norm(x)
@@ -787,11 +841,14 @@ class LatentMMDiTFlowNet(nn.Module):
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256, head_width_mult=1, qk_norm=False,
-                 attn_impl="manual"):
+                 attn_impl="manual", pos_embed="learned"):
         super().__init__()
         attn_impl = str(attn_impl)
         if attn_impl not in MMDIT_ATTN_IMPLS:
             raise ValueError(f"unknown MM-DiT attention implementation {attn_impl!r}")
+        pos_embed = str(pos_embed)
+        if pos_embed not in DIT_POS_EMBEDS:
+            raise ValueError(f"unknown DiT positional embedding {pos_embed!r}")
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
         self.hidden = int(hidden)
@@ -800,8 +857,13 @@ class LatentMMDiTFlowNet(nn.Module):
         self.head_width_mult = int(head_width_mult)
         self.uses_qk_norm = bool(qk_norm)
         self.attn_impl = attn_impl
+        self.dit_pos_embed = pos_embed
+        self.uses_2d_pos_embed = pos_embed == "sincos2d"
         self.in_proj = nn.Linear(latent_ch, hidden)
-        self.pos = nn.Parameter(torch.zeros(1, max_tokens, hidden))
+        self.pos = (
+            nn.Parameter(torch.zeros(1, max_tokens, hidden))
+            if pos_embed == "learned" else None
+        )
         self.time = nn.Sequential(nn.Linear(cond_dim + 1, hidden), nn.GELU(),
                                   nn.Linear(hidden, hidden))
         self.ctx_proj = nn.Linear(cond_dim, hidden)
@@ -813,6 +875,11 @@ class LatentMMDiTFlowNet(nn.Module):
         ])
         self.norm = nn.LayerNorm(hidden)
         self.out_proj = make_velocity_head(hidden, latent_ch, self.head_width_mult)
+
+    def image_pos(self, h, w, device, dtype):
+        if self.dit_pos_embed == "learned":
+            return self.pos[:, :int(h) * int(w)].to(device=device, dtype=dtype)
+        return sinusoidal_2d_positions(h, w, self.hidden, device=device, dtype=dtype)
 
     def _context(self, cond):
         if isinstance(cond, dict):
@@ -834,7 +901,8 @@ class LatentMMDiTFlowNet(nn.Module):
         if n > self.max_tokens:
             raise ValueError(f"latent token count {n} exceeds max_tokens={self.max_tokens}")
         cond_ctx = self.time(torch.cat([cond_vec, t.to(cond_vec.dtype)], dim=1))
-        img = self.in_proj(z.flatten(2).transpose(1, 2)) + self.pos[:, :n]
+        img = self.in_proj(z.flatten(2).transpose(1, 2))
+        img = img + self.image_pos(h, w, img.device, img.dtype)
         img = img + cond_ctx[:, None, :]
         ctx, ctx_mask = self._context(cond)
         for block in self.blocks:
@@ -849,9 +917,12 @@ class LatentMMDiTFlowNet(nn.Module):
 
 def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4,
               cond_dim=None, dit_head_width_mult=1, latent_max_tokens=256,
-              dit_qk_norm=False, dit_attn_impl="manual"):
+              dit_qk_norm=False, dit_attn_impl="manual", dit_pos_embed="learned"):
     if flow_arch == "conv":
         return LatentFlowNet(latent_ch=latent_ch, hidden=hidden, cond_dim=cond_dim)
+    dit_pos_embed = str(dit_pos_embed)
+    if dit_pos_embed not in DIT_POS_EMBEDS:
+        raise ValueError(f"unknown DiT positional embedding {dit_pos_embed!r}")
     dit_head_width_mult = int(dit_head_width_mult)
     if dit_head_width_mult <= 0:
         raise ValueError("dit_head_width_mult must be positive")
@@ -862,7 +933,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
         return LatentDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth, heads=heads,
                                 cond_dim=cond_dim,
                                 head_width_mult=dit_head_width_mult,
-                                max_tokens=latent_max_tokens)
+                                max_tokens=latent_max_tokens,
+                                pos_embed=dit_pos_embed)
     if flow_arch == "crossdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
@@ -870,7 +942,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
         return LatentCrossDiTFlowNet(latent_ch=latent_ch, hidden=hidden, depth=dit_depth,
                                      heads=heads, cond_dim=cond_dim,
                                      head_width_mult=dit_head_width_mult,
-                                     max_tokens=latent_max_tokens)
+                                     max_tokens=latent_max_tokens,
+                                     pos_embed=dit_pos_embed)
     if flow_arch == "mmdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
@@ -880,7 +953,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                   head_width_mult=dit_head_width_mult,
                                   max_tokens=latent_max_tokens,
                                   qk_norm=dit_qk_norm,
-                                  attn_impl=dit_attn_impl)
+                                  attn_impl=dit_attn_impl,
+                                  pos_embed=dit_pos_embed)
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
@@ -2950,6 +3024,9 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     dit_attn_impl = str(ckpt.get("dit_attn_impl", report.get("dit_attn_impl", "manual")))
     if dit_attn_impl not in MMDIT_ATTN_IMPLS:
         raise ValueError(f"unknown MM-DiT attention implementation {dit_attn_impl!r}")
+    dit_pos_embed = str(ckpt.get("dit_pos_embed", report.get("dit_pos_embed", "learned")))
+    if dit_pos_embed not in DIT_POS_EMBEDS:
+        raise ValueError(f"unknown DiT positional embedding {dit_pos_embed!r}")
     cond_mode = ckpt.get("cond_mode", report.get("cond_mode", "facts"))
     data_mode = ckpt.get("data_mode", report.get("data_mode", "synthetic_factors"))
     cond_dim = int(ckpt.get("cond_dim", report.get("cond_dim", len(FACT_VOCAB))))
@@ -3014,7 +3091,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                      dit_head_width_mult=dit_head_width_mult,
                      latent_max_tokens=latent_max_tokens,
                      dit_qk_norm=dit_qk_norm,
-                     dit_attn_impl=dit_attn_impl).to(device)
+                     dit_attn_impl=dit_attn_impl,
+                     dit_pos_embed=dit_pos_embed).to(device)
     flow_repa_aligner = None
     if ckpt.get("flow_repa_aligner_state_dict"):
         if image_embedding_in_dim <= 0:
@@ -3061,6 +3139,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         ),
         "dit_qk_norm": bool(dit_qk_norm) if flow_arch == "mmdit" else False,
         "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
+        "dit_pos_embed": dit_pos_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
+        "uses_2d_pos_embed": bool(getattr(flow, "uses_2d_pos_embed", False)),
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "flow_load": flow_load,
@@ -3581,6 +3661,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       dit_depth=3, dit_heads=4, cond_drop=0.0, cfg_scale=1.0,
                       cfg_rescale=0.0,
                       dit_head_width_mult=1, latent_max_tokens=256,
+                      dit_pos_embed="learned",
                       ae_arch="semantic", latent_downsample=4, ae_res_blocks=1,
                       ae_recon_loss="mse", ae_grad_w=0.0, ae_ms_w=0.0,
                       ae_latent_reg_w=0.0,
@@ -3712,6 +3793,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("dit_head_width_mult must be positive")
     if dit_attn_impl not in MMDIT_ATTN_IMPLS:
         raise ValueError(f"unknown MM-DiT attention implementation {dit_attn_impl!r}")
+    dit_pos_embed = str(dit_pos_embed)
+    if dit_pos_embed not in DIT_POS_EMBEDS:
+        raise ValueError(f"unknown DiT positional embedding {dit_pos_embed!r}")
     if latent_max_tokens <= 0:
         raise ValueError("latent_max_tokens must be positive")
     if flow_ema_decay < 0.0 or flow_ema_decay >= 1.0:
@@ -3764,7 +3848,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                      dit_head_width_mult=dit_head_width_mult,
                      latent_max_tokens=latent_max_tokens,
                      dit_qk_norm=bool(dit_qk_norm),
-                     dit_attn_impl=dit_attn_impl).to(device)
+                     dit_attn_impl=dit_attn_impl,
+                     dit_pos_embed=dit_pos_embed).to(device)
     flow_repa_aligner = None
     if image_records is not None and flow_repa_w > 0.0:
         hidden_feature_dim = flow_hidden_feature_dim(flow)
@@ -4076,6 +4161,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         ),
         "dit_qk_norm": bool(dit_qk_norm) if flow_arch == "mmdit" else False,
         "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
+        "dit_pos_embed": dit_pos_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
+        "uses_2d_pos_embed": bool(getattr(flow, "uses_2d_pos_embed", False)),
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "fact_w": float(fact_w),
@@ -4218,6 +4305,7 @@ def selftest():
                                             flow_loss_weight_gamma=5.0,
                                             latent_normalize="channel",
                                             latent_stat_samples=8,
+                                            dit_pos_embed="sincos2d",
                                             cfg_interval=(0.0, 0.5),
                                             semantic_guidance_interval=(0.0, 0.5))
     assert report2["flow_arch"] == "dit"
@@ -4228,6 +4316,8 @@ def selftest():
     assert report2["flow_loss_weight"] == "min-snr-v"
     assert report2["flow_loss_weight_gamma"] == 5.0
     assert report2["flow_loss_weight_normalize"] is True
+    assert report2["dit_pos_embed"] == "sincos2d" and report2["uses_2d_pos_embed"] is True
+    assert "pos" not in flow2.state_dict()
     assert report2["ae_intervention_w"] == 0.1
     assert report2["ae_factor_orth_w"] == 0.05
     assert report2["latent_normalize"] == "channel" and report2["latent_norm_n"] == 8
@@ -4610,6 +4700,9 @@ def main(argv=None):
     ap.add_argument("--dit-attn-impl", default="manual", choices=MMDIT_ATTN_IMPLS,
                     dest="dit_attn_impl",
                     help="MM-DiT attention implementation: manual, sdpa, or auto")
+    ap.add_argument("--dit-pos-embed", default="learned", choices=DIT_POS_EMBEDS,
+                    dest="dit_pos_embed",
+                    help="image-token positional embedding for DiT/CrossDiT/MM-DiT flows")
     ap.add_argument("--cond-drop", type=float, default=0.0, dest="cond_drop")
     ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
     ap.add_argument("--cfg-rescale", type=float, default=0.0, dest="cfg_rescale",
@@ -4855,6 +4948,7 @@ def main(argv=None):
         dit_head_width_mult=args.dit_head_width_mult,
         dit_qk_norm=args.dit_qk_norm,
         dit_attn_impl=args.dit_attn_impl,
+        dit_pos_embed=args.dit_pos_embed,
         latent_max_tokens=args.latent_max_tokens, ae_arch=args.ae_arch,
         latent_downsample=args.latent_downsample, ae_res_blocks=args.ae_res_blocks,
         ae_recon_loss=args.ae_recon_loss, ae_grad_w=args.ae_grad_w,
@@ -5011,6 +5105,8 @@ def main(argv=None):
         "dit_head_width_mult": args.dit_head_width_mult,
         "dit_qk_norm": report.get("dit_qk_norm", False),
         "dit_attn_impl": report.get("dit_attn_impl", "manual"),
+        "dit_pos_embed": report.get("dit_pos_embed", ""),
+        "uses_2d_pos_embed": report.get("uses_2d_pos_embed", False),
         "cond_mode": args.cond_mode,
         "cond_dim": report["cond_dim"],
         "data_mode": report.get("data_mode", "synthetic_factors"),
