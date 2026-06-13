@@ -177,6 +177,10 @@ def payload(args):
                 prompt_grid_args += (
                     f" --sample-candidates-per-prompt "
                     f"{args.image_sample_candidates_per_prompt}")
+                prompt_grid_args += (
+                    f" --sample-text-guidance-w {args.image_sample_text_guidance_w} "
+                    f"--sample-text-guidance-interval "
+                    f"{shlex_quote(args.image_sample_text_guidance_interval)}")
                 prompt_grid_args += f" --prompt-embed-backend {args.image_prompt_embed_backend}"
                 prompt_grid_args += f" --prompt-embed-model {shlex_quote(args.image_prompt_embed_model)}"
                 prompt_grid_args += f" --prompt-embed-device {shlex_quote(args.image_prompt_embed_device)}"
@@ -796,6 +800,14 @@ def main():
                     dest="image_sample_candidates_per_prompt",
                     help=("number of candidates to draw per latent image sample prompt; "
                           "best is selected when the checkpoint has a text-image aligner"))
+    ap.add_argument("--image-sample-text-guidance-w", type=float, default=0.0,
+                    dest="image_sample_text_guidance_w",
+                    help=("sampling-time text-image alignment guidance weight for latent "
+                          "image sample prompts"))
+    ap.add_argument("--image-sample-text-guidance-interval", default="0.0,1.0",
+                    dest="image_sample_text_guidance_interval",
+                    help=("sample-prompt text guidance active interval over flow time, "
+                          "formatted start,end"))
     ap.add_argument("--image-prompt-embed-backend", default="stats",
                     choices=("stats", "hf"), dest="image_prompt_embed_backend",
                     help="text embedding backend for --image-sample-prompts on embedding checkpoints")
@@ -1029,6 +1041,10 @@ def main():
         sys.exit("ERROR: --image-sample-candidates-per-prompt must be positive")
     if args.image_sample_candidates_per_prompt > 1 and not args.image_sample_prompts:
         sys.exit("ERROR: --image-sample-candidates-per-prompt > 1 requires --image-sample-prompts")
+    if args.image_sample_text_guidance_w < 0.0:
+        sys.exit("ERROR: --image-sample-text-guidance-w must be non-negative")
+    if args.image_sample_text_guidance_w > 0.0 and not args.image_sample_prompts:
+        sys.exit("ERROR: --image-sample-text-guidance-w requires --image-sample-prompts")
     if (args.image_sample_prompts and args.image_prompt_embed_backend == "hf"
             and not args.image_prompt_embed_model):
         sys.exit("ERROR: --image-prompt-embed-backend hf requires --image-prompt-embed-model")

@@ -2506,6 +2506,25 @@ def semantic_guidance_step(ae, z, fact_cond, weight=0.0, step_size=1.0, mode="de
     return guided.detach()
 
 
+def text_alignment_guidance_step(text_aligner, z, cond, weight=0.0, step_size=1.0,
+                                 eps=1.0e-6):
+    """Sampling-time latent guidance toward a learned image/text alignment score."""
+    if weight <= 0.0:
+        return z
+    if text_aligner is None:
+        raise ValueError("text alignment guidance requires a checkpoint text_aligner")
+    z_var = z.detach().requires_grad_(True)
+    with torch.enable_grad():
+        img_emb, txt_emb = text_aligner(z_var, cond)
+        score = text_aligner.scale().to(img_emb.dtype) * (img_emb * txt_emb).sum(dim=-1)
+        objective = score.sum()
+        grad = torch.autograd.grad(objective, z_var, allow_unused=False)[0]
+    flat = grad.flatten(1)
+    denom = flat.norm(dim=1).view((-1,) + (1,) * (grad.ndim - 1)).clamp_min(float(eps))
+    guided = z_var + float(weight) * abs(float(step_size)) * grad / denom
+    return guided.detach()
+
+
 def semantic_fact_loss_from_logits(logits, cond, suffix="_endpoint_ce"):
     losses = {}
     for pred, idxs in FACT_GROUPS.items():
@@ -3196,10 +3215,15 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                    semantic_guidance_mode="decoded", sample_method="euler",
                    cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                    semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-                   sample_time_shift=1.0, sample_schedule="linear", cfg_uncond=None):
+                   sample_time_shift=1.0, sample_schedule="linear", cfg_uncond=None,
+                   text_guidance_w=0.0, text_guidance_aligner=None,
+                   text_guidance_cond=None,
+                   text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     batch = condition_batch(cond)
     if cfg_uncond is not None and condition_batch(cfg_uncond) != batch:
         raise ValueError("cfg_uncond batch must match cond batch")
+    if text_guidance_cond is not None and condition_batch(text_guidance_cond) != batch:
+        raise ValueError("text_guidance_cond batch must match cond batch")
     latent_stats = flow_latent_stats(flow)
     z = _seeded_randn((batch,) + tuple(latent_shape), device=device, seed=seed)
     flow.eval()
@@ -3209,6 +3233,12 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         semantic_cond = fact_condition_or_none(cond)
     if semantic_guidance_w > 0.0 and ae is None:
         raise ValueError("semantic guidance requires ae")
+    if text_guidance_w < 0.0:
+        raise ValueError("text_guidance_w must be non-negative")
+    if text_guidance_w > 0.0 and text_guidance_aligner is None:
+        raise ValueError("text alignment guidance requires a checkpoint text_aligner")
+    if text_guidance_cond is None:
+        text_guidance_cond = cond
     if sample_method not in SAMPLE_METHODS:
         raise ValueError(f"unknown sample method {sample_method!r}")
     if sample_schedule not in SAMPLE_SCHEDULES:
@@ -3218,6 +3248,8 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
     cfg_interval = validate_guidance_interval(cfg_interval, name="cfg_interval")
     semantic_guidance_interval = validate_guidance_interval(
         semantic_guidance_interval, name="semantic_guidance_interval")
+    text_guidance_interval = validate_guidance_interval(
+        text_guidance_interval, name="text_guidance_interval")
     schedule = flow_time_schedule(
         steps, device=device, shift=sample_time_shift, schedule=sample_schedule)
     for i in range(steps):
@@ -3260,6 +3292,13 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                                            weight=semantic_guidance_w,
                                            step_size=dt, mode=semantic_guidance_mode)
             z = normalize_latent(z_raw, latent_stats)
+        if (text_guidance_w > 0.0
+                and interval_active(t_scalar, text_guidance_interval)):
+            z_raw = denormalize_latent(z, latent_stats)
+            z_raw = text_alignment_guidance_step(
+                text_guidance_aligner, z_raw, text_guidance_cond,
+                weight=text_guidance_w, step_size=dt)
+            z = normalize_latent(z_raw, latent_stats)
     return denormalize_latent(z, latent_stats)
 
 
@@ -3270,7 +3309,10 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
                   semantic_guidance_mode="decoded", sample_method="euler",
                   cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                   semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-                  sample_time_shift=1.0, sample_schedule="linear", cfg_uncond=None):
+                  sample_time_shift=1.0, sample_schedule="linear", cfg_uncond=None,
+                  text_guidance_w=0.0, text_guidance_aligner=None,
+                  text_guidance_cond=None,
+                  text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     z = sample_latents(flow, cond, latent_shape=latent_shape, steps=steps, device=device,
                        seed=seed, cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
                        ae=ae, semantic_cond=semantic_cond,
@@ -3279,7 +3321,11 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
                        sample_method=sample_method, cfg_interval=cfg_interval,
                        semantic_guidance_interval=semantic_guidance_interval,
                        sample_time_shift=sample_time_shift,
-                       sample_schedule=sample_schedule, cfg_uncond=cfg_uncond)
+                       sample_schedule=sample_schedule, cfg_uncond=cfg_uncond,
+                       text_guidance_w=text_guidance_w,
+                       text_guidance_aligner=text_guidance_aligner,
+                       text_guidance_cond=text_guidance_cond,
+                       text_guidance_interval=text_guidance_interval)
     ae.eval()
     return ae.decode(z).clamp(-1.0, 1.0)
 
@@ -3489,7 +3535,9 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                                  prompt_embed_device=None, prompt_embed_dtype="auto",
                                  prompt_embed_normalize=True, prompt_embed_stats_dim=0,
                                  prompt_embed_trust_remote_code=False,
-                                 negative_prompts=(), candidates_per_prompt=1):
+                                 negative_prompts=(), candidates_per_prompt=1,
+                                 text_guidance_w=0.0,
+                                 text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
     ae.eval()
     flow.eval()
     prompts = tuple(str(p).strip() for p in prompts if str(p).strip())
@@ -3498,6 +3546,11 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
     candidates_per_prompt = int(candidates_per_prompt)
     if candidates_per_prompt <= 0:
         raise ValueError("candidates_per_prompt must be positive")
+    text_guidance_w = float(text_guidance_w)
+    if text_guidance_w < 0.0:
+        raise ValueError("text_guidance_w must be non-negative")
+    text_guidance_interval = validate_guidance_interval(
+        text_guidance_interval, name="text_guidance_interval")
     cond = text_prompt_condition(
         prompts, conditioner, prompt_vocab=prompt_vocab, caption_max_len=caption_max_len,
         source=caption_cond_source, device=device, return_tokens=flow_uses_cond_tokens(flow),
@@ -3518,15 +3571,20 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
             trust_remote_code=prompt_embed_trust_remote_code)
     sample_cond = repeat_condition_rows(cond, candidates_per_prompt)
     sample_uncond = repeat_condition_rows(cfg_uncond, candidates_per_prompt)
+    text_aligner = getattr(flow, "text_aligner", None)
     sample = sample_images(ae, flow, sample_cond, latent_shape=ae_latent_shape(ae, size),
                            steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
                            cfg_rescale=cfg_rescale,
                            sample_method=sample_method, cfg_interval=cfg_interval,
                            sample_time_shift=sample_time_shift,
-                           sample_schedule=sample_schedule, cfg_uncond=sample_uncond)
+                           sample_schedule=sample_schedule, cfg_uncond=sample_uncond,
+                           text_guidance_w=text_guidance_w,
+                           text_guidance_aligner=text_aligner,
+                           text_guidance_cond=sample_cond,
+                           text_guidance_interval=text_guidance_interval)
     sample, selection_meta = select_prompt_candidates(
         ae, sample, sample_cond, prompts, candidates_per_prompt=candidates_per_prompt,
-        text_aligner=getattr(flow, "text_aligner", None))
+        text_aligner=text_aligner)
     n = len(prompts)
     cols = int(np.ceil(np.sqrt(n)))
     rows = int(np.ceil(n / cols))
@@ -3539,6 +3597,11 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         "sample_grid_sample_method": sample_method,
         "sample_grid_sample_schedule": sample_schedule,
         "sample_grid_cfg_interval": list(validate_guidance_interval(cfg_interval)),
+        "sample_grid_text_guidance_w": float(text_guidance_w),
+        "sample_grid_text_guidance_interval": list(text_guidance_interval),
+        "sample_grid_text_guidance_scorer": (
+            "text_aligner" if text_guidance_w > 0.0 else "none"
+        ),
         "sample_grid_cond_mode": "prompt",
         "sample_grid_caption_cond_source": caption_cond_source,
         "sample_grid_cfg_uncond_mode": (
@@ -5885,7 +5948,8 @@ def selftest():
             prompt_vocab=vocab6, caption_max_len=8, sample_steps=1, seed=21,
             caption_cond_source="embedding", prompt_embed_backend="stats",
             prompt_embed_stats_dim=4, cfg_scale=1.25,
-            negative_prompts=("low quality", "washed out"), candidates_per_prompt=2)
+            negative_prompts=("low quality", "washed out"), candidates_per_prompt=2,
+            text_guidance_w=0.05, text_guidance_interval=(0.0, 1.0))
         assert embed_prompt_meta["sample_grid_cond_mode"] == "prompt"
         assert embed_prompt_meta["sample_grid_caption_cond_source"] == "embedding"
         assert embed_prompt_meta["sample_grid_prompt_embed_backend"] == "stats"
@@ -5894,6 +5958,8 @@ def selftest():
         assert embed_prompt_meta["sample_grid_candidates_per_prompt"] == 2
         assert embed_prompt_meta["sample_grid_selection_scorer"] == "text_aligner_cosine"
         assert "sample_grid_selection_score_mean" in embed_prompt_meta
+        assert embed_prompt_meta["sample_grid_text_guidance_w"] == 0.05
+        assert embed_prompt_meta["sample_grid_text_guidance_scorer"] == "text_aligner"
         ae_rect, flow_rect, conditioner_rect, vocab_rect, report_rect = train_latent_flow(
             ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=16,
             flow_arch="dit", dit_depth=1, dit_heads=2, seed=14,
@@ -6342,6 +6408,14 @@ def main(argv=None):
                     dest="sample_candidates_per_prompt",
                     help=("number of candidates to draw per sample prompt; when a text-image "
                           "aligner is available the best candidate is selected"))
+    ap.add_argument("--sample-text-guidance-w", type=float, default=0.0,
+                    dest="sample_text_guidance_w",
+                    help=("sampling-time text-image alignment guidance weight for "
+                          "--sample-prompts; requires a checkpoint text_aligner"))
+    ap.add_argument("--sample-text-guidance-interval", default="0.0,1.0",
+                    dest="sample_text_guidance_interval",
+                    help=("text alignment guidance active interval over flow time, "
+                          "formatted start,end"))
     ap.add_argument("--prompt-embed-backend", default="stats",
                     choices=("stats", "hf"), dest="prompt_embed_backend",
                     help="text embedding backend used by --sample-prompts with embedding conditioning")
@@ -6373,6 +6447,7 @@ def main(argv=None):
         cli_size_buckets = normalize_image_size_buckets(args.size_buckets)
         sample_prompts = parse_sample_prompts(args.sample_prompts)
         sample_negative_prompts = parse_sample_prompts(args.sample_negative_prompts)
+        sample_text_guidance_interval = _parse_interval(args.sample_text_guidance_interval)
         sample_schedules = (
             _parse_string_list(args.sample_schedules) if args.sample_schedules else None
         )
@@ -6389,6 +6464,10 @@ def main(argv=None):
         ap.error("--sample-candidates-per-prompt must be positive")
     if args.sample_candidates_per_prompt > 1 and not sample_prompts:
         ap.error("--sample-candidates-per-prompt > 1 requires --sample-prompts")
+    if args.sample_text_guidance_w < 0.0:
+        ap.error("--sample-text-guidance-w must be non-negative")
+    if args.sample_text_guidance_w > 0.0 and not sample_prompts:
+        ap.error("--sample-text-guidance-w requires --sample-prompts")
     if sample_prompts and args.prompt_embed_backend == "hf" and not args.prompt_embed_model:
         ap.error("--prompt-embed-backend hf requires --prompt-embed-model")
     if sample_schedules is not None:
@@ -6473,7 +6552,9 @@ def main(argv=None):
                     prompt_embed_stats_dim=args.prompt_embed_stats_dim,
                     prompt_embed_trust_remote_code=args.prompt_embed_trust_remote_code,
                     negative_prompts=sample_negative_prompts,
-                    candidates_per_prompt=args.sample_candidates_per_prompt)
+                    candidates_per_prompt=args.sample_candidates_per_prompt,
+                    text_guidance_w=args.sample_text_guidance_w,
+                    text_guidance_interval=sample_text_guidance_interval)
             elif report.get("experiment") == "image_latent_manifest_sampler_sweep":
                 grid_records = read_image_manifest(
                     report["eval_image_manifest"], root=report.get("eval_image_root", ""),
@@ -6646,7 +6727,9 @@ def main(argv=None):
                 prompt_embed_stats_dim=args.prompt_embed_stats_dim,
                 prompt_embed_trust_remote_code=args.prompt_embed_trust_remote_code,
                 negative_prompts=sample_negative_prompts,
-                candidates_per_prompt=args.sample_candidates_per_prompt)
+                candidates_per_prompt=args.sample_candidates_per_prompt,
+                text_guidance_w=args.sample_text_guidance_w,
+                text_guidance_interval=sample_text_guidance_interval)
         elif args.image_manifest:
             grid_records = read_image_manifest(
                 args.image_manifest, root=args.image_root, split=args.image_split,

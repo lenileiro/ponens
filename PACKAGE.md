@@ -1307,6 +1307,13 @@ that scorer fall back to the first candidate and record the fallback in sample-g
 forwards the same knob as `--image-sample-candidates-per-prompt`, so GPU prompt grids can use
 alignment-guided inspection without changing training or adding prompt-specific rules.
 
+Image-65 adds sampling-time text-alignment guidance for prompt grids. `--sample-text-guidance-w`
+uses the checkpoint's learned image/text aligner as a differentiable latent reward during sampling:
+after each active solver step, the latent is nudged along the normalized gradient that increases the
+prompt/image alignment score. This is generic scorer guidance, not a renderer rule, and defaults to
+off. RunPod forwards `--image-sample-text-guidance-w` and
+`--image-sample-text-guidance-interval` for GPU prompt-grid runs.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
