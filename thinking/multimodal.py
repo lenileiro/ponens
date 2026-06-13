@@ -36,6 +36,7 @@ from .concepts import (
     schema_concept_contrastive_loss,
     schema_concept_prototype_alignment_loss,
     schema_concept_prototype_spread_loss,
+    schema_concept_state_spread_loss,
 )
 from .vision import COLORS, SHAPES, ObjectSpec, render_object, sample_object
 from .trace import Vocab
@@ -831,6 +832,27 @@ def concept_factor_prototype_spread_loss(model, margin=0.2):
     return schema_concept_prototype_spread_loss(prototypes, margin=margin)
 
 
+def concept_factor_state_spread_loss(factor_geometry_states_by_mode, golds,
+                                     variance_target=0.05,
+                                     centroid_margin=0.2,
+                                     covariance_weight=0.05):
+    if not factor_geometry_states_by_mode:
+        return torch.tensor(0.0)
+    first_mode = next(iter(factor_geometry_states_by_mode.values()))
+    first_factor = next(iter(first_mode.values()))
+    device = first_factor.device
+    targets = concept_factor_target_ids(golds, device)
+    losses = [
+        schema_concept_state_spread_loss(
+            states, targets, variance_target=variance_target,
+            centroid_margin=centroid_margin, covariance_weight=covariance_weight)
+        for states in factor_geometry_states_by_mode.values()
+    ]
+    if not losses:
+        return torch.tensor(0.0, device=device)
+    return torch.stack(losses).mean()
+
+
 def concept_factor_agreement_loss(factor_logits_by_mode):
     items = list(factor_logits_by_mode.items())
     if len(items) < 2:
@@ -967,7 +989,10 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           concept_transfer_w=0.0, concept_transfer_margin=0.0,
           concept_contrast_w=0.0, concept_contrast_temperature=0.1,
           concept_prototype_w=0.0, concept_prototype_spread_w=0.0,
-          concept_prototype_spread_margin=0.2):
+          concept_prototype_spread_margin=0.2,
+          concept_state_spread_w=0.0, concept_state_spread_variance=0.05,
+          concept_state_spread_margin=0.2,
+          concept_state_spread_covariance_w=0.05):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     surfaces = load_text_surfaces(surfaces_path)
@@ -983,6 +1008,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     last_concept_agreement = last_concept_distill = last_concept_rank_distill = 0.0
     last_concept_transfer = last_concept_contrast = 0.0
     last_concept_prototype = last_concept_prototype_spread = 0.0
+    last_concept_state_spread = 0.0
     for st in range(1, steps + 1):
         model.train()
         img, aud, txt, ids, golds = _batch(batch, rng, vocab, device, surfaces,
@@ -996,7 +1022,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         needs_factor_batch = (
             concept_w or concept_agreement_w or concept_distill_w
             or concept_rank_distill_w or concept_transfer_w
-            or concept_contrast_w or concept_prototype_w)
+            or concept_contrast_w or concept_prototype_w or concept_state_spread_w)
         if needs_factor_batch:
             factor_states_by_mode = {
                 mode: model.factor_concept_states(img, aud, txt, mode=mode)
@@ -1028,7 +1054,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
             factor_geometry_states_by_mode = (
                 {mode: model.factor_geometry_from_states(states)
                  for mode, states in factor_states_by_mode.items()}
-                if (concept_contrast_w or concept_prototype_w) else {})
+                if (concept_contrast_w or concept_prototype_w
+                    or concept_state_spread_w) else {})
             concept_contrast = (
                 concept_factor_contrastive_loss(
                     factor_geometry_states_by_mode, golds,
@@ -1039,6 +1066,13 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                     model, factor_geometry_states_by_mode, golds,
                     temperature=concept_contrast_temperature)
                 if concept_prototype_w else base_loss * 0.0)
+            concept_state_spread = (
+                concept_factor_state_spread_loss(
+                    factor_geometry_states_by_mode, golds,
+                    variance_target=concept_state_spread_variance,
+                    centroid_margin=concept_state_spread_margin,
+                    covariance_weight=concept_state_spread_covariance_w)
+                if concept_state_spread_w else base_loss * 0.0)
         else:
             concept_loss = base_loss * 0.0
             concept_agreement = base_loss * 0.0
@@ -1047,6 +1081,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
             concept_transfer = base_loss * 0.0
             concept_contrast = base_loss * 0.0
             concept_prototype = base_loss * 0.0
+            concept_state_spread = base_loss * 0.0
         concept_prototype_spread = (
             concept_factor_prototype_spread_loss(
                 model, margin=concept_prototype_spread_margin)
@@ -1059,7 +1094,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                 + float(concept_transfer_w) * concept_transfer
                 + float(concept_contrast_w) * concept_contrast
                 + float(concept_prototype_w) * concept_prototype
-                + float(concept_prototype_spread_w) * concept_prototype_spread)
+                + float(concept_prototype_spread_w) * concept_prototype_spread
+                + float(concept_state_spread_w) * concept_state_spread)
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -1073,6 +1109,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         last_concept_contrast = float(concept_contrast.detach())
         last_concept_prototype = float(concept_prototype.detach())
         last_concept_prototype_spread = float(concept_prototype_spread.detach())
+        last_concept_state_spread = float(concept_state_spread.detach())
         if st % log_every == 0 or st == steps:
             print(f"  m0 {st}/{steps} loss {loss.item():.3f} "
                   f"base {last_base:.3f} agree {last_agreement:.3f} "
@@ -1083,7 +1120,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                   f"concept-transfer {last_concept_transfer:.3f} "
                   f"concept-contrast {last_concept_contrast:.3f} "
                   f"concept-proto {last_concept_prototype:.3f} "
-                  f"concept-proto-spread {last_concept_prototype_spread:.3f}",
+                  f"concept-proto-spread {last_concept_prototype_spread:.3f} "
+                  f"concept-state-spread {last_concept_state_spread:.3f}",
                   flush=True)
     model.train_metrics = {"token_loss": last_base, "agreement_loss": last_agreement,
                            "concept_loss": last_concept,
@@ -1094,7 +1132,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                            "concept_contrast_loss": last_concept_contrast,
                            "concept_prototype_loss": last_concept_prototype,
                            "concept_prototype_spread_loss": (
-                               last_concept_prototype_spread)}
+                               last_concept_prototype_spread),
+                           "concept_state_spread_loss": last_concept_state_spread}
     return model, vocab, surfaces
 
 
@@ -1124,6 +1163,8 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         concept_contrast_w=0.0, concept_contrast_temperature=0.1,
         concept_prototype_w=0.0, concept_prototype_spread_w=0.0,
         concept_prototype_spread_margin=0.2,
+        concept_state_spread_w=0.0, concept_state_spread_variance=0.05,
+        concept_state_spread_margin=0.2, concept_state_spread_covariance_w=0.05,
         log_every=100):
     model, vocab, surfaces = train(steps=steps, seed=seed, device=device, value_w=value_w,
                                    surfaces_path=surfaces_path, batch=batch, d=d, lr=lr,
@@ -1149,6 +1190,12 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                    concept_prototype_spread_w=concept_prototype_spread_w,
                                    concept_prototype_spread_margin=(
                                        concept_prototype_spread_margin),
+                                   concept_state_spread_w=concept_state_spread_w,
+                                   concept_state_spread_variance=(
+                                       concept_state_spread_variance),
+                                   concept_state_spread_margin=concept_state_spread_margin,
+                                   concept_state_spread_covariance_w=(
+                                       concept_state_spread_covariance_w),
                                    log_every=log_every)
     full = evaluate(model, vocab, surfaces, n=eval_n, device=device, text_split="eval",
                     mode="full")
@@ -1200,6 +1247,11 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
               "concept_prototype_spread_w": float(concept_prototype_spread_w),
               "concept_prototype_spread_margin": float(
                   concept_prototype_spread_margin),
+              "concept_state_spread_w": float(concept_state_spread_w),
+              "concept_state_spread_variance": float(concept_state_spread_variance),
+              "concept_state_spread_margin": float(concept_state_spread_margin),
+              "concept_state_spread_covariance_w": float(
+                  concept_state_spread_covariance_w),
               "concept_transfer_variant": "full_correct_detached_vector",
               "train_metrics": getattr(model, "train_metrics", {}),
               "architecture": architecture,
@@ -1298,6 +1350,7 @@ def selftest():
     assert torch.isfinite(concept_factor_prototype_loss(
         model, factor_geometry_states, golds, temperature=0.2))
     assert torch.isfinite(concept_factor_prototype_spread_loss(model, margin=0.2))
+    assert torch.isfinite(concept_factor_state_spread_loss(factor_geometry_states, golds))
     assert torch.isfinite(concept_factor_agreement_loss(factor_logits))
     assert torch.isfinite(concept_full_distill_loss(factor_logits, temperature=1.25))
     assert torch.isfinite(concept_full_rank_distill_loss(factor_logits, golds, margin=0.05))
@@ -1393,6 +1446,18 @@ def main(argv=None):
     ap.add_argument("--concept-prototype-spread-margin", type=float, default=0.2,
                     dest="concept_prototype_spread_margin",
                     help="maximum allowed same-key prototype cosine before spread penalty")
+    ap.add_argument("--concept-state-spread-w", type=float, default=0.0,
+                    dest="concept_state_spread_w",
+                    help="batch state anti-collapse loss weight for concept geometry states")
+    ap.add_argument("--concept-state-spread-variance", type=float, default=0.05,
+                    dest="concept_state_spread_variance",
+                    help="minimum normalized per-dimension concept-state std target")
+    ap.add_argument("--concept-state-spread-margin", type=float, default=0.2,
+                    dest="concept_state_spread_margin",
+                    help="maximum observed-value centroid cosine before state spread penalty")
+    ap.add_argument("--concept-state-spread-covariance-w", type=float, default=0.05,
+                    dest="concept_state_spread_covariance_w",
+                    help="relative decorrelation weight inside concept-state spread loss")
     ap.add_argument("--img-tokens", type=int, default=4, dest="img_tokens")
     ap.add_argument("--aud-tokens", type=int, default=8, dest="aud_tokens")
     ap.add_argument("--txt-tokens", type=int, default=8, dest="txt_tokens")
@@ -1437,7 +1502,8 @@ def main(argv=None):
             or args.concept_agreement_w < 0.0 or args.concept_distill_w < 0.0
             or args.concept_rank_distill_w < 0.0 or args.concept_transfer_w < 0.0
             or args.concept_contrast_w < 0.0 or args.concept_prototype_w < 0.0
-            or args.concept_prototype_spread_w < 0.0):
+            or args.concept_prototype_spread_w < 0.0
+            or args.concept_state_spread_w < 0.0):
         ap.error("agreement/concept loss weights must be non-negative")
     if args.concept_rank_distill_margin < 0.0:
         ap.error("--concept-rank-distill-margin must be non-negative")
@@ -1449,6 +1515,12 @@ def main(argv=None):
         ap.error("--concept-contrast-temperature must be positive")
     if args.concept_prototype_spread_margin < 0.0:
         ap.error("--concept-prototype-spread-margin must be non-negative")
+    if args.concept_state_spread_variance < 0.0:
+        ap.error("--concept-state-spread-variance must be non-negative")
+    if args.concept_state_spread_margin < -1.0:
+        ap.error("--concept-state-spread-margin must be >= -1")
+    if args.concept_state_spread_covariance_w < 0.0:
+        ap.error("--concept-state-spread-covariance-w must be non-negative")
     if args.modality_dropout < 0.0 or args.modality_dropout > 1.0:
         ap.error("--modality-dropout must be in [0, 1]")
     if args.eval_n <= 0:
@@ -1482,6 +1554,11 @@ def main(argv=None):
                  concept_prototype_spread_w=args.concept_prototype_spread_w,
                  concept_prototype_spread_margin=(
                      args.concept_prototype_spread_margin),
+                 concept_state_spread_w=args.concept_state_spread_w,
+                 concept_state_spread_variance=args.concept_state_spread_variance,
+                 concept_state_spread_margin=args.concept_state_spread_margin,
+                 concept_state_spread_covariance_w=(
+                     args.concept_state_spread_covariance_w),
                  log_every=args.log_every,
                  device=args.device)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)

@@ -54,6 +54,7 @@ from .concepts import (
     schema_concept_contrastive_loss,
     schema_concept_prototype_alignment_loss,
     schema_concept_prototype_spread_loss,
+    schema_concept_state_spread_loss,
 )
 from .trace import Vocab
 
@@ -1487,6 +1488,17 @@ def fact_concept_prototype_spread_loss(model, margin=0.2):
         return torch.tensor(0.0, device=device)
     prototypes = {key: head.geometry_prototypes[i] for i, key in enumerate(head.keys)}
     return schema_concept_prototype_spread_loss(prototypes, margin=margin)
+
+
+def fact_concept_state_spread_loss(model, txt, records, schema, variance_target=0.05,
+                                   centroid_margin=0.2, covariance_weight=0.05):
+    if schema is None or getattr(model, "fact_concepts", None) is None:
+        return torch.tensor(0.0, device=txt.device)
+    states = model.fact_concept_geometry_states(txt)
+    targets = fact_concept_target_ids(records, schema, txt.device)
+    return schema_concept_state_spread_loss(
+        states, targets, variance_target=variance_target,
+        centroid_margin=centroid_margin, covariance_weight=covariance_weight)
 
 
 def choice_loss(model, txt, records, answer_w=1.0, none_w=1.0,
@@ -2993,6 +3005,10 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               fact_concept_prototype_w=0.0,
               fact_concept_prototype_spread_w=0.0,
               fact_concept_prototype_spread_margin=0.2,
+              fact_concept_state_spread_w=0.0,
+              fact_concept_state_spread_variance=0.05,
+              fact_concept_state_spread_margin=0.2,
+              fact_concept_state_spread_covariance_w=0.05,
               prefix="text", decode_w=1.0, choice_w=0.0,
               choice_answer_w=1.0, choice_none_w=1.0,
               choice_answer_margin=0.0, choice_none_margin=0.0,
@@ -3113,6 +3129,13 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
             fact_concept_prototype_spread_loss(
                 model, margin=fact_concept_prototype_spread_margin)
             if fact_concept_prototype_spread_w else torch.tensor(0.0, device=device))
+        concept_state_spread_loss = (
+            fact_concept_state_spread_loss(
+                model, txt, rec_batch, model.fact_schema,
+                variance_target=fact_concept_state_spread_variance,
+                centroid_margin=fact_concept_state_spread_margin,
+                covariance_weight=fact_concept_state_spread_covariance_w)
+            if fact_concept_state_spread_w else torch.tensor(0.0, device=device))
         ch_loss = choice_loss(model, txt, rec_batch,
                               answer_w=choice_answer_w, none_w=choice_none_w,
                               answer_margin=choice_answer_margin,
@@ -3437,6 +3460,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 + fact_concept_contrast_w * concept_contrast_loss
                 + fact_concept_prototype_w * concept_proto_loss
                 + fact_concept_prototype_spread_w * concept_proto_spread_loss
+                + fact_concept_state_spread_w * concept_state_spread_loss
                 + choice_w * ch_loss
                 + choice_final_w * final_loss
                 + choice_final_control_w * final_control_loss
@@ -3474,6 +3498,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                   f"fact-contrast {concept_contrast_loss.item():.3f} "
                   f"fact-proto {concept_proto_loss.item():.3f} "
                   f"fact-proto-spread {concept_proto_spread_loss.item():.3f} "
+                  f"fact-state-spread {concept_state_spread_loss.item():.3f} "
                   f"choice {ch_loss.item():.3f} final {final_loss.item():.3f} "
                   f"final-control {final_control_loss.item():.3f} "
                   f"final-contrast {final_contrast_loss.item():.3f} "
@@ -3510,6 +3535,10 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                 fact_concept_prototype_w=0.0,
                 fact_concept_prototype_spread_w=0.0,
                 fact_concept_prototype_spread_margin=0.2,
+                fact_concept_state_spread_w=0.0,
+                fact_concept_state_spread_variance=0.05,
+                fact_concept_state_spread_margin=0.2,
+                fact_concept_state_spread_covariance_w=0.05,
                 decode_w=1.0, choice_w=0.0, choice_answer_w=1.0,
                 choice_none_w=1.0, choice_context_w=0.0,
                 choice_answer_margin=0.0, choice_none_margin=0.0,
@@ -3565,6 +3594,12 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                      fact_concept_prototype_spread_w=fact_concept_prototype_spread_w,
                      fact_concept_prototype_spread_margin=(
                          fact_concept_prototype_spread_margin),
+                     fact_concept_state_spread_w=fact_concept_state_spread_w,
+                     fact_concept_state_spread_variance=(
+                         fact_concept_state_spread_variance),
+                     fact_concept_state_spread_margin=fact_concept_state_spread_margin,
+                     fact_concept_state_spread_covariance_w=(
+                         fact_concept_state_spread_covariance_w),
                      prefix="text", decode_w=decode_w, choice_w=choice_w,
                      choice_answer_w=choice_answer_w,
                      choice_none_w=choice_none_w,
@@ -5169,6 +5204,9 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         fact_concept_contrast_temperature=0.1,
         fact_concept_prototype_w=0.0, fact_concept_prototype_spread_w=0.0,
         fact_concept_prototype_spread_margin=0.2,
+        fact_concept_state_spread_w=0.0, fact_concept_state_spread_variance=0.05,
+        fact_concept_state_spread_margin=0.2,
+        fact_concept_state_spread_covariance_w=0.05,
         choice_answer_w=1.0, choice_none_w=1.0,
         choice_answer_margin=0.0, choice_none_margin=0.0,
         choice_final_w=0.0, choice_final_control_w=0.0,
@@ -5221,6 +5259,13 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                    fact_concept_prototype_spread_w),
                                fact_concept_prototype_spread_margin=(
                                    fact_concept_prototype_spread_margin),
+                               fact_concept_state_spread_w=fact_concept_state_spread_w,
+                               fact_concept_state_spread_variance=(
+                                   fact_concept_state_spread_variance),
+                               fact_concept_state_spread_margin=(
+                                   fact_concept_state_spread_margin),
+                               fact_concept_state_spread_covariance_w=(
+                                   fact_concept_state_spread_covariance_w),
                                decode_w=decode_w,
                                choice_w=choice_w, choice_answer_w=choice_answer_w,
                                choice_none_w=choice_none_w,
@@ -5303,6 +5348,13 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                   fact_concept_prototype_spread_w),
               "fact_concept_prototype_spread_margin": float(
                   fact_concept_prototype_spread_margin),
+              "fact_concept_state_spread_w": float(fact_concept_state_spread_w),
+              "fact_concept_state_spread_variance": float(
+                  fact_concept_state_spread_variance),
+              "fact_concept_state_spread_margin": float(
+                  fact_concept_state_spread_margin),
+              "fact_concept_state_spread_covariance_w": float(
+                  fact_concept_state_spread_covariance_w),
               "choice_w": float(choice_w),
               "choice_answer_w": float(choice_answer_w),
               "choice_none_w": float(choice_none_w),
@@ -5411,6 +5463,10 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      fact_concept_prototype_w=0.0,
                      fact_concept_prototype_spread_w=0.0,
                      fact_concept_prototype_spread_margin=0.2,
+                     fact_concept_state_spread_w=0.0,
+                     fact_concept_state_spread_variance=0.05,
+                     fact_concept_state_spread_margin=0.2,
+                     fact_concept_state_spread_covariance_w=0.05,
                      choice_answer_w=1.0, choice_none_w=1.0,
                      choice_answer_margin=0.0, choice_none_margin=0.0,
                      choice_final_w=0.0, choice_final_control_w=0.0,
@@ -5544,6 +5600,13 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   fact_concept_prototype_spread_w),
               "fact_concept_prototype_spread_margin": float(
                   fact_concept_prototype_spread_margin),
+              "fact_concept_state_spread_w": float(fact_concept_state_spread_w),
+              "fact_concept_state_spread_variance": float(
+                  fact_concept_state_spread_variance),
+              "fact_concept_state_spread_margin": float(
+                  fact_concept_state_spread_margin),
+              "fact_concept_state_spread_covariance_w": float(
+                  fact_concept_state_spread_covariance_w),
               "choice_w": float(choice_w),
               "choice_answer_w": float(choice_answer_w),
               "choice_none_w": float(choice_none_w),
@@ -5887,6 +5950,12 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   fact_concept_prototype_spread_w=fact_concept_prototype_spread_w,
                   fact_concept_prototype_spread_margin=(
                       fact_concept_prototype_spread_margin),
+                  fact_concept_state_spread_w=fact_concept_state_spread_w,
+                  fact_concept_state_spread_variance=(
+                      fact_concept_state_spread_variance),
+                  fact_concept_state_spread_margin=fact_concept_state_spread_margin,
+                  fact_concept_state_spread_covariance_w=(
+                      fact_concept_state_spread_covariance_w),
                   prefix=f"study-r{round_i + 1}",
                   decode_w=decode_w, choice_w=choice_w,
                   choice_answer_w=choice_answer_w, choice_none_w=choice_none_w,
@@ -6207,6 +6276,8 @@ def selftest():
     assert torch.isfinite(fact_concept_prototype_loss(
         choice_model, choice_txt, choice_eval, choice_schema))
     assert torch.isfinite(fact_concept_prototype_spread_loss(choice_model))
+    assert torch.isfinite(fact_concept_state_spread_loss(
+        choice_model, choice_txt, choice_eval, choice_schema))
     concept_eval_report = fact_concept_eval(
         choice_model, choice_vocab, choice_eval, device="cpu")
     assert concept_eval_report["n_records"] == len(choice_eval)
@@ -6764,6 +6835,18 @@ def main(argv=None):
     ap.add_argument("--fact-concept-prototype-spread-margin", type=float, default=0.2,
                     dest="fact_concept_prototype_spread_margin",
                     help="maximum allowed cosine similarity between value prototypes")
+    ap.add_argument("--fact-concept-state-spread-w", type=float, default=0.0,
+                    dest="fact_concept_state_spread_w",
+                    help="weight for anti-collapse spread regularization on concept states")
+    ap.add_argument("--fact-concept-state-spread-variance", type=float, default=0.05,
+                    dest="fact_concept_state_spread_variance",
+                    help="minimum normalized per-dimension concept-state std target")
+    ap.add_argument("--fact-concept-state-spread-margin", type=float, default=0.2,
+                    dest="fact_concept_state_spread_margin",
+                    help="maximum same-key centroid cosine before state spread penalty")
+    ap.add_argument("--fact-concept-state-spread-covariance-w", type=float, default=0.05,
+                    dest="fact_concept_state_spread_covariance_w",
+                    help="relative decorrelation weight inside concept-state spread loss")
     ap.add_argument("--decode-w", type=float, default=1.0, dest="decode_w",
                     help="weight for canonical trace decoder loss; set 0 for semantic-only study")
     ap.add_argument("--choice-w", type=float, default=0.0, dest="choice_w",
@@ -7014,12 +7097,19 @@ def main(argv=None):
         return
     if (args.fact_concept_w < 0.0 or args.fact_concept_contrast_w < 0.0
             or args.fact_concept_prototype_w < 0.0
-            or args.fact_concept_prototype_spread_w < 0.0):
+            or args.fact_concept_prototype_spread_w < 0.0
+            or args.fact_concept_state_spread_w < 0.0):
         ap.error("fact concept loss weights must be non-negative")
     if args.fact_concept_contrast_temperature <= 0.0:
         ap.error("--fact-concept-contrast-temperature must be positive")
     if args.fact_concept_prototype_spread_margin < -1.0:
         ap.error("--fact-concept-prototype-spread-margin must be >= -1")
+    if args.fact_concept_state_spread_variance < 0.0:
+        ap.error("--fact-concept-state-spread-variance must be non-negative")
+    if args.fact_concept_state_spread_margin < -1.0:
+        ap.error("--fact-concept-state-spread-margin must be >= -1")
+    if args.fact_concept_state_spread_covariance_w < 0.0:
+        ap.error("--fact-concept-state-spread-covariance-w must be non-negative")
     if args.import_scan:
         import_scan(args.out, url=args.scan_url, max_records=args.scan_max,
                     eval_frac=args.scan_eval_frac, seed=args.seed)
@@ -7090,6 +7180,13 @@ def main(argv=None):
                              args.fact_concept_prototype_spread_w),
                          fact_concept_prototype_spread_margin=(
                              args.fact_concept_prototype_spread_margin),
+                         fact_concept_state_spread_w=args.fact_concept_state_spread_w,
+                         fact_concept_state_spread_variance=(
+                             args.fact_concept_state_spread_variance),
+                         fact_concept_state_spread_margin=(
+                             args.fact_concept_state_spread_margin),
+                         fact_concept_state_spread_covariance_w=(
+                             args.fact_concept_state_spread_covariance_w),
                          choice_w=args.choice_w,
                          choice_answer_w=args.choice_answer_w,
                          choice_none_w=args.choice_none_w,
@@ -7211,6 +7308,11 @@ def main(argv=None):
         fact_concept_prototype_spread_w=args.fact_concept_prototype_spread_w,
         fact_concept_prototype_spread_margin=(
             args.fact_concept_prototype_spread_margin),
+        fact_concept_state_spread_w=args.fact_concept_state_spread_w,
+        fact_concept_state_spread_variance=args.fact_concept_state_spread_variance,
+        fact_concept_state_spread_margin=args.fact_concept_state_spread_margin,
+        fact_concept_state_spread_covariance_w=(
+            args.fact_concept_state_spread_covariance_w),
         choice_w=args.choice_w,
         choice_answer_w=args.choice_answer_w, choice_none_w=args.choice_none_w,
         choice_answer_margin=args.choice_answer_margin,

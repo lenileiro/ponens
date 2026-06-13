@@ -190,6 +190,53 @@ def schema_concept_prototype_alignment_loss(states_by_key, target_ids_by_key,
     return torch.stack(losses).mean()
 
 
+def schema_concept_state_spread_loss(states_by_key, target_ids_by_key,
+                                     variance_target=0.05,
+                                     centroid_margin=0.2,
+                                     covariance_weight=0.05):
+    """Anti-collapse regularizer for schema concept geometry states.
+
+    The regularizer is task-agnostic. It uses only repeated data-supplied ids
+    inside each schema key to keep projected states from becoming a single
+    direction: dimensions need non-trivial batch variance, dimensions should not
+    all carry the same signal, and observed value centroids should separate.
+    """
+    var_target = float(variance_target)
+    centroid_margin = float(centroid_margin)
+    covariance_weight = float(covariance_weight)
+    losses = []
+    for key, states in states_by_key.items():
+        targets = target_ids_by_key.get(key)
+        if targets is None:
+            continue
+        targets = targets.to(device=states.device, dtype=torch.long)
+        valid = targets.ge(0)
+        if int(valid.sum()) < 2:
+            continue
+        z = F.normalize(states[valid], dim=-1)
+        labels = targets[valid]
+        std = torch.sqrt(z.var(dim=0, unbiased=False) + 1e-4)
+        losses.append(F.relu(var_target - std).mean())
+        if z.shape[0] > 2:
+            centered = z - z.mean(dim=0, keepdim=True)
+            cov = centered.t().matmul(centered) / (z.shape[0] - 1)
+            eye = torch.eye(cov.shape[0], dtype=torch.bool, device=cov.device)
+            losses.append(cov.masked_select(~eye).pow(2).mean() * covariance_weight)
+        centers = []
+        for label in labels.unique(sorted=True):
+            rows = labels.eq(label)
+            if bool(rows.any()):
+                centers.append(F.normalize(z[rows].mean(dim=0), dim=0))
+        if len(centers) > 1:
+            centers = torch.stack(centers, dim=0)
+            sim = centers.matmul(centers.t())
+            eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+            losses.append(F.relu(sim.masked_select(~eye) - centroid_margin).mean())
+    if not losses:
+        return _zero_from_states(states_by_key)
+    return torch.stack(losses).mean()
+
+
 def schema_concept_prototype_spread_loss(prototypes_by_key, margin=0.2):
     """Keep value prototypes for the same schema key from collapsing together."""
     margin = float(margin)
