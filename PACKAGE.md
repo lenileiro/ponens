@@ -733,6 +733,19 @@ choice to **0.600** while collapsing real-answer `squad_choice` from **0.300** t
 leaving question-swap control failed. The next target is calibration/anchoring that preserves
 positive answers while keeping this candidate-corruption abstention.
 
+`--choice-candidate-replacement-pair-w` is that first calibration attempt. It trains paired
+original/corrupted examples together: the original must still choose the gold candidate, the
+corrupted example must choose `none`, and the same candidate's final logit must fall after
+corruption. This is still generated from the reading record itself. A 2-step paired-only smoke
+activated the new loss (`cand-repl-pair` **1.175**) but was too weak on abstention and still
+collapsed positives (`squad_choice` **0.000**, candidate-replacement abstention **0.325**).
+Lowering the weight to **0.25** and adding `--study-anchor-correct-per-kind 5` improved the shape
+but not enough: `squad_choice` held at **0.100** and candidate-replacement abstention reached
+**0.250**, while question-swap remained failed. The selector rejected both rounds. The useful
+direction is clear: paired candidate-corruption is the right kind of data-derived pressure, but the
+self-study curriculum needs stronger positive-retention anchors or staged calibration before it can
+be accepted.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels

@@ -1860,6 +1860,34 @@ def choice_candidate_replacement_batch_records(sources, rng, n):
     return rows
 
 
+def choice_candidate_replacement_pair_batch(sources, rng, pairs):
+    if not sources or pairs <= 0:
+        return [], []
+    rows = []
+    pair_ids = []
+    tries = 0
+    while len(pair_ids) < int(pairs) and tries < int(pairs) * 4:
+        rec = sources[int(rng.integers(len(sources)))]
+        target = qa_choice_target(rec)
+        repl = _choice_candidate_replacement_record(rec, rng)
+        if repl is not None and target is not None and target != "none":
+            idx = len(pair_ids)
+            full_id = f"{rec.rec_id}:candidate_replacement_full:{idx}"
+            repl_id = f"{rec.rec_id}:candidate_replacement_none:{idx}"
+            full = TextRecord(rec_id=full_id, split=rec.split, tokens=rec.tokens,
+                              facts=rec.facts, group=rec.group, kind=rec.kind,
+                              base_id=rec.base_id, changed=rec.changed, meta=rec.meta)
+            repl = TextRecord(rec_id=repl_id, split=rec.split, tokens=repl.tokens,
+                              facts=(("answer", "choice", "none"),),
+                              group=rec.group, kind=repl.kind, base_id=rec.rec_id,
+                              changed=(("answer", "choice", "none"),),
+                              meta=repl.meta)
+            rows.extend([full, repl])
+            pair_ids.append((full_id, repl_id, target))
+        tries += 1
+    return rows, pair_ids
+
+
 def choice_answerability_control_batch_records(sources, rng, n, swap_groups=None):
     if not sources or n <= 0:
         return []
@@ -2066,6 +2094,38 @@ def choice_final_control_contrast_loss(model, txt, records, pair_ids, margin=0.0
     return sum(losses) / len(losses)
 
 
+def choice_candidate_replacement_pair_loss(model, txt, records, pair_ids, margin=0.0):
+    rows = {}
+    for rec, ids, logits in model.choice_logits(txt, records):
+        if logits is not None:
+            rows[rec.rec_id] = (ids, logits)
+    losses = []
+    margin_t = torch.tensor(float(margin), dtype=torch.float32, device=txt.device)
+    for full_id, repl_id, target in pair_ids:
+        full_row = rows.get(full_id)
+        repl_row = rows.get(repl_id)
+        if full_row is None or repl_row is None:
+            continue
+        full_ids, full_logits = full_row
+        repl_ids, repl_logits = repl_row
+        if target not in full_ids or "none" not in repl_ids:
+            continue
+        full_target_idx = full_ids.index(target)
+        repl_none_idx = repl_ids.index("none")
+        target_t = torch.tensor([full_target_idx], dtype=torch.long, device=txt.device)
+        none_t = torch.tensor([repl_none_idx], dtype=torch.long, device=txt.device)
+        losses.append(0.5 * (
+            F.cross_entropy(full_logits[None], target_t)
+            + F.cross_entropy(repl_logits[None], none_t)))
+        if target in repl_ids:
+            repl_target_idx = repl_ids.index(target)
+            losses.append(F.softplus(repl_logits[repl_target_idx] + margin_t
+                                     - full_logits[full_target_idx]))
+    if not losses:
+        return torch.tensor(0.0, device=txt.device)
+    return sum(losses) / len(losses)
+
+
 def choice_question_context_scores(model, txt, records):
     prefix, pooled = model.encode_text(txt)
     context_values = model.choice_context(prefix)
@@ -2179,6 +2239,8 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
               choice_final_control_contrast_margin=0.0,
               choice_candidate_replacement_w=0.0,
               choice_candidate_replacement_margin=0.0,
+              choice_candidate_replacement_pair_w=0.0,
+              choice_candidate_replacement_pair_margin=0.0,
               choice_answerability_w=0.0, choice_answerability_control_w=0.0,
               choice_answerability_margin=0.0, choice_answerability_contrast_w=0.0,
               choice_answerability_contrast_margin=0.0,
@@ -2209,6 +2271,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
     control_sources = (choice_control_source_records(train_records)
                        if (choice_control_w or choice_control_contrast_w
                            or choice_candidate_replacement_w
+                           or choice_candidate_replacement_pair_w
                            or choice_final_control_w
                            or choice_final_control_contrast_w
                            or choice_question_context_contrast_w
@@ -2321,6 +2384,21 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 replacement_loss = torch.tensor(0.0, device=device)
         else:
             replacement_loss = torch.tensor(0.0, device=device)
+        if choice_candidate_replacement_pair_w and control_sources:
+            replacement_pair_records, replacement_pairs = (
+                choice_candidate_replacement_pair_batch(
+                    control_sources, rng, max(1, batch // 2)))
+            if replacement_pair_records and replacement_pairs:
+                replacement_pair_txt, _replacement_pair_ids = pack(
+                    replacement_pair_records, vocab, device)
+                replacement_pair_loss = choice_candidate_replacement_pair_loss(
+                    model, replacement_pair_txt, replacement_pair_records,
+                    replacement_pairs,
+                    margin=choice_candidate_replacement_pair_margin)
+            else:
+                replacement_pair_loss = torch.tensor(0.0, device=device)
+        else:
+            replacement_pair_loss = torch.tensor(0.0, device=device)
         if choice_answerability_control_w and control_sources:
             ans_control_records = choice_answerability_control_batch_records(
                 control_sources, rng, max(1, batch // 2),
@@ -2421,6 +2499,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                 + choice_final_control_w * final_control_loss
                 + choice_final_control_contrast_w * final_contrast_loss
                 + choice_candidate_replacement_w * replacement_loss
+                + choice_candidate_replacement_pair_w * replacement_pair_loss
                 + choice_answerability_w * ans_loss
                 + choice_answerability_control_w * ans_control_loss
                 + choice_candidate_answerability_w * cand_ans_loss
@@ -2444,6 +2523,7 @@ def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
                   f"final-control {final_control_loss.item():.3f} "
                   f"final-contrast {final_contrast_loss.item():.3f} "
                   f"cand-repl {replacement_loss.item():.3f} "
+                  f"cand-repl-pair {replacement_pair_loss.item():.3f} "
                   f"ans {ans_loss.item():.3f} "
                   f"ans-control {ans_control_loss.item():.3f} "
                   f"cand-ans {cand_ans_loss.item():.3f} "
@@ -2472,6 +2552,8 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                 choice_final_control_contrast_margin=0.0,
                 choice_candidate_replacement_w=0.0,
                 choice_candidate_replacement_margin=0.0,
+                choice_candidate_replacement_pair_w=0.0,
+                choice_candidate_replacement_pair_margin=0.0,
                 choice_answerability_w=0.0, choice_answerability_control_w=0.0,
                 choice_answerability_margin=0.0,
                 choice_answerability_contrast_w=0.0,
@@ -2512,6 +2594,10 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4, lr=1e-3, 
                      choice_candidate_replacement_w=choice_candidate_replacement_w,
                      choice_candidate_replacement_margin=(
                          choice_candidate_replacement_margin),
+                     choice_candidate_replacement_pair_w=(
+                         choice_candidate_replacement_pair_w),
+                     choice_candidate_replacement_pair_margin=(
+                         choice_candidate_replacement_pair_margin),
                      choice_answerability_w=choice_answerability_w,
                      choice_answerability_control_w=choice_answerability_control_w,
                      choice_answerability_margin=choice_answerability_margin,
@@ -3553,6 +3639,8 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         choice_final_control_contrast_margin=0.0,
         choice_candidate_replacement_w=0.0,
         choice_candidate_replacement_margin=0.0,
+        choice_candidate_replacement_pair_w=0.0,
+        choice_candidate_replacement_pair_margin=0.0,
         choice_answerability_w=0.0, choice_answerability_control_w=0.0,
         choice_answerability_margin=0.0,
         choice_answerability_contrast_w=0.0,
@@ -3592,6 +3680,10 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                    choice_candidate_replacement_w),
                                choice_candidate_replacement_margin=(
                                    choice_candidate_replacement_margin),
+                               choice_candidate_replacement_pair_w=(
+                                   choice_candidate_replacement_pair_w),
+                               choice_candidate_replacement_pair_margin=(
+                                   choice_candidate_replacement_pair_margin),
                                choice_answerability_w=choice_answerability_w,
                                choice_answerability_control_w=choice_answerability_control_w,
                                choice_answerability_margin=choice_answerability_margin,
@@ -3644,6 +3736,10 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                   choice_candidate_replacement_w),
               "choice_candidate_replacement_margin": float(
                   choice_candidate_replacement_margin),
+              "choice_candidate_replacement_pair_w": float(
+                  choice_candidate_replacement_pair_w),
+              "choice_candidate_replacement_pair_margin": float(
+                  choice_candidate_replacement_pair_margin),
               "choice_answerability_w": float(choice_answerability_w),
               "choice_answerability_control_w": float(choice_answerability_control_w),
               "choice_answerability_margin": float(choice_answerability_margin),
@@ -3721,6 +3817,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      choice_final_control_contrast_margin=0.0,
                      choice_candidate_replacement_w=0.0,
                      choice_candidate_replacement_margin=0.0,
+                     choice_candidate_replacement_pair_w=0.0,
+                     choice_candidate_replacement_pair_margin=0.0,
                      choice_answerability_w=0.0, choice_answerability_control_w=0.0,
                      choice_answerability_margin=0.0,
                      choice_answerability_contrast_w=0.0,
@@ -3814,6 +3912,10 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   choice_candidate_replacement_w),
               "choice_candidate_replacement_margin": float(
                   choice_candidate_replacement_margin),
+              "choice_candidate_replacement_pair_w": float(
+                  choice_candidate_replacement_pair_w),
+              "choice_candidate_replacement_pair_margin": float(
+                  choice_candidate_replacement_pair_margin),
               "choice_answerability_w": float(choice_answerability_w),
               "choice_answerability_control_w": float(choice_answerability_control_w),
               "choice_answerability_margin": float(choice_answerability_margin),
@@ -3987,6 +4089,10 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                   choice_candidate_replacement_w=choice_candidate_replacement_w,
                   choice_candidate_replacement_margin=(
                       choice_candidate_replacement_margin),
+                  choice_candidate_replacement_pair_w=(
+                      choice_candidate_replacement_pair_w),
+                  choice_candidate_replacement_pair_margin=(
+                      choice_candidate_replacement_pair_margin),
                   choice_answerability_w=choice_answerability_w,
                   choice_answerability_control_w=choice_answerability_control_w,
                   choice_answerability_margin=choice_answerability_margin,
@@ -4325,6 +4431,13 @@ def selftest():
     repl_txt, _repl_ids = pack(repl_rows, choice_vocab, "cpu")
     assert torch.isfinite(choice_final_loss(choice_model, repl_txt, repl_rows,
                                             answer_w=0.0, none_w=1.0))
+    repl_pair_rows, repl_pair_ids = choice_candidate_replacement_pair_batch(
+        choice_eval, np.random.default_rng(15), pairs=2)
+    assert len(repl_pair_rows) == 4 and len(repl_pair_ids) == 2
+    assert {qa_choice_target(r) for r in repl_pair_rows} >= {"none"}
+    repl_pair_txt, _repl_pair_ids = pack(repl_pair_rows, choice_vocab, "cpu")
+    assert torch.isfinite(choice_candidate_replacement_pair_loss(
+        choice_model, repl_pair_txt, repl_pair_rows, repl_pair_ids))
     squad_choice_neg, _neg_seen, neg_stats = _squad_records_from_payload(
         squad_payload, "train", 0, np.random.default_rng(2), "fixture",
         max_context_tokens=8, max_question_tokens=8, max_answer_tokens=3,
@@ -4697,6 +4810,13 @@ def main(argv=None):
     ap.add_argument("--choice-candidate-replacement-margin", type=float, default=0.0,
                     dest="choice_candidate_replacement_margin",
                     help="margin for generated candidate-corruption none loss")
+    ap.add_argument("--choice-candidate-replacement-pair-w", type=float, default=0.0,
+                    dest="choice_candidate_replacement_pair_w",
+                    help=("weight for paired original-vs-corrupted-candidate calibration "
+                          "on final QA choice logits"))
+    ap.add_argument("--choice-candidate-replacement-pair-margin", type=float, default=0.0,
+                    dest="choice_candidate_replacement_pair_margin",
+                    help="margin for paired original-vs-corrupted-candidate calibration")
     ap.add_argument("--choice-answerability-w", type=float, default=0.0,
                     dest="choice_answerability_w",
                     help="weight for learned QA answerability coverage loss")
@@ -4893,6 +5013,10 @@ def main(argv=None):
                              args.choice_candidate_replacement_w),
                          choice_candidate_replacement_margin=(
                              args.choice_candidate_replacement_margin),
+                         choice_candidate_replacement_pair_w=(
+                             args.choice_candidate_replacement_pair_w),
+                         choice_candidate_replacement_pair_margin=(
+                             args.choice_candidate_replacement_pair_margin),
                          choice_answerability_w=args.choice_answerability_w,
                          choice_answerability_control_w=(
                              args.choice_answerability_control_w),
@@ -4959,6 +5083,9 @@ def main(argv=None):
             args.choice_final_control_contrast_margin),
         choice_candidate_replacement_w=args.choice_candidate_replacement_w,
         choice_candidate_replacement_margin=args.choice_candidate_replacement_margin,
+        choice_candidate_replacement_pair_w=args.choice_candidate_replacement_pair_w,
+        choice_candidate_replacement_pair_margin=(
+            args.choice_candidate_replacement_pair_margin),
         choice_answerability_w=args.choice_answerability_w,
         choice_answerability_control_w=args.choice_answerability_control_w,
         choice_answerability_margin=args.choice_answerability_margin,
