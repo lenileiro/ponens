@@ -432,7 +432,6 @@ def payload(args):
                 f"--lr {args.multimodal_lr} --log-every {args.multimodal_log_every} "
                 f"--value-w {args.multimodal_value_w} "
                 f"--agreement-w {args.multimodal_agreement_w} "
-                f"--fusion-arch {args.multimodal_fusion_arch} "
                 f"--concept-tokens {args.multimodal_concept_tokens} "
                 f"--fusion-layers {args.multimodal_fusion_layers} "
                 f"--concept-w {args.multimodal_concept_w} "
@@ -1131,9 +1130,6 @@ def main():
     ap.add_argument("--multimodal-agreement-w", type=float, default=0.0,
                     dest="multimodal_agreement_w",
                     help="M-0 cross-mode factor-value agreement loss weight")
-    ap.add_argument("--multimodal-fusion-arch", default="concept",
-                    choices=("concat", "concept"), dest="multimodal_fusion_arch",
-                    help="M-0 upstream fusion architecture")
     ap.add_argument("--multimodal-concept-tokens", type=int, default=4,
                     dest="multimodal_concept_tokens")
     ap.add_argument("--multimodal-fusion-layers", type=int, default=1,

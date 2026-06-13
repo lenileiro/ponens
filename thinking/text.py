@@ -3533,6 +3533,88 @@ def sample_records_per_kind(records, rng, per_kind):
     return out, counts
 
 
+def choice_neighbor_records_per_kind(model, vocab, hard_records, correct_records, rng,
+                                     per_kind, device=DEV, pool_per_kind=0):
+    """Select correct QA records nearest to current hard records in model concept space."""
+    if per_kind <= 0:
+        return [], {}, {"adaptive": True, "reason": "disabled"}
+    hard = [r for r in hard_records if qa_choice_target(r) not in (None, "none")]
+    candidates = [r for r in correct_records if qa_choice_target(r) not in (None, "none")]
+    if not hard:
+        rows, counts = sample_records_per_kind(correct_records, rng, per_kind)
+        return rows, counts, {"adaptive": False, "reason": "no_hard_choice_records"}
+    if not candidates:
+        return [], {}, {"adaptive": False, "reason": "no_correct_choice_records"}
+    pool_per_kind = max(0, int(pool_per_kind))
+    if pool_per_kind:
+        pooled = []
+        by_kind = {}
+        for rec in candidates:
+            by_kind.setdefault(rec.kind, []).append(rec)
+        for rows in by_kind.values():
+            n = min(pool_per_kind, len(rows))
+            if n < len(rows):
+                idx = rng.choice(len(rows), size=n, replace=False)
+                pooled.extend(rows[int(i)] for i in idx)
+            else:
+                pooled.extend(rows)
+        candidates = pooled
+    pool = []
+    seen_ids = set()
+    for rec in hard + candidates:
+        if rec.rec_id in seen_ids:
+            continue
+        seen_ids.add(rec.rec_id)
+        pool.append(rec)
+    txt, _ids = pack(pool, vocab, device)
+    model.eval()
+    with torch.no_grad():
+        vectors = choice_candidate_concept_vectors(model, txt, pool)
+    hard_vecs = []
+    for rec in hard:
+        target = qa_choice_target(rec)
+        row = vectors.get(rec.rec_id)
+        if row and target in row:
+            hard_vecs.append(row[target].detach())
+    if not hard_vecs:
+        rows, counts = sample_records_per_kind(correct_records, rng, per_kind)
+        return rows, counts, {"adaptive": False, "reason": "no_hard_vectors"}
+    scored = {}
+    for rec in candidates:
+        target = qa_choice_target(rec)
+        row = vectors.get(rec.rec_id)
+        if not row or target not in row:
+            continue
+        vec = row[target].detach()
+        score = torch.stack([(vec * hard_vec).sum() for hard_vec in hard_vecs]).max()
+        scored.setdefault(rec.kind, []).append((float(score.cpu()), rec))
+    if not scored:
+        rows, counts = sample_records_per_kind(correct_records, rng, per_kind)
+        return rows, counts, {"adaptive": False, "reason": "no_correct_vectors"}
+    out = []
+    counts = {}
+    score_means = {}
+    for kind, rows in sorted(scored.items()):
+        order = rng.permutation(len(rows)) if len(rows) > 1 else np.arange(len(rows))
+        shuffled = [rows[int(i)] for i in order]
+        shuffled.sort(key=lambda item: item[0], reverse=True)
+        picked = [rec for _score, rec in shuffled[:min(int(per_kind), len(shuffled))]]
+        if picked:
+            out.extend(picked)
+            counts[kind] = len(picked)
+            score_means[kind] = float(np.mean([score for score, _rec in shuffled[:len(picked)]]))
+    return out, counts, {
+        "adaptive": True,
+        "reason": "nearest_hard_choice_concept",
+        "hard_choice_records": len(hard),
+        "hard_vectors": len(hard_vecs),
+        "candidate_correct_records": len(candidates),
+        "selected_records": len(out),
+        "selected_by_kind": counts,
+        "selected_score_mean_by_kind": score_means,
+    }
+
+
 def retention_anchor_records(records):
     out = []
     for i, rec in enumerate(records):
@@ -4870,6 +4952,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      study_anchor_retention_bucket=False,
                      study_distill_correct_per_kind=0,
                      study_discovery_correct_per_kind=0,
+                     study_adaptive_correct_mining=False,
+                     study_adaptive_correct_pool_per_kind=0,
                      study_focus_control_failures=False,
                      study_select_best=False, study_score_metric="both",
                      study_retention_w=1.0, study_control_w=1.0,
@@ -4897,6 +4981,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
     study_anchor_correct_repeat = max(1, int(study_anchor_correct_repeat))
     study_distill_correct_per_kind = max(0, int(study_distill_correct_per_kind))
     study_discovery_correct_per_kind = max(0, int(study_discovery_correct_per_kind))
+    study_adaptive_correct_pool_per_kind = max(
+        0, int(study_adaptive_correct_pool_per_kind))
     eval_kwargs = dict(device=device, max_new=max_new, free_n=free_n,
                        paraphrase_n=paraphrase_n, counterfactual_n=counterfactual_n,
                        kind_free_n=kind_free_n, fact_n=fact_n,
@@ -5016,6 +5102,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "study_anchor_retention_bucket": bool(study_anchor_retention_bucket),
               "study_distill_correct_per_kind": int(study_distill_correct_per_kind),
               "study_discovery_correct_per_kind": int(study_discovery_correct_per_kind),
+              "study_adaptive_correct_mining": bool(study_adaptive_correct_mining),
+              "study_adaptive_correct_pool_per_kind": int(
+                  study_adaptive_correct_pool_per_kind),
               "study_focus_control_failures": bool(study_focus_control_failures),
               "study_control_focus_sides": list(focused_control_sides),
               "study_control_sampling_sides": list(focused_sampling_sides),
@@ -5082,8 +5171,10 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
         anchor_counts = {}
         distill_records = []
         distill_counts = {}
+        distill_selection = {}
         discovery_records = []
         discovery_counts = {}
+        discovery_selection = {}
         if study_strategy == "errors":
             need_metric_correct = bool(
                 study_anchor_correct_per_kind
@@ -5146,12 +5237,28 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                     anchor_records = anchor_records * study_anchor_correct_repeat
             if study_distill_correct_per_kind and choice_correct_records:
                 rng = np.random.default_rng(round_seed + 71)
-                distill_records, distill_counts = sample_records_per_kind(
-                    choice_correct_records, rng, study_distill_correct_per_kind)
+                if study_adaptive_correct_mining and hard_records:
+                    distill_records, distill_counts, distill_selection = (
+                        choice_neighbor_records_per_kind(
+                            model, vocab, hard_records, choice_correct_records, rng,
+                            study_distill_correct_per_kind, device=device,
+                            pool_per_kind=study_adaptive_correct_pool_per_kind))
+                else:
+                    distill_records, distill_counts = sample_records_per_kind(
+                        choice_correct_records, rng, study_distill_correct_per_kind)
+                    distill_selection = {"adaptive": False, "reason": "random_per_kind"}
             if study_discovery_correct_per_kind and choice_correct_records:
                 rng = np.random.default_rng(round_seed + 89)
-                discovery_records, discovery_counts = sample_records_per_kind(
-                    choice_correct_records, rng, study_discovery_correct_per_kind)
+                if study_adaptive_correct_mining and hard_records:
+                    discovery_records, discovery_counts, discovery_selection = (
+                        choice_neighbor_records_per_kind(
+                            model, vocab, hard_records, choice_correct_records, rng,
+                            study_discovery_correct_per_kind, device=device,
+                            pool_per_kind=study_adaptive_correct_pool_per_kind))
+                else:
+                    discovery_records, discovery_counts = sample_records_per_kind(
+                        choice_correct_records, rng, study_discovery_correct_per_kind)
+                    discovery_selection = {"adaptive": False, "reason": "random_per_kind"}
             hard_report = hard_report | {
                 "n_anchor_records": len(anchor_records),
                 "n_unique_anchor_records": sum(anchor_counts.values()),
@@ -5160,8 +5267,10 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                 "anchor_records_by_kind": anchor_counts,
                 "n_distill_records": len(distill_records),
                 "distill_records_by_kind": distill_counts,
+                "distill_selection": distill_selection,
                 "n_discovery_records": len(discovery_records),
                 "discovery_records_by_kind": discovery_counts,
+                "discovery_selection": discovery_selection,
             }
             round_fit_records = hard_records + anchor_records + train_replay_records
             if not hard_records:
@@ -5182,8 +5291,10 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                               "anchor_records_by_kind": anchor_counts,
                               "distill_records": len(distill_records),
                               "distill_records_by_kind": distill_counts,
+                              "distill_selection": distill_selection,
                               "discovery_records": len(discovery_records),
                               "discovery_records_by_kind": discovery_counts,
+                              "discovery_selection": discovery_selection,
                               "control_focus_sides": list(focused_control_sides),
                               "control_sampling_sides": list(focused_sampling_sides),
                               "replay_fit_records": len(train_replay_records),
@@ -5542,6 +5653,12 @@ def selftest():
         choice_model, choice_vocab, choice_eval, device="cpu", n=2, seed=0)
     assert len(choice_errs) + len(choice_correct) == choice_outcome_report["n_records"]
     assert "by_kind" in choice_outcome_report
+    neighbor_rows, neighbor_counts, neighbor_report = choice_neighbor_records_per_kind(
+        choice_model, choice_vocab, choice_eval[:1], choice_eval[1:],
+        np.random.default_rng(26), per_kind=1, device="cpu", pool_per_kind=2)
+    assert neighbor_rows and sum(neighbor_counts.values()) == len(neighbor_rows)
+    assert neighbor_report["adaptive"] and neighbor_report["selected_records"] == len(
+        neighbor_rows)
     swap_rec = _qa_question_swap_record(choice_norm[0], choice_norm[1])
     assert swap_rec is not None and swap_rec.facts == choice_norm[0].facts
     donor_q = tuple(choice_norm[1].tokens[
@@ -6218,6 +6335,12 @@ def main(argv=None):
     ap.add_argument("--study-discovery-correct-per-kind", type=int, default=0,
                     help=("for error self-study, use this many currently-correct "
                           "choice records per kind as concept-bridge discovery sources"))
+    ap.add_argument("--study-adaptive-correct-mining", action="store_true",
+                    help=("select correct self-teaching records nearest to hard examples "
+                          "in own-model concept space"))
+    ap.add_argument("--study-adaptive-correct-pool-per-kind", type=int, default=0,
+                    help=("cap correct-record candidates per kind before adaptive mining; "
+                          "0 = use all currently-correct candidates"))
     ap.add_argument("--study-focus-control-failures", action="store_true",
                     help=("during study, focus generated controls on control families "
                           "that failed the initial gate"))
@@ -6396,6 +6519,10 @@ def main(argv=None):
                              args.study_distill_correct_per_kind),
                          study_discovery_correct_per_kind=(
                              args.study_discovery_correct_per_kind),
+                         study_adaptive_correct_mining=(
+                             args.study_adaptive_correct_mining),
+                         study_adaptive_correct_pool_per_kind=(
+                             args.study_adaptive_correct_pool_per_kind),
                          study_focus_control_failures=args.study_focus_control_failures,
                          study_select_best=args.study_select_best,
                          study_score_metric=args.study_score_metric,

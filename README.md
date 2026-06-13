@@ -362,7 +362,7 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
 .venv/bin/python -m thinking.multimodal --steps 240 --eval-n 120 --free-n 20 \
     --counterfactual-n 40 --free-counterfactual-n 20 --trunk-arch residual \
     --trunk-width 96 --trunk-depth 2 --txt-tokens 12 --agreement-w 0.1 \
-    --fusion-arch concept --concept-tokens 4 --fusion-layers 1 \
+    --concept-tokens 4 --fusion-layers 1 \
     --concept-w 0.25 --concept-agreement-w 0.1 --concept-distill-w 0.1 \
     --concept-rank-distill-w 0.1 --concept-rank-distill-margin 0.05 \
     --modality-dropout 0.05 \

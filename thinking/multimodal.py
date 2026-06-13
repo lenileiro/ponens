@@ -40,7 +40,6 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_SURFACES = os.path.join(ROOT, "data", "multimodal_transcripts.json")
 MODES = ("full", "sensor_only", "text_only")
 TRUNK_ARCHES = ("conv", "residual")
-FUSION_ARCHES = ("concat", "concept")
 FACTOR_VALUES = {
     "color": COLOR_NAMES,
     "shape": SHAPES,
@@ -322,16 +321,13 @@ class MultimodalLM(nn.Module):
     def __init__(self, vocab_size, d=96, layers=3, heads=4, pad=0, max_len=128,
                  img_tokens=4, aud_tokens=8, txt_tokens=8, trunk_arch="conv",
                  trunk_width=64, trunk_depth=1, text_layers=1, modality_dropout=0.0,
-                 fusion_arch="concept", concept_tokens=4, fusion_layers=1):
+                 concept_tokens=4, fusion_layers=1):
         super().__init__()
         if img_tokens <= 0 or aud_tokens <= 0 or txt_tokens <= 0:
             raise ValueError("multimodal prefix token counts must be positive")
         if modality_dropout < 0.0 or modality_dropout > 1.0:
             raise ValueError("modality_dropout must be in [0, 1]")
         trunk_arch = str(trunk_arch)
-        fusion_arch = str(fusion_arch)
-        if fusion_arch not in FUSION_ARCHES:
-            raise ValueError(f"unknown multimodal fusion arch {fusion_arch!r}")
         self.config = {
             "vocab_size": int(vocab_size), "d": int(d), "layers": int(layers),
             "heads": int(heads), "pad": int(pad), "max_len": int(max_len),
@@ -339,11 +335,10 @@ class MultimodalLM(nn.Module):
             "txt_tokens": int(txt_tokens), "trunk_arch": trunk_arch,
             "trunk_width": int(trunk_width), "trunk_depth": int(trunk_depth),
             "text_layers": int(text_layers), "modality_dropout": float(modality_dropout),
-            "fusion_arch": fusion_arch, "concept_tokens": int(concept_tokens),
+            "fusion": "concept", "concept_tokens": int(concept_tokens),
             "fusion_layers": int(fusion_layers),
         }
         self.modality_dropout = float(modality_dropout)
-        self.fusion_arch = fusion_arch
         self.lm = ScratchpadLM(vocab_size, d=d, layers=layers, heads=heads, max_len=max_len,
                                pad=pad, pointer=False, loop=False)
         img_pool = _grid_pool(img_tokens)
@@ -355,9 +350,8 @@ class MultimodalLM(nn.Module):
                               width=trunk_width, depth=trunk_depth)
         self.txt = TextTrunk(vocab_size, d, pad=pad, n_tokens=txt_tokens, heads=heads,
                              layers=text_layers, modality=2)
-        self.fusion = (ConceptFusion(d, heads=heads, concept_tokens=concept_tokens,
-                                     layers=fusion_layers)
-                       if fusion_arch == "concept" else None)
+        self.fusion = ConceptFusion(d, heads=heads, concept_tokens=concept_tokens,
+                                    layers=fusion_layers)
         self.factor_queries = nn.Parameter(torch.randn(len(VALUE_POS), d) * 0.02)
         self.factor_heads = nn.ModuleDict({
             factor: nn.Linear(d, len(FACTOR_VALUES[factor])) for factor in VALUE_POS
@@ -386,9 +380,6 @@ class MultimodalLM(nn.Module):
             raise ValueError(f"unknown multimodal mode {mode!r}")
         elif self.modality_dropout > 0.0:
             ip, ap, tp = self._apply_modality_dropout(ip, ap, tp)
-        if self.fusion is None:
-            prefix = torch.cat([ip, ap, tp], dim=1)
-            return prefix, None
         return self.fusion(ip, ap, tp)
 
     def factor_logits(self, img, aud, txt, mode="full"):
@@ -772,8 +763,8 @@ def concept_full_rank_distill_loss(factor_logits_by_mode, golds, margin=0.0):
 def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100, value_w=6.0,
           surfaces_path=None, layers=3, heads=4, max_len=128, img_tokens=4, aud_tokens=8,
           txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
-          modality_dropout=0.0, agreement_w=0.0, fusion_arch="concept", concept_tokens=4,
-          fusion_layers=1, concept_w=0.0, concept_agreement_w=0.0,
+          modality_dropout=0.0, agreement_w=0.0, concept_tokens=4, fusion_layers=1,
+          concept_w=0.0, concept_agreement_w=0.0,
           concept_distill_w=0.0, concept_distill_temperature=1.0,
           concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0):
     torch.manual_seed(seed)
@@ -784,8 +775,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                          max_len=max_len, img_tokens=img_tokens, aud_tokens=aud_tokens,
                          txt_tokens=txt_tokens, trunk_arch=trunk_arch, trunk_width=trunk_width,
                          trunk_depth=trunk_depth, text_layers=text_layers,
-                         modality_dropout=modality_dropout, fusion_arch=fusion_arch,
-                         concept_tokens=concept_tokens, fusion_layers=fusion_layers).to(device)
+                         modality_dropout=modality_dropout, concept_tokens=concept_tokens,
+                         fusion_layers=fusion_layers).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     last_base = last_agreement = last_concept = 0.0
     last_concept_agreement = last_concept_distill = last_concept_rank_distill = 0.0
@@ -862,8 +853,8 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         counterfactual_n=40, free_counterfactual_n=20, surfaces_path=None, checkpoint=None,
         batch=32, d=96, lr=1e-3, layers=3, heads=4, max_len=128, img_tokens=4, aud_tokens=8,
         txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
-        modality_dropout=0.0, agreement_w=0.0, fusion_arch="concept", concept_tokens=4,
-        fusion_layers=1, concept_w=0.0, concept_agreement_w=0.0,
+        modality_dropout=0.0, agreement_w=0.0, concept_tokens=4, fusion_layers=1,
+        concept_w=0.0, concept_agreement_w=0.0,
         concept_distill_w=0.0, concept_distill_temperature=1.0,
         concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0, log_every=100):
     model, vocab, surfaces = train(steps=steps, seed=seed, device=device, value_w=value_w,
@@ -874,8 +865,7 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                    trunk_width=trunk_width, trunk_depth=trunk_depth,
                                    text_layers=text_layers,
                                    modality_dropout=modality_dropout,
-                                   agreement_w=agreement_w, fusion_arch=fusion_arch,
-                                   concept_tokens=concept_tokens,
+                                   agreement_w=agreement_w, concept_tokens=concept_tokens,
                                    fusion_layers=fusion_layers, concept_w=concept_w,
                                    concept_agreement_w=concept_agreement_w,
                                    concept_distill_w=concept_distill_w,
@@ -908,9 +898,7 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
     architecture["img_pool"] = list(model.img.pool)
     architecture["aud_pool"] = list(model.aud.pool)
     architecture["reader_prefix_tokens"] = int(img_tokens) + int(aud_tokens) + int(txt_tokens)
-    architecture["prefix_tokens"] = (
-        architecture["reader_prefix_tokens"]
-        + (int(concept_tokens) if fusion_arch == "concept" else 0))
+    architecture["prefix_tokens"] = architecture["reader_prefix_tokens"] + int(concept_tokens)
     report = {"experiment": "m0_multimodal_bridge", "steps": steps, "batch": int(batch),
               "lr": float(lr), "value_w": float(value_w),
               "agreement_w": float(agreement_w),
@@ -989,7 +977,7 @@ def selftest():
     model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad).to("cpu")
     x, a, tt, ids, golds = _batch(2, rng, vocab, "cpu", surfaces)
     assert _grid_pool(4) == (2, 2) and _grid_pool(8) == (2, 4)
-    assert model.config["fusion_arch"] == "concept"
+    assert model.config["fusion"] == "concept"
     logits = model(x, a, tt, ids)
     assert logits.shape == (2, ids.shape[1], len(vocab)), logits.shape
     logits_text = model(x, a, tt, ids, mode="text_only")
@@ -1005,15 +993,10 @@ def selftest():
     assert torch.isfinite(concept_factor_agreement_loss(factor_logits))
     assert torch.isfinite(concept_full_distill_loss(factor_logits, temperature=1.25))
     assert torch.isfinite(concept_full_rank_distill_loss(factor_logits, golds, margin=0.05))
-    concat_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
-                                fusion_arch="concat").to("cpu")
-    concat_prefix, concat_concepts = concat_model.encode_prefix(x, a, tt, mode="full")
-    assert concat_concepts is None and concat_prefix.shape[1] == 20
     res_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
                              img_tokens=4, aud_tokens=8, txt_tokens=6,
                              trunk_arch="residual", trunk_width=32, trunk_depth=1,
-                             text_layers=2, modality_dropout=0.1,
-                             fusion_arch="concept", concept_tokens=3,
+                             text_layers=2, modality_dropout=0.1, concept_tokens=3,
                              fusion_layers=2).to("cpu")
     assert res_model.img.arch == "residual" and res_model.img.pool == (2, 2)
     assert res_model.txt.layers == 2 and res_model.txt.n_tokens == 6
@@ -1053,9 +1036,6 @@ def main(argv=None):
     ap.add_argument("--value-w", type=float, default=6.0, dest="value_w")
     ap.add_argument("--agreement-w", type=float, default=0.0, dest="agreement_w",
                     help="cross-mode factor-value distribution agreement loss weight")
-    ap.add_argument("--fusion-arch", default="concept", choices=FUSION_ARCHES,
-                    dest="fusion_arch",
-                    help="upstream prefix fusion: concat keeps old path, concept adds shared tokens")
     ap.add_argument("--concept-tokens", type=int, default=4, dest="concept_tokens",
                     help="shared concept tokens prepended before the decoder in concept fusion")
     ap.add_argument("--fusion-layers", type=int, default=1, dest="fusion_layers",
@@ -1142,8 +1122,8 @@ def main(argv=None):
                  txt_tokens=args.txt_tokens, trunk_arch=args.trunk_arch,
                  trunk_width=args.trunk_width, trunk_depth=args.trunk_depth,
                  text_layers=args.text_layers, modality_dropout=args.modality_dropout,
-                 agreement_w=args.agreement_w, fusion_arch=args.fusion_arch,
-                 concept_tokens=args.concept_tokens, fusion_layers=args.fusion_layers,
+                 agreement_w=args.agreement_w, concept_tokens=args.concept_tokens,
+                 fusion_layers=args.fusion_layers,
                  concept_w=args.concept_w,
                  concept_agreement_w=args.concept_agreement_w,
                  concept_distill_w=args.concept_distill_w,

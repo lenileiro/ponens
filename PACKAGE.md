@@ -870,6 +870,22 @@ rejected the round (`selected_round` **0**) because `squad_choice` regressed fro
 is a stronger self-preservation primitive; the unresolved issue is applying that retention without
 freezing the model's existing candidate-binding mistakes.
 
+`--study-adaptive-correct-mining` makes that retention more local to the current reading failure.
+Instead of sampling all currently-correct records uniformly for self-distillation and discovery, the
+study loop can rank correct QA records by nearest hard-example target vectors in the model's own
+candidate concept space, then select the top records per kind. The optional
+`--study-adaptive-correct-pool-per-kind` caps the candidate pool before ranking. This still avoids
+hard-coded facts: hard examples and correct examples come from the model's own pre-study outcomes,
+and the neighborhood is computed from learned concept vectors.
+
+The adaptive-correct smoke activated this path for both distillation and discovery: **777** hard
+choice vectors ranked a **64**-record correct pool and selected **20** nearest `squad_choice`
+records for each self-teaching route, with mean selected similarities around **0.75**. The selector
+still rejected the round (`selected_round` **0**) because aggregate held-out choice stayed at
+**0.050**, `squad_choice` regressed from **0.400** to **0.200**, and candidate/discovery controls
+remained negative. The useful progress is a measured local-retention curriculum; the next pressure
+has to make candidate replacement and discovery margins improve, not merely select relevant memory.
+
 ## 3b. Image grounding: synthetic visual factors first
 
 `thinking/vision.py` is the Image-0/Image-1 rung for applying the FER hypothesis to pixels
@@ -1643,17 +1659,15 @@ checkpoints record the full architecture, and RunPod forwards the same levers th
 `--multimodal-trunk-arch`, `--multimodal-img-tokens`, `--multimodal-txt-tokens`,
 `--multimodal-dropout`, and `--multimodal-agreement-w`.
 
-M-2 upstream concept update: multimodal now has a shared concept-fusion architecture instead of
-only concatenating independent reader prefixes. `--fusion-arch concept` prepends learned concept
-tokens, mixes them with image/audio/text prefixes before the trace decoder, and exposes an
-auxiliary concept head over the same factor schema. `--concept-w` trains those upstream concept
+M-2 upstream concept update: multimodal now uses shared concept fusion as the single upstream
+path. Learned concept tokens mix with image/audio/text prefixes before the trace decoder, and an
+auxiliary concept head exposes the same factor schema. `--concept-w` trains those upstream concept
 tokens directly, `--concept-agreement-w` aligns their factor distributions across full,
 sensor-only, and text-only paths, and `--concept-distill-w` distills the full multimodal concept
 distribution into partial modes. This lets the multimodal bridge use the same idea as the text
 self-teaching work: preserve and transfer model-derived concept distributions upstream, before the
-canonical trace decoder has to emit tokens. `--fusion-arch concat` remains available as the old
-architecture. Reports now include `concept_head`, `concept_gate`, reader-prefix token count, and
-total prefix token count, and RunPod exposes the new controls as `--multimodal-fusion-arch`,
+canonical trace decoder has to emit tokens. Reports now include `concept_head`, `concept_gate`,
+reader-prefix token count, and total prefix token count, and RunPod exposes the active controls as
 `--multimodal-concept-tokens`, `--multimodal-fusion-layers`, `--multimodal-concept-w`,
 `--multimodal-concept-agreement-w`, and `--multimodal-concept-distill-w`.
 
