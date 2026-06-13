@@ -183,6 +183,9 @@ def payload(args):
                      f"--dit-attn-impl {args.image_dit_attn_impl} "
                      f"--dit-pos-embed {args.image_dit_pos_embed} "
                      f"--ae-arch {args.image_ae_arch} "
+                     f"--ae-hf-model {shlex_quote(args.image_ae_hf_model)} "
+                     f"--ae-hf-subfolder {shlex_quote(args.image_ae_hf_subfolder)} "
+                     f"--ae-hf-scaling-factor {args.image_ae_hf_scaling_factor} "
                      f"--latent-downsample {args.image_latent_downsample} "
                      f"--ae-res-blocks {args.image_ae_res_blocks} "
                      f"--latent-max-tokens {args.image_latent_max_tokens} "
@@ -227,6 +230,10 @@ def payload(args):
                      f"--ae-factor-orth-w {args.image_ae_factor_orth_w} "
                      f"--flow-semantic-w {args.image_flow_semantic_w} "
                      f"--flow-consistency-w {args.image_flow_consistency_w} "
+                     f"--flow-distill-steps {args.image_flow_distill_steps} "
+                     f"--flow-distill-w {args.image_flow_distill_w} "
+                     f"--flow-distill-time-gap {args.image_flow_distill_time_gap} "
+                     f"--flow-distill-teacher {args.image_flow_distill_teacher} "
                      f"--flow-ema-decay {args.image_flow_ema_decay} "
                      f"--ema-eval-mode {args.image_ema_eval_mode} "
                      f"--time-sampling {args.image_time_sampling} "
@@ -619,9 +626,19 @@ def main():
     ap.add_argument("--image-dit-pos-embed", default="learned",
                     choices=("learned", "sincos2d"), dest="image_dit_pos_embed",
                     help="latent image DiT positional embedding")
-    ap.add_argument("--image-ae-arch", default="semantic", choices=("semantic", "residual"),
+    ap.add_argument("--image-ae-arch", default="semantic",
+                    choices=("semantic", "residual", "hf-vae"),
                     dest="image_ae_arch",
                     help="autoencoder architecture for latent image generation")
+    ap.add_argument("--image-ae-hf-model", default="",
+                    dest="image_ae_hf_model",
+                    help="Diffusers AutoencoderKL model id when --image-ae-arch hf-vae")
+    ap.add_argument("--image-ae-hf-subfolder", default="",
+                    dest="image_ae_hf_subfolder",
+                    help="optional Hugging Face subfolder for --image-ae-hf-model")
+    ap.add_argument("--image-ae-hf-scaling-factor", type=float, default=0.0,
+                    dest="image_ae_hf_scaling_factor",
+                    help="override HF VAE latent scaling factor; 0 uses model config")
     ap.add_argument("--image-latent-downsample", type=int, default=4,
                     dest="image_latent_downsample",
                     help="AE spatial compression factor for latent image generation")
@@ -767,6 +784,18 @@ def main():
     ap.add_argument("--image-flow-consistency-w", type=float, default=0.0,
                     dest="image_flow_consistency_w",
                     help="same-path endpoint consistency loss weight for latent image flow")
+    ap.add_argument("--image-flow-distill-steps", type=int, default=0,
+                    dest="image_flow_distill_steps",
+                    help="post-flow own-model endpoint distillation steps")
+    ap.add_argument("--image-flow-distill-w", type=float, default=1.0,
+                    dest="image_flow_distill_w",
+                    help="loss weight for own-model endpoint distillation")
+    ap.add_argument("--image-flow-distill-time-gap", type=float, default=0.25,
+                    dest="image_flow_distill_time_gap",
+                    help="fractional move toward clean data time for the frozen teacher")
+    ap.add_argument("--image-flow-distill-teacher", default="auto",
+                    choices=("raw", "ema", "auto"), dest="image_flow_distill_teacher",
+                    help="teacher snapshot for own-model endpoint distillation")
     ap.add_argument("--image-flow-ema-decay", type=float, default=0.0,
                     dest="image_flow_ema_decay",
                     help="EMA decay for latent image flow/conditioner weights")
@@ -909,6 +938,18 @@ def main():
         sys.exit("ERROR: --image-time-shift-ref-dim must be positive")
     if args.image_flow_loss_weight_gamma <= 0.0:
         sys.exit("ERROR: --image-flow-loss-weight-gamma must be positive")
+    if args.image_flow_distill_steps < 0:
+        sys.exit("ERROR: --image-flow-distill-steps must be non-negative")
+    if args.image_flow_distill_w < 0.0:
+        sys.exit("ERROR: --image-flow-distill-w must be non-negative")
+    if args.image_flow_distill_time_gap <= 0.0 or args.image_flow_distill_time_gap > 1.0:
+        sys.exit("ERROR: --image-flow-distill-time-gap must be in (0, 1]")
+    if (args.image_flow_distill_steps > 0 and args.image_flow_distill_w > 0.0
+            and args.image_flow_distill_teacher == "ema"
+            and args.image_flow_ema_decay <= 0.0):
+        sys.exit("ERROR: --image-flow-distill-teacher ema requires --image-flow-ema-decay > 0")
+    if args.image_ae_arch == "hf-vae" and not args.image_ae_hf_model:
+        sys.exit("ERROR: --image-ae-arch hf-vae requires --image-ae-hf-model")
     if args.upload_image_data:
         if not args.image_manifest:
             sys.exit("ERROR: --upload-image-data requires --image-manifest")
@@ -940,14 +981,21 @@ def main():
     cap = args.max_minutes * 60
     run = payload(args)
     image_embed_deps = bool(args.image_embed and args.image_embed_backend == "hf")
+    image_hf_ae_deps = bool(args.image_latent and args.image_ae_arch == "hf-vae")
     if args.fast:                                           # image torch; verbalizer
         fast_pkgs = "numpy tokenizers pandas pyarrow pillow"
         if image_embed_deps:
             fast_pkgs += " transformers accelerate"
+        if image_hf_ae_deps:
+            fast_pkgs += " diffusers transformers accelerate safetensors"
         setup = f"pip install -q {fast_pkgs}"
     else:
-        install_embed = "INSTALL_IMAGE_EMBED_DEPS=1 " if image_embed_deps else ""
-        setup = f"{install_embed}WORKDIR={REMOTE} bash runpod/setup.sh"
+        install_deps = ""
+        if image_embed_deps:
+            install_deps += "INSTALL_IMAGE_EMBED_DEPS=1 "
+        if image_hf_ae_deps:
+            install_deps += "INSTALL_IMAGE_HF_AE_DEPS=1 "
+        setup = f"{install_deps}WORKDIR={REMOTE} bash runpod/setup.sh"
     # tee to LOCAL disk: /workspace is a network volume that stalls under streaming writes
     # (see runpod/setup.sh -- it cost us rung B4: training was healthy, only the log froze)
     remote_cmd = (

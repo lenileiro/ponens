@@ -1209,6 +1209,26 @@ largest active aspect bucket. Reports/checkpoints now record requested shift, ef
 latent effective dimension, reference dimension, scale, and mode. This keeps the manual schedule
 available while making high-dimensional semantic latents less dependent on hand-retuned constants.
 
+Image-58 adds an optional pretrained latent-autoencoder bridge. `thinking.image_latent
+--ae-arch hf-vae --ae-hf-model MODEL_ID` loads a frozen Diffusers `AutoencoderKL` and trains the
+same text-conditioned flow on its latents instead of always learning a tiny local AE first.
+`--ae-hf-subfolder` supports repos that store the VAE under `vae/`, and
+`--ae-hf-scaling-factor` can override the model config when needed. Checkpoints store the model
+reference and avoid serializing the frozen pretrained VAE weights, while local semantic/residual
+AE runs stay dependency-free. RunPod installs `diffusers` only when `--image-ae-arch hf-vae` is
+selected. This is the practical hook for SD-style VAE latents today and RAE-style pretrained
+latent spaces when exported through the same AutoencoderKL interface.
+
+Image-59 adds opt-in own-model endpoint distillation for the latent flow. After normal flow
+training, `--flow-distill-steps N` freezes a teacher snapshot of the same model (`raw`, `ema`, or
+`auto`) and trains the student to match the teacher's cleaner-time endpoint prediction from a
+noisier point on the same rectified-flow path. The objective is latent/condition generic: it works
+for fact, text, manifest, cached, local-AE, and pretrained-AE paths without caption grammar or
+object-rule code. Reports/checkpoints record `flow_distill_steps_run`, `flow_distill_teacher_used`,
+and `last_distill.distill_endpoint_mse`; RunPod exposes the same controls as
+`--image-flow-distill-steps`, `--image-flow-distill-w`, `--image-flow-distill-time-gap`, and
+`--image-flow-distill-teacher`.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered

@@ -23,6 +23,7 @@ linearly usable after compression instead of becoming another entangled bottlene
       --ae-steps 400 --flow-steps 400 --flow-semantic-w 0.25
 """
 import argparse
+import copy
 import json
 import math
 import os
@@ -56,6 +57,8 @@ MMDIT_ATTN_IMPLS = ("manual", "sdpa", "auto")
 DIT_POS_EMBEDS = ("learned", "sincos2d")
 FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
 TIME_SHIFT_MODES = ("manual", "dim")
+AE_ARCHES = ("semantic", "residual", "hf-vae")
+FLOW_DISTILL_TEACHERS = ("raw", "ema", "auto")
 DEFAULT_GUIDANCE_INTERVAL = (0.0, 1.0)
 
 
@@ -255,8 +258,82 @@ class ResidualAutoencoder(nn.Module):
         return out
 
 
+def _config_value(config, key, default=None):
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+class HFAutoencoderKL(nn.Module):
+    """Frozen Diffusers AutoencoderKL adapter for pretrained latent image spaces."""
+
+    def __init__(self, model_id, subfolder="", scaling_factor=0.0, latent_downsample=8):
+        super().__init__()
+        if not model_id:
+            raise ValueError("ae_arch='hf-vae' requires --ae-hf-model")
+        try:
+            from diffusers import AutoencoderKL
+        except Exception as e:  # pragma: no cover - optional GPU dependency.
+            raise ImportError(
+                "ae_arch='hf-vae' requires diffusers. Install it with "
+                "`pip install diffusers transformers accelerate safetensors`."
+            ) from e
+        kwargs = {}
+        if subfolder:
+            kwargs["subfolder"] = str(subfolder)
+        self.model_id = str(model_id)
+        self.subfolder = str(subfolder or "")
+        self.vae = AutoencoderKL.from_pretrained(self.model_id, **kwargs)
+        config = getattr(self.vae, "config", None)
+        self.latent_ch = int(_config_value(config, "latent_channels", 4) or 4)
+        scale = float(scaling_factor or 0.0)
+        if scale <= 0.0:
+            scale = float(_config_value(config, "scaling_factor", 0.18215) or 0.18215)
+        self.scaling_factor = float(scale)
+        self.downsample = int(latent_downsample or 8)
+        for p in self.vae.parameters():
+            p.requires_grad_(False)
+        self.vae.eval()
+
+    def _param_dtype(self):
+        try:
+            return next(self.vae.parameters()).dtype
+        except StopIteration:  # pragma: no cover - AutoencoderKL always has params.
+            return torch.float32
+
+    def train(self, mode=True):
+        super().train(False)
+        self.vae.eval()
+        return self
+
+    def encode(self, x):
+        x_in = x.to(dtype=self._param_dtype())
+        out = self.vae.encode(x_in)
+        dist = getattr(out, "latent_dist", None)
+        if dist is not None:
+            z = dist.mode() if hasattr(dist, "mode") else dist.sample()
+        elif hasattr(out, "latents"):
+            z = out.latents
+        else:
+            z = out[0]
+        return z * float(self.scaling_factor)
+
+    def decode(self, z):
+        z_in = (z / float(self.scaling_factor)).to(dtype=self._param_dtype())
+        out = self.vae.decode(z_in)
+        sample = getattr(out, "sample", out[0] if isinstance(out, tuple) else out)
+        return sample.clamp(-1.0, 1.0)
+
+    def forward(self, x):
+        z = self.encode(x)
+        return {"latent": z, "recon": self.decode(z)}
+
+
 def make_autoencoder(ae_arch="semantic", latent_ch=16, hidden=64, latent_downsample=4,
-                     ae_res_blocks=1):
+                     ae_res_blocks=1, ae_hf_model="", ae_hf_subfolder="",
+                     ae_hf_scaling_factor=0.0):
     if ae_arch == "semantic":
         if int(latent_downsample) != 4:
             raise ValueError("semantic AE uses latent_downsample=4; use --ae-arch residual")
@@ -265,6 +342,11 @@ def make_autoencoder(ae_arch="semantic", latent_ch=16, hidden=64, latent_downsam
         return ResidualAutoencoder(latent_ch=latent_ch, hidden=hidden,
                                    downsample=latent_downsample,
                                    res_blocks=ae_res_blocks)
+    if ae_arch == "hf-vae":
+        return HFAutoencoderKL(
+            ae_hf_model, subfolder=ae_hf_subfolder,
+            scaling_factor=ae_hf_scaling_factor,
+            latent_downsample=latent_downsample)
     raise ValueError(f"unknown autoencoder architecture {ae_arch!r}")
 
 
@@ -2767,6 +2849,49 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
     return total, parts
 
 
+def latent_flow_self_distill_losses(flow, teacher_flow, z1, cond, teacher_cond=None,
+                                    time_sampling="uniform", time_logit_mean=0.0,
+                                    time_logit_std=1.0, time_shift=1.0,
+                                    latent_stats=None, time_gap=0.25):
+    """Distill a frozen same-model teacher into cleaner endpoint predictions.
+
+    The student starts from a noisier point on the same rectified-flow path and matches the
+    teacher's clean endpoint prediction at a later data-time. This is generic over the condition
+    payload and latent source; it only assumes the flow can predict velocity from (z_t, t, cond).
+    """
+    gap = float(time_gap)
+    if gap <= 0.0 or gap > 1.0:
+        raise ValueError("flow_distill_time_gap must be in (0, 1]")
+    latent_stats = flow_latent_stats(flow) if latent_stats is None else latent_stats
+    z1_model = normalize_latent(z1, latent_stats)
+    x0 = torch.randn_like(z1_model)
+    t = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
+                          logit_mean=time_logit_mean, logit_std=time_logit_std,
+                          time_shift=time_shift)
+    t_teacher = (t + gap * (1.0 - t)).clamp(max=1.0 - 1.0e-4)
+    zt = (1.0 - t) * x0 + t * z1_model
+    zt_teacher = (1.0 - t_teacher) * x0 + t_teacher * z1_model
+    pred = flow(zt, t, cond)
+    endpoint = zt + (1.0 - t) * pred
+    with torch.no_grad():
+        teacher_pred = teacher_flow(
+            zt_teacher, t_teacher, cond if teacher_cond is None else teacher_cond)
+        teacher_endpoint = zt_teacher + (1.0 - t_teacher) * teacher_pred
+    endpoint_loss = F.mse_loss(endpoint, teacher_endpoint.detach())
+    parts = {
+        "distill_endpoint_mse": endpoint_loss.detach(),
+        "distill_student_endpoint_mse": F.mse_loss(endpoint.detach(), z1_model).detach(),
+        "distill_teacher_endpoint_mse": F.mse_loss(
+            teacher_endpoint.detach(), z1_model).detach(),
+        "distill_time_mean": t.detach().mean(),
+        "distill_teacher_time_mean": t_teacher.detach().mean(),
+        "distill_time_gap": (t_teacher - t).detach().mean(),
+        "distill_requested_time_gap": torch.tensor(gap, device=z1.device),
+        "time_shift": torch.tensor(float(time_shift), device=z1.device),
+    }
+    return endpoint_loss, parts
+
+
 @torch.no_grad()
 def flow_endpoint_metrics(flow, z1, cond, time_sampling="uniform", time_logit_mean=0.0,
                           time_logit_std=1.0, time_shift=1.0, latent_stats=None):
@@ -3601,7 +3726,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     dit_attn_impl = str(ckpt.get("dit_attn_impl", report.get("dit_attn_impl", "manual")))
     if dit_attn_impl not in MMDIT_ATTN_IMPLS:
         raise ValueError(f"unknown MM-DiT attention implementation {dit_attn_impl!r}")
-    dit_pos_embed = str(ckpt.get("dit_pos_embed", report.get("dit_pos_embed", "learned")))
+    dit_pos_embed = str(ckpt.get("dit_pos_embed", report.get("dit_pos_embed", "learned"))
+                        or "learned")
     if dit_pos_embed not in DIT_POS_EMBEDS:
         raise ValueError(f"unknown DiT positional embedding {dit_pos_embed!r}")
     cond_mode = ckpt.get("cond_mode", report.get("cond_mode", "facts"))
@@ -3618,6 +3744,11 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "image_feature_embed_dim", report.get("image_feature_embed_dim", 128)) or 128)
     flow_repa_embed_dim = int(ckpt.get(
         "flow_repa_embed_dim", report.get("flow_repa_embed_dim", 128)) or 128)
+    ae_hf_model = str(ckpt.get("ae_hf_model", report.get("ae_hf_model", "")) or "")
+    ae_hf_subfolder = str(ckpt.get(
+        "ae_hf_subfolder", report.get("ae_hf_subfolder", "")) or "")
+    ae_hf_scaling_factor = float(ckpt.get(
+        "ae_hf_scaling_factor", report.get("ae_hf_scaling_factor", 0.0)) or 0.0)
     caption_max_len = int(ckpt.get("caption_max_len", report.get("caption_max_len", 32)) or 32)
     if cond_mode == "text" and data_mode != "image_manifest":
         caption_max_len = 32
@@ -3662,7 +3793,11 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         image_feature_aligner.eval()
     ae = make_autoencoder(ae_arch=ae_arch, latent_ch=latent_ch, hidden=hidden,
                           latent_downsample=latent_downsample,
-                          ae_res_blocks=ae_res_blocks).to(device)
+                          ae_res_blocks=ae_res_blocks,
+                          ae_hf_model=ae_hf_model,
+                          ae_hf_subfolder=ae_hf_subfolder,
+                          ae_hf_scaling_factor=ae_hf_scaling_factor).to(device)
+    latent_ch = int(getattr(ae, "latent_ch", latent_ch))
     flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
                      dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim,
                      dit_head_width_mult=dit_head_width_mult,
@@ -3686,7 +3821,9 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         ckpt.get("latent_stats", {"mode": ckpt.get("latent_normalize", "none")}),
         device)
     attach_latent_stats(flow, latent_stats)
-    ae.load_state_dict(ckpt["autoencoder_state_dict"])
+    ae_state = ckpt.get("autoencoder_state_dict", {})
+    if ae_state:
+        ae.load_state_dict(ae_state)
     flow_state = ckpt["flow_state_dict"]
     ema_available = bool(ckpt.get("flow_ema_state_dict"))
     ema_loaded = bool(prefer_ema and ema_available)
@@ -3709,6 +3846,10 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
             "size_bucket_count", len(report.get("size_buckets", [])))),
         "latent_ch": latent_ch,
         "ae_arch": ae_arch,
+        "ae_external": ae_arch == "hf-vae",
+        "ae_hf_model": ae_hf_model,
+        "ae_hf_subfolder": ae_hf_subfolder,
+        "ae_hf_scaling_factor": float(getattr(ae, "scaling_factor", ae_hf_scaling_factor)),
         "latent_downsample": int(getattr(ae, "downsample", latent_downsample)),
         "ae_res_blocks": int(ae_res_blocks) if ae_arch == "residual" else 0,
         "latent_max_tokens": int(latent_max_tokens),
@@ -4274,6 +4415,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       dit_head_width_mult=1, latent_max_tokens=256,
                       dit_pos_embed="learned",
                       ae_arch="semantic", latent_downsample=4, ae_res_blocks=1,
+                      ae_hf_model="", ae_hf_subfolder="", ae_hf_scaling_factor=0.0,
                       ae_recon_loss="mse", ae_grad_w=0.0, ae_ms_w=0.0,
                       ae_latent_reg_w=0.0,
                       image_text_align_w=0.0, flow_text_align_w=0.0, text_embed_dim=128,
@@ -4282,6 +4424,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       flow_repa_w=0.0, flow_repa_steps=0, flow_repa_embed_dim=128,
                       sample_steps=4, roundtrip_samples=1, flow_semantic_w=0.0,
                       flow_consistency_w=0.0,
+                      flow_distill_steps=0, flow_distill_w=1.0,
+                      flow_distill_time_gap=0.25, flow_distill_teacher="auto",
                       cond_mode="facts", text_cond_dim=0,
                       size_buckets=(),
                       image_manifest="", image_root="", image_split="train",
@@ -4316,6 +4460,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     requested_size_buckets = normalize_image_size_buckets(size_buckets)
     if cond_mode not in ("facts", "text"):
         raise ValueError(f"unknown condition mode {cond_mode!r}")
+    if ae_arch not in AE_ARCHES:
+        raise ValueError(f"unknown autoencoder architecture {ae_arch!r}")
+    if ae_arch == "hf-vae" and not image_manifest:
+        raise ValueError("ae_arch='hf-vae' requires image_manifest training")
+    if ae_arch == "hf-vae" and not ae_hf_model:
+        raise ValueError("ae_arch='hf-vae' requires ae_hf_model")
     if cfg_rescale < 0.0 or cfg_rescale > 1.0:
         raise ValueError("cfg_rescale must be in [0, 1]")
     image_records = None
@@ -4410,6 +4560,19 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("semantic_guidance_w must be non-negative")
     if flow_consistency_w < 0.0:
         raise ValueError("flow_consistency_w must be non-negative")
+    flow_distill_steps = int(flow_distill_steps)
+    if flow_distill_steps < 0:
+        raise ValueError("flow_distill_steps must be non-negative")
+    if flow_distill_w < 0.0:
+        raise ValueError("flow_distill_w must be non-negative")
+    if flow_distill_time_gap <= 0.0 or flow_distill_time_gap > 1.0:
+        raise ValueError("flow_distill_time_gap must be in (0, 1]")
+    flow_distill_teacher = str(flow_distill_teacher)
+    if flow_distill_teacher not in FLOW_DISTILL_TEACHERS:
+        raise ValueError(f"unknown flow distillation teacher {flow_distill_teacher!r}")
+    if (flow_distill_steps > 0 and flow_distill_w > 0.0
+            and flow_distill_teacher == "ema" and flow_ema_decay <= 0.0):
+        raise ValueError("flow_distill_teacher='ema' requires flow_ema_decay > 0")
     flow_cache_dir = str(flow_cache_dir or "")
     flow_cache_latents = bool(flow_cache_latents or flow_cache_dir)
     if flow_cache_latents and image_records is None:
@@ -4473,7 +4636,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                                             else 32).to(device)
     ae = make_autoencoder(ae_arch=ae_arch, latent_ch=latent_ch, hidden=hidden,
                           latent_downsample=latent_downsample,
-                          ae_res_blocks=ae_res_blocks).to(device)
+                          ae_res_blocks=ae_res_blocks,
+                          ae_hf_model=ae_hf_model,
+                          ae_hf_subfolder=ae_hf_subfolder,
+                          ae_hf_scaling_factor=ae_hf_scaling_factor).to(device)
+    latent_ch = int(getattr(ae, "latent_ch", latent_ch))
+    ae_has_trainable_params = any(p.requires_grad for p in ae.parameters())
+    ae_trainable_param_count = int(sum(p.numel() for p in ae.parameters() if p.requires_grad))
     text_aligner = None
     if image_records is not None and (image_text_align_w > 0.0 or flow_text_align_w > 0.0):
         text_aligner = ImageTextAligner(
@@ -4521,21 +4690,29 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     attach_text_aligner(flow, text_aligner)
     attach_image_feature_aligner(flow, image_feature_aligner)
     attach_flow_repa_aligner(flow, flow_repa_aligner)
-    ae_params = list(ae.parameters())
+    ae_params = [p for p in ae.parameters() if p.requires_grad]
     if text_aligner is not None and image_text_align_w > 0.0:
         ae_params += list(conditioner.parameters()) + list(text_aligner.parameters())
     if image_feature_aligner is not None and image_feature_align_w > 0.0:
         ae_params += list(image_feature_aligner.parameters())
-    opt_ae = torch.optim.AdamW(ae_params, lr=lr, weight_decay=0.01)
+    opt_ae = (
+        torch.optim.AdamW(ae_params, lr=lr, weight_decay=0.01)
+        if ae_params else None
+    )
     scaler = amp_grad_scaler(device, train_precision)
-    ae.train()
+    if ae_has_trainable_params:
+        ae.train()
+    else:
+        ae.eval()
     if text_aligner is not None:
         text_aligner.train()
     if image_feature_aligner is not None:
         image_feature_aligner.train()
     size_bucket_sample_counts = {image_size_key(bucket): 0 for bucket in train_size_buckets}
     last_ae = {}
-    for _ in range(ae_steps):
+    ae_train_steps_run = 0
+    for _ in range(ae_steps if opt_ae is not None else 0):
+        ae_train_steps_run += 1
         opt_ae.zero_grad(set_to_none=True)
         for _micro in range(ae_accum_steps):
             if image_records is None:
@@ -4640,6 +4817,67 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
             weights=image_sample_weights)
     attach_latent_stats(flow, latent_stats)
+
+    def sample_flow_distill_batch(teacher_conditioner=None):
+        return_tokens = flow_uses_cond_tokens(flow)
+        if flow_cache is not None:
+            z1, cache_payload = sample_latent_cache(flow_cache, rng, batch, device=device)
+            if caption_cond_source == "embedding":
+                embs = cache_payload["text_embeddings"].to(device=device)
+                cond = conditioner(embs, return_tokens=return_tokens)
+                teacher_cond = (
+                    teacher_conditioner(embs, return_tokens=return_tokens)
+                    if teacher_conditioner is not None else cond
+                )
+            else:
+                ids = cache_payload["caption_ids"]
+                cond = caption_condition_ids(
+                    ids, conditioner, device=device, return_tokens=return_tokens)
+                teacher_cond = (
+                    caption_condition_ids(
+                        ids, teacher_conditioner, device=device, return_tokens=return_tokens)
+                    if teacher_conditioner is not None else cond
+                )
+            return z1, cond, teacher_cond
+        if image_records is None:
+            x, fact_cond, _yc, _ys, specs = _batch(
+                batch, rng, size=size, device=device, return_specs=True)
+            with torch.no_grad(), amp_autocast(device, train_precision):
+                z1 = ae.encode(x)
+            if cond_mode == "facts":
+                cond = fact_cond
+                return z1, cond, cond
+            ids = prompt_ids(
+                specs, prompt_vocab, rng=rng, templates=prompt_templates, device=device)
+            cond = conditioner(ids, return_tokens=return_tokens)
+            teacher_cond = (
+                teacher_conditioner(ids, return_tokens=return_tokens)
+                if teacher_conditioner is not None else cond
+            )
+            return z1, cond, teacher_cond
+        _batch_size, x, captions, chosen_records = sample_bucketed_image_text_batch(
+            image_records, rng, batch=batch, size_buckets=train_size_buckets,
+            bucket_records=bucket_records, device=device, return_records=True,
+            crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
+            record_weights=image_record_weights)
+        with torch.no_grad(), amp_autocast(device, train_precision):
+            z1 = ae.encode(x)
+        if caption_cond_source == "embedding":
+            embs = record_text_embedding_tensor(chosen_records, device=device)
+            cond = conditioner(embs, return_tokens=return_tokens)
+            teacher_cond = (
+                teacher_conditioner(embs, return_tokens=return_tokens)
+                if teacher_conditioner is not None else cond
+            )
+        else:
+            ids = caption_ids(captions, prompt_vocab, max_len=caption_max_len, device=device)
+            cond = conditioner(ids, return_tokens=return_tokens)
+            teacher_cond = (
+                teacher_conditioner(ids, return_tokens=return_tokens)
+                if teacher_conditioner is not None else cond
+            )
+        return z1, cond, teacher_cond
+
     flow.train()
     if conditioner is not None:
         conditioner.train()
@@ -4728,6 +4966,79 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             if conditioner is not None:
                 update_ema_state(conditioner_ema, conditioner, last_ema_decay)
 
+    last_distill = {}
+    flow_distill_steps_run = 0
+    flow_distill_teacher_used = ""
+    if flow_distill_steps > 0 and flow_distill_w > 0.0:
+        if flow_distill_teacher == "ema":
+            flow_distill_teacher_used = "ema"
+        elif flow_distill_teacher == "auto" and flow_ema is not None:
+            flow_distill_teacher_used = "ema"
+        else:
+            flow_distill_teacher_used = "raw"
+        teacher_state = (
+            flow_ema if flow_distill_teacher_used == "ema" else clone_state_dict(flow)
+        )
+        teacher_flow = make_flow(
+            flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
+            dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim,
+            dit_head_width_mult=dit_head_width_mult,
+            latent_max_tokens=max_train_latent_tokens,
+            dit_qk_norm=dit_qk_norm, dit_attn_impl=dit_attn_impl,
+            dit_pos_embed=dit_pos_embed).to(device)
+        load_flow_state(teacher_flow, teacher_state)
+        attach_latent_stats(teacher_flow, latent_stats)
+        teacher_flow.eval()
+        for p in teacher_flow.parameters():
+            p.requires_grad_(False)
+        teacher_conditioner = None
+        if conditioner is not None:
+            teacher_conditioner = copy.deepcopy(conditioner).to(device)
+            if flow_distill_teacher_used == "ema" and conditioner_ema is not None:
+                teacher_conditioner.load_state_dict(conditioner_ema)
+            teacher_conditioner.eval()
+            for p in teacher_conditioner.parameters():
+                p.requires_grad_(False)
+        flow.train()
+        if conditioner is not None:
+            conditioner.train()
+        for _distill_step in range(flow_distill_steps):
+            opt_flow.zero_grad(set_to_none=True)
+            for _micro in range(flow_accum_steps):
+                z1, cond, teacher_cond = sample_flow_distill_batch(
+                    teacher_conditioner=teacher_conditioner)
+                with amp_autocast(device, train_precision):
+                    loss, parts = latent_flow_self_distill_losses(
+                        flow, teacher_flow, z1, cond, teacher_cond=teacher_cond,
+                        time_sampling=time_sampling,
+                        time_logit_mean=time_logit_mean, time_logit_std=time_logit_std,
+                        time_shift=effective_time_shift, latent_stats=latent_stats,
+                        time_gap=flow_distill_time_gap)
+                    scaled_loss = (float(flow_distill_w) * loss) / float(flow_accum_steps)
+                scaler.scale(scaled_loss).backward()
+                last_distill = {
+                    "total_loss": float((float(flow_distill_w) * loss).detach().cpu()),
+                    "flow_distill_w": float(flow_distill_w),
+                    "teacher": flow_distill_teacher_used,
+                }
+                last_distill.update({
+                    k: float(v.detach().cpu()) for k, v in parts.items()
+                })
+            if grad_clip > 0.0:
+                scaler.unscale_(opt_flow)
+                grad_norm = torch.nn.utils.clip_grad_norm_(flow_params, float(grad_clip))
+                last_distill["grad_norm"] = float(grad_norm.detach().cpu())
+            scaler.step(opt_flow)
+            scaler.update()
+            flow_distill_steps_run += 1
+            if flow_ema is not None:
+                ema_updates += 1
+                last_ema_decay = ema_effective_decay(flow_ema_decay, ema_updates,
+                                                     warmup=flow_ema_warmup)
+                update_ema_state(flow_ema, flow, last_ema_decay)
+                if conditioner is not None:
+                    update_ema_state(conditioner_ema, conditioner, last_ema_decay)
+
     if conditioner is not None:
         conditioner.eval()
     if text_aligner is not None:
@@ -4792,6 +5103,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     report.update({
         "experiment": "image3_latent_fact_conditioned_rectified_flow",
         "ae_steps": int(ae_steps),
+        "ae_train_steps_run": int(ae_train_steps_run),
+        "ae_trainable": bool(ae_has_trainable_params),
+        "ae_trainable_param_count": int(ae_trainable_param_count),
         "flow_steps": int(flow_steps),
         "batch": int(batch),
         "flow_cache_latents": bool(flow_cache is not None),
@@ -4832,6 +5146,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "size_bucket_missing_dims": int(bucket_missing_dims),
         "latent_ch": int(latent_ch),
         "ae_arch": ae_arch,
+        "ae_external": ae_arch == "hf-vae",
+        "ae_hf_model": ae_hf_model if ae_arch == "hf-vae" else "",
+        "ae_hf_subfolder": ae_hf_subfolder if ae_arch == "hf-vae" else "",
+        "ae_hf_scaling_factor": (
+            float(getattr(ae, "scaling_factor", ae_hf_scaling_factor))
+            if ae_arch == "hf-vae" else 0.0
+        ),
         "latent_downsample": int(getattr(ae, "downsample", latent_downsample)),
         "ae_res_blocks": int(ae_res_blocks) if ae_arch == "residual" else 0,
         "latent_h": int(latent_shape[1]),
@@ -4886,6 +5207,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "semantic_guidance_interval": list(semantic_guidance_interval),
         "flow_semantic_w": float(flow_semantic_w),
         "flow_consistency_w": float(flow_consistency_w),
+        "flow_distill_steps": int(flow_distill_steps),
+        "flow_distill_steps_run": int(flow_distill_steps_run),
+        "flow_distill_w": float(flow_distill_w),
+        "flow_distill_time_gap": float(flow_distill_time_gap),
+        "flow_distill_teacher": flow_distill_teacher,
+        "flow_distill_teacher_used": flow_distill_teacher_used,
         "flow_ema_decay": float(flow_ema_decay),
         "flow_ema_warmup": bool(flow_ema_warmup),
         "flow_ema_updates": int(ema_updates),
@@ -4933,6 +5260,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "prompt_vocab_size": len(prompt_vocab) if prompt_vocab is not None else 0,
         "last_ae": last_ae,
         "last_flow": last_flow,
+        "last_distill": last_distill,
         "last_flow_loss": last_flow.get("velocity_mse"),
         "fact_vocab": [list(f) for f in FACT_VOCAB],
     })
@@ -4964,6 +5292,12 @@ def selftest():
     shifted = flow_time_schedule(4, device="cpu", shift=4.0)
     assert torch.allclose(shifted[[0, -1]], torch.tensor([0.0, 1.0]))
     assert 0.0 < float(shifted[1]) < 0.25
+    try:
+        make_autoencoder(ae_arch="hf-vae")
+    except ValueError as e:
+        assert "ae-hf-model" in str(e)
+    else:
+        raise AssertionError("hf-vae should require an explicit model id")
     spec = ObjectSpec("p0", "blue", "triangle")
     cond = fact_condition(object_facts(spec), device="cpu")[None]
     img = sample_images(ae, flow, cond, latent_shape=(4, 8, 8), steps=2, device="cpu", seed=0,
@@ -4991,6 +5325,10 @@ def selftest():
                                             flow_semantic_w=0.25, ae_intervention_w=0.1,
                                             ae_factor_orth_w=0.05,
                                             flow_consistency_w=0.1,
+                                            flow_distill_steps=1,
+                                            flow_distill_w=0.5,
+                                            flow_distill_time_gap=0.25,
+                                            flow_distill_teacher="raw",
                                             flow_loss_weight="min-snr-v",
                                             flow_loss_weight_gamma=5.0,
                                             latent_normalize="channel",
@@ -5003,6 +5341,10 @@ def selftest():
     assert report2["cfg_rescale"] == 0.5
     assert report2["flow_semantic_w"] == 0.25
     assert report2["flow_consistency_w"] == 0.1
+    assert report2["flow_distill_steps"] == 1
+    assert report2["flow_distill_steps_run"] == 1
+    assert report2["flow_distill_w"] == 0.5
+    assert report2["flow_distill_teacher_used"] == "raw"
     assert report2["flow_loss_weight"] == "min-snr-v"
     assert report2["flow_loss_weight_gamma"] == 5.0
     assert report2["flow_loss_weight_normalize"] is True
@@ -5017,6 +5359,7 @@ def selftest():
     assert "latent_factor_orth_loss" in report2["last_ae"]
     assert "semantic_endpoint_ce" in report2["last_flow"]
     assert "endpoint_consistency_mse" in report2["last_flow"]
+    assert "distill_endpoint_mse" in report2["last_distill"]
     assert "velocity_mse_unweighted" in report2["last_flow"]
     assert report2["last_flow"]["velocity_weight_max"] >= report2["last_flow"]["velocity_weight_min"]
     img2 = sample_images(ae2, flow2, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
@@ -5031,6 +5374,8 @@ def selftest():
         flow_accum_steps=2, grad_clip=1.0, intervention_samples=0,
         time_shift_mode="dim", time_shift_ref_dim=24.0)
     assert report_res["ae_arch"] == "residual"
+    assert report_res["ae_trainable"] is True and report_res["ae_train_steps_run"] == 1
+    assert report_res["ae_trainable_param_count"] > 0
     assert report_res["ae_recon_loss"] == "hybrid"
     assert report_res["ae_accum_steps"] == 2 and report_res["flow_accum_steps"] == 2
     assert report_res["ae_effective_batch"] == 4 and report_res["flow_effective_batch"] == 4
@@ -5425,9 +5770,16 @@ def main(argv=None):
                     help=("manifest training buckets as comma/space/semicolon separated HxW values; "
                           "omitted uses --size"))
     ap.add_argument("--latent-ch", type=int, default=16, dest="latent_ch")
-    ap.add_argument("--ae-arch", default="semantic", choices=("semantic", "residual"),
+    ap.add_argument("--ae-arch", default="semantic", choices=AE_ARCHES,
                     dest="ae_arch",
                     help="autoencoder architecture for image latents")
+    ap.add_argument("--ae-hf-model", default="", dest="ae_hf_model",
+                    help="Diffusers AutoencoderKL model id when --ae-arch hf-vae")
+    ap.add_argument("--ae-hf-subfolder", default="", dest="ae_hf_subfolder",
+                    help="optional Hugging Face subfolder for --ae-hf-model")
+    ap.add_argument("--ae-hf-scaling-factor", type=float, default=0.0,
+                    dest="ae_hf_scaling_factor",
+                    help="override HF VAE latent scaling factor; 0 uses model config")
     ap.add_argument("--latent-downsample", type=int, default=4, dest="latent_downsample",
                     help="AE spatial compression factor; residual AE supports powers of two")
     ap.add_argument("--ae-res-blocks", type=int, default=1, dest="ae_res_blocks",
@@ -5533,6 +5885,18 @@ def main(argv=None):
     ap.add_argument("--flow-consistency-w", type=float, default=0.0,
                     dest="flow_consistency_w",
                     help="same-path clean-endpoint consistency loss weight for latent flow")
+    ap.add_argument("--flow-distill-steps", type=int, default=0,
+                    dest="flow_distill_steps",
+                    help="post-flow own-model endpoint distillation steps")
+    ap.add_argument("--flow-distill-w", type=float, default=1.0,
+                    dest="flow_distill_w",
+                    help="loss weight for own-model endpoint distillation")
+    ap.add_argument("--flow-distill-time-gap", type=float, default=0.25,
+                    dest="flow_distill_time_gap",
+                    help="fractional move toward clean data time for the frozen teacher")
+    ap.add_argument("--flow-distill-teacher", default="auto", choices=FLOW_DISTILL_TEACHERS,
+                    dest="flow_distill_teacher",
+                    help="teacher snapshot for own-model distillation")
     ap.add_argument("--flow-ema-decay", type=float, default=0.0, dest="flow_ema_decay",
                     help="EMA decay for flow/conditioner weights; 0 disables EMA")
     ap.add_argument("--no-ema-warmup", action="store_true", dest="no_ema_warmup",
@@ -5754,6 +6118,9 @@ def main(argv=None):
         dit_pos_embed=args.dit_pos_embed,
         latent_max_tokens=args.latent_max_tokens, ae_arch=args.ae_arch,
         latent_downsample=args.latent_downsample, ae_res_blocks=args.ae_res_blocks,
+        ae_hf_model=args.ae_hf_model,
+        ae_hf_subfolder=args.ae_hf_subfolder,
+        ae_hf_scaling_factor=args.ae_hf_scaling_factor,
         ae_recon_loss=args.ae_recon_loss, ae_grad_w=args.ae_grad_w,
         ae_ms_w=args.ae_ms_w, ae_latent_reg_w=args.ae_latent_reg_w,
         image_text_align_w=args.image_text_align_w,
@@ -5768,6 +6135,10 @@ def main(argv=None):
         sample_steps=args.sample_steps, roundtrip_samples=args.roundtrip_samples,
         flow_semantic_w=args.flow_semantic_w, cond_mode=args.cond_mode,
         flow_consistency_w=args.flow_consistency_w, size_buckets=cli_size_buckets,
+        flow_distill_steps=args.flow_distill_steps,
+        flow_distill_w=args.flow_distill_w,
+        flow_distill_time_gap=args.flow_distill_time_gap,
+        flow_distill_teacher=args.flow_distill_teacher,
         text_cond_dim=args.text_cond_dim, prompt_templates=templates,
         image_manifest=args.image_manifest, image_root=args.image_root,
         image_split=args.image_split, image_min_aesthetic=args.image_min_aesthetic,
@@ -5869,17 +6240,23 @@ def main(argv=None):
             conditioner.load_state_dict(raw_conditioner)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save({
-        "autoencoder_state_dict": ae.state_dict(),
+        "autoencoder_state_dict": (
+            {} if report.get("ae_external", False) else ae.state_dict()
+        ),
         "flow_state_dict": flow.state_dict(),
         "report": report,
         "fact_vocab": FACT_VOCAB,
-        "latent_ch": args.latent_ch,
+        "latent_ch": report.get("latent_ch", args.latent_ch),
         "image_size": image_size_value(run_size),
         "image_h": int(run_size[0]),
         "image_w": int(run_size[1]),
         "size_buckets": report.get("size_buckets", []),
         "size_bucket_count": report.get("size_bucket_count", 0),
         "ae_arch": args.ae_arch,
+        "ae_external": report.get("ae_external", False),
+        "ae_hf_model": args.ae_hf_model,
+        "ae_hf_subfolder": args.ae_hf_subfolder,
+        "ae_hf_scaling_factor": report.get("ae_hf_scaling_factor", args.ae_hf_scaling_factor),
         "latent_downsample": report.get("latent_downsample", args.latent_downsample),
         "ae_res_blocks": report.get("ae_res_blocks", args.ae_res_blocks),
         "latent_max_tokens": args.latent_max_tokens,
@@ -5918,7 +6295,7 @@ def main(argv=None):
         "dit_head_width_mult": args.dit_head_width_mult,
         "dit_qk_norm": report.get("dit_qk_norm", False),
         "dit_attn_impl": report.get("dit_attn_impl", "manual"),
-        "dit_pos_embed": report.get("dit_pos_embed", ""),
+        "dit_pos_embed": report.get("dit_pos_embed", "") or args.dit_pos_embed,
         "uses_2d_pos_embed": report.get("uses_2d_pos_embed", False),
         "cond_mode": args.cond_mode,
         "cond_dim": report["cond_dim"],
@@ -5951,6 +6328,13 @@ def main(argv=None):
         "ae_factor_orth_w": args.ae_factor_orth_w,
         "flow_semantic_w": args.flow_semantic_w,
         "flow_consistency_w": args.flow_consistency_w,
+        "flow_distill_steps": report.get("flow_distill_steps", args.flow_distill_steps),
+        "flow_distill_steps_run": report.get("flow_distill_steps_run", 0),
+        "flow_distill_w": report.get("flow_distill_w", args.flow_distill_w),
+        "flow_distill_time_gap": report.get(
+            "flow_distill_time_gap", args.flow_distill_time_gap),
+        "flow_distill_teacher": report.get("flow_distill_teacher", args.flow_distill_teacher),
+        "flow_distill_teacher_used": report.get("flow_distill_teacher_used", ""),
         "flow_ema_decay": args.flow_ema_decay,
         "flow_ema_warmup": not args.no_ema_warmup,
         "flow_ema_effective_decay": report.get("flow_ema_effective_decay", 0.0),

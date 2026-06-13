@@ -31,6 +31,9 @@ BASE_DEPS=(numpy pandas scikit-learn tokenizers nltk pillow)
 if [ "${INSTALL_IMAGE_EMBED_DEPS:-0}" = "1" ]; then
   BASE_DEPS+=(transformers accelerate)
 fi
+if [ "${INSTALL_IMAGE_HF_AE_DEPS:-0}" = "1" ]; then
+  BASE_DEPS+=(diffusers transformers accelerate safetensors)
+fi
 VIRTUAL_ENV=$VENV uv pip install --quiet "${BASE_DEPS[@]}"
 # WordNet for dictionary.py (genus-projected A1 dictionary)
 $VENV/bin/python -c "import nltk; nltk.download('wordnet', quiet=True); nltk.download('omw-1.4', quiet=True)"
