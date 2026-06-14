@@ -33,6 +33,7 @@ from scratchpad_model import CausalBlock, ScratchpadLM
 from .concepts import (
     LatentConceptHead,
     LatentConceptMemory,
+    LatentConceptSequencePredictor,
     latent_concept_association_loss,
     latent_concept_bridge_loss,
     latent_concept_bridge_scores,
@@ -46,6 +47,7 @@ from .concepts import (
     latent_concept_graph_snapshot,
     latent_concept_memory_loss,
     latent_concept_neighborhood_loss,
+    latent_concept_sequence_prediction_loss,
     latent_concept_slot_factorization_loss,
     latent_concept_transition_consistency_loss,
     latent_concept_vicreg_loss,
@@ -237,6 +239,7 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
         "copied_position_rows": 0,
         "copied_text_tensors": [],
         "copied_latent_tensors": [],
+        "copied_sequence_tensors": [],
         "skipped_shape": [],
         "skipped_missing": [],
     }
@@ -276,6 +279,7 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
             })
     text_prefixes = ("txt.enc.", "txt.blocks.", "txt.ln.")
     latent_prefixes = ("latent_concepts.", "latent_concept_memory.")
+    sequence_prefix = "reading_predictor."
     memory_key = "latent_concept_memory.memory"
     src_memory = state.get(memory_key)
     dst_memory = dst_state.get(memory_key)
@@ -287,14 +291,19 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
             if name in ("txt.emb.weight", "txt.pos.weight"):
                 continue
             if name.startswith(text_prefixes):
+                dst_name = name
                 copied_key = "copied_text_tensors"
             elif name.startswith(latent_prefixes):
+                dst_name = name
                 copied_key = "copied_latent_tensors"
+            elif name.startswith(sequence_prefix):
+                dst_name = "concept_sequence_predictor." + name[len(sequence_prefix):]
+                copied_key = "copied_sequence_tensors"
             else:
                 continue
-            dst_val = dst_state.get(name)
+            dst_val = dst_state.get(dst_name)
             if dst_val is None:
-                report["skipped_missing"].append(name)
+                report["skipped_missing"].append(dst_name)
                 continue
             if (name.startswith("latent_concept_memory.")
                     and name != memory_key
@@ -308,20 +317,22 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
                 continue
             if tuple(src_val.shape) != tuple(dst_val.shape):
                 report["skipped_shape"].append({
-                    "name": name,
+                    "name": dst_name,
                     "source": list(src_val.shape),
                     "target": list(dst_val.shape),
                 })
                 continue
             dst_val.copy_(src_val.to(device=dst_val.device, dtype=dst_val.dtype))
-            report[copied_key].append(name)
+            report[copied_key].append(dst_name)
     report["copied_text_tensor_count"] = len(report["copied_text_tensors"])
     report["copied_latent_tensor_count"] = len(report["copied_latent_tensors"])
+    report["copied_sequence_tensor_count"] = len(report["copied_sequence_tensors"])
     report["copied"] = bool(
         report["copied_token_embeddings"]
         or report["copied_position_rows"]
         or report["copied_text_tensor_count"]
-        or report["copied_latent_tensor_count"])
+        or report["copied_latent_tensor_count"]
+        or report["copied_sequence_tensor_count"])
     model.text_checkpoint_transfer = report
     return report
 
@@ -524,6 +535,9 @@ class MultimodalLM(nn.Module):
             self.latent_concept_slots, d, heads=heads,
             mixer_layers=self.latent_concept_layers)
             if self.latent_concept_slots > 0 else None)
+        self.concept_sequence_predictor = (
+            LatentConceptSequencePredictor(d)
+            if self.latent_concept_slots > 0 else None)
         self.latent_concept_memory = (LatentConceptMemory(
             self.latent_concept_memory_size, d)
             if self.latent_concept_memory_size > 0 else None)
@@ -632,6 +646,50 @@ def _batch_from_records(records, vocab, device, view_dims):
 def _sample_records(records, n, rng):
     idx = rng.integers(len(records), size=int(n))
     return [records[int(i)] for i in idx]
+
+
+def _sequence_order(rec, fallback):
+    meta = rec.meta if isinstance(rec.meta, dict) else {}
+    raw_order = meta.get(
+        "chunk_index", meta.get("order", meta.get("position", fallback)))
+    try:
+        return float(raw_order)
+    except (TypeError, ValueError):
+        return float(fallback)
+
+
+def mine_multimodal_sequence_pairs(records, split="train", n=0, seed=0):
+    """Pair adjacent multimodal records from source/order metadata."""
+    groups = {}
+    total = 0
+    for pos, rec in enumerate(records):
+        if rec.split != split:
+            continue
+        total += 1
+        meta = rec.meta if isinstance(rec.meta, dict) else {}
+        source = str(meta.get("source", meta.get("document", "__records__")))
+        groups.setdefault(source, []).append((_sequence_order(rec, pos), pos, rec))
+    pairs = []
+    for rows in groups.values():
+        rows = sorted(rows, key=lambda row: (row[0], row[1]))
+        pairs.extend((a[2], b[2]) for a, b in zip(rows, rows[1:]))
+    sampled = bool(n and n < len(pairs))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(pairs), size=int(n), replace=False)
+        pairs = [pairs[int(i)] for i in idx]
+    return pairs, {"n_records": int(total),
+                   "n_pairs": len(pairs),
+                   "n_sources": len(groups),
+                   "sampled": sampled,
+                   "split": split,
+                   "skipped": not bool(pairs)}
+
+
+def _sample_pairs(pairs, n, rng):
+    if not pairs:
+        return []
+    return [pairs[int(rng.integers(len(pairs)))] for _ in range(int(n))]
 
 
 def token_loss(logits, ids, pad):
@@ -902,6 +960,54 @@ def latent_multimodal_graph_prediction_loss_from_views(
             transitive_steps=transitive_steps, transitive_w=transitive_w,
             target_power=target_power))
     return torch.stack(losses).mean() if losses else target.sum() * 0.0
+
+
+def latent_multimodal_sequence_prediction_loss(
+        model, pair_batch, vocab, view_dims, device=DEV, temperature=0.1,
+        view_dropout=0.0):
+    if (getattr(model, "latent_concepts", None) is None
+            or getattr(model, "concept_sequence_predictor", None) is None
+            or not pair_batch or len(pair_batch) <= 1):
+        try:
+            dev = next(model.parameters()).device
+        except StopIteration:
+            dev = torch.device("cpu")
+        return torch.tensor(0.0, device=dev)
+    anchors = [a for a, _b in pair_batch]
+    positives = [b for _a, b in pair_batch]
+    anchor_features, anchor_txt, _anchor_ids = _batch_from_records(
+        anchors, vocab, device, view_dims)
+    positive_features, positive_txt, _positive_ids = _batch_from_records(
+        positives, vocab, device, view_dims)
+    source_slots = model.latent_concept_states(
+        anchor_features, anchor_txt, mode="full",
+        view_dropout=view_dropout, project=False)
+    target_slots = model.latent_concept_states(
+        positive_features, positive_txt, mode="full",
+        view_dropout=0.0, project=False)
+    return latent_concept_sequence_prediction_loss(
+        model.concept_sequence_predictor, source_slots, target_slots,
+        temperature=temperature)
+
+
+@torch.no_grad()
+def update_multimodal_sequence_transitions(model, pair_batch, vocab, view_dims,
+                                           device=DEV, decay=0.99):
+    memory = getattr(model, "latent_concept_memory", None)
+    if (getattr(model, "latent_concepts", None) is None
+            or memory is None or not pair_batch):
+        return 0
+    anchors = [a for a, _b in pair_batch]
+    positives = [b for _a, b in pair_batch]
+    anchor_features, anchor_txt, _anchor_ids = _batch_from_records(
+        anchors, vocab, device, view_dims)
+    positive_features, positive_txt, _positive_ids = _batch_from_records(
+        positives, vocab, device, view_dims)
+    source_slots = model.latent_concept_states(
+        anchor_features, anchor_txt, mode="full", project=True)
+    target_slots = model.latent_concept_states(
+        positive_features, positive_txt, mode="full", project=True)
+    return int(memory.update_transitions(source_slots, target_slots, decay=decay))
 
 
 @torch.no_grad()
@@ -1241,6 +1347,64 @@ def latent_multimodal_bridge_eval(model, records, vocab, view_dims, n=200,
     return report
 
 
+def latent_multimodal_sequence_eval(model, records, vocab, view_dims, n=200,
+                                    seed=1, device=DEV):
+    if (getattr(model, "latent_concepts", None) is None
+            or getattr(model, "concept_sequence_predictor", None) is None):
+        return {"sequence_acc": 0.0, "n_records": 0, "n_pairs": 0,
+                "sampled": False, "skipped": True}
+    pairs, mine_report = mine_multimodal_sequence_pairs(
+        records, split="eval", n=n, seed=seed)
+    if len(pairs) <= 1:
+        return {"sequence_acc": 0.0, "n_records": mine_report.get("n_records", 0),
+                "n_pairs": len(pairs), "sampled": mine_report.get("sampled", False),
+                "skipped": True, "mining": mine_report}
+    correct = total = 0
+    pos_sum = neg_sum = 0.0
+    neg_count = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(pairs), 64):
+            pair_batch = pairs[off:off + 64]
+            if len(pair_batch) <= 1:
+                continue
+            anchors = [a for a, _b in pair_batch]
+            positives = [b for _a, b in pair_batch]
+            anchor_features, anchor_txt, _anchor_ids = _batch_from_records(
+                anchors, vocab, device, view_dims)
+            positive_features, positive_txt, _positive_ids = _batch_from_records(
+                positives, vocab, device, view_dims)
+            source_slots = model.latent_concept_states(
+                anchor_features, anchor_txt, mode="full", project=False)
+            target_slots = model.latent_concept_states(
+                positive_features, positive_txt, mode="full", project=False)
+            predicted = model.concept_sequence_predictor(source_slots)
+            predicted = F.normalize(predicted.reshape(predicted.shape[0], -1), dim=-1)
+            target = F.normalize(target_slots.reshape(target_slots.shape[0], -1), dim=-1)
+            sim = predicted.matmul(target.t())
+            labels = torch.arange(sim.shape[0], device=sim.device)
+            nearest = sim.argmax(-1)
+            correct += int(nearest.eq(labels).sum())
+            total += int(sim.shape[0])
+            pos_sum += float(sim.diag().sum())
+            eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+            neg_sum += float(sim.masked_select(~eye).sum())
+            neg_count += int((~eye).sum())
+    if total == 0:
+        return {"sequence_acc": 0.0, "n_records": mine_report.get("n_records", 0),
+                "n_pairs": len(pairs), "sampled": mine_report.get("sampled", False),
+                "skipped": True, "mining": mine_report}
+    return {"sequence_acc": correct / max(1, total),
+            "positive_cosine": pos_sum / max(1, total),
+            "negative_cosine": neg_sum / max(1, neg_count),
+            "margin": (pos_sum / max(1, total)) - (neg_sum / max(1, neg_count)),
+            "n_records": mine_report.get("n_records", 0),
+            "n_pairs": len(pairs),
+            "sampled": mine_report.get("sampled", False),
+            "skipped": False,
+            "mining": mine_report}
+
+
 def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           device=DEV, log_every=100, layers=3, heads=4, max_len=128,
           view_tokens=4, txt_tokens=8, trunk_arch="mlp",
@@ -1287,6 +1451,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           latent_concept_graph_predict_transitive_w=0.1,
           latent_concept_graph_predict_target_power=1.0,
           latent_concept_bridge_w=0.0,
+          latent_concept_sequence_w=0.0,
+          latent_concept_sequence_batch=0,
+          latent_concept_sequence_temperature=0.1,
           latent_concept_neighborhood_w=0.0,
           latent_concept_neighborhood_temperature=0.1,
           latent_concept_neighborhood_margin=0.0,
@@ -1310,6 +1477,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_concept_w, latent_concept_factorization_w, latent_concept_memory_w,
         latent_concept_fer_w, latent_concept_association_w, latent_concept_composition_w,
         latent_concept_graph_predict_w, latent_concept_bridge_w,
+        latent_concept_sequence_w,
         latent_concept_neighborhood_w,
         latent_concept_transition_w, latent_concept_cluster_w)
     if any(float(w) < 0.0 for w in latent_weights):
@@ -1317,8 +1485,15 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     if (any(float(w) > 0.0 for w in latent_weights)
             or latent_concept_memory_size > 0) and latent_concept_slots <= 0:
         raise ValueError("latent concept losses require latent_concept_slots > 0")
+    if int(latent_concept_sequence_batch) < 0 or int(latent_concept_sequence_batch) == 1:
+        raise ValueError("latent concept sequence batch must be 0 or at least 2")
+    if float(latent_concept_sequence_temperature) <= 0.0:
+        raise ValueError("latent concept sequence temperature must be positive")
     records = load_manifest(manifest, root=root)
     train_records, eval_records = split_records(records)
+    sequence_batch = int(latent_concept_sequence_batch) or max(2, batch // 2)
+    sequence_pairs, sequence_report = mine_multimodal_sequence_pairs(
+        records, split="train")
     view_dims = feature_dims(records)
     vocab = build_vocab(records)
     torch.manual_seed(seed)
@@ -1418,6 +1593,13 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_bridge = (
             latent_multimodal_bridge_loss_from_views(model, latent_views)
             if latent_concept_bridge_w else base_loss * 0.0)
+        latent_sequence = base_loss * 0.0
+        if latent_concept_sequence_w and sequence_pairs:
+            sequence_pair_batch = _sample_pairs(sequence_pairs, sequence_batch, rng)
+            latent_sequence = latent_multimodal_sequence_prediction_loss(
+                model, sequence_pair_batch, vocab, view_dims, device=device,
+                temperature=latent_concept_sequence_temperature,
+                view_dropout=latent_concept_view_dropout)
         latent_neighborhood = (
             latent_multimodal_neighborhood_loss_from_views(
                 latent_views, temperature=latent_concept_neighborhood_temperature,
@@ -1443,6 +1625,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 + float(latent_concept_composition_w) * latent_composition
                 + float(latent_concept_graph_predict_w) * latent_graph_predict
                 + float(latent_concept_bridge_w) * latent_bridge
+                + float(latent_concept_sequence_w) * latent_sequence
                 + float(latent_concept_neighborhood_w) * latent_neighborhood
                 + float(latent_concept_transition_w) * latent_transition
                 + float(latent_concept_cluster_w) * latent_cluster)
@@ -1458,9 +1641,18 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                                 or latent_concept_graph_predict_w
                                 or latent_concept_bridge_w) else None)))
         transition_updates = 0
-        if latent_concept_graph_predict_w or latent_concept_bridge_w:
+        if (latent_concept_graph_predict_w or latent_concept_bridge_w
+                or latent_concept_sequence_w):
             transition_updates = int(update_multimodal_latent_transitions(
                 model, latent_views, decay=latent_concept_association_decay))
+        sequence_transition_updates = 0
+        if sequence_pairs and (latent_concept_sequence_w
+                               or latent_concept_graph_predict_w
+                               or latent_concept_bridge_w):
+            sequence_pair_batch = _sample_pairs(sequence_pairs, sequence_batch, rng)
+            sequence_transition_updates = int(update_multimodal_sequence_transitions(
+                model, sequence_pair_batch, vocab, view_dims, device=device,
+                decay=latent_concept_association_decay))
         fer_metrics = latent_multimodal_fer_metrics_from_views(latent_views)
         bridge_metrics = latent_multimodal_bridge_metrics_from_views(model, latent_views)
         last = {
@@ -1484,6 +1676,15 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "latent_graph_predict_loss": float(latent_graph_predict.detach()),
             "latent_bridge_loss": float(latent_bridge.detach()),
             "latent_bridge_w": float(latent_concept_bridge_w),
+            "latent_sequence_loss": float(latent_sequence.detach()),
+            "latent_sequence_w": float(latent_concept_sequence_w),
+            "latent_sequence_batch": int(sequence_batch),
+            "latent_sequence_temperature": float(
+                latent_concept_sequence_temperature),
+            "latent_sequence_pairs": len(sequence_pairs),
+            "latent_sequence_report": sequence_report,
+            "latent_sequence_transition_last_batch_updates": int(
+                sequence_transition_updates),
             "latent_bridge_score": float(bridge_metrics["bridge_score"]),
             "latent_bridge_entropy": float(bridge_metrics["bridge_entropy"]),
             "latent_bridge_connectivity": float(
@@ -1517,7 +1718,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                   f"token {last['token_loss']:.3f} agree {last['agreement_loss']:.3f} "
                   f"latent {last['latent_concept_loss']:.3f} "
                   f"fer {last['latent_fer_loss']:.3f} "
-                  f"memory {last['latent_memory_loss']:.3f}",
+                  f"memory {last['latent_memory_loss']:.3f} "
+                  f"sequence {last['latent_sequence_loss']:.3f}",
                   flush=True)
     model.train_metrics = last
     model.manifest_info = {
@@ -1554,6 +1756,9 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
     latent_bridge_probe = latent_multimodal_bridge_eval(
         model, eval_records, vocab, view_dims, n=eval_n, seed=seed + 31,
         device=device)
+    latent_sequence_probe = latent_multimodal_sequence_eval(
+        model, eval_records, vocab, view_dims, n=eval_n, seed=seed + 37,
+        device=device)
     architecture = dict(model.config)
     architecture["reader_prefix_tokens"] = (
         int(model.config["view_tokens"]) * len(model.config["view_names"])
@@ -1574,6 +1779,7 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         "latent_graph_probe": latent_probe,
         "latent_fer_probe": latent_fer_probe,
         "latent_bridge_probe": latent_bridge_probe,
+        "latent_sequence_probe": latent_sequence_probe,
         "text_checkpoint_transfer": getattr(model, "text_checkpoint_transfer", {}),
         "gate": metrics["full"]["token_acc"] >= 0.50,
     }
@@ -1607,6 +1813,10 @@ def _write_selftest_manifest(path):
             "text": ["sample", str(i), "label", label],
             "views": {"sensor_a": sensor_a, "sensor_b": sensor_b},
             "target": ["extract", "sample", str(i), "label", label, "done", "."],
+            "meta": {
+                "source": "selftest-eval" if i >= 8 else "selftest-train",
+                "chunk_index": i - 8 if i >= 8 else i,
+            },
         })
     with open(path, "w") as f:
         for row in rows:
@@ -1655,6 +1865,16 @@ def selftest():
             model, views["full"], relation_decay=0.5) > 0
         assert update_multimodal_latent_transitions(model, views, decay=0.5) > 0
         assert int(model.latent_concept_memory.transition_updates.item()) > 0
+        seq_pairs, seq_report = mine_multimodal_sequence_pairs(records, split="train")
+        assert seq_report["n_pairs"] == 7 and seq_report["skipped"] is False
+        assert torch.isfinite(latent_multimodal_sequence_prediction_loss(
+            model, seq_pairs[:2], vocab, view_dims, device="cpu", temperature=0.1))
+        assert update_multimodal_sequence_transitions(
+            model, seq_pairs[:2], vocab, view_dims, device="cpu", decay=0.5) > 0
+        seq_eval = latent_multimodal_sequence_eval(
+            model, records, vocab, view_dims, n=0, device="cpu")
+        assert seq_eval["skipped"] is False
+        assert math.isfinite(seq_eval["margin"])
         assert torch.isfinite(latent_multimodal_memory_loss_from_views(model, views))
         assert torch.isfinite(latent_multimodal_association_loss_from_views(model, views))
         assert torch.isfinite(latent_multimodal_composition_loss_from_views(model, views))
@@ -1680,6 +1900,8 @@ def selftest():
             latent_concept_composition_w=0.01,
             latent_concept_graph_predict_w=0.01,
             latent_concept_bridge_w=0.01,
+            latent_concept_sequence_w=0.01,
+            latent_concept_sequence_batch=2,
             latent_concept_neighborhood_w=0.01,
             latent_concept_transition_w=0.01,
             latent_concept_cluster_w=0.01)
@@ -1690,6 +1912,11 @@ def selftest():
         assert trained_model.train_metrics["latent_bridge_graph_ready"] is True
         assert trained_model.train_metrics["latent_bridge_skipped"] is False
         assert math.isfinite(trained_model.train_metrics["latent_bridge_score"])
+        assert trained_model.train_metrics["latent_sequence_w"] == 0.01
+        assert trained_model.train_metrics["latent_sequence_pairs"] == 7
+        assert math.isfinite(trained_model.train_metrics["latent_sequence_loss"])
+        assert (trained_model.train_metrics[
+            "latent_sequence_transition_last_batch_updates"] > 0)
     print("multimodal selftest OK")
 
 
@@ -1803,6 +2030,13 @@ def main(argv=None):
     ap.add_argument("--latent-concept-bridge-w", type=float, default=0.0,
                     dest="latent_concept_bridge_w",
                     help="weight for label-free weak-connection bridge closure")
+    ap.add_argument("--latent-concept-sequence-w", type=float, default=0.0,
+                    dest="latent_concept_sequence_w",
+                    help="weight for adjacent-record latent concept prediction")
+    ap.add_argument("--latent-concept-sequence-batch", type=int, default=0,
+                    dest="latent_concept_sequence_batch")
+    ap.add_argument("--latent-concept-sequence-temperature", type=float,
+                    default=0.1, dest="latent_concept_sequence_temperature")
     ap.add_argument("--latent-concept-neighborhood-w", type=float, default=0.0,
                     dest="latent_concept_neighborhood_w")
     ap.add_argument("--latent-concept-neighborhood-temperature", type=float,
@@ -1874,6 +2108,7 @@ def main(argv=None):
         args.latent_concept_association_w,
         args.latent_concept_composition_w, args.latent_concept_graph_predict_w,
         args.latent_concept_bridge_w,
+        args.latent_concept_sequence_w,
         args.latent_concept_neighborhood_w, args.latent_concept_transition_w,
         args.latent_concept_cluster_w,
     ]
@@ -1899,6 +2134,10 @@ def main(argv=None):
         ap.error("--latent-concept-composition-temperature must be positive")
     if args.latent_concept_graph_predict_temperature <= 0.0:
         ap.error("--latent-concept-graph-predict-temperature must be positive")
+    if args.latent_concept_sequence_batch < 0 or args.latent_concept_sequence_batch == 1:
+        ap.error("--latent-concept-sequence-batch must be 0 or at least 2")
+    if args.latent_concept_sequence_temperature <= 0.0:
+        ap.error("--latent-concept-sequence-temperature must be positive")
     if args.latent_concept_neighborhood_temperature <= 0.0:
         ap.error("--latent-concept-neighborhood-temperature must be positive")
     if args.latent_concept_transition_temperature <= 0.0:
@@ -1976,6 +2215,10 @@ def main(argv=None):
         latent_concept_graph_predict_target_power=(
             args.latent_concept_graph_predict_target_power),
         latent_concept_bridge_w=args.latent_concept_bridge_w,
+        latent_concept_sequence_w=args.latent_concept_sequence_w,
+        latent_concept_sequence_batch=args.latent_concept_sequence_batch,
+        latent_concept_sequence_temperature=(
+            args.latent_concept_sequence_temperature),
         latent_concept_neighborhood_w=args.latent_concept_neighborhood_w,
         latent_concept_neighborhood_temperature=(
             args.latent_concept_neighborhood_temperature),

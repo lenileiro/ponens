@@ -52,6 +52,7 @@ from scratchpad_model import CausalBlock, ScratchpadLM
 from .concepts import (
     LatentConceptHead,
     LatentConceptMemory,
+    LatentConceptSequencePredictor,
     SchemaConceptHead,
     SchemaConceptRefiner,
     latent_concept_bridge_loss,
@@ -68,6 +69,7 @@ from .concepts import (
     latent_concept_graph_ready,
     latent_concept_graph_snapshot,
     latent_concept_neighborhood_loss,
+    latent_concept_sequence_prediction_loss,
     latent_concept_slot_factorization_loss,
     latent_concept_transition_consistency_loss,
     latent_concept_vicreg_loss,
@@ -779,12 +781,7 @@ class TextFactLM(nn.Module):
                               arch=self.text_encoder_arch)
         self.lm = ScratchpadLM(vocab_size, d=d, layers=layers, heads=heads, max_len=max_len,
                                pad=pad, pointer=False, loop=False)
-        self.reading_predictor = nn.Sequential(
-            nn.LayerNorm(d),
-            nn.Linear(d, d),
-            nn.GELU(),
-            nn.Linear(d, d, bias=False),
-        )
+        self.reading_predictor = LatentConceptSequencePredictor(d)
         self.fact_schema = fact_schema
         self.fact_heads = nn.ModuleDict()
         self.fact_concept_refiner = None
@@ -1912,12 +1909,9 @@ def reading_sequence_prediction_loss(model, pairs, vocab, device=DEV,
         anchor_txt, feature_dropout=feature_dropout, project=False)
     target_slots = model.latent_concept_states(
         positive_txt, feature_dropout=0.0, project=False).detach()
-    predicted = model.reading_predictor(source_slots)
-    predicted = F.normalize(predicted.reshape(predicted.shape[0], -1), dim=-1)
-    target = F.normalize(target_slots.reshape(target_slots.shape[0], -1), dim=-1)
-    logits = predicted.matmul(target.t()) / max(float(temperature), 1e-6)
-    labels = torch.arange(logits.shape[0], device=logits.device)
-    return F.cross_entropy(logits, labels)
+    return latent_concept_sequence_prediction_loss(
+        model.reading_predictor, source_slots, target_slots,
+        temperature=temperature)
 
 
 @torch.no_grad()

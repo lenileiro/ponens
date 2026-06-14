@@ -115,6 +115,18 @@ class LatentConceptHead(nn.Module):
         return slots
 
 
+class LatentConceptSequencePredictor(nn.Sequential):
+    """Predict the next latent concept state from the current one."""
+
+    def __init__(self, d):
+        super().__init__(
+            nn.LayerNorm(d),
+            nn.Linear(d, d),
+            nn.GELU(),
+            nn.Linear(d, d, bias=False),
+        )
+
+
 class LatentConceptMemory(nn.Module):
     """Checkpointed schema-free prototype memory for latent concept slots."""
 
@@ -409,6 +421,39 @@ def latent_concept_memory_loss(slots, memory, temperature=0.1, balance_w=0.0):
         losses.append(float(balance_w) * F.kl_div(
             probs.clamp_min(1e-8).log(), uniform, reduction="batchmean"))
     return torch.stack(losses).mean()
+
+
+def latent_concept_sequence_prediction_loss(predictor, source_slots, target_slots,
+                                            temperature=0.1):
+    """Self-supervised next-concept prediction over latent slots.
+
+    The caller chooses what "next" means from data order or another learned
+    transition source. The loss only sees latent states and a predictor module,
+    so it can be reused for reading chunks, multimodal streams, or future
+    temporal observations without task-specific labels.
+    """
+    if source_slots is None or target_slots is None or predictor is None:
+        slots = source_slots if source_slots is not None else target_slots
+        if slots is None:
+            return torch.tensor(0.0)
+        return slots.sum() * 0.0
+    if source_slots.ndim != 3 or target_slots.ndim != 3:
+        raise ValueError("latent sequence prediction expects [batch, slots, dim]")
+    if source_slots.shape[0] != target_slots.shape[0]:
+        raise ValueError("latent sequence prediction batch mismatch")
+    if source_slots.shape[-1] != target_slots.shape[-1]:
+        raise ValueError("latent sequence prediction dimension mismatch")
+    if source_slots.shape[0] <= 1:
+        return source_slots.sum() * 0.0
+    predicted = predictor(source_slots)
+    predicted = F.normalize(predicted.reshape(predicted.shape[0], -1), dim=-1)
+    target = F.normalize(
+        target_slots.detach().to(source_slots).reshape(target_slots.shape[0], -1),
+        dim=-1)
+    temp = max(float(temperature), 1e-6)
+    logits = predicted.matmul(target.t()) / temp
+    labels = torch.arange(logits.shape[0], device=logits.device)
+    return F.cross_entropy(logits, labels)
 
 
 def latent_concept_association_loss(slots, memory, relations, temperature=0.1,
