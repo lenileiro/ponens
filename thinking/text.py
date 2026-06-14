@@ -70,6 +70,7 @@ from .concepts import (
     latent_concept_graph_snapshot,
     latent_concept_neighborhood_loss,
     latent_concept_sequence_prediction_loss,
+    latent_concept_sequence_prediction_scores,
     latent_concept_slot_factorization_loss,
     latent_concept_transition_consistency_loss,
     latent_concept_vicreg_loss,
@@ -2336,11 +2337,12 @@ READING_SCORE_METRICS = (
 READING_DISCOVERY_SIGNALS = (
     "view", "context", "sequence", "neighborhood", "cluster", "fer", "bridge")
 READING_STUDY_STRATEGIES = (
-    "random", "errors", "curiosity", "graph", "cycle", "discovery", "auto")
+    "random", "errors", "curiosity", "sequence", "graph", "cycle",
+    "discovery", "auto")
 READING_MEMORY_STUDY_STRATEGIES = ("curiosity", "graph", "discovery")
 READING_POOL_STUDY_STRATEGIES = (
-    "errors", "curiosity", "graph", "cycle", "discovery")
-READING_TRANSITION_STUDY_STRATEGIES = ("graph", "cycle", "discovery")
+    "errors", "curiosity", "sequence", "graph", "cycle", "discovery")
+READING_TRANSITION_STUDY_STRATEGIES = ("sequence", "graph", "cycle", "discovery")
 READING_GRAPH_READY_STUDY_STRATEGIES = ("graph", "cycle")
 
 
@@ -2697,6 +2699,100 @@ def reading_latent_curiosity_records(
                       "skipped": False}
 
 
+def _reading_sequence_surprise_rows(
+        model, vocab, pairs, device=DEV, token_drop_p=0.15,
+        token_replace_p=0.05, feature_dropout=0.0, temperature=0.1):
+    rows = []
+    if (getattr(model, "latent_concepts", None) is None
+            or not hasattr(model, "reading_predictor")
+            or len(pairs) <= 1):
+        return rows
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(pairs), 64):
+            pair_batch = pairs[off:off + 64]
+            if len(pair_batch) <= 1:
+                continue
+            anchors = [a for a, _b in pair_batch]
+            positives = [b for _a, b in pair_batch]
+            anchor_txt = corrupt_reading_tokens(
+                pack_reading(anchors, vocab, device), vocab.pad, vocab.unk,
+                token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+            positive_txt = corrupt_reading_tokens(
+                pack_reading(positives, vocab, device), vocab.pad, vocab.unk,
+                token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+            source_slots = model.latent_concept_states(
+                anchor_txt, feature_dropout=feature_dropout, project=False)
+            target_slots = model.latent_concept_states(
+                positive_txt, feature_dropout=0.0, project=False)
+            scores, parts = latent_concept_sequence_prediction_scores(
+                model.reading_predictor, source_slots, target_slots,
+                temperature=temperature)
+            ce = parts.get("cross_entropy", scores.new_zeros(scores.shape))
+            pos = parts.get("positive_cosine", scores.new_zeros(scores.shape))
+            neg = parts.get("hard_negative_cosine", scores.new_zeros(scores.shape))
+            rank = parts.get("rank", scores.new_zeros(scores.shape))
+            for i, (anchor, positive) in enumerate(pair_batch):
+                rows.append({
+                    "anchor": anchor,
+                    "positive": positive,
+                    "sequence_surprise": float(scores[i].detach().cpu()),
+                    "sequence_cross_entropy": float(ce[i].detach().cpu()),
+                    "sequence_positive_cosine": float(pos[i].detach().cpu()),
+                    "sequence_hard_negative_cosine": float(neg[i].detach().cpu()),
+                    "sequence_rank": float(rank[i].detach().cpu()),
+                })
+    return rows
+
+
+def reading_sequence_surprise_records(
+        model, vocab, records, device=DEV, n=0, seed=0,
+        token_drop_p=0.15, token_replace_p=0.05, feature_dropout=0.0,
+        temperature=0.1):
+    if (getattr(model, "latent_concepts", None) is None
+            or not hasattr(model, "reading_predictor")):
+        return [], {"n_records": 0, "n_pairs": 0, "sampled": False,
+                    "n_selected": 0, "mean_sequence_surprise": 0.0,
+                    "max_sequence_surprise": 0.0, "skipped": True}
+    pairs, mine_report = mine_reading_sequence_pairs(
+        records, split="train", n=n, seed=seed)
+    rows = _reading_sequence_surprise_rows(
+        model, vocab, pairs, device=device, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+        temperature=temperature)
+    rows.sort(key=lambda row: row["sequence_surprise"], reverse=True)
+    selected = []
+    seen = set()
+    for row in rows:
+        for rec in (row["anchor"], row["positive"]):
+            if rec.rec_id in seen:
+                continue
+            seen.add(rec.rec_id)
+            selected.append(rec)
+
+    def mean_field(name):
+        return float(np.mean([row[name] for row in rows])) if rows else 0.0
+
+    def max_field(name):
+        return float(max([row[name] for row in rows])) if rows else 0.0
+
+    return selected, {"n_records": mine_report.get("n_records", 0),
+                      "n_pairs": len(pairs),
+                      "sampled": mine_report.get("sampled", False),
+                      "n_selected": len(selected),
+                      "mean_sequence_surprise": mean_field("sequence_surprise"),
+                      "max_sequence_surprise": max_field("sequence_surprise"),
+                      "mean_sequence_cross_entropy": mean_field(
+                          "sequence_cross_entropy"),
+                      "mean_sequence_positive_cosine": mean_field(
+                          "sequence_positive_cosine"),
+                      "mean_sequence_hard_negative_cosine": mean_field(
+                          "sequence_hard_negative_cosine"),
+                      "mean_sequence_rank": mean_field("sequence_rank"),
+                      "skipped": not bool(rows),
+                      "mining": mine_report}
+
+
 def reading_latent_graph_prediction_records(
         model, vocab, records, device=DEV, n=0, seed=0, context_keep_p=0.5,
         feature_dropout=0.0, temperature=0.1, self_loop_w=0.05,
@@ -2879,7 +2975,8 @@ def reading_latent_discovery_records(
         graph_transitive_w=0.1, graph_target_power=1.0,
         cycle_temperature=0.1, cycle_self_loop_w=0.05,
         cycle_transitive_steps=2, cycle_transitive_w=0.1,
-        cycle_target_power=1.0, cycle_w=0.5):
+        cycle_target_power=1.0, cycle_w=0.5,
+        sequence_temperature=0.1):
     memory = getattr(model, "latent_concept_memory", None)
     if getattr(model, "latent_concepts", None) is None or memory is None:
         return [], {"n_records": 0, "sampled": False, "n_selected": 0,
@@ -2890,6 +2987,26 @@ def reading_latent_discovery_records(
         rng = np.random.default_rng(seed)
         idx = rng.choice(len(candidates), size=n, replace=False)
         candidates = [candidates[int(i)] for i in idx]
+    candidate_ids = {rec.rec_id for rec in candidates}
+    sequence_pairs, sequence_mining = mine_reading_sequence_pairs(
+        records, split="train")
+    if candidate_ids:
+        sequence_pairs = [
+            (a, b) for a, b in sequence_pairs
+            if a.rec_id in candidate_ids and b.rec_id in candidate_ids
+        ]
+    sequence_rows = _reading_sequence_surprise_rows(
+        model, vocab, sequence_pairs, device=device,
+        token_drop_p=0.0, token_replace_p=0.0,
+        feature_dropout=0.0, temperature=sequence_temperature)
+    sequence_by_id = {}
+    for seq_row in sequence_rows:
+        for key in ("anchor", "positive"):
+            rec = seq_row[key]
+            current = sequence_by_id.get(rec.rec_id)
+            if (current is None
+                    or seq_row["sequence_surprise"] > current["sequence_surprise"]):
+                sequence_by_id[rec.rec_id] = seq_row
     rows = []
     model.eval()
     with torch.no_grad():
@@ -2958,6 +3075,7 @@ def reading_latent_discovery_records(
             target_cycle = cycle_parts.get(
                 "target_cycle_kl", cycle.new_zeros(cycle.shape))
             for i, rec in enumerate(batch):
+                seq = sequence_by_id.get(rec.rec_id, {})
                 rows.append({
                     "record": rec,
                     "curiosity": float(curiosity[i].detach().cpu()),
@@ -2976,8 +3094,19 @@ def reading_latent_discovery_records(
                     "bridge_entropy": float(bridge_entropy[i].detach().cpu()),
                     "bridge_connectivity": float(
                         bridge_connectivity[i].detach().cpu()),
+                    "sequence_surprise": float(
+                        seq.get("sequence_surprise", 0.0)),
+                    "sequence_cross_entropy": float(
+                        seq.get("sequence_cross_entropy", 0.0)),
+                    "sequence_positive_cosine": float(
+                        seq.get("sequence_positive_cosine", 0.0)),
+                    "sequence_hard_negative_cosine": float(
+                        seq.get("sequence_hard_negative_cosine", 0.0)),
+                    "sequence_rank": float(seq.get("sequence_rank", 0.0)),
                 })
-    components = ("curiosity", "graph", "cycle", "slot_disorder", "bridge")
+    components = (
+        "curiosity", "graph", "cycle", "slot_disorder", "bridge",
+        "sequence_surprise")
     for name in components:
         scaled = _minmax_scale([row[name] for row in rows])
         for row, value in zip(rows, scaled):
@@ -3014,6 +3143,17 @@ def reading_latent_discovery_records(
                       "max_bridge_score": max_field("bridge"),
                       "mean_bridge_entropy": mean_field("bridge_entropy"),
                       "mean_bridge_connectivity": mean_field("bridge_connectivity"),
+                      "mean_sequence_surprise": mean_field("sequence_surprise"),
+                      "max_sequence_surprise": max_field("sequence_surprise"),
+                      "mean_sequence_cross_entropy": mean_field(
+                          "sequence_cross_entropy"),
+                      "mean_sequence_positive_cosine": mean_field(
+                          "sequence_positive_cosine"),
+                      "mean_sequence_hard_negative_cosine": mean_field(
+                          "sequence_hard_negative_cosine"),
+                      "mean_sequence_rank": mean_field("sequence_rank"),
+                      "n_sequence_pairs": len(sequence_rows),
+                      "sequence_mining": sequence_mining,
                       "skipped": False}
 
 
@@ -3518,6 +3658,14 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 transitive_w=graph_predict_transitive_w,
                 target_power=graph_predict_target_power)
             report = report | {"strategy": "graph"}
+        elif study_strategy == "sequence":
+            selected, report = reading_sequence_surprise_records(
+                model, vocab, records, device=device, n=probe_n,
+                seed=seed + 1301 + int(step),
+                token_drop_p=0.0, token_replace_p=0.0,
+                feature_dropout=0.0,
+                temperature=sequence_temperature)
+            report = report | {"strategy": "sequence"}
         elif study_strategy == "cycle":
             selected, report = reading_latent_graph_cycle_records(
                 model, vocab, records, device=device, n=probe_n,
@@ -3551,7 +3699,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 cycle_transitive_steps=graph_cycle_transitive_steps,
                 cycle_transitive_w=graph_cycle_transitive_w,
                 cycle_target_power=graph_cycle_target_power,
-                cycle_w=graph_cycle_consistency_w)
+                cycle_w=graph_cycle_consistency_w,
+                sequence_temperature=sequence_temperature)
             report = report | {"strategy": "discovery"}
         else:
             hard, _correct, report = reading_latent_record_outcomes(
@@ -4103,7 +4252,8 @@ def fit_reading_concepts_select_best(
         context_keep_p=context_keep_p, score_metric=score_metric,
         score_margin_w=score_margin_w)
     bridge_insight_gate = bool(
-        bridge_w and initial_study_strategy in READING_POOL_STUDY_STRATEGIES)
+        bridge_w and initial_study_strategy in READING_POOL_STUDY_STRATEGIES
+        and initial_study_strategy != "sequence")
     replay_records = list(replay_records or [])
     before_replay_bundle = None
     if replay_records and replay_retention_w:
@@ -6917,6 +7067,11 @@ def selftest():
     seq_updates = update_reading_sequence_transitions(
         reading_model, seq_pairs, reading_vocab, device="cpu", decay=0.5)
     assert seq_updates > 0
+    seq_selected, seq_study_report = reading_sequence_surprise_records(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0,
+        token_drop_p=0.1, token_replace_p=0.0)
+    assert seq_selected and seq_study_report["n_pairs"] == 2
+    assert math.isfinite(seq_study_report["mean_sequence_surprise"])
     assert torch.isfinite(reading_latent_memory_loss(
         reading_model, reading_txt, feature_dropout=0.1))
     assert torch.isfinite(reading_latent_association_loss(
@@ -6952,6 +7107,8 @@ def selftest():
     assert math.isfinite(discovery_report["mean_score"])
     assert "mean_slot_disorder" in discovery_report
     assert "mean_bridge_score" in discovery_report
+    assert "mean_sequence_surprise" in discovery_report
+    assert discovery_report["n_sequence_pairs"] == 2
     bridge_eval = reading_latent_bridge_eval(
         reading_model, reading_vocab, reading_records, device="cpu", n=0)
     assert bridge_eval["skipped"] is False
@@ -7031,6 +7188,9 @@ def selftest():
     assert any("mean_reverse_kl" in r for r in reading_model.reading_study_reports
                if r.get("strategy") == "discovery")
     assert any("mean_bridge_score" in r for r in reading_model.reading_study_reports
+               if r.get("strategy") == "discovery")
+    assert any("mean_sequence_surprise" in r
+               for r in reading_model.reading_study_reports
                if r.get("strategy") == "discovery")
     assert any("pool_bridge_before" in r for r in reading_model.reading_study_reports
                if r.get("strategy") == "discovery")

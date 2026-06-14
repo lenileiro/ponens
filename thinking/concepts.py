@@ -456,6 +456,50 @@ def latent_concept_sequence_prediction_loss(predictor, source_slots, target_slot
     return F.cross_entropy(logits, labels)
 
 
+def latent_concept_sequence_prediction_scores(predictor, source_slots, target_slots,
+                                              temperature=0.1):
+    """Score how surprising each source->target latent concept transition is."""
+    if source_slots is None or target_slots is None or predictor is None:
+        slots = source_slots if source_slots is not None else target_slots
+        if slots is None:
+            zero = torch.zeros(0)
+            return zero, {"cross_entropy": zero, "positive_cosine": zero,
+                          "hard_negative_cosine": zero, "rank": zero}
+        zero = slots.reshape(slots.shape[0], -1).sum(-1) * 0.0
+        return zero, {"cross_entropy": zero, "positive_cosine": zero,
+                      "hard_negative_cosine": zero, "rank": zero}
+    if source_slots.ndim != 3 or target_slots.ndim != 3:
+        raise ValueError("latent sequence prediction scores expect [batch, slots, dim]")
+    if source_slots.shape[0] != target_slots.shape[0]:
+        raise ValueError("latent sequence prediction score batch mismatch")
+    if source_slots.shape[-1] != target_slots.shape[-1]:
+        raise ValueError("latent sequence prediction score dimension mismatch")
+    if source_slots.shape[0] <= 1:
+        zero = source_slots.reshape(source_slots.shape[0], -1).sum(-1) * 0.0
+        return zero, {"cross_entropy": zero, "positive_cosine": zero,
+                      "hard_negative_cosine": zero, "rank": zero}
+    predicted = predictor(source_slots)
+    predicted = F.normalize(predicted.reshape(predicted.shape[0], -1), dim=-1)
+    target = F.normalize(
+        target_slots.detach().to(source_slots).reshape(target_slots.shape[0], -1),
+        dim=-1)
+    sim = predicted.matmul(target.t())
+    labels = torch.arange(sim.shape[0], device=sim.device)
+    temp = max(float(temperature), 1e-6)
+    cross_entropy = F.cross_entropy(sim / temp, labels, reduction="none")
+    positive = sim.diag()
+    eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+    hard_negative = sim.masked_fill(eye, -float("inf")).max(-1).values
+    hard_negative = torch.where(
+        torch.isfinite(hard_negative), hard_negative, torch.zeros_like(positive))
+    rank = sim.ge(positive[:, None]).sum(-1).to(dtype=sim.dtype) - 1.0
+    surprise = cross_entropy + F.relu(hard_negative - positive)
+    return surprise, {"cross_entropy": cross_entropy,
+                      "positive_cosine": positive,
+                      "hard_negative_cosine": hard_negative,
+                      "rank": rank}
+
+
 def latent_concept_association_loss(slots, memory, relations, temperature=0.1,
                                     target_power=1.0, self_loop_w=0.05,
                                     transitive_steps=1, transitive_w=0.0):
