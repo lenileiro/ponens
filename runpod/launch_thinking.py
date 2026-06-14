@@ -525,6 +525,9 @@ def apply_image_quality_preset(args):
     args.image_flow_consistency_w = max(float(args.image_flow_consistency_w), 0.05)
     args.image_flow_endpoint_w = max(float(args.image_flow_endpoint_w), 0.1)
     args.image_flow_frequency_w = max(float(args.image_flow_frequency_w), 0.02 if hq else 0.01)
+    args.image_flow_multiscale_w = max(float(args.image_flow_multiscale_w), 0.03 if hq else 0.01)
+    if not str(args.image_flow_multiscale_scales or "").strip():
+        args.image_flow_multiscale_scales = "2,4"
     args.image_flow_noise_coupling = "sliced_ot"
     args.image_flow_noise_coupling_projections = max(
         int(args.image_flow_noise_coupling_projections), 4)
@@ -1030,6 +1033,8 @@ def payload(args):
                      f"--flow-consistency-w {args.image_flow_consistency_w} "
                      f"--flow-endpoint-w {args.image_flow_endpoint_w} "
                      f"--flow-frequency-w {args.image_flow_frequency_w} "
+                     f"--flow-multiscale-w {args.image_flow_multiscale_w} "
+                     f"--flow-multiscale-scales {shlex_quote(args.image_flow_multiscale_scales)} "
                      f"--flow-noise-coupling {args.image_flow_noise_coupling} "
                      f"--flow-noise-coupling-projections "
                      f"{args.image_flow_noise_coupling_projections} "
@@ -2646,6 +2651,12 @@ def main():
     ap.add_argument("--image-flow-frequency-w", type=float, default=0.0,
                     dest="image_flow_frequency_w",
                     help="frequency-domain clean-endpoint latent loss weight for image flow")
+    ap.add_argument("--image-flow-multiscale-w", type=float, default=0.0,
+                    dest="image_flow_multiscale_w",
+                    help="coarse-to-fine downsampled velocity loss weight for image flow")
+    ap.add_argument("--image-flow-multiscale-scales", default="2,4",
+                    dest="image_flow_multiscale_scales",
+                    help="comma-separated latent downsample scales for image flow multiscale loss")
     ap.add_argument("--image-flow-noise-coupling", default="random",
                     choices=("random", "sliced_ot"), dest="image_flow_noise_coupling",
                     help="source-noise/data pairing for image flow matching")
@@ -3417,6 +3428,18 @@ def main():
         sys.exit("ERROR: --image-flow-endpoint-w must be non-negative")
     if args.image_flow_frequency_w < 0.0:
         sys.exit("ERROR: --image-flow-frequency-w must be non-negative")
+    if args.image_flow_multiscale_w < 0.0:
+        sys.exit("ERROR: --image-flow-multiscale-w must be non-negative")
+    for raw_scale in str(args.image_flow_multiscale_scales or "").split(","):
+        raw_scale = raw_scale.strip()
+        if not raw_scale:
+            continue
+        try:
+            scale = int(raw_scale)
+        except ValueError:
+            sys.exit("ERROR: --image-flow-multiscale-scales must contain integers")
+        if scale <= 1:
+            sys.exit("ERROR: --image-flow-multiscale-scales entries must be > 1")
     if args.image_flow_self_repa_w < 0.0:
         sys.exit("ERROR: --image-flow-self-repa-w must be non-negative")
     if args.image_flow_self_repa_steps < 0:
