@@ -3672,10 +3672,17 @@ def fit_reading_concepts_select_best(
         replay_teacher_vocab=None, replay_w=0.0, replay_batch=0,
         replay_retention_w=0.0,
         eval_n=64, score_metric="mastery", score_margin_w=0.1,
+        score_min_delta=0.0, score_patience=0,
         rounds=1, before_bundle=None):
     schedule = _step_schedule(steps, rounds)
     if not schedule:
         raise ValueError("reading selected training requires at least one step")
+    score_min_delta = float(score_min_delta)
+    if score_min_delta < 0.0:
+        raise ValueError("reading study score min delta must be non-negative")
+    score_patience = int(score_patience)
+    if score_patience < 0:
+        raise ValueError("reading study score patience must be non-negative")
     if int(memory_size) > 0:
         model.enable_latent_concept_memory(int(memory_size))
     initial_study_strategy = resolve_reading_study_strategy(
@@ -3731,6 +3738,9 @@ def fit_reading_concepts_select_best(
     all_study_reports = []
     all_neighborhood_reports = []
     all_cluster_reports = []
+    no_improve_rounds = 0
+    stopped_early = False
+    stop_round = 0
     for round_i, round_steps in enumerate(schedule, start=1):
         fit_reading_concepts(
             model, vocab, records, steps=round_steps, batch=batch, lr=lr,
@@ -3828,22 +3838,39 @@ def fit_reading_concepts_select_best(
                 score_metric=score_metric, score_margin_w=score_margin_w)
         row = selection_row(round_i, round_steps, bundle, replay_bundle)
         score = float(row["score"])
-        selected = score > best_score
-        rounds_report.append(row | {"selected": bool(selected)})
+        score_delta_from_best = float(score - best_score)
+        selected = score_delta_from_best > score_min_delta
+        rounds_report.append(row | {
+            "selected": bool(selected),
+            "score_delta_from_best": score_delta_from_best,
+        })
         if selected:
             best_score = score
             best_round = round_i
             best_state = _model_state_copy(model)
             best_metrics = dict(getattr(model, "reading_train_metrics", {}))
+            no_improve_rounds = 0
+        else:
+            no_improve_rounds += 1
+            if score_patience and no_improve_rounds >= score_patience:
+                stopped_early = True
+                stop_round = round_i
+                break
     model.load_state_dict(best_state, strict=False)
     for row in rounds_report:
         row["selected"] = row["round"] == best_round
     selection = {
         "enabled": True,
         "rounds_requested": int(rounds),
-        "rounds_run": len(schedule),
+        "rounds_planned": len(schedule),
+        "rounds_run": len(rounds_report) - 1,
         "score_metric": score_metric,
         "score_margin_w": float(score_margin_w),
+        "score_min_delta": float(score_min_delta),
+        "score_patience": int(score_patience),
+        "stopped_early": bool(stopped_early),
+        "stop_round": int(stop_round),
+        "no_improve_rounds": int(no_improve_rounds),
         "replay_retention_w": float(replay_retention_w),
         "selected_round": int(best_round),
         "accepted_update": bool(best_round > 0),
@@ -4057,6 +4084,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          study_hard_max=0, study_refresh_steps=0,
                          study_select_best=True, study_rounds=1,
                          study_score_metric="mastery", study_score_margin_w=0.1,
+                         study_score_min_delta=0.0, study_score_patience=0,
                          text_field="text", max_tokens=128, min_tokens=8,
                          eval_frac=0.10, eval_n=64, out=None, checkpoint=None):
     records = load_reading_records(
@@ -4150,7 +4178,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             study_hard_max=study_hard_max,
             study_refresh_steps=study_refresh_steps, eval_n=eval_n,
             score_metric=study_score_metric,
-            score_margin_w=study_score_margin_w, rounds=study_rounds,
+            score_margin_w=study_score_margin_w,
+            score_min_delta=study_score_min_delta,
+            score_patience=study_score_patience,
+            rounds=study_rounds,
             before_bundle=before_bundle)
     else:
         fit_reading_concepts(
@@ -4325,6 +4356,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "study_rounds": int(study_rounds),
               "study_score_metric": study_score_metric,
               "study_score_margin_w": float(study_score_margin_w),
+              "study_score_min_delta": float(study_score_min_delta),
+              "study_score_patience": int(study_score_patience),
               "train_records": sum(r.split == "train" for r in records),
               "eval_records": sum(r.split == "eval" for r in records),
               "vocab_size": len(vocab),
@@ -4509,6 +4542,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              study_hard_max=0, study_refresh_steps=0,
                              study_select_best=True, study_rounds=1,
                              study_score_metric="mastery", study_score_margin_w=0.1,
+                             study_score_min_delta=0.0, study_score_patience=0,
                              replay_w=0.0, replay_batch=0,
                              replay_retention_w=0.0,
                              text_field="text", max_tokens=128, min_tokens=8,
@@ -4624,6 +4658,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             study_refresh_steps=study_refresh_steps, eval_n=eval_n,
             score_metric=study_score_metric,
             score_margin_w=study_score_margin_w,
+            score_min_delta=study_score_min_delta,
+            score_patience=study_score_patience,
             replay_records=replay_records,
             replay_teacher_model=replay_teacher_model,
             replay_teacher_vocab=replay_teacher_vocab,
@@ -4821,6 +4857,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "study_rounds": int(study_rounds),
               "study_score_metric": study_score_metric,
               "study_score_margin_w": float(study_score_margin_w),
+              "study_score_min_delta": float(study_score_min_delta),
+              "study_score_patience": int(study_score_patience),
               "replay_w": float(replay_w),
               "replay_batch": int(replay_batch),
               "replay_retention_w": float(replay_retention_w),
@@ -6420,6 +6458,21 @@ def selftest():
     assert scored and max(scored) > 0.0
     assert any("mean_reverse_kl" in r for r in reading_model.reading_study_reports
                if r.get("strategy") == "discovery")
+    patience_model = TextFactLM(
+        len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
+        fact_schema=None, latent_concept_slots=2,
+        latent_concept_memory_size=8).to("cpu")
+    _pm, _pv, patience_selection = fit_reading_concepts_select_best(
+        patience_model, reading_vocab, reading_records, steps=2, rounds=2,
+        batch=2, lr=1e-4, seed=7, device="cpu", log_every=10,
+        token_drop_p=0.1, token_replace_p=0.0, study_strategy="auto",
+        study_probe_n=2, study_hard_max=1, study_refresh_steps=1,
+        memory_size=8, eval_n=0, score_min_delta=999.0, score_patience=1)
+    assert patience_selection["stopped_early"] is True
+    assert patience_selection["rounds_run"] == 1
+    assert patience_selection["stop_round"] == 1
+    assert patience_selection["accepted_update"] is False
+    assert "score_delta_from_best" in patience_selection["rounds"][1]
     reading_payload = checkpoint_payload(reading_model, reading_vocab, 32, 1, 4,
                                          {"experiment": "reading-selftest"})
     assert reading_payload["fact_schema"] is None
@@ -6519,6 +6572,8 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-study-score-metric", choices=READING_SCORE_METRICS,
                     default="mastery")
     ap.add_argument("--reading-study-score-margin-w", type=float, default=0.1)
+    ap.add_argument("--reading-study-score-min-delta", type=float, default=0.0)
+    ap.add_argument("--reading-study-score-patience", type=int, default=0)
 
 
 def _reading_kwargs(args):
@@ -6593,6 +6648,8 @@ def _reading_kwargs(args):
                 study_rounds=args.reading_study_rounds,
                 study_score_metric=args.reading_study_score_metric,
                 study_score_margin_w=args.reading_study_score_margin_w,
+                study_score_min_delta=args.reading_study_score_min_delta,
+                study_score_patience=args.reading_study_score_patience,
                 text_field=args.reading_text_field,
                 max_tokens=args.reading_max_tokens,
                 min_tokens=args.reading_min_tokens,
