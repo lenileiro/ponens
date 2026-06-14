@@ -147,26 +147,6 @@ python -m thinking.text --import-snli --snli-zip /private/tmp/snli_1.0.zip \
     --snli-train 20000 --snli-eval 1000 --seed 11 --out data/text_snli.jsonl
 python -m thinking.text --import-mnli --mnli-zip /private/tmp/multinli_1.0.zip \
     --mnli-train 20000 --mnli-eval 2000 --seed 19 --out data/text_mnli.jsonl
-python -m thinking.text --import-squad --squad-train 5000 --squad-eval 1000 \
-    --squad-max-context-tokens 160 --squad-max-question-tokens 40 \
-    --squad-max-answer-tokens 8 --seed 23 --out data/text_squad.jsonl
-python -m thinking.text --import-squad --squad-train 800 --squad-eval 200 \
-    --squad-max-context-tokens 96 --squad-max-question-tokens 32 \
-    --squad-max-answer-tokens 5 --seed 29 --out data/text_squad_smoke.jsonl
-python -m thinking.text --import-squad --squad-choice-only --squad-choice-n 4 \
-    --squad-train 1200 --squad-eval 300 --squad-max-context-tokens 128 \
-    --squad-max-question-tokens 32 --squad-max-answer-tokens 6 --seed 31 \
-    --out data/text_squad_choice_smoke.jsonl
-python -m thinking.text --import-squad --squad-choice-only --squad-choice-n 4 \
-    --squad-choice-swap-negatives 1 --squad-train 1800 --squad-eval 450 \
-    --squad-max-context-tokens 128 --squad-max-question-tokens 32 \
-    --squad-max-answer-tokens 6 --seed 37 \
-    --out data/text_squad_choice_neg_smoke.jsonl
-python -m thinking.text --import-squad --squad-choice-only --squad-choice-n 4 \
-    --squad-choice-swap-negatives 1 --squad-choice-absent-negatives 1 \
-    --squad-train 2400 --squad-eval 600 --squad-max-context-tokens 128 \
-    --squad-max-question-tokens 32 --squad-max-answer-tokens 6 --seed 41 \
-    --out data/text_squad_choice_absent_neg_smoke.jsonl
 python -m thinking.text --data data/text_snli.jsonl --steps 1500 --batch 64 --d 192 \
     --layers 4 --heads 6 --semantic-w 0.75 --free-n 200 --max-new 20 \
     --out runs/text_snli.json --checkpoint runs/text_snli.pt
@@ -239,139 +219,46 @@ python -m thinking.text --data data/text_mnli.jsonl \
     --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
     --out runs/text_study_mnli_select_both_replay_smoke.json
-python -m thinking.text --data data/text_squad_smoke.jsonl \
-    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_control_smoke.pt \
-    --study-replay-data data/text_grounded.jsonl \
-    --steps 12 --study-rounds 1 --study-strategy errors \
-    --study-probe-n 128 --study-hard-max 96 --study-select-best \
-    --study-score-metric both --study-retention-w 2.0 --study-control-w 2.0 \
-    --batch 24 --study-lr 0.0005 --decode-w 0.25 --semantic-w 1.0 \
-    --balance-by kind --fact-n 80 --kind-fact-n 10 --artifact-n 80 \
-    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 36 \
-    --out runs/text_study_squad_control_smoke.json
-python -m thinking.text --data data/text_squad_choice_smoke.jsonl \
-    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_choice_all_smoke.pt \
-    --study-replay-data data/text_grounded.jsonl \
-    --steps 80 --study-rounds 1 --study-strategy all --study-select-best \
-    --study-score-metric both --study-retention-w 2.0 --study-control-w 2.0 \
-    --batch 32 --study-lr 0.0005 --decode-w 0.25 --semantic-w 1.0 \
-    --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
-    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_squad_choice_all_smoke.json
-python -m thinking.text --data data/text_squad_choice_neg_smoke.jsonl \
-    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_choice_neg_guard_smoke.pt \
-    --study-replay-data data/text_grounded.jsonl \
-    --steps 100 --study-rounds 1 --study-strategy all --study-select-best \
-    --study-score-metric both --study-retention-w 2.0 --study-control-w 2.0 \
-    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0.25 \
-    --semantic-w 1.0 --balance-by kind --fact-n 160 --kind-fact-n 30 \
-    --artifact-n 160 --free-n -1 --paraphrase-n -1 --counterfactual-n -1 \
-    --max-new 24 --out runs/text_study_squad_choice_neg_guard_smoke.json
-python -m thinking.text --data data/text_squad_choice_neg_smoke.jsonl \
-    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_choice_seeded_smoke.pt \
-    --study-replay-data data/text_grounded.jsonl \
-    --steps 100 --study-rounds 1 --study-strategy all --study-select-best \
-    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
-    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0.25 \
-    --semantic-w 0.5 --choice-w 1.0 --balance-by kind --fact-n 160 \
-    --kind-fact-n 30 --artifact-n 160 --free-n -1 --paraphrase-n -1 \
-    --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_squad_choice_seeded_smoke.json
-python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
-    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_choice_absent_answerw4_smoke.pt \
-    --study-replay-data data/text_grounded.jsonl \
-    --steps 100 --study-rounds 1 --study-strategy all --study-select-best \
-    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
-    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
-    --semantic-w 0 --choice-w 1.0 --choice-answer-w 4.0 --choice-none-w 1.0 \
-    --balance-by kind --fact-n 160 --kind-fact-n 30 --artifact-n 160 \
-    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_squad_choice_absent_answerw4_smoke.json
-python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
-    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_choice_evidence_2round_smoke.pt \
-    --study-replay-data data/text_grounded.jsonl \
-    --steps 10 --study-rounds 2 --study-strategy all --study-select-best \
-    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
-    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
-    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
-    --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
-    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_squad_choice_evidence_2round_smoke.json
-python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
-    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_choice_errors_kindguard_2round_smoke.pt \
-    --study-replay-data data/text_grounded.jsonl \
-    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
-    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
-    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
-    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
-    --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
-    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_squad_choice_errors_kindguard_2round_smoke.json
-python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
-    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_choice_candidate_ctx_pair_controlguard_2round_smoke.pt \
-    --study-replay-data data/text_grounded.jsonl \
-    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
-    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
-    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
-    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
-    --choice-pair-w 1.0 --choice-pair-margin 0.0 --balance-by kind \
-    --fact-n 80 --kind-fact-n 20 --artifact-n 80 --free-n -1 \
-    --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_squad_choice_candidate_ctx_pair_controlguard_2round_smoke.json
-python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
-    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_choice_candidate_ctx_pair_ctrlcontrast_2round_smoke.pt \
-    --study-replay-data data/text_grounded.jsonl \
-    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
-    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
-    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
-    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
-    --choice-pair-w 1.0 --choice-pair-margin 0.0 --choice-control-w 0 \
-    --choice-control-contrast-w 1.0 --choice-control-margin 0.0 \
-    --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
-    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_squad_choice_candidate_ctx_pair_ctrlcontrast_2round_smoke.json
-python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
-    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_choice_contextloc025_pair_2round_smoke.pt \
-    --study-replay-data data/text_grounded.jsonl \
-    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best \
-    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
-    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
-    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
-    --choice-context-w 0.25 --choice-pair-w 1.0 --choice-pair-margin 0.0 \
-    --choice-control-w 0 --choice-control-contrast-w 0 --choice-control-margin 0.0 \
-    --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
-    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_squad_choice_contextloc025_pair_2round_smoke.json
-python -m thinking.text --data data/text_squad_choice_absent_neg_smoke.jsonl \
-    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
-    --study-out-checkpoint runs/text_study_squad_choice_answerability_candctx025_confirm1_qctx_2round_smoke.pt \
-    --study-replay-data data/text_grounded.jsonl \
-    --steps 10 --study-rounds 2 --study-strategy errors --study-select-best --study-confirm-n 1 \
-    --study-score-metric choice --study-retention-w 2.0 --study-control-w 2.0 \
-    --study-kind-w 1.0 --batch 32 --study-lr 0.0005 --decode-w 0 \
-    --semantic-w 0 --choice-w 1.0 --choice-answer-w 1.0 --choice-none-w 1.0 \
-    --choice-answerability-w 0.5 --choice-answerability-control-w 0.5 \
-    --choice-answerability-contrast-w 0.5 --choice-answerability-contrast-margin 0.0 \
-    --choice-answerability-pair-w 0.5 --choice-answerability-pair-margin 0.0 \
-    --choice-context-w 0.25 \
-    --choice-candidate-context-w 0.25 --choice-candidate-context-margin 0.0 \
-    --choice-question-context-w 0.25 \
-    --choice-question-context-contrast-w 0.10 --choice-question-context-margin 0.0 \
-    --choice-pair-w 1.0 --choice-pair-margin 0.0 \
-    --choice-control-w 0 --choice-control-contrast-w 0 --choice-control-margin 0.0 \
-    --balance-by kind --fact-n 80 --kind-fact-n 20 --artifact-n 80 \
-    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_squad_choice_answerability_candctx025_confirm1_qctx_2round_smoke.json
+python -m thinking.text --reading-data NEWER-TECHNIQUES.md \
+    --steps 4 --batch 16 --d 96 --layers 2 --heads 4 \
+    --latent-concept-slots 6 --latent-concept-layers 1 \
+    --reading-max-tokens 96 --reading-min-tokens 8 --reading-eval-n 32 \
+    --reading-study-strategy graph --reading-study-probe-n 48 \
+    --reading-study-hard-max 24 --reading-study-refresh-steps 1 \
+    --reading-memory-size 64 --reading-memory-w 0.05 \
+    --reading-association-w 0.05 --reading-association-transitive-steps 3 \
+    --reading-association-transitive-w 0.25 \
+    --reading-composition-w 0.1 --reading-composition-transitive-steps 3 \
+    --reading-composition-transitive-w 0.25 \
+    --reading-graph-predict-w 0.2 --reading-graph-predict-transitive-steps 3 \
+    --reading-graph-predict-transitive-w 0.25 \
+    --reading-context-target-w 0.1 --reading-neighborhood-w 0.05 \
+    --reading-neighborhood-batch 8 --reading-neighborhood-probe-n 32 \
+    --reading-transition-w 0.05 --reading-transition-batch 8 \
+    --reading-cluster-w 0.05 --reading-cluster-batch 16 \
+    --reading-cluster-probe-n 32 \
+    --out runs/text_raw_reading_graph_study_smoke.json \
+    --checkpoint runs/text_raw_reading_graph_study_smoke.pt
+python -m thinking.multimodal --steps 3 --batch 4 --dim 96 \
+    --layers 1 --heads 4 --eval-n 20 --free-n 0 --counterfactual-n 0 \
+    --free-counterfactual-n 0 --latent-concept-slots 6 \
+    --latent-concept-memory-size 64 --latent-concept-memory-w 0.05 \
+    --latent-concept-association-w 0.05 \
+    --latent-concept-association-transitive-steps 3 \
+    --latent-concept-association-transitive-w 0.25 \
+    --latent-concept-composition-w 0.05 \
+    --latent-concept-composition-transitive-steps 3 \
+    --latent-concept-composition-transitive-w 0.25 \
+    --latent-concept-graph-predict-w 0.1 \
+    --latent-concept-graph-predict-transitive-steps 3 \
+    --latent-concept-graph-predict-transitive-w 0.25 \
+    --latent-concept-neighborhood-w 0.05 \
+    --latent-concept-transition-w 0.05 --latent-concept-cluster-w 0.05 \
+    --study-strategy graph --study-probe-n 8 --study-hard-max 4 \
+    --study-refresh-steps 1 \
+    --text-checkpoint runs/text_raw_reading_graph_study_smoke.pt \
+    --out runs/m0_multimodal_graph_study_smoke.json \
+    --checkpoint runs/m0_multimodal_graph_study_smoke.pt
 ```
 
 Current local Text-0 SNLI baseline (20k train / 1k dev, 1.5k steps, d=192, 4 layers, 6 heads,
@@ -404,8 +291,8 @@ improves global teacher-forced/semantic accuracy to **0.874 / 0.894** and keeps 
 semantic accuracy high (**0.981**), but it still fails the gate: sampled free F1 is **0.742**,
 sampled paraphrase consistency is **0.467**, SNLI dev semantic-head is **0.522**, and HANS
 lexical-overlap semantic-head remains **0.594**. The next text rung should scale shortcut-
-resistant web data and add richer semantic datasets (e.g. MultiNLI/CFQ/GeoQuery/SQuAD-style
-answer facts) plus stronger paraphrase and counterfactual splits.
+resistant web data and add richer semantic corpora (e.g. MultiNLI/CFQ/GeoQuery and raw-reading
+material) plus stronger paraphrase and counterfactual splits.
 
 Kind-balanced mixed training is a useful curriculum control, not a rulebook. With
 `--balance-by kind`, the mixed SNLI+HANS+grounded run improves global sampled free F1 to
@@ -446,505 +333,32 @@ MultiNLI teacher-forced accuracy (**0.350** to **0.408**) and semantic-head accu
 both heads). It still fails the gate; this is the weight-update mechanism for future reading
 curricula, not language mastery.
 
-SQuAD v1.1 is now a second real reading-task source. `--import-squad` downloads the official
-context/question/answer JSON, windows each passage around the labeled answer span, and can render
-either extractive answer facts (`answer length`, `a000 answer_token`, ...) or contrastive
-multiple-choice facts (`answer choice c00x`) whose candidates are shuffled real answers from the
-same paragraph. The importer writes filtering/windowing stats so skipped long-answer examples are
-visible instead of hidden. Evaluation now also includes QA controls: full context+question must
-beat question-only, context-only, and same-paragraph question-swap inputs, otherwise the study
-selector receives a shortcut-control penalty via `--study-control-w`. `--study-kind-w` penalizes
-updates that improve the aggregate score by sacrificing an entire eval kind, and the study selector
-now refuses non-positive total scores unless `--study-allow-negative-score` is set.
+Raw reading is now the active reading-task path. `--reading-data` accepts JSON, JSONL, or TXT
+chunks and builds schema-free text windows without answer labels or task-specific heads. Training
+creates two corrupted views of each window, updates persistent latent concept memory, mines
+association/composition graphs, and can choose hard examples by graph-prediction surprise.
+`--reading-study-strategy graph` waits until memory and relations exist, then refreshes the study
+pool from nonzero graph scores. Selection is driven by retrieval, context, neighborhood, cluster,
+and graph-prediction metrics rather than a task-specific answer harness. The old task-specific
+reader/import/candidate path has been removed from the code and is no longer supported here.
 
-A local 800/200 extractive SQuAD smoke expanded the balanced text checkpoint from **11,251** to
-**20,633** text tokens and from **26** to **1,760** fact values. After a 12-step hard-example
-replay study, sampled SQuAD semantic-head accuracy rose from **0.049** to **0.117**, but
-teacher-forced accuracy fell (**0.019** to **0.004**) and QA ablation gaps remained below the 0.05
-gate. The contrastive choice smoke is more tractable: four-choice SQuAD imports add only **4**
-fact values. An 80-step all-record replay study improved sampled teacher-forced choice accuracy
-from **0.000** to **0.283**, kept grounded replay gated, and scored positive before kind-collapse
-guarding, but still failed understanding controls (`full - context_only = 0.000`, question-swap
-teacher gap **0.000**, semantic question-swap gap **0.026**).
+A local MPS smoke on `NEWER-TECHNIQUES.md` ran real optimizer steps through this path. Graph-study
+refresh produced nonzero mean scores at steps 2-4 (**0.320**, **0.341**, **0.290**), final
+`graph_predict_loss` was **0.384**, `memory_active` reached **64**, and the association graph held
+**698** active edges. `cluster_acc` moved from **0.000** to **1.000** on the sampled probe. This is
+real weight movement and graph self-study, not a claim of language mastery.
 
-Question-swap negatives add an explicit data-derived `answer choice none` target for swapped
-questions whose answers are not in the candidate list. The first 100-step negative-swap study
-learned the negative class while collapsing positive SQuAD choices (`squad_choice` sampled
-teacher/semantic **0.000**, `squad_choice_swap_negative` **1.000**). With `--study-kind-w 1.0`
-and the positive-score guard, the same collapsed round is rejected (`score_allowed=false`,
-selected round **0**, checkpoint deltas **0.000**), preserving replay and refusing a misleading
-update.
-
-The candidate-aware choice head is now separate from the fixed semantic value head: it scores each
-record's candidate spans plus a learned `none` option, uses a target-balanced positive/none loss
-(`--choice-w`), and can be selected with `--study-score-metric choice`. Checkpoint expansion and
-eval now seed missing/new weights from `--seed`, so repeated study commands are reproducible. The
-seeded 100-step SQuAD choice smoke improved aggregate candidate-head accuracy from **0.188** to
-**0.463**, but the selector still rejected the update (`score_allowed=false`, selected round
-**0**) because `squad_choice` fell to **0.033** while `squad_choice_swap_negative` reached
-**0.833**, grounded replay teacher accuracy dropped from **0.983** to **0.922**, and QA choice
-control gaps stayed below threshold. This proves the architecture can train a data-derived
-candidate scorer and reject a shortcut update; it is still not language understanding.
-
-Answer-absent negatives are now another data-derived SQuAD choice control. They keep the original
-context and question but replace the choices with same-paragraph answer candidates that exclude the
-gold answer, so `answer choice none` cannot be learned solely from a swapped-question surface.
-The new 2.4k/600 smoke writes positives, swapped-question negatives, and answer-absent negatives.
-A 100-step choice-only run with extra positive pressure (`--choice-answer-w 4.0`) still failed to
-beat the guarded baseline: the candidate-head round scored **0.106** aggregate, kept
-`squad_choice` at **0.233**, and only weakly learned answerability (`squad_choice_absent_negative`
-**0.067**, `squad_choice_swap_negative` **0.133**). The selected round stayed **0**. This rules
-out simple scalar loss weighting as the fix.
-
-The candidate scorer now uses an evidence threshold instead of a static `none` vector. The question
-span attends over context tokens, each candidate span is scored against both the question and the
-attended context, and `none` wins only when no candidate clears the learned threshold. That is a
-better architecture for answerability, but the current small study still rejects training updates:
-the 100-step evidence run learned both negative kinds perfectly while collapsing real choices
-(`squad_choice` **0.000**, absent/swap negatives **1.000**), and the lighter 2-round/10-step
-self-study run selected round **0** over both trained rounds. Its untrained expanded head was more
-balanced on the sampled eval (`squad_choice` **0.250**, absent **0.150**, swap **0.400**), while
-both trained rounds again drove `squad_choice` to **0.000**. The guarded self-study machinery is
-doing its job; the next text rung needs richer positive supervision or a stronger candidate
-matching objective before accepting reading-task weight updates.
-
-The choice objective now combines candidate ranking for real answers with a learned threshold for
-answerability, and `--study-strategy errors` is choice-aware when `--study-score-metric choice` is
-selected. That means reading-task self-study mines the candidate-head records the model actually
-misses instead of using semantic-head errors as a proxy. On the 2-round SQuAD choice/absent/swap
-smoke, round 1 mined **1,776 / 2,400** choice errors and round 2 mined **1,407 / 2,400**. Aggregate
-choice accuracy could rise from **0.338** to **0.625**, and the QA choice control gaps cleared the
-0.05 thresholds, but the real-answer kind still regressed (`squad_choice` **0.250** to **0.150**)
-while negative kinds dominated (absent **0.850**, swap **0.900**). The selector now compares each
-eval kind against the pre-study baseline, records `kind_regressions`, and blocks a round when the
-kind guard is enabled. The same smoke therefore keeps `selected_round` **0** with checkpoint deltas
-**0.000**. This is a stronger self-teaching guard, not language mastery; the remaining gap is a
-positive candidate-matching objective that can improve real answers without leaning on `none`.
-
-The next candidate objective is paired rather than label-count based. SQuAD positives are paired
-with their dataset-derived answer-absent or swapped-question negatives through `base_id`; the
-paired loss (`--choice-pair-w`) asks the positive answer evidence to outrank the paired `none`
-record's candidate evidence. The choice scorer also now retrieves context evidence per candidate
-instead of sharing one question-attended context vector across every option. That made the initial
-expanded head less lucky on the sampled SQuAD choice eval (**0.150** aggregate), but after 10
-choice-error steps the candidate head reached **0.400** without regressing `squad_choice`
-(**0.200** before and after; absent/swap negatives **0.450**/**0.450**). The update still failed
-understanding controls (`qa_choice_full_minus_question_only` **0.0375**,
-`qa_choice_full_minus_context_only` **-0.0750**, `qa_choice_full_minus_question_swap` **-0.0385**).
-Selection now records `control_failures` and, when `--study-control-w` is enabled, treats failed
-shortcut controls as hard blockers instead of only score penalties. The strict-control smoke keeps
-`selected_round` **0** and checkpoint deltas **0.000**. This is the right failure: the model can
-fit more of the task, but it is still not allowed to call that understanding until it beats the
-ablations.
-
-Training-side QA controls are now generated from the same data, not from English rules.
-`--choice-control-w` samples question-only/context-only ablations from positive choice records and
-trains them as `answer choice none`; `--choice-control-contrast-w` instead keeps the original target
-and asks the full context+question target evidence to outrank the ablated target evidence. Both are
-guarded by the same held-out ablation checks. In the 2-round smoke, blunt ablation-none training
-overcorrected into `none`: with weight **1.0**, aggregate choice reached **0.588** but
-`squad_choice` fell from **0.200** to **0.050**; with weight **0.25**, aggregate reached **0.500**
-but `squad_choice` still fell to **0.050**. The contrastive control loss avoided the blunt `none`
-target, but still did not solve the shortcut: one round preserved `squad_choice` at **0.200** while
-choice controls became worse (`question_only` gap **-0.4875**, `context_only` **-0.2000**), and the
-other improved negatives while leaving all control gaps negative. All control-training smokes keep
-`selected_round` **0**. The next model-side gap is not more scalar loss pressure; it needs a
-stronger mechanism for binding question predicates to matching context spans before answerability
-training can be trusted.
-
-The choice head now has an explicit data-derived context localization loss (`--choice-context-w`).
-For positive SQuAD choice records, the target choice tokens are located in the context token stream,
-and the question+candidate context attention is trained to place probability mass on that answer
-span. This is not an English rule; it is span supervision extracted from the reading record. With
-`--choice-context-w 1.0`, the model improved negatives while preserving `squad_choice` in the first
-round, but still failed context-only and question-swap controls. With the lighter
-`--choice-context-w 0.25`, round 1 was the cleanest result so far: sampled choice accuracy improved
-from **0.150** to **0.4125**, `squad_choice` stayed at **0.200**, answer-absent rose to **0.450**,
-and swapped-question negatives rose to **0.400**. The selector still rejected it because held-out
-controls remained below threshold (`context_only` gap **-0.0375**, question-swap gap **-0.0385**).
-Adding same-paragraph question-swap contrast on top made the small head worse, not better. The
-current evidence says span localization helps candidate evidence, but the architecture still needs
-a stronger question-conditioned binding mechanism before a reading update should be accepted.
-
-The scorer now includes that stronger binding path: candidate context evidence is gated by a
-question-to-context attention distribution instead of letting the context stand in for the question
-when a control ablates it. `--choice-question-context-w` trains that question-only attention to
-locate the data-labeled answer span, and `--choice-question-context-contrast-w` asks the full
-question's answer-span attention to outrank a same-context swapped question's attention to the
-original answer. This is the first objective to pass all held-out choice shortcut controls in a
-round: with `--choice-context-w 0.25 --choice-question-context-w 0.25
---choice-question-context-contrast-w 0.10`, round 1 reached sampled choice accuracy **0.425** and
-control gaps `question_only` **0.100**, `context_only` **0.1625**, `question_swap` **0.0769**.
-The selector still rejected the update because the real-answer `squad_choice` kind regressed
-from **0.200** to **0.150** while the negative kinds improved (**0.700** / **0.750**). Raising
-positive answer weight to **2.0** flipped the failure: `squad_choice` rose to **0.250**, but both
-negative kinds collapsed to **0.000** and controls failed. The current bottleneck is therefore not
-a missing scalar weight; it is preserving positive and negative answerability simultaneously while
-maintaining the new binding controls.
-
-Two retention/calibration probes make that bottleneck sharper. `--study-anchor-correct-per-kind`
-mixes currently-correct train records back into error-mined self-study batches, so the model
-teaches itself from misses without forgetting examples it already handles. On the qctx
-swap-contrast smoke, 32 anchors per kind were correctly added (**96** anchors total; **32** each
-for `squad_choice`, answer-absent, and swapped-question negatives), but the accepted checkpoint
-still stayed at round **0**: round 1 reached choice accuracy **0.450** while `squad_choice`
-regressed to **0.100** and question-swap control fell to **0.000**. `--choice-answer-margin`
-adds a margin between positive evidence and the learned `none` threshold without changing class
-weights; at margin **0.5**, round 1 reached **0.2375** choice accuracy and kept negatives usable
-(**0.400** / **0.500**), but `squad_choice` still regressed to **0.150** and question-only /
-question-swap controls remained just under threshold (**0.0375** / **0.0385**). The evidence now
-points away from more sampling or scalar loss knobs and toward a representation that models
-answerability as a joint relation between question predicate, context span, and candidate span.
-
-The current scorer also adds a small learned context-mass term: if the question-to-context
-distribution places more mass on a candidate's matching context span than a uniform distribution
-would, the candidate logit gets learned support. Answer-absent negatives now still supervise the
-question-to-context distribution toward the true answer span, so "none" is learned as an uncovered
-answer relation instead of as missing answer evidence. With this path and the same qctx contrast,
-round 2 reached choice accuracy **0.4125**, preserved all three choice kinds
-(`squad_choice` **0.400**, answer-absent **0.500**, swapped-question **0.550**), and retained
-replay (**0.965** semantic), but controls failed again (`question_only` **-0.0125**,
-`question_swap` **-0.0769**), so the selector kept round **0**. Adding
-`--choice-control-contrast-w 0.25` did not rescue it: the best round stayed rejected, with
-question-only and context-only gaps negative in round 1 and all three shortcut controls negative
-by round 2. That makes the next architectural target clearer: the model needs an answerability
-head that separates "the question finds an answer span" from "this candidate covers that span",
-rather than pushing both jobs through the candidate logits alone.
-
-That answerability head is now implemented as a learned coverage verifier. It builds a
-question-selected context vector, compares it to each candidate span through separate learned
-projections, trains positive/none answerability with `--choice-answerability-w`, trains generated
-question-only/context-only/swapped-question none controls with `--choice-answerability-control-w`,
-and trains the full question's covered-span score to outrank the same-context swapped question
-with `--choice-answerability-contrast-w`. This is still data-derived supervision: the labels come
-from the imported reading records and generated counterfactual records, not from fixed English
-facts. On the non-confirmed two-round smoke, the selector accepted round **2** for the first time
-in this SQuAD-choice line: choice accuracy rose from **0.1875** to **0.325**, replay stayed high
-(**0.97125**, a **0.005** drop from reference), all held-out choice shortcut controls passed
-(`question_only` **0.1125**, `context_only` **0.200**, `question_swap` **0.1154**), and no primary
-kind regressed (`squad_choice` **0.300**, answer-absent **0.600**, swapped-question negatives
-**0.400**).
-
-The selector now has an optional confirmation gate: `--study-confirm-n` reruns selection on
-additional held-out evaluation seeds and compares each candidate against the initial checkpoint on
-the same sample. With `--study-confirm-n 1`, the same training run was correctly rejected: primary
-round 2 still passed all controls, but confirmation seed **7936** found a `squad_choice` regression
-from **0.250** to **0.100** while the negative kinds improved (**0.550** / **0.550**), producing
-score **-0.0525** and keeping selected round **0**. This is not language mastery, but it is a
-stronger reading-update gate: a candidate update must now retain prior grounded facts, pass
-shortcut controls, and preserve answerable examples across independent held-out samples before it
-can be accepted.
-
-The answerability head now also has a paired contrast (`--choice-answerability-pair-w`) over
-SQuAD records that share a `base_id`: answer-present examples must score above their
-answer-absent or swapped-question partners. This is the answerability analogue of
-`--choice-pair-w`, and it uses only imported record structure. In the confirmation-gated smoke,
-the pair loss optimized (`ans-pair` fell from **0.648** in round 1 to **0.129** in round 2), but
-the selector still kept `selected_round` **0**. Primary round 2 reached **0.2625** sampled choice
-accuracy with `squad_choice` **0.300**, absent **0.350**, and swap **0.500**, but confirmation
-seed **7936** exposed a `squad_choice` regression from **0.250** to **0.050** and a failed
-question-swap control. The learned objective is aligned, but it is not sufficient; the next text
-step needs candidate-span binding that keeps real answers stable under independent held-out
-samples.
-
-Candidate-span binding is now explicit via `--choice-candidate-context-w`: for answer-present
-SQuAD choice records, the correct candidate must localize the answer span better than the
-distractor candidates. This is still span supervision from the imported reading record, not a
-hand-authored English rule. With weight **0.25**, the confirmation-gated smoke improved the failure
-mode: primary round 2 moved `squad_choice` to **0.450**, and confirmation seed **7936** preserved
-`squad_choice` at its **0.250** baseline with no kind regressions. The update is still rejected
-because controls failed (`question_only` **0.0250**, `question_swap` **-0.0769**), so
-`selected_round` remains **0**. That narrows the remaining gap: the model can now retain answerable
-choices better, but it must still prove that the answer depends on both the actual question and
-the actual context before a reading update can be accepted.
-
-The final evaluated choice head now has optional direct supervision too:
-`--choice-final-w` trains `model.choice_logits` after answerability is added, and
-`--choice-final-control-w` trains generated question-only/context-only/swapped-question controls
-as `none` through those same final logits. This closes an instrumentation gap: earlier losses
-trained raw candidate evidence and answerability separately, while evaluation used their sum. The
-first probes show why the gate is still needed. At control weight **0.25**, aggregate sampled
-choice rose to **0.550**, but `squad_choice` collapsed to **0.000** and confirmation seed **7936**
-regressed from **0.250** to **0.000**. At control weight **0.05**, round 2 kept better aggregate
-choice (**0.4875**) and held primary control gaps closer, but confirmation still regressed
-`squad_choice` from **0.250** to **0.050** while negatives dominated (**0.750** /
-**0.700**). Both runs keep `selected_round` **0**. The useful result is diagnostic: final-logit
-control pressure reaches the evaluated head, but the next accepted update needs a
-positive-preserving calibration mechanism rather than stronger `none` pressure.
-
-A narrower final-logit contrast now avoids training controls directly as `none`:
-`--choice-final-control-contrast-w` reuses full-vs-ablation/swap pairs and only requires the
-full record's target final logit to outrank the control record's target final logit. With weight
-**0.25** and final-control none disabled, round 2 preserved more real-answer signal than the
-final-control-none probe (`squad_choice` **0.250** primary, **0.150** confirmation) and kept
-negatives usable (primary absent/swap **0.650** / **0.500**), but confirmation still failed all
-shortcut controls (`question_only` **-0.225**, `context_only` **-0.1125**, `question_swap`
-**-0.0769**) and regressed `squad_choice` from **0.250** to **0.150**. `selected_round` stayed
-**0**. This confirms the issue is not just scoring the final head; the next accepted update needs
-a representation/calibration method that improves shortcut dependence without making same-context
-controls overconfident.
-
-The evaluated QA head now uses candidate-specific answerability coverage when available, and
-`--choice-candidate-answerability-w` / `--choice-candidate-answerability-control-w` train that
-coverage directly. This follows the FER paper's warning that output accuracy alone is not enough:
-the model should represent answerability as reusable question-context-candidate structure, not as one
-record-level shortcut score. In the guarded 2-round SQuAD smoke, candidate coverage was active
-(`cand-ans` **1.774 -> 1.944**, generated control coverage **1.462 -> 0.998**) and round 2 raised
-primary aggregate choice to **0.425**, but it still overfit negatives (`squad_choice` **0.150**,
-absent **0.600**, swap **0.750**) and failed shortcut controls (`question_only` **-0.1375**,
-`question_swap` **-0.0385**). Confirmation preserved the same failure shape and regressed
-`squad_choice` from **0.250** to **0.150**, so `selected_round` stayed **0**. The next gap is
-question-conditioned evidence routing: coverage must depend on the actual question tokens enough to
-drop under question-only and swapped-question controls.
-
-`--choice-candidate-answerability-contrast-w` adds that missing pressure at the coverage level:
-for generated full-vs-ablation/swap pairs, the full record's target candidate coverage must outrank
-the same target coverage under the control input. With weight **0.25**, the guarded 2-round smoke
-made primary round 2 less negative-collapsed (`squad_choice` **0.250**, absent **0.600**, swap
-**0.750**) and logged active contrast (`cand-ans-contrast` **0.653 -> 0.662**), but it still failed
-primary controls (`question_only` **-0.100**, `context_only` **0.0375**, `question_swap`
-**-0.1154**) and confirmation dropped `squad_choice` to **0.050** with all shortcut controls
-negative. `selected_round` again stayed **0**. The useful result is that same-target coverage
-contrast can preserve real answers on the primary sample, but the representation is still unstable
-across held-out samples; the next route needs a question-evidence router that generalizes, not just
-a stronger pairwise margin.
-
-The QA gate now includes a candidate-replacement control. For each positive SQuAD choice record,
-the control replaces the gold candidate span with another same-length span from the same context
-and changes the target to `answer choice none`; no English facts or answer rules are embedded in
-the code. The same generated controls are available to the existing choice/final/answerability
-control losses, and eval reports `qa_candidate_replacement_control` with
-`candidate_replacement_none_acc`. On the current guarded SQuAD-choice checkpoint, the eval-only
-smoke exposed a hard failure: full sampled choice accuracy was **0.1125**, positive-only ablation
-choice gaps were healthy (`question_only` / `context_only` **0.275** / **0.275**), but candidate
-replacement abstention was **0.000**. That means the present head can still accept a corrupted
-candidate instead of proving the candidate is the answer to the question. The selector now treats
-this as a control failure (`qa_candidate_replacement_none_acc` must reach **0.55**), so future
-accepted reading updates have to learn question-context-candidate binding rather than just pass
-the older shortcut probes.
-
-`--choice-candidate-replacement-w` now exposes that pressure as a dedicated self-study loss on the
-evaluated final QA head. It samples the same generated corrupted-candidate records during training
-and asks the model to choose `none`; `--choice-candidate-replacement-margin` controls the margin.
-A 2-step smoke verified the loss is active (`cand-repl` **1.623**) and can move the new control
-fast: candidate-replacement abstention improved from **0.000** to **0.750** on the trained round.
-The round was still rejected because the pressure overcorrected into `none`, raising aggregate
-choice to **0.600** while collapsing real-answer `squad_choice` from **0.300** to **0.000** and
-leaving question-swap control failed. The next target is calibration/anchoring that preserves
-positive answers while keeping this candidate-corruption abstention.
-
-`--choice-candidate-replacement-pair-w` is that first calibration attempt. It trains paired
-original/corrupted examples together: the original must still choose the gold candidate, the
-corrupted example must choose `none`, and the same candidate's final logit must fall after
-corruption. This is still generated from the reading record itself. A 2-step paired-only smoke
-activated the new loss (`cand-repl-pair` **1.175**) but was too weak on abstention and still
-collapsed positives (`squad_choice` **0.000**, candidate-replacement abstention **0.325**).
-Lowering the weight to **0.25** and adding `--study-anchor-correct-per-kind 5` improved the shape
-but not enough: `squad_choice` held at **0.100** and candidate-replacement abstention reached
-**0.250**, while question-swap remained failed. The selector rejected both rounds. The useful
-direction is clear: paired candidate-corruption is the right kind of data-derived pressure, but the
-self-study curriculum needs stronger positive-retention anchors or staged calibration before it can
-be accepted.
-
-`--choice-positive-anchor-w` and `--choice-concept-bridge-w` add the next non-hardcoded calibration
-pieces. The positive anchor samples answer-present QA records from the same data and keeps the final
-choice head from drifting into `none`. The concept bridge mines repeated gold candidate surfaces
-from the records, pairs different records that share that discovered candidate, and trains their
-question/context/candidate latent vectors to be closer to each other than to distractor choices.
-Eval now reports `qa_concept_discovery_control` with unique held-out bridge pairs and requires
-`qa_concept_discovery_margin >= 0.05`, so a “light bulb” connection has to show up as reusable
-latent structure rather than an output-only coincidence. In the guarded 2-step smoke, the bridge
-loss was active (`concept` **0.548**) and moved the unique-pair discovery margin from **-0.023** to
-**-0.014**, but it still failed the discovery threshold, candidate replacement, and question-swap
-controls, and it regressed `squad_choice` from **0.300** to **0.100**. `selected_round` stayed
-**0**. This gives us a measurable discovery objective, but the current curriculum is still too weak
-to produce accepted language mastery.
-
-`--choice-candidate-replacement-binding-w` separates candidate-binding evidence from blunt
-replacement-to-`none` training. It uses the same generated original/corrupted pairs, but only asks
-the final QA head to lower the replaced target candidate's logit relative to the original target
-candidate. Eval now reports `qa_candidate_replacement_binding_control` with
-`target_logit_drop`, and the study selector treats drops below **0.05** as a control failure. On
-the current checkpoint, this exposes the failure directly: corrupted candidates start slightly
-higher than the real target (`target_logit_drop` **-0.004**). A guarded 2-step smoke with binding
-loss, positive anchors, and concept bridge activated the new pressure (`cand-repl-bind` **0.714**)
-and nudged the drop to **0.001**, but it still failed abstention/discovery/swap controls and
-regressed `squad_choice` to **0.100**, so `selected_round` stayed **0**. The useful progress is
-that candidate binding is now a separately measured internal relation, not only a final `none`
-accuracy side effect.
-
-`--choice-candidate-replacement-answerability-binding-w` adds the same target-drop pressure at the
-candidate coverage layer. The held-out `qa_candidate_replacement_answerability_binding_control`
-reports `target_cover_drop`, catching cases where the final logit changes but the model still
-believes the corrupted target is covered by the context. On the same checkpoint, the corrupted
-candidate also starts slightly higher in coverage (`target_cover_drop` **-0.0029**). A guarded
-2-step smoke activated the new loss (`cand-repl-ans-bind` **0.683**) and moved that internal
-relation positive (**0.0044**) while preserving `squad_choice` better (**0.200** vs **0.100** in
-the previous binding smoke). The round still failed the **0.05** cover-drop threshold, abstention,
-discovery, and swap controls, so `selected_round` stayed **0**. This is a better direction:
-coverage binding improves the right internal relation with less positive-answer damage, but the
-effect is still too small for an accepted self-study update.
-
-`--study-anchor-correct-repeat` and `--study-anchor-retention-bucket` expose the next curriculum
-knobs for that positive-regression problem. The anchors are not hand-authored examples: they are
-currently-correct records mined by the model during error self-study. Repeating them upweights
-retention, and the retention-bucket option gives them separate `:retention_anchor` training kinds
-so `--balance-by kind` can sample them deliberately. In the guarded 2-step smoke, repeating 15
-unique correct anchors **50x** added **750** retention rows and raised aggregate choice from
-**0.150** to **0.200**, but `squad_choice` still regressed to **0.100**. Isolating those anchors in
-retention buckets raised aggregate choice to **0.225** but worsened discovery/binding/swap controls
-and still failed retention, so `selected_round` stayed **0**. This confirms the next needed change
-is not merely more anchor mass; the learning objective has to bind question-conditioned evidence
-without stealing capacity from real answer choices.
-
-`--choice-self-distill-w` / `--choice-distill-w` and the study knobs
-`--study-distill-correct-per-kind` plus `--study-discovery-correct-per-kind` add a self-teaching
-path for those "light bulb" connections. During error self-study, the model now mines records it
-currently answers correctly, freezes a teacher snapshot of itself, and preserves that teacher's
-full QA choice distribution with KL distillation while the student trains on hard examples. The
-same mined correct pool can be passed as a concept-discovery source. Exact repeated answer-surface
-bridges still run first; when they are too sparse, the bridge falls back to an own-model
-neighborhood miner that connects nearest correct target concept vectors and contrasts them against
-distractor choices. This is deliberately data/model-derived: no English facts or answer rules are
-hand-coded.
-
-The guarded self-distill/discovery smoke mined **46** correct distillation records and **46**
-discovery records. The new bridge path activated (`concept` **0.569**, `distill` **0.001**) and
-the trained round raised aggregate choice from **0.150** to **0.250** while preserving real-answer
-`squad_choice` at **0.300**. The selector still rejected the round (`selected_round` **0**) because
-question-swap negatives regressed to **0.000**, candidate replacement/coverage controls remained
-below threshold, and held-out exact concept discovery was still negative (**-0.034**). The useful
-step is that the curriculum can now create model-derived concept-connection pressure even when
-exact repeated answers are sparse; the next issue is making those discovered neighborhoods pass the
-held-out control instead of just improving aggregate choice.
-
-`--study-focus-control-failures` adds the first adaptive control curriculum for the upstream text
-reader that later feeds multimodal fusion. The study gate already knows which shortcut controls
-failed; this option converts those failed metrics into extra generated-control sampling pressure
-during the next fit, while keeping the base question/context/candidate corruption mix active. It
-does not add facts or English rules: the focus set is derived from the model's own pre-study
-evaluation report, then written into the study report as `study_control_focus_sides` and
-`study_control_sampling_sides`.
-
-The guarded focus smoke found the same real weaknesses (`question_swap` and `candidate_replace`)
-and oversampled those controls alongside the base mix. The round still failed the selector:
-aggregate choice landed at **0.225**, real-answer `squad_choice` regressed from **0.300** to
-**0.200**, swap negatives stayed at **0.000**, and candidate replacement abstention was still
-negative (**-0.500** margin), so `selected_round` stayed **0**. That is a useful upstream
-architecture change rather than a claimed mastery jump: future multimodal runs can inherit a text
-reader that reports and targets its own failed evidence routes, but the guarded selector prevents
-those experimental updates from replacing the checkpoint until they improve both retention and
-controls.
-
-`--choice-concept-prototype-w` adds a stricter version of the "light bulb" objective. The bridge
-loss can connect two examples, but mastery needs a reusable concept, so prototype training mines
-repeated answer concepts from the data or the current correct pool, builds leave-one-out prototypes
-in the model's candidate-vector space, and pulls the target toward its concept prototype while
-pushing it away from distractors and other prototypes. When exact repeated surfaces are sparse, it
-falls back to own-model nearest-neighbor prototype groups over currently correct examples, so the
-pressure can still activate without adding hand-authored facts. The new held-out
-`qa_concept_prototype_control` reports `prototype_margin` and the study selector treats margins
-below **0.05** as a control failure. This is still not a hand-authored English rule: the prototype
-clusters come from the reading task records and the model's own concept vectors.
-
-The guarded prototype smoke activated both discovery losses (`concept` **0.578**, `proto`
-**0.592**) and the held-out prototype margin was above threshold before/after (**0.098** ->
-**0.097**). The round still stayed rejected (`selected_round` **0**) because `squad_choice`
-regressed from **0.400** to **0.200** and candidate/discovery controls still failed. That is the
-right failure mode for this stage: the architecture can now train and gate reusable concept
-clusters, while selection still prevents a "concept-looking" update from counting as language
-mastery if answer retention and grounding controls do not improve.
-
-`--choice-self-rank-distill-w` / `--choice-rank-distill-w` strengthens the retention side of
-self-teaching. KL distillation can be almost zero before a study step moves the student, so this
-term asks the student to preserve the frozen teacher's currently-correct winner and its
-target-over-alternative margin on mined correct records. It is still model-derived: the teacher is
-the pre-study checkpoint and the records are selected because that checkpoint answered them
-correctly.
-
-The guarded rank-distill smoke activated the new pressure (`rankdistill` **1.096**) alongside the
-concept/prototype losses and raised aggregate held-out choice from **0.050** to **0.100** while
-improving candidate-replacement abstention margin from **-0.400** to **-0.300**. The selector still
-rejected the round (`selected_round` **0**) because `squad_choice` regressed from **0.400** to
-**0.200** and shortcut/candidate/discovery controls remained below threshold. The useful progress
-is a stronger self-preservation primitive; the unresolved issue is applying that retention without
-freezing the model's existing candidate-binding mistakes.
-
-`--study-adaptive-correct-mining` makes that retention more local to the current reading failure.
-Instead of sampling all currently-correct records uniformly for self-distillation and discovery, the
-study loop can rank correct QA records by nearest hard-example target vectors in the model's own
-candidate concept space, then select the top records per kind. The optional
-`--study-adaptive-correct-pool-per-kind` caps the candidate pool before ranking. This still avoids
-hard-coded facts: hard examples and correct examples come from the model's own pre-study outcomes,
-and the neighborhood is computed from learned concept vectors.
-
-The adaptive-correct smoke activated this path for both distillation and discovery: **777** hard
-choice vectors ranked a **64**-record correct pool and selected **20** nearest `squad_choice`
-records for each self-teaching route, with mean selected similarities around **0.75**. The selector
-still rejected the round (`selected_round` **0**) because aggregate held-out choice stayed at
-**0.050**, `squad_choice` regressed from **0.400** to **0.200**, and candidate/discovery controls
-remained negative. The useful progress is a measured local-retention curriculum; the next pressure
-has to make candidate replacement and discovery margins improve, not merely select relevant memory.
-
-The hard-aware discovery update makes that pressure act on the actual failures. When
-`--study-discovery-correct-per-kind` supplies mined correct neighbors, the concept bridge/prototype
-source pool now combines those neighbors with the current hard examples before fitting. The smoke
-confirmed **2,100** discovery source records (**2,080** hard + **20** mined correct), activated the
-same concept/prototype losses (`concept` **0.536**, `proto` **0.555**), improved the round score
-from **-0.126** to **-0.095**, and preserved held-out `squad_choice` at **0.400**. The selector
-still rejected the round (`selected_round` **0**) because candidate replacement and concept
-discovery controls remained below threshold. This is the right shape: self-discovery now trains on
-hard examples connected to model-mined neighbors, while the gate prevents a premature update.
-
-`--study-discovery-transfer` makes that connection explicit: each concept bridge batch pairs hard
-QA examples with their nearest currently-correct target concepts instead of sampling the combined
-source pool as an undifferentiated neighborhood. The transfer smoke activated that direct
-hard-to-correct pairing and improved several failed control gaps (`question_swap` **-0.200 ->
-0.050**, candidate replacement abstention **-0.500 -> -0.400**, target-logit drop **-0.0349 ->
--0.0254**, concept discovery **-0.0235 -> -0.0217**). The selector still rejected the round because
-held-out `squad_choice` regressed from **0.400** to **0.200**. So transfer is now an available
-"light bulb" pressure, but it remains opt-in until retention catches up.
-
-The asymmetric transfer update detaches the currently-correct neighbor inside that transfer loss,
-so the hard example moves toward a stable concept without directly dragging the correct example. A
-smoke kept the transfer control improvements but still regressed held-out `squad_choice` from
-**0.400** to **0.200**, leaving `selected_round` at **0**. That localizes the remaining retention
-damage to the broader study optimization, not just symmetric bridge gradients.
-
-`--study-fragile-correct-mining` adds a retention-oriented self-teaching source. Instead of sampling
-currently-correct records uniformly, it ranks them by the model's own target-vs-alternative choice
-margin and selects the lowest-margin records per kind for anchor replay and own-model
-distillation/rank retention. This is not a hand-written rule: fragile examples are discovered from
-current logits and the existing reading-task labels.
-
-The fragile-anchor transfer smoke selected **46** low-margin correct records (**20**
-`squad_choice`, **18** absent negatives, **8** swapped-question negatives), with `squad_choice`
-anchor mean margin only **0.027**. The round improved sampled held-out balance relative to direct
-transfer (`kind_scores` became **0.20 / 0.20 / 0.20**, round score **-0.146** vs **-0.281** for the
-transfer-only smoke), but `squad_choice` still regressed from **0.400** to **0.200** and controls
-remained below threshold, so `selected_round` stayed **0**. The useful result is a measurable
-fragile-memory curriculum; the unresolved gap is stronger positive answer retention under the
-control losses.
-
-The positive-anchor-source update routes those same fragile anchor records into
-`choice_positive_anchor_w` instead of sampling generic control sources. On the same smoke,
-`positive_anchor_source_records` was **46**, sampled `squad_choice` stayed at **0.400** while
-absent/swap negatives rose to **0.200 / 0.200**, kind regressions dropped to none, and round score
-became positive (**0.019**). The selector still kept `selected_round` at **0** because control gaps
-remained below threshold, so the next gap is control repair without sacrificing the retained
-positive answer path.
-
-A larger local MPS check imported **15k** SQuAD choice records from the official SQuAD URLs
-(**12k** train / **3k** eval with answer-present, answer-absent, and swapped-question records) and
-ran the same fragile-anchor-source update with bounded mining/eval. Against the pre-study
-checkpoint, sampled positive `squad_choice` improved from **0.233** to **0.333** and sampled
-semantic accuracy from **0.083** to **0.100**, while question/context-only choice gaps stayed
-positive. It still failed the language gate: absent/swap negatives stayed at **0.000**, candidate
-replacement abstention stayed **0.017**, and the swapped-question gap remained negative
-(**-0.017**). This is real weight movement on web data, not mastery yet.
+The upstream multimodal bridge now inherits the same latent concept machinery. Loading the text
+checkpoint into a multimodal MPS smoke copied **28** token embeddings, **14** text tensors, and
+**37** latent tensors, then used `--study-strategy graph` on multimodal concept states. Graph-study
+mean scores were **0.537**, **0.205**, and **0.241** across the three steps; final
+`latent_graph_predict_loss` was **0.249**, `latent_memory_active` reached **64**, and the latent
+association graph held **700** active edges. The important result is architectural: text-side
+self-study memory, relation graphs, and graph-prediction surprise are now available upstream to
+multimodal learning.
 
 The architecture now has a generic schema concept head in `thinking.concepts.SchemaConceptHead`.
-Instead of adding another QA-specific rule path, text records expose `(slot, predicate) -> value`
+Instead of adding another task-specific rule path, text records expose `(slot, predicate) -> value`
 concepts through learned key queries and learned value embeddings. `TextFactLM` trains this with
 `--fact-concept-w` and reports `fact_concept_head`; checkpoint expansion copies learned concept
 queries/value embeddings by symbolic schema identity, not by array position. The multimodal
@@ -953,14 +367,14 @@ so concept transfer, agreement, and distillation operate on the same architectur
 A concept-only SNLI check with decoder and old semantic-head losses disabled
 (`--decode-w 0 --semantic-w 0 --fact-concept-w 1`) reached sampled `fact_concept_head` **0.405**
 after 40 local MPS steps. This is not language mastery; it is the model-side insertion point for
-understanding-oriented training rather than a harness-specific QA branch.
+understanding-oriented training rather than a harness-specific branch.
 
 The same concept head now has a schema-generic contrastive geometry objective. Text reading runs
 can add `--fact-concept-contrast-w` so records sharing a data-supplied concept value pull the same
 slot states together while other values for that slot separate; reports expose
 `fact_concept_geometry` nearest-same accuracy and same-vs-different cosine margin. The multimodal
 bridge exposes the same mechanism as `--concept-contrast-w`, so color/shape/sound factors and text
-facts improve through one learned concept geometry rather than through task-specific QA handling.
+facts improve through one learned concept geometry rather than through task-specific handling.
 RunPod forwards the multimodal form as `--multimodal-concept-contrast-w` and
 `--multimodal-concept-contrast-temperature`.
 
