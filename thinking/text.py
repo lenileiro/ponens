@@ -2544,6 +2544,170 @@ def reading_latent_graph_cycle_records(
                       "skipped": False}
 
 
+def _minmax_scale(values):
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return arr
+    lo = float(np.min(arr))
+    hi = float(np.max(arr))
+    if hi <= lo + 1e-12:
+        return np.zeros_like(arr)
+    return (arr - lo) / (hi - lo)
+
+
+def _latent_slot_disorder_scores(slots):
+    if slots is None or slots.ndim != 3:
+        return torch.zeros(0)
+    if slots.shape[1] <= 1:
+        return slots.reshape(slots.shape[0], -1).sum(-1) * 0.0
+    z = F.normalize(slots, dim=-1)
+    corr = z.matmul(z.transpose(1, 2))
+    eye = torch.eye(slots.shape[1], dtype=torch.bool, device=slots.device)
+    correlation = corr.masked_select(~eye[None]).view(
+        slots.shape[0], slots.shape[1], slots.shape[1] - 1).pow(2).mean((1, 2))
+    energy = slots.pow(2).mean(-1)
+    usage = energy / energy.sum(-1, keepdim=True).clamp_min(1e-8)
+    uniform = torch.full_like(usage, 1.0 / usage.shape[-1])
+    imbalance = F.kl_div(usage.clamp_min(1e-8).log(), uniform, reduction="none").sum(-1)
+    return 0.5 * (correlation + imbalance)
+
+
+def reading_latent_discovery_records(
+        model, vocab, records, device=DEV, n=0, seed=0, context_keep_p=0.5,
+        feature_dropout=0.0, curiosity_temperature=0.1,
+        curiosity_self_loop_w=0.05, curiosity_transitive_steps=2,
+        curiosity_transitive_w=0.1, graph_temperature=0.1,
+        graph_self_loop_w=0.05, graph_transitive_steps=2,
+        graph_transitive_w=0.1, graph_target_power=1.0,
+        cycle_temperature=0.1, cycle_self_loop_w=0.05,
+        cycle_transitive_steps=2, cycle_transitive_w=0.1,
+        cycle_target_power=1.0, cycle_w=0.5):
+    memory = getattr(model, "latent_concept_memory", None)
+    if getattr(model, "latent_concepts", None) is None or memory is None:
+        return [], {"n_records": 0, "sampled": False, "n_selected": 0,
+                    "mean_score": 0.0, "max_score": 0.0, "skipped": True}
+    candidates = [r for r in records if r.split == "train"]
+    sampled = bool(n and n < len(candidates))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=n, replace=False)
+        candidates = [candidates[int(i)] for i in idx]
+    rows = []
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(candidates), 64):
+            batch = candidates[off:off + 64]
+            txt = pack_reading(batch, vocab, device)
+            full_slots = model.latent_concept_states(
+                txt, feature_dropout=feature_dropout, project=True)
+            curiosity, curiosity_parts = latent_concept_graph_curiosity_scores(
+                full_slots, memory.active(), memory.active_relations(),
+                temperature=curiosity_temperature,
+                self_loop_w=curiosity_self_loop_w,
+                transitive_steps=curiosity_transitive_steps,
+                transitive_w=curiosity_transitive_w)
+            context_txt, heldout_txt = split_reading_context_target(
+                txt, vocab.pad, context_keep_p=context_keep_p)
+            source_slots = model.latent_concept_states(
+                context_txt, feature_dropout=feature_dropout, project=True)
+            heldout_slots = model.latent_concept_states(
+                heldout_txt, feature_dropout=0.0, project=True)
+            if hasattr(model, "latent_concept_graph_prediction_scores"):
+                graph, graph_parts = model.latent_concept_graph_prediction_scores(
+                    source_slots, heldout_slots, temperature=graph_temperature,
+                    self_loop_w=graph_self_loop_w,
+                    transitive_steps=graph_transitive_steps,
+                    transitive_w=graph_transitive_w,
+                    target_power=graph_target_power)
+            else:
+                graph, graph_parts = latent_concept_graph_prediction_scores(
+                    source_slots, heldout_slots, memory.active(),
+                    memory.active_prediction_relations(),
+                    temperature=graph_temperature, self_loop_w=graph_self_loop_w,
+                    transitive_steps=graph_transitive_steps,
+                    transitive_w=graph_transitive_w,
+                    target_power=graph_target_power)
+            if hasattr(model, "latent_concept_graph_cycle_scores"):
+                cycle, cycle_parts = model.latent_concept_graph_cycle_scores(
+                    source_slots, heldout_slots, temperature=cycle_temperature,
+                    self_loop_w=cycle_self_loop_w,
+                    transitive_steps=cycle_transitive_steps,
+                    transitive_w=cycle_transitive_w,
+                    target_power=cycle_target_power,
+                    cycle_w=cycle_w)
+            else:
+                cycle, cycle_parts = latent_concept_graph_cycle_scores(
+                    source_slots, heldout_slots, memory.active(),
+                    memory.active_prediction_relations(),
+                    temperature=cycle_temperature, self_loop_w=cycle_self_loop_w,
+                    transitive_steps=cycle_transitive_steps,
+                    transitive_w=cycle_transitive_w,
+                    target_power=cycle_target_power,
+                    cycle_w=cycle_w)
+            disorder = _latent_slot_disorder_scores(full_slots)
+            novelty = curiosity_parts.get("novelty", curiosity.new_zeros(curiosity.shape))
+            association = curiosity_parts.get(
+                "association", curiosity.new_zeros(curiosity.shape))
+            graph_kl = graph_parts.get("kl", graph.new_zeros(graph.shape))
+            graph_cosine = graph_parts.get("cosine", graph.new_zeros(graph.shape))
+            forward = cycle_parts.get("forward_kl", cycle.new_zeros(cycle.shape))
+            reverse = cycle_parts.get("reverse_kl", cycle.new_zeros(cycle.shape))
+            source_cycle = cycle_parts.get(
+                "source_cycle_kl", cycle.new_zeros(cycle.shape))
+            target_cycle = cycle_parts.get(
+                "target_cycle_kl", cycle.new_zeros(cycle.shape))
+            for i, rec in enumerate(batch):
+                rows.append({
+                    "record": rec,
+                    "curiosity": float(curiosity[i].detach().cpu()),
+                    "novelty": float(novelty[i].detach().cpu()),
+                    "association": float(association[i].detach().cpu()),
+                    "graph": float(graph[i].detach().cpu()),
+                    "graph_kl": float(graph_kl[i].detach().cpu()),
+                    "graph_cosine": float(graph_cosine[i].detach().cpu()),
+                    "cycle": float(cycle[i].detach().cpu()),
+                    "forward_kl": float(forward[i].detach().cpu()),
+                    "reverse_kl": float(reverse[i].detach().cpu()),
+                    "source_cycle_kl": float(source_cycle[i].detach().cpu()),
+                    "target_cycle_kl": float(target_cycle[i].detach().cpu()),
+                    "slot_disorder": float(disorder[i].detach().cpu()),
+                })
+    components = ("curiosity", "graph", "cycle", "slot_disorder")
+    for name in components:
+        scaled = _minmax_scale([row[name] for row in rows])
+        for row, value in zip(rows, scaled):
+            row[f"{name}_scaled"] = float(value)
+    for row in rows:
+        row["score"] = float(np.mean([row[f"{name}_scaled"] for name in components]))
+    rows.sort(key=lambda row: row["score"], reverse=True)
+    selected = [row["record"] for row in rows]
+
+    def mean_field(name):
+        return float(np.mean([row[name] for row in rows])) if rows else 0.0
+
+    def max_field(name):
+        return float(max([row[name] for row in rows])) if rows else 0.0
+
+    return selected, {"n_records": len(candidates),
+                      "sampled": sampled,
+                      "n_selected": len(selected),
+                      "mean_score": mean_field("score"),
+                      "max_score": max_field("score"),
+                      "mean_curiosity": mean_field("curiosity"),
+                      "mean_novelty": mean_field("novelty"),
+                      "mean_association": mean_field("association"),
+                      "mean_graph_score": mean_field("graph"),
+                      "mean_graph_kl": mean_field("graph_kl"),
+                      "mean_graph_cosine": mean_field("graph_cosine"),
+                      "mean_cycle_score": mean_field("cycle"),
+                      "mean_forward_kl": mean_field("forward_kl"),
+                      "mean_reverse_kl": mean_field("reverse_kl"),
+                      "mean_source_cycle_kl": mean_field("source_cycle_kl"),
+                      "mean_target_cycle_kl": mean_field("target_cycle_kl"),
+                      "mean_slot_disorder": mean_field("slot_disorder"),
+                      "skipped": False}
+
+
 def latent_fact_concept_loss(model, txt, records, schema):
     if (schema is None or getattr(model, "fact_concepts", None) is None
             or getattr(model, "latent_concepts", None) is None):
@@ -2918,7 +3082,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     if float(replay_w) < 0.0:
         raise ValueError("reading replay loss weight must be non-negative")
     study_strategy = str(study_strategy)
-    if study_strategy not in ("random", "errors", "curiosity", "graph", "cycle"):
+    if study_strategy not in (
+            "random", "errors", "curiosity", "graph", "cycle", "discovery"):
         raise ValueError(f"unknown reading study strategy {study_strategy!r}")
     rng = np.random.default_rng(seed)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
@@ -2941,6 +3106,9 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading curiosity study requires latent concept memory")
     if study_strategy == "graph" and getattr(model, "latent_concept_memory", None) is None:
         raise ValueError("reading graph study requires latent concept memory")
+    if (study_strategy == "discovery"
+            and getattr(model, "latent_concept_memory", None) is None):
+        raise ValueError("reading discovery study requires latent concept memory")
     if replay_w and (not replay_sources or replay_teacher_model is None
                      or replay_teacher_vocab is None):
         raise ValueError("reading replay loss requires replay records and teacher checkpoint")
@@ -3032,6 +3200,28 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 target_power=graph_cycle_target_power,
                 cycle_w=graph_cycle_consistency_w)
             report = report | {"strategy": "cycle"}
+        elif study_strategy == "discovery":
+            selected, report = reading_latent_discovery_records(
+                model, vocab, records, device=device, n=probe_n,
+                seed=seed + 1301 + int(step),
+                context_keep_p=context_keep_p,
+                feature_dropout=0.0,
+                curiosity_temperature=association_temperature,
+                curiosity_self_loop_w=association_self_loop_w,
+                curiosity_transitive_steps=association_transitive_steps,
+                curiosity_transitive_w=association_transitive_w,
+                graph_temperature=graph_predict_temperature,
+                graph_self_loop_w=graph_predict_self_loop_w,
+                graph_transitive_steps=graph_predict_transitive_steps,
+                graph_transitive_w=graph_predict_transitive_w,
+                graph_target_power=graph_predict_target_power,
+                cycle_temperature=graph_cycle_temperature,
+                cycle_self_loop_w=graph_cycle_self_loop_w,
+                cycle_transitive_steps=graph_cycle_transitive_steps,
+                cycle_transitive_w=graph_cycle_transitive_w,
+                cycle_target_power=graph_cycle_target_power,
+                cycle_w=graph_cycle_consistency_w)
+            report = report | {"strategy": "discovery"}
         else:
             hard, _correct, report = reading_latent_record_outcomes(
                 model, vocab, records, device=device, n=probe_n,
@@ -3041,7 +3231,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
             selected = list(hard)
             report = report | {"strategy": "errors"}
         if study_hard_max and len(selected) > int(study_hard_max):
-            if study_strategy in ("curiosity", "graph", "cycle"):
+            if study_strategy in ("curiosity", "graph", "cycle", "discovery"):
                 selected = selected[:int(study_hard_max)]
             else:
                 cap_rng = np.random.default_rng(seed + 1759 + int(step))
@@ -3087,7 +3277,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         model.train()
         refresh_due = (not study_pool or st == 1 or (
             study_refresh_steps and (st - 1) % int(study_refresh_steps) == 0))
-        if study_strategy in ("errors", "curiosity", "graph", "cycle") and refresh_due:
+        if study_strategy in (
+                "errors", "curiosity", "graph", "cycle", "discovery") and refresh_due:
             if study_strategy not in ("graph", "cycle") or graph_study_ready():
                 refresh_study_pool(st)
                 model.train()
@@ -3101,7 +3292,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 and (st - 1) % int(cluster_refresh_steps) == 0)):
             refresh_clusters(st)
             model.train()
-        source = (study_pool if study_strategy in ("errors", "curiosity", "graph", "cycle")
+        source = (study_pool if study_strategy in (
+            "errors", "curiosity", "graph", "cycle", "discovery")
                   and study_pool else train_records)
         rec_batch = batch_records(source, rng, batch)
         txt = pack_reading(rec_batch, vocab, device)
@@ -3244,7 +3436,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                                 or graph_predict_w or graph_cycle_w)
                             else None)))
         last_transition_updates = 0
-        if graph_predict_w or graph_cycle_w or study_strategy == "graph":
+        if (graph_predict_w or graph_cycle_w
+                or study_strategy in ("graph", "cycle", "discovery")):
             last_transition_updates = int(update_reading_latent_transitions(
                 model, txt, vocab.pad, context_keep_p=context_keep_p,
                 feature_dropout=0.0, decay=association_decay))
@@ -6083,6 +6276,19 @@ def selftest():
         reading_model, reading_vocab, reading_records, device="cpu", n=0,
         context_keep_p=0.5, transitive_steps=2, transitive_w=0.1)
     assert graph_records and graph_report["skipped"] is False
+    cycle_records, cycle_report = reading_latent_graph_cycle_records(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0,
+        context_keep_p=0.5, transitive_steps=2, transitive_w=0.1)
+    assert cycle_records and cycle_report["skipped"] is False
+    discovery_records, discovery_report = reading_latent_discovery_records(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0,
+        context_keep_p=0.5, curiosity_transitive_steps=2,
+        curiosity_transitive_w=0.1, graph_transitive_steps=2,
+        graph_transitive_w=0.1, cycle_transitive_steps=2,
+        cycle_transitive_w=0.1)
+    assert discovery_records and discovery_report["skipped"] is False
+    assert math.isfinite(discovery_report["mean_score"])
+    assert "mean_slot_disorder" in discovery_report
     pairs, pair_report = mine_reading_latent_neighbors(
         reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0)
     assert pair_report["n_pairs"] == 2 and pairs
@@ -6102,7 +6308,7 @@ def selftest():
     fit_reading_concepts(
         reading_model, reading_vocab, reading_records, steps=3, batch=2, lr=1e-4,
         seed=5, device="cpu", log_every=1, token_drop_p=0.1,
-        token_replace_p=0.0, study_strategy="cycle", study_probe_n=4,
+        token_replace_p=0.0, study_strategy="discovery", study_probe_n=4,
         study_hard_max=2, study_refresh_steps=1, context_target_w=0.1,
         context_keep_p=0.5, memory_size=8, composition_w=0.1, graph_predict_w=0.1,
         graph_cycle_w=0.1, fer_w=0.1,
@@ -6116,12 +6322,13 @@ def selftest():
     assert math.isfinite(reading_model.reading_train_metrics["fer_score"])
     assert math.isfinite(reading_model.reading_train_metrics["graph_cycle_loss"])
     assert reading_model.reading_train_metrics["graph_transition_updates"] > 0
-    assert any(r.get("strategy") == "cycle" for r in reading_model.reading_study_reports)
+    assert any(r.get("strategy") == "discovery"
+               for r in reading_model.reading_study_reports)
     scored = [r.get("mean_score", 0.0) for r in reading_model.reading_study_reports
-              if r.get("strategy") == "cycle" and not r.get("skipped")]
+              if r.get("strategy") == "discovery" and not r.get("skipped")]
     assert scored and max(scored) > 0.0
     assert any("mean_reverse_kl" in r for r in reading_model.reading_study_reports
-               if r.get("strategy") == "cycle")
+               if r.get("strategy") == "discovery")
     reading_payload = checkpoint_payload(reading_model, reading_vocab, 32, 1, 4,
                                          {"experiment": "reading-selftest"})
     assert reading_payload["fact_schema"] is None
@@ -6211,7 +6418,8 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-cluster-margin", type=float, default=0.0)
     ap.add_argument("--reading-cluster-min-size", type=int, default=2)
     ap.add_argument("--reading-study-strategy",
-                    choices=("random", "errors", "curiosity", "graph", "cycle"),
+                    choices=("random", "errors", "curiosity", "graph", "cycle",
+                             "discovery"),
                     default="errors")
     ap.add_argument("--reading-study-probe-n", type=int, default=0)
     ap.add_argument("--reading-study-hard-max", type=int, default=0)
