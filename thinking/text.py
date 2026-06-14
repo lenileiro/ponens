@@ -2362,11 +2362,96 @@ def reading_neighborhood_retrieval_eval(model, vocab, records, device=DEV, n=0,
             "mining": mine_report}
 
 
-READING_SCORE_METRICS = ("view", "context", "neighborhood", "both", "min", "all")
+def reading_cluster_retrieval_eval(model, vocab, records, device=DEV, n=0,
+                                   seed=0, token_drop_p=0.15,
+                                   token_replace_p=0.05,
+                                   min_cluster_size=2):
+    clusters, mine_report = mine_reading_latent_clusters(
+        model, vocab, records, device=device, n=n, seed=seed, split="eval",
+        min_cluster_size=min_cluster_size)
+    if len(clusters) < 2:
+        return {"cluster_acc": 0.0, "n_records": mine_report.get("n_records", 0),
+                "n_clusters": len(clusters),
+                "n_clustered_records": mine_report.get("n_clustered_records", 0),
+                "sampled": mine_report.get("sampled", False),
+                "skipped": True, "mining": mine_report}
+    rows = []
+    cluster_ids = []
+    for cluster_id, cluster in enumerate(clusters):
+        for rec in cluster:
+            rows.append(rec)
+            cluster_ids.append(cluster_id)
+    if len(rows) < 2:
+        return {"cluster_acc": 0.0, "n_records": mine_report.get("n_records", 0),
+                "n_clusters": len(clusters),
+                "n_clustered_records": len(rows),
+                "sampled": mine_report.get("sampled", False),
+                "skipped": True, "mining": mine_report}
+    model.eval()
+    with torch.no_grad():
+        txt = pack_reading(rows, vocab, device)
+        torch.manual_seed(int(seed) + 1)
+        view_a = corrupt_reading_tokens(
+            txt, vocab.pad, vocab.unk, token_drop_p=token_drop_p,
+            token_replace_p=token_replace_p)
+        torch.manual_seed(int(seed) + 2)
+        view_b = corrupt_reading_tokens(
+            txt, vocab.pad, vocab.unk, token_drop_p=token_drop_p,
+            token_replace_p=token_replace_p)
+        slots_a = model.latent_concept_states(view_a, project=True)
+        slots_b = model.latent_concept_states(view_b, project=True)
+        a = F.normalize(slots_a.reshape(slots_a.shape[0], -1), dim=-1)
+        b = F.normalize(slots_b.reshape(slots_b.shape[0], -1), dim=-1)
+        labels = torch.tensor(cluster_ids, dtype=torch.long, device=device)
+        centers = []
+        center_labels = []
+        for label in labels.unique(sorted=True):
+            mask = labels.eq(label)
+            if int(mask.sum()) >= int(min_cluster_size):
+                centers.append(F.normalize(a[mask].mean(0), dim=0))
+                center_labels.append(int(label.item()))
+        if len(centers) < 2:
+            return {"cluster_acc": 0.0,
+                    "n_records": mine_report.get("n_records", 0),
+                    "n_clusters": len(clusters),
+                    "n_clustered_records": len(rows),
+                    "sampled": mine_report.get("sampled", False),
+                    "skipped": True, "mining": mine_report}
+        centers = torch.stack(centers, dim=0)
+        label_to_center = {label: i for i, label in enumerate(center_labels)}
+        keep = torch.tensor([label in label_to_center for label in cluster_ids],
+                            dtype=torch.bool, device=device)
+        target = torch.tensor([label_to_center[label] for label in cluster_ids
+                               if label in label_to_center],
+                              dtype=torch.long, device=device)
+        sim = b[keep].matmul(centers.t())
+        pred = sim.argmax(-1)
+        acc = float(pred.eq(target).float().mean())
+        target_sim = sim.gather(1, target[:, None]).squeeze(1)
+        other_sim = sim.masked_fill(
+            F.one_hot(target, num_classes=centers.shape[0]).bool(),
+            -float("inf")).max(-1).values
+        positive = float(target_sim.mean())
+        negative = float(other_sim.mean())
+    return {"cluster_acc": acc,
+            "positive_cosine": positive,
+            "negative_cosine": negative,
+            "margin": positive - negative,
+            "n_records": mine_report.get("n_records", 0),
+            "n_clusters": len(clusters),
+            "n_clustered_records": len(rows),
+            "sampled": mine_report.get("sampled", False),
+            "skipped": False,
+            "mining": mine_report}
+
+
+READING_SCORE_METRICS = (
+    "view", "context", "neighborhood", "cluster", "both", "min", "all")
 
 
 def reading_discovery_score_components(view_eval, context_eval, metric="both",
-                                       margin_w=0.1, neighborhood_eval=None):
+                                       margin_w=0.1, neighborhood_eval=None,
+                                       cluster_eval=None):
     metric = str(metric)
     if metric not in READING_SCORE_METRICS:
         raise ValueError(f"unknown reading score metric {metric!r}")
@@ -2378,19 +2463,26 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     neighborhood_eval = neighborhood_eval or {}
     neighborhood_acc = float(neighborhood_eval.get("neighbor_acc", 0.0))
     neighborhood_margin = float(neighborhood_eval.get("margin", 0.0))
+    cluster_eval = cluster_eval or {}
+    cluster_acc = float(cluster_eval.get("cluster_acc", 0.0))
+    cluster_margin = float(cluster_eval.get("margin", 0.0))
     view_score = view_acc + margin_w * view_margin
     context_score = context_acc + margin_w * context_margin
     neighborhood_score = neighborhood_acc + margin_w * neighborhood_margin
+    cluster_score = cluster_acc + margin_w * cluster_margin
     if metric == "view":
         score = view_score
     elif metric == "context":
         score = context_score
     elif metric == "neighborhood":
         score = neighborhood_score
+    elif metric == "cluster":
+        score = cluster_score
     elif metric == "min":
         score = min(view_score, context_score)
     elif metric == "all":
-        score = (view_score + context_score + neighborhood_score) / 3.0
+        score = (view_score + context_score + neighborhood_score
+                 + cluster_score) / 4.0
     else:
         score = 0.5 * (view_score + context_score)
     return {"metric": metric,
@@ -2399,15 +2491,19 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "view_score": float(view_score),
             "context_score": float(context_score),
             "neighborhood_score": float(neighborhood_score),
+            "cluster_score": float(cluster_score),
             "paired_view_acc": view_acc,
             "paired_view_margin": view_margin,
             "context_target_acc": context_acc,
             "context_target_margin": context_margin,
             "neighborhood_acc": neighborhood_acc,
             "neighborhood_margin": neighborhood_margin,
+            "cluster_acc": cluster_acc,
+            "cluster_margin": cluster_margin,
             "view_skipped": bool(view_eval.get("skipped", False)),
             "context_skipped": bool(context_eval.get("skipped", False)),
-            "neighborhood_skipped": bool(neighborhood_eval.get("skipped", False))}
+            "neighborhood_skipped": bool(neighborhood_eval.get("skipped", False)),
+            "cluster_skipped": bool(cluster_eval.get("skipped", False))}
 
 
 def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
@@ -2423,12 +2519,16 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
     neighborhood = reading_neighborhood_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 29,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    cluster = reading_cluster_retrieval_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 31,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
     return {"view": view,
             "context_target": context,
             "neighborhood": neighborhood,
+            "cluster": cluster,
             "score_components": reading_discovery_score_components(
                 view, context, metric=score_metric, margin_w=score_margin_w,
-                neighborhood_eval=neighborhood)}
+                neighborhood_eval=neighborhood, cluster_eval=cluster)}
 
 
 def reading_latent_record_outcomes(model, vocab, records, device=DEV, n=0, seed=0,
@@ -5330,6 +5430,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
     after_context = after_bundle["context_target"]
     before_neighborhood = before_bundle["neighborhood"]
     after_neighborhood = after_bundle["neighborhood"]
+    before_cluster = before_bundle["cluster"]
+    after_cluster = after_bundle["cluster"]
     report = {"experiment": "text_raw_reading_concept_pretrain",
               "data": data,
               "steps": int(steps), "batch": int(batch), "lr": float(lr),
@@ -5381,6 +5483,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "after_context_target": after_context,
               "before_neighborhood": before_neighborhood,
               "after_neighborhood": after_neighborhood,
+              "before_cluster": before_cluster,
+              "after_cluster": after_cluster,
               "before_score_components": before_bundle["score_components"],
               "after_score_components": after_bundle["score_components"],
               "selection": selection,
@@ -5400,6 +5504,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                   "neighborhood_margin": (
                       after_neighborhood.get("margin", 0.0)
                       - before_neighborhood.get("margin", 0.0)),
+                  "cluster_acc": (
+                      after_cluster.get("cluster_acc", 0.0)
+                      - before_cluster.get("cluster_acc", 0.0)),
+                  "cluster_margin": (
+                      after_cluster.get("margin", 0.0)
+                      - before_cluster.get("margin", 0.0)),
               },
               "train_metrics": getattr(model, "reading_train_metrics", {}),
               "study_hard_examples": getattr(model, "reading_study_reports", []),
@@ -5610,6 +5720,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
     after_context = after_bundle["context_target"]
     before_neighborhood = before_bundle["neighborhood"]
     after_neighborhood = after_bundle["neighborhood"]
+    before_cluster = before_bundle["cluster"]
+    after_cluster = after_bundle["cluster"]
     d = int(ckpt.get("d", 96))
     layers = int(ckpt.get("layers", 3))
     heads = int(ckpt.get("heads", 4))
@@ -5676,6 +5788,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "after_context_target": after_context,
               "before_neighborhood": before_neighborhood,
               "after_neighborhood": after_neighborhood,
+              "before_cluster": before_cluster,
+              "after_cluster": after_cluster,
               "before_score_components": before_bundle["score_components"],
               "after_score_components": after_bundle["score_components"],
               "before_replay": before_replay_bundle,
@@ -5697,6 +5811,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                   "neighborhood_margin": (
                       after_neighborhood.get("margin", 0.0)
                       - before_neighborhood.get("margin", 0.0)),
+                  "cluster_acc": (
+                      after_cluster.get("cluster_acc", 0.0)
+                      - before_cluster.get("cluster_acc", 0.0)),
+                  "cluster_margin": (
+                      after_cluster.get("margin", 0.0)
+                      - before_cluster.get("margin", 0.0)),
                   "replay_score": (
                       (after_replay_bundle or {}).get("score_components", {}).get(
                           "score", 0.0)
@@ -9187,6 +9307,10 @@ def selftest():
         reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0,
         token_drop_p=0.1, token_replace_p=0.0)
     assert reading_neighborhood_eval["n_pairs"] == 2
+    reading_cluster_eval = reading_cluster_retrieval_eval(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0,
+        token_drop_p=0.1, token_replace_p=0.0)
+    assert "cluster_acc" in reading_cluster_eval
     reading_bundle = reading_eval_bundle(
         reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
         seed=0, token_drop_p=0.1, token_replace_p=0.0, context_keep_p=0.5,
@@ -9197,6 +9321,11 @@ def selftest():
         seed=0, token_drop_p=0.1, token_replace_p=0.0, context_keep_p=0.5,
         score_metric="neighborhood", score_margin_w=0.1)
     assert "neighborhood_score" in reading_neighborhood_bundle["score_components"]
+    reading_cluster_bundle = reading_eval_bundle(
+        reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
+        seed=0, token_drop_p=0.1, token_replace_p=0.0, context_keep_p=0.5,
+        score_metric="cluster", score_margin_w=0.1)
+    assert "cluster_score" in reading_cluster_bundle["score_components"]
     selected_reading_model = TextFactLM(
         len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
         fact_schema=None, latent_concept_slots=2).to("cpu")
