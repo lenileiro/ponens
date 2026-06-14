@@ -268,6 +268,11 @@ def text_reading_cmd(args, py):
         f"--reading-span-mask-frac {args.reading_span_mask_frac} "
         f"--reading-span-completion-temperature "
         f"{args.reading_span_completion_temperature} "
+        f"--reading-context-closure-w {args.reading_context_closure_w} "
+        f"--reading-context-closure-split-frac "
+        f"{args.reading_context_closure_split_frac} "
+        f"--reading-context-closure-temperature "
+        f"{args.reading_context_closure_temperature} "
         f"--reading-sequence-w {args.reading_sequence_w} "
         f"--reading-sequence-batch {args.reading_sequence_batch} "
         f"--reading-sequence-temperature {args.reading_sequence_temperature} "
@@ -630,6 +635,8 @@ def apply_image_quality_preset(args):
         args.image_quality_score_steps = max(int(args.image_quality_score_steps), 1000)
         args.image_preference_w = max(float(args.image_preference_w), 0.5)
         args.image_flow_preference_w = max(float(args.image_flow_preference_w), 0.05)
+        if hq and str(args.image_flow_preference_loss or "margin") == "margin":
+            args.image_flow_preference_loss = "dpo"
         args.image_flow_preference_batch = max(int(args.image_flow_preference_batch), 1)
     args.image_eval_generated = True
     args.image_prompt_embed_backend = args.image_embed_backend
@@ -1049,6 +1056,8 @@ def payload(args):
                      f"{args.image_preference_max_pairs} "
                      f"--image-preference-w {args.image_preference_w} "
                      f"--flow-preference-w {args.image_flow_preference_w} "
+                     f"--flow-preference-loss {args.image_flow_preference_loss} "
+                     f"--flow-preference-beta {args.image_flow_preference_beta} "
                      f"--flow-preference-margin {args.image_flow_preference_margin} "
                      f"--flow-preference-batch {args.image_flow_preference_batch} "
                      f"--caption-vocab-max {args.image_caption_vocab_max} "
@@ -1679,6 +1688,12 @@ def main():
                     dest="reading_span_mask_frac")
     ap.add_argument("--reading-span-completion-temperature", type=float,
                     default=0.1, dest="reading_span_completion_temperature")
+    ap.add_argument("--reading-context-closure-w", type=float, default=0.05,
+                    dest="reading_context_closure_w")
+    ap.add_argument("--reading-context-closure-split-frac", type=float,
+                    default=0.5, dest="reading_context_closure_split_frac")
+    ap.add_argument("--reading-context-closure-temperature", type=float,
+                    default=0.1, dest="reading_context_closure_temperature")
     ap.add_argument("--reading-sequence-w", type=float, default=0.05,
                     dest="reading_sequence_w")
     ap.add_argument("--reading-sequence-batch", type=int, default=0,
@@ -1859,9 +1874,9 @@ def main():
     ap.add_argument("--reading-study-rounds", type=int, default=1,
                     dest="reading_study_rounds")
     ap.add_argument("--reading-study-score-metric", default="mastery",
-                    choices=("view", "context", "sequence", "neighborhood",
-                             "cluster", "fer", "bridge", "both", "min", "all",
-                             "balanced", "mastery"),
+                    choices=("view", "context", "span", "closure", "sequence",
+                             "neighborhood", "cluster", "fer", "bridge", "both",
+                             "min", "all", "balanced", "mastery"),
                     dest="reading_study_score_metric")
     ap.add_argument("--reading-study-score-margin-w", type=float, default=0.1,
                     dest="reading_study_score_margin_w")
@@ -2492,6 +2507,13 @@ def main():
                     dest="image_flow_preference_w",
                     help=("direct chosen/rejected preference loss weight on the image "
                           "latent-flow generator"))
+    ap.add_argument("--image-flow-preference-loss", default="margin",
+                    choices=("margin", "dpo"), dest="image_flow_preference_loss",
+                    help=("direct image flow preference objective; dpo compares the "
+                          "policy pair gap against a frozen reference flow"))
+    ap.add_argument("--image-flow-preference-beta", type=float, default=1.0,
+                    dest="image_flow_preference_beta",
+                    help="inverse-temperature for --image-flow-preference-loss dpo")
     ap.add_argument("--image-flow-preference-margin", type=float, default=0.0,
                     dest="image_flow_preference_margin",
                     help="minimum velocity-loss gap for image direct flow preference pairs")
@@ -3273,6 +3295,7 @@ def main():
             "--reading-replay-retention-w": args.reading_replay_retention_w,
             "--reading-context-target-w": args.reading_context_target_w,
             "--reading-span-completion-w": args.reading_span_completion_w,
+            "--reading-context-closure-w": args.reading_context_closure_w,
             "--reading-sequence-w": args.reading_sequence_w,
             "--reading-sequence-batch": args.reading_sequence_batch,
             "--reading-factorization-w": args.reading_factorization_w,
@@ -3371,12 +3394,17 @@ def main():
             "--reading-token-replace": args.reading_token_replace,
             "--reading-context-keep-p": args.reading_context_keep_p,
             "--reading-span-mask-frac": args.reading_span_mask_frac,
+            "--reading-context-closure-split-frac": (
+                args.reading_context_closure_split_frac),
         }
         for name, value in bounded_text.items():
             if value < 0.0 or value > 1.0:
                 sys.exit(f"ERROR: {name} must be in [0, 1]")
         if args.reading_span_mask_frac <= 0.0 or args.reading_span_mask_frac >= 1.0:
             sys.exit("ERROR: --reading-span-mask-frac must be in (0, 1)")
+        if (args.reading_context_closure_split_frac <= 0.0
+                or args.reading_context_closure_split_frac >= 1.0):
+            sys.exit("ERROR: --reading-context-closure-split-frac must be in (0, 1)")
         if args.reading_feature_dropout < 0.0 or args.reading_feature_dropout >= 1.0:
             sys.exit("ERROR: --reading-feature-dropout must be in [0, 1)")
         text_temperatures = {
@@ -3384,6 +3412,8 @@ def main():
                 args.reading_context_target_temperature),
             "--reading-span-completion-temperature": (
                 args.reading_span_completion_temperature),
+            "--reading-context-closure-temperature": (
+                args.reading_context_closure_temperature),
             "--reading-sequence-temperature": args.reading_sequence_temperature,
             "--reading-memory-temperature": args.reading_memory_temperature,
             "--reading-consolidation-temperature": (
@@ -3846,6 +3876,8 @@ def main():
         sys.exit("ERROR: --image-preference-w requires --image-quality-score-steps > 0")
     if args.image_flow_preference_w < 0.0:
         sys.exit("ERROR: --image-flow-preference-w must be non-negative")
+    if args.image_flow_preference_beta <= 0.0:
+        sys.exit("ERROR: --image-flow-preference-beta must be positive")
     if args.image_flow_preference_margin < 0.0:
         sys.exit("ERROR: --image-flow-preference-margin must be non-negative")
     if args.image_flow_preference_batch < 0:

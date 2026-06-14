@@ -914,6 +914,28 @@ def split_reading_context_target(txt, pad, context_keep_p=0.5):
     return context_txt, target_txt
 
 
+def split_reading_context_closure(txt, pad, split_frac=0.5):
+    frac = float(split_frac)
+    if frac <= 0.0 or frac >= 1.0:
+        raise ValueError("reading context closure split fraction must be in (0, 1)")
+    valid = txt.ne(pad)
+    prefix = torch.full_like(txt, int(pad))
+    suffix = torch.full_like(txt, int(pad))
+    used = torch.zeros_like(valid)
+    for row in range(txt.shape[0]):
+        positions = torch.where(valid[row])[0]
+        n = int(positions.numel())
+        if n <= 1:
+            continue
+        split = max(1, min(n - 1, int(round(n * frac))))
+        prefix_positions = positions[:split]
+        suffix_positions = positions[split:]
+        prefix[row, prefix_positions] = txt[row, prefix_positions]
+        suffix[row, suffix_positions] = txt[row, suffix_positions]
+        used[row, positions] = True
+    return prefix, suffix, used
+
+
 def mask_reading_spans(txt, pad, span_frac=0.25):
     frac = float(span_frac)
     if frac <= 0.0 or frac >= 1.0:
@@ -980,6 +1002,41 @@ def reading_span_completion_loss(model, txt, pad, span_frac=0.25,
     return loss, {
         "completion_loss": completion_metrics["completion_loss"],
         "hidden_token_rate": hidden_rate.detach(),
+        "view_count": int(completion_metrics.get("view_count", 0)),
+        "skipped": bool(completion_metrics.get("skipped", False)),
+    }
+
+
+def reading_context_closure_loss(model, txt, pad, split_frac=0.5,
+                                 feature_dropout=0.1, temperature=0.1):
+    zero = txt.float().sum() * 0.0
+    metrics = {"completion_loss": zero, "prefix_token_rate": zero,
+               "suffix_token_rate": zero, "view_count": 0, "skipped": True}
+    if getattr(model, "latent_concepts", None) is None:
+        return zero, metrics
+    if txt.shape[0] <= 1:
+        return zero, metrics
+    prefix_txt, suffix_txt, used = split_reading_context_closure(
+        txt, pad, split_frac=split_frac)
+    used_count = used.sum()
+    if int(used_count.item()) <= 0:
+        return zero, metrics
+    valid_count = txt.ne(pad).sum().clamp_min(1)
+    prefix_rate = prefix_txt.ne(pad).sum().float() / valid_count.float()
+    suffix_rate = suffix_txt.ne(pad).sum().float() / valid_count.float()
+    prefix_slots = model.latent_concept_states(
+        prefix_txt, feature_dropout=feature_dropout, project=False)
+    suffix_slots = model.latent_concept_states(
+        suffix_txt, feature_dropout=feature_dropout, project=False)
+    full_slots = model.latent_concept_states(
+        txt, feature_dropout=0.0, project=False).detach()
+    loss, completion_metrics = latent_concept_completion_loss(
+        model.reading_predictor, {"prefix": prefix_slots, "suffix": suffix_slots},
+        full_slots, temperature=temperature)
+    return loss, {
+        "completion_loss": completion_metrics["completion_loss"],
+        "prefix_token_rate": prefix_rate.detach(),
+        "suffix_token_rate": suffix_rate.detach(),
         "view_count": int(completion_metrics.get("view_count", 0)),
         "skipped": bool(completion_metrics.get("skipped", False)),
     }
@@ -1296,6 +1353,22 @@ def _reading_span_completion_embeddings(model, txt, pad, seed=0, span_frac=0.25)
     full_slots = model.latent_concept_states(txt, project=False)
     predicted = model.reading_predictor(partial_slots)
     predicted = F.normalize(predicted.reshape(predicted.shape[0], -1), dim=-1)
+    target = F.normalize(full_slots.reshape(full_slots.shape[0], -1), dim=-1)
+    return predicted, target
+
+
+def _reading_context_closure_embeddings(model, txt, pad, seed=0, split_frac=0.5):
+    torch.manual_seed(int(seed))
+    prefix_txt, suffix_txt, _used = split_reading_context_closure(
+        txt, pad, split_frac=split_frac)
+    prefix_slots = model.latent_concept_states(prefix_txt, project=False)
+    suffix_slots = model.latent_concept_states(suffix_txt, project=False)
+    full_slots = model.latent_concept_states(txt, project=False)
+    prefix_pred = model.reading_predictor(prefix_slots)
+    suffix_pred = model.reading_predictor(suffix_slots)
+    prefix_pred = F.normalize(prefix_pred.reshape(prefix_pred.shape[0], -1), dim=-1)
+    suffix_pred = F.normalize(suffix_pred.reshape(suffix_pred.shape[0], -1), dim=-1)
+    predicted = F.normalize(torch.stack((prefix_pred, suffix_pred), dim=0).mean(0), dim=-1)
     target = F.normalize(full_slots.reshape(full_slots.shape[0], -1), dim=-1)
     return predicted, target
 
@@ -1738,6 +1811,51 @@ def reading_span_completion_retrieval_eval(model, vocab, records, device=DEV, n=
             "skipped": False}
 
 
+def reading_context_closure_retrieval_eval(model, vocab, records, device=DEV, n=0,
+                                           seed=0, split_frac=0.5):
+    if (getattr(model, "latent_concepts", None) is None
+            or not hasattr(model, "reading_predictor")):
+        return {"context_closure_acc": 0.0, "n_records": 0, "sampled": False,
+                "skipped": True}
+    selected = eval_reading_records(records, n=n, seed=seed)
+    if not selected:
+        return {"context_closure_acc": 0.0, "n_records": 0, "sampled": False,
+                "skipped": True}
+    correct = total = 0
+    pos_sum = neg_sum = 0.0
+    neg_count = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(selected), 64):
+            batch = selected[off:off + 64]
+            if len(batch) <= 1:
+                continue
+            txt = pack_reading(batch, vocab, device)
+            predicted, target = _reading_context_closure_embeddings(
+                model, txt, vocab.pad, seed=seed + off * 2,
+                split_frac=split_frac)
+            sim = predicted.matmul(target.t())
+            nearest = sim.argmax(-1)
+            labels = torch.arange(sim.shape[0], device=sim.device)
+            correct += int(nearest.eq(labels).sum())
+            total += int(sim.shape[0])
+            pos_sum += float(sim.diag().sum())
+            eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+            neg_sum += float(sim.masked_select(~eye).sum())
+            neg_count += int((~eye).sum())
+    eval_count = len([r for r in records if r.split == "eval"])
+    if total == 0:
+        return {"context_closure_acc": 0.0, "n_records": 0,
+                "sampled": bool(n > 0 and n < eval_count), "skipped": True}
+    return {"context_closure_acc": correct / max(1, total),
+            "positive_cosine": pos_sum / max(1, total),
+            "negative_cosine": neg_sum / max(1, neg_count),
+            "margin": (pos_sum / max(1, total)) - (neg_sum / max(1, neg_count)),
+            "n_records": total,
+            "sampled": bool(n > 0 and n < eval_count),
+            "skipped": False}
+
+
 def reading_sequence_retrieval_eval(model, vocab, records, device=DEV, n=0,
                                     seed=0, token_drop_p=0.15,
                                     token_replace_p=0.05):
@@ -1987,11 +2105,11 @@ def reading_fer_eval(model, vocab, records, device=DEV, n=0, seed=0,
 
 
 READING_SCORE_METRICS = (
-    "view", "context", "span", "sequence", "neighborhood", "cluster", "fer",
-    "bridge", "both", "min", "all", "balanced", "mastery")
+    "view", "context", "span", "closure", "sequence", "neighborhood", "cluster",
+    "fer", "bridge", "both", "min", "all", "balanced", "mastery")
 READING_DISCOVERY_SIGNALS = (
-    "view", "context", "span", "sequence", "neighborhood", "cluster", "fer",
-    "bridge")
+    "view", "context", "span", "closure", "sequence", "neighborhood", "cluster",
+    "fer", "bridge")
 READING_STUDY_STRATEGIES = (
     "random", "errors", "fer", "curiosity", "sequence", "graph", "cycle",
     "gap", "discovery", "auto")
@@ -2021,7 +2139,7 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
                                        margin_w=0.1, neighborhood_eval=None,
                                        cluster_eval=None, fer_eval=None,
                                        bridge_eval=None, sequence_eval=None,
-                                       span_eval=None):
+                                       span_eval=None, closure_eval=None):
     metric = str(metric)
     if metric not in READING_SCORE_METRICS:
         raise ValueError(f"unknown reading score metric {metric!r}")
@@ -2033,6 +2151,9 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     span_eval = span_eval or {}
     span_acc = float(span_eval.get("span_completion_acc", 0.0))
     span_margin = float(span_eval.get("margin", 0.0))
+    closure_eval = closure_eval or {}
+    closure_acc = float(closure_eval.get("context_closure_acc", 0.0))
+    closure_margin = float(closure_eval.get("margin", 0.0))
     sequence_eval = sequence_eval or {}
     sequence_acc = float(sequence_eval.get("sequence_acc", 0.0))
     sequence_margin = float(sequence_eval.get("margin", 0.0))
@@ -2056,16 +2177,18 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     view_score = view_acc + margin_w * view_margin
     context_score = context_acc + margin_w * context_margin
     span_score = span_acc + margin_w * span_margin
+    closure_score = closure_acc + margin_w * closure_margin
     sequence_score = sequence_acc + margin_w * sequence_margin
     neighborhood_score = neighborhood_acc + margin_w * neighborhood_margin
     cluster_score = cluster_acc + margin_w * cluster_margin
     scores = {"view": view_score, "context": context_score, "span": span_score,
-              "sequence": sequence_score,
+              "closure": closure_score, "sequence": sequence_score,
               "neighborhood": neighborhood_score, "cluster": cluster_score,
               "fer": fer_score, "bridge": bridge_score}
     skipped = {"view": bool(view_eval.get("skipped", False)),
                "context": bool(context_eval.get("skipped", False)),
                "span": bool(span_eval.get("skipped", False)),
+               "closure": bool(closure_eval.get("skipped", False)),
                "sequence": bool(sequence_eval.get("skipped", False)),
                "neighborhood": bool(neighborhood_eval.get("skipped", False)),
                "cluster": bool(cluster_eval.get("skipped", False)),
@@ -2089,6 +2212,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
         score = context_score
     elif metric == "span":
         score = span_score
+    elif metric == "closure":
+        score = closure_score
     elif metric == "sequence":
         score = sequence_score
     elif metric == "neighborhood":
@@ -2121,6 +2246,7 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "view_score": float(view_score),
             "context_score": float(context_score),
             "span_score": float(span_score),
+            "context_closure_score": float(closure_score),
             "neighborhood_score": float(neighborhood_score),
             "cluster_score": float(cluster_score),
             "fer_score": float(fer_score),
@@ -2139,6 +2265,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "context_target_margin": context_margin,
             "span_completion_acc": span_acc,
             "span_completion_margin": span_margin,
+            "context_closure_acc": closure_acc,
+            "context_closure_margin": closure_margin,
             "sequence_score": float(sequence_score),
             "sequence_acc": sequence_acc,
             "sequence_margin": sequence_margin,
@@ -2149,6 +2277,7 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "view_skipped": skipped["view"],
             "context_skipped": skipped["context"],
             "span_skipped": skipped["span"],
+            "closure_skipped": skipped["closure"],
             "sequence_skipped": skipped["sequence"],
             "neighborhood_skipped": skipped["neighborhood"],
             "cluster_skipped": skipped["cluster"],
@@ -2159,6 +2288,7 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
 def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
                         token_drop_p=0.15, token_replace_p=0.05,
                         context_keep_p=0.5, span_mask_frac=0.25,
+                        context_closure_split_frac=0.5,
                         score_metric="mastery", score_margin_w=0.1):
     view = reading_latent_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 17,
@@ -2169,6 +2299,9 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
     span = reading_span_completion_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 24,
         span_frac=span_mask_frac)
+    closure = reading_context_closure_retrieval_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 26,
+        split_frac=context_closure_split_frac)
     sequence = reading_sequence_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 25,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p)
@@ -2187,6 +2320,7 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
     return {"view": view,
             "context_target": context,
             "span_completion": span,
+            "context_closure": closure,
             "sequence": sequence,
             "neighborhood": neighborhood,
             "cluster": cluster,
@@ -2196,7 +2330,7 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
                 view, context, metric=score_metric, margin_w=score_margin_w,
                 neighborhood_eval=neighborhood, cluster_eval=cluster,
                 fer_eval=fer, bridge_eval=bridge, sequence_eval=sequence,
-                span_eval=span)}
+                span_eval=span, closure_eval=closure)}
 
 
 def reading_latent_bridge_graph_state(model):
@@ -3126,6 +3260,9 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          context_target_temperature=0.1,
                          span_completion_w=0.05, span_mask_frac=0.25,
                          span_completion_temperature=0.1,
+                         context_closure_w=0.05,
+                         context_closure_split_frac=0.5,
+                         context_closure_temperature=0.1,
                          sequence_w=0.05, sequence_batch=0,
                          sequence_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
@@ -3271,6 +3408,13 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading span mask fraction must be in (0, 1)")
     if float(span_completion_temperature) <= 0.0:
         raise ValueError("reading span completion temperature must be positive")
+    if float(context_closure_w) < 0.0:
+        raise ValueError("reading context closure weight must be non-negative")
+    if (float(context_closure_split_frac) <= 0.0
+            or float(context_closure_split_frac) >= 1.0):
+        raise ValueError("reading context closure split fraction must be in (0, 1)")
+    if float(context_closure_temperature) <= 0.0:
+        raise ValueError("reading context closure temperature must be positive")
     if float(sequence_w) < 0.0:
         raise ValueError("reading sequence loss weight must be non-negative")
     if int(sequence_batch) < 0 or int(sequence_batch) == 1:
@@ -3432,6 +3576,10 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_span_completion = 0.0
     last_span_hidden_rate = 0.0
     last_span_skipped = True
+    last_context_closure = 0.0
+    last_context_closure_prefix_rate = 0.0
+    last_context_closure_suffix_rate = 0.0
+    last_context_closure_skipped = True
     last_sequence = 0.0
     last_sequence_transition_updates = 0
     last_neighborhood = 0.0
@@ -3866,6 +4014,22 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 "view_count": 0,
                 "skipped": True,
             }
+        if context_closure_w:
+            context_closure, context_closure_metrics = (
+                reading_context_closure_loss(
+                    model, txt, vocab.pad, split_frac=context_closure_split_frac,
+                    feature_dropout=feature_dropout,
+                    temperature=context_closure_temperature))
+        else:
+            context_closure = view_loss * 0.0
+            zero_metric = view_loss.detach() * 0.0
+            context_closure_metrics = {
+                "completion_loss": zero_metric,
+                "prefix_token_rate": zero_metric,
+                "suffix_token_rate": zero_metric,
+                "view_count": 0,
+                "skipped": True,
+            }
         sequence_loss = view_loss * 0.0
         if sequence_w and sequence_pairs:
             sequence_pair_batch = batch_reading_neighbor_pairs(
@@ -3931,6 +4095,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 + float(bridge_w) * bridge_loss
                 + float(context_target_w) * context_target
                 + float(span_completion_w) * span_completion
+                + float(context_closure_w) * context_closure
                 + float(sequence_w) * sequence_loss
                 + float(neighborhood_w) * neighborhood_loss
                 + float(transition_w) * transition_loss
@@ -4041,6 +4206,12 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_span_hidden_rate = float(
             span_completion_metrics["hidden_token_rate"].detach())
         last_span_skipped = bool(span_completion_metrics["skipped"])
+        last_context_closure = float(context_closure.detach())
+        last_context_closure_prefix_rate = float(
+            context_closure_metrics["prefix_token_rate"].detach())
+        last_context_closure_suffix_rate = float(
+            context_closure_metrics["suffix_token_rate"].detach())
+        last_context_closure_skipped = bool(context_closure_metrics["skipped"])
         last_sequence = float(sequence_loss.detach())
         last_neighborhood = float(neighborhood_loss.detach())
         last_transition = float(transition_loss.detach())
@@ -4064,6 +4235,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                   f"bridge {last_bridge:.3f} "
                   f"context-target {last_context_target:.3f} "
                   f"span-complete {last_span_completion:.3f} "
+                  f"closure {last_context_closure:.3f} "
                   f"sequence {last_sequence:.3f} "
                   f"neighborhood {last_neighborhood:.3f} "
                   f"transition {last_transition:.3f} "
@@ -4262,6 +4434,13 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "span_completion_temperature": float(span_completion_temperature),
         "span_completion_hidden_token_rate": last_span_hidden_rate,
         "span_completion_skipped": bool(last_span_skipped),
+        "context_closure_loss": last_context_closure,
+        "context_closure_w": float(context_closure_w),
+        "context_closure_split_frac": float(context_closure_split_frac),
+        "context_closure_temperature": float(context_closure_temperature),
+        "context_closure_prefix_token_rate": last_context_closure_prefix_rate,
+        "context_closure_suffix_token_rate": last_context_closure_suffix_rate,
+        "context_closure_skipped": bool(last_context_closure_skipped),
         "sequence_loss": last_sequence,
         "sequence_w": float(sequence_w),
         "sequence_batch": int(sequence_batch),
@@ -4384,6 +4563,8 @@ def fit_reading_concepts_select_best(
         context_target_temperature=0.1,
         span_completion_w=0.05, span_mask_frac=0.25,
         span_completion_temperature=0.1,
+        context_closure_w=0.05, context_closure_split_frac=0.5,
+        context_closure_temperature=0.1,
         sequence_w=0.05, sequence_batch=0, sequence_temperature=0.1,
         neighborhood_w=0.0, neighborhood_batch=0,
         neighborhood_probe_n=0, neighborhood_refresh_steps=0,
@@ -4426,7 +4607,8 @@ def fit_reading_concepts_select_best(
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=score_metric,
-        score_margin_w=score_margin_w, span_mask_frac=span_mask_frac)
+        score_margin_w=score_margin_w, span_mask_frac=span_mask_frac,
+        context_closure_split_frac=context_closure_split_frac)
     bridge_insight_gate = bool(
         bridge_w and initial_study_strategy in READING_POOL_STUDY_STRATEGIES
         and initial_study_strategy not in ("sequence", "fer"))
@@ -4438,7 +4620,8 @@ def fit_reading_concepts_select_best(
             seed=seed + 4093, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, context_keep_p=context_keep_p,
             score_metric=score_metric, score_margin_w=score_margin_w,
-            span_mask_frac=span_mask_frac)
+            span_mask_frac=span_mask_frac,
+            context_closure_split_frac=context_closure_split_frac)
 
     def selection_row(round_id, round_steps, bundle, replay_bundle=None):
         base_score = float(bundle["score_components"]["score"])
@@ -4568,6 +4751,9 @@ def fit_reading_concepts_select_best(
             span_completion_w=span_completion_w,
             span_mask_frac=span_mask_frac,
             span_completion_temperature=span_completion_temperature,
+            context_closure_w=context_closure_w,
+            context_closure_split_frac=context_closure_split_frac,
+            context_closure_temperature=context_closure_temperature,
             sequence_w=sequence_w,
             sequence_batch=sequence_batch,
             sequence_temperature=sequence_temperature,
@@ -4612,7 +4798,8 @@ def fit_reading_concepts_select_best(
             model, vocab, records, device=device, eval_n=eval_n, seed=seed,
             token_drop_p=token_drop_p, token_replace_p=token_replace_p,
             context_keep_p=context_keep_p, score_metric=score_metric,
-            score_margin_w=score_margin_w, span_mask_frac=span_mask_frac)
+            score_margin_w=score_margin_w, span_mask_frac=span_mask_frac,
+            context_closure_split_frac=context_closure_split_frac)
         replay_bundle = None
         if before_replay_bundle is not None:
             replay_bundle = reading_eval_bundle(
@@ -4620,7 +4807,8 @@ def fit_reading_concepts_select_best(
                 seed=seed + 4093, token_drop_p=token_drop_p,
                 token_replace_p=token_replace_p, context_keep_p=context_keep_p,
                 score_metric=score_metric, score_margin_w=score_margin_w,
-                span_mask_frac=span_mask_frac)
+                span_mask_frac=span_mask_frac,
+                context_closure_split_frac=context_closure_split_frac)
         row = selection_row(round_i, round_steps, bundle, replay_bundle)
         score = float(row["score"])
         score_delta_from_best = float(score - best_score)
@@ -4780,6 +4968,9 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            context_target_temperature=0.1,
                            span_completion_w=0.05, span_mask_frac=0.25,
                            span_completion_temperature=0.1,
+                           context_closure_w=0.05,
+                           context_closure_split_frac=0.5,
+                           context_closure_temperature=0.1,
                            sequence_w=0.05, sequence_batch=0,
                            sequence_temperature=0.1,
                            neighborhood_w=0.0, neighborhood_batch=0,
@@ -4890,6 +5081,9 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             span_completion_w=span_completion_w,
             span_mask_frac=span_mask_frac,
             span_completion_temperature=span_completion_temperature,
+            context_closure_w=context_closure_w,
+            context_closure_split_frac=context_closure_split_frac,
+            context_closure_temperature=context_closure_temperature,
             sequence_w=sequence_w, sequence_batch=sequence_batch,
             sequence_temperature=sequence_temperature,
             neighborhood_w=neighborhood_w,
@@ -4993,6 +5187,9 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         span_completion_w=span_completion_w,
         span_mask_frac=span_mask_frac,
         span_completion_temperature=span_completion_temperature,
+        context_closure_w=context_closure_w,
+        context_closure_split_frac=context_closure_split_frac,
+        context_closure_temperature=context_closure_temperature,
         sequence_w=sequence_w, sequence_batch=sequence_batch,
         sequence_temperature=sequence_temperature,
         neighborhood_w=neighborhood_w,
@@ -5077,6 +5274,9 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          context_target_temperature=0.1,
                          span_completion_w=0.05, span_mask_frac=0.25,
                          span_completion_temperature=0.1,
+                         context_closure_w=0.05,
+                         context_closure_split_frac=0.5,
+                         context_closure_temperature=0.1,
                          sequence_w=0.05, sequence_batch=0,
                          sequence_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
@@ -5117,7 +5317,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=study_score_metric,
-        score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac)
+        score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac,
+        context_closure_split_frac=context_closure_split_frac)
     selection = {"enabled": False}
     if study_select_best:
         _model, _vocab, selection = fit_reading_concepts_select_best(
@@ -5193,6 +5394,9 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             span_completion_w=span_completion_w,
             span_mask_frac=span_mask_frac,
             span_completion_temperature=span_completion_temperature,
+            context_closure_w=context_closure_w,
+            context_closure_split_frac=context_closure_split_frac,
+            context_closure_temperature=context_closure_temperature,
             sequence_w=sequence_w, sequence_batch=sequence_batch,
             sequence_temperature=sequence_temperature,
             neighborhood_w=neighborhood_w,
@@ -5297,6 +5501,9 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             span_completion_w=span_completion_w,
             span_mask_frac=span_mask_frac,
             span_completion_temperature=span_completion_temperature,
+            context_closure_w=context_closure_w,
+            context_closure_split_frac=context_closure_split_frac,
+            context_closure_temperature=context_closure_temperature,
             sequence_w=sequence_w, sequence_batch=sequence_batch,
             sequence_temperature=sequence_temperature,
             neighborhood_w=neighborhood_w,
@@ -5323,13 +5530,16 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=study_score_metric,
-        score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac)
+        score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac,
+        context_closure_split_frac=context_closure_split_frac)
     before = before_bundle["view"]
     after = after_bundle["view"]
     before_context = before_bundle["context_target"]
     after_context = after_bundle["context_target"]
     before_span = before_bundle["span_completion"]
     after_span = after_bundle["span_completion"]
+    before_closure = before_bundle["context_closure"]
+    after_closure = after_bundle["context_closure"]
     before_sequence = before_bundle["sequence"]
     after_sequence = after_bundle["sequence"]
     before_neighborhood = before_bundle["neighborhood"]
@@ -5415,6 +5625,9 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "span_completion_w": float(span_completion_w),
               "span_mask_frac": float(span_mask_frac),
               "span_completion_temperature": float(span_completion_temperature),
+              "context_closure_w": float(context_closure_w),
+              "context_closure_split_frac": float(context_closure_split_frac),
+              "context_closure_temperature": float(context_closure_temperature),
               "sequence_w": float(sequence_w),
               "sequence_batch": int(sequence_batch),
               "sequence_temperature": float(sequence_temperature),
@@ -5458,6 +5671,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "after_context_target": after_context,
               "before_span_completion": before_span,
               "after_span_completion": after_span,
+              "before_context_closure": before_closure,
+              "after_context_closure": after_closure,
               "before_sequence": before_sequence,
               "after_sequence": after_sequence,
               "before_neighborhood": before_neighborhood,
@@ -5502,6 +5717,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                   "span_completion_margin": (
                       after_span.get("margin", 0.0)
                       - before_span.get("margin", 0.0)),
+                  "context_closure_acc": (
+                      after_closure.get("context_closure_acc", 0.0)
+                      - before_closure.get("context_closure_acc", 0.0)),
+                  "context_closure_margin": (
+                      after_closure.get("margin", 0.0)
+                      - before_closure.get("margin", 0.0)),
                   "sequence_acc": (
                       after_sequence.get("sequence_acc", 0.0)
                       - before_sequence.get("sequence_acc", 0.0)),
@@ -5659,6 +5880,9 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              context_target_temperature=0.1,
                              span_completion_w=0.05, span_mask_frac=0.25,
                              span_completion_temperature=0.1,
+                             context_closure_w=0.05,
+                             context_closure_split_frac=0.5,
+                             context_closure_temperature=0.1,
                              sequence_w=0.05, sequence_batch=0,
                              sequence_temperature=0.1,
                              neighborhood_w=0.0, neighborhood_batch=0,
@@ -5720,13 +5944,15 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=study_score_metric,
-        score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac)
+        score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac,
+        context_closure_split_frac=context_closure_split_frac)
     before_replay_bundle = (reading_eval_bundle(
         model, vocab, replay_records, device=device, eval_n=eval_n,
         seed=seed + 4093, token_drop_p=token_drop_p,
         token_replace_p=token_replace_p, context_keep_p=context_keep_p,
         score_metric=study_score_metric, score_margin_w=study_score_margin_w,
-        span_mask_frac=span_mask_frac)
+        span_mask_frac=span_mask_frac,
+        context_closure_split_frac=context_closure_split_frac)
         if replay_records else None)
     selection = {"enabled": False}
     if study_select_best:
@@ -5803,6 +6029,9 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             span_completion_w=span_completion_w,
             span_mask_frac=span_mask_frac,
             span_completion_temperature=span_completion_temperature,
+            context_closure_w=context_closure_w,
+            context_closure_split_frac=context_closure_split_frac,
+            context_closure_temperature=context_closure_temperature,
             sequence_w=sequence_w, sequence_batch=sequence_batch,
             sequence_temperature=sequence_temperature,
             neighborhood_w=neighborhood_w,
@@ -5911,6 +6140,9 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             span_completion_w=span_completion_w,
             span_mask_frac=span_mask_frac,
             span_completion_temperature=span_completion_temperature,
+            context_closure_w=context_closure_w,
+            context_closure_split_frac=context_closure_split_frac,
+            context_closure_temperature=context_closure_temperature,
             sequence_w=sequence_w, sequence_batch=sequence_batch,
             sequence_temperature=sequence_temperature,
             neighborhood_w=neighborhood_w,
@@ -5941,13 +6173,15 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=study_score_metric,
-        score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac)
+        score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac,
+        context_closure_split_frac=context_closure_split_frac)
     after_replay_bundle = (reading_eval_bundle(
         model, vocab, replay_records, device=device, eval_n=eval_n,
         seed=seed + 4093, token_drop_p=token_drop_p,
         token_replace_p=token_replace_p, context_keep_p=context_keep_p,
         score_metric=study_score_metric, score_margin_w=study_score_margin_w,
-        span_mask_frac=span_mask_frac)
+        span_mask_frac=span_mask_frac,
+        context_closure_split_frac=context_closure_split_frac)
         if replay_records else None)
     before = before_bundle["view"]
     after = after_bundle["view"]
@@ -5955,6 +6189,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
     after_context = after_bundle["context_target"]
     before_span = before_bundle["span_completion"]
     after_span = after_bundle["span_completion"]
+    before_closure = before_bundle["context_closure"]
+    after_closure = after_bundle["context_closure"]
     before_sequence = before_bundle["sequence"]
     after_sequence = after_bundle["sequence"]
     before_neighborhood = before_bundle["neighborhood"]
@@ -6069,6 +6305,9 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "span_completion_w": float(span_completion_w),
               "span_mask_frac": float(span_mask_frac),
               "span_completion_temperature": float(span_completion_temperature),
+              "context_closure_w": float(context_closure_w),
+              "context_closure_split_frac": float(context_closure_split_frac),
+              "context_closure_temperature": float(context_closure_temperature),
               "sequence_w": float(sequence_w),
               "sequence_batch": int(sequence_batch),
               "sequence_temperature": float(sequence_temperature),
@@ -6119,6 +6358,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "after_context_target": after_context,
               "before_span_completion": before_span,
               "after_span_completion": after_span,
+              "before_context_closure": before_closure,
+              "after_context_closure": after_closure,
               "before_sequence": before_sequence,
               "after_sequence": after_sequence,
               "before_neighborhood": before_neighborhood,
@@ -6165,6 +6406,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                   "span_completion_margin": (
                       after_span.get("margin", 0.0)
                       - before_span.get("margin", 0.0)),
+                  "context_closure_acc": (
+                      after_closure.get("context_closure_acc", 0.0)
+                      - before_closure.get("context_closure_acc", 0.0)),
+                  "context_closure_margin": (
+                      after_closure.get("margin", 0.0)
+                      - before_closure.get("margin", 0.0)),
                   "sequence_acc": (
                       after_sequence.get("sequence_acc", 0.0)
                       - before_sequence.get("sequence_acc", 0.0)),
@@ -6394,6 +6641,13 @@ def selftest():
     assert torch.isfinite(span_completion_loss)
     assert span_completion_metrics["skipped"] is False
     assert float(span_completion_metrics["hidden_token_rate"]) > 0.0
+    closure_loss, closure_metrics = reading_context_closure_loss(
+        reading_model, reading_txt, reading_vocab.pad, split_frac=0.5,
+        feature_dropout=0.1, temperature=0.1)
+    assert torch.isfinite(closure_loss)
+    assert closure_metrics["skipped"] is False
+    assert float(closure_metrics["prefix_token_rate"]) > 0.0
+    assert float(closure_metrics["suffix_token_rate"]) > 0.0
     discovery_loss, discovery_metrics = reading_latent_discovery_loss(
         reading_model, reading_txt, reading_vocab.pad, feature_dropout=0.1,
         context_keep_p=0.5, graph_transitive_steps=2,
@@ -6472,6 +6726,13 @@ def selftest():
     assert span_bundle["score_components"]["span_skipped"] is False
     assert math.isfinite(span_bundle["score_components"]["span_score"])
     assert "span_completion" in span_bundle
+    closure_bundle = reading_eval_bundle(
+        reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
+        score_metric="closure")
+    assert closure_bundle["score_components"]["metric"] == "closure"
+    assert closure_bundle["score_components"]["closure_skipped"] is False
+    assert math.isfinite(closure_bundle["score_components"]["context_closure_score"])
+    assert "context_closure" in closure_bundle
     mastery_bundle = reading_eval_bundle(
         reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
         score_metric="mastery")
@@ -6479,9 +6740,11 @@ def selftest():
     assert ("mastery_score" in mastery_bundle["score_components"]
             and "signal_coverage" in mastery_bundle["score_components"]
             and "span_score" in mastery_bundle["score_components"]
+            and "context_closure_score" in mastery_bundle["score_components"]
             and "sequence_score" in mastery_bundle["score_components"]
             and "bridge_score" in mastery_bundle["score_components"])
     assert mastery_bundle["score_components"]["span_skipped"] is False
+    assert mastery_bundle["score_components"]["closure_skipped"] is False
     assert mastery_bundle["score_components"]["bridge_skipped"] is False
     assert (mastery_bundle["score_components"]["score"]
             == mastery_bundle["score_components"]["mastery_score"])
@@ -6491,6 +6754,7 @@ def selftest():
         token_replace_p=0.0, study_strategy="discovery", study_probe_n=4,
         study_hard_max=2, study_refresh_steps=1, context_target_w=0.1,
         span_completion_w=0.1, span_mask_frac=0.25,
+        context_closure_w=0.1, context_closure_split_frac=0.5,
         context_keep_p=0.5, memory_size=8, composition_w=0.1, graph_predict_w=0.1,
         graph_cycle_w=0.1, bridge_w=0.1, fer_w=0.1,
         consolidation_w=0.1, consolidation_fer_w=0.1,
@@ -6519,6 +6783,14 @@ def selftest():
         reading_model.reading_train_metrics["span_completion_loss"])
     assert (reading_model.reading_train_metrics[
         "span_completion_hidden_token_rate"] > 0.0)
+    assert reading_model.reading_train_metrics["context_closure_w"] == 0.1
+    assert reading_model.reading_train_metrics["context_closure_skipped"] is False
+    assert math.isfinite(
+        reading_model.reading_train_metrics["context_closure_loss"])
+    assert (reading_model.reading_train_metrics[
+        "context_closure_prefix_token_rate"] > 0.0)
+    assert (reading_model.reading_train_metrics[
+        "context_closure_suffix_token_rate"] > 0.0)
     assert reading_model.reading_train_metrics["discovery_w"] == 0.1
     assert reading_model.reading_train_metrics["discovery_fer_w"] == 0.1
     assert reading_model.reading_train_metrics["discovery_skipped"] is False
@@ -6731,6 +7003,9 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-span-completion-w", type=float, default=0.05)
     ap.add_argument("--reading-span-mask-frac", type=float, default=0.25)
     ap.add_argument("--reading-span-completion-temperature", type=float, default=0.1)
+    ap.add_argument("--reading-context-closure-w", type=float, default=0.05)
+    ap.add_argument("--reading-context-closure-split-frac", type=float, default=0.5)
+    ap.add_argument("--reading-context-closure-temperature", type=float, default=0.1)
     ap.add_argument("--reading-sequence-w", type=float, default=0.05)
     ap.add_argument("--reading-sequence-batch", type=int, default=0)
     ap.add_argument("--reading-sequence-temperature", type=float, default=0.1)
@@ -6905,6 +7180,10 @@ def _reading_kwargs(args):
                 span_mask_frac=args.reading_span_mask_frac,
                 span_completion_temperature=(
                     args.reading_span_completion_temperature),
+                context_closure_w=args.reading_context_closure_w,
+                context_closure_split_frac=args.reading_context_closure_split_frac,
+                context_closure_temperature=(
+                    args.reading_context_closure_temperature),
                 sequence_w=args.reading_sequence_w,
                 sequence_batch=args.reading_sequence_batch,
                 sequence_temperature=args.reading_sequence_temperature,
