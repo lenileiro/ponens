@@ -183,8 +183,9 @@ class CausalBlock(nn.Module):
         self.store_attn = False                          # when set, stash softmax weights for aux supervision
         self._attn = None
 
-    def forward(self, x, ids, pad_mask):
+    def forward(self, x, ids, pad_mask, causal=None):
         B, L, D = x.shape
+        use_causal = self.causal if causal is None else causal   # per-call override (read vs write)
         h = self.norm1(x)
         q, k, v = self.qkv(h).view(B, L, 3, self.h, self.hd).permute(2, 0, 3, 1, 4)  # B,H,L,hd
         q, k = self.qnorm(q), self.knorm(k)              # QK-norm
@@ -193,7 +194,7 @@ class CausalBlock(nn.Module):
             q = q * cos + _rotate_half(q) * sin
             k = k * cos + _rotate_half(k) * sin
         scores = (q @ k.transpose(-2, -1)) * self.logit_scale.view(1, self.h, 1, 1)
-        if self.causal:
+        if use_causal:
             mask = torch.triu(torch.ones(L, L, device=x.device, dtype=torch.bool), 1)
             if self.attn_window is not None:             # also mask positions > window steps back
                 idx = torch.arange(L, device=x.device)
@@ -379,7 +380,8 @@ class ScratchpadLM(nn.Module):
         halts.append(q)
         return auto and bool((torch.sigmoid(q) > 0.5).all())
 
-    def forward(self, ids, loops=None, return_per_loop=False, loop_noise=0.0, prefix=None):
+    def forward(self, ids, loops=None, return_per_loop=False, loop_noise=0.0, prefix=None,
+                causal=None):
         """prefix: optional (B, P, d) continuous embeddings (image patches or feature views)
         prepended BEFORE the token stream -- the multimodal bridge. Logits are returned for
         ALL positions; callers slice [:, P:] for the token part. Incompatible with the
@@ -467,7 +469,7 @@ class ScratchpadLM(nn.Module):
                     break
         else:
             for i, blk in enumerate(self.blocks):
-                x = blk(x, ids, pad_mask)
+                x = blk(x, ids, pad_mask, causal=causal)          # causal=None -> block default
                 if self.mem is not None and i == self.mem_at:     # in-weight memory read (residual)
                     x = x + self.mem(self.memnorm(x))
         self._halt_p = None
