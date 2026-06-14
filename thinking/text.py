@@ -91,6 +91,7 @@ MNLI_URL = "https://cims.nyu.edu/~sbowman/multinli/multinli_1.0.zip"
 HANS_TRAIN_URL = "https://raw.githubusercontent.com/tommccoy1/hans/master/heuristics_train_set.txt"
 HANS_EVAL_URL = "https://raw.githubusercontent.com/tommccoy1/hans/master/heuristics_evaluation_set.txt"
 TOKEN_RE = re.compile(r"[a-z0-9_]+|[^\s\w]", re.ASCII)
+READING_DEFAULT_LATENT_CONCEPT_SLOTS = 4
 
 
 @dataclass(frozen=True)
@@ -4575,7 +4576,8 @@ def fit_reading_concepts_select_best(
 
 def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4,
                            text_encoder_arch="transformer", text_encoder_layers=1,
-                           latent_concept_slots=4, latent_concept_layers=1,
+                           latent_concept_slots=READING_DEFAULT_LATENT_CONCEPT_SLOTS,
+                           latent_concept_layers=1,
                            latent_concept_prefix=False,
                            latent_concept_refine=False,
                            latent_concept_refine_gate_init=-2.0,
@@ -4801,7 +4803,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
 
 def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          text_encoder_arch="transformer", text_encoder_layers=1,
-                         latent_concept_slots=4, latent_concept_layers=1,
+                         latent_concept_slots=READING_DEFAULT_LATENT_CONCEPT_SLOTS,
+                         latent_concept_layers=1,
                          latent_concept_prefix=False, latent_concept_refine=False,
                          latent_concept_refine_gate_init=-2.0,
                          lr=1e-3, seed=0, device=DEV, log_every=100,
@@ -5254,7 +5257,8 @@ def expanded_reading_checkpoint_model(checkpoint, reading_records, device=DEV,
     vocab = build_reading_vocab(reading_records, base_vocab=src_vocab)
     ckpt_slots = int(getattr(src_model, "latent_concept_slots", 0)
                      or ckpt.get("latent_concept_slots", 0))
-    slots = int(latent_concept_slots or ckpt_slots or 4)
+    slots = int(latent_concept_slots or ckpt_slots
+                or READING_DEFAULT_LATENT_CONCEPT_SLOTS)
     layers = int(latent_concept_layers if latent_concept_layers is not None
                  else ckpt.get("latent_concept_layers", 1))
     use_prefix = (bool(latent_concept_prefix)
@@ -7608,6 +7612,13 @@ def _reading_kwargs(args):
                 eval_n=args.reading_eval_n)
 
 
+def _new_reading_latent_slots(args):
+    """Fresh raw-reading runs need latent slots when concept memory is enabled."""
+    return (int(args.latent_concept_slots)
+            if int(args.latent_concept_slots) > 0
+            else READING_DEFAULT_LATENT_CONCEPT_SLOTS)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
@@ -7777,7 +7788,7 @@ def main(argv=None):
                 layers=args.layers, heads=args.heads,
                 text_encoder_arch=args.text_encoder_arch,
                 text_encoder_layers=args.text_encoder_layers,
-                latent_concept_slots=args.latent_concept_slots,
+                latent_concept_slots=_new_reading_latent_slots(args),
                 latent_concept_layers=args.latent_concept_layers,
                 latent_concept_prefix=args.latent_concept_prefix,
                 latent_concept_refine=args.latent_concept_refine,
