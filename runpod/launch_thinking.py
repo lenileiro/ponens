@@ -518,6 +518,7 @@ def apply_image_quality_preset(args):
     args.image_quality_rank_margin = max(float(args.image_quality_rank_margin), 0.05)
     args.image_flow_consistency_w = max(float(args.image_flow_consistency_w), 0.05)
     args.image_flow_endpoint_w = max(float(args.image_flow_endpoint_w), 0.1)
+    args.image_flow_frequency_w = max(float(args.image_flow_frequency_w), 0.02 if hq else 0.01)
     args.image_flow_noise_coupling = "sliced_ot"
     args.image_flow_noise_coupling_projections = max(
         int(args.image_flow_noise_coupling_projections), 4)
@@ -1046,6 +1047,7 @@ def payload(args):
                      f"{args.image_eval_generated_candidates_per_prompt} "
                      f"--flow-consistency-w {args.image_flow_consistency_w} "
                      f"--flow-endpoint-w {args.image_flow_endpoint_w} "
+                     f"--flow-frequency-w {args.image_flow_frequency_w} "
                      f"--flow-noise-coupling {args.image_flow_noise_coupling} "
                      f"--flow-noise-coupling-projections "
                      f"{args.image_flow_noise_coupling_projections} "
@@ -2807,6 +2809,9 @@ def main():
     ap.add_argument("--image-flow-endpoint-w", type=float, default=0.0,
                     dest="image_flow_endpoint_w",
                     help="direct clean-endpoint latent prediction loss weight for image flow")
+    ap.add_argument("--image-flow-frequency-w", type=float, default=0.0,
+                    dest="image_flow_frequency_w",
+                    help="frequency-domain clean-endpoint latent loss weight for image flow")
     ap.add_argument("--image-flow-noise-coupling", default="random",
                     choices=("random", "sliced_ot"), dest="image_flow_noise_coupling",
                     help="source-noise/data pairing for image flow matching")
@@ -3598,6 +3603,8 @@ def main():
         sys.exit("ERROR: --image-flow-loss-weight-gamma must be positive")
     if args.image_flow_endpoint_w < 0.0:
         sys.exit("ERROR: --image-flow-endpoint-w must be non-negative")
+    if args.image_flow_frequency_w < 0.0:
+        sys.exit("ERROR: --image-flow-frequency-w must be non-negative")
     if args.image_flow_self_repa_w < 0.0:
         sys.exit("ERROR: --image-flow-self-repa-w must be non-negative")
     if args.image_flow_self_repa_steps < 0:

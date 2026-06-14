@@ -5466,7 +5466,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        time_logit_std=1.0,
                        time_mode_scale=DEFAULT_TIME_MODE_SCALE, time_shift=1.0,
                        latent_stats=None, consistency_w=0.0,
-                       endpoint_w=0.0,
+                       endpoint_w=0.0, frequency_w=0.0,
                        flow_noise_coupling="random", flow_noise_coupling_projections=1,
                        flow_loss_weight="none", flow_loss_weight_gamma=5.0,
                        flow_loss_weight_normalize=True,
@@ -5485,6 +5485,9 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     endpoint_w = float(endpoint_w)
     if endpoint_w < 0.0:
         raise ValueError("endpoint_w must be non-negative")
+    frequency_w = float(frequency_w)
+    if frequency_w < 0.0:
+        raise ValueError("frequency_w must be non-negative")
     z1_model = normalize_latent(z1, latent_stats)
     x0 = torch.randn_like(z1_model)
     x0, coupling_parts = couple_flow_noise_to_data(
@@ -5530,6 +5533,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         "flow_endpoint_target_mse": endpoint_weighted.detach(),
         "flow_endpoint_target_mse_unweighted": endpoint_unweighted.detach(),
         "flow_endpoint_w": torch.tensor(float(endpoint_w), device=z1.device),
+        "flow_frequency_w": torch.tensor(float(frequency_w), device=z1.device),
         "velocity_weight_mean": velocity_weights.detach().mean(),
         "velocity_weight_min": velocity_weights.detach().min(),
         "velocity_weight_max": velocity_weights.detach().max(),
@@ -5541,6 +5545,10 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     parts.update(coupling_parts)
     if endpoint_w > 0.0:
         total = total + float(endpoint_w) * endpoint_weighted
+    if frequency_w > 0.0:
+        frequency = frequency_recon_loss(endpoint_pred, z1_model)
+        total = total + float(frequency_w) * frequency
+        parts["flow_endpoint_frequency_l1"] = frequency.detach()
     if consistency_w > 0.0:
         t2 = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                                logit_mean=time_logit_mean, logit_std=time_logit_std,
@@ -8367,6 +8375,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
             report.get("flow_noise_coupling_projections", 1)) or 1),
         "flow_endpoint_w": float(ckpt.get(
             "flow_endpoint_w", report.get("flow_endpoint_w", 0.0)) or 0.0),
+        "flow_frequency_w": float(ckpt.get(
+            "flow_frequency_w", report.get("flow_frequency_w", 0.0)) or 0.0),
         "flow_loss_weight_gamma": float(ckpt.get(
             "flow_loss_weight_gamma", report.get("flow_loss_weight_gamma", 5.0))),
         "flow_loss_weight_normalize": bool(ckpt.get(
@@ -9212,6 +9222,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       flow_sra_mode="token",
                       sample_steps=4,
                       flow_consistency_w=0.0, flow_endpoint_w=0.0,
+                      flow_frequency_w=0.0,
                       flow_distill_steps=0, flow_distill_w=1.0,
                       flow_distill_time_gap=0.25, flow_distill_teacher="auto",
                       flow_guidance_distill_w=0.0,
@@ -9465,6 +9476,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("flow_consistency_w must be non-negative")
     if flow_endpoint_w < 0.0:
         raise ValueError("flow_endpoint_w must be non-negative")
+    flow_frequency_w = float(flow_frequency_w)
+    if flow_frequency_w < 0.0:
+        raise ValueError("flow_frequency_w must be non-negative")
     flow_distill_steps = int(flow_distill_steps)
     if flow_distill_steps < 0:
         raise ValueError("flow_distill_steps must be non-negative")
@@ -10235,6 +10249,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     flow_loss_weight_normalize=flow_loss_weight_normalize,
                     consistency_w=flow_consistency_w,
                     endpoint_w=flow_endpoint_w,
+                    frequency_w=flow_frequency_w,
                     text_aligner=text_aligner, text_align_w=flow_text_align_w,
                     feature_aligner=image_feature_aligner, image_features=image_features,
                     feature_align_w=flow_feature_align_w,
@@ -10639,6 +10654,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "sample_schedule": sample_schedule,
         "flow_consistency_w": float(flow_consistency_w),
         "flow_endpoint_w": float(flow_endpoint_w),
+        "flow_frequency_w": float(flow_frequency_w),
         "flow_distill_steps": int(flow_distill_steps),
         "flow_distill_steps_run": int(flow_distill_steps_run),
         "flow_distill_w": float(flow_distill_w),
@@ -10968,6 +10984,7 @@ def selftest():
             image_root=td, image_split="train", caption_max_len=8,
             image_max_records=3, sample_steps=1, flow_distill_steps=1,
             flow_guidance_distill_w=0.01, flow_ema_decay=0.9,
+            flow_frequency_w=0.01,
             flow_boundary_mode="double-cosine",
             flow_time_embed="fourier", flow_time_embed_dim=8,
             dit_mlp="swiglu",
@@ -10985,6 +11002,7 @@ def selftest():
         assert report["time_sampling"] == "adaptive"
         assert math.isclose(report["time_mode_scale"], DEFAULT_TIME_MODE_SCALE)
         assert report["time_adaptive_enabled"] is True
+        assert math.isclose(report["flow_frequency_w"], 0.01)
         assert report["time_adaptive_prior"] == "mode"
         assert math.isclose(report["time_adaptive_prior_mix"], 0.25)
         assert report["time_adaptive_prior_prob_max"] > report["time_adaptive_prior_prob_min"]
@@ -11318,6 +11336,9 @@ def main(argv=None):
     ap.add_argument("--flow-endpoint-w", type=float, default=0.0,
                     dest="flow_endpoint_w",
                     help="direct clean-endpoint latent prediction loss weight for latent flow")
+    ap.add_argument("--flow-frequency-w", type=float, default=0.0,
+                    dest="flow_frequency_w",
+                    help="frequency-domain clean-endpoint latent loss weight for latent flow")
     ap.add_argument("--flow-noise-coupling", default="random", choices=FLOW_NOISE_COUPLINGS,
                     dest="flow_noise_coupling",
                     help="source-noise/data pairing for flow matching")
@@ -11686,6 +11707,8 @@ def main(argv=None):
         ap.error("--flow-time-embed-dim must be non-negative")
     if args.flow_endpoint_w < 0.0:
         ap.error("--flow-endpoint-w must be non-negative")
+    if args.flow_frequency_w < 0.0:
+        ap.error("--flow-frequency-w must be non-negative")
     if args.flow_self_repa_w < 0.0:
         ap.error("--flow-self-repa-w must be non-negative")
     if args.flow_self_repa_steps < 0:
@@ -12022,6 +12045,7 @@ def main(argv=None):
         sample_steps=args.sample_steps, cond_mode=args.cond_mode,
         flow_consistency_w=args.flow_consistency_w,
         flow_endpoint_w=args.flow_endpoint_w,
+        flow_frequency_w=args.flow_frequency_w,
         flow_noise_coupling=args.flow_noise_coupling,
         flow_noise_coupling_projections=args.flow_noise_coupling_projections,
         size_buckets=cli_size_buckets,
@@ -12460,6 +12484,7 @@ def main(argv=None):
         "flow_noise_coupling_projections": report.get(
             "flow_noise_coupling_projections", args.flow_noise_coupling_projections),
         "flow_endpoint_w": report.get("flow_endpoint_w", args.flow_endpoint_w),
+        "flow_frequency_w": report.get("flow_frequency_w", args.flow_frequency_w),
         "flow_loss_weight_gamma": args.flow_loss_weight_gamma,
         "flow_loss_weight_normalize": not args.no_flow_loss_weight_normalize,
         "sample_time_shift": report.get("sample_time_shift", report.get("time_shift", args.time_shift)),
