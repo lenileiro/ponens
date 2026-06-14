@@ -219,6 +219,25 @@ class LatentConceptMemory(nn.Module):
             fer_correlation_w=fer_correlation_w,
             fer_balance_w=fer_balance_w)
 
+    def reanalysis_loss(self, probe_slots, anchor_slots, graph_w=1.0,
+                        cycle_w=0.5, bridge_w=0.5, fer_w=0.0,
+                        temperature=0.1, self_loop_w=0.05,
+                        transitive_steps=2, transitive_w=0.1,
+                        target_power=1.0, cycle_consistency_w=0.5,
+                        fer_fragmentation_w=1.0, fer_correlation_w=1.0,
+                        fer_balance_w=0.1):
+        return latent_concept_reanalysis_loss(
+            probe_slots, anchor_slots, self.active(),
+            relations=self.active_relations(),
+            transitions=self.active_transitions(),
+            prediction_relations=self.active_prediction_relations(),
+            graph_w=graph_w, cycle_w=cycle_w, bridge_w=bridge_w, fer_w=fer_w,
+            temperature=temperature, self_loop_w=self_loop_w,
+            transitive_steps=transitive_steps, transitive_w=transitive_w,
+            target_power=target_power, cycle_consistency_w=cycle_consistency_w,
+            fer_fragmentation_w=fer_fragmentation_w,
+            fer_correlation_w=fer_correlation_w, fer_balance_w=fer_balance_w)
+
     def association_loss(self, slots, temperature=0.1, target_power=1.0,
                          self_loop_w=0.05, transitive_steps=1,
                          transitive_w=0.0):
@@ -658,6 +677,144 @@ def latent_concept_discovery_loss(
     if float(fer_w):
         fer_loss = latent_concept_fer_loss(
             full_slots, fragmentation_w=fer_fragmentation_w,
+            correlation_w=fer_correlation_w, balance_w=fer_balance_w)
+        losses.append(float(fer_w) * fer_loss)
+        metrics["fer_loss"] = fer_loss
+    if not losses:
+        return zero, metrics
+    metrics["skipped"] = False
+    return torch.stack(losses).mean(), metrics
+
+
+def _latent_reanalysis_zero(probe_slots, anchor_slots=None):
+    slots = probe_slots if probe_slots is not None else anchor_slots
+    if slots is None:
+        return torch.tensor(0.0)
+    return slots.reshape(slots.shape[0], -1).sum() * 0.0
+
+
+def latent_concept_reanalysis_loss(
+        probe_slots, anchor_slots, memory, relations=None, transitions=None,
+        prediction_relations=None, graph_w=1.0, cycle_w=0.5,
+        bridge_w=0.5, fer_w=0.0, temperature=0.1, self_loop_w=0.05,
+        transitive_steps=2, transitive_w=0.1, target_power=1.0,
+        cycle_consistency_w=0.5, fer_fragmentation_w=1.0,
+        fer_correlation_w=1.0, fer_balance_w=0.1):
+    """Re-read a degraded view into the model's own graph-closed concept state.
+
+    `anchor_slots` are a stable view of the same observation and are detached.
+    `probe_slots` are a weaker or partial view that receives gradients.  The
+    target is not a label or answer: it is the anchor's distribution over the
+    persistent concept memory after optional propagation through the self-mined
+    relation/transition graph. This makes the model update weights toward an
+    internally coherent concept closure when it rereads data.
+    """
+    weights = {
+        "graph_w": graph_w, "cycle_w": cycle_w,
+        "bridge_w": bridge_w, "fer_w": fer_w,
+    }
+    if any(float(w) < 0.0 for w in weights.values()):
+        raise ValueError("latent concept reanalysis weights must be non-negative")
+    zero = _latent_reanalysis_zero(probe_slots, anchor_slots)
+    metrics = {
+        "closure_loss": zero,
+        "closure_kl": zero,
+        "closure_cosine": zero,
+        "cycle_loss": zero,
+        "bridge_loss": zero,
+        "fer_loss": zero,
+        "memory_active": 0,
+        "graph_ready": False,
+        "skipped": True,
+    }
+    if probe_slots is None or anchor_slots is None:
+        return zero, metrics
+    if memory is None or memory.numel() == 0:
+        return zero, metrics
+    if probe_slots.ndim != 3 or anchor_slots.ndim != 3:
+        raise ValueError("latent concept reanalysis expects [batch, slots, dim]")
+    if probe_slots.shape[0] != anchor_slots.shape[0]:
+        raise ValueError("latent concept reanalysis batch mismatch")
+    if probe_slots.shape[-1] != anchor_slots.shape[-1]:
+        raise ValueError("latent concept reanalysis probe/anchor dimension mismatch")
+    if probe_slots.shape[-1] != memory.shape[-1]:
+        raise ValueError("latent concept reanalysis memory dimension mismatch")
+    active_n = int(memory.shape[0])
+    metrics["memory_active"] = active_n
+    if active_n <= 0:
+        return zero, metrics
+    temp = max(float(temperature), 1e-6)
+    if float(target_power) <= 0.0:
+        raise ValueError("latent concept reanalysis target power must be positive")
+    if float(cycle_consistency_w) < 0.0:
+        raise ValueError("latent concept reanalysis cycle consistency must be non-negative")
+
+    mem = F.normalize(
+        memory.to(device=probe_slots.device, dtype=probe_slots.dtype), dim=-1)
+    probe = F.normalize(probe_slots, dim=-1)
+    anchor = F.normalize(anchor_slots.detach().to(probe_slots), dim=-1)
+    probe_dist = (probe.matmul(mem.t()) / temp).softmax(-1).mean(1)
+    with torch.no_grad():
+        anchor_dist = (anchor.matmul(mem.t()) / temp).softmax(-1).mean(1)
+
+    pred_rel = prediction_relations
+    if pred_rel is None:
+        pred_rel = transitions if _has_offdiag_edges(transitions) else relations
+    rel = None
+    graph_ready = bool(active_n > 1 and _has_offdiag_edges(pred_rel))
+    if graph_ready:
+        rel = _latent_relation_targets(
+            pred_rel, active_n, probe_slots.device, probe_slots.dtype,
+            self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+            transitive_w=transitive_w)
+    metrics["graph_ready"] = bool(rel is not None)
+
+    target = anchor_dist.detach()
+    if rel is not None:
+        target = target.matmul(rel)
+        target = target / target.sum(-1, keepdim=True).clamp_min(1e-8)
+    power = float(target_power)
+    if power != 1.0:
+        target = target.clamp_min(1e-8).pow(power)
+        target = target / target.sum(-1, keepdim=True).clamp_min(1e-8)
+    target = target.detach()
+    target_center = F.normalize(target.matmul(mem).detach(), dim=-1)
+    probe_center = F.normalize(probe_dist.matmul(mem), dim=-1)
+    closure_kl = F.kl_div(
+        probe_dist.clamp_min(1e-8).log(), target,
+        reduction="none").sum(-1).mean()
+    closure_cosine = (1.0 - (probe_center * target_center).sum(-1)).mean()
+    closure_loss = 0.5 * (closure_kl + closure_cosine)
+    metrics["closure_loss"] = closure_loss
+    metrics["closure_kl"] = closure_kl
+    metrics["closure_cosine"] = closure_cosine
+
+    losses = []
+    if float(graph_w):
+        losses.append(float(graph_w) * closure_loss)
+    if float(cycle_w) and rel is not None:
+        rev = _latent_relation_targets(
+            pred_rel.t(), active_n, probe_slots.device, probe_slots.dtype,
+            self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+            transitive_w=transitive_w)
+        if rev is not None:
+            reverse = target.matmul(rev)
+            reverse = reverse / reverse.sum(-1, keepdim=True).clamp_min(1e-8)
+            cycle_target = anchor_dist.detach()
+            cycle_loss = F.kl_div(
+                reverse.clamp_min(1e-8).log(), cycle_target,
+                reduction="none").sum(-1).mean()
+            cycle_loss = float(cycle_consistency_w) * cycle_loss
+            losses.append(float(cycle_w) * cycle_loss)
+            metrics["cycle_loss"] = cycle_loss
+    if float(bridge_w):
+        bridge_loss = latent_concept_bridge_loss(
+            probe_slots, memory, relations=relations, transitions=transitions)
+        losses.append(float(bridge_w) * bridge_loss)
+        metrics["bridge_loss"] = bridge_loss
+    if float(fer_w):
+        fer_loss = latent_concept_fer_loss(
+            probe_slots, fragmentation_w=fer_fragmentation_w,
             correlation_w=fer_correlation_w, balance_w=fer_balance_w)
         losses.append(float(fer_w) * fer_loss)
         metrics["fer_loss"] = fer_loss

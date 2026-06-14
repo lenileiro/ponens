@@ -72,6 +72,7 @@ from .concepts import (
     latent_concept_graph_snapshot,
     latent_concept_memory_consolidation_loss,
     latent_concept_neighborhood_loss,
+    latent_concept_reanalysis_loss,
     latent_concept_sequence_prediction_loss,
     latent_concept_sequence_prediction_scores,
     latent_concept_slot_factorization_loss,
@@ -1726,6 +1727,58 @@ def reading_latent_discovery_loss(
         cycle_transitive_steps=cycle_transitive_steps,
         cycle_transitive_w=cycle_transitive_w,
         cycle_target_power=cycle_target_power,
+        cycle_consistency_w=cycle_consistency_w,
+        fer_fragmentation_w=fer_fragmentation_w,
+        fer_correlation_w=fer_correlation_w,
+        fer_balance_w=fer_balance_w)
+
+
+def reading_latent_reanalysis_loss(
+        model, txt, pad, unk, token_drop_p=0.15, token_replace_p=0.05,
+        feature_dropout=0.1, graph_w=1.0, cycle_w=0.5, bridge_w=0.5,
+        fer_w=0.0, temperature=0.1, self_loop_w=0.05,
+        transitive_steps=2, transitive_w=0.1, target_power=1.0,
+        cycle_consistency_w=0.5, fer_fragmentation_w=1.0,
+        fer_correlation_w=1.0, fer_balance_w=0.1):
+    zero = torch.tensor(0.0, device=txt.device)
+    metrics = {"closure_loss": zero, "closure_kl": zero,
+               "closure_cosine": zero, "cycle_loss": zero,
+               "bridge_loss": zero, "fer_loss": zero,
+               "memory_active": 0, "graph_ready": False, "skipped": True}
+    memory = getattr(model, "latent_concept_memory", None)
+    if getattr(model, "latent_concepts", None) is None or memory is None:
+        return zero, metrics
+    active = memory.active()
+    metrics["memory_active"] = int(active.shape[0])
+    if active.numel() == 0:
+        return zero, metrics
+    with torch.no_grad():
+        anchor_slots = model.latent_concept_states(
+            txt, feature_dropout=0.0, project=True)
+    probe_txt = corrupt_reading_tokens(
+        txt, pad, unk, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p)
+    probe_slots = model.latent_concept_states(
+        probe_txt, feature_dropout=feature_dropout, project=True)
+    if hasattr(memory, "reanalysis_loss"):
+        return memory.reanalysis_loss(
+            probe_slots, anchor_slots,
+            graph_w=graph_w, cycle_w=cycle_w, bridge_w=bridge_w, fer_w=fer_w,
+            temperature=temperature, self_loop_w=self_loop_w,
+            transitive_steps=transitive_steps, transitive_w=transitive_w,
+            target_power=target_power,
+            cycle_consistency_w=cycle_consistency_w,
+            fer_fragmentation_w=fer_fragmentation_w,
+            fer_correlation_w=fer_correlation_w,
+            fer_balance_w=fer_balance_w)
+    return latent_concept_reanalysis_loss(
+        probe_slots, anchor_slots, active, relations=memory.active_relations(),
+        transitions=memory.active_transitions(),
+        prediction_relations=memory.active_prediction_relations(),
+        graph_w=graph_w, cycle_w=cycle_w, bridge_w=bridge_w, fer_w=fer_w,
+        temperature=temperature, self_loop_w=self_loop_w,
+        transitive_steps=transitive_steps, transitive_w=transitive_w,
+        target_power=target_power,
         cycle_consistency_w=cycle_consistency_w,
         fer_fragmentation_w=fer_fragmentation_w,
         fer_correlation_w=fer_correlation_w,
@@ -3571,6 +3624,10 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          discovery_w=0.0, discovery_curiosity_w=1.0,
                          discovery_graph_w=1.0, discovery_cycle_w=1.0,
                          discovery_bridge_w=1.0, discovery_fer_w=0.0,
+                         reanalysis_w=0.0, reanalysis_graph_w=1.0,
+                         reanalysis_cycle_w=0.5,
+                         reanalysis_bridge_w=0.5,
+                         reanalysis_fer_w=0.0,
                          association_w=0.05, association_temperature=0.1,
                          association_decay=0.99, association_target_power=1.0,
                          association_self_loop_w=0.05,
@@ -3662,6 +3719,13 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
             or float(discovery_bridge_w) < 0.0
             or float(discovery_fer_w) < 0.0):
         raise ValueError("reading discovery component weights must be non-negative")
+    if float(reanalysis_w) < 0.0:
+        raise ValueError("reading reanalysis weight must be non-negative")
+    if (float(reanalysis_graph_w) < 0.0
+            or float(reanalysis_cycle_w) < 0.0
+            or float(reanalysis_bridge_w) < 0.0
+            or float(reanalysis_fer_w) < 0.0):
+        raise ValueError("reading reanalysis component weights must be non-negative")
     if float(association_w) < 0.0:
         raise ValueError("reading association loss weight must be non-negative")
     if float(association_temperature) <= 0.0:
@@ -3787,6 +3851,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading consolidation requires latent concept memory")
     if discovery_w and getattr(model, "latent_concept_memory", None) is None:
         raise ValueError("reading discovery requires latent concept memory")
+    if reanalysis_w and getattr(model, "latent_concept_memory", None) is None:
+        raise ValueError("reading reanalysis requires latent concept memory")
     if (study_strategy in READING_MEMORY_STUDY_STRATEGIES
             and getattr(model, "latent_concept_memory", None) is None):
         raise ValueError(
@@ -3842,6 +3908,14 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_discovery_memory_active = 0
     last_discovery_graph_ready = False
     last_discovery_skipped = True
+    last_reanalysis = 0.0
+    last_reanalysis_closure = 0.0
+    last_reanalysis_cycle = 0.0
+    last_reanalysis_bridge = 0.0
+    last_reanalysis_fer = 0.0
+    last_reanalysis_memory_active = 0
+    last_reanalysis_graph_ready = False
+    last_reanalysis_skipped = True
     last_association = 0.0
     last_composition = 0.0
     last_graph_predict = 0.0
@@ -4148,6 +4222,42 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 "graph_ready": False,
                 "skipped": True,
             }
+        if reanalysis_w:
+            reanalysis_loss, reanalysis_metrics = reading_latent_reanalysis_loss(
+                model, txt, vocab.pad, vocab.unk,
+                token_drop_p=token_drop_p,
+                token_replace_p=token_replace_p,
+                feature_dropout=feature_dropout,
+                graph_w=reanalysis_graph_w,
+                cycle_w=reanalysis_cycle_w,
+                bridge_w=reanalysis_bridge_w,
+                fer_w=reanalysis_fer_w,
+                temperature=graph_predict_temperature,
+                self_loop_w=graph_predict_self_loop_w,
+                transitive_steps=graph_predict_transitive_steps,
+                transitive_w=graph_predict_transitive_w,
+                target_power=graph_predict_target_power,
+                cycle_consistency_w=graph_cycle_consistency_w,
+                fer_fragmentation_w=fer_fragmentation_w,
+                fer_correlation_w=fer_correlation_w,
+                fer_balance_w=fer_balance_w)
+        else:
+            reanalysis_loss = view_loss * 0.0
+            zero_metric = view_loss.detach() * 0.0
+            memory = getattr(model, "latent_concept_memory", None)
+            reanalysis_metrics = {
+                "closure_loss": zero_metric,
+                "closure_kl": zero_metric,
+                "closure_cosine": zero_metric,
+                "cycle_loss": zero_metric,
+                "bridge_loss": zero_metric,
+                "fer_loss": zero_metric,
+                "memory_active": int(
+                    getattr(memory, "filled", torch.zeros((), dtype=torch.long)).item())
+                if memory is not None else 0,
+                "graph_ready": False,
+                "skipped": True,
+            }
         composition_loss = (
             reading_latent_composition_loss(
                 model, txt, feature_dropout=feature_dropout,
@@ -4244,6 +4354,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 + float(memory_w) * memory_loss
                 + float(consolidation_w) * consolidation_loss
                 + float(discovery_w) * discovery_loss
+                + float(reanalysis_w) * reanalysis_loss
                 + float(association_w) * association_loss
                 + float(composition_w) * composition_loss
                 + float(graph_predict_w) * graph_predict_loss
@@ -4264,11 +4375,13 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                             if (association_w or composition_w
                                 or graph_predict_w or graph_cycle_w
                                 or discovery_w
+                                or reanalysis_w
                                 or bridge_w)
                             else None)))
         last_transition_updates = 0
         if (graph_predict_w or graph_cycle_w
                 or discovery_w
+                or reanalysis_w
                 or bridge_w
                 or study_strategy in READING_TRANSITION_STUDY_STRATEGIES):
             last_transition_updates = int(update_reading_latent_transitions(
@@ -4314,6 +4427,18 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_discovery_memory_active = int(discovery_metrics["memory_active"])
         last_discovery_graph_ready = bool(discovery_metrics["graph_ready"])
         last_discovery_skipped = bool(discovery_metrics["skipped"])
+        last_reanalysis = float(reanalysis_loss.detach())
+        last_reanalysis_closure = float(
+            reanalysis_metrics["closure_loss"].detach())
+        last_reanalysis_cycle = float(
+            reanalysis_metrics["cycle_loss"].detach())
+        last_reanalysis_bridge = float(
+            reanalysis_metrics["bridge_loss"].detach())
+        last_reanalysis_fer = float(
+            reanalysis_metrics["fer_loss"].detach())
+        last_reanalysis_memory_active = int(reanalysis_metrics["memory_active"])
+        last_reanalysis_graph_ready = bool(reanalysis_metrics["graph_ready"])
+        last_reanalysis_skipped = bool(reanalysis_metrics["skipped"])
         last_association = float(association_loss.detach())
         last_composition = float(composition_loss.detach())
         last_graph_predict = float(graph_predict_loss.detach())
@@ -4333,6 +4458,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                   f"memory {last_memory:.3f} "
                   f"consolidate {last_consolidation:.3f} "
                   f"discover {last_discovery:.3f} "
+                  f"reanalyze {last_reanalysis:.3f} "
                   f"assoc {last_association:.3f} "
                   f"compose {last_composition:.3f} "
                   f"graph-predict {last_graph_predict:.3f} "
@@ -4453,6 +4579,19 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "discovery_memory_active": int(last_discovery_memory_active),
         "discovery_graph_ready": bool(last_discovery_graph_ready),
         "discovery_skipped": bool(last_discovery_skipped),
+        "reanalysis_loss": last_reanalysis,
+        "reanalysis_w": float(reanalysis_w),
+        "reanalysis_graph_w": float(reanalysis_graph_w),
+        "reanalysis_cycle_w": float(reanalysis_cycle_w),
+        "reanalysis_bridge_w": float(reanalysis_bridge_w),
+        "reanalysis_fer_w": float(reanalysis_fer_w),
+        "reanalysis_closure_loss": last_reanalysis_closure,
+        "reanalysis_cycle_loss": last_reanalysis_cycle,
+        "reanalysis_bridge_loss": last_reanalysis_bridge,
+        "reanalysis_fer_loss": last_reanalysis_fer,
+        "reanalysis_memory_active": int(last_reanalysis_memory_active),
+        "reanalysis_graph_ready": bool(last_reanalysis_graph_ready),
+        "reanalysis_skipped": bool(last_reanalysis_skipped),
         "association_loss": last_association,
         "association_w": float(association_w),
         "association_temperature": float(association_temperature),
@@ -4595,6 +4734,9 @@ def fit_reading_concepts_select_best(
         discovery_w=0.0, discovery_curiosity_w=1.0,
         discovery_graph_w=1.0, discovery_cycle_w=1.0,
         discovery_bridge_w=1.0, discovery_fer_w=0.0,
+        reanalysis_w=0.0, reanalysis_graph_w=1.0,
+        reanalysis_cycle_w=0.5, reanalysis_bridge_w=0.5,
+        reanalysis_fer_w=0.0,
         association_w=0.05, association_temperature=0.1,
         association_decay=0.99, association_target_power=1.0,
         association_self_loop_w=0.05, association_transitive_steps=2,
@@ -4751,6 +4893,11 @@ def fit_reading_concepts_select_best(
             discovery_cycle_w=discovery_cycle_w,
             discovery_bridge_w=discovery_bridge_w,
             discovery_fer_w=discovery_fer_w,
+            reanalysis_w=reanalysis_w,
+            reanalysis_graph_w=reanalysis_graph_w,
+            reanalysis_cycle_w=reanalysis_cycle_w,
+            reanalysis_bridge_w=reanalysis_bridge_w,
+            reanalysis_fer_w=reanalysis_fer_w,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -4957,6 +5104,10 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            discovery_w=0.0, discovery_curiosity_w=1.0,
                            discovery_graph_w=1.0, discovery_cycle_w=1.0,
                            discovery_bridge_w=1.0, discovery_fer_w=0.0,
+                           reanalysis_w=0.0, reanalysis_graph_w=1.0,
+                           reanalysis_cycle_w=0.5,
+                           reanalysis_bridge_w=0.5,
+                           reanalysis_fer_w=0.0,
                            association_w=0.05, association_temperature=0.1,
                            association_decay=0.99, association_target_power=1.0,
                            association_self_loop_w=0.05,
@@ -5049,6 +5200,11 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             discovery_cycle_w=discovery_cycle_w,
             discovery_bridge_w=discovery_bridge_w,
             discovery_fer_w=discovery_fer_w,
+            reanalysis_w=reanalysis_w,
+            reanalysis_graph_w=reanalysis_graph_w,
+            reanalysis_cycle_w=reanalysis_cycle_w,
+            reanalysis_bridge_w=reanalysis_bridge_w,
+            reanalysis_fer_w=reanalysis_fer_w,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -5138,6 +5294,11 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         discovery_cycle_w=discovery_cycle_w,
         discovery_bridge_w=discovery_bridge_w,
         discovery_fer_w=discovery_fer_w,
+        reanalysis_w=reanalysis_w,
+        reanalysis_graph_w=reanalysis_graph_w,
+        reanalysis_cycle_w=reanalysis_cycle_w,
+        reanalysis_bridge_w=reanalysis_bridge_w,
+        reanalysis_fer_w=reanalysis_fer_w,
         association_w=association_w,
         association_temperature=association_temperature,
         association_decay=association_decay,
@@ -5216,6 +5377,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          discovery_w=0.0, discovery_curiosity_w=1.0,
                          discovery_graph_w=1.0, discovery_cycle_w=1.0,
                          discovery_bridge_w=1.0, discovery_fer_w=0.0,
+                         reanalysis_w=0.0, reanalysis_graph_w=1.0,
+                         reanalysis_cycle_w=0.5,
+                         reanalysis_bridge_w=0.5,
+                         reanalysis_fer_w=0.0,
                          association_w=0.05, association_temperature=0.1,
                          association_decay=0.99, association_target_power=1.0,
                          association_self_loop_w=0.05,
@@ -5314,6 +5479,11 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             discovery_cycle_w=discovery_cycle_w,
             discovery_bridge_w=discovery_bridge_w,
             discovery_fer_w=discovery_fer_w,
+            reanalysis_w=reanalysis_w,
+            reanalysis_graph_w=reanalysis_graph_w,
+            reanalysis_cycle_w=reanalysis_cycle_w,
+            reanalysis_bridge_w=reanalysis_bridge_w,
+            reanalysis_fer_w=reanalysis_fer_w,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -5404,6 +5574,11 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             discovery_cycle_w=discovery_cycle_w,
             discovery_bridge_w=discovery_bridge_w,
             discovery_fer_w=discovery_fer_w,
+            reanalysis_w=reanalysis_w,
+            reanalysis_graph_w=reanalysis_graph_w,
+            reanalysis_cycle_w=reanalysis_cycle_w,
+            reanalysis_bridge_w=reanalysis_bridge_w,
+            reanalysis_fer_w=reanalysis_fer_w,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -7818,6 +7993,7 @@ def selftest():
         graph_cycle_w=0.1, bridge_w=0.1, fer_w=0.1,
         consolidation_w=0.1, consolidation_fer_w=0.1,
         discovery_w=0.1, discovery_fer_w=0.1,
+        reanalysis_w=0.1, reanalysis_fer_w=0.1,
         sequence_w=0.1, sequence_batch=2, sequence_temperature=0.1,
         neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2,
         transition_w=0.1, transition_batch=2,
@@ -7840,6 +8016,12 @@ def selftest():
     assert math.isfinite(reading_model.reading_train_metrics["discovery_loss"])
     assert math.isfinite(
         reading_model.reading_train_metrics["discovery_graph_loss"])
+    assert reading_model.reading_train_metrics["reanalysis_w"] == 0.1
+    assert reading_model.reading_train_metrics["reanalysis_fer_w"] == 0.1
+    assert reading_model.reading_train_metrics["reanalysis_skipped"] is False
+    assert math.isfinite(reading_model.reading_train_metrics["reanalysis_loss"])
+    assert math.isfinite(
+        reading_model.reading_train_metrics["reanalysis_closure_loss"])
     assert reading_model.reading_train_metrics["sequence_w"] == 0.1
     assert reading_model.reading_train_metrics["sequence_pairs"] == 2
     assert math.isfinite(reading_model.reading_train_metrics["sequence_loss"])
@@ -7984,6 +8166,11 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-discovery-cycle-w", type=float, default=1.0)
     ap.add_argument("--reading-discovery-bridge-w", type=float, default=1.0)
     ap.add_argument("--reading-discovery-fer-w", type=float, default=0.0)
+    ap.add_argument("--reading-reanalysis-w", type=float, default=0.0)
+    ap.add_argument("--reading-reanalysis-graph-w", type=float, default=1.0)
+    ap.add_argument("--reading-reanalysis-cycle-w", type=float, default=0.5)
+    ap.add_argument("--reading-reanalysis-bridge-w", type=float, default=0.5)
+    ap.add_argument("--reading-reanalysis-fer-w", type=float, default=0.0)
     ap.add_argument("--reading-association-w", type=float, default=0.05)
     ap.add_argument("--reading-association-temperature", type=float, default=0.1)
     ap.add_argument("--reading-association-decay", type=float, default=0.99)
@@ -8075,6 +8262,11 @@ def _reading_kwargs(args):
                 discovery_cycle_w=args.reading_discovery_cycle_w,
                 discovery_bridge_w=args.reading_discovery_bridge_w,
                 discovery_fer_w=args.reading_discovery_fer_w,
+                reanalysis_w=args.reading_reanalysis_w,
+                reanalysis_graph_w=args.reading_reanalysis_graph_w,
+                reanalysis_cycle_w=args.reading_reanalysis_cycle_w,
+                reanalysis_bridge_w=args.reading_reanalysis_bridge_w,
+                reanalysis_fer_w=args.reading_reanalysis_fer_w,
                 association_w=args.reading_association_w,
                 association_temperature=args.reading_association_temperature,
                 association_decay=args.reading_association_decay,

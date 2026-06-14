@@ -52,6 +52,7 @@ from .concepts import (
     latent_concept_memory_consolidation_loss,
     latent_concept_memory_loss,
     latent_concept_neighborhood_loss,
+    latent_concept_reanalysis_loss,
     latent_concept_sequence_prediction_loss,
     latent_concept_sequence_prediction_scores,
     latent_concept_slot_factorization_loss,
@@ -1088,6 +1089,75 @@ def latent_multimodal_discovery_loss_from_views(
         "graph_ready": bool(metrics["graph_ready"] or base_metrics["graph_ready"]),
         "skipped": bool(base_metrics.get("skipped", True) and not graph_modes),
     }
+    return torch.stack(losses).mean(), metrics
+
+
+def latent_multimodal_reanalysis_loss_from_views(
+        model, views, graph_w=1.0, cycle_w=0.5, bridge_w=0.5,
+        fer_w=0.0, temperature=0.1, self_loop_w=0.05,
+        transitive_steps=2, transitive_w=0.1, target_power=1.0,
+        cycle_consistency_w=0.5, fer_fragmentation_w=1.0,
+        fer_correlation_w=1.0, fer_balance_w=0.1):
+    views = {mode: slots for mode, slots in views.items() if slots is not None}
+    zero = (next(iter(views.values())).sum() * 0.0
+            if views else torch.tensor(0.0))
+    metric_keys = (
+        "closure_loss", "closure_kl", "closure_cosine",
+        "cycle_loss", "bridge_loss", "fer_loss")
+    metrics = {key: zero for key in metric_keys}
+    metrics.update({"memory_active": 0, "graph_ready": False, "skipped": True})
+    if not views:
+        return zero, metrics
+    memory = getattr(model, "latent_concept_memory", None)
+    if memory is None:
+        return zero, metrics
+    active = memory.active()
+    metrics["memory_active"] = int(active.shape[0])
+    if active.numel() == 0:
+        return zero, metrics
+    anchor = views.get("full")
+    if anchor is None:
+        anchor = next(iter(views.values()))
+    anchor = anchor.detach()
+    probe_modes = [
+        mode for mode in ("sensor_only", "text_only")
+        if mode in views and views[mode] is not anchor
+    ]
+    if not probe_modes:
+        probe_modes = [mode for mode, slots in views.items() if slots is not anchor]
+    if not probe_modes:
+        probe_modes = ["full"]
+    losses = []
+    by_key = {key: [] for key in metric_keys}
+    graph_ready = False
+    for mode in probe_modes:
+        probe = views[mode] if mode in views else anchor
+        loss, view_metrics = latent_concept_reanalysis_loss(
+            probe, anchor, active, relations=memory.active_relations(),
+            transitions=memory.active_transitions(),
+            prediction_relations=memory.active_prediction_relations(),
+            graph_w=graph_w, cycle_w=cycle_w, bridge_w=bridge_w, fer_w=fer_w,
+            temperature=temperature, self_loop_w=self_loop_w,
+            transitive_steps=transitive_steps, transitive_w=transitive_w,
+            target_power=target_power,
+            cycle_consistency_w=cycle_consistency_w,
+            fer_fragmentation_w=fer_fragmentation_w,
+            fer_correlation_w=fer_correlation_w,
+            fer_balance_w=fer_balance_w)
+        if bool(view_metrics.get("skipped", True)):
+            continue
+        losses.append(loss)
+        for key in metric_keys:
+            by_key[key].append(view_metrics[key])
+        graph_ready = bool(graph_ready or view_metrics["graph_ready"])
+    if not losses:
+        return zero, metrics
+    metrics = {
+        key: torch.stack(values).mean() if values else zero
+        for key, values in by_key.items()
+    } | {"memory_active": int(active.shape[0]),
+         "graph_ready": bool(graph_ready),
+         "skipped": False}
     return torch.stack(losses).mean(), metrics
 
 
@@ -2184,6 +2254,12 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           latent_concept_discovery_cycle_w=1.0,
           latent_concept_discovery_bridge_w=1.0,
           latent_concept_discovery_fer_w=0.0,
+          latent_concept_reanalysis_w=0.0,
+          latent_concept_reanalysis_graph_w=1.0,
+          latent_concept_reanalysis_cycle_w=0.5,
+          latent_concept_reanalysis_bridge_w=0.5,
+          latent_concept_reanalysis_fer_w=0.0,
+          latent_concept_reanalysis_cycle_consistency_w=0.5,
           latent_concept_association_w=0.0,
           latent_concept_association_temperature=0.1,
           latent_concept_association_decay=0.99,
@@ -2238,6 +2314,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_concept_w, latent_concept_factorization_w, latent_concept_memory_w,
         latent_concept_fer_w, latent_concept_consolidation_w,
         latent_concept_discovery_w,
+        latent_concept_reanalysis_w,
         latent_concept_association_w, latent_concept_composition_w,
         latent_concept_graph_predict_w, latent_concept_bridge_w,
         latent_concept_sequence_w,
@@ -2291,6 +2368,16 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         raise ValueError("latent concept discovery component weights must be non-negative")
     if float(latent_concept_discovery_w) and latent_concept_memory_size <= 0:
         raise ValueError("latent concept discovery requires memory_size > 0")
+    reanalysis_component_weights = (
+        latent_concept_reanalysis_graph_w,
+        latent_concept_reanalysis_cycle_w,
+        latent_concept_reanalysis_bridge_w,
+        latent_concept_reanalysis_fer_w,
+        latent_concept_reanalysis_cycle_consistency_w)
+    if any(float(w) < 0.0 for w in reanalysis_component_weights):
+        raise ValueError("latent concept reanalysis component weights must be non-negative")
+    if float(latent_concept_reanalysis_w) and latent_concept_memory_size <= 0:
+        raise ValueError("latent concept reanalysis requires memory_size > 0")
     if int(latent_concept_sequence_batch) < 0 or int(latent_concept_sequence_batch) == 1:
         raise ValueError("latent concept sequence batch must be 0 or at least 2")
     if float(latent_concept_sequence_temperature) <= 0.0:
@@ -2592,6 +2679,43 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 "graph_ready": False,
                 "skipped": True,
             }
+        if latent_concept_reanalysis_w:
+            latent_reanalysis, reanalysis_metrics = (
+                latent_multimodal_reanalysis_loss_from_views(
+                    model, latent_views,
+                    graph_w=latent_concept_reanalysis_graph_w,
+                    cycle_w=latent_concept_reanalysis_cycle_w,
+                    bridge_w=latent_concept_reanalysis_bridge_w,
+                    fer_w=latent_concept_reanalysis_fer_w,
+                    temperature=latent_concept_graph_predict_temperature,
+                    self_loop_w=latent_concept_graph_predict_self_loop_w,
+                    transitive_steps=(
+                        latent_concept_graph_predict_transitive_steps),
+                    transitive_w=(
+                        latent_concept_graph_predict_transitive_w),
+                    target_power=latent_concept_graph_predict_target_power,
+                    cycle_consistency_w=(
+                        latent_concept_reanalysis_cycle_consistency_w),
+                    fer_fragmentation_w=latent_concept_fer_fragmentation_w,
+                    fer_correlation_w=latent_concept_fer_correlation_w,
+                    fer_balance_w=latent_concept_fer_balance_w))
+        else:
+            latent_reanalysis = base_loss * 0.0
+            reanalysis_zero = base_loss.detach() * 0.0
+            memory = getattr(model, "latent_concept_memory", None)
+            reanalysis_metrics = {
+                "closure_loss": reanalysis_zero,
+                "closure_kl": reanalysis_zero,
+                "closure_cosine": reanalysis_zero,
+                "cycle_loss": reanalysis_zero,
+                "bridge_loss": reanalysis_zero,
+                "fer_loss": reanalysis_zero,
+                "memory_active": int(
+                    getattr(memory, "filled", torch.zeros((), dtype=torch.long)).item())
+                if memory is not None else 0,
+                "graph_ready": False,
+                "skipped": True,
+            }
         latent_composition = (
             latent_multimodal_composition_loss_from_views(
                 model, latent_views,
@@ -2643,6 +2767,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 + float(latent_concept_memory_w) * latent_memory
                 + float(latent_concept_consolidation_w) * latent_consolidation
                 + float(latent_concept_discovery_w) * latent_discovery
+                + float(latent_concept_reanalysis_w) * latent_reanalysis
                 + float(latent_concept_association_w) * latent_association
                 + float(latent_concept_composition_w) * latent_composition
                 + float(latent_concept_graph_predict_w) * latent_graph_predict
@@ -2662,10 +2787,12 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                                 or latent_concept_composition_w
                                 or latent_concept_graph_predict_w
                                 or latent_concept_discovery_w
+                                or latent_concept_reanalysis_w
                                 or latent_concept_bridge_w) else None)))
         transition_updates = 0
         if (latent_concept_graph_predict_w or latent_concept_bridge_w
                 or latent_concept_discovery_w
+                or latent_concept_reanalysis_w
                 or latent_concept_sequence_w):
             transition_updates = int(update_multimodal_latent_transitions(
                 model, latent_views, decay=latent_concept_association_decay))
@@ -2765,6 +2892,30 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "latent_discovery_graph_ready": bool(
                 discovery_metrics["graph_ready"]),
             "latent_discovery_skipped": bool(discovery_metrics["skipped"]),
+            "latent_reanalysis_loss": float(latent_reanalysis.detach()),
+            "latent_reanalysis_w": float(latent_concept_reanalysis_w),
+            "latent_reanalysis_graph_w": float(
+                latent_concept_reanalysis_graph_w),
+            "latent_reanalysis_cycle_w": float(
+                latent_concept_reanalysis_cycle_w),
+            "latent_reanalysis_bridge_w": float(
+                latent_concept_reanalysis_bridge_w),
+            "latent_reanalysis_fer_w": float(latent_concept_reanalysis_fer_w),
+            "latent_reanalysis_cycle_consistency_w": float(
+                latent_concept_reanalysis_cycle_consistency_w),
+            "latent_reanalysis_closure_loss": float(
+                reanalysis_metrics["closure_loss"].detach()),
+            "latent_reanalysis_cycle_loss": float(
+                reanalysis_metrics["cycle_loss"].detach()),
+            "latent_reanalysis_bridge_loss": float(
+                reanalysis_metrics["bridge_loss"].detach()),
+            "latent_reanalysis_fer_loss": float(
+                reanalysis_metrics["fer_loss"].detach()),
+            "latent_reanalysis_memory_active": int(
+                reanalysis_metrics["memory_active"]),
+            "latent_reanalysis_graph_ready": bool(
+                reanalysis_metrics["graph_ready"]),
+            "latent_reanalysis_skipped": bool(reanalysis_metrics["skipped"]),
             "latent_association_loss": float(latent_association.detach()),
             "latent_composition_loss": float(latent_composition.detach()),
             "latent_graph_predict_loss": float(latent_graph_predict.detach()),
@@ -2815,6 +2966,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                   f"memory {last['latent_memory_loss']:.3f} "
                   f"consolidate {last['latent_consolidation_loss']:.3f} "
                   f"discover {last['latent_discovery_loss']:.3f} "
+                  f"reanalyze {last['latent_reanalysis_loss']:.3f} "
                   f"sequence {last['latent_sequence_loss']:.3f}",
                   flush=True)
         if select_best and st in selection_boundaries:
@@ -3172,6 +3324,14 @@ def selftest():
         assert discovery_metrics["memory_active"] > 0
         assert torch.isfinite(discovery_metrics["graph_loss"])
         assert torch.isfinite(discovery_metrics["bridge_loss"])
+        reanalysis_loss, reanalysis_metrics = (
+            latent_multimodal_reanalysis_loss_from_views(
+                model, views, graph_w=1.0, cycle_w=1.0,
+                bridge_w=1.0, fer_w=0.1))
+        assert torch.isfinite(reanalysis_loss)
+        assert reanalysis_metrics["skipped"] is False
+        assert reanalysis_metrics["memory_active"] > 0
+        assert torch.isfinite(reanalysis_metrics["closure_loss"])
         assert torch.isfinite(latent_multimodal_neighborhood_loss_from_views(views))
         assert torch.isfinite(latent_multimodal_transition_loss_from_views(views))
         assert torch.isfinite(latent_multimodal_cluster_loss_from_views(views))
@@ -3183,6 +3343,8 @@ def selftest():
             latent_concept_fer_w=0.01,
             latent_concept_discovery_w=0.01,
             latent_concept_discovery_fer_w=0.01,
+            latent_concept_reanalysis_w=0.01,
+            latent_concept_reanalysis_fer_w=0.01,
             latent_concept_fer_probe_n=4,
             latent_concept_fer_hard_max=2,
             latent_concept_fer_refresh_steps=1,
@@ -3204,6 +3366,12 @@ def selftest():
         assert math.isfinite(trained_model.train_metrics["latent_discovery_loss"])
         assert math.isfinite(
             trained_model.train_metrics["latent_discovery_graph_loss"])
+        assert trained_model.train_metrics["latent_reanalysis_w"] == 0.01
+        assert trained_model.train_metrics["latent_reanalysis_fer_w"] == 0.01
+        assert trained_model.train_metrics["latent_reanalysis_skipped"] is False
+        assert math.isfinite(trained_model.train_metrics["latent_reanalysis_loss"])
+        assert math.isfinite(
+            trained_model.train_metrics["latent_reanalysis_closure_loss"])
         assert trained_model.train_metrics["latent_fer_study_pool_size"] == 2
         assert trained_model.train_metrics["latent_fer_study_reports"]
         assert len(set(trained_model.train_metrics["latent_fer_hard_record_ids"])) == 2
@@ -3410,6 +3578,19 @@ def main(argv=None):
                     default=1.0, dest="latent_concept_discovery_bridge_w")
     ap.add_argument("--latent-concept-discovery-fer-w", type=float,
                     default=0.0, dest="latent_concept_discovery_fer_w")
+    ap.add_argument("--latent-concept-reanalysis-w", type=float, default=0.0,
+                    dest="latent_concept_reanalysis_w")
+    ap.add_argument("--latent-concept-reanalysis-graph-w", type=float,
+                    default=1.0, dest="latent_concept_reanalysis_graph_w")
+    ap.add_argument("--latent-concept-reanalysis-cycle-w", type=float,
+                    default=0.5, dest="latent_concept_reanalysis_cycle_w")
+    ap.add_argument("--latent-concept-reanalysis-bridge-w", type=float,
+                    default=0.5, dest="latent_concept_reanalysis_bridge_w")
+    ap.add_argument("--latent-concept-reanalysis-fer-w", type=float,
+                    default=0.0, dest="latent_concept_reanalysis_fer_w")
+    ap.add_argument("--latent-concept-reanalysis-cycle-consistency-w",
+                    type=float, default=0.5,
+                    dest="latent_concept_reanalysis_cycle_consistency_w")
     ap.add_argument("--latent-concept-association-w", type=float, default=0.0,
                     dest="latent_concept_association_w")
     ap.add_argument("--latent-concept-association-temperature", type=float,
@@ -3548,6 +3729,7 @@ def main(argv=None):
         args.latent_concept_fer_w, args.latent_concept_memory_w,
         args.latent_concept_consolidation_w,
         args.latent_concept_discovery_w,
+        args.latent_concept_reanalysis_w,
         args.latent_concept_association_w,
         args.latent_concept_composition_w, args.latent_concept_graph_predict_w,
         args.latent_concept_bridge_w,
@@ -3605,6 +3787,15 @@ def main(argv=None):
     if (args.latent_concept_discovery_w > 0.0
             and args.latent_concept_memory_size <= 0):
         ap.error("--latent-concept-discovery-w requires --latent-concept-memory-size > 0")
+    if (args.latent_concept_reanalysis_graph_w < 0.0
+            or args.latent_concept_reanalysis_cycle_w < 0.0
+            or args.latent_concept_reanalysis_bridge_w < 0.0
+            or args.latent_concept_reanalysis_fer_w < 0.0
+            or args.latent_concept_reanalysis_cycle_consistency_w < 0.0):
+        ap.error("latent concept reanalysis component weights must be non-negative")
+    if (args.latent_concept_reanalysis_w > 0.0
+            and args.latent_concept_memory_size <= 0):
+        ap.error("--latent-concept-reanalysis-w requires --latent-concept-memory-size > 0")
     if args.latent_concept_association_temperature <= 0.0:
         ap.error("--latent-concept-association-temperature must be positive")
     if args.latent_concept_composition_temperature <= 0.0:
@@ -3693,6 +3884,14 @@ def main(argv=None):
         latent_concept_discovery_cycle_w=args.latent_concept_discovery_cycle_w,
         latent_concept_discovery_bridge_w=args.latent_concept_discovery_bridge_w,
         latent_concept_discovery_fer_w=args.latent_concept_discovery_fer_w,
+        latent_concept_reanalysis_w=args.latent_concept_reanalysis_w,
+        latent_concept_reanalysis_graph_w=args.latent_concept_reanalysis_graph_w,
+        latent_concept_reanalysis_cycle_w=args.latent_concept_reanalysis_cycle_w,
+        latent_concept_reanalysis_bridge_w=(
+            args.latent_concept_reanalysis_bridge_w),
+        latent_concept_reanalysis_fer_w=args.latent_concept_reanalysis_fer_w,
+        latent_concept_reanalysis_cycle_consistency_w=(
+            args.latent_concept_reanalysis_cycle_consistency_w),
         latent_concept_association_w=args.latent_concept_association_w,
         latent_concept_association_temperature=(
             args.latent_concept_association_temperature),

@@ -286,6 +286,11 @@ def text_reading_cmd(args, PY):
         f"--reading-discovery-cycle-w {args.reading_discovery_cycle_w} "
         f"--reading-discovery-bridge-w {args.reading_discovery_bridge_w} "
         f"--reading-discovery-fer-w {args.reading_discovery_fer_w} "
+        f"--reading-reanalysis-w {args.reading_reanalysis_w} "
+        f"--reading-reanalysis-graph-w {args.reading_reanalysis_graph_w} "
+        f"--reading-reanalysis-cycle-w {args.reading_reanalysis_cycle_w} "
+        f"--reading-reanalysis-bridge-w {args.reading_reanalysis_bridge_w} "
+        f"--reading-reanalysis-fer-w {args.reading_reanalysis_fer_w} "
         f"--reading-association-w {args.reading_association_w} "
         f"--reading-association-temperature {args.reading_association_temperature} "
         f"--reading-association-decay {args.reading_association_decay} "
@@ -1405,6 +1410,18 @@ def payload(args):
                 f"{args.multimodal_latent_concept_discovery_bridge_w} "
                 f"--latent-concept-discovery-fer-w "
                 f"{args.multimodal_latent_concept_discovery_fer_w} "
+                f"--latent-concept-reanalysis-w "
+                f"{args.multimodal_latent_concept_reanalysis_w} "
+                f"--latent-concept-reanalysis-graph-w "
+                f"{args.multimodal_latent_concept_reanalysis_graph_w} "
+                f"--latent-concept-reanalysis-cycle-w "
+                f"{args.multimodal_latent_concept_reanalysis_cycle_w} "
+                f"--latent-concept-reanalysis-bridge-w "
+                f"{args.multimodal_latent_concept_reanalysis_bridge_w} "
+                f"--latent-concept-reanalysis-fer-w "
+                f"{args.multimodal_latent_concept_reanalysis_fer_w} "
+                f"--latent-concept-reanalysis-cycle-consistency-w "
+                f"{args.multimodal_latent_concept_reanalysis_cycle_consistency_w} "
                 f"--latent-concept-association-w "
                 f"{args.multimodal_latent_concept_association_w} "
                 f"--latent-concept-association-temperature "
@@ -1836,6 +1853,16 @@ def main():
                     dest="reading_discovery_bridge_w")
     ap.add_argument("--reading-discovery-fer-w", type=float, default=0.0,
                     dest="reading_discovery_fer_w")
+    ap.add_argument("--reading-reanalysis-w", type=float, default=0.0,
+                    dest="reading_reanalysis_w")
+    ap.add_argument("--reading-reanalysis-graph-w", type=float, default=1.0,
+                    dest="reading_reanalysis_graph_w")
+    ap.add_argument("--reading-reanalysis-cycle-w", type=float, default=0.5,
+                    dest="reading_reanalysis_cycle_w")
+    ap.add_argument("--reading-reanalysis-bridge-w", type=float, default=0.5,
+                    dest="reading_reanalysis_bridge_w")
+    ap.add_argument("--reading-reanalysis-fer-w", type=float, default=0.0,
+                    dest="reading_reanalysis_fer_w")
     ap.add_argument("--reading-association-w", type=float, default=0.05,
                     dest="reading_association_w")
     ap.add_argument("--reading-association-temperature", type=float,
@@ -3069,6 +3096,24 @@ def main():
     ap.add_argument("--multimodal-latent-concept-discovery-fer-w",
                     type=float, default=0.0,
                     dest="multimodal_latent_concept_discovery_fer_w")
+    ap.add_argument("--multimodal-latent-concept-reanalysis-w", type=float,
+                    default=0.0, dest="multimodal_latent_concept_reanalysis_w")
+    ap.add_argument("--multimodal-latent-concept-reanalysis-graph-w",
+                    type=float, default=1.0,
+                    dest="multimodal_latent_concept_reanalysis_graph_w")
+    ap.add_argument("--multimodal-latent-concept-reanalysis-cycle-w",
+                    type=float, default=0.5,
+                    dest="multimodal_latent_concept_reanalysis_cycle_w")
+    ap.add_argument("--multimodal-latent-concept-reanalysis-bridge-w",
+                    type=float, default=0.5,
+                    dest="multimodal_latent_concept_reanalysis_bridge_w")
+    ap.add_argument("--multimodal-latent-concept-reanalysis-fer-w",
+                    type=float, default=0.0,
+                    dest="multimodal_latent_concept_reanalysis_fer_w")
+    ap.add_argument(
+        "--multimodal-latent-concept-reanalysis-cycle-consistency-w",
+        type=float, default=0.5,
+        dest="multimodal_latent_concept_reanalysis_cycle_consistency_w")
     ap.add_argument("--multimodal-latent-concept-association-w", type=float,
                     default=0.0, dest="multimodal_latent_concept_association_w")
     ap.add_argument("--multimodal-latent-concept-association-temperature",
@@ -3322,6 +3367,11 @@ def main():
             "--reading-discovery-cycle-w": args.reading_discovery_cycle_w,
             "--reading-discovery-bridge-w": args.reading_discovery_bridge_w,
             "--reading-discovery-fer-w": args.reading_discovery_fer_w,
+            "--reading-reanalysis-w": args.reading_reanalysis_w,
+            "--reading-reanalysis-graph-w": args.reading_reanalysis_graph_w,
+            "--reading-reanalysis-cycle-w": args.reading_reanalysis_cycle_w,
+            "--reading-reanalysis-bridge-w": args.reading_reanalysis_bridge_w,
+            "--reading-reanalysis-fer-w": args.reading_reanalysis_fer_w,
             "--reading-association-w": args.reading_association_w,
             "--reading-association-self-loop-w": (
                 args.reading_association_self_loop_w),
@@ -3418,6 +3468,10 @@ def main():
         if args.reading_discovery_w > 0.0 and args.reading_memory_size <= 0:
             sys.exit(
                 "ERROR: --reading-discovery-w requires "
+                "--reading-memory-size > 0")
+        if args.reading_reanalysis_w > 0.0 and args.reading_memory_size <= 0:
+            sys.exit(
+                "ERROR: --reading-reanalysis-w requires "
                 "--reading-memory-size > 0")
         if (args.reading_association_decay < 0.0
                 or args.reading_association_decay >= 1.0):
@@ -3984,6 +4038,18 @@ def main():
                 args.multimodal_latent_concept_discovery_bridge_w),
             "--multimodal-latent-concept-discovery-fer-w": (
                 args.multimodal_latent_concept_discovery_fer_w),
+            "--multimodal-latent-concept-reanalysis-w": (
+                args.multimodal_latent_concept_reanalysis_w),
+            "--multimodal-latent-concept-reanalysis-graph-w": (
+                args.multimodal_latent_concept_reanalysis_graph_w),
+            "--multimodal-latent-concept-reanalysis-cycle-w": (
+                args.multimodal_latent_concept_reanalysis_cycle_w),
+            "--multimodal-latent-concept-reanalysis-bridge-w": (
+                args.multimodal_latent_concept_reanalysis_bridge_w),
+            "--multimodal-latent-concept-reanalysis-fer-w": (
+                args.multimodal_latent_concept_reanalysis_fer_w),
+            "--multimodal-latent-concept-reanalysis-cycle-consistency-w": (
+                args.multimodal_latent_concept_reanalysis_cycle_consistency_w),
             "--multimodal-latent-concept-association-w": (
                 args.multimodal_latent_concept_association_w),
             "--multimodal-latent-concept-association-self-loop-w": (
@@ -4050,6 +4116,7 @@ def main():
             args.multimodal_latent_concept_memory_w,
             args.multimodal_latent_concept_consolidation_w,
             args.multimodal_latent_concept_discovery_w,
+            args.multimodal_latent_concept_reanalysis_w,
             args.multimodal_latent_concept_association_w,
             args.multimodal_latent_concept_composition_w,
             args.multimodal_latent_concept_graph_predict_w,
@@ -4120,6 +4187,11 @@ def main():
                 and args.multimodal_latent_concept_memory_size <= 0):
             sys.exit(
                 "ERROR: --multimodal-latent-concept-discovery-w requires "
+                "--multimodal-latent-concept-memory-size > 0")
+        if (args.multimodal_latent_concept_reanalysis_w > 0.0
+                and args.multimodal_latent_concept_memory_size <= 0):
+            sys.exit(
+                "ERROR: --multimodal-latent-concept-reanalysis-w requires "
                 "--multimodal-latent-concept-memory-size > 0")
         if (args.multimodal_latent_concept_association_decay < 0.0
                 or args.multimodal_latent_concept_association_decay >= 1.0):
