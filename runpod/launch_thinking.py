@@ -512,6 +512,7 @@ def apply_image_quality_preset(args):
     args.image_flow_repa_mode = "auto"
     args.image_flow_self_repa_w = max(float(args.image_flow_self_repa_w), 0.05)
     args.image_flow_self_repa_mode = "auto"
+    args.image_flow_factorization_w = max(float(args.image_flow_factorization_w), 0.01)
     args.image_flow_sra_w = max(float(args.image_flow_sra_w), 0.05)
     args.image_flow_sra_mode = "both"
     args.image_flow_sra_time_gap = float(args.image_flow_sra_time_gap or 0.25)
@@ -983,6 +984,13 @@ def payload(args):
                      f"--flow-self-repa-steps {args.image_flow_self_repa_steps} "
                      f"--flow-self-repa-embed-dim {args.image_flow_self_repa_embed_dim} "
                      f"--flow-self-repa-mode {args.image_flow_self_repa_mode} "
+                     f"--flow-factorization-w {args.image_flow_factorization_w} "
+                     f"--flow-factorization-variance-target "
+                     f"{args.image_flow_factorization_variance_target} "
+                     f"--flow-factorization-covariance-w "
+                     f"{args.image_flow_factorization_covariance_w} "
+                     f"--flow-factorization-token-correlation-w "
+                     f"{args.image_flow_factorization_token_correlation_w} "
                      f"--flow-sra-w {args.image_flow_sra_w} "
                      f"--flow-sra-steps {args.image_flow_sra_steps} "
                      f"--flow-sra-time-gap {args.image_flow_sra_time_gap} "
@@ -2323,6 +2331,19 @@ def main():
                     choices=("pooled", "token", "both", "auto"),
                     dest="image_flow_self_repa_mode",
                     help="image self-REPA target: pooled clean latent, patch tokens, both, or auto")
+    ap.add_argument("--image-flow-factorization-w", type=float, default=0.0,
+                    dest="image_flow_factorization_w",
+                    help="anti-collapse hidden-token factorization weight for image flow")
+    ap.add_argument("--image-flow-factorization-variance-target", type=float,
+                    default=0.05, dest="image_flow_factorization_variance_target",
+                    help="minimum hidden-token feature std for image flow factorization")
+    ap.add_argument("--image-flow-factorization-covariance-w", type=float,
+                    default=0.05, dest="image_flow_factorization_covariance_w",
+                    help="off-diagonal covariance weight inside image flow factorization")
+    ap.add_argument("--image-flow-factorization-token-correlation-w", type=float,
+                    default=0.05,
+                    dest="image_flow_factorization_token_correlation_w",
+                    help="same-sample token correlation weight inside image flow factorization")
     ap.add_argument("--image-flow-sra-w", type=float, default=0.0,
                     dest="image_flow_sra_w",
                     help=("image flow self-representation alignment weight: match noisy "
@@ -3510,6 +3531,14 @@ def main():
         sys.exit("ERROR: --image-flow-self-repa-steps must be non-negative")
     if args.image_flow_self_repa_embed_dim <= 0:
         sys.exit("ERROR: --image-flow-self-repa-embed-dim must be positive")
+    if args.image_flow_factorization_w < 0.0:
+        sys.exit("ERROR: --image-flow-factorization-w must be non-negative")
+    if args.image_flow_factorization_variance_target < 0.0:
+        sys.exit(
+            "ERROR: --image-flow-factorization-variance-target must be non-negative")
+    if (args.image_flow_factorization_covariance_w < 0.0
+            or args.image_flow_factorization_token_correlation_w < 0.0):
+        sys.exit("ERROR: image flow factorization component weights must be non-negative")
     if args.image_flow_sra_w < 0.0:
         sys.exit("ERROR: --image-flow-sra-w must be non-negative")
     if args.image_flow_sra_steps < 0:

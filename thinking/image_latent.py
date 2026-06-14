@@ -5286,6 +5286,62 @@ def flow_hidden_self_representation_alignment_loss(hidden_tokens, target_tokens,
     return loss, parts
 
 
+def flow_hidden_factorization_loss(hidden_tokens, variance_target=0.05,
+                                   covariance_w=0.05, token_correlation_w=0.05,
+                                   prefix="flow_factorization", eps=1.0e-6):
+    if hidden_tokens.ndim != 3:
+        raise ValueError(
+            f"expected hidden tokens as B,N,H, got {tuple(hidden_tokens.shape)}")
+    bsz = int(hidden_tokens.shape[0])
+    tokens = int(hidden_tokens.shape[1])
+    dim = int(hidden_tokens.shape[2])
+    x = hidden_tokens.float()
+    zero = x.sum() * 0.0
+    parts = {
+        f"{prefix}_loss": zero.detach(),
+        f"{prefix}_variance_loss": zero.detach(),
+        f"{prefix}_covariance_loss": zero.detach(),
+        f"{prefix}_token_correlation_loss": zero.detach(),
+        f"{prefix}_std_mean": zero.detach(),
+        f"{prefix}_std_min": zero.detach(),
+        f"{prefix}_batch": torch.tensor(float(bsz), device=hidden_tokens.device),
+        f"{prefix}_tokens": torch.tensor(float(tokens), device=hidden_tokens.device),
+        f"{prefix}_dim": torch.tensor(float(dim), device=hidden_tokens.device),
+    }
+    if bsz <= 0 or tokens <= 0 or dim <= 0:
+        return zero, parts
+    flat = x.reshape(bsz * tokens, dim)
+    if int(flat.shape[0]) <= 1:
+        return zero, parts
+    centered = flat - flat.mean(dim=0, keepdim=True)
+    std = centered.std(dim=0, unbiased=False)
+    variance = F.relu(float(variance_target) - std).mean()
+    covariance = zero
+    covariance_w = float(covariance_w)
+    if dim > 1 and covariance_w > 0.0:
+        normed = centered / std.clamp_min(float(eps))
+        cov = normed.t().matmul(normed) / float(max(1, int(flat.shape[0]) - 1))
+        eye = torch.eye(dim, dtype=torch.bool, device=cov.device)
+        covariance = cov.masked_select(~eye).pow(2).mean()
+    token_corr = zero
+    token_correlation_w = float(token_correlation_w)
+    if tokens > 1 and token_correlation_w > 0.0:
+        tok = F.normalize(x, dim=-1, eps=float(eps))
+        sim = torch.bmm(tok, tok.transpose(1, 2))
+        eye = torch.eye(tokens, dtype=torch.bool, device=sim.device)
+        token_corr = sim[:, ~eye].pow(2).mean()
+    loss = variance + covariance_w * covariance + token_correlation_w * token_corr
+    parts.update({
+        f"{prefix}_loss": loss.detach(),
+        f"{prefix}_variance_loss": variance.detach(),
+        f"{prefix}_covariance_loss": covariance.detach(),
+        f"{prefix}_token_correlation_loss": token_corr.detach(),
+        f"{prefix}_std_mean": std.detach().mean(),
+        f"{prefix}_std_min": std.detach().min(),
+    })
+    return loss, parts
+
+
 def condition_batch(cond):
     return int(condition_vector(cond).shape[0])
 
@@ -5583,6 +5639,9 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        repa_mode="pooled",
                        self_repa_aligner=None, self_repa_w=0.0,
                        self_repa_mode="pooled",
+                       factorization_w=0.0, factorization_variance_target=0.05,
+                       factorization_covariance_w=0.05,
+                       factorization_token_correlation_w=0.05,
                        sra_w=0.0, sra_time_gap=0.25, sra_mode="token",
                        quality_scorer=None, quality_records=None, quality_stats=None,
                        quality_targets=None, quality_masks=None,
@@ -5602,6 +5661,16 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     if multiscale_w < 0.0:
         raise ValueError("multiscale_w must be non-negative")
     multiscale_scales = normalize_flow_multiscale_scales(multiscale_scales)
+    factorization_w = float(factorization_w)
+    if factorization_w < 0.0:
+        raise ValueError("factorization_w must be non-negative")
+    factorization_variance_target = float(factorization_variance_target)
+    if factorization_variance_target < 0.0:
+        raise ValueError("factorization_variance_target must be non-negative")
+    factorization_covariance_w = float(factorization_covariance_w)
+    factorization_token_correlation_w = float(factorization_token_correlation_w)
+    if factorization_covariance_w < 0.0 or factorization_token_correlation_w < 0.0:
+        raise ValueError("flow factorization component weights must be non-negative")
     self_condition_p = float(self_condition_p)
     if self_condition_p < 0.0 or self_condition_p > 1.0:
         raise ValueError("self_condition_p must be in [0, 1]")
@@ -5633,6 +5702,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     need_flow_features = (
         (repa_aligner is not None and repa_w > 0.0)
         or (self_repa_aligner is not None and self_repa_w > 0.0)
+        or factorization_w > 0.0
         or sra_w > 0.0
     )
     if need_flow_features:
@@ -5836,6 +5906,24 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
             flow_repa_mode_id(active_self_repa_mode), device=z1.device)
         parts["flow_self_repa_components"] = torch.tensor(
             float(len(self_repa_losses)), device=z1.device)
+    if factorization_w > 0.0:
+        if flow_features is None or "image_tokens" not in flow_features:
+            raise ValueError("flow factorization requires transformer image-token features")
+        factorization, factorization_parts = flow_hidden_factorization_loss(
+            flow_features["image_tokens"],
+            variance_target=factorization_variance_target,
+            covariance_w=factorization_covariance_w,
+            token_correlation_w=factorization_token_correlation_w)
+        total = total + float(factorization_w) * factorization
+        parts.update(factorization_parts)
+        parts["flow_factorization_w"] = torch.tensor(
+            float(factorization_w), device=z1.device)
+        parts["flow_factorization_variance_target"] = torch.tensor(
+            float(factorization_variance_target), device=z1.device)
+        parts["flow_factorization_covariance_w"] = torch.tensor(
+            float(factorization_covariance_w), device=z1.device)
+        parts["flow_factorization_token_correlation_w"] = torch.tensor(
+            float(factorization_token_correlation_w), device=z1.device)
     if sra_w > 0.0:
         if flow_features is None or "image_tokens" not in flow_features:
             raise ValueError("flow SRA alignment requires transformer image-token features")
@@ -8670,6 +8758,17 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
             "flow_self_repa_w", report.get("flow_self_repa_w", 0.0))),
         "flow_self_repa_steps": int(ckpt.get(
             "flow_self_repa_steps", report.get("flow_self_repa_steps", 0)) or 0),
+        "flow_factorization_w": float(ckpt.get(
+            "flow_factorization_w", report.get("flow_factorization_w", 0.0))),
+        "flow_factorization_variance_target": float(ckpt.get(
+            "flow_factorization_variance_target",
+            report.get("flow_factorization_variance_target", 0.05))),
+        "flow_factorization_covariance_w": float(ckpt.get(
+            "flow_factorization_covariance_w",
+            report.get("flow_factorization_covariance_w", 0.05))),
+        "flow_factorization_token_correlation_w": float(ckpt.get(
+            "flow_factorization_token_correlation_w",
+            report.get("flow_factorization_token_correlation_w", 0.05))),
         "flow_sra_w": float(ckpt.get("flow_sra_w", report.get("flow_sra_w", 0.0))),
         "flow_sra_steps": int(ckpt.get(
             "flow_sra_steps", report.get("flow_sra_steps", 0)) or 0),
@@ -9438,6 +9537,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       flow_repa_mode="pooled",
                       flow_self_repa_w=0.0, flow_self_repa_steps=0,
                       flow_self_repa_embed_dim=128, flow_self_repa_mode="pooled",
+                      flow_factorization_w=0.0,
+                      flow_factorization_variance_target=0.05,
+                      flow_factorization_covariance_w=0.05,
+                      flow_factorization_token_correlation_w=0.05,
                       flow_sra_w=0.0, flow_sra_steps=0, flow_sra_time_gap=0.25,
                       flow_sra_mode="token",
                       sample_steps=4,
@@ -9675,6 +9778,19 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("flow_self_repa_w must be non-negative")
     if flow_self_repa_steps < 0:
         raise ValueError("flow_self_repa_steps must be non-negative")
+    flow_factorization_w = float(flow_factorization_w)
+    if flow_factorization_w < 0.0:
+        raise ValueError("flow_factorization_w must be non-negative")
+    if flow_factorization_w > 0.0 and flow_arch == "conv":
+        raise ValueError("flow_factorization_w requires DiT/CrossDiT/MM-DiT flow")
+    flow_factorization_variance_target = float(flow_factorization_variance_target)
+    flow_factorization_covariance_w = float(flow_factorization_covariance_w)
+    flow_factorization_token_correlation_w = float(flow_factorization_token_correlation_w)
+    if flow_factorization_variance_target < 0.0:
+        raise ValueError("flow_factorization_variance_target must be non-negative")
+    if (flow_factorization_covariance_w < 0.0
+            or flow_factorization_token_correlation_w < 0.0):
+        raise ValueError("flow factorization component weights must be non-negative")
     if flow_sra_w < 0.0:
         raise ValueError("flow_sra_w must be non-negative")
     if flow_sra_steps < 0:
@@ -10499,6 +10615,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     self_repa_aligner=flow_self_repa_aligner,
                     self_repa_w=active_flow_self_repa_w,
                     self_repa_mode=flow_self_repa_mode,
+                    factorization_w=flow_factorization_w,
+                    factorization_variance_target=(
+                        flow_factorization_variance_target),
+                    factorization_covariance_w=flow_factorization_covariance_w,
+                    factorization_token_correlation_w=(
+                        flow_factorization_token_correlation_w),
                     sra_w=active_flow_sra_w,
                     sra_time_gap=flow_sra_time_gap,
                     sra_mode=flow_sra_mode,
@@ -10873,6 +10995,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_self_repa_mode": str(flow_self_repa_mode),
         "flow_self_repa_embed_dim": int(flow_self_repa_embed_dim),
         "flow_self_repa_aligner": flow_self_repa_aligner is not None,
+        "flow_factorization_w": float(flow_factorization_w),
+        "flow_factorization_variance_target": float(
+            flow_factorization_variance_target),
+        "flow_factorization_covariance_w": float(flow_factorization_covariance_w),
+        "flow_factorization_token_correlation_w": float(
+            flow_factorization_token_correlation_w),
         "flow_sra_w": float(flow_sra_w),
         "flow_sra_steps": int(flow_sra_steps),
         "flow_sra_active_steps": (
@@ -11231,6 +11359,7 @@ def selftest():
             image_max_records=3, sample_steps=1, flow_distill_steps=1,
             flow_guidance_distill_w=0.01, flow_ema_decay=0.9,
             flow_frequency_w=0.01, flow_straightness_w=0.01,
+            flow_factorization_w=0.01,
             flow_multiscale_w=0.01, flow_multiscale_scales=(2,),
             flow_boundary_mode="double-cosine",
             flow_time_embed="fourier", flow_time_embed_dim=8,
@@ -11253,6 +11382,8 @@ def selftest():
         assert math.isclose(report["flow_frequency_w"], 0.01)
         assert math.isclose(report["flow_straightness_w"], 0.01)
         assert "flow_straightness_velocity_mse" in report["last_flow"]
+        assert math.isclose(report["flow_factorization_w"], 0.01)
+        assert "flow_factorization_loss" in report["last_flow"]
         assert math.isclose(report["flow_multiscale_w"], 0.01)
         assert report["flow_multiscale_scales"] == [2]
         assert report["last_flow"]["flow_multiscale_active_scales"] >= 1
@@ -11469,6 +11600,18 @@ def main(argv=None):
     ap.add_argument("--flow-self-repa-mode", default="pooled", choices=FLOW_REPA_MODES,
                     dest="flow_self_repa_mode",
                     help="self-REPA target: pooled clean latent, latent patch tokens, both, or auto")
+    ap.add_argument("--flow-factorization-w", type=float, default=0.0,
+                    dest="flow_factorization_w",
+                    help="anti-collapse hidden-token factorization weight for transformer flows")
+    ap.add_argument("--flow-factorization-variance-target", type=float, default=0.05,
+                    dest="flow_factorization_variance_target",
+                    help="minimum hidden-token feature std target for --flow-factorization-w")
+    ap.add_argument("--flow-factorization-covariance-w", type=float, default=0.05,
+                    dest="flow_factorization_covariance_w",
+                    help="off-diagonal feature covariance weight inside flow factorization")
+    ap.add_argument("--flow-factorization-token-correlation-w", type=float, default=0.05,
+                    dest="flow_factorization_token_correlation_w",
+                    help="same-sample image-token correlation weight inside flow factorization")
     ap.add_argument("--flow-sra-w", type=float, default=0.0, dest="flow_sra_w",
                     help=("self-representation alignment weight: match noisy-step hidden "
                           "tokens to detached cleaner-step hidden tokens"))
@@ -12011,6 +12154,15 @@ def main(argv=None):
         ap.error("--flow-self-repa-steps must be non-negative")
     if args.flow_self_repa_embed_dim <= 0:
         ap.error("--flow-self-repa-embed-dim must be positive")
+    if args.flow_factorization_w < 0.0:
+        ap.error("--flow-factorization-w must be non-negative")
+    if args.flow_factorization_w > 0.0 and args.flow_arch == "conv":
+        ap.error("--flow-factorization-w requires --flow-arch dit/crossdit/mmdit")
+    if args.flow_factorization_variance_target < 0.0:
+        ap.error("--flow-factorization-variance-target must be non-negative")
+    if (args.flow_factorization_covariance_w < 0.0
+            or args.flow_factorization_token_correlation_w < 0.0):
+        ap.error("flow factorization component weights must be non-negative")
     if args.flow_sra_w < 0.0:
         ap.error("--flow-sra-w must be non-negative")
     if args.flow_sra_steps < 0:
@@ -12336,6 +12488,12 @@ def main(argv=None):
         flow_self_repa_steps=args.flow_self_repa_steps,
         flow_self_repa_embed_dim=args.flow_self_repa_embed_dim,
         flow_self_repa_mode=args.flow_self_repa_mode,
+        flow_factorization_w=args.flow_factorization_w,
+        flow_factorization_variance_target=(
+            args.flow_factorization_variance_target),
+        flow_factorization_covariance_w=args.flow_factorization_covariance_w,
+        flow_factorization_token_correlation_w=(
+            args.flow_factorization_token_correlation_w),
         flow_sra_w=args.flow_sra_w,
         flow_sra_steps=args.flow_sra_steps,
         flow_sra_time_gap=args.flow_sra_time_gap,
@@ -12592,6 +12750,12 @@ def main(argv=None):
         "flow_self_repa_steps": args.flow_self_repa_steps,
         "flow_self_repa_embed_dim": args.flow_self_repa_embed_dim,
         "flow_self_repa_mode": args.flow_self_repa_mode,
+        "flow_factorization_w": args.flow_factorization_w,
+        "flow_factorization_variance_target": (
+            args.flow_factorization_variance_target),
+        "flow_factorization_covariance_w": args.flow_factorization_covariance_w,
+        "flow_factorization_token_correlation_w": (
+            args.flow_factorization_token_correlation_w),
         "flow_sra_w": args.flow_sra_w,
         "flow_sra_steps": args.flow_sra_steps,
         "flow_sra_time_gap": args.flow_sra_time_gap,
