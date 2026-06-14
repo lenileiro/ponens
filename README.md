@@ -209,7 +209,8 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --reading-discovery-w 0.05 \
     --reading-gap-w 0.05 --reading-gap-transitive-steps 3 \
     --reading-gap-transitive-w 0.25 \
-    --reading-context-target-w 0.1 --reading-neighborhood-w 0.05 \
+    --reading-context-target-w 0.1 --reading-span-completion-w 0.05 \
+    --reading-neighborhood-w 0.05 \
     --reading-neighborhood-batch 8 --reading-neighborhood-probe-n 32 \
     --reading-transition-w 0.05 --reading-transition-batch 8 \
     --reading-cluster-w 0.05 --reading-cluster-batch 16 \

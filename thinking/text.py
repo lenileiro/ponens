@@ -1406,6 +1406,28 @@ def split_reading_context_target(txt, pad, context_keep_p=0.5):
     return context_txt, target_txt
 
 
+def mask_reading_spans(txt, pad, span_frac=0.25):
+    frac = float(span_frac)
+    if frac <= 0.0 or frac >= 1.0:
+        raise ValueError("reading span mask fraction must be in (0, 1)")
+    out = txt.clone()
+    valid = txt.ne(pad)
+    hidden = torch.zeros_like(valid)
+    for row in range(txt.shape[0]):
+        positions = torch.where(valid[row])[0]
+        n = int(positions.numel())
+        if n <= 1:
+            continue
+        span = max(1, int(round(n * frac)))
+        span = min(span, n - 1)
+        start = int(torch.randint(
+            0, n - span + 1, (1,), device=txt.device).item())
+        masked_positions = positions[start:start + span]
+        out[row, masked_positions] = int(pad)
+        hidden[row, masked_positions] = True
+    return out, hidden
+
+
 def reading_context_target_loss(model, txt, pad, context_keep_p=0.5,
                                 feature_dropout=0.1, temperature=0.1):
     if getattr(model, "latent_concepts", None) is None:
@@ -1422,6 +1444,37 @@ def reading_context_target_loss(model, txt, pad, context_keep_p=0.5,
         model.reading_predictor, {"context": context_slots}, target_slots,
         temperature=temperature)
     return loss
+
+
+def reading_span_completion_loss(model, txt, pad, span_frac=0.25,
+                                 feature_dropout=0.1, temperature=0.1):
+    zero = txt.float().sum() * 0.0
+    metrics = {"completion_loss": zero, "hidden_token_rate": zero,
+               "view_count": 0, "skipped": True}
+    if getattr(model, "latent_concepts", None) is None:
+        return zero, metrics
+    if txt.shape[0] <= 1:
+        return zero, metrics
+    masked_txt, hidden = mask_reading_spans(
+        txt, pad, span_frac=span_frac)
+    hidden_count = hidden.sum()
+    valid_count = txt.ne(pad).sum().clamp_min(1)
+    hidden_rate = hidden_count.float() / valid_count.float()
+    if int(hidden_count.item()) <= 0:
+        return zero, metrics | {"hidden_token_rate": hidden_rate.detach()}
+    partial_slots = model.latent_concept_states(
+        masked_txt, feature_dropout=feature_dropout, project=False)
+    full_slots = model.latent_concept_states(
+        txt, feature_dropout=0.0, project=False).detach()
+    loss, completion_metrics = latent_concept_completion_loss(
+        model.reading_predictor, {"span": partial_slots}, full_slots,
+        temperature=temperature)
+    return loss, {
+        "completion_loss": completion_metrics["completion_loss"],
+        "hidden_token_rate": hidden_rate.detach(),
+        "view_count": int(completion_metrics.get("view_count", 0)),
+        "skipped": bool(completion_metrics.get("skipped", False)),
+    }
 
 
 def reading_context_graph_prediction_loss(
@@ -3689,6 +3742,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          bridge_w=0.0,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
+                         span_completion_w=0.05, span_mask_frac=0.25,
+                         span_completion_temperature=0.1,
                          sequence_w=0.05, sequence_batch=0,
                          sequence_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
@@ -3828,6 +3883,12 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading graph cycle consistency weight must be non-negative")
     if float(bridge_w) < 0.0:
         raise ValueError("reading bridge weight must be non-negative")
+    if float(span_completion_w) < 0.0:
+        raise ValueError("reading span completion weight must be non-negative")
+    if float(span_mask_frac) <= 0.0 or float(span_mask_frac) >= 1.0:
+        raise ValueError("reading span mask fraction must be in (0, 1)")
+    if float(span_completion_temperature) <= 0.0:
+        raise ValueError("reading span completion temperature must be positive")
     if float(sequence_w) < 0.0:
         raise ValueError("reading sequence loss weight must be non-negative")
     if int(sequence_batch) < 0 or int(sequence_batch) == 1:
@@ -3986,6 +4047,9 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_graph_cycle = 0.0
     last_bridge = 0.0
     last_context_target = 0.0
+    last_span_completion = 0.0
+    last_span_hidden_rate = 0.0
+    last_span_skipped = True
     last_sequence = 0.0
     last_sequence_transition_updates = 0
     last_neighborhood = 0.0
@@ -4405,6 +4469,21 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 feature_dropout=feature_dropout,
                 temperature=context_target_temperature)
             if context_target_w else view_loss * 0.0)
+        if span_completion_w:
+            span_completion, span_completion_metrics = (
+                reading_span_completion_loss(
+                    model, txt, vocab.pad, span_frac=span_mask_frac,
+                    feature_dropout=feature_dropout,
+                    temperature=span_completion_temperature))
+        else:
+            span_completion = view_loss * 0.0
+            zero_metric = view_loss.detach() * 0.0
+            span_completion_metrics = {
+                "completion_loss": zero_metric,
+                "hidden_token_rate": zero_metric,
+                "view_count": 0,
+                "skipped": True,
+            }
         sequence_loss = view_loss * 0.0
         if sequence_w and sequence_pairs:
             sequence_pair_batch = batch_reading_neighbor_pairs(
@@ -4469,6 +4548,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 + float(graph_cycle_w) * graph_cycle_loss
                 + float(bridge_w) * bridge_loss
                 + float(context_target_w) * context_target
+                + float(span_completion_w) * span_completion
                 + float(sequence_w) * sequence_loss
                 + float(neighborhood_w) * neighborhood_loss
                 + float(transition_w) * transition_loss
@@ -4575,6 +4655,10 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_graph_cycle = float(graph_cycle_loss.detach())
         last_bridge = float(bridge_loss.detach())
         last_context_target = float(context_target.detach())
+        last_span_completion = float(span_completion.detach())
+        last_span_hidden_rate = float(
+            span_completion_metrics["hidden_token_rate"].detach())
+        last_span_skipped = bool(span_completion_metrics["skipped"])
         last_sequence = float(sequence_loss.detach())
         last_neighborhood = float(neighborhood_loss.detach())
         last_transition = float(transition_loss.detach())
@@ -4597,6 +4681,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                   f"graph-cycle {last_graph_cycle:.3f} "
                   f"bridge {last_bridge:.3f} "
                   f"context-target {last_context_target:.3f} "
+                  f"span-complete {last_span_completion:.3f} "
                   f"sequence {last_sequence:.3f} "
                   f"neighborhood {last_neighborhood:.3f} "
                   f"transition {last_transition:.3f} "
@@ -4789,6 +4874,12 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "bridge_loss": last_bridge,
         "bridge_w": float(bridge_w),
         "context_target_loss": last_context_target,
+        "span_completion_loss": last_span_completion,
+        "span_completion_w": float(span_completion_w),
+        "span_mask_frac": float(span_mask_frac),
+        "span_completion_temperature": float(span_completion_temperature),
+        "span_completion_hidden_token_rate": last_span_hidden_rate,
+        "span_completion_skipped": bool(last_span_skipped),
         "sequence_loss": last_sequence,
         "sequence_w": float(sequence_w),
         "sequence_batch": int(sequence_batch),
@@ -4909,6 +5000,8 @@ def fit_reading_concepts_select_best(
         bridge_w=0.0,
         context_target_w=0.1, context_keep_p=0.5,
         context_target_temperature=0.1,
+        span_completion_w=0.05, span_mask_frac=0.25,
+        span_completion_temperature=0.1,
         sequence_w=0.05, sequence_batch=0, sequence_temperature=0.1,
         neighborhood_w=0.0, neighborhood_batch=0,
         neighborhood_probe_n=0, neighborhood_refresh_steps=0,
@@ -5089,6 +5182,9 @@ def fit_reading_concepts_select_best(
             context_target_w=context_target_w,
             context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            span_completion_w=span_completion_w,
+            span_mask_frac=span_mask_frac,
+            span_completion_temperature=span_completion_temperature,
             sequence_w=sequence_w,
             sequence_batch=sequence_batch,
             sequence_temperature=sequence_temperature,
@@ -5298,6 +5394,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            bridge_w=0.0,
                            context_target_w=0.1, context_keep_p=0.5,
                            context_target_temperature=0.1,
+                           span_completion_w=0.05, span_mask_frac=0.25,
+                           span_completion_temperature=0.1,
                            sequence_w=0.05, sequence_batch=0,
                            sequence_temperature=0.1,
                            neighborhood_w=0.0, neighborhood_batch=0,
@@ -5406,6 +5504,9 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             bridge_w=bridge_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            span_completion_w=span_completion_w,
+            span_mask_frac=span_mask_frac,
+            span_completion_temperature=span_completion_temperature,
             sequence_w=sequence_w, sequence_batch=sequence_batch,
             sequence_temperature=sequence_temperature,
             neighborhood_w=neighborhood_w,
@@ -5506,6 +5607,9 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         bridge_w=bridge_w,
         context_target_w=context_target_w, context_keep_p=context_keep_p,
         context_target_temperature=context_target_temperature,
+        span_completion_w=span_completion_w,
+        span_mask_frac=span_mask_frac,
+        span_completion_temperature=span_completion_temperature,
         sequence_w=sequence_w, sequence_batch=sequence_batch,
         sequence_temperature=sequence_temperature,
         neighborhood_w=neighborhood_w,
@@ -5588,6 +5692,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          bridge_w=0.0,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
+                         span_completion_w=0.05, span_mask_frac=0.25,
+                         span_completion_temperature=0.1,
                          sequence_w=0.05, sequence_batch=0,
                          sequence_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
@@ -5702,6 +5808,9 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             bridge_w=bridge_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            span_completion_w=span_completion_w,
+            span_mask_frac=span_mask_frac,
+            span_completion_temperature=span_completion_temperature,
             sequence_w=sequence_w, sequence_batch=sequence_batch,
             sequence_temperature=sequence_temperature,
             neighborhood_w=neighborhood_w,
@@ -5803,6 +5912,9 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             bridge_w=bridge_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            span_completion_w=span_completion_w,
+            span_mask_frac=span_mask_frac,
+            span_completion_temperature=span_completion_temperature,
             sequence_w=sequence_w, sequence_batch=sequence_batch,
             sequence_temperature=sequence_temperature,
             neighborhood_w=neighborhood_w,
@@ -5916,6 +6028,9 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
+              "span_completion_w": float(span_completion_w),
+              "span_mask_frac": float(span_mask_frac),
+              "span_completion_temperature": float(span_completion_temperature),
               "sequence_w": float(sequence_w),
               "sequence_batch": int(sequence_batch),
               "sequence_temperature": float(sequence_temperature),
@@ -6158,6 +6273,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              bridge_w=0.0,
                              context_target_w=0.1, context_keep_p=0.5,
                              context_target_temperature=0.1,
+                             span_completion_w=0.05, span_mask_frac=0.25,
+                             span_completion_temperature=0.1,
                              sequence_w=0.05, sequence_batch=0,
                              sequence_temperature=0.1,
                              neighborhood_w=0.0, neighborhood_batch=0,
@@ -6298,6 +6415,9 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             bridge_w=bridge_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            span_completion_w=span_completion_w,
+            span_mask_frac=span_mask_frac,
+            span_completion_temperature=span_completion_temperature,
             sequence_w=sequence_w, sequence_batch=sequence_batch,
             sequence_temperature=sequence_temperature,
             neighborhood_w=neighborhood_w,
@@ -6403,6 +6523,9 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             bridge_w=bridge_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            span_completion_w=span_completion_w,
+            span_mask_frac=span_mask_frac,
+            span_completion_temperature=span_completion_temperature,
             sequence_w=sequence_w, sequence_batch=sequence_batch,
             sequence_temperature=sequence_temperature,
             neighborhood_w=neighborhood_w,
@@ -6555,6 +6678,9 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
+              "span_completion_w": float(span_completion_w),
+              "span_mask_frac": float(span_mask_frac),
+              "span_completion_temperature": float(span_completion_temperature),
               "sequence_w": float(sequence_w),
               "sequence_batch": int(sequence_batch),
               "sequence_temperature": float(sequence_temperature),
@@ -8066,6 +8192,12 @@ def selftest():
         reading_model, reading_txt, reading_vocab.pad, context_keep_p=0.5,
         feature_dropout=0.1, transitive_steps=2, transitive_w=0.1,
         cycle_w=0.5))
+    span_completion_loss, span_completion_metrics = reading_span_completion_loss(
+        reading_model, reading_txt, reading_vocab.pad, span_frac=0.25,
+        feature_dropout=0.1, temperature=0.1)
+    assert torch.isfinite(span_completion_loss)
+    assert span_completion_metrics["skipped"] is False
+    assert float(span_completion_metrics["hidden_token_rate"]) > 0.0
     discovery_loss, discovery_metrics = reading_latent_discovery_loss(
         reading_model, reading_txt, reading_vocab.pad, feature_dropout=0.1,
         context_keep_p=0.5, graph_transitive_steps=2,
@@ -8153,6 +8285,7 @@ def selftest():
         seed=5, device="cpu", log_every=1, token_drop_p=0.1,
         token_replace_p=0.0, study_strategy="discovery", study_probe_n=4,
         study_hard_max=2, study_refresh_steps=1, context_target_w=0.1,
+        span_completion_w=0.1, span_mask_frac=0.25,
         context_keep_p=0.5, memory_size=8, composition_w=0.1, graph_predict_w=0.1,
         graph_cycle_w=0.1, bridge_w=0.1, fer_w=0.1,
         consolidation_w=0.1, consolidation_fer_w=0.1,
@@ -8175,6 +8308,12 @@ def selftest():
     assert reading_model.reading_train_metrics["graph_predict_w"] == 0.1
     assert reading_model.reading_train_metrics["graph_cycle_w"] == 0.1
     assert reading_model.reading_train_metrics["bridge_w"] == 0.1
+    assert reading_model.reading_train_metrics["span_completion_w"] == 0.1
+    assert reading_model.reading_train_metrics["span_completion_skipped"] is False
+    assert math.isfinite(
+        reading_model.reading_train_metrics["span_completion_loss"])
+    assert (reading_model.reading_train_metrics[
+        "span_completion_hidden_token_rate"] > 0.0)
     assert reading_model.reading_train_metrics["discovery_w"] == 0.1
     assert reading_model.reading_train_metrics["discovery_fer_w"] == 0.1
     assert reading_model.reading_train_metrics["discovery_skipped"] is False
@@ -8386,6 +8525,9 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-context-target-w", type=float, default=0.1)
     ap.add_argument("--reading-context-keep-p", type=float, default=0.5)
     ap.add_argument("--reading-context-target-temperature", type=float, default=0.1)
+    ap.add_argument("--reading-span-completion-w", type=float, default=0.05)
+    ap.add_argument("--reading-span-mask-frac", type=float, default=0.25)
+    ap.add_argument("--reading-span-completion-temperature", type=float, default=0.1)
     ap.add_argument("--reading-sequence-w", type=float, default=0.05)
     ap.add_argument("--reading-sequence-batch", type=int, default=0)
     ap.add_argument("--reading-sequence-temperature", type=float, default=0.1)
@@ -8556,6 +8698,10 @@ def _reading_kwargs(args):
                 context_target_w=args.reading_context_target_w,
                 context_keep_p=args.reading_context_keep_p,
                 context_target_temperature=args.reading_context_target_temperature,
+                span_completion_w=args.reading_span_completion_w,
+                span_mask_frac=args.reading_span_mask_frac,
+                span_completion_temperature=(
+                    args.reading_span_completion_temperature),
                 sequence_w=args.reading_sequence_w,
                 sequence_batch=args.reading_sequence_batch,
                 sequence_temperature=args.reading_sequence_temperature,

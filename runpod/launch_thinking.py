@@ -264,6 +264,10 @@ def text_reading_cmd(args, py):
         f"--reading-context-keep-p {args.reading_context_keep_p} "
         f"--reading-context-target-temperature "
         f"{args.reading_context_target_temperature} "
+        f"--reading-span-completion-w {args.reading_span_completion_w} "
+        f"--reading-span-mask-frac {args.reading_span_mask_frac} "
+        f"--reading-span-completion-temperature "
+        f"{args.reading_span_completion_temperature} "
         f"--reading-sequence-w {args.reading_sequence_w} "
         f"--reading-sequence-batch {args.reading_sequence_batch} "
         f"--reading-sequence-temperature {args.reading_sequence_temperature} "
@@ -1660,6 +1664,12 @@ def main():
                     dest="reading_context_keep_p")
     ap.add_argument("--reading-context-target-temperature", type=float,
                     default=0.1, dest="reading_context_target_temperature")
+    ap.add_argument("--reading-span-completion-w", type=float, default=0.05,
+                    dest="reading_span_completion_w")
+    ap.add_argument("--reading-span-mask-frac", type=float, default=0.25,
+                    dest="reading_span_mask_frac")
+    ap.add_argument("--reading-span-completion-temperature", type=float,
+                    default=0.1, dest="reading_span_completion_temperature")
     ap.add_argument("--reading-sequence-w", type=float, default=0.05,
                     dest="reading_sequence_w")
     ap.add_argument("--reading-sequence-batch", type=int, default=0,
@@ -3241,6 +3251,7 @@ def main():
             "--reading-replay-batch": args.reading_replay_batch,
             "--reading-replay-retention-w": args.reading_replay_retention_w,
             "--reading-context-target-w": args.reading_context_target_w,
+            "--reading-span-completion-w": args.reading_span_completion_w,
             "--reading-sequence-w": args.reading_sequence_w,
             "--reading-sequence-batch": args.reading_sequence_batch,
             "--reading-factorization-w": args.reading_factorization_w,
@@ -3338,15 +3349,20 @@ def main():
             "--reading-token-drop": args.reading_token_drop,
             "--reading-token-replace": args.reading_token_replace,
             "--reading-context-keep-p": args.reading_context_keep_p,
+            "--reading-span-mask-frac": args.reading_span_mask_frac,
         }
         for name, value in bounded_text.items():
             if value < 0.0 or value > 1.0:
                 sys.exit(f"ERROR: {name} must be in [0, 1]")
+        if args.reading_span_mask_frac <= 0.0 or args.reading_span_mask_frac >= 1.0:
+            sys.exit("ERROR: --reading-span-mask-frac must be in (0, 1)")
         if args.reading_feature_dropout < 0.0 or args.reading_feature_dropout >= 1.0:
             sys.exit("ERROR: --reading-feature-dropout must be in [0, 1)")
         text_temperatures = {
             "--reading-context-target-temperature": (
                 args.reading_context_target_temperature),
+            "--reading-span-completion-temperature": (
+                args.reading_span_completion_temperature),
             "--reading-sequence-temperature": args.reading_sequence_temperature,
             "--reading-memory-temperature": args.reading_memory_temperature,
             "--reading-consolidation-temperature": (

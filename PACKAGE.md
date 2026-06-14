@@ -19,7 +19,7 @@ new work on the current entry points:
 `thinking.text` accepts raw reading corpora through `--reading-data`. This is the language-mastery
 path: text chunks are read directly, latent slots are trained with
 sequence, factorization, association, graph, neighborhood, transition, cluster, discovery,
-reanalysis, memory-gap, and graph-closure insight objectives. No English rules or prompt
+span completion, reanalysis, memory-gap, and graph-closure insight objectives. No English rules or prompt
 templates are embedded in the module, and legacy dataset importers are not supported APIs.
 Checkpoints carry a bounded raw-reading replay bank selected from the model's own study records,
 so continuation can retain earlier concepts without a separate task-specific harness.
@@ -32,7 +32,7 @@ python -m thinking.text --reading-data data/reading.jsonl \
     --latent-concept-slots 4 --reading-memory-size 256 \
     --reading-study-strategy gap --reading-study-probe-n 256 \
     --reading-discovery-w 0.05 --reading-reanalysis-w 0.05 \
-    --reading-gap-w 0.05 \
+    --reading-gap-w 0.05 --reading-span-completion-w 0.05 \
     --out runs/text_raw_reading.json \
     --checkpoint runs/text_raw_reading.pt
 
@@ -42,7 +42,8 @@ python -m thinking.text --reading-data data/new_reading.jsonl \
     --steps 4000 --batch 16 \
     --reading-study-strategy gap --reading-study-probe-n 256 \
     --reading-discovery-w 0.05 --reading-reanalysis-w 0.05 \
-    --reading-gap-w 0.05 --reading-replay-w 0.05 \
+    --reading-gap-w 0.05 --reading-span-completion-w 0.05 \
+    --reading-replay-w 0.05 \
     --out runs/text_raw_reading_study.json
 ```
 
