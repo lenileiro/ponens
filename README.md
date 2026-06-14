@@ -147,6 +147,9 @@ installs those when this path is active.
     --report-out runs/image_eval_report.json
 # Preference-loop artifact: score multiple generated candidates per prompt, then emit
 # chosen/rejected pairs for direct flow preference tuning and quality-scorer training.
+# The latent-flow trainer accepts `--flow-preference-loss dpo` to anchor those
+# pairwise updates against a frozen reference flow instead of only optimizing a
+# raw chosen/rejected margin.
 .venv/bin/python -m thinking.image_score --manifest data/images/generated_captioned.jsonl \
     --root data/images --backend ensemble --technical-w 0.3 \
     --external-sidecar data/images/generated_reward_scores.jsonl \
@@ -176,7 +179,8 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
 # `*_candidates.jsonl` -> PickScore-scored candidates -> `*_preferences.jsonl` chosen/rejected
 # pairs, including sampler/CFG provenance, for the next quality-scorer and direct-flow preference pass. If that portable preference
 # artifact and its candidate images exist locally, the next `web-hf-vae-hq` launch auto-uploads
-# and consumes it. Prompt candidates now cycle through the configured CFG/sampler/seed
+# and consumes it with reference-anchored DPO flow preference tuning. Prompt candidates
+# now cycle through the configured CFG/sampler/seed
 # sweep lists and record per-candidate provenance for preference mining; add
 # `--image-no-auto-preferences` to force a first-run/no-feedback profile. Both use SigLIP So400m
 # pooled prompts plus T5-large token-sequence conditioning, crop/flip/pad-aware
