@@ -54,6 +54,7 @@ from .concepts import (
     LatentConceptMemory,
     SchemaConceptHead,
     SchemaConceptRefiner,
+    latent_concept_bridge_scores,
     latent_concept_composition_loss,
     latent_concept_graph_cycle_loss,
     latent_concept_graph_cycle_scores,
@@ -2598,35 +2599,6 @@ def _latent_slot_disorder_scores(slots):
     return 0.5 * (correlation + imbalance)
 
 
-def _latent_bridge_scores(slots, memory, eps=1e-8):
-    if slots is None or slots.ndim != 3:
-        empty = torch.zeros(0)
-        return empty, empty, empty
-    active = memory.active() if memory is not None else None
-    batch = slots.shape[0]
-    if active is None or active.shape[0] <= 1:
-        zero = slots.reshape(batch, -1).sum(-1) * 0.0
-        return zero, zero, torch.ones_like(zero)
-    z = F.normalize(slots, dim=-1)
-    active = F.normalize(active.to(z), dim=-1)
-    probs = F.softmax(z.matmul(active.t()), dim=-1)
-    concept_mass = probs.mean(1)
-    entropy = -(concept_mass.clamp_min(eps).log() * concept_mass).sum(-1)
-    entropy = entropy / math.log(float(active.shape[0]))
-    relations = memory.active_relations().to(concept_mass).clamp_min(0.0)
-    transitions = memory.active_transitions().to(concept_mass).clamp_min(0.0)
-    graph = relations + transitions + transitions.t()
-    if graph.numel():
-        graph = graph / graph.max().clamp_min(eps)
-        graph = graph.clone()
-        graph.fill_diagonal_(1.0)
-    connected = (
-        concept_mass[:, :, None] * graph[None] * concept_mass[:, None, :]
-    ).sum((1, 2)).clamp(0.0, 1.0)
-    bridge = entropy * (1.0 - connected)
-    return bridge, entropy, connected
-
-
 def reading_latent_discovery_records(
         model, vocab, records, device=DEV, n=0, seed=0, context_keep_p=0.5,
         feature_dropout=0.0, curiosity_temperature=0.1,
@@ -2700,8 +2672,9 @@ def reading_latent_discovery_records(
                     target_power=cycle_target_power,
                     cycle_w=cycle_w)
             disorder = _latent_slot_disorder_scores(full_slots)
-            bridge, bridge_entropy, bridge_connectivity = _latent_bridge_scores(
-                full_slots, memory)
+            bridge, bridge_entropy, bridge_connectivity = latent_concept_bridge_scores(
+                full_slots, memory.active(), memory.active_relations(),
+                memory.active_transitions())
             novelty = curiosity_parts.get("novelty", curiosity.new_zeros(curiosity.shape))
             association = curiosity_parts.get(
                 "association", curiosity.new_zeros(curiosity.shape))

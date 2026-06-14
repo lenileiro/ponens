@@ -34,6 +34,8 @@ from .concepts import (
     LatentConceptHead,
     LatentConceptMemory,
     latent_concept_association_loss,
+    latent_concept_bridge_loss,
+    latent_concept_bridge_scores,
     latent_concept_cluster_prototype_loss,
     latent_concept_composition_loss,
     latent_concept_fer_loss,
@@ -737,6 +739,54 @@ def latent_multimodal_fer_metrics_from_views(views):
             "modes": modes}
 
 
+def latent_multimodal_bridge_loss_from_views(model, views):
+    views = {mode: slots for mode, slots in views.items() if slots is not None}
+    if not views:
+        return torch.tensor(0.0)
+    memory = getattr(model, "latent_concept_memory", None)
+    if memory is None:
+        return next(iter(views.values())).sum() * 0.0
+    losses = [
+        latent_concept_bridge_loss(
+            slots, memory.active(), memory.active_relations(),
+            memory.active_transitions())
+        for slots in views.values()
+    ]
+    return torch.stack(losses).mean() if losses else next(iter(views.values())).sum() * 0.0
+
+
+def latent_multimodal_bridge_metrics_from_views(model, views):
+    views = {mode: slots for mode, slots in views.items() if slots is not None}
+    if not views:
+        return {"bridge_score": 0.0, "bridge_entropy": 0.0,
+                "bridge_connectivity": 0.0, "mode_count": 0, "modes": {}}
+    memory = getattr(model, "latent_concept_memory", None)
+    if memory is None:
+        return {"bridge_score": 0.0, "bridge_entropy": 0.0,
+                "bridge_connectivity": 1.0, "mode_count": 0, "modes": {}}
+    keys = ("bridge_score", "bridge_entropy", "bridge_connectivity")
+    totals = {key: 0.0 for key in keys}
+    modes = {}
+    for mode, slots in views.items():
+        score, entropy, connectivity = latent_concept_bridge_scores(
+            slots, memory.active(), memory.active_relations(),
+            memory.active_transitions())
+        report = {
+            "bridge_score": float(score.detach().mean()) if score.numel() else 0.0,
+            "bridge_entropy": (
+                float(entropy.detach().mean()) if entropy.numel() else 0.0),
+            "bridge_connectivity": (
+                float(connectivity.detach().mean()) if connectivity.numel() else 1.0),
+        }
+        modes[mode] = report
+        for key in keys:
+            totals[key] += report[key]
+    count = float(max(1, len(modes)))
+    return {**{key: totals[key] / count for key in keys},
+            "mode_count": len(modes),
+            "modes": modes}
+
+
 def latent_multimodal_memory_loss_from_views(model, views, temperature=0.1,
                                              balance_w=0.0):
     views = {mode: slots for mode, slots in views.items() if slots is not None}
@@ -1075,6 +1125,60 @@ def latent_multimodal_fer_eval(model, records, vocab, view_dims, n=200,
     return report
 
 
+def latent_multimodal_bridge_eval(model, records, vocab, view_dims, n=200,
+                                  seed=1, device=DEV):
+    if (getattr(model, "latent_concepts", None) is None
+            or getattr(model, "latent_concept_memory", None) is None):
+        return {"bridge_score": 0.0, "bridge_entropy": 0.0,
+                "bridge_connectivity": 1.0, "n_records": 0,
+                "sampled": False, "skipped": True, "modes": {}}
+    rng = np.random.default_rng(seed)
+    count = min(int(n), len(records)) if int(n) > 0 else len(records)
+    sample = _sample_records(records, count, rng) if count else []
+    if not sample:
+        return {"bridge_score": 0.0, "bridge_entropy": 0.0,
+                "bridge_connectivity": 1.0, "n_records": 0,
+                "sampled": False, "skipped": True, "modes": {}}
+    keys = ("bridge_score", "bridge_entropy", "bridge_connectivity")
+    totals = {key: 0.0 for key in keys}
+    mode_totals = {mode: {key: 0.0 for key in keys} for mode in MODES}
+    total = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(sample), 64):
+            batch_records = sample[off:off + 64]
+            features, txt, _ids = _batch_from_records(
+                batch_records, vocab, device, view_dims)
+            views = {
+                mode: model.latent_concept_states(
+                    features, txt, mode=mode, project=True)
+                for mode in MODES
+            }
+            metrics = latent_multimodal_bridge_metrics_from_views(model, views)
+            weight = len(batch_records)
+            total += weight
+            for key in keys:
+                totals[key] += float(metrics[key]) * weight
+            for mode, mode_metrics in metrics.get("modes", {}).items():
+                for key in keys:
+                    mode_totals[mode][key] += float(mode_metrics[key]) * weight
+    if total == 0:
+        return {"bridge_score": 0.0, "bridge_entropy": 0.0,
+                "bridge_connectivity": 1.0, "n_records": 0,
+                "sampled": False, "skipped": True, "modes": {}}
+    report = {key: totals[key] / float(total) for key in keys}
+    report.update({
+        "n_records": total,
+        "sampled": bool(int(n) > 0 and int(n) < len(records)),
+        "skipped": False,
+        "modes": {
+            mode: {key: vals[key] / float(total) for key in keys}
+            for mode, vals in mode_totals.items()
+        },
+    })
+    return report
+
+
 def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           device=DEV, log_every=100, layers=3, heads=4, max_len=128,
           view_tokens=4, txt_tokens=8, trunk_arch="mlp",
@@ -1120,6 +1224,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           latent_concept_graph_predict_transitive_steps=2,
           latent_concept_graph_predict_transitive_w=0.1,
           latent_concept_graph_predict_target_power=1.0,
+          latent_concept_bridge_w=0.0,
           latent_concept_neighborhood_w=0.0,
           latent_concept_neighborhood_temperature=0.1,
           latent_concept_neighborhood_margin=0.0,
@@ -1142,7 +1247,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     latent_weights = (
         latent_concept_w, latent_concept_factorization_w, latent_concept_memory_w,
         latent_concept_fer_w, latent_concept_association_w, latent_concept_composition_w,
-        latent_concept_graph_predict_w, latent_concept_neighborhood_w,
+        latent_concept_graph_predict_w, latent_concept_bridge_w,
+        latent_concept_neighborhood_w,
         latent_concept_transition_w, latent_concept_cluster_w)
     if any(float(w) < 0.0 for w in latent_weights):
         raise ValueError("latent concept loss weights must be non-negative")
@@ -1247,6 +1353,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 transitive_w=latent_concept_graph_predict_transitive_w,
                 target_power=latent_concept_graph_predict_target_power)
             if latent_concept_graph_predict_w else base_loss * 0.0)
+        latent_bridge = (
+            latent_multimodal_bridge_loss_from_views(model, latent_views)
+            if latent_concept_bridge_w else base_loss * 0.0)
         latent_neighborhood = (
             latent_multimodal_neighborhood_loss_from_views(
                 latent_views, temperature=latent_concept_neighborhood_temperature,
@@ -1271,6 +1380,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 + float(latent_concept_association_w) * latent_association
                 + float(latent_concept_composition_w) * latent_composition
                 + float(latent_concept_graph_predict_w) * latent_graph_predict
+                + float(latent_concept_bridge_w) * latent_bridge
                 + float(latent_concept_neighborhood_w) * latent_neighborhood
                 + float(latent_concept_transition_w) * latent_transition
                 + float(latent_concept_cluster_w) * latent_cluster)
@@ -1283,12 +1393,14 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             relation_decay=(latent_concept_association_decay
                             if (latent_concept_association_w
                                 or latent_concept_composition_w
-                                or latent_concept_graph_predict_w) else None)))
+                                or latent_concept_graph_predict_w
+                                or latent_concept_bridge_w) else None)))
         transition_updates = 0
-        if latent_concept_graph_predict_w:
+        if latent_concept_graph_predict_w or latent_concept_bridge_w:
             transition_updates = int(update_multimodal_latent_transitions(
                 model, latent_views, decay=latent_concept_association_decay))
         fer_metrics = latent_multimodal_fer_metrics_from_views(latent_views)
+        bridge_metrics = latent_multimodal_bridge_metrics_from_views(model, latent_views)
         last = {
             "loss": float(loss.detach()),
             "token_loss": float(base_loss.detach()),
@@ -1308,6 +1420,12 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "latent_association_loss": float(latent_association.detach()),
             "latent_composition_loss": float(latent_composition.detach()),
             "latent_graph_predict_loss": float(latent_graph_predict.detach()),
+            "latent_bridge_loss": float(latent_bridge.detach()),
+            "latent_bridge_w": float(latent_concept_bridge_w),
+            "latent_bridge_score": float(bridge_metrics["bridge_score"]),
+            "latent_bridge_entropy": float(bridge_metrics["bridge_entropy"]),
+            "latent_bridge_connectivity": float(
+                bridge_metrics["bridge_connectivity"]),
             "latent_neighborhood_loss": float(latent_neighborhood.detach()),
             "latent_transition_loss": float(latent_transition.detach()),
             "latent_cluster_loss": float(latent_cluster.detach()),
@@ -1368,6 +1486,9 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
     latent_fer_probe = latent_multimodal_fer_eval(
         model, eval_records, vocab, view_dims, n=eval_n, seed=seed + 29,
         device=device)
+    latent_bridge_probe = latent_multimodal_bridge_eval(
+        model, eval_records, vocab, view_dims, n=eval_n, seed=seed + 31,
+        device=device)
     architecture = dict(model.config)
     architecture["reader_prefix_tokens"] = (
         int(model.config["view_tokens"]) * len(model.config["view_names"])
@@ -1387,6 +1508,7 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         "teacher_forced": metrics,
         "latent_graph_probe": latent_probe,
         "latent_fer_probe": latent_fer_probe,
+        "latent_bridge_probe": latent_bridge_probe,
         "text_checkpoint_transfer": getattr(model, "text_checkpoint_transfer", {}),
         "gate": metrics["full"]["token_acc"] >= 0.50,
     }
@@ -1468,6 +1590,13 @@ def selftest():
         assert torch.isfinite(latent_multimodal_association_loss_from_views(model, views))
         assert torch.isfinite(latent_multimodal_composition_loss_from_views(model, views))
         assert torch.isfinite(latent_multimodal_graph_prediction_loss_from_views(model, views))
+        assert torch.isfinite(latent_multimodal_bridge_loss_from_views(model, views))
+        bridge_metrics = latent_multimodal_bridge_metrics_from_views(model, views)
+        assert math.isfinite(bridge_metrics["bridge_score"])
+        bridge_eval = latent_multimodal_bridge_eval(
+            model, records, vocab, view_dims, n=4, device="cpu")
+        assert bridge_eval["skipped"] is False
+        assert math.isfinite(bridge_eval["bridge_score"])
         assert torch.isfinite(latent_multimodal_neighborhood_loss_from_views(views))
         assert torch.isfinite(latent_multimodal_transition_loss_from_views(views))
         assert torch.isfinite(latent_multimodal_cluster_loss_from_views(views))
@@ -1480,12 +1609,15 @@ def selftest():
             latent_concept_association_w=0.01,
             latent_concept_composition_w=0.01,
             latent_concept_graph_predict_w=0.01,
+            latent_concept_bridge_w=0.01,
             latent_concept_neighborhood_w=0.01,
             latent_concept_transition_w=0.01,
             latent_concept_cluster_w=0.01)
         assert trained_model.train_metrics["latent_graph_transition_updates"] > 0
         assert trained_model.train_metrics["latent_fer_w"] == 0.01
         assert math.isfinite(trained_model.train_metrics["latent_fer_score"])
+        assert trained_model.train_metrics["latent_bridge_w"] == 0.01
+        assert math.isfinite(trained_model.train_metrics["latent_bridge_score"])
     print("multimodal selftest OK")
 
 
@@ -1596,6 +1728,9 @@ def main(argv=None):
                     default=0.1, dest="latent_concept_graph_predict_transitive_w")
     ap.add_argument("--latent-concept-graph-predict-target-power", type=float,
                     default=1.0, dest="latent_concept_graph_predict_target_power")
+    ap.add_argument("--latent-concept-bridge-w", type=float, default=0.0,
+                    dest="latent_concept_bridge_w",
+                    help="weight for label-free weak-connection bridge closure")
     ap.add_argument("--latent-concept-neighborhood-w", type=float, default=0.0,
                     dest="latent_concept_neighborhood_w")
     ap.add_argument("--latent-concept-neighborhood-temperature", type=float,
@@ -1666,6 +1801,7 @@ def main(argv=None):
         args.latent_concept_fer_w, args.latent_concept_memory_w,
         args.latent_concept_association_w,
         args.latent_concept_composition_w, args.latent_concept_graph_predict_w,
+        args.latent_concept_bridge_w,
         args.latent_concept_neighborhood_w, args.latent_concept_transition_w,
         args.latent_concept_cluster_w,
     ]
@@ -1767,6 +1903,7 @@ def main(argv=None):
             args.latent_concept_graph_predict_transitive_w),
         latent_concept_graph_predict_target_power=(
             args.latent_concept_graph_predict_target_power),
+        latent_concept_bridge_w=args.latent_concept_bridge_w,
         latent_concept_neighborhood_w=args.latent_concept_neighborhood_w,
         latent_concept_neighborhood_temperature=(
             args.latent_concept_neighborhood_temperature),

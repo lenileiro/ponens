@@ -501,6 +501,75 @@ def latent_concept_graph_curiosity_scores(slots, memory, relations=None,
     return score, {"novelty": novelty, "association": association}
 
 
+def latent_concept_bridge_scores(slots, memory, relations=None, transitions=None,
+                                 require_graph=False, eps=1e-8):
+    """Score broad concept activations that are weakly connected in memory.
+
+    The score is label-free: it uses only current slot-to-prototype mass and the
+    model's self-mined relation/transition graph. High values identify examples
+    where several latent concepts are simultaneously active but not yet well
+    connected by the graph, which is useful for self-study and discovery.
+    """
+    if slots is None:
+        empty = torch.zeros(0)
+        return empty, empty, empty
+    if slots.ndim != 3:
+        raise ValueError("latent concept bridge expects [batch, slots, dim]")
+    if memory is None or memory.numel() == 0:
+        zero = slots.reshape(slots.shape[0], -1).sum(-1) * 0.0
+        return zero, zero, torch.ones_like(zero)
+    if slots.shape[-1] != memory.shape[-1]:
+        raise ValueError("latent concept bridge memory dimension mismatch")
+    n = int(memory.shape[0])
+    if n <= 1:
+        zero = slots.reshape(slots.shape[0], -1).sum(-1) * 0.0
+        return zero, zero, torch.ones_like(zero)
+    z = F.normalize(slots, dim=-1)
+    mem = F.normalize(memory.to(device=slots.device, dtype=slots.dtype), dim=-1)
+    concept_mass = z.matmul(mem.t()).softmax(-1).mean(1)
+    entropy = -(concept_mass.clamp_min(eps).log() * concept_mass).sum(-1)
+    entropy = entropy / math.log(float(n))
+    graph = torch.zeros(n, n, dtype=slots.dtype, device=slots.device)
+    if relations is not None and relations.numel():
+        rel = relations[:n, :n].to(device=slots.device, dtype=slots.dtype)
+        if rel.shape != (n, n):
+            raise ValueError("latent concept bridge relation shape mismatch")
+        graph = graph + rel.clamp_min(0.0)
+    if transitions is not None and transitions.numel():
+        trans = transitions[:n, :n].to(device=slots.device, dtype=slots.dtype)
+        if trans.shape != (n, n):
+            raise ValueError("latent concept bridge transition shape mismatch")
+        trans = trans.clamp_min(0.0)
+        graph = graph + trans + trans.t()
+    eye = torch.eye(n, dtype=torch.bool, device=slots.device)
+    has_edges = bool(graph.masked_fill(eye, 0.0).gt(0.0).any())
+    if require_graph and not has_edges:
+        zero = slots.reshape(slots.shape[0], -1).sum(-1) * 0.0
+        return zero, entropy, torch.ones_like(zero)
+    if graph.numel():
+        graph = graph / graph.max().clamp_min(eps)
+    graph = graph.masked_fill(eye, 1.0)
+    connected = (
+        concept_mass[:, :, None] * graph[None] * concept_mass[:, None, :]
+    ).sum((1, 2)).clamp(0.0, 1.0)
+    bridge = entropy * (1.0 - connected)
+    return bridge, entropy, connected
+
+
+def latent_concept_bridge_loss(slots, memory, relations=None, transitions=None):
+    """Close self-mined concept bridges without collapsing multi-concept mass.
+
+    Entropy is detached, so the model cannot reduce this loss by simply making
+    slots less multi-concept. Gradient flows through graph connectivity instead.
+    """
+    bridge, entropy, connected = latent_concept_bridge_scores(
+        slots, memory, relations=relations, transitions=transitions,
+        require_graph=True)
+    if bridge.numel() == 0:
+        return torch.tensor(0.0)
+    return (entropy.detach() * (1.0 - connected)).mean()
+
+
 def latent_concept_composition_loss(slots, memory, relations, temperature=0.1,
                                     self_loop_w=0.0, transitive_steps=2,
                                     transitive_w=0.1, margin=0.0):
