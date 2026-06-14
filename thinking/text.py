@@ -70,6 +70,7 @@ from .concepts import (
     latent_concept_fer_scores,
     latent_concept_graph_ready,
     latent_concept_graph_snapshot,
+    latent_concept_memory_gap_loss,
     latent_concept_memory_consolidation_loss,
     latent_concept_neighborhood_loss,
     latent_concept_reanalysis_loss,
@@ -1783,6 +1784,38 @@ def reading_latent_reanalysis_loss(
         fer_fragmentation_w=fer_fragmentation_w,
         fer_correlation_w=fer_correlation_w,
         fer_balance_w=fer_balance_w)
+
+
+def reading_latent_gap_loss(model, txt, feature_dropout=0.1, temperature=0.1,
+                            self_loop_w=0.0, transitive_steps=2,
+                            transitive_w=0.1, target_power=1.0,
+                            relation_w=1.0, transition_w=1.0):
+    zero = torch.tensor(0.0, device=txt.device)
+    metrics = {"gap_loss": zero, "gap_kl": zero, "gap_cosine": zero,
+               "gap_entropy": zero, "gap_target_mass": zero,
+               "gap_present_overlap": zero, "memory_active": 0,
+               "graph_ready": False, "skipped": True}
+    memory = getattr(model, "latent_concept_memory", None)
+    if getattr(model, "latent_concepts", None) is None or memory is None:
+        return zero, metrics
+    active = memory.active()
+    metrics["memory_active"] = int(active.shape[0])
+    if active.numel() == 0:
+        return zero, metrics
+    slots = model.latent_concept_states(
+        txt, feature_dropout=feature_dropout, project=True)
+    if hasattr(memory, "gap_loss"):
+        return memory.gap_loss(
+            slots, temperature=temperature, self_loop_w=self_loop_w,
+            transitive_steps=transitive_steps, transitive_w=transitive_w,
+            target_power=target_power, relation_w=relation_w,
+            transition_w=transition_w)
+    return latent_concept_memory_gap_loss(
+        slots, active, relations=memory.active_relations(),
+        transitions=memory.active_transitions(), temperature=temperature,
+        self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+        transitive_w=transitive_w, target_power=target_power,
+        relation_w=relation_w, transition_w=transition_w)
 
 
 @torch.no_grad()
@@ -3628,6 +3661,11 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          reanalysis_cycle_w=0.5,
                          reanalysis_bridge_w=0.5,
                          reanalysis_fer_w=0.0,
+                         gap_w=0.0, gap_temperature=0.1,
+                         gap_self_loop_w=0.0,
+                         gap_transitive_steps=2,
+                         gap_transitive_w=0.1,
+                         gap_target_power=1.0,
                          association_w=0.05, association_temperature=0.1,
                          association_decay=0.99, association_target_power=1.0,
                          association_self_loop_w=0.05,
@@ -3726,6 +3764,18 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
             or float(reanalysis_bridge_w) < 0.0
             or float(reanalysis_fer_w) < 0.0):
         raise ValueError("reading reanalysis component weights must be non-negative")
+    if float(gap_w) < 0.0:
+        raise ValueError("reading gap loss weight must be non-negative")
+    if float(gap_temperature) <= 0.0:
+        raise ValueError("reading gap temperature must be positive")
+    if float(gap_self_loop_w) < 0.0:
+        raise ValueError("reading gap self-loop weight must be non-negative")
+    if int(gap_transitive_steps) < 1:
+        raise ValueError("reading gap transitive steps must be positive")
+    if float(gap_transitive_w) < 0.0:
+        raise ValueError("reading gap transitive weight must be non-negative")
+    if float(gap_target_power) <= 0.0:
+        raise ValueError("reading gap target power must be positive")
     if float(association_w) < 0.0:
         raise ValueError("reading association loss weight must be non-negative")
     if float(association_temperature) <= 0.0:
@@ -3853,6 +3903,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading discovery requires latent concept memory")
     if reanalysis_w and getattr(model, "latent_concept_memory", None) is None:
         raise ValueError("reading reanalysis requires latent concept memory")
+    if gap_w and getattr(model, "latent_concept_memory", None) is None:
+        raise ValueError("reading gap loss requires latent concept memory")
     if (study_strategy in READING_MEMORY_STUDY_STRATEGIES
             and getattr(model, "latent_concept_memory", None) is None):
         raise ValueError(
@@ -3916,6 +3968,15 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_reanalysis_memory_active = 0
     last_reanalysis_graph_ready = False
     last_reanalysis_skipped = True
+    last_gap = 0.0
+    last_gap_kl = 0.0
+    last_gap_cosine = 0.0
+    last_gap_entropy = 0.0
+    last_gap_target_mass = 0.0
+    last_gap_present_overlap = 0.0
+    last_gap_memory_active = 0
+    last_gap_graph_ready = False
+    last_gap_skipped = True
     last_association = 0.0
     last_composition = 0.0
     last_graph_predict = 0.0
@@ -4258,6 +4319,31 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 "graph_ready": False,
                 "skipped": True,
             }
+        if gap_w:
+            gap_loss, gap_metrics = reading_latent_gap_loss(
+                model, txt, feature_dropout=feature_dropout,
+                temperature=gap_temperature,
+                self_loop_w=gap_self_loop_w,
+                transitive_steps=gap_transitive_steps,
+                transitive_w=gap_transitive_w,
+                target_power=gap_target_power)
+        else:
+            gap_loss = view_loss * 0.0
+            zero_metric = view_loss.detach() * 0.0
+            memory = getattr(model, "latent_concept_memory", None)
+            gap_metrics = {
+                "gap_loss": zero_metric,
+                "gap_kl": zero_metric,
+                "gap_cosine": zero_metric,
+                "gap_entropy": zero_metric,
+                "gap_target_mass": zero_metric,
+                "gap_present_overlap": zero_metric,
+                "memory_active": int(
+                    getattr(memory, "filled", torch.zeros((), dtype=torch.long)).item())
+                if memory is not None else 0,
+                "graph_ready": False,
+                "skipped": True,
+            }
         composition_loss = (
             reading_latent_composition_loss(
                 model, txt, feature_dropout=feature_dropout,
@@ -4355,6 +4441,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 + float(consolidation_w) * consolidation_loss
                 + float(discovery_w) * discovery_loss
                 + float(reanalysis_w) * reanalysis_loss
+                + float(gap_w) * gap_loss
                 + float(association_w) * association_loss
                 + float(composition_w) * composition_loss
                 + float(graph_predict_w) * graph_predict_loss
@@ -4376,12 +4463,14 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                                 or graph_predict_w or graph_cycle_w
                                 or discovery_w
                                 or reanalysis_w
+                                or gap_w
                                 or bridge_w)
                             else None)))
         last_transition_updates = 0
         if (graph_predict_w or graph_cycle_w
                 or discovery_w
                 or reanalysis_w
+                or gap_w
                 or bridge_w
                 or study_strategy in READING_TRANSITION_STUDY_STRATEGIES):
             last_transition_updates = int(update_reading_latent_transitions(
@@ -4389,7 +4478,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 feature_dropout=0.0, decay=association_decay))
         last_sequence_transition_updates = 0
         if sequence_pairs and (sequence_w or graph_predict_w
-                               or graph_cycle_w or bridge_w):
+                               or graph_cycle_w or gap_w or bridge_w):
             sequence_pair_batch = batch_reading_neighbor_pairs(
                 sequence_pairs, rng, sequence_batch)
             last_sequence_transition_updates = int(
@@ -4439,6 +4528,16 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_reanalysis_memory_active = int(reanalysis_metrics["memory_active"])
         last_reanalysis_graph_ready = bool(reanalysis_metrics["graph_ready"])
         last_reanalysis_skipped = bool(reanalysis_metrics["skipped"])
+        last_gap = float(gap_loss.detach())
+        last_gap_kl = float(gap_metrics["gap_kl"].detach())
+        last_gap_cosine = float(gap_metrics["gap_cosine"].detach())
+        last_gap_entropy = float(gap_metrics["gap_entropy"].detach())
+        last_gap_target_mass = float(gap_metrics["gap_target_mass"].detach())
+        last_gap_present_overlap = float(
+            gap_metrics["gap_present_overlap"].detach())
+        last_gap_memory_active = int(gap_metrics["memory_active"])
+        last_gap_graph_ready = bool(gap_metrics["graph_ready"])
+        last_gap_skipped = bool(gap_metrics["skipped"])
         last_association = float(association_loss.detach())
         last_composition = float(composition_loss.detach())
         last_graph_predict = float(graph_predict_loss.detach())
@@ -4459,6 +4558,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                   f"consolidate {last_consolidation:.3f} "
                   f"discover {last_discovery:.3f} "
                   f"reanalyze {last_reanalysis:.3f} "
+                  f"gap {last_gap:.3f} "
                   f"assoc {last_association:.3f} "
                   f"compose {last_composition:.3f} "
                   f"graph-predict {last_graph_predict:.3f} "
@@ -4592,6 +4692,21 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "reanalysis_memory_active": int(last_reanalysis_memory_active),
         "reanalysis_graph_ready": bool(last_reanalysis_graph_ready),
         "reanalysis_skipped": bool(last_reanalysis_skipped),
+        "gap_loss": last_gap,
+        "gap_w": float(gap_w),
+        "gap_temperature": float(gap_temperature),
+        "gap_self_loop_w": float(gap_self_loop_w),
+        "gap_transitive_steps": int(gap_transitive_steps),
+        "gap_transitive_w": float(gap_transitive_w),
+        "gap_target_power": float(gap_target_power),
+        "gap_kl": last_gap_kl,
+        "gap_cosine": last_gap_cosine,
+        "gap_entropy": last_gap_entropy,
+        "gap_target_mass": last_gap_target_mass,
+        "gap_present_overlap": last_gap_present_overlap,
+        "gap_memory_active": int(last_gap_memory_active),
+        "gap_graph_ready": bool(last_gap_graph_ready),
+        "gap_skipped": bool(last_gap_skipped),
         "association_loss": last_association,
         "association_w": float(association_w),
         "association_temperature": float(association_temperature),
@@ -4737,6 +4852,9 @@ def fit_reading_concepts_select_best(
         reanalysis_w=0.0, reanalysis_graph_w=1.0,
         reanalysis_cycle_w=0.5, reanalysis_bridge_w=0.5,
         reanalysis_fer_w=0.0,
+        gap_w=0.0, gap_temperature=0.1, gap_self_loop_w=0.0,
+        gap_transitive_steps=2, gap_transitive_w=0.1,
+        gap_target_power=1.0,
         association_w=0.05, association_temperature=0.1,
         association_decay=0.99, association_target_power=1.0,
         association_self_loop_w=0.05, association_transitive_steps=2,
@@ -4898,6 +5016,12 @@ def fit_reading_concepts_select_best(
             reanalysis_cycle_w=reanalysis_cycle_w,
             reanalysis_bridge_w=reanalysis_bridge_w,
             reanalysis_fer_w=reanalysis_fer_w,
+            gap_w=gap_w,
+            gap_temperature=gap_temperature,
+            gap_self_loop_w=gap_self_loop_w,
+            gap_transitive_steps=gap_transitive_steps,
+            gap_transitive_w=gap_transitive_w,
+            gap_target_power=gap_target_power,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -5108,6 +5232,11 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            reanalysis_cycle_w=0.5,
                            reanalysis_bridge_w=0.5,
                            reanalysis_fer_w=0.0,
+                           gap_w=0.0, gap_temperature=0.1,
+                           gap_self_loop_w=0.0,
+                           gap_transitive_steps=2,
+                           gap_transitive_w=0.1,
+                           gap_target_power=1.0,
                            association_w=0.05, association_temperature=0.1,
                            association_decay=0.99, association_target_power=1.0,
                            association_self_loop_w=0.05,
@@ -5205,6 +5334,12 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             reanalysis_cycle_w=reanalysis_cycle_w,
             reanalysis_bridge_w=reanalysis_bridge_w,
             reanalysis_fer_w=reanalysis_fer_w,
+            gap_w=gap_w,
+            gap_temperature=gap_temperature,
+            gap_self_loop_w=gap_self_loop_w,
+            gap_transitive_steps=gap_transitive_steps,
+            gap_transitive_w=gap_transitive_w,
+            gap_target_power=gap_target_power,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -5299,6 +5434,12 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         reanalysis_cycle_w=reanalysis_cycle_w,
         reanalysis_bridge_w=reanalysis_bridge_w,
         reanalysis_fer_w=reanalysis_fer_w,
+        gap_w=gap_w,
+        gap_temperature=gap_temperature,
+        gap_self_loop_w=gap_self_loop_w,
+        gap_transitive_steps=gap_transitive_steps,
+        gap_transitive_w=gap_transitive_w,
+        gap_target_power=gap_target_power,
         association_w=association_w,
         association_temperature=association_temperature,
         association_decay=association_decay,
@@ -5381,6 +5522,11 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          reanalysis_cycle_w=0.5,
                          reanalysis_bridge_w=0.5,
                          reanalysis_fer_w=0.0,
+                         gap_w=0.0, gap_temperature=0.1,
+                         gap_self_loop_w=0.0,
+                         gap_transitive_steps=2,
+                         gap_transitive_w=0.1,
+                         gap_target_power=1.0,
                          association_w=0.05, association_temperature=0.1,
                          association_decay=0.99, association_target_power=1.0,
                          association_self_loop_w=0.05,
@@ -5484,6 +5630,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             reanalysis_cycle_w=reanalysis_cycle_w,
             reanalysis_bridge_w=reanalysis_bridge_w,
             reanalysis_fer_w=reanalysis_fer_w,
+            gap_w=gap_w,
+            gap_temperature=gap_temperature,
+            gap_self_loop_w=gap_self_loop_w,
+            gap_transitive_steps=gap_transitive_steps,
+            gap_transitive_w=gap_transitive_w,
+            gap_target_power=gap_target_power,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -5579,6 +5731,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             reanalysis_cycle_w=reanalysis_cycle_w,
             reanalysis_bridge_w=reanalysis_bridge_w,
             reanalysis_fer_w=reanalysis_fer_w,
+            gap_w=gap_w,
+            gap_temperature=gap_temperature,
+            gap_self_loop_w=gap_self_loop_w,
+            gap_transitive_steps=gap_transitive_steps,
+            gap_transitive_w=gap_transitive_w,
+            gap_target_power=gap_target_power,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -7886,6 +8044,13 @@ def selftest():
     assert math.isfinite(seq_study_report["mean_sequence_surprise"])
     assert torch.isfinite(reading_latent_memory_loss(
         reading_model, reading_txt, feature_dropout=0.1))
+    gap_loss, gap_metrics = reading_latent_gap_loss(
+        reading_model, reading_txt, feature_dropout=0.1,
+        transitive_steps=2, transitive_w=0.1)
+    assert torch.isfinite(gap_loss)
+    assert gap_metrics["skipped"] is False
+    assert gap_metrics["memory_active"] > 0
+    assert torch.isfinite(gap_metrics["gap_kl"])
     consolidation_loss, consolidation_metrics = (
         reading_latent_memory_consolidation_loss(
             reading_model, reading_txt, reading_vocab.pad, reading_vocab.unk,
@@ -7994,6 +8159,7 @@ def selftest():
         consolidation_w=0.1, consolidation_fer_w=0.1,
         discovery_w=0.1, discovery_fer_w=0.1,
         reanalysis_w=0.1, reanalysis_fer_w=0.1,
+        gap_w=0.1,
         sequence_w=0.1, sequence_batch=2, sequence_temperature=0.1,
         neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2,
         transition_w=0.1, transition_batch=2,
@@ -8022,6 +8188,10 @@ def selftest():
     assert math.isfinite(reading_model.reading_train_metrics["reanalysis_loss"])
     assert math.isfinite(
         reading_model.reading_train_metrics["reanalysis_closure_loss"])
+    assert reading_model.reading_train_metrics["gap_w"] == 0.1
+    assert reading_model.reading_train_metrics["gap_skipped"] is False
+    assert math.isfinite(reading_model.reading_train_metrics["gap_loss"])
+    assert math.isfinite(reading_model.reading_train_metrics["gap_kl"])
     assert reading_model.reading_train_metrics["sequence_w"] == 0.1
     assert reading_model.reading_train_metrics["sequence_pairs"] == 2
     assert math.isfinite(reading_model.reading_train_metrics["sequence_loss"])
@@ -8171,6 +8341,12 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-reanalysis-cycle-w", type=float, default=0.5)
     ap.add_argument("--reading-reanalysis-bridge-w", type=float, default=0.5)
     ap.add_argument("--reading-reanalysis-fer-w", type=float, default=0.0)
+    ap.add_argument("--reading-gap-w", type=float, default=0.0)
+    ap.add_argument("--reading-gap-temperature", type=float, default=0.1)
+    ap.add_argument("--reading-gap-self-loop-w", type=float, default=0.0)
+    ap.add_argument("--reading-gap-transitive-steps", type=int, default=2)
+    ap.add_argument("--reading-gap-transitive-w", type=float, default=0.1)
+    ap.add_argument("--reading-gap-target-power", type=float, default=1.0)
     ap.add_argument("--reading-association-w", type=float, default=0.05)
     ap.add_argument("--reading-association-temperature", type=float, default=0.1)
     ap.add_argument("--reading-association-decay", type=float, default=0.99)
@@ -8267,6 +8443,12 @@ def _reading_kwargs(args):
                 reanalysis_cycle_w=args.reading_reanalysis_cycle_w,
                 reanalysis_bridge_w=args.reading_reanalysis_bridge_w,
                 reanalysis_fer_w=args.reading_reanalysis_fer_w,
+                gap_w=args.reading_gap_w,
+                gap_temperature=args.reading_gap_temperature,
+                gap_self_loop_w=args.reading_gap_self_loop_w,
+                gap_transitive_steps=args.reading_gap_transitive_steps,
+                gap_transitive_w=args.reading_gap_transitive_w,
+                gap_target_power=args.reading_gap_target_power,
                 association_w=args.reading_association_w,
                 association_temperature=args.reading_association_temperature,
                 association_decay=args.reading_association_decay,

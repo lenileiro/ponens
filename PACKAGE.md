@@ -5,7 +5,7 @@ surface bank, kinship QA worlds, proof-checking CLI, rule-induction harness, or 
 new work on the current surfaces:
 
 - `thinking.text`: raw reading and semantic text learning with latent concept discovery,
-  replay, self-study, and reanalysis.
+  replay, self-study, reanalysis, and memory-gap training.
 - `thinking.multimodal`: generic named-feature/text prefix bridge into a shared decoder, with
   latent slots and concept memory.
 - `thinking.vision_understanding`: image concept memory from manifests.
@@ -18,8 +18,9 @@ new work on the current surfaces:
 
 `thinking.text` accepts either structured semantic records or raw reading corpora. The raw-reading
 path is the language-mastery path: text chunks are read directly, latent slots are trained with
-sequence, factorization, association, graph, neighborhood, transition, cluster, discovery, and
-reanalysis objectives. No English rules or prompt templates are embedded in the module.
+sequence, factorization, association, graph, neighborhood, transition, cluster, discovery,
+reanalysis, and memory-gap objectives. No English rules or prompt templates are embedded in the
+module.
 
 ```bash
 python -m thinking.text --selftest
@@ -28,6 +29,7 @@ python -m thinking.text --reading-data data/reading.jsonl \
     --steps 40000 --batch 16 --d 256 --layers 4 --heads 8 \
     --latent-concept-slots 4 --latent-concept-memory-size 256 \
     --reading-discovery-w 0.05 --reading-reanalysis-w 0.05 \
+    --reading-gap-w 0.05 \
     --out runs/text_raw_reading.json \
     --checkpoint runs/text_raw_reading.pt
 ```
@@ -57,6 +59,7 @@ python -m thinking.multimodal --manifest data/multimodal.jsonl \
     --latent-concept-slots 8 --latent-concept-memory-size 64 \
     --latent-concept-discovery-w 0.05 \
     --latent-concept-reanalysis-w 0.05 \
+    --latent-concept-gap-w 0.05 \
     --out runs/multimodal.json \
     --checkpoint runs/multimodal.pt
 ```

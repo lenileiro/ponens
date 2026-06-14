@@ -290,6 +290,12 @@ def text_reading_cmd(args, py):
         f"--reading-reanalysis-cycle-w {args.reading_reanalysis_cycle_w} "
         f"--reading-reanalysis-bridge-w {args.reading_reanalysis_bridge_w} "
         f"--reading-reanalysis-fer-w {args.reading_reanalysis_fer_w} "
+        f"--reading-gap-w {args.reading_gap_w} "
+        f"--reading-gap-temperature {args.reading_gap_temperature} "
+        f"--reading-gap-self-loop-w {args.reading_gap_self_loop_w} "
+        f"--reading-gap-transitive-steps {args.reading_gap_transitive_steps} "
+        f"--reading-gap-transitive-w {args.reading_gap_transitive_w} "
+        f"--reading-gap-target-power {args.reading_gap_target_power} "
         f"--reading-association-w {args.reading_association_w} "
         f"--reading-association-temperature {args.reading_association_temperature} "
         f"--reading-association-decay {args.reading_association_decay} "
@@ -1410,6 +1416,18 @@ def payload(args):
                 f"{args.multimodal_latent_concept_reanalysis_fer_w} "
                 f"--latent-concept-reanalysis-cycle-consistency-w "
                 f"{args.multimodal_latent_concept_reanalysis_cycle_consistency_w} "
+                f"--latent-concept-gap-w "
+                f"{args.multimodal_latent_concept_gap_w} "
+                f"--latent-concept-gap-temperature "
+                f"{args.multimodal_latent_concept_gap_temperature} "
+                f"--latent-concept-gap-self-loop-w "
+                f"{args.multimodal_latent_concept_gap_self_loop_w} "
+                f"--latent-concept-gap-transitive-steps "
+                f"{args.multimodal_latent_concept_gap_transitive_steps} "
+                f"--latent-concept-gap-transitive-w "
+                f"{args.multimodal_latent_concept_gap_transitive_w} "
+                f"--latent-concept-gap-target-power "
+                f"{args.multimodal_latent_concept_gap_target_power} "
                 f"--latent-concept-association-w "
                 f"{args.multimodal_latent_concept_association_w} "
                 f"--latent-concept-association-temperature "
@@ -1672,6 +1690,18 @@ def main():
                     dest="reading_reanalysis_bridge_w")
     ap.add_argument("--reading-reanalysis-fer-w", type=float, default=0.0,
                     dest="reading_reanalysis_fer_w")
+    ap.add_argument("--reading-gap-w", type=float, default=0.0,
+                    dest="reading_gap_w")
+    ap.add_argument("--reading-gap-temperature", type=float, default=0.1,
+                    dest="reading_gap_temperature")
+    ap.add_argument("--reading-gap-self-loop-w", type=float, default=0.0,
+                    dest="reading_gap_self_loop_w")
+    ap.add_argument("--reading-gap-transitive-steps", type=int, default=2,
+                    dest="reading_gap_transitive_steps")
+    ap.add_argument("--reading-gap-transitive-w", type=float, default=0.1,
+                    dest="reading_gap_transitive_w")
+    ap.add_argument("--reading-gap-target-power", type=float, default=1.0,
+                    dest="reading_gap_target_power")
     ap.add_argument("--reading-association-w", type=float, default=0.05,
                     dest="reading_association_w")
     ap.add_argument("--reading-association-temperature", type=float,
@@ -2938,6 +2968,23 @@ def main():
         "--multimodal-latent-concept-reanalysis-cycle-consistency-w",
         type=float, default=0.5,
         dest="multimodal_latent_concept_reanalysis_cycle_consistency_w")
+    ap.add_argument("--multimodal-latent-concept-gap-w", type=float, default=0.0,
+                    dest="multimodal_latent_concept_gap_w")
+    ap.add_argument("--multimodal-latent-concept-gap-temperature",
+                    type=float, default=0.1,
+                    dest="multimodal_latent_concept_gap_temperature")
+    ap.add_argument("--multimodal-latent-concept-gap-self-loop-w",
+                    type=float, default=0.0,
+                    dest="multimodal_latent_concept_gap_self_loop_w")
+    ap.add_argument("--multimodal-latent-concept-gap-transitive-steps",
+                    type=int, default=2,
+                    dest="multimodal_latent_concept_gap_transitive_steps")
+    ap.add_argument("--multimodal-latent-concept-gap-transitive-w",
+                    type=float, default=0.1,
+                    dest="multimodal_latent_concept_gap_transitive_w")
+    ap.add_argument("--multimodal-latent-concept-gap-target-power",
+                    type=float, default=1.0,
+                    dest="multimodal_latent_concept_gap_target_power")
     ap.add_argument("--multimodal-latent-concept-association-w", type=float,
                     default=0.0, dest="multimodal_latent_concept_association_w")
     ap.add_argument("--multimodal-latent-concept-association-temperature",
@@ -3099,6 +3146,7 @@ def main():
                 args.reading_composition_transitive_steps),
             "--reading-graph-predict-transitive-steps": (
                 args.reading_graph_predict_transitive_steps),
+            "--reading-gap-transitive-steps": args.reading_gap_transitive_steps,
             "--reading-graph-cycle-transitive-steps": (
                 args.reading_graph_cycle_transitive_steps),
             "--reading-cluster-min-size": args.reading_cluster_min_size,
@@ -3153,6 +3201,9 @@ def main():
             "--reading-reanalysis-cycle-w": args.reading_reanalysis_cycle_w,
             "--reading-reanalysis-bridge-w": args.reading_reanalysis_bridge_w,
             "--reading-reanalysis-fer-w": args.reading_reanalysis_fer_w,
+            "--reading-gap-w": args.reading_gap_w,
+            "--reading-gap-self-loop-w": args.reading_gap_self_loop_w,
+            "--reading-gap-transitive-w": args.reading_gap_transitive_w,
             "--reading-association-w": args.reading_association_w,
             "--reading-association-self-loop-w": (
                 args.reading_association_self_loop_w),
@@ -3230,6 +3281,7 @@ def main():
             "--reading-memory-temperature": args.reading_memory_temperature,
             "--reading-consolidation-temperature": (
                 args.reading_consolidation_temperature),
+            "--reading-gap-temperature": args.reading_gap_temperature,
             "--reading-association-temperature": args.reading_association_temperature,
             "--reading-composition-temperature": args.reading_composition_temperature,
             "--reading-graph-predict-temperature": (
@@ -3254,11 +3306,15 @@ def main():
             sys.exit(
                 "ERROR: --reading-reanalysis-w requires "
                 "--reading-memory-size > 0")
+        if args.reading_gap_w > 0.0 and args.reading_memory_size <= 0:
+            sys.exit(
+                "ERROR: --reading-gap-w requires --reading-memory-size > 0")
         if (args.reading_association_decay < 0.0
                 or args.reading_association_decay >= 1.0):
             sys.exit("ERROR: --reading-association-decay must be in [0, 1)")
         if (args.reading_association_target_power <= 0.0
                 or args.reading_graph_predict_target_power <= 0.0
+                or args.reading_gap_target_power <= 0.0
                 or args.reading_graph_cycle_target_power <= 0.0):
             sys.exit("ERROR: raw-reading graph target powers must be positive")
         if args.reading_sequence_batch == 1:
@@ -3843,6 +3899,12 @@ def main():
                 args.multimodal_latent_concept_reanalysis_fer_w),
             "--multimodal-latent-concept-reanalysis-cycle-consistency-w": (
                 args.multimodal_latent_concept_reanalysis_cycle_consistency_w),
+            "--multimodal-latent-concept-gap-w": (
+                args.multimodal_latent_concept_gap_w),
+            "--multimodal-latent-concept-gap-self-loop-w": (
+                args.multimodal_latent_concept_gap_self_loop_w),
+            "--multimodal-latent-concept-gap-transitive-w": (
+                args.multimodal_latent_concept_gap_transitive_w),
             "--multimodal-latent-concept-association-w": (
                 args.multimodal_latent_concept_association_w),
             "--multimodal-latent-concept-association-self-loop-w": (
@@ -3910,6 +3972,7 @@ def main():
             args.multimodal_latent_concept_consolidation_w,
             args.multimodal_latent_concept_discovery_w,
             args.multimodal_latent_concept_reanalysis_w,
+            args.multimodal_latent_concept_gap_w,
             args.multimodal_latent_concept_association_w,
             args.multimodal_latent_concept_composition_w,
             args.multimodal_latent_concept_graph_predict_w,
@@ -3946,6 +4009,8 @@ def main():
                 args.multimodal_latent_concept_memory_temperature),
             "--multimodal-latent-concept-consolidation-temperature": (
                 args.multimodal_latent_concept_consolidation_temperature),
+            "--multimodal-latent-concept-gap-temperature": (
+                args.multimodal_latent_concept_gap_temperature),
             "--multimodal-latent-concept-association-temperature": (
                 args.multimodal_latent_concept_association_temperature),
             "--multimodal-latent-concept-composition-temperature": (
@@ -3986,11 +4051,21 @@ def main():
             sys.exit(
                 "ERROR: --multimodal-latent-concept-reanalysis-w requires "
                 "--multimodal-latent-concept-memory-size > 0")
+        if (args.multimodal_latent_concept_gap_w > 0.0
+                and args.multimodal_latent_concept_memory_size <= 0):
+            sys.exit(
+                "ERROR: --multimodal-latent-concept-gap-w requires "
+                "--multimodal-latent-concept-memory-size > 0")
+        if args.multimodal_latent_concept_gap_transitive_steps <= 0:
+            sys.exit(
+                "ERROR: --multimodal-latent-concept-gap-transitive-steps "
+                "must be positive")
         if (args.multimodal_latent_concept_association_decay < 0.0
                 or args.multimodal_latent_concept_association_decay >= 1.0):
             sys.exit(
                 "ERROR: --multimodal-latent-concept-association-decay must be in [0, 1)")
         if (args.multimodal_latent_concept_association_target_power <= 0.0
+                or args.multimodal_latent_concept_gap_target_power <= 0.0
                 or args.multimodal_latent_concept_graph_predict_target_power <= 0.0):
             sys.exit("ERROR: multimodal graph target powers must be positive")
         if args.multimodal_dropout < 0.0 or args.multimodal_dropout > 1.0:

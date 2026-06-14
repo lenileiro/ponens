@@ -2,14 +2,16 @@
 
 An in-house research stack for small models that learn from raw text, images, audio, and named
 feature views without a synthetic English surface bank. The current package centers on data-backed
-reading, latent concept discovery, image generation/evaluation, and a generic multimodal bridge.
+reading, latent concept discovery, memory-gap training, image generation/evaluation, and a generic
+multimodal bridge.
 
 ## Why
 
 The current bet is that language mastery should come from reading, latent structure, replay,
-reanalysis, and cross-modal concept pressure, not from hand-authored QA harnesses or templated
-phrasing rules. The code keeps the model surfaces manifest-driven: datasets provide text, feature
-views, image records, and optional target tokens; model code learns the representations.
+reanalysis, self-generated memory gaps, and cross-modal concept pressure, not from hand-authored QA
+harnesses or templated phrasing rules. The code keeps the model surfaces manifest-driven: datasets
+provide text, feature views, image records, and optional target tokens; model code learns the
+representations.
 
 ## What's here
 
@@ -19,8 +21,8 @@ views, image records, and optional target tokens; model code learns the represen
 | `scratchpad_model.py` | the model: small transformer with a **pointer/copy head**, learnable attention temperature, optional recurrence (looped / HRM / TRM / mHC) and Ouro-style learned halting |
 | `runpod/` | H100 launchers (tar-over-ssh, timeout-bounded, always-terminate) |
 | `thinking/vision_understanding.py`, `thinking/image_data.py`, `thinking/image_caption.py`, `thinking/image_embed.py`, `thinking/image_score.py`, `thinking/image_preferences.py`, `thinking/image_curate.py`, `thinking/image_eval.py`, `thinking/image_latent.py` | Image stack: manifest-driven visual concept learning, captioned image data, recaptioning, embedding/quality/preference sidecars, curation, offline image-quality eval, and text-conditioned latent flow |
-| `thinking/text.py` | raw-reading and semantic text learning with latent concept memory, replay, discovery, and reanalysis |
-| `thinking/multimodal.py` | Generic manifest-driven multimodal prefix bridge with named feature views, text tokens, targets, latent slots, and concept memory |
+| `thinking/text.py` | raw-reading and semantic text learning with latent concept memory, replay, discovery, reanalysis, and memory-gap training |
+| `thinking/multimodal.py` | Generic manifest-driven multimodal prefix bridge with named feature views, text tokens, targets, latent slots, concept memory, and memory-gap training |
 | `*.md` | research notes and plans; historical surface-bank docs are no longer package APIs |
 
 ## Quickstart
@@ -272,6 +274,8 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --reading-composition-transitive-w 0.25 \
     --reading-graph-predict-w 0.2 --reading-graph-predict-transitive-steps 3 \
     --reading-graph-predict-transitive-w 0.25 \
+    --reading-gap-w 0.05 --reading-gap-transitive-steps 3 \
+    --reading-gap-transitive-w 0.25 \
     --reading-context-target-w 0.1 --reading-neighborhood-w 0.05 \
     --reading-neighborhood-batch 8 --reading-neighborhood-probe-n 32 \
     --reading-transition-w 0.05 --reading-transition-batch 8 \
@@ -292,6 +296,9 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --latent-concept-graph-predict-w 0.1 \
     --latent-concept-graph-predict-transitive-steps 3 \
     --latent-concept-graph-predict-transitive-w 0.25 \
+    --latent-concept-gap-w 0.05 \
+    --latent-concept-gap-transitive-steps 3 \
+    --latent-concept-gap-transitive-w 0.25 \
     --latent-concept-neighborhood-w 0.05 \
     --latent-concept-transition-w 0.05 --latent-concept-cluster-w 0.05 \
     --text-checkpoint runs/text_raw_reading_graph_study_smoke.pt \

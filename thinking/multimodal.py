@@ -49,6 +49,7 @@ from .concepts import (
     latent_concept_graph_prediction_scores,
     latent_concept_graph_ready,
     latent_concept_graph_snapshot,
+    latent_concept_memory_gap_loss,
     latent_concept_memory_consolidation_loss,
     latent_concept_memory_loss,
     latent_concept_neighborhood_loss,
@@ -1161,6 +1162,53 @@ def latent_multimodal_reanalysis_loss_from_views(
     return torch.stack(losses).mean(), metrics
 
 
+def latent_multimodal_gap_loss_from_views(
+        model, views, temperature=0.1, self_loop_w=0.0,
+        transitive_steps=2, transitive_w=0.1, target_power=1.0):
+    views = {mode: slots for mode, slots in views.items() if slots is not None}
+    zero = (next(iter(views.values())).sum() * 0.0
+            if views else torch.tensor(0.0))
+    metric_keys = (
+        "gap_loss", "gap_kl", "gap_cosine", "gap_entropy",
+        "gap_target_mass", "gap_present_overlap")
+    metrics = {key: zero for key in metric_keys}
+    metrics.update({"memory_active": 0, "graph_ready": False, "skipped": True})
+    if not views:
+        return zero, metrics
+    memory = getattr(model, "latent_concept_memory", None)
+    if memory is None:
+        return zero, metrics
+    active = memory.active()
+    metrics["memory_active"] = int(active.shape[0])
+    if active.numel() == 0:
+        return zero, metrics
+    losses = []
+    by_key = {key: [] for key in metric_keys}
+    graph_ready = False
+    for slots in views.values():
+        loss, view_metrics = latent_concept_memory_gap_loss(
+            slots, active, relations=memory.active_relations(),
+            transitions=memory.active_transitions(), temperature=temperature,
+            self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+            transitive_w=transitive_w, target_power=target_power)
+        if bool(view_metrics.get("skipped", True)):
+            graph_ready = bool(graph_ready or view_metrics.get("graph_ready", False))
+            continue
+        losses.append(loss)
+        for key in metric_keys:
+            by_key[key].append(view_metrics[key])
+        graph_ready = bool(graph_ready or view_metrics["graph_ready"])
+    if not losses:
+        return zero, metrics | {"graph_ready": bool(graph_ready)}
+    metrics = {
+        key: torch.stack(values).mean() if values else zero
+        for key, values in by_key.items()
+    } | {"memory_active": int(active.shape[0]),
+         "graph_ready": bool(graph_ready),
+         "skipped": False}
+    return torch.stack(losses).mean(), metrics
+
+
 def latent_multimodal_association_loss_from_views(
         model, views, temperature=0.1, target_power=1.0, self_loop_w=0.05,
         transitive_steps=1, transitive_w=0.0):
@@ -2260,6 +2308,12 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           latent_concept_reanalysis_bridge_w=0.5,
           latent_concept_reanalysis_fer_w=0.0,
           latent_concept_reanalysis_cycle_consistency_w=0.5,
+          latent_concept_gap_w=0.0,
+          latent_concept_gap_temperature=0.1,
+          latent_concept_gap_self_loop_w=0.0,
+          latent_concept_gap_transitive_steps=2,
+          latent_concept_gap_transitive_w=0.1,
+          latent_concept_gap_target_power=1.0,
           latent_concept_association_w=0.0,
           latent_concept_association_temperature=0.1,
           latent_concept_association_decay=0.99,
@@ -2315,6 +2369,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_concept_fer_w, latent_concept_consolidation_w,
         latent_concept_discovery_w,
         latent_concept_reanalysis_w,
+        latent_concept_gap_w,
         latent_concept_association_w, latent_concept_composition_w,
         latent_concept_graph_predict_w, latent_concept_bridge_w,
         latent_concept_sequence_w,
@@ -2378,6 +2433,18 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         raise ValueError("latent concept reanalysis component weights must be non-negative")
     if float(latent_concept_reanalysis_w) and latent_concept_memory_size <= 0:
         raise ValueError("latent concept reanalysis requires memory_size > 0")
+    if float(latent_concept_gap_w) and latent_concept_memory_size <= 0:
+        raise ValueError("latent concept gap loss requires memory_size > 0")
+    if float(latent_concept_gap_temperature) <= 0.0:
+        raise ValueError("latent concept gap temperature must be positive")
+    if float(latent_concept_gap_self_loop_w) < 0.0:
+        raise ValueError("latent concept gap self-loop weight must be non-negative")
+    if int(latent_concept_gap_transitive_steps) < 1:
+        raise ValueError("latent concept gap transitive steps must be positive")
+    if float(latent_concept_gap_transitive_w) < 0.0:
+        raise ValueError("latent concept gap transitive weight must be non-negative")
+    if float(latent_concept_gap_target_power) <= 0.0:
+        raise ValueError("latent concept gap target power must be positive")
     if int(latent_concept_sequence_batch) < 0 or int(latent_concept_sequence_batch) == 1:
         raise ValueError("latent concept sequence batch must be 0 or at least 2")
     if float(latent_concept_sequence_temperature) <= 0.0:
@@ -2716,6 +2783,31 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 "graph_ready": False,
                 "skipped": True,
             }
+        if latent_concept_gap_w:
+            latent_gap, gap_metrics = latent_multimodal_gap_loss_from_views(
+                model, latent_views,
+                temperature=latent_concept_gap_temperature,
+                self_loop_w=latent_concept_gap_self_loop_w,
+                transitive_steps=latent_concept_gap_transitive_steps,
+                transitive_w=latent_concept_gap_transitive_w,
+                target_power=latent_concept_gap_target_power)
+        else:
+            latent_gap = base_loss * 0.0
+            gap_zero = base_loss.detach() * 0.0
+            memory = getattr(model, "latent_concept_memory", None)
+            gap_metrics = {
+                "gap_loss": gap_zero,
+                "gap_kl": gap_zero,
+                "gap_cosine": gap_zero,
+                "gap_entropy": gap_zero,
+                "gap_target_mass": gap_zero,
+                "gap_present_overlap": gap_zero,
+                "memory_active": int(
+                    getattr(memory, "filled", torch.zeros((), dtype=torch.long)).item())
+                if memory is not None else 0,
+                "graph_ready": False,
+                "skipped": True,
+            }
         latent_composition = (
             latent_multimodal_composition_loss_from_views(
                 model, latent_views,
@@ -2768,6 +2860,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 + float(latent_concept_consolidation_w) * latent_consolidation
                 + float(latent_concept_discovery_w) * latent_discovery
                 + float(latent_concept_reanalysis_w) * latent_reanalysis
+                + float(latent_concept_gap_w) * latent_gap
                 + float(latent_concept_association_w) * latent_association
                 + float(latent_concept_composition_w) * latent_composition
                 + float(latent_concept_graph_predict_w) * latent_graph_predict
@@ -2788,17 +2881,20 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                                 or latent_concept_graph_predict_w
                                 or latent_concept_discovery_w
                                 or latent_concept_reanalysis_w
+                                or latent_concept_gap_w
                                 or latent_concept_bridge_w) else None)))
         transition_updates = 0
         if (latent_concept_graph_predict_w or latent_concept_bridge_w
                 or latent_concept_discovery_w
                 or latent_concept_reanalysis_w
+                or latent_concept_gap_w
                 or latent_concept_sequence_w):
             transition_updates = int(update_multimodal_latent_transitions(
                 model, latent_views, decay=latent_concept_association_decay))
         sequence_transition_updates = 0
         if sequence_pairs and (latent_concept_sequence_w
                                or latent_concept_graph_predict_w
+                               or latent_concept_gap_w
                                or latent_concept_bridge_w):
             sequence_pair_batch = _sample_pairs(sequence_pairs, sequence_batch, rng)
             sequence_transition_updates = int(update_multimodal_sequence_transitions(
@@ -2916,6 +3012,23 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "latent_reanalysis_graph_ready": bool(
                 reanalysis_metrics["graph_ready"]),
             "latent_reanalysis_skipped": bool(reanalysis_metrics["skipped"]),
+            "latent_gap_loss": float(latent_gap.detach()),
+            "latent_gap_w": float(latent_concept_gap_w),
+            "latent_gap_temperature": float(latent_concept_gap_temperature),
+            "latent_gap_self_loop_w": float(latent_concept_gap_self_loop_w),
+            "latent_gap_transitive_steps": int(latent_concept_gap_transitive_steps),
+            "latent_gap_transitive_w": float(latent_concept_gap_transitive_w),
+            "latent_gap_target_power": float(latent_concept_gap_target_power),
+            "latent_gap_kl": float(gap_metrics["gap_kl"].detach()),
+            "latent_gap_cosine": float(gap_metrics["gap_cosine"].detach()),
+            "latent_gap_entropy": float(gap_metrics["gap_entropy"].detach()),
+            "latent_gap_target_mass": float(
+                gap_metrics["gap_target_mass"].detach()),
+            "latent_gap_present_overlap": float(
+                gap_metrics["gap_present_overlap"].detach()),
+            "latent_gap_memory_active": int(gap_metrics["memory_active"]),
+            "latent_gap_graph_ready": bool(gap_metrics["graph_ready"]),
+            "latent_gap_skipped": bool(gap_metrics["skipped"]),
             "latent_association_loss": float(latent_association.detach()),
             "latent_composition_loss": float(latent_composition.detach()),
             "latent_graph_predict_loss": float(latent_graph_predict.detach()),
@@ -2967,6 +3080,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                   f"consolidate {last['latent_consolidation_loss']:.3f} "
                   f"discover {last['latent_discovery_loss']:.3f} "
                   f"reanalyze {last['latent_reanalysis_loss']:.3f} "
+                  f"gap {last['latent_gap_loss']:.3f} "
                   f"sequence {last['latent_sequence_loss']:.3f}",
                   flush=True)
         if select_best and st in selection_boundaries:
@@ -3279,6 +3393,11 @@ def selftest():
         assert torch.isfinite(latent_multimodal_composition_loss_from_views(model, views))
         assert torch.isfinite(latent_multimodal_graph_prediction_loss_from_views(model, views))
         assert torch.isfinite(latent_multimodal_bridge_loss_from_views(model, views))
+        gap_loss, gap_metrics = latent_multimodal_gap_loss_from_views(model, views)
+        assert torch.isfinite(gap_loss)
+        assert gap_metrics["skipped"] is False
+        assert gap_metrics["memory_active"] > 0
+        assert torch.isfinite(gap_metrics["gap_kl"])
         bridge_metrics = latent_multimodal_bridge_metrics_from_views(model, views)
         assert math.isfinite(bridge_metrics["bridge_score"])
         bridge_eval = latent_multimodal_bridge_eval(
@@ -3345,6 +3464,7 @@ def selftest():
             latent_concept_discovery_fer_w=0.01,
             latent_concept_reanalysis_w=0.01,
             latent_concept_reanalysis_fer_w=0.01,
+            latent_concept_gap_w=0.01,
             latent_concept_fer_probe_n=4,
             latent_concept_fer_hard_max=2,
             latent_concept_fer_refresh_steps=1,
@@ -3372,6 +3492,10 @@ def selftest():
         assert math.isfinite(trained_model.train_metrics["latent_reanalysis_loss"])
         assert math.isfinite(
             trained_model.train_metrics["latent_reanalysis_closure_loss"])
+        assert trained_model.train_metrics["latent_gap_w"] == 0.01
+        assert trained_model.train_metrics["latent_gap_skipped"] is False
+        assert math.isfinite(trained_model.train_metrics["latent_gap_loss"])
+        assert math.isfinite(trained_model.train_metrics["latent_gap_kl"])
         assert trained_model.train_metrics["latent_fer_study_pool_size"] == 2
         assert trained_model.train_metrics["latent_fer_study_reports"]
         assert len(set(trained_model.train_metrics["latent_fer_hard_record_ids"])) == 2
@@ -3591,6 +3715,18 @@ def main(argv=None):
     ap.add_argument("--latent-concept-reanalysis-cycle-consistency-w",
                     type=float, default=0.5,
                     dest="latent_concept_reanalysis_cycle_consistency_w")
+    ap.add_argument("--latent-concept-gap-w", type=float, default=0.0,
+                    dest="latent_concept_gap_w")
+    ap.add_argument("--latent-concept-gap-temperature", type=float, default=0.1,
+                    dest="latent_concept_gap_temperature")
+    ap.add_argument("--latent-concept-gap-self-loop-w", type=float, default=0.0,
+                    dest="latent_concept_gap_self_loop_w")
+    ap.add_argument("--latent-concept-gap-transitive-steps", type=int, default=2,
+                    dest="latent_concept_gap_transitive_steps")
+    ap.add_argument("--latent-concept-gap-transitive-w", type=float, default=0.1,
+                    dest="latent_concept_gap_transitive_w")
+    ap.add_argument("--latent-concept-gap-target-power", type=float, default=1.0,
+                    dest="latent_concept_gap_target_power")
     ap.add_argument("--latent-concept-association-w", type=float, default=0.0,
                     dest="latent_concept_association_w")
     ap.add_argument("--latent-concept-association-temperature", type=float,
@@ -3730,6 +3866,7 @@ def main(argv=None):
         args.latent_concept_consolidation_w,
         args.latent_concept_discovery_w,
         args.latent_concept_reanalysis_w,
+        args.latent_concept_gap_w,
         args.latent_concept_association_w,
         args.latent_concept_composition_w, args.latent_concept_graph_predict_w,
         args.latent_concept_bridge_w,
@@ -3796,6 +3933,18 @@ def main(argv=None):
     if (args.latent_concept_reanalysis_w > 0.0
             and args.latent_concept_memory_size <= 0):
         ap.error("--latent-concept-reanalysis-w requires --latent-concept-memory-size > 0")
+    if (args.latent_concept_gap_w > 0.0
+            and args.latent_concept_memory_size <= 0):
+        ap.error("--latent-concept-gap-w requires --latent-concept-memory-size > 0")
+    if args.latent_concept_gap_temperature <= 0.0:
+        ap.error("--latent-concept-gap-temperature must be positive")
+    if (args.latent_concept_gap_self_loop_w < 0.0
+            or args.latent_concept_gap_transitive_w < 0.0):
+        ap.error("latent concept gap graph weights must be non-negative")
+    if args.latent_concept_gap_transitive_steps <= 0:
+        ap.error("--latent-concept-gap-transitive-steps must be positive")
+    if args.latent_concept_gap_target_power <= 0.0:
+        ap.error("--latent-concept-gap-target-power must be positive")
     if args.latent_concept_association_temperature <= 0.0:
         ap.error("--latent-concept-association-temperature must be positive")
     if args.latent_concept_composition_temperature <= 0.0:
@@ -3892,6 +4041,13 @@ def main(argv=None):
         latent_concept_reanalysis_fer_w=args.latent_concept_reanalysis_fer_w,
         latent_concept_reanalysis_cycle_consistency_w=(
             args.latent_concept_reanalysis_cycle_consistency_w),
+        latent_concept_gap_w=args.latent_concept_gap_w,
+        latent_concept_gap_temperature=args.latent_concept_gap_temperature,
+        latent_concept_gap_self_loop_w=args.latent_concept_gap_self_loop_w,
+        latent_concept_gap_transitive_steps=(
+            args.latent_concept_gap_transitive_steps),
+        latent_concept_gap_transitive_w=args.latent_concept_gap_transitive_w,
+        latent_concept_gap_target_power=args.latent_concept_gap_target_power,
         latent_concept_association_w=args.latent_concept_association_w,
         latent_concept_association_temperature=(
             args.latent_concept_association_temperature),
