@@ -2132,15 +2132,64 @@ def reading_cluster_retrieval_eval(model, vocab, records, device=DEV, n=0,
             "mining": mine_report}
 
 
+def reading_fer_eval(model, vocab, records, device=DEV, n=0, seed=0,
+                     feature_dropout=0.0):
+    if getattr(model, "latent_concepts", None) is None:
+        return {"fer_score": 0.0, "fragmentation": 0.0,
+                "slot_correlation": 0.0, "slot_imbalance": 0.0,
+                "n_records": 0, "sampled": False, "skipped": True}
+    if n < 0:
+        return {"fer_score": 0.0, "fragmentation": 0.0,
+                "slot_correlation": 0.0, "slot_imbalance": 0.0,
+                "n_records": 0, "sampled": False, "skipped": True}
+    eval_rows = [r for r in records if r.split == "eval"]
+    candidates = eval_rows or list(records)
+    if not candidates:
+        return {"fer_score": 0.0, "fragmentation": 0.0,
+                "slot_correlation": 0.0, "slot_imbalance": 0.0,
+                "n_records": 0, "sampled": False, "skipped": True}
+    sampled = bool(n and n < len(candidates))
+    selected = candidates
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=n, replace=False)
+        selected = [candidates[int(i)] for i in idx]
+    totals = {"fer_score": 0.0, "fragmentation": 0.0,
+              "slot_correlation": 0.0, "slot_imbalance": 0.0}
+    total = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(selected), 64):
+            batch = selected[off:off + 64]
+            txt = pack_reading(batch, vocab, device)
+            slots = model.latent_concept_states(
+                txt, feature_dropout=feature_dropout, project=True)
+            metrics = latent_concept_fer_metrics(slots)
+            weight = len(batch)
+            total += weight
+            for key in totals:
+                totals[key] += float(metrics[key].detach()) * weight
+    if total == 0:
+        return {"fer_score": 0.0, "fragmentation": 0.0,
+                "slot_correlation": 0.0, "slot_imbalance": 0.0,
+                "n_records": 0, "sampled": sampled, "skipped": True}
+    report = {key: value / float(total) for key, value in totals.items()}
+    report.update({"n_records": total,
+                   "sampled": sampled,
+                   "source_split": "eval" if eval_rows else "all",
+                   "skipped": False})
+    return report
+
+
 READING_SCORE_METRICS = (
-    "view", "context", "neighborhood", "cluster", "both", "min", "all",
+    "view", "context", "neighborhood", "cluster", "fer", "both", "min", "all",
     "balanced")
-READING_DISCOVERY_SIGNALS = ("view", "context", "neighborhood", "cluster")
+READING_DISCOVERY_SIGNALS = ("view", "context", "neighborhood", "cluster", "fer")
 
 
 def reading_discovery_score_components(view_eval, context_eval, metric="both",
                                        margin_w=0.1, neighborhood_eval=None,
-                                       cluster_eval=None):
+                                       cluster_eval=None, fer_eval=None):
     metric = str(metric)
     if metric not in READING_SCORE_METRICS:
         raise ValueError(f"unknown reading score metric {metric!r}")
@@ -2155,16 +2204,22 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     cluster_eval = cluster_eval or {}
     cluster_acc = float(cluster_eval.get("cluster_acc", 0.0))
     cluster_margin = float(cluster_eval.get("margin", 0.0))
+    fer_eval = fer_eval or {}
+    fer_raw_score = max(0.0, float(fer_eval.get("fer_score", 0.0)))
+    fer_score = (0.0 if bool(fer_eval.get("skipped", False))
+                 else 1.0 / (1.0 + fer_raw_score))
     view_score = view_acc + margin_w * view_margin
     context_score = context_acc + margin_w * context_margin
     neighborhood_score = neighborhood_acc + margin_w * neighborhood_margin
     cluster_score = cluster_acc + margin_w * cluster_margin
     scores = {"view": view_score, "context": context_score,
-              "neighborhood": neighborhood_score, "cluster": cluster_score}
+              "neighborhood": neighborhood_score, "cluster": cluster_score,
+              "fer": fer_score}
     skipped = {"view": bool(view_eval.get("skipped", False)),
                "context": bool(context_eval.get("skipped", False)),
                "neighborhood": bool(neighborhood_eval.get("skipped", False)),
-               "cluster": bool(cluster_eval.get("skipped", False))}
+               "cluster": bool(cluster_eval.get("skipped", False)),
+               "fer": bool(fer_eval.get("skipped", False))}
     active_scores = [scores[name] for name in READING_DISCOVERY_SIGNALS
                      if not skipped[name]]
     if not active_scores:
@@ -2181,6 +2236,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
         score = neighborhood_score
     elif metric == "cluster":
         score = cluster_score
+    elif metric == "fer":
+        score = fer_score
     elif metric == "min":
         score = min(view_score, context_score)
     elif metric == "all":
@@ -2200,6 +2257,11 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "context_score": float(context_score),
             "neighborhood_score": float(neighborhood_score),
             "cluster_score": float(cluster_score),
+            "fer_score": float(fer_score),
+            "fer_raw_score": float(fer_raw_score),
+            "fer_fragmentation": float(fer_eval.get("fragmentation", 0.0)),
+            "fer_slot_correlation": float(fer_eval.get("slot_correlation", 0.0)),
+            "fer_slot_imbalance": float(fer_eval.get("slot_imbalance", 0.0)),
             "paired_view_acc": view_acc,
             "paired_view_margin": view_margin,
             "context_target_acc": context_acc,
@@ -2211,7 +2273,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "view_skipped": skipped["view"],
             "context_skipped": skipped["context"],
             "neighborhood_skipped": skipped["neighborhood"],
-            "cluster_skipped": skipped["cluster"]}
+            "cluster_skipped": skipped["cluster"],
+            "fer_skipped": skipped["fer"]}
 
 
 def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
@@ -2230,13 +2293,18 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
     cluster = reading_cluster_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 31,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    fer = reading_fer_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 37,
+        feature_dropout=0.0)
     return {"view": view,
             "context_target": context,
             "neighborhood": neighborhood,
             "cluster": cluster,
+            "fer": fer,
             "score_components": reading_discovery_score_components(
                 view, context, metric=score_metric, margin_w=score_margin_w,
-                neighborhood_eval=neighborhood, cluster_eval=cluster)}
+                neighborhood_eval=neighborhood, cluster_eval=cluster,
+                fer_eval=fer)}
 
 
 def reading_latent_record_outcomes(model, vocab, records, device=DEV, n=0, seed=0,
@@ -3939,6 +4007,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
     after_neighborhood = after_bundle["neighborhood"]
     before_cluster = before_bundle["cluster"]
     after_cluster = after_bundle["cluster"]
+    before_fer = before_bundle["fer"]
+    after_fer = after_bundle["fer"]
     report = {"experiment": "text_raw_reading_concept_pretrain",
               "data": data,
               "steps": int(steps), "batch": int(batch), "lr": float(lr),
@@ -4035,6 +4105,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "after_neighborhood": after_neighborhood,
               "before_cluster": before_cluster,
               "after_cluster": after_cluster,
+              "before_fer": before_fer,
+              "after_fer": after_fer,
               "before_score_components": before_bundle["score_components"],
               "after_score_components": after_bundle["score_components"],
               "selection": selection,
@@ -4060,6 +4132,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                   "cluster_margin": (
                       after_cluster.get("margin", 0.0)
                       - before_cluster.get("margin", 0.0)),
+                  "fer_quality": (
+                      after_bundle["score_components"].get("fer_score", 0.0)
+                      - before_bundle["score_components"].get("fer_score", 0.0)),
+                  "fer_raw_score": (
+                      after_fer.get("fer_score", 0.0)
+                      - before_fer.get("fer_score", 0.0)),
               },
               "train_metrics": getattr(model, "reading_train_metrics", {}),
               "study_hard_examples": getattr(model, "reading_study_reports", []),
@@ -4397,6 +4475,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
     after_neighborhood = after_bundle["neighborhood"]
     before_cluster = before_bundle["cluster"]
     after_cluster = after_bundle["cluster"]
+    before_fer = before_bundle["fer"]
+    after_fer = after_bundle["fer"]
     d = int(ckpt.get("d", 96))
     layers = int(ckpt.get("layers", 3))
     heads = int(ckpt.get("heads", 4))
@@ -4508,6 +4588,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "after_neighborhood": after_neighborhood,
               "before_cluster": before_cluster,
               "after_cluster": after_cluster,
+              "before_fer": before_fer,
+              "after_fer": after_fer,
               "before_score_components": before_bundle["score_components"],
               "after_score_components": after_bundle["score_components"],
               "before_replay": before_replay_bundle,
@@ -4535,6 +4617,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                   "cluster_margin": (
                       after_cluster.get("margin", 0.0)
                       - before_cluster.get("margin", 0.0)),
+                  "fer_quality": (
+                      after_bundle["score_components"].get("fer_score", 0.0)
+                      - before_bundle["score_components"].get("fer_score", 0.0)),
+                  "fer_raw_score": (
+                      after_fer.get("fer_score", 0.0)
+                      - before_fer.get("fer_score", 0.0)),
                   "replay_score": (
                       (after_replay_bundle or {}).get("score_components", {}).get(
                           "score", 0.0)
@@ -6001,6 +6089,16 @@ def selftest():
     clusters, cluster_report = mine_reading_latent_clusters(
         reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0)
     assert cluster_report["n_clusters"] >= 1 and clusters
+    fer_eval = reading_fer_eval(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0)
+    assert fer_eval["skipped"] is False
+    assert math.isfinite(fer_eval["fer_score"])
+    fer_bundle = reading_eval_bundle(
+        reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
+        score_metric="fer")
+    assert fer_bundle["score_components"]["metric"] == "fer"
+    assert fer_bundle["score_components"]["fer_skipped"] is False
+    assert math.isfinite(fer_bundle["score_components"]["score"])
     fit_reading_concepts(
         reading_model, reading_vocab, reading_records, steps=3, batch=2, lr=1e-4,
         seed=5, device="cpu", log_every=1, token_drop_p=0.1,
