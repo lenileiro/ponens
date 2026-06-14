@@ -8202,6 +8202,85 @@ def sample_quality_gate_failure_message(report, prefix="sample_grid"):
     return "sample quality gate failed: " + "; ".join(str(x) for x in failures)
 
 
+def reference_reproduction_gate_report(
+        report, prefix="reference_flow", max_pixel_mse=None, max_pixel_mae=None,
+        max_structure_edge_l1=None, max_structure_multiscale_l1=None,
+        max_structure_frequency_l1=None, max_structure_ssim_loss=None,
+        max_selected_score=None):
+    """Return pass/fail metadata for shown-image reproduction thresholds."""
+    thresholds = {
+        "max_pixel_mse": max_pixel_mse,
+        "max_pixel_mae": max_pixel_mae,
+        "max_structure_edge_l1": max_structure_edge_l1,
+        "max_structure_multiscale_l1": max_structure_multiscale_l1,
+        "max_structure_frequency_l1": max_structure_frequency_l1,
+        "max_structure_ssim_loss": max_structure_ssim_loss,
+        "max_selected_score": max_selected_score,
+    }
+    thresholds = {
+        key: (None if value is None else float(value))
+        for key, value in thresholds.items()
+    }
+    enabled = any(value is not None for value in thresholds.values())
+    failures = []
+
+    def check_max(metric, gate_name, key=None):
+        threshold = thresholds[gate_name]
+        if threshold is None:
+            return
+        metric_key = key or f"{prefix}_{metric}"
+        value = _sample_gate_metric_value(report, metric_key)
+        if value is None:
+            failures.append(f"{metric_key} is missing for {gate_name}={threshold:g}")
+        elif value > threshold:
+            failures.append(
+                f"{metric_key} {value:g} > {gate_name} {threshold:g}")
+
+    check_max("pixel_mse", "max_pixel_mse")
+    check_max("pixel_mae", "max_pixel_mae")
+    check_max("structure_edge_l1", "max_structure_edge_l1")
+    check_max("structure_multiscale_l1", "max_structure_multiscale_l1")
+    check_max("structure_frequency_l1", "max_structure_frequency_l1")
+    check_max("structure_ssim_loss", "max_structure_ssim_loss")
+    check_max(
+        "selected_score", "max_selected_score",
+        key="sample_grid_reference_selected_denoise_score")
+
+    gate_prefix = "sample_reference"
+    meta = {
+        f"{gate_prefix}_quality_gate_enabled": bool(enabled),
+        f"{gate_prefix}_quality_gate_passed": bool(not failures),
+        f"{gate_prefix}_quality_gate_failures": failures,
+    }
+    for name, value in thresholds.items():
+        meta[f"{gate_prefix}_quality_gate_{name}"] = value
+    return meta
+
+
+def cli_reference_reproduction_gate_report(report, args, prefix="reference_flow"):
+    return reference_reproduction_gate_report(
+        report, prefix=prefix,
+        max_pixel_mse=args.sample_reference_max_pixel_mse,
+        max_pixel_mae=args.sample_reference_max_pixel_mae,
+        max_structure_edge_l1=args.sample_reference_max_structure_edge_l1,
+        max_structure_multiscale_l1=(
+            args.sample_reference_max_structure_multiscale_l1),
+        max_structure_frequency_l1=(
+            args.sample_reference_max_structure_frequency_l1),
+        max_structure_ssim_loss=args.sample_reference_max_structure_ssim_loss,
+        max_selected_score=args.sample_reference_max_selected_score)
+
+
+def reference_reproduction_gate_failure_message(report):
+    failures = report.get("sample_reference_quality_gate_failures", [])
+    if not failures:
+        return ""
+    return (
+        "reference reproduction quality gate failed: "
+        + "; ".join(str(x) for x in failures)
+    )
+
+
 def sample_candidate_health_scores(samples, eps=1.0e-8):
     return sample_health_components(samples, eps=eps)["health_score"]
 
@@ -13172,6 +13251,24 @@ def selftest():
             health_meta, prefix="unit", min_detail_energy=1.0)
         assert gate_fail["unit_quality_gate_passed"] is False
         assert gate_fail["unit_quality_gate_failures"]
+        ref_gate_report = {
+            "reference_flow_pixel_mse": 0.10,
+            "reference_flow_pixel_mae": 0.20,
+            "reference_flow_structure_edge_l1": 0.05,
+            "reference_flow_structure_multiscale_l1": 0.10,
+            "reference_flow_structure_frequency_l1": 0.15,
+            "reference_flow_structure_ssim_loss": 0.20,
+            "sample_grid_reference_selected_denoise_score": 0.60,
+        }
+        ref_gate_pass = reference_reproduction_gate_report(
+            ref_gate_report, max_pixel_mse=0.20,
+            max_structure_ssim_loss=0.30, max_selected_score=1.0)
+        assert ref_gate_pass["sample_reference_quality_gate_enabled"] is True
+        assert ref_gate_pass["sample_reference_quality_gate_passed"] is True
+        ref_gate_fail = reference_reproduction_gate_report(
+            ref_gate_report, max_pixel_mse=0.01)
+        assert ref_gate_fail["sample_reference_quality_gate_passed"] is False
+        assert reference_reproduction_gate_failure_message(ref_gate_fail)
         flat = torch.zeros(3, 16, 16)
         yy, xx = torch.meshgrid(
             torch.linspace(-0.8, 0.8, 16),
@@ -14192,6 +14289,36 @@ def main(argv=None):
                     dest="sample_reference_denoise_strengths",
                     help=("optional comma-separated reference denoise strength sweep; "
                           "the reference grid uses the best reproduction score"))
+    ap.add_argument("--sample-reference-max-pixel-mse", type=float, default=None,
+                    dest="sample_reference_max_pixel_mse",
+                    help=("fail after --sample-reference-grid-out if reference "
+                          "pixel MSE is above this threshold"))
+    ap.add_argument("--sample-reference-max-pixel-mae", type=float, default=None,
+                    dest="sample_reference_max_pixel_mae",
+                    help=("fail after --sample-reference-grid-out if reference "
+                          "pixel MAE is above this threshold"))
+    ap.add_argument("--sample-reference-max-structure-edge-l1", type=float,
+                    default=None, dest="sample_reference_max_structure_edge_l1",
+                    help=("fail after --sample-reference-grid-out if reference "
+                          "edge L1 is above this threshold"))
+    ap.add_argument("--sample-reference-max-structure-multiscale-l1", type=float,
+                    default=None,
+                    dest="sample_reference_max_structure_multiscale_l1",
+                    help=("fail after --sample-reference-grid-out if reference "
+                          "multiscale L1 is above this threshold"))
+    ap.add_argument("--sample-reference-max-structure-frequency-l1", type=float,
+                    default=None,
+                    dest="sample_reference_max_structure_frequency_l1",
+                    help=("fail after --sample-reference-grid-out if reference "
+                          "frequency L1 is above this threshold"))
+    ap.add_argument("--sample-reference-max-structure-ssim-loss", type=float,
+                    default=None, dest="sample_reference_max_structure_ssim_loss",
+                    help=("fail after --sample-reference-grid-out if reference "
+                          "SSIM-style structure loss is above this threshold"))
+    ap.add_argument("--sample-reference-max-selected-score", type=float, default=None,
+                    dest="sample_reference_max_selected_score",
+                    help=("fail after --sample-reference-grid-out if the selected "
+                          "reference reproduction sweep score is above this threshold"))
     ap.add_argument("--sample-grid-samples", type=int, default=1,
                     dest="sample_grid_samples",
                     help="generated samples per color/shape condition in --sample-grid-out")
@@ -14430,6 +14557,23 @@ def main(argv=None):
     if (args.sample_reference_denoise_strength < 0.0
             or args.sample_reference_denoise_strength > 1.0):
         ap.error("--sample-reference-denoise-strength must be in [0, 1]")
+    reference_gate_names = (
+        "sample_reference_max_pixel_mse",
+        "sample_reference_max_pixel_mae",
+        "sample_reference_max_structure_edge_l1",
+        "sample_reference_max_structure_multiscale_l1",
+        "sample_reference_max_structure_frequency_l1",
+        "sample_reference_max_structure_ssim_loss",
+        "sample_reference_max_selected_score",
+    )
+    reference_gate_enabled = any(
+        getattr(args, name) is not None for name in reference_gate_names)
+    if reference_gate_enabled and not args.sample_reference_grid_out:
+        ap.error("sample reference gates require --sample-reference-grid-out")
+    for gate_name in reference_gate_names:
+        gate_value = getattr(args, gate_name)
+        if gate_value is not None and gate_value < 0.0:
+            ap.error(f"--{gate_name.replace('_', '-')} must be non-negative")
     try:
         sample_reference_denoise_strengths = normalize_reference_denoise_strengths(
             args.sample_reference_denoise_strength,
@@ -14872,6 +15016,7 @@ def main(argv=None):
                 "ema" if meta["ema_loaded"] else "raw")
             report.update(reference_meta)
             report.update(cli_sample_quality_gate_report(report, args))
+            report.update(cli_reference_reproduction_gate_report(report, args))
         if args.eval_out:
             os.makedirs(os.path.dirname(args.eval_out) or ".", exist_ok=True)
             with open(args.eval_out, "w") as f:
@@ -14880,7 +15025,10 @@ def main(argv=None):
             print(f"saved -> {args.eval_out}")
         else:
             print(json.dumps(report, indent=1))
-        gate_message = sample_quality_gate_failure_message(report)
+        gate_message = (
+            sample_quality_gate_failure_message(report)
+            or reference_reproduction_gate_failure_message(report)
+        )
         if gate_message:
             raise SystemExit(gate_message)
         return
@@ -15245,6 +15393,7 @@ def main(argv=None):
         reference_meta["sample_grid_checkpoint_weight_mode"] = grid_weight_mode
         report.update(reference_meta)
         report.update(cli_sample_quality_gate_report(report, args))
+        report.update(cli_reference_reproduction_gate_report(report, args))
         load_flow_state(flow, raw_flow)
         if conditioner is not None and raw_conditioner is not None:
             conditioner.load_state_dict(raw_conditioner)
@@ -15594,7 +15743,10 @@ def main(argv=None):
     }, args.out)
     print(json.dumps(report, indent=1))
     print(f"saved -> {args.out}")
-    gate_message = sample_quality_gate_failure_message(report)
+    gate_message = (
+        sample_quality_gate_failure_message(report)
+        or reference_reproduction_gate_failure_message(report)
+    )
     if gate_message:
         raise SystemExit(gate_message)
 

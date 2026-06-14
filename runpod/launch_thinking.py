@@ -1056,6 +1056,23 @@ def payload(args):
                     f"{args.image_sample_reference_denoise_strength} "
                     f"--sample-reference-denoise-strengths "
                     f"{shlex_quote(args.image_sample_reference_denoise_strengths)}")
+                for flag, value in (
+                        ("sample-reference-max-pixel-mse",
+                         args.image_sample_reference_max_pixel_mse),
+                        ("sample-reference-max-pixel-mae",
+                         args.image_sample_reference_max_pixel_mae),
+                        ("sample-reference-max-structure-edge-l1",
+                         args.image_sample_reference_max_structure_edge_l1),
+                        ("sample-reference-max-structure-multiscale-l1",
+                         args.image_sample_reference_max_structure_multiscale_l1),
+                        ("sample-reference-max-structure-frequency-l1",
+                         args.image_sample_reference_max_structure_frequency_l1),
+                        ("sample-reference-max-structure-ssim-loss",
+                         args.image_sample_reference_max_structure_ssim_loss),
+                        ("sample-reference-max-selected-score",
+                         args.image_sample_reference_max_selected_score)):
+                    if value is not None:
+                        reference_grid_args += f" --{flag} {value}"
                 if reference_manifest:
                     reference_grid_args += (
                         f" --sample-reference-manifest "
@@ -2938,6 +2955,33 @@ def main():
                     dest="image_sample_reference_denoise_strengths",
                     help=("comma-separated reference denoise sweep for image "
                           "reproduction grids"))
+    ap.add_argument("--image-sample-reference-max-pixel-mse", type=float, default=None,
+                    dest="image_sample_reference_max_pixel_mse",
+                    help="fail image reference reproduction if pixel MSE exceeds this")
+    ap.add_argument("--image-sample-reference-max-pixel-mae", type=float, default=None,
+                    dest="image_sample_reference_max_pixel_mae",
+                    help="fail image reference reproduction if pixel MAE exceeds this")
+    ap.add_argument("--image-sample-reference-max-structure-edge-l1", type=float,
+                    default=None,
+                    dest="image_sample_reference_max_structure_edge_l1",
+                    help="fail image reference reproduction if edge L1 exceeds this")
+    ap.add_argument("--image-sample-reference-max-structure-multiscale-l1", type=float,
+                    default=None,
+                    dest="image_sample_reference_max_structure_multiscale_l1",
+                    help="fail image reference reproduction if multiscale L1 exceeds this")
+    ap.add_argument("--image-sample-reference-max-structure-frequency-l1", type=float,
+                    default=None,
+                    dest="image_sample_reference_max_structure_frequency_l1",
+                    help="fail image reference reproduction if frequency L1 exceeds this")
+    ap.add_argument("--image-sample-reference-max-structure-ssim-loss", type=float,
+                    default=None,
+                    dest="image_sample_reference_max_structure_ssim_loss",
+                    help=("fail image reference reproduction if SSIM-style structure "
+                          "loss exceeds this"))
+    ap.add_argument("--image-sample-reference-max-selected-score", type=float,
+                    default=None,
+                    dest="image_sample_reference_max_selected_score",
+                    help="fail image reference reproduction if sweep score exceeds this")
     ap.add_argument("--image-sample-manifest-out", default="",
                     dest="image_sample_manifest_out",
                     help=("optional JSONL manifest path for individual generated image "
@@ -4256,6 +4300,26 @@ def main():
     if (args.image_sample_reference_denoise_strength < 0.0
             or args.image_sample_reference_denoise_strength > 1.0):
         sys.exit("ERROR: --image-sample-reference-denoise-strength must be in [0, 1]")
+    image_reference_gate_names = (
+        "image_sample_reference_max_pixel_mse",
+        "image_sample_reference_max_pixel_mae",
+        "image_sample_reference_max_structure_edge_l1",
+        "image_sample_reference_max_structure_multiscale_l1",
+        "image_sample_reference_max_structure_frequency_l1",
+        "image_sample_reference_max_structure_ssim_loss",
+        "image_sample_reference_max_selected_score",
+    )
+    image_reference_gate_enabled = any(
+        getattr(args, name) is not None for name in image_reference_gate_names)
+    if image_reference_gate_enabled and not args.image_sample_reference_grid:
+        sys.exit(
+            "ERROR: image reference reproduction gates require "
+            "--image-sample-reference-grid")
+    for gate_name in image_reference_gate_names:
+        gate_value = getattr(args, gate_name)
+        if gate_value is not None and gate_value < 0.0:
+            flag = "--" + gate_name.replace("_", "-")
+            sys.exit(f"ERROR: {flag} must be non-negative")
     reference_strength_values = (
         args.image_sample_reference_denoise_strengths
         if str(args.image_sample_reference_denoise_strengths or "").strip()
