@@ -2196,9 +2196,10 @@ def reading_fer_eval(model, vocab, records, device=DEV, n=0, seed=0,
 
 
 READING_SCORE_METRICS = (
-    "view", "context", "neighborhood", "cluster", "fer", "both", "min", "all",
-    "balanced", "mastery")
-READING_DISCOVERY_SIGNALS = ("view", "context", "neighborhood", "cluster", "fer")
+    "view", "context", "neighborhood", "cluster", "fer", "bridge",
+    "both", "min", "all", "balanced", "mastery")
+READING_DISCOVERY_SIGNALS = (
+    "view", "context", "neighborhood", "cluster", "fer", "bridge")
 READING_STUDY_STRATEGIES = (
     "random", "errors", "curiosity", "graph", "cycle", "discovery", "auto")
 READING_MEMORY_STUDY_STRATEGIES = ("curiosity", "graph", "discovery")
@@ -2221,7 +2222,8 @@ def resolve_reading_study_strategy(study_strategy, model):
 
 def reading_discovery_score_components(view_eval, context_eval, metric="both",
                                        margin_w=0.1, neighborhood_eval=None,
-                                       cluster_eval=None, fer_eval=None):
+                                       cluster_eval=None, fer_eval=None,
+                                       bridge_eval=None):
     metric = str(metric)
     if metric not in READING_SCORE_METRICS:
         raise ValueError(f"unknown reading score metric {metric!r}")
@@ -2240,18 +2242,26 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     fer_raw_score = max(0.0, float(fer_eval.get("fer_score", 0.0)))
     fer_score = (0.0 if bool(fer_eval.get("skipped", False))
                  else 1.0 / (1.0 + fer_raw_score))
+    bridge_eval = {"skipped": True} if bridge_eval is None else bridge_eval
+    bridge_raw_score = max(0.0, float(bridge_eval.get("mean_bridge_score", 0.0)))
+    bridge_resolution = 1.0 / (1.0 + bridge_raw_score)
+    bridge_connectivity = min(1.0, max(0.0, float(
+        bridge_eval.get("mean_bridge_connectivity", 1.0))))
+    bridge_score = (0.0 if bool(bridge_eval.get("skipped", False))
+                    else 0.5 * (bridge_resolution + bridge_connectivity))
     view_score = view_acc + margin_w * view_margin
     context_score = context_acc + margin_w * context_margin
     neighborhood_score = neighborhood_acc + margin_w * neighborhood_margin
     cluster_score = cluster_acc + margin_w * cluster_margin
     scores = {"view": view_score, "context": context_score,
               "neighborhood": neighborhood_score, "cluster": cluster_score,
-              "fer": fer_score}
+              "fer": fer_score, "bridge": bridge_score}
     skipped = {"view": bool(view_eval.get("skipped", False)),
                "context": bool(context_eval.get("skipped", False)),
                "neighborhood": bool(neighborhood_eval.get("skipped", False)),
                "cluster": bool(cluster_eval.get("skipped", False)),
-               "fer": bool(fer_eval.get("skipped", False))}
+               "fer": bool(fer_eval.get("skipped", False)),
+               "bridge": bool(bridge_eval.get("skipped", False))}
     active_scores = [scores[name] for name in READING_DISCOVERY_SIGNALS
                      if not skipped[name]]
     if not active_scores:
@@ -2274,6 +2284,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
         score = cluster_score
     elif metric == "fer":
         score = fer_score
+    elif metric == "bridge":
+        score = bridge_score
     elif metric == "min":
         score = min(view_score, context_score)
     elif metric == "all":
@@ -2302,6 +2314,11 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "fer_fragmentation": float(fer_eval.get("fragmentation", 0.0)),
             "fer_slot_correlation": float(fer_eval.get("slot_correlation", 0.0)),
             "fer_slot_imbalance": float(fer_eval.get("slot_imbalance", 0.0)),
+            "bridge_score": float(bridge_score),
+            "bridge_raw_score": float(bridge_raw_score),
+            "bridge_resolution": float(bridge_resolution),
+            "bridge_connectivity": float(bridge_connectivity),
+            "bridge_entropy": float(bridge_eval.get("mean_bridge_entropy", 0.0)),
             "paired_view_acc": view_acc,
             "paired_view_margin": view_margin,
             "context_target_acc": context_acc,
@@ -2314,7 +2331,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "context_skipped": skipped["context"],
             "neighborhood_skipped": skipped["neighborhood"],
             "cluster_skipped": skipped["cluster"],
-            "fer_skipped": skipped["fer"]}
+            "fer_skipped": skipped["fer"],
+            "bridge_skipped": skipped["bridge"]}
 
 
 def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
@@ -2336,15 +2354,19 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
     fer = reading_fer_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 37,
         feature_dropout=0.0)
+    bridge = reading_latent_bridge_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 41,
+        feature_dropout=0.0)
     return {"view": view,
             "context_target": context,
             "neighborhood": neighborhood,
             "cluster": cluster,
             "fer": fer,
+            "bridge": bridge,
             "score_components": reading_discovery_score_components(
                 view, context, metric=score_metric, margin_w=score_margin_w,
                 neighborhood_eval=neighborhood, cluster_eval=cluster,
-                fer_eval=fer)}
+                fer_eval=fer, bridge_eval=bridge)}
 
 
 def reading_latent_bridge_eval(model, vocab, records, device=DEV, n=0, seed=0,
@@ -2353,7 +2375,10 @@ def reading_latent_bridge_eval(model, vocab, records, device=DEV, n=0, seed=0,
     if getattr(model, "latent_concepts", None) is None or memory is None:
         return {"n_records": 0, "sampled": False, "mean_bridge_score": 0.0,
                 "max_bridge_score": 0.0, "mean_bridge_entropy": 0.0,
-                "mean_bridge_connectivity": 1.0, "skipped": True}
+                "mean_bridge_connectivity": 1.0, "memory_filled": 0,
+                "relation_updates": 0, "transition_updates": 0,
+                "graph_ready": False, "skipped": True,
+                "skip_reason": "latent_concept_memory_unavailable"}
     candidates = list(records)
     sampled = bool(n and n < len(candidates))
     if sampled:
@@ -2363,7 +2388,38 @@ def reading_latent_bridge_eval(model, vocab, records, device=DEV, n=0, seed=0,
     if not candidates:
         return {"n_records": 0, "sampled": sampled, "mean_bridge_score": 0.0,
                 "max_bridge_score": 0.0, "mean_bridge_entropy": 0.0,
-                "mean_bridge_connectivity": 1.0, "skipped": True}
+                "mean_bridge_connectivity": 1.0, "memory_filled": 0,
+                "relation_updates": 0, "transition_updates": 0,
+                "graph_ready": False, "skipped": True,
+                "skip_reason": "no_records"}
+    active_memory = memory.active()
+    relations = memory.active_relations()
+    transitions = memory.active_transitions()
+    filled = int(active_memory.shape[0])
+    relation_updates = int(
+        getattr(memory, "relation_updates", torch.zeros((), dtype=torch.long)).item())
+    transition_updates = int(
+        getattr(memory, "transition_updates", torch.zeros((), dtype=torch.long)).item())
+
+    def has_offdiag_edges(mat):
+        if mat is None or mat.numel() == 0 or mat.shape[0] <= 1:
+            return False
+        eye = torch.eye(mat.shape[0], dtype=torch.bool, device=mat.device)
+        offdiag = mat.masked_fill(eye, 0.0)
+        return bool(offdiag.gt(0.0).any().item())
+
+    has_relation_edges = relation_updates > 0 and has_offdiag_edges(relations)
+    has_transition_edges = transition_updates > 0 and has_offdiag_edges(transitions)
+    graph_ready = filled > 1 and (has_relation_edges or has_transition_edges)
+    if not graph_ready:
+        return {"n_records": len(candidates), "sampled": sampled,
+                "mean_bridge_score": 0.0, "max_bridge_score": 0.0,
+                "mean_bridge_entropy": 0.0, "mean_bridge_connectivity": 1.0,
+                "memory_filled": filled,
+                "relation_updates": relation_updates,
+                "transition_updates": transition_updates,
+                "graph_ready": False, "skipped": True,
+                "skip_reason": "latent_concept_graph_unavailable"}
     score_values = []
     entropy_values = []
     connectivity_values = []
@@ -2375,8 +2431,7 @@ def reading_latent_bridge_eval(model, vocab, records, device=DEV, n=0, seed=0,
             slots = model.latent_concept_states(
                 txt, feature_dropout=feature_dropout, project=True)
             bridge, entropy, connectivity = latent_concept_bridge_scores(
-                slots, memory.active(), memory.active_relations(),
-                memory.active_transitions())
+                slots, active_memory, relations, transitions, require_graph=True)
             score_values.extend(float(x) for x in bridge.detach().cpu().tolist())
             entropy_values.extend(float(x) for x in entropy.detach().cpu().tolist())
             connectivity_values.extend(
@@ -2391,6 +2446,10 @@ def reading_latent_bridge_eval(model, vocab, records, device=DEV, n=0, seed=0,
                 float(np.mean(entropy_values)) if entropy_values else 0.0),
             "mean_bridge_connectivity": (
                 float(np.mean(connectivity_values)) if connectivity_values else 1.0),
+            "memory_filled": filled,
+            "relation_updates": relation_updates,
+            "transition_updates": transition_updates,
+            "graph_ready": True,
             "skipped": False}
 
 
@@ -4423,6 +4482,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
     after_cluster = after_bundle["cluster"]
     before_fer = before_bundle["fer"]
     after_fer = after_bundle["fer"]
+    before_bridge = before_bundle["bridge"]
+    after_bridge = after_bundle["bridge"]
     train_metrics = getattr(model, "reading_train_metrics", {})
     resolved_study_strategy = train_metrics.get("study_strategy", study_strategy)
     requested_study_strategy = train_metrics.get(
@@ -4529,6 +4590,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "after_cluster": after_cluster,
               "before_fer": before_fer,
               "after_fer": after_fer,
+              "before_bridge": before_bridge,
+              "after_bridge": after_bridge,
               "before_score_components": before_bundle["score_components"],
               "after_score_components": after_bundle["score_components"],
               "selection": selection,
@@ -4575,6 +4638,16 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                   "fer_raw_score": (
                       after_fer.get("fer_score", 0.0)
                       - before_fer.get("fer_score", 0.0)),
+                  "bridge_quality": (
+                      after_bundle["score_components"].get("bridge_score", 0.0)
+                      - before_bundle["score_components"].get(
+                          "bridge_score", 0.0)),
+                  "bridge_raw_score": (
+                      after_bridge.get("mean_bridge_score", 0.0)
+                      - before_bridge.get("mean_bridge_score", 0.0)),
+                  "bridge_connectivity": (
+                      after_bridge.get("mean_bridge_connectivity", 0.0)
+                      - before_bridge.get("mean_bridge_connectivity", 0.0)),
               },
               "train_metrics": train_metrics,
               "study_hard_examples": getattr(model, "reading_study_reports", []),
@@ -4920,6 +4993,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
     after_cluster = after_bundle["cluster"]
     before_fer = before_bundle["fer"]
     after_fer = after_bundle["fer"]
+    before_bridge = before_bundle["bridge"]
+    after_bridge = after_bundle["bridge"]
     d = int(ckpt.get("d", 96))
     layers = int(ckpt.get("layers", 3))
     heads = int(ckpt.get("heads", 4))
@@ -5041,6 +5116,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "after_cluster": after_cluster,
               "before_fer": before_fer,
               "after_fer": after_fer,
+              "before_bridge": before_bridge,
+              "after_bridge": after_bridge,
               "before_score_components": before_bundle["score_components"],
               "after_score_components": after_bundle["score_components"],
               "before_replay": before_replay_bundle,
@@ -5089,6 +5166,16 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                   "fer_raw_score": (
                       after_fer.get("fer_score", 0.0)
                       - before_fer.get("fer_score", 0.0)),
+                  "bridge_quality": (
+                      after_bundle["score_components"].get("bridge_score", 0.0)
+                      - before_bundle["score_components"].get(
+                          "bridge_score", 0.0)),
+                  "bridge_raw_score": (
+                      after_bridge.get("mean_bridge_score", 0.0)
+                      - before_bridge.get("mean_bridge_score", 0.0)),
+                  "bridge_connectivity": (
+                      after_bridge.get("mean_bridge_connectivity", 0.0)
+                      - before_bridge.get("mean_bridge_connectivity", 0.0)),
                   "replay_score": (
                       (after_replay_bundle or {}).get("score_components", {}).get(
                           "score", 0.0)
@@ -6528,6 +6615,10 @@ def selftest():
         reading_model, reading_txt, feature_dropout=0.1)
     assert torch.isfinite(fer_loss)
     assert torch.isfinite(fer_metrics["fer_score"])
+    cold_bridge_eval = reading_latent_bridge_eval(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0)
+    assert cold_bridge_eval["skipped"] is True
+    assert cold_bridge_eval["graph_ready"] is False
     updates = update_reading_latent_memory(reading_model, reading_txt,
                                            relation_decay=0.5)
     assert updates > 0
@@ -6592,12 +6683,20 @@ def selftest():
     assert fer_bundle["score_components"]["metric"] == "fer"
     assert fer_bundle["score_components"]["fer_skipped"] is False
     assert math.isfinite(fer_bundle["score_components"]["score"])
+    bridge_bundle = reading_eval_bundle(
+        reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
+        score_metric="bridge")
+    assert bridge_bundle["score_components"]["metric"] == "bridge"
+    assert bridge_bundle["score_components"]["bridge_skipped"] is False
+    assert math.isfinite(bridge_bundle["score_components"]["bridge_score"])
     mastery_bundle = reading_eval_bundle(
         reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
         score_metric="mastery")
     assert mastery_bundle["score_components"]["metric"] == "mastery"
     assert ("mastery_score" in mastery_bundle["score_components"]
-            and "signal_coverage" in mastery_bundle["score_components"])
+            and "signal_coverage" in mastery_bundle["score_components"]
+            and "bridge_score" in mastery_bundle["score_components"])
+    assert mastery_bundle["score_components"]["bridge_skipped"] is False
     assert (mastery_bundle["score_components"]["score"]
             == mastery_bundle["score_components"]["mastery_score"])
     fit_reading_concepts(
