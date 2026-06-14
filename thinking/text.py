@@ -56,6 +56,7 @@ from .concepts import (
     SchemaConceptRefiner,
     latent_concept_composition_loss,
     latent_concept_graph_cycle_loss,
+    latent_concept_graph_cycle_scores,
     latent_concept_graph_prediction_loss,
     latent_concept_graph_prediction_scores,
     latent_concept_graph_curiosity_scores,
@@ -930,6 +931,26 @@ class TextFactLM(nn.Module):
                 return target_slots.sum() * 0.0
             return torch.tensor(0.0, device=next(self.parameters()).device)
         return self.latent_concept_memory.graph_cycle_loss(
+            source_slots, target_slots, temperature=temperature,
+            self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+            transitive_w=transitive_w, target_power=target_power,
+            cycle_w=cycle_w)
+
+    def latent_concept_graph_cycle_scores(
+            self, source_slots, target_slots, temperature=0.1,
+            self_loop_w=0.05, transitive_steps=2, transitive_w=0.1,
+            target_power=1.0, cycle_w=0.5):
+        if self.latent_concept_memory is None:
+            zero = source_slots if source_slots is not None else target_slots
+            if zero is None:
+                zero = torch.zeros(0, device=next(self.parameters()).device)
+            else:
+                zero = zero.reshape(zero.shape[0], -1).sum(-1) * 0.0
+            return zero, {
+                "forward_kl": zero, "reverse_kl": zero,
+                "source_cycle_kl": zero, "target_cycle_kl": zero,
+            }
+        return self.latent_concept_memory.graph_cycle_scores(
             source_slots, target_slots, temperature=temperature,
             self_loop_w=self_loop_w, transitive_steps=transitive_steps,
             transitive_w=transitive_w, target_power=target_power,

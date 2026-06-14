@@ -169,7 +169,7 @@ def apply_image_quality_preset(args):
         args.train_steps = 20000
     args.image_dit_head_width_mult = max(int(args.image_dit_head_width_mult), 2)
     args.image_dit_qk_norm = True
-    args.image_dit_attn_impl = "linear"
+    args.image_dit_attn_impl = "auto"
     args.image_dit_pos_embed = "rope2d"
     args.image_dit_mlp = "swiglu"
     args.image_flow_checkpoint_blocks = True
@@ -273,9 +273,9 @@ def payload(args):
         return " && ".join(cmds)                           # lang is a COMPLETE payload: without
         #                                                    this return the default kinship
         #                                                    multi-seed run was appended after it
-    if (args.vision_understanding or args.vision or args.image2 or args.image_flow
-            or args.image_latent or args.image_embed or args.image_fetch
-            or args.image_caption or args.image_score or args.audio or args.multimodal):
+    if (args.vision_understanding or args.image_latent or args.image_embed
+            or args.image_fetch or args.image_caption or args.image_score or args.audio
+            or args.multimodal):
         effective_image_manifest = args.image_manifest
         if args.image_fetch:
             IFETCH = PY.replace("thinking.cli", "thinking.image_fetch")
@@ -594,15 +594,6 @@ def payload(args):
                      f"--sample-latent-clip {args.image_sample_latent_clip} "
                      f"--eval-generated-candidates-per-prompt "
                      f"{args.image_eval_generated_candidates_per_prompt} "
-                     f"--semantic-guidance-w {args.image_semantic_guidance_w} "
-                     f"--semantic-guidance-mode {args.image_semantic_guidance_mode} "
-                     f"--semantic-guidance-interval "
-                     f"{shlex_quote(args.image_semantic_guidance_interval)} "
-                     f"--roundtrip-samples {args.image_roundtrip_samples} "
-                     f"--intervention-samples {args.image_intervention_samples} "
-                     f"--ae-intervention-w {args.image_ae_intervention_w} "
-                     f"--ae-factor-orth-w {args.image_ae_factor_orth_w} "
-                     f"--flow-semantic-w {args.image_flow_semantic_w} "
                      f"--flow-consistency-w {args.image_flow_consistency_w} "
                      f"--flow-endpoint-w {args.image_flow_endpoint_w} "
                      f"--flow-noise-coupling {args.image_flow_noise_coupling} "
@@ -650,8 +641,6 @@ def payload(args):
                 train += " --no-flow-loss-weight-normalize"
             if args.image_flow_cache_dir:
                 train += f" --flow-cache-dir {shlex_quote(args.image_flow_cache_dir)}"
-            if args.image_prompt_templates:
-                train += f" --prompt-templates {shlex_quote(args.image_prompt_templates)}"
             if args.image_min_aesthetic is not None:
                 train += f" --image-min-aesthetic {args.image_min_aesthetic}"
             if args.image_eval_sweep:
@@ -698,16 +687,6 @@ def payload(args):
                         eval_cmd += (
                             f" --eval-image-min-aesthetic {args.image_min_aesthetic}"
                         )
-                else:
-                    eval_cmd += (
-                          f" --semantic-guidance-w {args.image_semantic_guidance_w} "
-                          f"--semantic-guidance-weights "
-                          f"{shlex_quote(args.image_semantic_guidance_sweep)} "
-                          f"--semantic-guidance-mode {args.image_semantic_guidance_mode} "
-                          f"--semantic-guidance-interval "
-                          f"{shlex_quote(args.image_semantic_guidance_interval)} "
-                          f"--roundtrip-samples {args.image_roundtrip_samples} "
-                          f"--intervention-samples {args.image_intervention_samples}")
                 if args.image_sample_finite_guard:
                     eval_cmd += " --sample-finite-guard"
                 if args.image_sample_grid:
@@ -782,48 +761,18 @@ def payload(args):
             AU = PY.replace("thinking.cli", "thinking.audio")
             cmds.append(f"{AU} --steps {args.train_steps or 500} "
                         f"--seeds {shlex_quote(args.seeds)} --out runs/audio1_fer.json")
-        if args.multimodal:                                # M-0: image+audio -> canonical facts
+        if args.multimodal:
             MM = PY.replace("thinking.cli", "thinking.multimodal")
             mm_dim = args.multimodal_dim or args.dim or 96
             mm_cmd = (
-                f"{MM} --steps {args.train_steps or 400} "
+                f"{MM} --manifest {shlex_quote(args.multimodal_manifest)} "
+                f"--steps {args.train_steps or 400} "
                 f"--batch {args.multimodal_batch} --dim {mm_dim} "
                 f"--layers {args.multimodal_layers} --heads {args.multimodal_heads} "
                 f"--lr {args.multimodal_lr} --log-every {args.multimodal_log_every} "
-                f"--value-w {args.multimodal_value_w} "
                 f"--agreement-w {args.multimodal_agreement_w} "
                 f"--concept-tokens {args.multimodal_concept_tokens} "
                 f"--fusion-layers {args.multimodal_fusion_layers} "
-                f"--concept-w {args.multimodal_concept_w} "
-                f"--concept-agreement-w {args.multimodal_concept_agreement_w} "
-                f"--concept-distill-w {args.multimodal_concept_distill_w} "
-                f"--concept-distill-temperature "
-                f"{args.multimodal_concept_distill_temperature} "
-                f"--concept-rank-distill-w {args.multimodal_concept_rank_distill_w} "
-                f"--concept-rank-distill-margin "
-                f"{args.multimodal_concept_rank_distill_margin} "
-                f"--concept-transfer-w {args.multimodal_concept_transfer_w} "
-                f"--concept-transfer-margin "
-                f"{args.multimodal_concept_transfer_margin} "
-                f"--concept-contrast-w {args.multimodal_concept_contrast_w} "
-                f"--concept-contrast-temperature "
-                f"{args.multimodal_concept_contrast_temperature} "
-                f"--concept-centroid-w {args.multimodal_concept_centroid_w} "
-                f"--concept-centroid-temperature "
-                f"{args.multimodal_concept_centroid_temperature} "
-                f"--concept-centroid-margin {args.multimodal_concept_centroid_margin} "
-                f"--concept-prototype-w {args.multimodal_concept_prototype_w} "
-                f"--concept-prototype-spread-w "
-                f"{args.multimodal_concept_prototype_spread_w} "
-                f"--concept-prototype-spread-margin "
-                f"{args.multimodal_concept_prototype_spread_margin} "
-                f"--concept-state-spread-w {args.multimodal_concept_state_spread_w} "
-                f"--concept-state-spread-variance "
-                f"{args.multimodal_concept_state_spread_variance} "
-                f"--concept-state-spread-margin "
-                f"{args.multimodal_concept_state_spread_margin} "
-                f"--concept-state-spread-covariance-w "
-                f"{args.multimodal_concept_state_spread_covariance_w} "
                 f"--latent-concept-slots {args.multimodal_latent_concept_slots} "
                 f"--latent-concept-layers {args.multimodal_latent_concept_layers} "
                 f"--latent-concept-w {args.multimodal_latent_concept_w} "
@@ -845,15 +794,11 @@ def payload(args):
                 f"--trunk-depth {args.multimodal_trunk_depth} "
                 f"--text-layers {args.multimodal_text_layers} "
                 f"--modality-dropout {args.multimodal_dropout} "
-                f"--eval-n {args.multimodal_eval_n} --free-n {args.multimodal_free_n} "
-                f"--counterfactual-n {args.multimodal_counterfactual_n} "
-                f"--free-counterfactual-n {args.multimodal_free_counterfactual_n} "
+                f"--eval-n {args.multimodal_eval_n} "
                 f"--out runs/m0_multimodal.json --checkpoint runs/m0_multimodal.pt"
             )
-            if args.multimodal_concept_prefix:
-                mm_cmd += " --concept-prefix"
-            if args.multimodal_surfaces:
-                mm_cmd += f" --surfaces {shlex_quote(args.multimodal_surfaces)}"
+            if args.multimodal_root:
+                mm_cmd += f" --root {shlex_quote(args.multimodal_root)}"
             cmds.append(mm_cmd)
         return " && ".join(cmds)
     if args.eval_only_run:
@@ -1057,14 +1002,6 @@ def main():
     ap.add_argument("--lang-ft", type=int, default=6000, dest="lang_ft")
     ap.add_argument("--ref", default="HEAD",
                     help="deploy this git ref (pinned commit); '' = live tree")
-    ap.add_argument("--vision", action="store_true",
-                    help="removed legacy synthetic image harness; use --vision-understanding")
-    ap.add_argument("--vision-arch", default="shared", choices=("shared", "factored", "bottleneck"),
-                    help="removed legacy synthetic image harness option")
-    ap.add_argument("--image2", action="store_true",
-                    help="removed legacy synthetic image harness; use --vision-understanding")
-    ap.add_argument("--image-flow", action="store_true", dest="image_flow",
-                    help="removed legacy synthetic image harness; use --image-latent with manifest")
     ap.add_argument("--vision-understanding", action="store_true",
                     dest="vision_understanding",
                     help="train manifest-driven visual concept slots and concept memory")
@@ -1394,9 +1331,10 @@ def main():
     ap.add_argument("--image-dit-qk-norm", action="store_true",
                     dest="image_dit_qk_norm",
                     help="enable per-head QK RMSNorm in latent image MM-DiT attention")
-    ap.add_argument("--image-dit-attn-impl", default="manual",
+    ap.add_argument("--image-dit-attn-impl", default="auto",
                     choices=("manual", "sdpa", "linear", "auto"), dest="image_dit_attn_impl",
-                    help="latent image MM-DiT attention implementation")
+                    help=("latent image MM-DiT attention implementation; auto uses exact "
+                          "PyTorch SDPA when available, linear is an explicit approximation"))
     ap.add_argument("--image-dit-pos-embed", default="learned",
                     choices=("learned", "sincos2d", "rope2d"), dest="image_dit_pos_embed",
                     help=("latent image DiT positional embedding; rope2d requires "
@@ -1596,8 +1534,6 @@ def main():
     ap.add_argument("--image-hflip-prob", type=float, default=0.0,
                     dest="image_hflip_prob",
                     help="random horizontal flip probability for manifest image training")
-    ap.add_argument("--image-prompt-templates", default="", dest="image_prompt_templates",
-                    help="internal fixture prompt templates; production runs use captions/prompts")
     ap.add_argument("--image-cond-drop", type=float, default=0.0, dest="image_cond_drop",
                     help="condition dropout for classifier-free latent image guidance")
     ap.add_argument("--image-cfg-scale", type=float, default=1.0, dest="image_cfg_scale",
@@ -1763,12 +1699,6 @@ def main():
     ap.add_argument("--image-prompt-embed-trust-remote-code", action="store_true",
                     dest="image_prompt_embed_trust_remote_code",
                     help="pass trust_remote_code=True to Hugging Face prompt embedder")
-    ap.add_argument("--image-semantic-guidance-w", type=float, default=0.0,
-                    dest="image_semantic_guidance_w",
-                    help="sampling-time semantic AE guidance weight for latent images")
-    ap.add_argument("--image-semantic-guidance-sweep", default="0.0,1.0,2.0",
-                    dest="image_semantic_guidance_sweep",
-                    help="comma-separated semantic guidance weights for latent image sweeps")
     ap.add_argument("--image-eval-text-guidance-sweep", default="0.0",
                     dest="image_eval_text_guidance_sweep",
                     help="comma-separated text guidance weights for manifest image eval sweeps")
@@ -1778,27 +1708,6 @@ def main():
     ap.add_argument("--image-eval-quality-guidance-sweep", default="0.0",
                     dest="image_eval_quality_guidance_sweep",
                     help="comma-separated quality guidance weights for manifest image eval sweeps")
-    ap.add_argument("--image-semantic-guidance-mode", default="decoded",
-                    choices=("latent", "decoded"), dest="image_semantic_guidance_mode",
-                    help="latent image semantic guidance mode")
-    ap.add_argument("--image-semantic-guidance-interval", default="0.0,1.0",
-                    dest="image_semantic_guidance_interval",
-                    help="semantic guidance active interval formatted start,end")
-    ap.add_argument("--image-roundtrip-samples", type=int, default=1,
-                    dest="image_roundtrip_samples",
-                    help="generated samples per color/shape condition during image eval")
-    ap.add_argument("--image-intervention-samples", type=int, default=32,
-                    dest="image_intervention_samples",
-                    help="samples for latent image fact-intervention diagnostics")
-    ap.add_argument("--image-ae-intervention-w", type=float, default=0.0,
-                    dest="image_ae_intervention_w",
-                    help="semantic AE latent fact-intervention loss weight")
-    ap.add_argument("--image-ae-factor-orth-w", type=float, default=0.0,
-                    dest="image_ae_factor_orth_w",
-                    help="semantic AE cross-factor latent orthogonality loss weight")
-    ap.add_argument("--image-flow-semantic-w", type=float, default=0.0,
-                    dest="image_flow_semantic_w",
-                    help="semantic endpoint alignment weight for latent image flow training")
     ap.add_argument("--image-flow-consistency-w", type=float, default=0.0,
                     dest="image_flow_consistency_w",
                     help="same-path endpoint consistency loss weight for latent image flow")
@@ -1857,9 +1766,11 @@ def main():
     ap.add_argument("--image-time-shift", type=float, default=1.0,
                     dest="image_time_shift",
                     help="latent image RF data-time shift; >1 biases training toward noise")
-    ap.add_argument("--image-time-shift-mode", default="manual",
-                    choices=("manual", "dim"), dest="image_time_shift_mode",
-                    help="manual uses --image-time-shift as-is; dim scales it by latent dimension")
+    ap.add_argument("--image-time-shift-mode", default="auto",
+                    choices=("manual", "dim", "auto"), dest="image_time_shift_mode",
+                    help=("manual uses --image-time-shift as-is; dim scales it by latent "
+                          "dimension; auto uses dim only when latent dimension exceeds "
+                          "--image-time-shift-ref-dim"))
     ap.add_argument("--image-time-shift-ref-dim", type=float, default=1024.0,
                     dest="image_time_shift_ref_dim",
                     help="reference latent element count for dimension-aware image time shift")
@@ -1907,7 +1818,11 @@ def main():
     ap.add_argument("--audio", action="store_true",
                     help="AUDIO-1: train synthetic audio factor FER experiment")
     ap.add_argument("--multimodal", action="store_true",
-                    help="M-0: train one prefix-conditioned LM on image+audio extraction")
+                    help="train generic manifest-driven multimodal prefix bridge")
+    ap.add_argument("--multimodal-manifest", default="", dest="multimodal_manifest",
+                    help="JSONL manifest passed to thinking.multimodal --manifest")
+    ap.add_argument("--multimodal-root", default="", dest="multimodal_root",
+                    help="optional root for relative multimodal feature paths")
     ap.add_argument("--multimodal-dim", type=int, default=0, dest="multimodal_dim",
                     help="M-0 decoder width; default uses --dim or 96")
     ap.add_argument("--multimodal-layers", type=int, default=3, dest="multimodal_layers")
@@ -1916,77 +1831,13 @@ def main():
     ap.add_argument("--multimodal-lr", type=float, default=1e-3, dest="multimodal_lr")
     ap.add_argument("--multimodal-log-every", type=int, default=100,
                     dest="multimodal_log_every")
-    ap.add_argument("--multimodal-value-w", type=float, default=6.0,
-                    dest="multimodal_value_w")
     ap.add_argument("--multimodal-agreement-w", type=float, default=0.0,
                     dest="multimodal_agreement_w",
-                    help="M-0 cross-mode factor-value agreement loss weight")
+                    help="cross-mode token-distribution agreement loss weight")
     ap.add_argument("--multimodal-concept-tokens", type=int, default=4,
                     dest="multimodal_concept_tokens")
     ap.add_argument("--multimodal-fusion-layers", type=int, default=1,
                     dest="multimodal_fusion_layers")
-    ap.add_argument("--multimodal-concept-prefix", action="store_true",
-                    dest="multimodal_concept_prefix",
-                    help="prepend M-0 schema concept states to the decoder prefix")
-    ap.add_argument("--multimodal-concept-w", type=float, default=0.0,
-                    dest="multimodal_concept_w",
-                    help="M-0 upstream concept-token factor loss weight")
-    ap.add_argument("--multimodal-concept-agreement-w", type=float, default=0.0,
-                    dest="multimodal_concept_agreement_w",
-                    help="M-0 cross-mode upstream concept agreement weight")
-    ap.add_argument("--multimodal-concept-distill-w", type=float, default=0.0,
-                    dest="multimodal_concept_distill_w",
-                    help="M-0 full-to-partial upstream concept distillation weight")
-    ap.add_argument("--multimodal-concept-distill-temperature", type=float, default=1.0,
-                    dest="multimodal_concept_distill_temperature")
-    ap.add_argument("--multimodal-concept-rank-distill-w", type=float, default=0.0,
-                    dest="multimodal_concept_rank_distill_w",
-                    help="M-0 full-correct concept rank distillation weight")
-    ap.add_argument("--multimodal-concept-rank-distill-margin", type=float, default=0.0,
-                    dest="multimodal_concept_rank_distill_margin",
-                    help="minimum margin for M-0 full-to-partial concept rank distillation")
-    ap.add_argument("--multimodal-concept-transfer-w", type=float, default=0.0,
-                    dest="multimodal_concept_transfer_w",
-                    help="M-0 correct-detached upstream concept vector transfer weight")
-    ap.add_argument("--multimodal-concept-transfer-margin", type=float, default=0.0,
-                    dest="multimodal_concept_transfer_margin",
-                    help="minimum margin for M-0 upstream concept vector transfer")
-    ap.add_argument("--multimodal-concept-contrast-w", type=float, default=0.0,
-                    dest="multimodal_concept_contrast_w",
-                    help="M-0 same-value concept geometry contrastive loss weight")
-    ap.add_argument("--multimodal-concept-contrast-temperature", type=float, default=0.1,
-                    dest="multimodal_concept_contrast_temperature",
-                    help="temperature for M-0 same-value concept geometry contrastive loss")
-    ap.add_argument("--multimodal-concept-centroid-w", type=float, default=0.0,
-                    dest="multimodal_concept_centroid_w",
-                    help="M-0 batch-discovered concept centroid loss weight")
-    ap.add_argument("--multimodal-concept-centroid-temperature", type=float, default=0.1,
-                    dest="multimodal_concept_centroid_temperature",
-                    help="temperature for M-0 concept centroid loss")
-    ap.add_argument("--multimodal-concept-centroid-margin", type=float, default=0.0,
-                    dest="multimodal_concept_centroid_margin",
-                    help="minimum margin for M-0 concept centroid loss")
-    ap.add_argument("--multimodal-concept-prototype-w", type=float, default=0.0,
-                    dest="multimodal_concept_prototype_w",
-                    help="M-0 concept-geometry prototype classification weight")
-    ap.add_argument("--multimodal-concept-prototype-spread-w", type=float, default=0.0,
-                    dest="multimodal_concept_prototype_spread_w",
-                    help="M-0 same-key concept prototype anti-collapse weight")
-    ap.add_argument("--multimodal-concept-prototype-spread-margin", type=float, default=0.2,
-                    dest="multimodal_concept_prototype_spread_margin",
-                    help="M-0 same-key prototype cosine spread margin")
-    ap.add_argument("--multimodal-concept-state-spread-w", type=float, default=0.0,
-                    dest="multimodal_concept_state_spread_w",
-                    help="M-0 concept geometry state anti-collapse loss weight")
-    ap.add_argument("--multimodal-concept-state-spread-variance", type=float, default=0.05,
-                    dest="multimodal_concept_state_spread_variance",
-                    help="minimum M-0 normalized concept-state std target")
-    ap.add_argument("--multimodal-concept-state-spread-margin", type=float, default=0.2,
-                    dest="multimodal_concept_state_spread_margin",
-                    help="maximum M-0 observed-value centroid cosine before spread penalty")
-    ap.add_argument("--multimodal-concept-state-spread-covariance-w", type=float,
-                    default=0.05, dest="multimodal_concept_state_spread_covariance_w",
-                    help="relative M-0 decorrelation weight inside state spread loss")
     ap.add_argument("--multimodal-latent-concept-slots", type=int, default=0,
                     dest="multimodal_latent_concept_slots",
                     help="schema-free M-0 latent concept slots aligned across modality views")
@@ -2017,9 +1868,9 @@ def main():
                     dest="multimodal_aud_tokens")
     ap.add_argument("--multimodal-txt-tokens", type=int, default=8,
                     dest="multimodal_txt_tokens")
-    ap.add_argument("--multimodal-trunk-arch", default="conv", choices=("conv", "residual"),
+    ap.add_argument("--multimodal-trunk-arch", default="mlp", choices=("mlp", "residual"),
                     dest="multimodal_trunk_arch",
-                    help="M-0 sensory reader trunk architecture")
+                    help="multimodal feature reader trunk architecture")
     ap.add_argument("--multimodal-trunk-width", type=int, default=64,
                     dest="multimodal_trunk_width")
     ap.add_argument("--multimodal-trunk-depth", type=int, default=1,
@@ -2030,13 +1881,6 @@ def main():
                     dest="multimodal_dropout",
                     help="drop full-mode modality prefixes during M-0 training")
     ap.add_argument("--multimodal-eval-n", type=int, default=200, dest="multimodal_eval_n")
-    ap.add_argument("--multimodal-free-n", type=int, default=40, dest="multimodal_free_n")
-    ap.add_argument("--multimodal-counterfactual-n", type=int, default=40,
-                    dest="multimodal_counterfactual_n")
-    ap.add_argument("--multimodal-free-counterfactual-n", type=int, default=20,
-                    dest="multimodal_free_counterfactual_n")
-    ap.add_argument("--multimodal-surfaces", default="", dest="multimodal_surfaces",
-                    help="optional transcript surface JSON path passed to thinking.multimodal")
     ap.add_argument("--lengen", action="store_true", help="rung L: depth generalization")
     ap.add_argument("--deep-ancestor-rule-aux", action="store_true",
                     help="train the forward ancestor run with rule/action and contrastive losses")
@@ -2091,19 +1935,6 @@ def main():
     bad_arms = sorted(set(args.curve_arms) - {"aux", "noaux"})
     if bad_arms:
         sys.exit(f"ERROR: unsupported --curve-arms values: {','.join(bad_arms)}")
-    legacy_image_flags = [
-        name for enabled, name in (
-            (args.vision, "--vision"),
-            (args.image2, "--image2"),
-            (args.image_flow, "--image-flow"),
-        ) if enabled
-    ]
-    if legacy_image_flags:
-        sys.exit(
-            "ERROR: legacy synthetic image harness flags were removed from GPU launch: "
-            + ", ".join(legacy_image_flags)
-            + ". Use --vision-understanding and --image-latent with --image-manifest "
-            "or --image-fetch.")
     if args.vision_understanding and not (args.image_manifest or args.image_fetch):
         sys.exit("ERROR: --vision-understanding requires --image-manifest or --image-fetch")
     if args.image_latent and not (args.image_manifest or args.image_fetch):
@@ -2152,10 +1983,6 @@ def main():
         )
     try:
         parse_unit_interval(args.image_cfg_interval, "--image-cfg-interval")
-        parse_unit_interval(
-            args.image_semantic_guidance_interval,
-            "--image-semantic-guidance-interval",
-        )
         parse_unit_interval(
             args.image_sample_churn_interval,
             "--image-sample-churn-interval",
@@ -2457,6 +2284,8 @@ def main():
         for name, value in positive.items():
             if value <= 0:
                 sys.exit(f"ERROR: {name} must be positive")
+        if not args.multimodal_manifest:
+            sys.exit("ERROR: --multimodal requires --multimodal-manifest")
         if args.multimodal_dim < 0:
             sys.exit("ERROR: --multimodal-dim must be non-negative")
         mm_dim = args.multimodal_dim or args.dim or 96
@@ -2466,17 +2295,7 @@ def main():
             sys.exit("ERROR: multimodal head dimension must be even for rope attention")
         if args.multimodal_lr <= 0.0:
             sys.exit("ERROR: --multimodal-lr must be positive")
-        if (args.multimodal_value_w < 0.0 or args.multimodal_agreement_w < 0.0
-                or args.multimodal_concept_w < 0.0
-                or args.multimodal_concept_agreement_w < 0.0
-                or args.multimodal_concept_distill_w < 0.0
-                or args.multimodal_concept_rank_distill_w < 0.0
-                or args.multimodal_concept_transfer_w < 0.0
-                or args.multimodal_concept_contrast_w < 0.0
-                or args.multimodal_concept_centroid_w < 0.0
-                or args.multimodal_concept_prototype_w < 0.0
-                or args.multimodal_concept_prototype_spread_w < 0.0
-                or args.multimodal_concept_state_spread_w < 0.0
+        if (args.multimodal_agreement_w < 0.0
                 or args.multimodal_latent_concept_w < 0.0
                 or args.multimodal_latent_concept_invariance_w < 0.0
                 or args.multimodal_latent_concept_variance_w < 0.0
@@ -2495,33 +2314,8 @@ def main():
         if args.multimodal_latent_concept_variance_target < 0.0:
             sys.exit(
                 "ERROR: --multimodal-latent-concept-variance-target must be non-negative")
-        if args.multimodal_concept_distill_temperature <= 0.0:
-            sys.exit("ERROR: --multimodal-concept-distill-temperature must be positive")
-        if args.multimodal_concept_contrast_temperature <= 0.0:
-            sys.exit("ERROR: --multimodal-concept-contrast-temperature must be positive")
-        if args.multimodal_concept_centroid_temperature <= 0.0:
-            sys.exit("ERROR: --multimodal-concept-centroid-temperature must be positive")
-        if args.multimodal_concept_centroid_margin < 0.0:
-            sys.exit("ERROR: --multimodal-concept-centroid-margin must be non-negative")
-        if args.multimodal_concept_rank_distill_margin < 0.0:
-            sys.exit("ERROR: --multimodal-concept-rank-distill-margin must be non-negative")
-        if args.multimodal_concept_transfer_margin < 0.0:
-            sys.exit("ERROR: --multimodal-concept-transfer-margin must be non-negative")
-        if args.multimodal_concept_prototype_spread_margin < 0.0:
-            sys.exit(
-                "ERROR: --multimodal-concept-prototype-spread-margin must be non-negative")
-        if args.multimodal_concept_state_spread_variance < 0.0:
-            sys.exit("ERROR: --multimodal-concept-state-spread-variance must be non-negative")
-        if args.multimodal_concept_state_spread_margin < -1.0:
-            sys.exit("ERROR: --multimodal-concept-state-spread-margin must be >= -1")
-        if args.multimodal_concept_state_spread_covariance_w < 0.0:
-            sys.exit(
-                "ERROR: --multimodal-concept-state-spread-covariance-w must be non-negative")
         if args.multimodal_dropout < 0.0 or args.multimodal_dropout > 1.0:
             sys.exit("ERROR: --multimodal-dropout must be in [0, 1]")
-        if (args.multimodal_free_n < 0 or args.multimodal_counterfactual_n < 0
-                or args.multimodal_free_counterfactual_n < 0):
-            sys.exit("ERROR: multimodal eval counts must be non-negative")
     if args.upload_image_data:
         if not args.image_manifest:
             sys.exit("ERROR: --upload-image-data requires --image-manifest")

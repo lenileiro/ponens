@@ -402,6 +402,8 @@ def cmd_selftest(_args):
     image_data_selftest()
     from .image_embed import selftest as image_embed_selftest
     image_embed_selftest()
+    from .image_curate import selftest as image_curate_selftest
+    image_curate_selftest()
     from .image_latent import selftest as image_latent_selftest
     image_latent_selftest()
     from .audio import selftest as audio_selftest

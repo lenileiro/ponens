@@ -17,7 +17,7 @@ The design follows the current scalable image-generation pattern at toy scale:
   python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
       --cfg-scales 1.0,1.25,1.5,2.0 --cfg-rescales 0.0,0.7 \
       --sample-steps-list 4,8,16 \
-      --eval-seeds 1,2,3 --roundtrip-samples 2 --eval-out runs/image_latent_dit_sweep.json
+      --eval-seeds 1,2,3 --eval-out runs/image_latent_dit_sweep.json
   python -m thinking.image_latent --train --cond-mode text --flow-arch dit \
       --image-manifest data/images/train.jsonl --image-root data/images \
       --ae-steps 400 --flow-steps 400
@@ -41,21 +41,9 @@ from torch.utils.checkpoint import checkpoint as torch_activation_checkpoint
 from .image_data import (ImageTextRecord, build_caption_vocab, caption_ids,
                          load_image_tensor, normalized_sampling_weights,
                          read_image_manifest, sample_image_text_batch,
-                         summarize_records, vocab_unknown_id)
-from .image_flow import FACT_VOCAB, fact_condition
-from .vision import COLORS, SHAPES, DEV, ObjectSpec, object_facts, render_object, sample_object
+                         summarize_records)
 
-COLOR_NAMES = tuple(COLORS)
-DEFAULT_PROMPT_TEMPLATES = (
-    "a {color} {shape}",
-    "the object is {color} and {shape}",
-    "{color} object with {shape} shape",
-    "render p0 as a {shape} colored {color}",
-)
-FACT_GROUPS = {
-    pred: tuple(i for i, fact in enumerate(FACT_VOCAB) if fact[0] == pred)
-    for pred in sorted({fact[0] for fact in FACT_VOCAB})
-}
+DEV = "cuda" if torch.cuda.is_available() else "cpu"
 SAMPLE_METHODS = ("euler", "heun", "midpoint", "rk4")
 SAMPLE_SCHEDULES = ("linear", "quadratic", "sqrt", "cosine")
 CFG_MODES = ("standard", "cfgpp")
@@ -66,7 +54,7 @@ FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
 FLOW_NOISE_COUPLINGS = ("random", "sliced_ot")
 FLOW_REPA_MODES = ("pooled", "token", "both", "auto")
 TIME_SAMPLINGS = ("uniform", "logit-normal")
-TIME_SHIFT_MODES = ("manual", "dim")
+TIME_SHIFT_MODES = ("manual", "dim", "auto")
 AE_ARCHES = ("semantic", "residual", "hf-vae")
 FLOW_DISTILL_TEACHERS = ("raw", "ema", "auto")
 DEFAULT_GUIDANCE_INTERVAL = (0.0, 1.0)
@@ -86,60 +74,8 @@ def should_checkpoint_blocks(module):
     return bool(getattr(module, "checkpoint_blocks", False)
                 and module.training and torch.is_grad_enabled())
 
-
-def _batch(n, rng, size=32, device=DEV, return_specs=False):
-    imgs, conds, yc, ys, specs = [], [], [], [], []
-    side = image_side(size)
-    for _ in range(n):
-        spec = sample_object(rng)
-        specs.append(spec)
-        imgs.append(render_object(spec, size=side) * 2.0 - 1.0)
-        conds.append(fact_condition(object_facts(spec), device="cpu").numpy())
-        yc.append(COLOR_NAMES.index(spec.color))
-        ys.append(SHAPES.index(spec.shape))
-    x = torch.tensor(np.stack(imgs), dtype=torch.float32, device=device)
-    cond = torch.tensor(np.stack(conds), dtype=torch.float32, device=device)
-    yc = torch.tensor(yc, dtype=torch.long, device=device)
-    ys = torch.tensor(ys, dtype=torch.long, device=device)
-    if return_specs:
-        return x, cond, yc, ys, specs
-    return x, cond, yc, ys
-
-
-def split_prompt(s):
-    return str(s).lower().replace(".", " .").replace(",", " ,").split()
-
-
-def render_prompt(spec, rng=None, templates=DEFAULT_PROMPT_TEMPLATES, index=None):
-    if index is None:
-        index = 0 if rng is None else int(rng.integers(len(templates)))
-    tpl = templates[index % len(templates)]
-    return split_prompt(tpl.format(color=spec.color, shape=spec.shape, slot=spec.slot))
-
-
-def build_prompt_vocab(templates=DEFAULT_PROMPT_TEMPLATES):
-    toks = ["<pad>", "<unk>"]
-    for color in COLORS:
-        for shape in SHAPES:
-            spec = ObjectSpec("p0", color, shape)
-            for i in range(len(templates)):
-                toks.extend(render_prompt(spec, templates=templates, index=i))
-    return {tok: i for i, tok in enumerate(dict.fromkeys(toks))}
-
-
-def prompt_ids(specs, vocab, rng=None, templates=DEFAULT_PROMPT_TEMPLATES, device=DEV):
-    rows = [render_prompt(spec, rng=rng, templates=templates) for spec in specs]
-    max_len = max(len(r) for r in rows)
-    ids = torch.zeros((len(rows), max_len), dtype=torch.long, device=device)
-    unk = vocab_unknown_id(vocab)
-    for i, row in enumerate(rows):
-        ids[i, :len(row)] = torch.tensor([vocab.get(tok, unk) for tok in row],
-                                         dtype=torch.long, device=device)
-    return ids
-
-
 class SemanticAutoencoder(nn.Module):
-    """Small convolutional AE with fact heads on the compressed latent."""
+    """Small convolutional autoencoder for manifest image latents."""
 
     def __init__(self, latent_ch=16, hidden=64):
         super().__init__()
@@ -161,17 +97,6 @@ class SemanticAutoencoder(nn.Module):
             nn.ConvTranspose2d(hidden // 2, 3, 4, stride=2, padding=1),
             nn.Tanh(),
         )
-        self.fact_pool = nn.AdaptiveAvgPool2d((2, 2))
-        self.color = nn.Sequential(
-            nn.Linear(latent_ch * 4, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, len(COLORS)),
-        )
-        self.shape = nn.Sequential(
-            nn.Linear(latent_ch * 4, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, len(SHAPES)),
-        )
 
     def encode(self, x):
         return self.encoder(x)
@@ -179,16 +104,9 @@ class SemanticAutoencoder(nn.Module):
     def decode(self, z):
         return self.decoder(z)
 
-    def fact_logits(self, z):
-        pooled = self.fact_pool(z).flatten(1)
-        return {"color": self.color(pooled), "shape": self.shape(pooled)}
-
     def forward(self, x):
         z = self.encode(x)
-        out = self.fact_logits(z)
-        out["latent"] = z
-        out["recon"] = self.decode(z)
-        return out
+        return {"latent": z, "recon": self.decode(z)}
 
 
 def _norm(ch):
@@ -253,17 +171,6 @@ class ResidualAutoencoder(nn.Module):
             dec_ch = out_ch
         dec.extend([nn.GELU(), nn.Conv2d(dec_ch, 3, 3, padding=1), nn.Tanh()])
         self.decoder = nn.Sequential(*dec)
-        self.fact_pool = nn.AdaptiveAvgPool2d((2, 2))
-        self.color = nn.Sequential(
-            nn.Linear(latent_ch * 4, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, len(COLORS)),
-        )
-        self.shape = nn.Sequential(
-            nn.Linear(latent_ch * 4, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, len(SHAPES)),
-        )
 
     def encode(self, x):
         return self.encoder(x)
@@ -271,16 +178,9 @@ class ResidualAutoencoder(nn.Module):
     def decode(self, z):
         return self.decoder(z)
 
-    def fact_logits(self, z):
-        pooled = self.fact_pool(z).flatten(1)
-        return {"color": self.color(pooled), "shape": self.shape(pooled)}
-
     def forward(self, x):
         z = self.encode(x)
-        out = self.fact_logits(z)
-        out["latent"] = z
-        out["recon"] = self.decode(z)
-        return out
+        return {"latent": z, "recon": self.decode(z)}
 
 
 def _config_value(config, key, default=None):
@@ -1366,7 +1266,7 @@ class LatentFlowNet(nn.Module):
 
     def __init__(self, latent_ch=16, hidden=64, cond_dim=None):
         super().__init__()
-        cond_dim = cond_dim or len(FACT_VOCAB)
+        cond_dim = int(cond_dim or hidden)
         self.cond = nn.Sequential(
             nn.Linear(cond_dim, hidden),
             nn.GELU(),
@@ -1577,7 +1477,7 @@ class LatentDiTFlowNet(nn.Module):
             raise ValueError(f"unknown DiT positional embedding {pos_embed!r}")
         if pos_embed == "rope2d":
             raise ValueError("rope2d positional embedding is only supported by MM-DiT")
-        cond_dim = cond_dim or len(FACT_VOCAB)
+        cond_dim = int(cond_dim or hidden)
         self.latent_ch = int(latent_ch)
         self.latent_patch_size = latent_patch_size
         self.token_dim = self.latent_ch * self.latent_patch_size * self.latent_patch_size
@@ -1694,7 +1594,7 @@ class LatentCrossDiTFlowNet(nn.Module):
             raise ValueError(f"unknown DiT positional embedding {pos_embed!r}")
         if pos_embed == "rope2d":
             raise ValueError("rope2d positional embedding is only supported by MM-DiT")
-        cond_dim = cond_dim or len(FACT_VOCAB)
+        cond_dim = int(cond_dim or hidden)
         self.latent_ch = int(latent_ch)
         self.latent_patch_size = latent_patch_size
         self.token_dim = self.latent_ch * self.latent_patch_size * self.latent_patch_size
@@ -1954,7 +1854,7 @@ class LatentMMDiTFlowNet(nn.Module):
         pos_embed = str(pos_embed)
         if pos_embed not in DIT_POS_EMBEDS:
             raise ValueError(f"unknown DiT positional embedding {pos_embed!r}")
-        cond_dim = cond_dim or len(FACT_VOCAB)
+        cond_dim = int(cond_dim or hidden)
         self.latent_ch = int(latent_ch)
         self.latent_patch_size = latent_patch_size
         self.token_dim = self.latent_ch * self.latent_patch_size * self.latent_patch_size
@@ -2054,7 +1954,7 @@ class LatentMMDiTFlowNet(nn.Module):
 
 def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4,
               cond_dim=None, dit_head_width_mult=1, latent_max_tokens=256,
-              dit_qk_norm=False, dit_attn_impl="manual", dit_pos_embed="learned",
+              dit_qk_norm=False, dit_attn_impl="auto", dit_pos_embed="learned",
               dit_mlp="gelu", latent_patch_size=1, flow_checkpoint_blocks=False):
     latent_patch_size = int(latent_patch_size)
     if latent_patch_size <= 0:
@@ -2162,14 +2062,6 @@ def _parse_number_list(s, cast=float):
     return tuple(cast(x.strip()) for x in str(s).split(",") if x.strip())
 
 
-def _parse_templates(s):
-    if not s:
-        return DEFAULT_PROMPT_TEMPLATES
-    if isinstance(s, (tuple, list)):
-        return tuple(str(x) for x in s if str(x).strip())
-    return tuple(x.strip() for x in str(s).split(";") if x.strip())
-
-
 def _parse_string_list(s):
     if isinstance(s, (tuple, list)):
         return tuple(str(x).strip() for x in s if str(x).strip())
@@ -2247,12 +2139,17 @@ def resolve_time_shift(time_shift=1.0, mode="manual", latent_shape=None,
     if ref_dim <= 0.0:
         raise ValueError("time_shift_ref_dim must be positive")
     dim_power = float(dim_power)
-    if mode == "manual":
-        effective_dim = latent_effective_dim(latent_shape) if latent_shape is not None else 0
+    effective_dim = latent_effective_dim(latent_shape) if latent_shape is not None else 0
+    effective_mode = mode
+    if mode == "auto":
+        effective_mode = "dim" if effective_dim > ref_dim else "manual"
+    if effective_mode == "manual":
         return {
             "time_shift": base,
             "time_shift_requested": base,
             "time_shift_mode": mode,
+            "time_shift_effective_mode": effective_mode,
+            "time_shift_auto_policy": "dim_when_latent_dim_exceeds_ref",
             "time_shift_ref_dim": float(ref_dim),
             "time_shift_dim_power": float(dim_power),
             "latent_effective_dim": int(effective_dim),
@@ -2260,7 +2157,6 @@ def resolve_time_shift(time_shift=1.0, mode="manual", latent_shape=None,
         }
     if latent_shape is None:
         raise ValueError("dimension-aware time shift requires a latent shape")
-    effective_dim = latent_effective_dim(latent_shape)
     scale = (float(effective_dim) / ref_dim) ** dim_power
     if not math.isfinite(scale) or scale <= 0.0:
         raise ValueError("dimension-aware time shift produced a non-positive scale")
@@ -2268,6 +2164,8 @@ def resolve_time_shift(time_shift=1.0, mode="manual", latent_shape=None,
         "time_shift": float(base * scale),
         "time_shift_requested": base,
         "time_shift_mode": mode,
+        "time_shift_effective_mode": effective_mode,
+        "time_shift_auto_policy": "dim_when_latent_dim_exceeds_ref",
         "time_shift_ref_dim": float(ref_dim),
         "time_shift_dim_power": float(dim_power),
         "latent_effective_dim": int(effective_dim),
@@ -2398,56 +2296,6 @@ def denormalize_latent(z, stats):
     mean = stats["mean"].to(device=z.device, dtype=z.dtype)
     std = stats["std"].to(device=z.device, dtype=z.dtype)
     return z * std + mean
-
-
-@torch.no_grad()
-def estimate_latent_stats(ae, n=512, batch=64, seed=123, size=32, device=DEV,
-                          mode="none", eps=1.0e-6):
-    mode = str(mode)
-    if mode == "none":
-        return {"mode": "none", "n": 0}
-    if mode not in ("global", "channel"):
-        raise ValueError(f"unknown latent normalization mode {mode!r}")
-    n = max(1, int(n))
-    rng = np.random.default_rng(seed)
-    ae.eval()
-    count = 0
-    seen = 0
-    sums = sums2 = None
-    while seen < n:
-        b = min(batch, n - seen)
-        x, _cond, _yc, _ys = _batch(b, rng, size=size, device=device)
-        z = ae.encode(x).detach().float().cpu().double()
-        if mode == "global":
-            cur_sum = z.sum()
-            cur_sum2 = z.pow(2).sum()
-            cur_count = z.numel()
-        else:
-            cur_sum = z.sum(dim=(0, 2, 3))
-            cur_sum2 = z.pow(2).sum(dim=(0, 2, 3))
-            cur_count = z.shape[0] * z.shape[2] * z.shape[3]
-        if sums is None:
-            sums = torch.zeros_like(cur_sum)
-            sums2 = torch.zeros_like(cur_sum2)
-        sums += cur_sum
-        sums2 += cur_sum2
-        count += int(cur_count)
-        seen += b
-    mean = sums / max(1, count)
-    var = (sums2 / max(1, count) - mean.pow(2)).clamp_min(float(eps) ** 2)
-    std = var.sqrt()
-    if mode == "global":
-        mean = mean.view(1, 1, 1, 1)
-        std = std.view(1, 1, 1, 1)
-    else:
-        mean = mean.view(1, -1, 1, 1)
-        std = std.view(1, -1, 1, 1)
-    return {
-        "mode": mode,
-        "n": int(seen),
-        "mean": mean.float(),
-        "std": std.float(),
-    }
 
 
 @torch.no_grad()
@@ -3767,16 +3615,6 @@ def reconstruction_loss_parts(pred, target, mode="mse", grad_w=0.0, ms_w=0.0,
     return loss, parts
 
 
-def autoencoder_loss(out, x, yc, ys, fact_w=0.25, recon_loss="mse", grad_w=0.0,
-                     ms_w=0.0, fft_w=0.0, latent_reg_w=0.0):
-    recon, parts = reconstruction_loss_parts(
-        out["recon"], x, mode=recon_loss, grad_w=grad_w, ms_w=ms_w,
-        fft_w=fft_w, latent=out.get("latent"), latent_reg_w=latent_reg_w)
-    facts = F.cross_entropy(out["color"], yc) + F.cross_entropy(out["shape"], ys)
-    parts["fact_ce"] = facts.detach()
-    return recon + fact_w * facts, parts
-
-
 def flow_uses_cond_tokens(flow):
     return bool(getattr(flow, "uses_cond_tokens", False))
 
@@ -4217,13 +4055,6 @@ def condition_batch(cond):
     return int(condition_vector(cond).shape[0])
 
 
-def fact_condition_or_none(cond):
-    vec = condition_vector(cond)
-    if vec.ndim == 2 and vec.shape[1] == len(FACT_VOCAB):
-        return vec
-    return None
-
-
 def zero_condition(cond):
     if not isinstance(cond, dict):
         return torch.zeros_like(cond)
@@ -4358,30 +4189,6 @@ def condition_active_mask(cond, keepdim=False):
     return active[:, None] if keepdim else active
 
 
-def semantic_guidance_step(ae, z, fact_cond, weight=0.0, step_size=1.0, mode="decoded",
-                           eps=1.0e-6):
-    """Classifier-style latent guidance using the learned semantic AE heads."""
-    if weight <= 0.0:
-        return z
-    if fact_cond is None:
-        raise ValueError("semantic guidance requires canonical fact conditions")
-    if mode not in ("latent", "decoded"):
-        raise ValueError(f"unknown semantic guidance mode {mode!r}")
-    z_var = z.detach().requires_grad_(True)
-    with torch.enable_grad():
-        if mode == "latent":
-            logits = ae.fact_logits(z_var)
-        else:
-            logits = ae(ae.decode(z_var))                  # decode/re-read, matching eval
-        loss, _parts = semantic_fact_loss_from_logits(logits, fact_cond,
-                                                      suffix="_guidance_ce")
-        grad = torch.autograd.grad(loss, z_var, allow_unused=False)[0]
-    flat = grad.flatten(1)
-    denom = flat.norm(dim=1).view((-1,) + (1,) * (grad.ndim - 1)).clamp_min(float(eps))
-    guided = z_var - float(weight) * float(step_size) * grad / denom
-    return guided.detach()
-
-
 def text_alignment_guidance_step(text_aligner, z, cond, weight=0.0, step_size=1.0,
                                  eps=1.0e-6):
     """Sampling-time latent guidance toward a learned image/text alignment score."""
@@ -4437,277 +4244,6 @@ def image_quality_guidance_step(scorer, z, weight=0.0, step_size=1.0, eps=1.0e-6
     denom = flat.norm(dim=1).view((-1,) + (1,) * (grad.ndim - 1)).clamp_min(float(eps))
     guided = z_var + float(weight) * abs(float(step_size)) * grad / denom
     return guided.detach()
-
-
-def semantic_fact_loss_from_logits(logits, cond, suffix="_endpoint_ce"):
-    losses = {}
-    for pred, idxs in FACT_GROUPS.items():
-        if pred not in logits:
-            continue
-        if logits[pred].shape[-1] != len(idxs):
-            raise ValueError(
-                f"fact head {pred!r} has {logits[pred].shape[-1]} classes, "
-                f"but FACT_VOCAB has {len(idxs)}"
-            )
-        group = cond[:, list(idxs)]
-        active = group.sum(dim=1) > 0
-        if not bool(active.any()):
-            continue
-        target = group[active].argmax(dim=1)
-        losses[pred] = F.cross_entropy(logits[pred][active], target)
-    if not losses:
-        zero = sum(v.sum() for v in logits.values()) * 0.0
-        return zero, {}
-    loss = sum(losses.values()) / len(losses)
-    parts = {f"{pred}{suffix}": val.detach() for pred, val in losses.items()}
-    return loss, parts
-
-
-def semantic_endpoint_loss(ae, z_clean, cond):
-    """REPA-style endpoint alignment: clean latent should decode to conditioned facts."""
-    return semantic_fact_loss_from_logits(ae.fact_logits(z_clean), cond)
-
-
-def fact_targets_from_condition(cond):
-    targets = {}
-    active = {}
-    for pred, idxs in FACT_GROUPS.items():
-        group = cond[:, list(idxs)]
-        targets[pred] = group.argmax(dim=1)
-        active[pred] = group.sum(dim=1) > 0
-    return targets, active
-
-
-@torch.no_grad()
-def latent_intervention_diagnostic(ae, n=64, batch=64, seed=123, size=32, device=DEV,
-                                   strength=1.0):
-    """Probe whether latent fact directions are reusable and minimally entangled.
-
-    The probe is intentionally data-derived: it estimates one prototype latent per fact value,
-    edits held-out latents with prototype differences, then asks whether only the requested fact
-    changes after decoding/re-encoding. This measures the FER/UFR property without injecting
-    symbolic rendering rules into the model.
-    """
-    n = int(n)
-    if n <= 0:
-        return {}
-    ae.eval()
-    rng = np.random.default_rng(seed)
-    proto_n = max(n, sum(len(idxs) for idxs in FACT_GROUPS.values()) * 4)
-    sums = counts = None
-    total = 0
-    while total < proto_n:
-        b = min(batch, proto_n - total)
-        x, cond, _yc, _ys = _batch(b, rng, size=size, device=device)
-        z = ae.encode(x)
-        targets, active = fact_targets_from_condition(cond)
-        if sums is None:
-            sums = {
-                pred: torch.zeros((len(idxs),) + tuple(z.shape[1:]), device=device)
-                for pred, idxs in FACT_GROUPS.items()
-            }
-            counts = {
-                pred: torch.zeros((len(idxs),), dtype=torch.long, device=device)
-                for pred, idxs in FACT_GROUPS.items()
-            }
-        for pred, idxs in FACT_GROUPS.items():
-            for val in range(len(idxs)):
-                mask = active[pred] & targets[pred].eq(val)
-                if bool(mask.any()):
-                    sums[pred][val] += z[mask].sum(dim=0)
-                    counts[pred][val] += int(mask.sum())
-        total += b
-
-    prototypes = {}
-    for pred, vals in sums.items():
-        valid = counts[pred] > 0
-        if int(valid.sum()) < 2:
-            continue
-        denom = counts[pred].clamp_min(1).to(vals.dtype).view((-1,) + (1,) * (vals.ndim - 1))
-        prototypes[pred] = vals / denom
-
-    latent_target_ok = image_target_ok = target_total = 0
-    collateral_ok = collateral_total = 0
-    pred_target = {pred: [0, 0] for pred in prototypes}
-    pred_collateral = {pred: [0, 0] for pred in prototypes}
-    total = 0
-    while total < n:
-        b = min(batch, n - total)
-        x, cond, _yc, _ys = _batch(b, rng, size=size, device=device)
-        z = ae.encode(x)
-        targets, active = fact_targets_from_condition(cond)
-        for pred, proto in prototypes.items():
-            classes = proto.shape[0]
-            mask = active[pred]
-            if not bool(mask.any()) or classes < 2:
-                continue
-            z_src = z[mask]
-            src = targets[pred][mask]
-            target = (src + 1) % classes
-            delta = proto[target] - proto[src]
-            z_edit = z_src + float(strength) * delta
-            latent_logits = ae.fact_logits(z_edit)
-            image = ae.decode(z_edit).clamp(-1.0, 1.0)
-            image_logits = ae(image)
-            latent_pred = latent_logits[pred].argmax(dim=1)
-            image_pred = image_logits[pred].argmax(dim=1)
-            ok_latent = int(latent_pred.eq(target).sum())
-            ok_image = int(image_pred.eq(target).sum())
-            count = int(target.numel())
-            latent_target_ok += ok_latent
-            image_target_ok += ok_image
-            target_total += count
-            pred_target[pred][0] += ok_image
-            pred_target[pred][1] += count
-            for other in prototypes:
-                if other == pred or other not in image_logits:
-                    continue
-                other_src = targets[other][mask]
-                other_ok = int(image_logits[other].argmax(dim=1).eq(other_src).sum())
-                collateral_ok += other_ok
-                collateral_total += count
-                pred_collateral[other][0] += other_ok
-                pred_collateral[other][1] += count
-        total += b
-
-    def div(num, den):
-        return float(num / den) if den else 0.0
-
-    target_acc = div(image_target_ok, target_total)
-    collateral_acc = div(collateral_ok, collateral_total)
-    return {
-        "latent_intervention_n": int(target_total),
-        "latent_intervention_strength": float(strength),
-        "latent_intervention_direct_target_acc": div(latent_target_ok, target_total),
-        "latent_intervention_image_target_acc": target_acc,
-        "latent_intervention_collateral_acc": collateral_acc,
-        "latent_intervention_score": float(target_acc * collateral_acc),
-        "latent_intervention_target_by_fact": {
-            pred: div(ok, total) for pred, (ok, total) in pred_target.items() if total
-        },
-        "latent_intervention_collateral_by_fact": {
-            pred: div(ok, total) for pred, (ok, total) in pred_collateral.items() if total
-        },
-    }
-
-
-def latent_intervention_training_loss(ae, z, cond, strength=1.0, decoded_w=1.0,
-                                      collateral_w=1.0):
-    """Differentiable version of the intervention probe for semantic AE training.
-
-    Prototypes are estimated from the current batch and detached. The optimizer therefore learns
-    to make fact directions usable without being allowed to satisfy the loss by moving the
-    prototype targets themselves inside the same step.
-    """
-    targets, active = fact_targets_from_condition(cond)
-    available_logits = ae.fact_logits(z)
-    losses = []
-    direct_losses, decoded_losses, collateral_losses = [], [], []
-    n_edits = 0
-    for pred, idxs in FACT_GROUPS.items():
-        if pred not in available_logits:
-            continue
-        present = [val for val in range(len(idxs))
-                   if bool((active[pred] & targets[pred].eq(val)).any())]
-        if len(present) < 2:
-            continue
-        prototypes = {}
-        for val in present:
-            mask = active[pred] & targets[pred].eq(val)
-            prototypes[val] = z[mask].detach().mean(dim=0)
-        for pos, src_val in enumerate(present):
-            mask = active[pred] & targets[pred].eq(src_val)
-            if not bool(mask.any()):
-                continue
-            tgt_val = present[(pos + 1) % len(present)]
-            z_edit = z[mask] + float(strength) * (prototypes[tgt_val] - prototypes[src_val])
-            tgt = torch.full((z_edit.shape[0],), tgt_val, dtype=torch.long, device=z.device)
-            direct_logits = ae.fact_logits(z_edit)
-            decoded = ae.decode(z_edit)
-            decoded_logits = ae(decoded)
-            direct = F.cross_entropy(direct_logits[pred], tgt)
-            decoded_target = F.cross_entropy(decoded_logits[pred], tgt)
-            step_losses = [direct, decoded_w * decoded_target]
-            direct_losses.append(direct)
-            decoded_losses.append(decoded_target)
-            n_edits += int(z_edit.shape[0])
-            for other, _other_idxs in FACT_GROUPS.items():
-                if other == pred or other not in decoded_logits:
-                    continue
-                other_tgt = targets[other][mask]
-                other_loss = F.cross_entropy(decoded_logits[other], other_tgt)
-                step_losses.append(collateral_w * other_loss)
-                collateral_losses.append(other_loss)
-            losses.append(sum(step_losses) / len(step_losses))
-    if not losses:
-        zero = z.sum() * 0.0
-        return zero, {
-            "intervention_loss": zero.detach(),
-            "intervention_edits": torch.tensor(0.0, device=z.device),
-        }
-    total = sum(losses) / len(losses)
-
-    def mean_or_zero(vals):
-        return (sum(vals) / len(vals)).detach() if vals else total.detach() * 0.0
-
-    return total, {
-        "intervention_loss": total.detach(),
-        "intervention_direct_ce": mean_or_zero(direct_losses),
-        "intervention_decoded_ce": mean_or_zero(decoded_losses),
-        "intervention_collateral_ce": mean_or_zero(collateral_losses),
-        "intervention_edits": torch.tensor(float(n_edits), device=z.device),
-    }
-
-
-def latent_factor_orthogonality_loss(z, cond, eps=1.0e-6):
-    """Penalize overlap between data-derived latent fact subspaces.
-
-    FER shows up when factors are accurate but internally tangled.  This loss estimates one latent
-    prototype per fact value from the current batch, centers those prototypes within each predicate,
-    and discourages different predicate subspaces from pointing in the same latent directions.  It
-    is generic over FACT_VOCAB predicate groups; no color/shape-specific rule is injected.
-    """
-    targets, active = fact_targets_from_condition(cond)
-    bases = {}
-    basis_count = 0
-    for pred, idxs in FACT_GROUPS.items():
-        present = [val for val in range(len(idxs))
-                   if bool((active[pred] & targets[pred].eq(val)).any())]
-        if len(present) < 2:
-            continue
-        protos = []
-        for val in present:
-            mask = active[pred] & targets[pred].eq(val)
-            protos.append(z[mask].mean(dim=0))
-        flat = torch.stack(protos).flatten(1)
-        flat = flat - flat.mean(dim=0, keepdim=True)
-        norms = flat.norm(dim=1)
-        keep = norms > float(eps)
-        if not bool(keep.any()):
-            continue
-        basis = flat[keep] / norms[keep, None].clamp_min(float(eps))
-        bases[pred] = basis
-        basis_count += int(basis.shape[0])
-
-    preds = sorted(bases)
-    losses = []
-    for i, pred_a in enumerate(preds):
-        for pred_b in preds[i + 1:]:
-            sim = bases[pred_a].matmul(bases[pred_b].transpose(0, 1))
-            losses.append(sim.pow(2).mean())
-    if not losses:
-        zero = z.sum() * 0.0
-        return zero, {
-            "factor_orth_loss": zero.detach(),
-            "factor_orth_pairs": torch.tensor(0.0, device=z.device),
-            "factor_orth_bases": torch.tensor(float(basis_count), device=z.device),
-        }
-    total = sum(losses) / len(losses)
-    return total, {
-        "factor_orth_loss": total.detach(),
-        "factor_orth_pairs": torch.tensor(float(len(losses)), device=z.device),
-        "factor_orth_bases": torch.tensor(float(basis_count), device=z.device),
-    }
 
 
 def couple_flow_noise_to_data(x0, z1, mode="random", projections=1, eps=1.0e-8):
@@ -4794,8 +4330,8 @@ def flow_repa_mode_id(mode):
     return float(FLOW_REPA_MODES.index(str(mode)) if str(mode) in FLOW_REPA_MODES else -1)
 
 
-def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
-                       semantic_cond=None, time_sampling="uniform", time_logit_mean=0.0,
+def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
+                       time_sampling="uniform", time_logit_mean=0.0,
                        time_logit_std=1.0, time_shift=1.0,
                        latent_stats=None, consistency_w=0.0,
                        endpoint_w=0.0,
@@ -4884,14 +4420,6 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
         total = total + float(consistency_w) * consistency
         parts["endpoint_consistency_mse"] = consistency.detach()
     z_clean = None
-    if ae is not None and semantic_w > 0.0:
-        z_clean = denormalize_latent(endpoint_pred, latent_stats)
-        sem_cond = cond if semantic_cond is None else semantic_cond
-        keep = condition_active_mask(cond_model, keepdim=True).to(sem_cond.dtype)
-        semantic, sem_parts = semantic_endpoint_loss(ae, z_clean, sem_cond * keep)
-        total = total + semantic_w * semantic
-        parts["semantic_endpoint_ce"] = semantic.detach()
-        parts.update(sem_parts)
     if text_aligner is not None and text_align_w > 0.0:
         if z_clean is None:
             z_clean = denormalize_latent(endpoint_pred, latent_stats)
@@ -5161,23 +4689,6 @@ def latent_flow_loss(flow, z1, cond, cond_drop=0.0, time_sampling="uniform",
                                       flow_loss_weight_gamma=flow_loss_weight_gamma,
                                       flow_loss_weight_normalize=flow_loss_weight_normalize)
     return loss
-
-
-def model_condition(specs, fact_cond, cond_mode="facts", conditioner=None, prompt_vocab=None,
-                    prompt_templates=DEFAULT_PROMPT_TEMPLATES, rng=None, device=DEV,
-                    return_tokens=False):
-    if cond_mode == "facts":
-        if return_tokens:
-            mask = torch.zeros((fact_cond.shape[0], 1), dtype=torch.bool, device=fact_cond.device)
-            return {"vec": fact_cond, "tokens": fact_cond[:, None, :], "mask": mask}
-        return fact_cond
-    if cond_mode == "text":
-        if conditioner is None or prompt_vocab is None:
-            raise ValueError("text conditioning requires conditioner and prompt_vocab")
-        ids = prompt_ids(specs, prompt_vocab, rng=rng, templates=prompt_templates, device=device)
-        return conditioner(ids, return_tokens=text_condition_return_tokens(
-            conditioner, return_tokens=return_tokens))
-    raise ValueError(f"unknown condition mode {cond_mode!r}")
 
 
 def caption_condition(captions, conditioner, vocab, max_len=64, device=DEV, return_tokens=False):
@@ -5679,10 +5190,8 @@ def guided_velocity(flow, z, t, cond, cfg_scale=1.0, cfg_rescale=0.0, cfg_uncond
 @torch.no_grad()
 def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0,
                    cfg_scale=1.0, cfg_rescale=0.0, ae=None,
-                   semantic_cond=None, semantic_guidance_w=0.0,
-                   semantic_guidance_mode="decoded", sample_method="euler",
+                   sample_method="euler",
                    cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
-                   semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                    sample_time_shift=1.0, sample_schedule="linear", cfg_uncond=None,
                    sample_churn=0.0, sample_churn_interval=DEFAULT_CHURN_INTERVAL,
                    text_guidance_w=0.0, text_guidance_aligner=None,
@@ -5705,10 +5214,6 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
     flow.eval()
     if ae is not None:
         ae.eval()
-    if semantic_cond is None:
-        semantic_cond = fact_condition_or_none(cond)
-    if semantic_guidance_w > 0.0 and ae is None:
-        raise ValueError("semantic guidance requires ae")
     if text_guidance_w < 0.0:
         raise ValueError("text_guidance_w must be non-negative")
     if text_guidance_w > 0.0 and text_guidance_aligner is None:
@@ -5755,8 +5260,6 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
     if cfg_mode not in CFG_MODES:
         raise ValueError(f"unknown cfg_mode {cfg_mode!r}")
     cfg_interval = validate_guidance_interval(cfg_interval, name="cfg_interval")
-    semantic_guidance_interval = validate_guidance_interval(
-        semantic_guidance_interval, name="semantic_guidance_interval")
     sample_churn_interval = validate_guidance_interval(
         sample_churn_interval, name="sample_churn_interval")
     text_guidance_interval = validate_guidance_interval(
@@ -5838,14 +5341,6 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         else:
             raise ValueError(f"unknown sample method {sample_method!r}")
         z = stabilize_latent(z)
-        if (semantic_guidance_w > 0.0
-                and interval_active(t_scalar, semantic_guidance_interval)):
-            z_raw = denormalize_latent(z, latent_stats)
-            z_raw = semantic_guidance_step(ae, z_raw, semantic_cond,
-                                           weight=semantic_guidance_w,
-                                           step_size=dt, mode=semantic_guidance_mode)
-            z = normalize_latent(z_raw, latent_stats)
-            z = stabilize_latent(z)
         if (text_guidance_w > 0.0
                 and interval_active(t_scalar, text_guidance_interval)):
             z_raw = denormalize_latent(z, latent_stats)
@@ -5885,10 +5380,8 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
 @torch.no_grad()
 def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, seed=0,
                   cfg_scale=1.0, cfg_rescale=0.0,
-                  semantic_cond=None, semantic_guidance_w=0.0,
-                  semantic_guidance_mode="decoded", sample_method="euler",
+                  sample_method="euler",
                   cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
-                  semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                   sample_time_shift=1.0, sample_schedule="linear", cfg_uncond=None,
                   sample_churn=0.0, sample_churn_interval=DEFAULT_CHURN_INTERVAL,
                   text_guidance_w=0.0, text_guidance_aligner=None,
@@ -5904,11 +5397,7 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
     latent_out = sample_latents(
         flow, cond, latent_shape=latent_shape, steps=steps, device=device,
         seed=seed, cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
-        ae=ae, semantic_cond=semantic_cond,
-        semantic_guidance_w=semantic_guidance_w,
-        semantic_guidance_mode=semantic_guidance_mode,
-        sample_method=sample_method, cfg_interval=cfg_interval,
-        semantic_guidance_interval=semantic_guidance_interval,
+        ae=ae, sample_method=sample_method, cfg_interval=cfg_interval,
         sample_time_shift=sample_time_shift,
         sample_schedule=sample_schedule, cfg_uncond=cfg_uncond,
         sample_churn=sample_churn,
@@ -6116,17 +5605,6 @@ def write_sample_manifest(samples, manifest_path, captions, image_dir="", metada
     }
 
 
-def make_condition_grid_specs(samples_per_combo=1):
-    samples_per_combo = int(samples_per_combo)
-    if samples_per_combo <= 0:
-        raise ValueError("samples_per_combo must be positive")
-    specs = []
-    for color in COLORS:
-        for shape in SHAPES:
-            specs.extend(ObjectSpec("p0", color, shape) for _ in range(samples_per_combo))
-    return specs, len(COLORS), len(SHAPES) * samples_per_combo
-
-
 @torch.no_grad()
 def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1,
                              text_aligner=None, image_feature_aligner=None,
@@ -6238,103 +5716,6 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
             selected_scores.max().detach().cpu())
     meta.update(selection_meta)
     return chosen.contiguous(), meta
-
-
-@torch.no_grad()
-def save_sample_grid(ae, flow, path, size=32, device=DEV, cond_mode="facts", conditioner=None,
-                     prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
-                     cfg_scale=1.0, cfg_rescale=0.0,
-                     sample_steps=4, sample_method="euler",
-                     semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
-                     cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
-                     semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-                     samples_per_combo=1, seed=0, sample_time_shift=1.0,
-                     sample_schedule="linear", sample_churn=0.0,
-                     sample_churn_interval=DEFAULT_CHURN_INTERVAL,
-                     sample_finite_guard=False, sample_velocity_clip=0.0,
-                     sample_latent_clip=0.0, cfg_mode="standard",
-                     sample_manifest_out="", sample_image_dir=""):
-    ae.eval()
-    flow.eval()
-    specs, rows, cols = make_condition_grid_specs(samples_per_combo=samples_per_combo)
-    fact_rows = [
-        fact_condition(object_facts(spec), device=device).detach().cpu().numpy()
-        for spec in specs
-    ]
-    fact_cond = torch.tensor(np.stack(fact_rows), dtype=torch.float32, device=device)
-    rng = np.random.default_rng(seed)
-    cond = model_condition(specs, fact_cond, cond_mode=cond_mode, conditioner=conditioner,
-                           prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
-                           rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
-    sample, trace = sample_images(
-        ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
-        steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
-        cfg_rescale=cfg_rescale,
-        semantic_cond=fact_cond, semantic_guidance_w=semantic_guidance_w,
-        semantic_guidance_mode=semantic_guidance_mode,
-        sample_method=sample_method, cfg_interval=cfg_interval,
-        semantic_guidance_interval=semantic_guidance_interval,
-        sample_time_shift=sample_time_shift,
-        sample_schedule=sample_schedule,
-        sample_churn=sample_churn,
-        sample_churn_interval=sample_churn_interval,
-        sample_finite_guard=sample_finite_guard,
-        sample_velocity_clip=sample_velocity_clip,
-        sample_latent_clip=sample_latent_clip,
-        cfg_mode=cfg_mode,
-        return_trace=True)
-    meta = write_ppm_grid(sample, path, rows=rows, cols=cols)
-    meta.update({
-        "sample_grid_cfg_scale": float(cfg_scale),
-        "sample_grid_cfg_rescale": float(cfg_rescale),
-        "sample_grid_cfg_mode": cfg_mode,
-        "sample_grid_sample_steps": int(sample_steps),
-        "sample_grid_sample_time_shift": float(sample_time_shift),
-        "sample_grid_sample_method": sample_method,
-        "sample_grid_sample_schedule": sample_schedule,
-        "sample_grid_sample_churn": float(sample_churn),
-        "sample_grid_sample_churn_interval": list(validate_guidance_interval(
-            sample_churn_interval, name="sample_churn_interval")),
-        "sample_grid_cfg_interval": list(validate_guidance_interval(cfg_interval)),
-        "sample_grid_semantic_guidance_w": float(semantic_guidance_w),
-        "sample_grid_semantic_guidance_mode": semantic_guidance_mode,
-        "sample_grid_semantic_guidance_interval": list(validate_guidance_interval(
-            semantic_guidance_interval)),
-        "sample_grid_cond_mode": cond_mode,
-        "sample_grid_seed": int(seed),
-        "sample_grid_samples_per_combo": int(samples_per_combo),
-    })
-    meta.update(prefix_sample_trace(trace, "sample_grid"))
-    meta.update(sample_health_metrics(sample, prefix="sample_grid"))
-    if sample_manifest_out:
-        captions = [
-            " ".join(render_prompt(spec, templates=prompt_templates, index=0))
-            .replace(" .", ".").replace(" ,", ",")
-            for spec in specs
-        ]
-        row_meta = [
-            {
-                "conditioning_mode": cond_mode,
-                "conditioning_color": spec.color,
-                "conditioning_shape": spec.shape,
-                "conditioning_slot": spec.slot,
-            }
-            for spec in specs
-        ]
-        meta.update(write_sample_manifest(
-            sample, sample_manifest_out, captions, image_dir=sample_image_dir,
-            metadata={
-                "sample_grid": path,
-                "sample_cfg_scale": float(cfg_scale),
-                "sample_cfg_rescale": float(cfg_rescale),
-                "sample_cfg_mode": cfg_mode,
-                "sample_steps": int(sample_steps),
-                "sample_method": sample_method,
-                "sample_schedule": sample_schedule,
-                "sample_seed": int(seed),
-            },
-            row_metadata=row_meta, prefix="fact_sample"))
-    return meta
 
 
 @torch.no_grad()
@@ -6632,224 +6013,6 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
             },
             row_metadata=row_meta, prefix="prompt_sample"))
     return meta
-
-
-@torch.no_grad()
-def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, cfg_rescale=0.0,
-                          sample_steps=4, samples_per_combo=1, seed=20, cond_mode="facts",
-                          conditioner=None,
-                          prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
-                          semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
-                          sample_method="euler", cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
-                          semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-                          sample_time_shift=1.0, sample_schedule="linear",
-                          sample_churn=0.0,
-                          sample_churn_interval=DEFAULT_CHURN_INTERVAL,
-                          sample_finite_guard=False, sample_velocity_clip=0.0,
-                          sample_latent_clip=0.0, cfg_mode="standard"):
-    """Generate from every canonical color/shape request and re-read facts from the image."""
-    samples_per_combo = int(samples_per_combo)
-    if samples_per_combo <= 0:
-        return {
-            "sample_roundtrip_n": 0,
-            "sample_roundtrip_color_acc": 0.0,
-            "sample_roundtrip_shape_acc": 0.0,
-            "sample_roundtrip_both_acc": 0.0,
-            "conditional_sample_mse": 0.0,
-        }
-    ae.eval()
-    flow.eval()
-    got_c = got_s = got_both = total = 0
-    mses = []
-    side = image_side(size)
-    latent_shape = ae_latent_shape(ae, size)
-    for ci, color in enumerate(COLORS):
-        for si, shape in enumerate(SHAPES):
-            spec = ObjectSpec("p0", color, shape)
-            fact_cond = fact_condition(object_facts(spec), device=device)[None].repeat(
-                samples_per_combo, 1)
-            specs = [spec] * samples_per_combo
-            rng = np.random.default_rng(seed + ci * 101 + si * 17)
-            cond = model_condition(specs, fact_cond, cond_mode=cond_mode,
-                                   conditioner=conditioner, prompt_vocab=prompt_vocab,
-                                   prompt_templates=prompt_templates, rng=rng, device=device,
-                                   return_tokens=flow_uses_cond_tokens(flow))
-            sample = sample_images(ae, flow, cond, latent_shape=latent_shape, steps=sample_steps,
-                                   device=device, seed=seed + ci * 101 + si * 17,
-                                   cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
-                                   semantic_cond=fact_cond,
-                                   semantic_guidance_w=semantic_guidance_w,
-                                   semantic_guidance_mode=semantic_guidance_mode,
-                                   sample_method=sample_method, cfg_interval=cfg_interval,
-                                   semantic_guidance_interval=semantic_guidance_interval,
-                                   sample_time_shift=sample_time_shift,
-                                   sample_schedule=sample_schedule,
-                                   sample_churn=sample_churn,
-                                   sample_churn_interval=sample_churn_interval,
-                                   sample_finite_guard=sample_finite_guard,
-                                   sample_velocity_clip=sample_velocity_clip,
-                                   sample_latent_clip=sample_latent_clip,
-                                   cfg_mode=cfg_mode)
-            out = ae(sample)
-            pc = out["color"].argmax(-1)
-            ps = out["shape"].argmax(-1)
-            target_c = torch.full((samples_per_combo,), ci, dtype=torch.long, device=device)
-            target_s = torch.full((samples_per_combo,), si, dtype=torch.long, device=device)
-            ok_c = pc.eq(target_c)
-            ok_s = ps.eq(target_s)
-            got_c += int(ok_c.sum())
-            got_s += int(ok_s.sum())
-            got_both += int((ok_c & ok_s).sum())
-            total += samples_per_combo
-            target = torch.tensor(render_object(spec, size=side) * 2.0 - 1.0,
-                                  dtype=torch.float32, device=device)[None]
-            target = target.expand_as(sample)
-            mses.append(float(F.mse_loss(sample, target).detach().cpu()))
-    return {
-        "sample_roundtrip_n": int(total),
-        "sample_roundtrip_color_acc": got_c / total,
-        "sample_roundtrip_shape_acc": got_s / total,
-        "sample_roundtrip_both_acc": got_both / total,
-        "conditional_sample_mse": float(np.mean(mses)),
-    }
-
-
-@torch.no_grad()
-def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=1.0,
-             cfg_rescale=0.0, sample_steps=4, roundtrip_samples=1, cond_mode="facts",
-             conditioner=None, prompt_vocab=None, prompt_templates=DEFAULT_PROMPT_TEMPLATES,
-             intervention_samples=0, semantic_guidance_w=0.0,
-             semantic_guidance_mode="decoded", sample_method="euler",
-             cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
-             semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-             sample_time_shift=1.0, sample_schedule="linear", time_shift=1.0,
-             sample_churn=0.0, sample_churn_interval=DEFAULT_CHURN_INTERVAL,
-             sample_finite_guard=False, sample_velocity_clip=0.0,
-             sample_latent_clip=0.0, cfg_mode="standard"):
-    torch.manual_seed(seed)
-    rng = np.random.default_rng(seed)
-    ae.eval()
-    flow.eval()
-    recon_losses, flow_losses = [], []
-    endpoint_mses, endpoint_consistency_mses, endpoint_time_gaps = [], [], []
-    factor_orth_losses, factor_orth_pairs, factor_orth_bases = [], [], []
-    got_c = got_s = total = 0
-    latent_means, latent_stds = [], []
-    side = image_side(size)
-    while total < n:
-        b = min(batch, n - total)
-        x, fact_cond, yc, ys, specs = _batch(b, rng, size=size, device=device, return_specs=True)
-        out = ae(x)
-        z = out["latent"]
-        recon_losses.append(float(F.mse_loss(out["recon"], x).detach().cpu()))
-        factor_orth, factor_parts = latent_factor_orthogonality_loss(z, fact_cond)
-        if float(factor_parts["factor_orth_pairs"].detach().cpu()) > 0.0:
-            factor_orth_losses.append(float(factor_orth.detach().cpu()))
-            factor_orth_pairs.append(float(factor_parts["factor_orth_pairs"].detach().cpu()))
-            factor_orth_bases.append(float(factor_parts["factor_orth_bases"].detach().cpu()))
-        cond = model_condition(specs, fact_cond, cond_mode=cond_mode, conditioner=conditioner,
-                               prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
-                               rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
-        flow_losses.append(float(latent_flow_loss(
-            flow, z, cond, time_shift=time_shift).detach().cpu()))
-        endpoint_metrics = flow_endpoint_metrics(flow, z, cond, time_shift=time_shift)
-        endpoint_mses.append(endpoint_metrics["latent_endpoint_mse"])
-        endpoint_consistency_mses.append(endpoint_metrics["latent_endpoint_consistency_mse"])
-        endpoint_time_gaps.append(endpoint_metrics["latent_endpoint_time_gap"])
-        got_c += int(out["color"].argmax(-1).eq(yc).sum())
-        got_s += int(out["shape"].argmax(-1).eq(ys).sum())
-        latent_means.append(float(z.mean().detach().cpu()))
-        latent_stds.append(float(z.std().detach().cpu()))
-        total += b
-
-    spec = ObjectSpec("p0", "red", "circle")
-    fact_cond = fact_condition(object_facts(spec), device=device)[None]
-    cond = model_condition([spec], fact_cond, cond_mode=cond_mode, conditioner=conditioner,
-                           prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
-                           rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
-    sample, trace = sample_images(
-        ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
-        steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
-        cfg_rescale=cfg_rescale,
-        semantic_cond=fact_cond, semantic_guidance_w=semantic_guidance_w,
-        semantic_guidance_mode=semantic_guidance_mode,
-        sample_method=sample_method, cfg_interval=cfg_interval,
-        semantic_guidance_interval=semantic_guidance_interval,
-        sample_time_shift=sample_time_shift,
-        sample_schedule=sample_schedule,
-        sample_churn=sample_churn,
-        sample_churn_interval=sample_churn_interval,
-        sample_finite_guard=sample_finite_guard,
-        sample_velocity_clip=sample_velocity_clip,
-        sample_latent_clip=sample_latent_clip,
-        cfg_mode=cfg_mode,
-        return_trace=True)
-    target = torch.tensor(render_object(spec, size=side) * 2.0 - 1.0,
-                          dtype=torch.float32, device=device)[None]
-    report = {
-        "n": int(total),
-        "recon_mse": float(np.mean(recon_losses)),
-        "latent_velocity_mse": float(np.mean(flow_losses)),
-        "latent_color_acc": got_c / total,
-        "latent_shape_acc": got_s / total,
-        "latent_mean": float(np.mean(latent_means)),
-        "latent_std": float(np.mean(latent_stds)),
-        "sample_min": float(sample.min().detach().cpu()),
-        "sample_max": float(sample.max().detach().cpu()),
-        "sample_center_target_mse": float(F.mse_loss(sample, target).detach().cpu()),
-        "latent_endpoint_mse": float(np.mean(endpoint_mses)),
-        "latent_endpoint_consistency_mse": float(np.mean(endpoint_consistency_mses)),
-        "latent_endpoint_time_gap": float(np.mean(endpoint_time_gaps)),
-        "cfg_scale": float(cfg_scale),
-        "cfg_rescale": float(cfg_rescale),
-        "cfg_mode": cfg_mode,
-        "cfg_interval": list(validate_guidance_interval(cfg_interval)),
-        "sample_steps": int(sample_steps),
-        "sample_time_shift": float(sample_time_shift),
-        "time_shift": float(time_shift),
-        "sample_method": sample_method,
-        "sample_schedule": sample_schedule,
-        "sample_churn": float(sample_churn),
-        "sample_churn_interval": list(validate_guidance_interval(
-            sample_churn_interval, name="sample_churn_interval")),
-        "semantic_guidance_w": float(semantic_guidance_w),
-        "semantic_guidance_mode": semantic_guidance_mode,
-        "semantic_guidance_interval": list(validate_guidance_interval(
-            semantic_guidance_interval)),
-    }
-    report.update(trace)
-    report.update(sample_health_metrics(sample))
-    if factor_orth_losses:
-        report.update({
-            "latent_factor_orth_loss": float(np.mean(factor_orth_losses)),
-            "latent_factor_orth_pairs": float(np.mean(factor_orth_pairs)),
-            "latent_factor_orth_bases": float(np.mean(factor_orth_bases)),
-        })
-    report.update(conditional_roundtrip(ae, flow, size=size, device=device, cfg_scale=cfg_scale,
-                                        cfg_rescale=cfg_rescale,
-                                        sample_steps=sample_steps,
-                                        samples_per_combo=roundtrip_samples, seed=seed + 17,
-                                        cond_mode=cond_mode, conditioner=conditioner,
-                                        prompt_vocab=prompt_vocab,
-                                        prompt_templates=prompt_templates,
-                                        semantic_guidance_w=semantic_guidance_w,
-                                        semantic_guidance_mode=semantic_guidance_mode,
-                                        sample_method=sample_method,
-                                        cfg_interval=cfg_interval,
-                                        semantic_guidance_interval=semantic_guidance_interval,
-                                        sample_time_shift=sample_time_shift,
-                                        sample_schedule=sample_schedule,
-                                        sample_churn=sample_churn,
-                                        sample_churn_interval=sample_churn_interval,
-                                        sample_finite_guard=sample_finite_guard,
-                                        sample_velocity_clip=sample_velocity_clip,
-                                        sample_latent_clip=sample_latent_clip,
-                                        cfg_mode=cfg_mode))
-    if intervention_samples:
-        report.update(latent_intervention_diagnostic(
-            ae, n=intervention_samples, batch=batch, seed=seed + 31, size=size, device=device))
-    report["cond_mode"] = cond_mode
-    return report
 
 
 @torch.no_grad()
@@ -7289,12 +6452,12 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     flow_checkpoint_blocks = bool(ckpt.get(
         "flow_checkpoint_blocks", report.get("flow_checkpoint_blocks", False)))
     cond_mode = ckpt.get("cond_mode", report.get("cond_mode", "text"))
-    data_mode = ckpt.get(
-        "data_mode",
-        report.get(
-            "data_mode",
-            "synthetic_fixture" if cond_mode == "facts" else "image_manifest"))
-    cond_dim = int(ckpt.get("cond_dim", report.get("cond_dim", len(FACT_VOCAB))))
+    data_mode = ckpt.get("data_mode", report.get("data_mode", "image_manifest"))
+    if cond_mode != "text" or data_mode != "image_manifest":
+        raise ValueError("checkpoint must be manifest text-conditioned")
+    cond_dim = int(ckpt.get("cond_dim", report.get("cond_dim", 0)) or 0)
+    if cond_dim <= 0:
+        raise ValueError("checkpoint is missing cond_dim")
     caption_cond_source = ckpt.get("caption_cond_source",
                                    report.get("caption_cond_source", "tokens"))
     text_embedding_in_dim = int(ckpt.get(
@@ -7325,10 +6488,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     ae_hf_scaling_factor = float(ckpt.get(
         "ae_hf_scaling_factor", report.get("ae_hf_scaling_factor", 0.0)) or 0.0)
     caption_max_len = int(ckpt.get("caption_max_len", report.get("caption_max_len", 32)) or 32)
-    if cond_mode == "text" and data_mode != "image_manifest":
-        caption_max_len = 32
-    prompt_templates = tuple(ckpt.get("prompt_templates", report.get("prompt_templates", []))
-                             or DEFAULT_PROMPT_TEMPLATES)
+    prompt_templates = ()
     prompt_vocab = ckpt.get("prompt_vocab") or None
     conditioner = None
     if cond_mode == "text":
@@ -7339,11 +6499,9 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                 text_embedding_in_dim, cond_dim=cond_dim, hidden=hidden).to(device)
         else:
             if prompt_vocab is None:
-                prompt_vocab = build_prompt_vocab(prompt_templates)
+                raise ValueError("token-conditioned checkpoint is missing prompt_vocab")
             conditioner = PromptConditioner(len(prompt_vocab), cond_dim=cond_dim,
                                             hidden=hidden, max_len=caption_max_len).to(device)
-        if caption_cond_source != "embedding" and prompt_vocab is None:
-            prompt_vocab = build_prompt_vocab(prompt_templates)
         cond_state = ckpt["conditioner_state_dict"]
         if prefer_ema and ckpt.get("conditioner_ema_state_dict"):
             cond_state = ckpt["conditioner_ema_state_dict"]
@@ -7490,6 +6648,12 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                 "time_shift_requested", ckpt.get("time_shift", report.get("time_shift", 1.0))))),
         "time_shift_mode": str(ckpt.get(
             "time_shift_mode", report.get("time_shift_mode", "manual"))),
+        "time_shift_effective_mode": str(ckpt.get(
+            "time_shift_effective_mode", report.get(
+                "time_shift_effective_mode",
+                ckpt.get("time_shift_mode", report.get("time_shift_mode", "manual"))))),
+        "time_shift_auto_policy": str(ckpt.get(
+            "time_shift_auto_policy", report.get("time_shift_auto_policy", ""))),
         "time_shift_ref_dim": float(ckpt.get(
             "time_shift_ref_dim", report.get("time_shift_ref_dim", 1024.0))),
         "time_shift_dim_power": float(ckpt.get(
@@ -7586,92 +6750,6 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
 
 
 @torch.no_grad()
-def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
-                  n=128, batch=64, seed=10, size=32, device=DEV, roundtrip_samples=1,
-                  cond_mode="facts", conditioner=None, prompt_vocab=None,
-                  prompt_templates=DEFAULT_PROMPT_TEMPLATES, semantic_guidance_w=0.0,
-                  semantic_guidance_weights=None, semantic_guidance_mode="decoded",
-                  sample_method="euler", sample_methods=None, cfg_rescales=(0.0,),
-                  cfg_modes=None,
-                  sample_schedule="linear", sample_schedules=None,
-                  sample_churn=0.0, sample_churns=None,
-                  sample_churn_interval=DEFAULT_CHURN_INTERVAL,
-                  cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
-                  semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-                  sample_time_shift=1.0, time_shift=1.0,
-                  sample_finite_guard=False, sample_velocity_clip=0.0,
-                  sample_latent_clip=0.0):
-    if semantic_guidance_weights is None:
-        semantic_guidance_weights = (semantic_guidance_w,)
-    if sample_methods is None:
-        sample_methods = (sample_method,)
-    if sample_schedules is None:
-        sample_schedules = (sample_schedule,)
-    if cfg_modes is None:
-        cfg_modes = ("standard",)
-    if sample_churns is None:
-        sample_churns = (sample_churn,)
-    cfg_rescales = tuple(float(x) for x in cfg_rescales)
-    cfg_modes = tuple(str(x) for x in cfg_modes)
-    bad_cfg_modes = sorted(set(cfg_modes) - set(CFG_MODES))
-    if bad_cfg_modes:
-        raise ValueError(f"unknown cfg mode(s): {','.join(bad_cfg_modes)}")
-    sample_churns = tuple(float(x) for x in sample_churns)
-    if any(x < 0.0 for x in sample_churns):
-        raise ValueError("sample_churns must be non-negative")
-    sample_churn_interval = validate_guidance_interval(
-        sample_churn_interval, name="sample_churn_interval")
-    rows = []
-    for cfg_scale in cfg_scales:
-        for cfg_rescale in cfg_rescales:
-            for cfg_mode in cfg_modes:
-                for sample_steps in sample_steps_list:
-                    for method in sample_methods:
-                        for schedule in sample_schedules:
-                            for churn in sample_churns:
-                                for guidance_w in semantic_guidance_weights:
-                                    row = evaluate(
-                                        ae, flow, n=n, batch=batch, seed=seed, size=size,
-                                        device=device, cfg_scale=float(cfg_scale),
-                                        cfg_rescale=float(cfg_rescale),
-                                        cfg_mode=cfg_mode,
-                                        sample_steps=int(sample_steps),
-                                        roundtrip_samples=roundtrip_samples,
-                                        cond_mode=cond_mode, conditioner=conditioner,
-                                        prompt_vocab=prompt_vocab,
-                                        prompt_templates=prompt_templates,
-                                        semantic_guidance_w=float(guidance_w),
-                                        semantic_guidance_mode=semantic_guidance_mode,
-                                        sample_method=method, sample_schedule=schedule,
-                                        cfg_interval=cfg_interval,
-                                        semantic_guidance_interval=semantic_guidance_interval,
-                                        sample_time_shift=sample_time_shift,
-                                        time_shift=time_shift,
-                                        sample_churn=float(churn),
-                                        sample_churn_interval=sample_churn_interval,
-                                        sample_finite_guard=sample_finite_guard,
-                                        sample_velocity_clip=sample_velocity_clip,
-                                        sample_latent_clip=sample_latent_clip)
-                                    row["sweep_key"] = (
-                                        f"cfg={float(cfg_scale):g};"
-                                        f"rescale={float(cfg_rescale):g};"
-                                        f"cfgmode={cfg_mode};"
-                                        f"steps={int(sample_steps)};method={method};"
-                                        f"schedule={schedule};churn={float(churn):g};"
-                                        f"churnint={format_interval(sample_churn_interval)};"
-                                        f"sem={float(guidance_w):g};"
-                                        f"shift={float(sample_time_shift):g};"
-                                        f"finiteguard={int(bool(sample_finite_guard))};"
-                                        f"vclip={float(sample_velocity_clip):g};"
-                                        f"zclip={float(sample_latent_clip):g};"
-                                        f"cfgint={format_interval(cfg_interval)};"
-                                        f"semint={format_interval(semantic_guidance_interval)}"
-                                    )
-                                    rows.append(row)
-    return rows
-
-
-@torch.no_grad()
 def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                        n=128, batch=64, seed=10, size=32, device=DEV, conditioner=None,
                        prompt_vocab=None, caption_max_len=64, sample_method="euler",
@@ -7761,10 +6839,6 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                                                 sample_finite_guard=sample_finite_guard,
                                                 sample_velocity_clip=sample_velocity_clip,
                                                 sample_latent_clip=sample_latent_clip)
-                                            row["semantic_guidance_w"] = 0.0
-                                            row["semantic_guidance_mode"] = "none"
-                                            row["semantic_guidance_interval"] = list(
-                                                DEFAULT_GUIDANCE_INTERVAL)
                                             row["sweep_key"] = (
                                                 f"cfg={float(cfg_scale):g};"
                                                 f"rescale={float(cfg_rescale):g};"
@@ -7792,10 +6866,6 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
 
 
 SWEEP_METRICS = (
-    "sample_roundtrip_color_acc",
-    "sample_roundtrip_shape_acc",
-    "sample_roundtrip_both_acc",
-    "conditional_sample_mse",
     "caption_sample_mse",
     "caption_retrieval_loss",
     "caption_retrieval_i2t_acc",
@@ -7875,12 +6945,9 @@ EVAL_WEIGHT_MODES = ("raw", "ema", "auto")
 
 def report_selection_key(report):
     inf = 1.0e30
-    conditional_mse = report.get("conditional_sample_mse", report.get("caption_sample_mse", inf))
+    caption_mse = report.get("caption_sample_mse", inf)
     center_mse = report.get("sample_center_target_mse", report.get("recon_mse", inf))
     return (
-        float(report.get("sample_roundtrip_both_acc", 0.0)),
-        float(report.get("sample_roundtrip_shape_acc", 0.0)),
-        float(report.get("sample_roundtrip_color_acc", 0.0)),
         float(report.get("generated_external_text_image_score_cos", 0.0)),
         float(report.get("generated_image_quality_score_pred_mean", 0.0)),
         float(report.get("generated_eval_selection_score_mean", 0.0)),
@@ -7907,7 +6974,7 @@ def report_selection_key(report):
         float(report.get("image_feature_retrieval_i2f_acc", 0.0)),
         float(report.get("generated_caption_retrieval_i2t_acc", 0.0)),
         float(report.get("caption_retrieval_i2t_acc", 0.0)),
-        -float(conditional_mse),
+        -float(caption_mse),
         -float(center_mse),
         -float(report.get("latent_velocity_mse", inf)),
         -float(report.get("latent_endpoint_consistency_mse", inf)),
@@ -7916,13 +6983,9 @@ def report_selection_key(report):
 
 def aggregate_selection_key(report):
     inf = 1.0e30
-    conditional_mse = report.get("conditional_sample_mse_mean",
-                                 report.get("caption_sample_mse_mean", inf))
+    caption_mse = report.get("caption_sample_mse_mean", inf)
     center_mse = report.get("sample_center_target_mse_mean", report.get("recon_mse_mean", inf))
     return (
-        float(report.get("sample_roundtrip_both_acc_mean", 0.0)),
-        float(report.get("sample_roundtrip_shape_acc_mean", 0.0)),
-        float(report.get("sample_roundtrip_color_acc_mean", 0.0)),
         float(report.get("generated_external_text_image_score_cos_mean", 0.0)),
         float(report.get("generated_image_quality_score_pred_mean_mean", 0.0)),
         float(report.get("generated_eval_selection_score_mean_mean", 0.0)),
@@ -7949,7 +7012,7 @@ def aggregate_selection_key(report):
         float(report.get("image_feature_retrieval_i2f_acc_mean", 0.0)),
         float(report.get("generated_caption_retrieval_i2t_acc_mean", 0.0)),
         float(report.get("caption_retrieval_i2t_acc_mean", 0.0)),
-        -float(conditional_mse),
+        -float(caption_mse),
         -float(center_mse),
         -float(report.get("latent_velocity_mse_mean", inf)),
         -float(report.get("latent_endpoint_consistency_mse_mean", inf)),
@@ -7975,20 +7038,12 @@ def eval_report_summary(report):
         "sample_schedule",
         "sample_churn",
         "sample_churn_interval",
-        "semantic_guidance_w",
-        "semantic_guidance_mode",
-        "semantic_guidance_interval",
         "text_guidance_w",
         "text_guidance_interval",
         "feature_guidance_w",
         "feature_guidance_interval",
         "quality_guidance_w",
         "quality_guidance_interval",
-        "sample_roundtrip_n",
-        "sample_roundtrip_color_acc",
-        "sample_roundtrip_shape_acc",
-        "sample_roundtrip_both_acc",
-        "conditional_sample_mse",
         "caption_sample_mse",
         "caption_retrieval_i2t_acc",
         "caption_retrieval_t2i_acc",
@@ -8049,16 +7104,6 @@ def eval_report_summary(report):
         "latent_endpoint_mse",
         "latent_endpoint_consistency_mse",
         "latent_endpoint_time_gap",
-        "latent_color_acc",
-        "latent_shape_acc",
-        "latent_intervention_n",
-        "latent_intervention_direct_target_acc",
-        "latent_intervention_image_target_acc",
-        "latent_intervention_collateral_acc",
-        "latent_intervention_score",
-        "latent_factor_orth_loss",
-        "latent_factor_orth_pairs",
-        "latent_factor_orth_bases",
     )
     return {k: report[k] for k in keys if k in report}
 
@@ -8075,11 +7120,7 @@ def aggregate_sweep_rows(rows):
                                                 DEFAULT_CHURN_INTERVAL)),
                float(row.get("cfg_rescale", 0.0)),
                str(row.get("cfg_mode", "standard")),
-               float(row.get("semantic_guidance_w", 0.0)),
-               str(row.get("semantic_guidance_mode", "decoded")),
                tuple(float(x) for x in row.get("cfg_interval", DEFAULT_GUIDANCE_INTERVAL)),
-               tuple(float(x) for x in row.get("semantic_guidance_interval",
-                                                DEFAULT_GUIDANCE_INTERVAL)),
                float(row.get("text_guidance_w", 0.0)),
                tuple(float(x) for x in row.get("text_guidance_interval",
                                                 DEFAULT_GUIDANCE_INTERVAL)),
@@ -8098,8 +7139,7 @@ def aggregate_sweep_rows(rows):
     for (cfg_scale, sample_steps, sample_method, sample_schedule, sample_time_shift,
          sample_churn, sample_churn_interval,
          cfg_rescale, cfg_mode,
-         semantic_guidance_w,
-         semantic_guidance_mode, cfg_interval, semantic_guidance_interval,
+         cfg_interval,
          text_guidance_w, text_guidance_interval,
          feature_guidance_w, feature_guidance_interval,
          quality_guidance_w, quality_guidance_interval,
@@ -8112,7 +7152,6 @@ def aggregate_sweep_rows(rows):
                 f"schedule={sample_schedule};shift={sample_time_shift:g};"
                 f"churn={sample_churn:g};churnint={format_interval(sample_churn_interval)};"
                 f"rescale={cfg_rescale:g};cfgmode={cfg_mode};"
-                f"sem={semantic_guidance_w:g};"
                 f"text={text_guidance_w:g};"
                 f"feature={feature_guidance_w:g};"
                 f"quality={quality_guidance_w:g};"
@@ -8121,7 +7160,6 @@ def aggregate_sweep_rows(rows):
                 f"vclip={sample_velocity_clip:g};"
                 f"zclip={sample_latent_clip:g};"
                 f"cfgint={format_interval(cfg_interval)};"
-                f"semint={format_interval(semantic_guidance_interval)};"
                 f"textint={format_interval(text_guidance_interval)};"
                 f"featureint={format_interval(feature_guidance_interval)};"
                 f"qualityint={format_interval(quality_guidance_interval)}"
@@ -8136,9 +7174,6 @@ def aggregate_sweep_rows(rows):
             "sample_time_shift": float(sample_time_shift),
             "sample_churn": float(sample_churn),
             "sample_churn_interval": list(sample_churn_interval),
-            "semantic_guidance_w": float(semantic_guidance_w),
-            "semantic_guidance_mode": semantic_guidance_mode,
-            "semantic_guidance_interval": list(semantic_guidance_interval),
             "text_guidance_w": float(text_guidance_w),
             "text_guidance_interval": list(text_guidance_interval),
             "feature_guidance_w": float(feature_guidance_w),
@@ -8168,9 +7203,7 @@ def aggregate_sweep_rows(rows):
 
 def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         n=128, batch=64, seed=10, eval_seeds=None, size=32, device=DEV,
-                        roundtrip_samples=1, prefer_ema=True, weight_mode=None,
-                        intervention_samples=0, semantic_guidance_w=0.0,
-                        semantic_guidance_weights=None, semantic_guidance_mode="decoded",
+                        prefer_ema=True, weight_mode=None,
                         sample_method="euler", sample_methods=None,
                         sample_schedule="linear", sample_schedules=None,
                         cfg_rescales=(0.0,),
@@ -8178,7 +7211,6 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         sample_churn=0.0, sample_churns=None,
                         sample_churn_interval=DEFAULT_CHURN_INTERVAL,
                         cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
-                        semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                         text_guidance_weights=(0.0,),
                         text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                         feature_guidance_weights=(0.0,),
@@ -8232,7 +7264,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
         raise ValueError("sample_latent_clip must be non-negative")
 
     def run_mode(mode):
-        ae, flow, conditioner, prompt_vocab, prompt_templates, meta = load_checkpoint(
+        ae, flow, conditioner, prompt_vocab, _prompt_templates, meta = load_checkpoint(
             path, device=device, prefer_ema=(mode == "ema"))
         actual_mode = "ema" if meta["ema_loaded"] else "raw"
         eval_size = image_hw(size, default=meta.get("image_size", 32) or 32)
@@ -8243,161 +7275,56 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
         if actual_sample_time_shift <= 0.0:
             raise ValueError("sample_time_shift must be positive")
         train_time_shift = float(meta.get("time_shift", actual_sample_time_shift))
-        manifest_path = eval_image_manifest
-        if not manifest_path and meta.get("data_mode") == "image_manifest":
-            manifest_path = meta.get("image_manifest", "")
-        if meta.get("data_mode") == "image_manifest" and not manifest_path:
-            raise ValueError(
-                "image-manifest checkpoints require --eval-image-manifest for checkpoint eval"
-            )
-        if manifest_path and meta["cond_mode"] != "text":
-            raise ValueError("manifest checkpoint eval requires a text-conditioned checkpoint")
-        if manifest_path:
-            guidance_values = [float(semantic_guidance_w)]
-            if semantic_guidance_weights is not None:
-                guidance_values.extend(float(w) for w in semantic_guidance_weights)
-            if any(abs(w) > 0.0 for w in guidance_values):
-                raise ValueError(
-                    "manifest checkpoint eval has captions but no canonical fact labels; "
-                    "keep semantic guidance weights at 0"
-                )
-            split = eval_image_split or "eval"
-            image_root = eval_image_root or meta.get("image_root", "")
-            records = read_image_manifest(
-                manifest_path, root=image_root, split=split,
-                min_aesthetic=eval_image_min_aesthetic,
-                max_records=eval_image_max_records)
-            rows = []
-            for eval_seed in eval_seeds:
-                for row in image_record_sweep(
-                        ae, flow, records, cfg_scales=cfg_scales,
-                        sample_steps_list=sample_steps_list, n=n, batch=batch,
-                        seed=int(eval_seed), size=eval_size, device=device,
-                        conditioner=conditioner, prompt_vocab=prompt_vocab,
-                        caption_max_len=meta["caption_max_len"],
-                        sample_method=sample_method, sample_methods=sample_methods,
-                        sample_schedule=sample_schedule, sample_schedules=sample_schedules,
-                        sample_churn=sample_churn,
-                        sample_churns=sample_churns,
-                        sample_churn_interval=sample_churn_interval,
-                        cfg_rescales=cfg_rescales,
-                        cfg_modes=cfg_modes,
-                        cfg_interval=cfg_interval,
-                        text_aligner=getattr(flow, "text_aligner", None),
-                        image_feature_aligner=getattr(flow, "image_feature_aligner", None),
-                        image_quality_scorer=getattr(flow, "image_quality_scorer", None),
-                        caption_cond_source=meta["caption_cond_source"],
-                        sample_time_shift=actual_sample_time_shift,
-                        time_shift=train_time_shift,
-                        text_guidance_weights=text_guidance_weights,
-                        text_guidance_interval=text_guidance_interval,
-                        feature_guidance_weights=feature_guidance_weights,
-                        feature_guidance_interval=feature_guidance_interval,
-                        quality_guidance_weights=quality_guidance_weights,
-                        quality_guidance_interval=quality_guidance_interval,
-                        generated_eval_n=generated_eval_n,
-                        generated_eval_candidates_per_prompt=(
-                            generated_eval_candidates_per_prompt),
-                        sample_finite_guard=sample_finite_guard,
-                        sample_velocity_clip=sample_velocity_clip,
-                        sample_latent_clip=sample_latent_clip):
-                    row["eval_seed"] = int(eval_seed)
-                    row["checkpoint_weight_mode"] = actual_mode
-                    rows.append(row)
-            aggregate = aggregate_sweep_rows(rows)
-            best = max(aggregate, key=aggregate_selection_key)
-            report = {
-                "experiment": "image_latent_manifest_sampler_sweep",
-                **meta,
-                "checkpoint_weight_mode": actual_mode,
-                "requested_checkpoint_weight_mode": weight_mode,
-                "selected_checkpoint_weights": actual_mode,
-                "n": int(n),
-                "image_size": image_size_value(eval_size),
-                "image_h": int(eval_size[0]),
-                "image_w": int(eval_size[1]),
-                "sample_method": sample_method,
-                "sample_methods": list(sample_methods or (sample_method,)),
-                "sample_schedule": sample_schedule,
-                "sample_schedules": list(sample_schedules or (sample_schedule,)),
-                "cfg_modes": list(cfg_modes),
-                "sample_churn": float(sample_churn),
-                "sample_churns": [float(x) for x in sample_churns],
-                "sample_churn_interval": list(sample_churn_interval),
-                "sample_finite_guard": bool(sample_finite_guard),
-                "sample_velocity_clip": float(sample_velocity_clip),
-                "sample_latent_clip": float(sample_latent_clip),
-                "generated_eval_n_requested": int(generated_eval_n),
-                "generated_eval_candidates_per_prompt": int(
-                    generated_eval_candidates_per_prompt),
-                "cfg_rescales": [float(x) for x in cfg_rescales],
-                "sample_time_shift": float(actual_sample_time_shift),
-                "time_shift": float(train_time_shift),
-                "cfg_interval": list(validate_guidance_interval(cfg_interval)),
-                "semantic_guidance_w": 0.0,
-                "semantic_guidance_weights": [0.0],
-                "semantic_guidance_mode": "none",
-                "semantic_guidance_interval": list(DEFAULT_GUIDANCE_INTERVAL),
-                "text_guidance_weights": [float(x) for x in text_guidance_weights],
-                "text_guidance_interval": list(validate_guidance_interval(
-                    text_guidance_interval, name="text_guidance_interval")),
-                "feature_guidance_weights": [float(x) for x in feature_guidance_weights],
-                "feature_guidance_interval": list(validate_guidance_interval(
-                    feature_guidance_interval, name="feature_guidance_interval")),
-                "quality_guidance_weights": [float(x) for x in quality_guidance_weights],
-                "quality_guidance_interval": list(validate_guidance_interval(
-                    quality_guidance_interval, name="quality_guidance_interval")),
-                "eval_seeds": [int(s) for s in eval_seeds],
-                "eval_image_manifest": manifest_path,
-                "eval_image_root": image_root,
-                "eval_image_split": split,
-                "eval_image_min_aesthetic": (
-                    float(eval_image_min_aesthetic)
-                    if eval_image_min_aesthetic is not None else None
-                ),
-                "eval_image_max_records": int(eval_image_max_records),
-                "rows": rows,
-                "aggregate": aggregate,
-                "best": best,
-            }
-            report.update(summarize_records(records))
-            return report
-
+        manifest_path = eval_image_manifest or meta.get("image_manifest", "")
+        if not manifest_path:
+            raise ValueError("checkpoint eval requires an image manifest")
+        split = eval_image_split or "eval"
+        image_root = eval_image_root or meta.get("image_root", "")
+        records = read_image_manifest(
+            manifest_path, root=image_root, split=split,
+            min_aesthetic=eval_image_min_aesthetic,
+            max_records=eval_image_max_records)
         rows = []
         for eval_seed in eval_seeds:
-            for row in sampler_sweep(ae, flow, cfg_scales=cfg_scales,
-                                     sample_steps_list=sample_steps_list, n=n, batch=batch,
-                                     seed=int(eval_seed), size=eval_size, device=device,
-                                     roundtrip_samples=roundtrip_samples,
-                                     cond_mode=meta["cond_mode"], conditioner=conditioner,
-                                     prompt_vocab=prompt_vocab,
-                                     prompt_templates=prompt_templates,
-                                     semantic_guidance_w=semantic_guidance_w,
-                                     semantic_guidance_weights=semantic_guidance_weights,
-                                     semantic_guidance_mode=semantic_guidance_mode,
-                                     sample_method=sample_method,
-                                     sample_methods=sample_methods,
-                                     sample_schedule=sample_schedule,
-                                     sample_schedules=sample_schedules,
-                                     sample_churn=sample_churn,
-                                     sample_churns=sample_churns,
-                                     sample_churn_interval=sample_churn_interval,
-                                     cfg_rescales=cfg_rescales,
-                                     cfg_modes=cfg_modes,
-                                     cfg_interval=cfg_interval,
-                                     sample_time_shift=actual_sample_time_shift,
-                                     time_shift=train_time_shift,
-                                     semantic_guidance_interval=semantic_guidance_interval,
-                                     sample_finite_guard=sample_finite_guard,
-                                     sample_velocity_clip=sample_velocity_clip,
-                                     sample_latent_clip=sample_latent_clip):
+            for row in image_record_sweep(
+                    ae, flow, records, cfg_scales=cfg_scales,
+                    sample_steps_list=sample_steps_list, n=n, batch=batch,
+                    seed=int(eval_seed), size=eval_size, device=device,
+                    conditioner=conditioner, prompt_vocab=prompt_vocab,
+                    caption_max_len=meta["caption_max_len"],
+                    sample_method=sample_method, sample_methods=sample_methods,
+                    sample_schedule=sample_schedule, sample_schedules=sample_schedules,
+                    sample_churn=sample_churn,
+                    sample_churns=sample_churns,
+                    sample_churn_interval=sample_churn_interval,
+                    cfg_rescales=cfg_rescales,
+                    cfg_modes=cfg_modes,
+                    cfg_interval=cfg_interval,
+                    text_aligner=getattr(flow, "text_aligner", None),
+                    image_feature_aligner=getattr(flow, "image_feature_aligner", None),
+                    image_quality_scorer=getattr(flow, "image_quality_scorer", None),
+                    caption_cond_source=meta["caption_cond_source"],
+                    sample_time_shift=actual_sample_time_shift,
+                    time_shift=train_time_shift,
+                    text_guidance_weights=text_guidance_weights,
+                    text_guidance_interval=text_guidance_interval,
+                    feature_guidance_weights=feature_guidance_weights,
+                    feature_guidance_interval=feature_guidance_interval,
+                    quality_guidance_weights=quality_guidance_weights,
+                    quality_guidance_interval=quality_guidance_interval,
+                    generated_eval_n=generated_eval_n,
+                    generated_eval_candidates_per_prompt=(
+                        generated_eval_candidates_per_prompt),
+                    sample_finite_guard=sample_finite_guard,
+                    sample_velocity_clip=sample_velocity_clip,
+                    sample_latent_clip=sample_latent_clip):
                 row["eval_seed"] = int(eval_seed)
                 row["checkpoint_weight_mode"] = actual_mode
                 rows.append(row)
         aggregate = aggregate_sweep_rows(rows)
         best = max(aggregate, key=aggregate_selection_key)
         report = {
-            "experiment": "image_latent_sampler_sweep",
+            "experiment": "image_latent_manifest_sampler_sweep",
             **meta,
             "checkpoint_weight_mode": actual_mode,
             "requested_checkpoint_weight_mode": weight_mode,
@@ -8406,7 +7333,6 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             "image_size": image_size_value(eval_size),
             "image_h": int(eval_size[0]),
             "image_w": int(eval_size[1]),
-            "roundtrip_samples": int(roundtrip_samples),
             "sample_method": sample_method,
             "sample_methods": list(sample_methods or (sample_method,)),
             "sample_schedule": sample_schedule,
@@ -8422,22 +7348,29 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             "sample_time_shift": float(actual_sample_time_shift),
             "time_shift": float(train_time_shift),
             "cfg_interval": list(validate_guidance_interval(cfg_interval)),
-            "semantic_guidance_w": float(semantic_guidance_w),
-            "semantic_guidance_weights": [
-                float(w) for w in (semantic_guidance_weights or (semantic_guidance_w,))
-            ],
-            "semantic_guidance_mode": semantic_guidance_mode,
-            "semantic_guidance_interval": list(validate_guidance_interval(
-                semantic_guidance_interval)),
+            "text_guidance_weights": [float(x) for x in text_guidance_weights],
+            "text_guidance_interval": list(validate_guidance_interval(
+                text_guidance_interval, name="text_guidance_interval")),
+            "feature_guidance_weights": [float(x) for x in feature_guidance_weights],
+            "feature_guidance_interval": list(validate_guidance_interval(
+                feature_guidance_interval, name="feature_guidance_interval")),
+            "quality_guidance_weights": [float(x) for x in quality_guidance_weights],
+            "quality_guidance_interval": list(validate_guidance_interval(
+                quality_guidance_interval, name="quality_guidance_interval")),
             "eval_seeds": [int(s) for s in eval_seeds],
+            "eval_image_manifest": manifest_path,
+            "eval_image_root": image_root,
+            "eval_image_split": split,
+            "eval_image_min_aesthetic": (
+                float(eval_image_min_aesthetic)
+                if eval_image_min_aesthetic is not None else None
+            ),
+            "eval_image_max_records": int(eval_image_max_records),
             "rows": rows,
             "aggregate": aggregate,
             "best": best,
         }
-        if intervention_samples:
-            report.update(latent_intervention_diagnostic(
-                ae, n=intervention_samples, batch=batch, seed=seed + 31, size=eval_size,
-                device=device))
+        report.update(summarize_records(records))
         return report
 
     if weight_mode != "auto":
@@ -8462,11 +7395,9 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
 
 
 def selected_grid_settings(report, fallback_cfg=1.0, fallback_cfg_rescale=0.0, fallback_steps=4,
-                           fallback_method="euler", fallback_semantic_w=0.0,
-                           fallback_semantic_mode="decoded",
+                           fallback_method="euler",
                            fallback_cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                            fallback_cfg_mode="standard",
-                           fallback_semantic_interval=DEFAULT_GUIDANCE_INTERVAL,
                            fallback_sample_time_shift=1.0,
                            fallback_sample_schedule="linear",
                            fallback_sample_churn=0.0,
@@ -8494,16 +7425,11 @@ def selected_grid_settings(report, fallback_cfg=1.0, fallback_cfg_rescale=0.0, f
             "sample_velocity_clip", fallback_sample_velocity_clip)),
         "sample_latent_clip": float(best.get(
             "sample_latent_clip", fallback_sample_latent_clip)),
-        "semantic_guidance_w": float(best.get("semantic_guidance_w", fallback_semantic_w)),
-        "semantic_guidance_mode": str(best.get("semantic_guidance_mode",
-                                               fallback_semantic_mode)),
-        "semantic_guidance_interval": tuple(best.get(
-            "semantic_guidance_interval", fallback_semantic_interval)),
     }
 
 
 def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidden=64,
-                      lr=2e-4, fact_w=1.0, seed=0, size=32, device=DEV, flow_arch="conv",
+                      lr=2e-4, seed=0, size=32, device=DEV, flow_arch="conv",
                       dit_depth=3, dit_heads=4, cond_drop=0.0, cfg_scale=1.0,
                       cfg_rescale=0.0, cfg_mode="standard",
                       dit_head_width_mult=1, latent_max_tokens=256,
@@ -8524,7 +7450,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       flow_self_repa_embed_dim=128, flow_self_repa_mode="pooled",
                       flow_sra_w=0.0, flow_sra_steps=0, flow_sra_time_gap=0.25,
                       flow_sra_mode="token",
-                      sample_steps=4, roundtrip_samples=1, flow_semantic_w=0.0,
+                      sample_steps=4,
                       flow_consistency_w=0.0, flow_endpoint_w=0.0,
                       flow_distill_steps=0, flow_distill_w=1.0,
                       flow_distill_time_gap=0.25, flow_distill_teacher="auto",
@@ -8546,20 +7472,17 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       caption_vocab_max=8192, caption_max_len=64,
                       caption_cond_source="tokens",
                       image_crop_mode="center", image_hflip_prob=0.0,
-                      dit_qk_norm=False, dit_attn_impl="manual",
-                      prompt_templates=DEFAULT_PROMPT_TEMPLATES, time_sampling="uniform",
+                      dit_qk_norm=False, dit_attn_impl="auto",
+                      time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0, time_shift=1.0,
                       time_curriculum_frac=0.0,
-                      time_shift_mode="manual", time_shift_ref_dim=1024.0,
+                      time_shift_mode="auto", time_shift_ref_dim=1024.0,
                       time_shift_dim_power=0.5,
                       flow_noise_coupling="random", flow_noise_coupling_projections=1,
                       flow_loss_weight="none", flow_loss_weight_gamma=5.0,
                       flow_loss_weight_normalize=True,
                       latent_normalize="auto", latent_stat_samples=512,
-                      ae_intervention_w=0.0, ae_factor_orth_w=0.0,
-                      semantic_guidance_w=0.0, semantic_guidance_mode="decoded",
                       cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
-                      semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                       sample_method="euler",
                       sample_schedule="linear",
                       sample_churn=0.0,
@@ -8567,20 +7490,19 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       sample_finite_guard=False, sample_velocity_clip=0.0,
                       sample_latent_clip=0.0,
                       flow_ema_decay=0.0, flow_ema_warmup=True, eval_with_ema=True,
-                      eval_weight_mode="auto", intervention_samples=32,
+                      eval_weight_mode="auto",
                       eval_generated_candidates_per_prompt=1,
                       train_precision="fp32", ae_accum_steps=1, flow_accum_steps=1,
                       grad_clip=0.0,
                       flow_cache_latents=False, flow_cache_records=0, flow_cache_batch=64,
                       flow_cache_dir="", flow_cache_shard_size=1024, flow_cache_dtype="fp32",
                       flow_cache_max_loaded_shards=0,
-                      return_conditioner=False, return_ema=False, return_aligner=False,
-                      allow_synthetic_fixture=False):
+                      return_conditioner=False, return_ema=False, return_aligner=False):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     size = image_hw(size, default=32)
     requested_size_buckets = normalize_image_size_buckets(size_buckets)
-    if cond_mode not in ("facts", "text"):
+    if cond_mode != "text":
         raise ValueError(f"unknown condition mode {cond_mode!r}")
     if ae_arch not in AE_ARCHES:
         raise ValueError(f"unknown autoencoder architecture {ae_arch!r}")
@@ -8597,10 +7519,6 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     if image_manifest:
         if cond_mode != "text":
             raise ValueError("image manifests require cond_mode='text'")
-        if flow_semantic_w > 0.0 or semantic_guidance_w > 0.0:
-            raise ValueError("image manifest training has captions but no canonical fact labels")
-        if ae_intervention_w > 0.0 or ae_factor_orth_w > 0.0 or intervention_samples:
-            raise ValueError("fact intervention/orthogonality diagnostics require fact labels")
         image_records = read_image_manifest(
             image_manifest, root=image_root, split=image_split,
             min_aesthetic=image_min_aesthetic, max_records=image_max_records)
@@ -8621,37 +7539,17 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             if not records_have_image_embedding_sequences(image_records):
                 raise ValueError(
                     f"flow_repa_mode={flow_repa_mode!r} requires image_embedding_sequence rows")
-    elif not allow_synthetic_fixture:
-        raise ValueError(
-            "image_latent training now requires image_manifest data; the synthetic "
-            "color/shape generator is only available to selftest fixtures")
-    elif (image_text_align_w > 0.0 or flow_text_align_w > 0.0
-          or image_feature_align_w > 0.0 or flow_feature_align_w > 0.0
-          or flow_repa_w > 0.0):
-        raise ValueError("image/text or image-feature alignment losses require image_manifest training")
     else:
-        caption_cond_source, text_embedding_in_dim = "tokens", 0
-        image_embedding_in_dim = 0
-        flow_repa_mode = str(flow_repa_mode)
-        if flow_repa_mode not in FLOW_REPA_MODES:
-            raise ValueError(f"unknown flow_repa_mode {flow_repa_mode!r}")
+        raise ValueError("image_latent training requires image_manifest data")
     flow_self_repa_mode = str(flow_self_repa_mode or "pooled")
     if flow_self_repa_mode not in FLOW_REPA_MODES:
         raise ValueError(f"unknown flow_self_repa_mode {flow_self_repa_mode!r}")
     flow_sra_mode = str(flow_sra_mode or "token")
     if flow_sra_mode not in FLOW_REPA_MODES:
         raise ValueError(f"unknown flow_sra_mode {flow_sra_mode!r}")
-    if image_records is None:
-        if requested_size_buckets:
-            raise ValueError("size_buckets require image_manifest training")
-        image_side(size)
-        train_size_buckets = (size,)
-        bucket_records = None
-        bucket_missing_dims = 0
-    else:
-        train_size_buckets = requested_size_buckets or (size,)
-        bucket_records, bucket_missing_dims = bucket_records_by_aspect(
-            image_records, train_size_buckets)
+    train_size_buckets = requested_size_buckets or (size,)
+    bucket_records, bucket_missing_dims = bucket_records_by_aspect(
+        image_records, train_size_buckets)
     if time_sampling not in TIME_SAMPLINGS:
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
     time_curriculum_frac = float(time_curriculum_frac)
@@ -8678,11 +7576,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         requested_latent_normalize, image_records=image_records, ae_arch=ae_arch)
     if image_quality_weight < 0.0:
         raise ValueError("image_quality_weight must be non-negative")
-    if image_quality_weight > 0.0 and image_records is None:
-        raise ValueError("image_quality_weight requires image_manifest training")
     source_weight_map = parse_source_weight_spec(image_source_weights)
-    if source_weight_map and image_records is None:
-        raise ValueError("image_source_weights require image_manifest training")
     if (image_quality_score_w < 0.0 or flow_quality_score_w < 0.0
             or image_quality_rank_w < 0.0 or quality_score_rank_w < 0.0
             or flow_quality_rank_w < 0.0):
@@ -8702,15 +7596,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("image_preference_w requires image_preference_manifest")
     if image_preference_w > 0.0 and quality_score_steps <= 0:
         raise ValueError("image_preference_w requires quality_score_steps > 0")
-    if image_preference_manifest and image_records is None:
-        raise ValueError("image_preference_manifest requires image_manifest training")
     if quality_score_rank_w > 0.0 and quality_score_steps <= 0:
         raise ValueError("quality_score_rank_w requires quality_score_steps > 0")
-    if (image_quality_score_w > 0.0 or flow_quality_score_w > 0.0
-            or image_quality_rank_w > 0.0 or quality_score_rank_w > 0.0
-            or flow_quality_rank_w > 0.0
-            or quality_score_steps > 0) and image_records is None:
-        raise ValueError("quality score losses require image_manifest training")
     if ((flow_quality_score_w > 0.0 or flow_quality_rank_w > 0.0)
             and image_quality_score_w <= 0.0 and image_quality_rank_w <= 0.0
             and quality_score_steps <= 0):
@@ -8756,12 +7643,6 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_accum_steps = max(1, int(flow_accum_steps))
     if grad_clip < 0.0:
         raise ValueError("grad_clip must be non-negative")
-    if ae_intervention_w < 0.0:
-        raise ValueError("ae_intervention_w must be non-negative")
-    if ae_factor_orth_w < 0.0:
-        raise ValueError("ae_factor_orth_w must be non-negative")
-    if semantic_guidance_w < 0.0:
-        raise ValueError("semantic_guidance_w must be non-negative")
     if flow_consistency_w < 0.0:
         raise ValueError("flow_consistency_w must be non-negative")
     if flow_endpoint_w < 0.0:
@@ -8787,8 +7668,6 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("flow_distill_teacher='ema' requires flow_ema_decay > 0")
     flow_cache_dir = str(flow_cache_dir or "")
     flow_cache_latents = bool(flow_cache_latents or flow_cache_dir)
-    if flow_cache_latents and image_records is None:
-        raise ValueError("flow latent cache currently requires image_manifest training")
     if flow_cache_records < 0 or flow_cache_batch <= 0:
         raise ValueError("flow cache record/batch settings must be non-negative/positive")
     if flow_cache_shard_size <= 0:
@@ -8798,8 +7677,6 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_cache_max_loaded_shards = int(flow_cache_max_loaded_shards)
     if flow_cache_max_loaded_shards < 0:
         raise ValueError("flow_cache_max_loaded_shards must be non-negative")
-    if semantic_guidance_mode not in ("latent", "decoded"):
-        raise ValueError(f"unknown semantic guidance mode {semantic_guidance_mode!r}")
     if sample_method not in SAMPLE_METHODS:
         raise ValueError(f"unknown sample method {sample_method!r}")
     if sample_schedule not in SAMPLE_SCHEDULES:
@@ -8819,8 +7696,6 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     if eval_generated_candidates_per_prompt <= 0:
         raise ValueError("eval_generated_candidates_per_prompt must be positive")
     cfg_interval = validate_guidance_interval(cfg_interval, name="cfg_interval")
-    semantic_guidance_interval = validate_guidance_interval(
-        semantic_guidance_interval, name="semantic_guidance_interval")
     if dit_head_width_mult <= 0:
         raise ValueError("dit_head_width_mult must be positive")
     if dit_attn_impl not in MMDIT_ATTN_IMPLS:
@@ -8862,28 +7737,21 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "image_quality_weight_records": 0,
         "image_quality_weight_missing": 0,
     }
-    if image_records is not None:
-        quality_weights, image_quality_report = quality_sampling_weights(
-            image_records, image_quality_weight)
-        source_weights, image_source_report = source_sampling_weights(
-            image_records, image_source_weights)
-        image_sample_weights = combine_sampling_weights(quality_weights, source_weights)
-        image_record_weights = record_weight_lookup(image_records, image_sample_weights)
+    quality_weights, image_quality_report = quality_sampling_weights(
+        image_records, image_quality_weight)
+    source_weights, image_source_report = source_sampling_weights(
+        image_records, image_source_weights)
+    image_sample_weights = combine_sampling_weights(quality_weights, source_weights)
+    image_record_weights = record_weight_lookup(image_records, image_sample_weights)
     image_bucket_probs = (
         size_bucket_sampling_probs(
             image_records, train_size_buckets, bucket_records=bucket_records,
             record_weights=image_record_weights)
-        if image_records is not None else None
     )
     image_bucket_report = (
         size_bucket_sampling_report(
             image_records, train_size_buckets, bucket_records=bucket_records,
             record_weights=image_record_weights, bucket_probs=image_bucket_probs)
-        if image_records is not None else {
-            "size_bucket_sampling_mode": "",
-            "size_bucket_weight_sums": {},
-            "size_bucket_sampling_probs": {},
-        }
     )
     image_preference_pairs = (
         read_image_preference_pairs(
@@ -8892,10 +7760,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             max_pairs=image_preference_max_pairs)
         if image_preference_manifest else []
     )
-    image_quality_score_stats = (
-        quality_score_stats(image_records) if image_records is not None else
-        {"n": 0, "missing": 0, "min": 0.0, "mean": 0.0, "max": 0.0, "has_range": False}
-    )
+    image_quality_score_stats = quality_score_stats(image_records)
     scalar_quality_requested = (
         image_quality_score_w > 0.0 or flow_quality_score_w > 0.0
         or image_quality_rank_w > 0.0 or quality_score_rank_w > 0.0
@@ -8909,23 +7774,20 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("quality rank losses require at least two distinct quality values")
     if cond_mode == "text":
         prompt_vocab = (
-            None if image_records is not None and caption_cond_source == "embedding"
+            None if caption_cond_source == "embedding"
             else build_caption_vocab(image_records, max_vocab=caption_vocab_max)
-            if image_records is not None
-            else build_prompt_vocab(prompt_templates)
         )
-    cond_dim = len(FACT_VOCAB)
+    cond_dim = 0
     conditioner = None
     if cond_mode == "text":
         cond_dim = int(text_cond_dim or hidden)
-        if image_records is not None and caption_cond_source == "embedding":
+        if caption_cond_source == "embedding":
             conditioner = PrecomputedTextConditioner(
                 text_embedding_in_dim, cond_dim=cond_dim, hidden=hidden).to(device)
         else:
             conditioner = PromptConditioner(len(prompt_vocab), cond_dim=cond_dim,
                                             hidden=hidden,
-                                            max_len=caption_max_len if image_records is not None
-                                            else 32).to(device)
+                                            max_len=caption_max_len).to(device)
     ae = make_autoencoder(ae_arch=ae_arch, latent_ch=latent_ch, hidden=hidden,
                           latent_downsample=latent_downsample,
                           ae_res_blocks=ae_res_blocks,
@@ -8936,19 +7798,17 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     ae_has_trainable_params = any(p.requires_grad for p in ae.parameters())
     ae_trainable_param_count = int(sum(p.numel() for p in ae.parameters() if p.requires_grad))
     text_aligner = None
-    if image_records is not None and (image_text_align_w > 0.0 or flow_text_align_w > 0.0):
+    if image_text_align_w > 0.0 or flow_text_align_w > 0.0:
         text_aligner = ImageTextAligner(
             latent_ch=latent_ch, cond_dim=cond_dim, hidden=hidden,
             embed_dim=text_embed_dim).to(device)
     image_feature_aligner = None
-    if image_records is not None and (
-            image_feature_align_w > 0.0 or flow_feature_align_w > 0.0):
+    if image_feature_align_w > 0.0 or flow_feature_align_w > 0.0:
         image_feature_aligner = ImageFeatureAligner(
             latent_ch=latent_ch, feature_dim=image_embedding_in_dim, hidden=hidden,
             embed_dim=image_feature_embed_dim).to(device)
     image_quality_scorer = None
-    if image_records is not None and (
-            image_quality_score_w > 0.0 or flow_quality_score_w > 0.0
+    if (image_quality_score_w > 0.0 or flow_quality_score_w > 0.0
             or image_quality_rank_w > 0.0 or quality_score_rank_w > 0.0
             or flow_quality_rank_w > 0.0 or quality_score_steps > 0):
         image_quality_scorer = ImageQualityScorer(latent_ch=latent_ch, hidden=hidden).to(device)
@@ -8987,7 +7847,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                      latent_patch_size=latent_patch_size,
                      flow_checkpoint_blocks=flow_checkpoint_blocks).to(device)
     flow_repa_aligner = None
-    if image_records is not None and flow_repa_w > 0.0:
+    if flow_repa_w > 0.0:
         hidden_feature_dim = flow_hidden_feature_dim(flow)
         if hidden_feature_dim <= 0:
             raise ValueError("flow REPA alignment requires DiT/CrossDiT/MM-DiT flow architecture")
@@ -9041,67 +7901,48 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         ae_train_steps_run += 1
         opt_ae.zero_grad(set_to_none=True)
         for _micro in range(ae_accum_steps):
-            if image_records is None:
-                x, fact_cond, yc, ys = _batch(batch, rng, size=size, device=device)
-            else:
-                batch_size, x, captions, chosen_records = sample_bucketed_image_text_batch(
-                    image_records, rng, batch=batch, size_buckets=train_size_buckets,
-                    bucket_records=bucket_records, device=device, return_records=True,
-                    crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
-                    record_weights=image_record_weights, bucket_probs=image_bucket_probs)
-                size_bucket_sample_counts[image_size_key(batch_size)] += int(batch)
+            batch_size, x, captions, chosen_records = sample_bucketed_image_text_batch(
+                image_records, rng, batch=batch, size_buckets=train_size_buckets,
+                bucket_records=bucket_records, device=device, return_records=True,
+                crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
+                record_weights=image_record_weights, bucket_probs=image_bucket_probs)
+            size_bucket_sample_counts[image_size_key(batch_size)] += int(batch)
             with amp_autocast(device, train_precision):
                 out = ae(x)
-                if image_records is None:
-                    loss, parts = autoencoder_loss(
-                        out, x, yc, ys, fact_w=fact_w, recon_loss=ae_recon_loss,
-                        grad_w=ae_grad_w, ms_w=ae_ms_w, fft_w=ae_fft_w,
-                        latent_reg_w=ae_latent_reg_w)
-                else:
-                    loss, parts = reconstruction_loss_parts(
-                        out["recon"], x, mode=ae_recon_loss, grad_w=ae_grad_w,
-                        ms_w=ae_ms_w, fft_w=ae_fft_w, latent=out.get("latent"),
-                        latent_reg_w=ae_latent_reg_w)
-                    if text_aligner is not None and image_text_align_w > 0.0:
-                        cond_vec = caption_record_condition(
-                            captions, chosen_records, conditioner, prompt_vocab,
-                            source=caption_cond_source, max_len=caption_max_len,
-                            device=device, return_tokens=False)
-                        align_loss, align_parts = image_text_alignment_loss(
-                            text_aligner, out["latent"], cond_vec, prefix="caption_align")
-                        loss = loss + float(image_text_align_w) * align_loss
-                        parts.update(align_parts)
-                    if image_feature_aligner is not None and image_feature_align_w > 0.0:
-                        image_features = record_image_embedding_tensor(
-                            chosen_records, device=device)
-                        feature_loss, feature_parts = image_feature_alignment_loss(
-                            image_feature_aligner, out["latent"], image_features,
-                            prefix="image_feature_align")
-                        loss = loss + float(image_feature_align_w) * feature_loss
-                        parts.update(feature_parts)
-                    if image_quality_scorer is not None and image_quality_score_w > 0.0:
-                        quality_loss, quality_parts = image_quality_score_loss(
-                            image_quality_scorer, out["latent"], chosen_records,
-                            image_quality_score_stats, prefix="quality_score")
-                        loss = loss + float(image_quality_score_w) * quality_loss
-                        parts.update(quality_parts)
-                    if image_quality_scorer is not None and image_quality_rank_w > 0.0:
-                        quality_rank, quality_rank_parts = image_quality_rank_loss(
-                            image_quality_scorer, out["latent"], chosen_records,
-                            image_quality_score_stats, prefix="quality_rank",
-                            margin=quality_rank_margin)
-                        loss = loss + float(image_quality_rank_w) * quality_rank
-                        parts.update(quality_rank_parts)
-                if image_records is None and ae_intervention_w > 0.0:
-                    intervention, intervention_parts = latent_intervention_training_loss(
-                        ae, out["latent"], fact_cond)
-                    loss = loss + float(ae_intervention_w) * intervention
-                    parts.update({f"latent_{k}": v for k, v in intervention_parts.items()})
-                if image_records is None and ae_factor_orth_w > 0.0:
-                    factor_orth, factor_orth_parts = latent_factor_orthogonality_loss(
-                        out["latent"], fact_cond)
-                    loss = loss + float(ae_factor_orth_w) * factor_orth
-                    parts.update({f"latent_{k}": v for k, v in factor_orth_parts.items()})
+                loss, parts = reconstruction_loss_parts(
+                    out["recon"], x, mode=ae_recon_loss, grad_w=ae_grad_w,
+                    ms_w=ae_ms_w, fft_w=ae_fft_w, latent=out.get("latent"),
+                    latent_reg_w=ae_latent_reg_w)
+                if text_aligner is not None and image_text_align_w > 0.0:
+                    cond_vec = caption_record_condition(
+                        captions, chosen_records, conditioner, prompt_vocab,
+                        source=caption_cond_source, max_len=caption_max_len,
+                        device=device, return_tokens=False)
+                    align_loss, align_parts = image_text_alignment_loss(
+                        text_aligner, out["latent"], cond_vec, prefix="caption_align")
+                    loss = loss + float(image_text_align_w) * align_loss
+                    parts.update(align_parts)
+                if image_feature_aligner is not None and image_feature_align_w > 0.0:
+                    image_features = record_image_embedding_tensor(
+                        chosen_records, device=device)
+                    feature_loss, feature_parts = image_feature_alignment_loss(
+                        image_feature_aligner, out["latent"], image_features,
+                        prefix="image_feature_align")
+                    loss = loss + float(image_feature_align_w) * feature_loss
+                    parts.update(feature_parts)
+                if image_quality_scorer is not None and image_quality_score_w > 0.0:
+                    quality_loss, quality_parts = image_quality_score_loss(
+                        image_quality_scorer, out["latent"], chosen_records,
+                        image_quality_score_stats, prefix="quality_score")
+                    loss = loss + float(image_quality_score_w) * quality_loss
+                    parts.update(quality_parts)
+                if image_quality_scorer is not None and image_quality_rank_w > 0.0:
+                    quality_rank, quality_rank_parts = image_quality_rank_loss(
+                        image_quality_scorer, out["latent"], chosen_records,
+                        image_quality_score_stats, prefix="quality_rank",
+                        margin=quality_rank_margin)
+                    loss = loss + float(image_quality_rank_w) * quality_rank
+                    parts.update(quality_rank_parts)
                 scaled_loss = loss / float(ae_accum_steps)
             scaler.scale(scaled_loss).backward()
             last_ae = {k: float(v.detach().cpu()) for k, v in parts.items()}
@@ -9156,11 +7997,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             record_weights=image_record_weights, cache_dtype=flow_cache_dtype)
         configure_latent_cache_runtime(
             flow_cache, max_loaded_shards=flow_cache_max_loaded_shards)
-    if image_records is None:
-        latent_stats = estimate_latent_stats(
-            ae, n=latent_stat_samples, batch=batch, seed=seed + 97, size=size, device=device,
-            mode=effective_latent_normalize)
-    elif flow_cache is not None:
+    if flow_cache is not None:
         latent_stats = estimate_latent_stats_cache(
             flow_cache, n=latent_stat_samples, seed=seed + 97,
             mode=effective_latent_normalize)
@@ -9348,24 +8185,6 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     if teacher_conditioner is not None else cond
                 )
             return z1, cond, teacher_cond
-        if image_records is None:
-            x, fact_cond, _yc, _ys, specs = _batch(
-                batch, rng, size=size, device=device, return_specs=True)
-            with torch.no_grad(), amp_autocast(device, train_precision):
-                z1 = ae.encode(x)
-            if cond_mode == "facts":
-                cond = fact_cond
-                return z1, cond, cond
-            ids = prompt_ids(
-                specs, prompt_vocab, rng=rng, templates=prompt_templates, device=device)
-            cond = conditioner(ids, return_tokens=text_condition_return_tokens(
-                conditioner, return_tokens=return_tokens))
-            teacher_cond = (
-                teacher_conditioner(ids, return_tokens=text_condition_return_tokens(
-                    teacher_conditioner, return_tokens=return_tokens))
-                if teacher_conditioner is not None else cond
-            )
-            return z1, cond, teacher_cond
         _batch_size, x, captions, chosen_records = sample_bucketed_image_text_batch(
             image_records, rng, batch=batch, size_buckets=train_size_buckets,
             bucket_records=bucket_records, device=device, return_records=True,
@@ -9430,7 +8249,6 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         for _micro in range(flow_accum_steps):
             if flow_cache is not None:
                 z1, cache_payload = sample_latent_cache(flow_cache, rng, batch, device=device)
-                fact_cond, specs = None, None
                 chosen_records = None
                 cond = cached_caption_payload_condition(
                     cache_payload, conditioner, source=caption_cond_source,
@@ -9439,20 +8257,6 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 image_feature_tokens = cache_payload.get("image_embedding_sequences")
                 quality_targets = cache_payload.get("quality_targets")
                 quality_masks = cache_payload.get("quality_masks")
-            elif image_records is None:
-                image_features = None
-                image_feature_tokens = None
-                quality_targets = None
-                quality_masks = None
-                chosen_records = None
-                x, fact_cond, _yc, _ys, specs = _batch(batch, rng, size=size, device=device,
-                                                       return_specs=True)
-                with torch.no_grad(), amp_autocast(device, train_precision):
-                    z1 = ae.encode(x)
-                cond = model_condition(
-                    specs, fact_cond, cond_mode=cond_mode, conditioner=conditioner,
-                    prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
-                    rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
             else:
                 batch_size, x, captions, chosen_records = sample_bucketed_image_text_batch(
                     image_records, rng, batch=batch, size_buckets=train_size_buckets,
@@ -9460,7 +8264,6 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
                     record_weights=image_record_weights, bucket_probs=image_bucket_probs)
                 size_bucket_sample_counts[image_size_key(batch_size)] += int(batch)
-                fact_cond, specs = None, None
                 with torch.no_grad(), amp_autocast(device, train_precision):
                     z1 = ae.encode(x)
                 cond = caption_record_condition(
@@ -9483,7 +8286,6 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             with amp_autocast(device, train_precision):
                 loss, parts = latent_flow_losses(
                     flow, z1, cond, cond_drop=cond_drop, ae=ae,
-                    semantic_w=flow_semantic_w, semantic_cond=fact_cond,
                     time_sampling=active_time_sampling, time_logit_mean=time_logit_mean,
                     time_logit_std=time_logit_std, time_shift=effective_time_shift,
                     flow_noise_coupling=flow_noise_coupling,
@@ -9649,49 +8451,26 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             load_flow_state(flow, raw_flow)
             if conditioner is not None:
                 conditioner.load_state_dict(raw_conditioner)
-        if image_records is None:
-            candidate = evaluate(ae, flow, seed=seed + 1, size=size, device=device,
-                                 cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
-                                 cfg_mode=cfg_mode,
-                                 sample_steps=sample_steps,
-                                 roundtrip_samples=roundtrip_samples, cond_mode=cond_mode,
-                                 conditioner=conditioner, prompt_vocab=prompt_vocab,
-                                 prompt_templates=prompt_templates,
-                                 intervention_samples=intervention_samples,
-                                 semantic_guidance_w=semantic_guidance_w,
-                                 semantic_guidance_mode=semantic_guidance_mode,
-                                 sample_method=sample_method,
-                                 sample_schedule=sample_schedule,
-                                 cfg_interval=cfg_interval,
-                                 semantic_guidance_interval=semantic_guidance_interval,
-                                 sample_time_shift=effective_time_shift,
-                                 time_shift=effective_time_shift,
-                                 sample_churn=sample_churn,
-                                 sample_churn_interval=sample_churn_interval,
-                                 sample_finite_guard=sample_finite_guard,
-                                 sample_velocity_clip=sample_velocity_clip,
-                                 sample_latent_clip=sample_latent_clip)
-        else:
-            candidate = evaluate_image_records(
-                ae, flow, image_records, seed=seed + 1, size=size, device=device,
-                conditioner=conditioner, prompt_vocab=prompt_vocab,
-                caption_max_len=caption_max_len, cfg_scale=cfg_scale,
-                cfg_rescale=cfg_rescale,
-                cfg_mode=cfg_mode,
-                sample_steps=sample_steps, sample_method=sample_method,
-                sample_schedule=sample_schedule,
-                cfg_interval=cfg_interval, text_aligner=text_aligner,
-                image_feature_aligner=image_feature_aligner,
-                image_quality_scorer=image_quality_scorer,
-                caption_cond_source=caption_cond_source,
-                sample_time_shift=effective_time_shift, time_shift=effective_time_shift,
-                sample_churn=sample_churn,
-                sample_churn_interval=sample_churn_interval,
-                generated_eval_candidates_per_prompt=(
-                    eval_generated_candidates_per_prompt),
-                sample_finite_guard=sample_finite_guard,
-                sample_velocity_clip=sample_velocity_clip,
-                sample_latent_clip=sample_latent_clip)
+        candidate = evaluate_image_records(
+            ae, flow, image_records, seed=seed + 1, size=size, device=device,
+            conditioner=conditioner, prompt_vocab=prompt_vocab,
+            caption_max_len=caption_max_len, cfg_scale=cfg_scale,
+            cfg_rescale=cfg_rescale,
+            cfg_mode=cfg_mode,
+            sample_steps=sample_steps, sample_method=sample_method,
+            sample_schedule=sample_schedule,
+            cfg_interval=cfg_interval, text_aligner=text_aligner,
+            image_feature_aligner=image_feature_aligner,
+            image_quality_scorer=image_quality_scorer,
+            caption_cond_source=caption_cond_source,
+            sample_time_shift=effective_time_shift, time_shift=effective_time_shift,
+            sample_churn=sample_churn,
+            sample_churn_interval=sample_churn_interval,
+            generated_eval_candidates_per_prompt=(
+                eval_generated_candidates_per_prompt),
+            sample_finite_guard=sample_finite_guard,
+            sample_velocity_clip=sample_velocity_clip,
+            sample_latent_clip=sample_latent_clip)
         candidate["eval_weight_mode"] = mode
         candidate_reports[mode] = candidate
     selected_eval_weights = max(candidate_reports, key=lambda mode: report_selection_key(
@@ -9701,7 +8480,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     if conditioner is not None:
         conditioner.load_state_dict(raw_conditioner)
     report.update({
-        "experiment": "image3_latent_fact_conditioned_rectified_flow",
+        "experiment": "image_latent_manifest_rectified_flow",
         "ae_steps": int(ae_steps),
         "ae_train_steps_run": int(ae_train_steps_run),
         "ae_trainable": bool(ae_has_trainable_params),
@@ -9807,7 +8586,6 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "zero_residual_gating": bool(getattr(flow, "uses_zero_residual_gating", False)),
-        "fact_w": float(fact_w),
         "ae_recon_loss": ae_recon_loss,
         "ae_grad_w": float(ae_grad_w),
         "ae_ms_w": float(ae_ms_w),
@@ -9849,18 +8627,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         ),
         "flow_sra_time_gap": float(flow_sra_time_gap),
         "flow_sra_mode": str(flow_sra_mode),
-        "ae_intervention_w": float(ae_intervention_w),
-        "ae_factor_orth_w": float(ae_factor_orth_w),
         "cond_drop": float(cond_drop),
         "cfg_rescale": float(cfg_rescale),
         "cfg_mode": cfg_mode,
         "cfg_interval": list(cfg_interval),
         "sample_method": sample_method,
         "sample_schedule": sample_schedule,
-        "semantic_guidance_w": float(semantic_guidance_w),
-        "semantic_guidance_mode": semantic_guidance_mode,
-        "semantic_guidance_interval": list(semantic_guidance_interval),
-        "flow_semantic_w": float(flow_semantic_w),
         "flow_consistency_w": float(flow_consistency_w),
         "flow_endpoint_w": float(flow_endpoint_w),
         "flow_distill_steps": int(flow_distill_steps),
@@ -9882,7 +8654,6 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "eval_with_ema": selected_eval_weights == "ema",
         "eval_generated_candidates_per_prompt": int(
             eval_generated_candidates_per_prompt),
-        "intervention_samples": int(intervention_samples),
         "weight_eval_candidates": {
             mode: eval_report_summary(candidate)
             for mode, candidate in candidate_reports.items()
@@ -9914,10 +8685,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "cfg_uncond_default": (
             "learned_null" if conditioner_has_learned_null(conditioner) else "zero"
         ),
-        "data_mode": "image_manifest" if image_records is not None else "synthetic_fixture",
+        "data_mode": "image_manifest",
         "image_manifest": image_manifest,
-        "image_root": image_root if image_records is not None else "",
-        "image_split": image_split if image_records is not None else "",
+        "image_root": image_root,
+        "image_split": image_split,
         "image_min_aesthetic": (
             float(image_min_aesthetic) if image_min_aesthetic is not None else None
         ),
@@ -9951,28 +8722,23 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "image_quality_score_mean": float(image_quality_score_stats["mean"]),
         "image_quality_score_max": float(image_quality_score_stats["max"]),
         "image_quality_score_has_range": bool(image_quality_score_stats["has_range"]),
-        "image_crop_mode": image_crop_mode if image_records is not None else "",
-        "image_hflip_prob": float(image_hflip_prob) if image_records is not None else 0.0,
-        "caption_vocab_max": int(caption_vocab_max) if image_records is not None else 0,
-        "caption_max_len": int(caption_max_len) if image_records is not None else 0,
-        "caption_cond_source": caption_cond_source if image_records is not None else "",
+        "image_crop_mode": image_crop_mode,
+        "image_hflip_prob": float(image_hflip_prob),
+        "caption_vocab_max": int(caption_vocab_max),
+        "caption_max_len": int(caption_max_len),
+        "caption_cond_source": caption_cond_source,
         "text_embedding_in_dim": int(text_embedding_in_dim),
         "image_embedding_in_dim": int(image_embedding_in_dim),
         "cond_dim": int(cond_dim),
-        "prompt_templates": (
-            [] if image_records is not None else list(prompt_templates) if cond_mode == "text"
-            else []
-        ),
+        "prompt_templates": [],
         "prompt_vocab_size": len(prompt_vocab) if prompt_vocab is not None else 0,
         "last_ae": last_ae,
         "last_quality_score": last_quality_score,
         "last_flow": last_flow,
         "last_distill": last_distill,
         "last_flow_loss": last_flow.get("velocity_mse"),
-        "fact_vocab": [list(f) for f in FACT_VOCAB],
     })
-    if image_records is not None:
-        report.update(summarize_records(image_records))
+    report.update(summarize_records(image_records))
     if return_ema:
         if return_conditioner:
             if return_aligner:
@@ -9990,946 +8756,74 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
 
 
 def selftest():
-    ae, flow, report = train_latent_flow(ae_steps=2, flow_steps=2, batch=4, latent_ch=4,
-                                         hidden=16, seed=0, device="cpu", sample_steps=2,
-                                         cond_mode="facts", allow_synthetic_fixture=True)
-    assert report["experiment"] == "image3_latent_fact_conditioned_rectified_flow"
-    assert report["latent_color_acc"] >= 0.0 and report["latent_shape_acc"] >= 0.0
-    assert "sample_roundtrip_both_acc" in report and report["sample_roundtrip_n"] == 15
-    assert "latent_endpoint_consistency_mse" in report
-    assert "latent_intervention_score" in report and report["latent_intervention_n"] > 0
-    assert "latent_factor_orth_loss" in report
-    assert "sample_health_score" in report and report["sample_health_score"] >= 0.0
-    assert "sample_finite_frac" in report and 0.0 <= report["sample_finite_frac"] <= 1.0
-    assert "sample_nonfinite_frac" in report and 0.0 <= report["sample_nonfinite_frac"] <= 1.0
-    assert "sample_trace_min_velocity_finite_frac" in report
-    assert "sample_trace_final_latent_finite_frac" in report
-    assert "sample_dynamic_range" in report and report["sample_dynamic_range"] >= 0.0
-    bad_samples = torch.linspace(-1.0, 1.0, 2 * 3 * 4 * 4).reshape(2, 3, 4, 4)
-    bad_samples[0, 0, 0, 0] = float("nan")
-    bad_metrics = sample_health_metrics(bad_samples, prefix="bad_sample")
-    assert bad_metrics["bad_sample_nonfinite_frac"] > 0.0
-    assert bad_metrics["bad_sample_collapsed_frac"] >= 0.5
-    assert math.isfinite(bad_metrics["bad_sample_health_score"])
-    candidate_scores = sample_candidate_health_scores(bad_samples)
-    assert candidate_scores.shape == (2,)
-    assert torch.isfinite(candidate_scores).all()
-    assert float(candidate_scores[1]) > float(candidate_scores[0])
-    mixed_text_records = [
-        ImageTextRecord(path="a.ppm", caption="a", text_embedding=(1.0, 0.0),
-                        text_embedding_sequence=((1.0, 0.0, 0.0),)),
-        ImageTextRecord(path="b.ppm", caption="b", text_embedding=(0.0, 1.0),
-                        text_embedding_sequence=((0.0, 1.0, 0.0),)),
-    ]
-    assert infer_text_embedding_dim(mixed_text_records) == 3
-    short_cond = {"vec": torch.zeros(1, 2), "tokens": torch.zeros(1, 2, 2),
-                  "mask": torch.zeros(1, 2, dtype=torch.bool)}
-    long_cond = {"vec": torch.ones(1, 2), "tokens": torch.ones(1, 3, 2),
-                 "mask": torch.zeros(1, 3, dtype=torch.bool)}
-    joined_cond = concat_conditions(short_cond, long_cond)
-    assert joined_cond["tokens"].shape == (2, 3, 2)
-    assert bool(joined_cond["mask"][0, 2])
-    fft_loss = frequency_recon_loss(bad_samples[1:2], bad_samples[1:2])
-    assert float(fft_loss) < 1.0e-8
-    data_pair = torch.tensor([0.0, 10.0], dtype=torch.float32).view(2, 1, 1, 1)
-    noise_pair = torch.tensor([9.0, 1.0], dtype=torch.float32).view(2, 1, 1, 1)
-    coupled_noise, coupling_parts = couple_flow_noise_to_data(
-        noise_pair, data_pair, mode="sliced_ot", projections=3)
-    assert coupled_noise.shape == noise_pair.shape
-    assert float(coupling_parts["flow_noise_pair_mse_after"]) < float(
-        coupling_parts["flow_noise_pair_mse_before"])
-    assert float(coupling_parts["flow_noise_coupling_accepted"]) == 1.0
-    assert float(coupling_parts["flow_noise_coupling_projections"]) == 3.0
-    class NaNFlow(nn.Module):
-        def forward(self, z, t, cond):
-            return torch.full_like(z, float("nan"))
-    bad_cond = torch.zeros(2, len(FACT_VOCAB))
-    bad_latents, bad_trace = sample_latents(
-        NaNFlow(), bad_cond, latent_shape=(4, 4, 4), steps=1, device="cpu",
-        sample_finite_guard=True, return_trace=True)
-    assert torch.isfinite(bad_latents).all()
-    assert bad_trace["sample_trace_min_velocity_finite_frac"] == 0.0
-    assert bad_trace["sample_trace_finite_guard_events"] > 0
-    assert report["latent_normalize_requested"] == "auto"
-    assert report["latent_normalize"] == "none"
-    shifted = flow_time_schedule(4, device="cpu", shift=4.0)
-    assert torch.allclose(shifted[[0, -1]], torch.tensor([0.0, 1.0]))
-    assert 0.0 < float(shifted[1]) < 0.25
-    schedules = {
-        name: flow_time_schedule(8, device="cpu", shift=1.0, schedule=name)
-        for name in SAMPLE_SCHEDULES
-    }
-    for name, schedule in schedules.items():
-        assert torch.allclose(schedule[[0, -1]], torch.tensor([0.0, 1.0])), name
-        assert bool(torch.all(schedule[1:] >= schedule[:-1])), name
-    assert float(schedules["quadratic"][1]) < float(schedules["linear"][1])
-    assert float(schedules["sqrt"][1]) > float(schedules["linear"][1])
-    assert float(schedules["cosine"][1]) < float(schedules["linear"][1])
-    try:
-        make_autoencoder(ae_arch="hf-vae")
-    except ValueError as e:
-        assert "ae-hf-model" in str(e)
-    else:
-        raise AssertionError("hf-vae should require an explicit model id")
-    spec = ObjectSpec("p0", "blue", "triangle")
-    cond = fact_condition(object_facts(spec), device="cpu")[None]
-    img = sample_images(ae, flow, cond, latent_shape=(4, 8, 8), steps=2, device="cpu", seed=0,
-                        cfg_scale=1.5)
-    assert img.shape == (1, 3, 32, 32)
-    guided_img = sample_images(ae, flow, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
-                               seed=0, cfg_scale=1.5, cfg_rescale=0.7,
-                               semantic_cond=cond,
-                               semantic_guidance_w=0.05,
-                               semantic_guidance_interval=(0.0, 0.5))
-    assert guided_img.shape == (1, 3, 32, 32)
-    grid_path = "/tmp/image_latent_selftest_grid.ppm"
-    grid_manifest = "/tmp/image_latent_selftest_grid_manifest.jsonl"
-    grid_meta = save_sample_grid(ae, flow, grid_path, size=32, device="cpu",
-                                 sample_steps=1, samples_per_combo=1, seed=9,
-                                 cfg_rescale=0.4,
-                                 sample_manifest_out=grid_manifest)
-    assert grid_meta["sample_grid_n"] == len(COLORS) * len(SHAPES)
-    assert grid_meta["sample_grid_cfg_rescale"] == 0.4
-    assert grid_meta["sample_manifest_records"] == grid_meta["sample_grid_n"]
-    assert "sample_grid_health_score" in grid_meta
-    assert "sample_grid_finite_frac" in grid_meta
-    assert "sample_grid_nonfinite_frac" in grid_meta
-    assert "sample_grid_trace_min_velocity_finite_frac" in grid_meta
-    assert "sample_grid_trace_final_latent_finite_frac" in grid_meta
-    assert "sample_grid_collapsed_frac" in grid_meta
-    with open(grid_path, "rb") as f:
-        assert f.read(2) == b"P6"
-    with open(grid_manifest, "r", encoding="utf-8") as f:
-        manifest_rows = [json.loads(line) for line in f if line.strip()]
-    assert len(manifest_rows) == grid_meta["sample_grid_n"]
-    assert manifest_rows[0]["split"] == "generated"
-    assert manifest_rows[0]["source"] == "image_latent_generated"
-    assert manifest_rows[0]["caption"]
-    assert manifest_rows[0]["conditioning_color"] in COLORS
-    assert manifest_rows[0]["conditioning_shape"] in SHAPES
-    assert os.path.exists(os.path.join(
-        os.path.dirname(grid_manifest), manifest_rows[0]["image"]))
-    ae2, flow2, report2 = train_latent_flow(ae_steps=1, flow_steps=2, batch=2, latent_ch=4,
-                                            hidden=32, flow_arch="dit", dit_depth=1,
-                                            dit_heads=2, seed=1, device="cpu", cond_drop=0.5,
-                                            cfg_scale=1.5, cfg_rescale=0.5,
-                                            sample_steps=1,
-                                            flow_semantic_w=0.25, ae_intervention_w=0.1,
-                                            ae_factor_orth_w=0.05,
-                                            flow_consistency_w=0.1,
-                                            flow_endpoint_w=0.25,
-                                            flow_noise_coupling="sliced_ot",
-                                            flow_noise_coupling_projections=3,
-                                            flow_distill_steps=1,
-                                            flow_distill_w=0.5,
-                                            flow_distill_time_gap=0.25,
-                                            flow_distill_teacher="raw",
-                                            flow_guidance_distill_w=0.25,
-                                            flow_guidance_distill_cfg_scale=1.4,
-                                            flow_guidance_distill_cfg_rescale=0.2,
-                                            time_sampling="logit-normal",
-                                            time_curriculum_frac=0.5,
-                                            flow_loss_weight="min-snr-v",
-                                            flow_loss_weight_gamma=5.0,
-                                            latent_normalize="channel",
-                                            latent_stat_samples=8,
-                                            dit_pos_embed="sincos2d",
-                                            cfg_interval=(0.0, 0.5),
-                                            semantic_guidance_interval=(0.0, 0.5),
-                                            cond_mode="facts", allow_synthetic_fixture=True)
-    assert report2["flow_arch"] == "dit"
-    assert report2["cond_drop"] == 0.5 and report2["cfg_scale"] == 1.5
-    assert report2["cfg_rescale"] == 0.5
-    assert report2["flow_semantic_w"] == 0.25
-    assert report2["flow_consistency_w"] == 0.1
-    assert report2["flow_endpoint_w"] == 0.25
-    assert report2["flow_noise_coupling"] == "sliced_ot"
-    assert report2["flow_noise_coupling_projections"] == 3
-    assert report2["flow_distill_steps"] == 1
-    assert report2["flow_distill_steps_run"] == 1
-    assert report2["flow_distill_w"] == 0.5
-    assert report2["flow_distill_teacher_used"] == "raw"
-    assert report2["flow_guidance_distill_w"] == 0.25
-    assert report2["flow_guidance_distill_cfg_scale"] == 1.4
-    assert report2["flow_guidance_distill_cfg_rescale"] == 0.2
-    assert report2["time_sampling"] == "logit-normal"
-    assert report2["time_curriculum_frac"] == 0.5
-    assert report2["time_curriculum_switch_step"] == 1
-    assert report2["time_curriculum_final_sampling"] == "uniform"
-    assert report2["last_flow"]["time_sampling"] == "uniform"
-    assert report2["flow_loss_weight"] == "min-snr-v"
-    assert report2["flow_loss_weight_gamma"] == 5.0
-    assert report2["flow_loss_weight_normalize"] is True
-    assert report2["dit_pos_embed"] == "sincos2d" and report2["uses_2d_pos_embed"] is True
-    assert "pos" not in flow2.state_dict()
-    assert report2["ae_intervention_w"] == 0.1
-    assert report2["ae_factor_orth_w"] == 0.05
-    assert report2["latent_normalize_requested"] == "channel"
-    assert report2["latent_normalize"] == "channel" and report2["latent_norm_n"] == 8
-    assert report2["cfg_interval"] == [0.0, 0.5]
-    assert report2["semantic_guidance_interval"] == [0.0, 0.5]
-    assert "latent_intervention_loss" in report2["last_ae"]
-    assert "latent_factor_orth_loss" in report2["last_ae"]
-    assert "semantic_endpoint_ce" in report2["last_flow"]
-    assert "endpoint_consistency_mse" in report2["last_flow"]
-    assert "flow_endpoint_target_mse" in report2["last_flow"]
-    assert report2["last_flow"]["flow_endpoint_w"] == 0.25
-    assert report2["last_flow"]["flow_noise_coupling_active"] == 1.0
-    assert report2["last_flow"]["flow_noise_coupling_projections"] == 3.0
-    assert "flow_noise_coupling_accepted" in report2["last_flow"]
-    assert "flow_noise_pair_mse_after" in report2["last_flow"]
-    assert "distill_endpoint_mse" in report2["last_distill"]
-    assert "distill_guidance_endpoint_mse" in report2["last_distill"]
-    assert report2["last_distill"]["distill_guidance_w"] == 0.25
-    assert report2["last_distill"]["time_sampling"] == "uniform"
-    assert "velocity_mse_unweighted" in report2["last_flow"]
-    assert report2["last_flow"]["velocity_weight_max"] >= report2["last_flow"]["velocity_weight_min"]
-    img2 = sample_images(ae2, flow2, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
-                         seed=1, cfg_scale=1.5)
-    assert img2.shape == (1, 3, 32, 32)
-    cfg_z = _seeded_randn((2, 4, 8, 8), device="cpu", seed=123)
-    cfg_t = torch.full((2, 1, 1, 1), 0.35, device="cpu")
-    cfg_cond = torch.cat([cond, fact_condition(
-        object_facts(ObjectSpec("p0", "red", "square")), device="cpu")[None]], dim=0)
-    cfg_uncond = zero_condition(cfg_cond)
-    cfg_seq_uncond = flow2(cfg_z, cfg_t, cfg_uncond)
-    cfg_seq_cond = flow2(cfg_z, cfg_t, cfg_cond)
-    cfg_expected = rescale_guided_velocity(
-        cfg_seq_uncond + 1.7 * (cfg_seq_cond - cfg_seq_uncond),
-        cfg_seq_cond,
-        cfg_rescale=0.25,
-    )
-    cfg_got = guided_velocity(flow2, cfg_z, cfg_t, cfg_cond, cfg_scale=1.7,
-                              cfg_rescale=0.25)
-    assert torch.allclose(cfg_got, cfg_expected, atol=1.0e-4, rtol=1.0e-4)
-    cfgpp_expected = (1.0 - cfg_t) * cfg_expected + cfg_t * cfg_seq_uncond
-    cfgpp_got = guided_velocity(flow2, cfg_z, cfg_t, cfg_cond, cfg_scale=1.7,
-                                cfg_rescale=0.25, cfg_mode="cfgpp")
-    assert torch.allclose(cfgpp_got, cfgpp_expected, atol=1.0e-4, rtol=1.0e-4)
-    ae_res, flow_res, report_res = train_latent_flow(
-        ae_steps=1, flow_steps=1, batch=2, latent_ch=6, hidden=32, flow_arch="dit",
-        dit_depth=1, dit_heads=2, seed=12, device="cpu", sample_steps=1,
-        ae_arch="residual", latent_downsample=8, ae_res_blocks=1,
-        latent_max_tokens=32, ae_recon_loss="hybrid", ae_grad_w=0.1, ae_ms_w=0.1,
-        ae_fft_w=0.05, ae_latent_reg_w=0.01, train_precision="bf16", ae_accum_steps=2,
-        flow_accum_steps=2, grad_clip=1.0, intervention_samples=0,
-        time_shift_mode="dim", time_shift_ref_dim=24.0,
-        cond_mode="facts", allow_synthetic_fixture=True)
-    assert report_res["ae_arch"] == "residual"
-    assert report_res["ae_trainable"] is True and report_res["ae_train_steps_run"] == 1
-    assert report_res["ae_trainable_param_count"] > 0
-    assert report_res["ae_recon_loss"] == "hybrid"
-    assert report_res["ae_fft_w"] == 0.05
-    assert report_res["ae_accum_steps"] == 2 and report_res["flow_accum_steps"] == 2
-    assert report_res["ae_effective_batch"] == 4 and report_res["flow_effective_batch"] == 4
-    assert report_res["train_precision"] == "bf16" and report_res["train_amp_enabled"] is False
-    assert report_res["grad_clip"] == 1.0
-    assert report_res["latent_downsample"] == 8
-    assert report_res["latent_h"] == 4 and report_res["latent_tokens"] == 16
-    assert report_res["time_shift_mode"] == "dim"
-    assert report_res["latent_effective_dim"] == 96
-    assert report_res["time_shift_requested"] == 1.0
-    assert abs(report_res["time_shift_dim_scale"] - 2.0) < 1.0e-6
-    assert abs(report_res["time_shift"] - 2.0) < 1.0e-6
-    assert report_res["last_flow"]["time_shift"] == 2.0
-    assert "recon_grad_l1" in report_res["last_ae"]
-    assert "recon_multiscale_l1" in report_res["last_ae"]
-    assert "recon_fft_l1" in report_res["last_ae"]
-    assert "latent_l2" in report_res["last_ae"]
-    assert "grad_norm" in report_res["last_ae"] and "grad_norm" in report_res["last_flow"]
-    img_res = sample_images(ae_res, flow_res, cond, latent_shape=ae_latent_shape(ae_res, 32),
-                            steps=1, device="cpu", seed=12)
-    assert img_res.shape == (1, 3, 32, 32)
-    res_ckpt = "/tmp/image_latent_residual_selftest.pt"
-    torch.save({
-        "autoencoder_state_dict": ae_res.state_dict(),
-        "flow_state_dict": flow_res.state_dict(),
-        "report": report_res,
-        "fact_vocab": FACT_VOCAB,
-        "latent_ch": 6,
-        "ae_arch": "residual",
-        "latent_downsample": 8,
-        "ae_res_blocks": 1,
-        "latent_max_tokens": 32,
-        "hidden": 32,
-        "flow_arch": "dit",
-        "dit_depth": 1,
-        "dit_heads": 2,
-        "dit_head_width_mult": 1,
-        "cond_mode": "facts",
-        "cond_dim": len(FACT_VOCAB),
-        "latent_stats": latent_stats_state(flow_latent_stats(flow_res)),
-    }, res_ckpt)
-    ae_res2, _flow_res2, _cond_res2, _vocab_res2, _tpl_res2, meta_res2 = load_checkpoint(
-        res_ckpt, device="cpu", prefer_ema=False)
-    assert meta_res2["ae_arch"] == "residual"
-    assert ae_latent_shape(ae_res2, 32) == (6, 4, 4)
-    sweep = sampler_sweep(ae2, flow2, cfg_scales=(1.0, 1.5), sample_steps_list=(1,),
-                          cfg_rescales=(0.0, 0.7),
-                          cfg_modes=CFG_MODES,
-                          semantic_guidance_weights=(0.0, 0.05),
-                          sample_methods=SAMPLE_METHODS,
-                          n=4, batch=2, seed=3, device="cpu")
-    assert len(sweep) == 64 and "sample_roundtrip_both_acc" in sweep[0]
-    agg = aggregate_sweep_rows([dict(r, eval_seed=i) for i, r in enumerate(sweep)])
-    assert len(agg) == 64 and "sample_roundtrip_both_acc_mean" in agg[0]
-    assert "semantic_guidance_w" in agg[0] and "sample_method" in agg[0]
-    assert "cfg_rescale" in agg[0] and "cfg_mode" in agg[0]
-    assert {row["sample_method"] for row in sweep} == set(SAMPLE_METHODS)
-    assert {row["cfg_mode"] for row in sweep} == set(CFG_MODES)
-    ae3, flow3, conditioner3, vocab3, report3 = train_latent_flow(
-        ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="dit",
-        dit_depth=1, dit_heads=2, seed=2, device="cpu", cond_mode="text",
-        text_cond_dim=8, flow_semantic_w=0.1, sample_steps=1, return_conditioner=True,
-        allow_synthetic_fixture=True)
-    assert report3["cond_mode"] == "text" and report3["prompt_vocab_size"] > 0
-    assert report3["conditioner_learned_null"] is True
-    assert report3["cfg_uncond_default"] == "learned_null"
-    text_cond_payload = caption_condition(
-        ("a blue triangle", "a red square"), conditioner3, vocab3,
-        max_len=16, device="cpu", return_tokens=False)
-    assert isinstance(text_cond_payload, dict) and condition_has_null(text_cond_payload)
-    text_drop = condition_dropout(text_cond_payload, 1.0)
-    assert int(condition_active_mask(text_drop).sum().detach().cpu()) == 0
-    assert torch.allclose(text_drop["vec"], text_cond_payload["null_vec"])
-    text_sweep = sampler_sweep(ae3, flow3, cfg_scales=(1.0,), sample_steps_list=(1,), n=4,
-                               batch=2, seed=4, device="cpu", cond_mode="text",
-                               conditioner=conditioner3, prompt_vocab=vocab3)
-    assert len(text_sweep) == 1 and text_sweep[0]["cond_mode"] == "text"
-    text_grid_path = "/tmp/image_latent_selftest_text_grid.ppm"
-    text_grid_meta = save_sample_grid(
-        ae3, flow3, text_grid_path, size=32, device="cpu", cond_mode="text",
-        conditioner=conditioner3, prompt_vocab=vocab3, sample_steps=1, samples_per_combo=1,
-        seed=10)
-    assert text_grid_meta["sample_grid_cond_mode"] == "text"
-    prompt_grid_path = "/tmp/image_latent_selftest_prompt_grid.ppm"
-    prompt_manifest = "/tmp/image_latent_selftest_prompt_manifest.jsonl"
-    prompt_grid_meta = save_text_prompt_sample_grid(
-        ae3, flow3, ("a blue triangle", "a red square"), prompt_grid_path,
-        size=32, device="cpu", conditioner=conditioner3, prompt_vocab=vocab3,
-        cfg_scale=1.5, sample_steps=1, seed=13, caption_cond_source="tokens",
-        negative_prompts=("blurry",), candidates_per_prompt=2,
-        sample_manifest_out=prompt_manifest)
-    assert prompt_grid_meta["sample_grid_cond_mode"] == "prompt"
-    assert prompt_grid_meta["sample_grid_prompt_count"] == 2
-    assert prompt_grid_meta["sample_grid_cfg_uncond_mode"] == "negative_prompt"
-    assert prompt_grid_meta["sample_grid_negative_prompt_count"] == 2
-    assert prompt_grid_meta["sample_grid_candidates_per_prompt"] == 2
-    assert prompt_grid_meta["sample_grid_selection_scorer"] == "sample_health"
-    assert "sample_grid_selection_score_mean" in prompt_grid_meta
-    assert len(prompt_grid_meta["sample_grid_selected_candidate_indices"]) == 2
-    assert prompt_grid_meta["sample_manifest_records"] == 2
-    with open(prompt_manifest, "r", encoding="utf-8") as f:
-        prompt_rows = [json.loads(line) for line in f if line.strip()]
-    assert [row["caption"] for row in prompt_rows] == ["a blue triangle", "a red square"]
-    assert all("selected_candidate_index" in row for row in prompt_rows)
-    ae4, flow4, conditioner4, vocab4, report4 = train_latent_flow(
-        ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="crossdit",
-        dit_depth=1, dit_heads=2, seed=5, device="cpu", cond_mode="text",
-        text_cond_dim=8, sample_steps=1, time_sampling="logit-normal",
-        time_shift=2.0, dit_mlp="swiglu", return_conditioner=True,
-        allow_synthetic_fixture=True)
-    assert report4["flow_arch"] == "crossdit" and flow_uses_cond_tokens(flow4)
-    assert report4["dit_mlp"] == "swiglu" and report4["uses_swiglu_mlp"] is True
-    assert report4["time_sampling"] == "logit-normal" and "time_mean" in report4["last_flow"]
-    assert report4["time_shift"] == 2.0 and report4["sample_time_shift"] == 2.0
-    assert report4["last_flow"]["time_shift"] == 2.0
-    cross_sweep = sampler_sweep(ae4, flow4, cfg_scales=(1.0,), sample_steps_list=(1,), n=4,
-                                batch=2, seed=6, device="cpu", cond_mode="text",
-                                conditioner=conditioner4, prompt_vocab=vocab4,
-                                sample_time_shift=2.0, time_shift=2.0)
-    assert len(cross_sweep) == 1 and cross_sweep[0]["cond_mode"] == "text"
-    assert cross_sweep[0]["sample_time_shift"] == 2.0 and cross_sweep[0]["time_shift"] == 2.0
-    ae5, flow5, conditioner5, vocab5, report5 = train_latent_flow(
-        ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="mmdit",
-        dit_depth=1, dit_heads=2, seed=7, device="cpu", cond_mode="text",
-        text_cond_dim=8, sample_steps=1, time_sampling="logit-normal",
-        flow_ema_decay=0.5, dit_head_width_mult=2, dit_qk_norm=True,
-        dit_attn_impl="linear",
-        dit_pos_embed="rope2d", dit_mlp="swiglu", flow_checkpoint_blocks=True,
-        latent_patch_size=2, flow_self_repa_w=0.1,
-        flow_self_repa_embed_dim=13, flow_self_repa_mode="both",
-        flow_sra_w=0.1, flow_sra_mode="both", flow_sra_time_gap=0.2,
-        return_conditioner=True, allow_synthetic_fixture=True)
-    assert report5["flow_arch"] == "mmdit" and flow_uses_cond_tokens(flow5)
-    assert report5["dit_head_width_mult"] == 2
-    assert report5["dit_qk_norm"] is True
-    assert report5["dit_attn_impl"] == "linear"
-    assert report5["dit_pos_embed"] == "rope2d"
-    assert report5["dit_mlp"] == "swiglu"
-    assert report5["latent_patch_size"] == 2
-    assert report5["latent_cells"] == 64 and report5["latent_tokens"] == 16
-    assert report5["uses_2d_pos_embed"] is True
-    assert report5["uses_rope2d_pos_embed"] is True
-    assert report5["uses_swiglu_mlp"] is True
-    assert report5["zero_residual_gating"] is True
-    assert flow5.uses_zero_residual_gating is True
-    assert report5["flow_checkpoint_blocks"] is True
-    assert report5["activation_checkpointing"] is True
-    assert flow5.uses_activation_checkpointing is True
-    assert report5["flow_self_repa_aligner"] is True
-    assert report5["flow_self_repa_mode"] == "both"
-    assert report5["flow_self_repa_embed_dim"] == 13
-    assert "flow_self_repa_loss" in report5["last_flow"]
-    assert "flow_self_repa_token_loss" in report5["last_flow"]
-    assert report5["last_flow"]["flow_self_repa_components"] == 2.0
-    assert report5["flow_sra_w"] == 0.1
-    assert report5["flow_sra_mode"] == "both"
-    assert report5["flow_sra_time_gap"] == 0.2
-    assert "flow_sra_loss" in report5["last_flow"]
-    assert "flow_sra_token_loss" in report5["last_flow"]
-    assert report5["last_flow"]["flow_sra_components"] == 2.0
-    assert any("q_norm" in k for k in flow5.state_dict())
-    assert report5["adaptive_modulation"] is True
-    assert report5["residual_gating"] is True
-    assert report5["ema_available"] is True
-    assert report5["eval_weight_mode"] == "auto"
-    assert report5["selected_eval_weights"] in ("raw", "ema")
-    assert report5["eval_with_ema"] == (report5["selected_eval_weights"] == "ema")
-    assert set(report5["weight_eval_candidates"]) == {"raw", "ema"}
-    assert "latent_intervention_score" in report5["weight_eval_candidates"]["raw"]
-    assert report5["flow_ema_warmup"] is True and report5["flow_ema_effective_decay"] < 0.5
-    assert load_flow_state(flow5, flow5.state_dict()) == {"missing": [], "unexpected": []}
-    with torch.no_grad():
-        conditioner5.null_vec.fill_(0.125)
-        conditioner5.null_tokens.fill_(0.25)
-    token_cond = caption_condition(
-        ("a blue triangle", "a red square"), conditioner5, vocab5,
-        max_len=16, device="cpu", return_tokens=True)
-    token_null = null_condition(token_cond)
-    assert torch.allclose(token_null["vec"], token_cond["null_vec"])
-    assert torch.allclose(token_null["tokens"], token_cond["null_tokens"])
-    token_uncond = zero_condition(token_cond)
-    token_cat = concat_conditions(token_uncond, token_cond)
-    assert condition_batch(token_cat) == 4 and token_cat["tokens"].shape[0] == 4
-    token_z = _seeded_randn((2, 4, 8, 8), device="cpu", seed=321)
-    token_t = torch.full((2, 1, 1, 1), 0.55, device="cpu")
-    token_seq_uncond = flow5(token_z, token_t, token_uncond)
-    token_seq_cond = flow5(token_z, token_t, token_cond)
-    token_expected = token_seq_uncond + 1.6 * (token_seq_cond - token_seq_uncond)
-    token_got = guided_velocity(flow5, token_z, token_t, token_cond, cfg_scale=1.6,
-                                cfg_uncond=token_uncond)
-    assert torch.allclose(token_got, token_expected, atol=1.0e-4, rtol=1.0e-4)
-    token_null_seq = flow5(token_z, token_t, token_null)
-    token_null_expected = token_null_seq + 1.6 * (token_seq_cond - token_null_seq)
-    token_null_got = guided_velocity(flow5, token_z, token_t, token_cond, cfg_scale=1.6)
-    assert torch.allclose(token_null_got, token_null_expected, atol=1.0e-4, rtol=1.0e-4)
-    token_cfgpp_expected = (1.0 - token_t) * token_expected + token_t * token_seq_uncond
-    token_cfgpp_got = guided_velocity(
-        flow5, token_z, token_t, token_cond, cfg_scale=1.6,
-        cfg_uncond=token_uncond, cfg_mode="cfgpp")
-    assert torch.allclose(
-        token_cfgpp_got, token_cfgpp_expected, atol=1.0e-4, rtol=1.0e-4)
-    swiglu_ckpt = "/tmp/image_latent_mmdit_swiglu_selftest.pt"
-    torch.save({
-        "autoencoder_state_dict": ae5.state_dict(),
-        "flow_state_dict": flow5.state_dict(),
-        "conditioner_state_dict": conditioner5.state_dict(),
-        "report": report5,
-        "fact_vocab": FACT_VOCAB,
-        "latent_ch": 4,
-        "hidden": 32,
-        "flow_arch": "mmdit",
-        "dit_depth": 1,
-        "dit_heads": 2,
-        "dit_head_width_mult": 2,
-        "dit_qk_norm": True,
-        "dit_attn_impl": report5["dit_attn_impl"],
-        "dit_pos_embed": "rope2d",
-        "dit_mlp": "swiglu",
-        "latent_patch_size": 2,
-        "flow_self_repa_w": 0.1,
-        "flow_self_repa_embed_dim": 13,
-        "flow_self_repa_mode": "both",
-        "flow_sra_w": 0.1,
-        "flow_sra_time_gap": 0.2,
-        "flow_sra_mode": "both",
-        "cond_mode": "text",
-        "cond_dim": 8,
-        "caption_max_len": 32,
-        "prompt_vocab": vocab5,
-        "latent_stats": latent_stats_state(flow_latent_stats(flow5)),
-        "flow_self_repa_aligner_state_dict": (
-            getattr(flow5, "flow_self_repa_aligner").state_dict()
-        ),
-    }, swiglu_ckpt)
-    _ae_sw, flow_sw, _cond_sw, _vocab_sw, _tpl_sw, meta_sw = load_checkpoint(
-        swiglu_ckpt, device="cpu", prefer_ema=False)
-    assert meta_sw["dit_mlp"] == "swiglu"
-    assert meta_sw["latent_patch_size"] == 2
-    assert meta_sw["flow_self_repa_aligner"] is True
-    assert meta_sw["flow_self_repa_embed_dim"] == 13
-    assert meta_sw["flow_self_repa_mode"] == "both"
-    assert meta_sw["flow_sra_w"] == 0.1
-    assert meta_sw["flow_sra_time_gap"] == 0.2
-    assert meta_sw["flow_sra_mode"] == "both"
-    assert getattr(flow_sw, "flow_self_repa_aligner", None) is not None
-    assert getattr(flow_sw, "uses_swiglu_mlp", False) is True
-    mm_sweep = sampler_sweep(ae5, flow5, cfg_scales=(1.0,), sample_steps_list=(1,), n=4,
-                             batch=2, seed=8, device="cpu", cond_mode="text",
-                             conditioner=conditioner5, prompt_vocab=vocab5)
-    assert len(mm_sweep) == 1 and mm_sweep[0]["cond_mode"] == "text"
+    small_shift = resolve_time_shift(
+        2.0, mode="auto", latent_shape=(4, 8, 8), ref_dim=1024.0, dim_power=0.5)
+    large_shift = resolve_time_shift(
+        1.0, mode="auto", latent_shape=(16, 16, 16), ref_dim=1024.0, dim_power=0.5)
+    explicit_dim_shift = resolve_time_shift(
+        1.0, mode="dim", latent_shape=(4, 8, 8), ref_dim=1024.0, dim_power=0.5)
+    assert small_shift["time_shift"] == 2.0
+    assert small_shift["time_shift_effective_mode"] == "manual"
+    assert large_shift["time_shift_effective_mode"] == "dim"
+    assert math.isclose(large_shift["time_shift_dim_scale"], 2.0)
+    assert explicit_dim_shift["time_shift_effective_mode"] == "dim"
+    assert explicit_dim_shift["time_shift_dim_scale"] < 1.0
     with tempfile.TemporaryDirectory() as td:
-        img_dir = os.path.join(td, "images")
-        os.makedirs(img_dir, exist_ok=True)
-        manifest = os.path.join(td, "manifest.jsonl")
         rows = []
-        for i, (name, split, source, color) in enumerate((
-                ("red.ppm", "train", "curated", (255, 0, 0)),
-                ("green.ppm", "train", "synthetic", (0, 255, 0)),
-                ("blue.ppm", "eval", "curated", (0, 0, 255)),
-                ("white.ppm", "eval", "synthetic", (255, 255, 255)))):
-            arr = np.zeros((8, 8, 3), dtype=np.uint8)
-            arr[:, :] = np.asarray(color, dtype=np.uint8)
-            with open(os.path.join(img_dir, name), "wb") as f:
-                f.write(b"P6\n8 8\n255\n")
+        rng = np.random.default_rng(11)
+        for i in range(3):
+            arr = rng.integers(0, 255, size=(16, 16, 3), dtype=np.uint8)
+            arr[:, :, i % 3] = np.linspace(0, 255, 16, dtype=np.uint8)[None, :]
+            name = f"image_{i}.ppm"
+            with open(os.path.join(td, name), "wb") as f:
+                f.write(b"P6\n16 16\n255\n")
                 f.write(arr.tobytes())
-            rows.append({"image": name, "caption": f"{split} color patch {i}",
-                         "split": split,
-                         "source": source,
-                         "width": 12 if source == "synthetic" else 8,
-                         "height": 8,
-                         "aesthetic": float(i + 1),
-                         "text_embedding": [float(i), float(i + 1), float(i % 2), 1.0],
-                         "text_embedding_sequence": [
-                             [float(i), float(i + 1), 0.0, 1.0],
-                             [float(i % 2), float(i + 2), 1.0, 0.0],
-                         ] + ([[float(i + 3), 0.0, 1.0, 1.0]] if i % 2 else []),
-                         "image_embedding": [float(i), float(i + 2),
-                                             float((i + 1) % 2), 1.0],
-                         "image_embedding_sequence": [
-                             [float(i), float(i + 2), 0.0, 1.0],
-                             [float((i + 1) % 2), float(i + 1), 1.0, 0.0],
-                         ] + ([[float(i + 4), 1.0, 0.0, 1.0]] if i % 2 else [])})
+            rows.append({
+                "image": name,
+                "caption": f"manifest texture sample {i}",
+                "split": "train",
+                "source": "fixture",
+                "aesthetic": float(i + 1),
+                "text_embedding": [1.0 if j == i else 0.0 for j in range(3)],
+                "image_embedding": [1.0 if j == (2 - i) else 0.0 for j in range(3)],
+            })
+        manifest = os.path.join(td, "manifest.jsonl")
         with open(manifest, "w", encoding="utf-8") as f:
             for row in rows:
                 f.write(json.dumps(row) + "\n")
-        preference_manifest = os.path.join(td, "preferences.jsonl")
-        with open(preference_manifest, "w", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "prompt": "train color patch preference",
-                "chosen_image": "green.ppm",
-                "rejected_image": "red.ppm",
-                "score_gap": 1.0,
-            }) + "\n")
-        ae6, flow6, conditioner6, vocab6, aligner6, report6 = train_latent_flow(
-            ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32,
-            flow_arch="mmdit", dit_depth=1, dit_heads=2, seed=9,
-            device="cpu", cond_mode="text", text_cond_dim=8,
-            image_manifest=manifest, image_root=img_dir, image_split="train",
-            image_max_records=2, caption_max_len=8, sample_steps=1,
-            caption_cond_source="embedding",
-            image_text_align_w=0.1, flow_text_align_w=0.1, text_embed_dim=12,
-            image_feature_align_w=0.1, flow_feature_align_w=0.1,
-            image_feature_embed_dim=10, flow_repa_w=0.1, flow_repa_embed_dim=11,
-            flow_repa_mode="both",
-            image_quality_weight=2.0,
-            image_source_weights="curated=3.0,synthetic=0.5,*=1.0",
-            image_quality_score_w=0.1,
-            flow_quality_score_w=0.1,
-            quality_score_steps=1,
-            image_preference_manifest=preference_manifest,
-            image_preference_w=0.5,
-            flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
-            flow_cache_dtype="bf16",
-            intervention_samples=0, return_conditioner=True, return_aligner=True)
-        assert report6["data_mode"] == "image_manifest"
-        assert report6["latent_normalize_requested"] == "auto"
-        assert report6["latent_normalize"] == "channel"
-        assert report6["latent_norm_n"] == 2
-        assert report6["text_aligner"] is True and aligner6 is not None
-        assert report6["image_feature_aligner"] is True
-        assert report6["flow_repa_aligner"] is True
-        assert "caption_align_i2t_acc" in report6["last_ae"]
-        assert "image_feature_align_i2f_acc" in report6["last_ae"]
-        assert "flow_caption_align_i2t_acc" in report6["last_flow"]
-        assert "flow_image_feature_align_i2f_acc" in report6["last_flow"]
-        assert "flow_repa_h2f_acc" in report6["last_flow"]
-        assert "flow_repa_token_loss" in report6["last_flow"]
-        assert "flow_repa_token_h2f_cos" in report6["last_flow"]
-        assert report6["last_flow"]["flow_repa_components"] == 2.0
-        assert report6["flow_repa_mode"] == "both"
-        assert report6["flow_repa_token_sequences"] is True
-        assert report6["image_embedding_in_dim"] == 4
-        assert report6["image_embedding_sequence_records"] == 2
-        assert report6["image_embedding_sequence_dims"] == [4]
-        assert report6["text_embedding_in_dim"] == 4
-        assert report6["text_embedding_sequence_records"] == 2
-        assert report6["text_embedding_sequence_dims"] == [4]
-        assert report6["flow_cache_text_embedding_ndim"] == 3
-        assert report6["flow_cache_text_embedding_seq_len"] == 3
-        assert report6["flow_cache_image_embedding_sequence_ndim"] == 3
-        assert report6["flow_cache_image_embedding_sequence_len"] == 3
-        assert report6["flow_repa_embed_dim"] == 11
-        assert "generated_external_text_image_score_cos" in report6
-        assert "generated_image_feature_distribution_frechet" in report6
-        assert report6["generated_image_feature_distribution_n"] >= 1
-        assert "generated_image_feature_distribution_support_precision" in report6
-        assert "generated_image_feature_distribution_diversity_l2_ratio" in report6
-        assert "sample_health_score" in report6 and report6["sample_health_score"] >= 0.0
-        assert "sample_finite_frac" in report6
-        assert "sample_nonfinite_frac" in report6
-        assert "sample_trace_min_velocity_finite_frac" in report6
-        assert "sample_trace_final_latent_finite_frac" in report6
-        assert "sample_dynamic_range" in report6
-        assert report6["image_quality_weighted"] is True
-        assert report6["image_quality_weight_source"] == "aesthetic_score_quality"
-        assert report6["image_quality_weight_records"] == 2
-        assert report6["image_quality_weight_ratio"] > 1.0
-        assert report6["image_source_weighted"] is True
-        assert report6["image_source_weights"]["curated"] == 3.0
-        assert report6["image_source_weight_default"] == 1.0
-        assert report6["image_source_counts"] == {"curated": 1, "synthetic": 1}
-        assert report6["image_sources"] == {"curated": 1, "synthetic": 1}
-        assert report6["image_sampling_weighted"] is True
-        assert report6["image_sampling_weight_max"] > report6["image_sampling_weight_min"]
-        assert report6["image_quality_scorer"] is True
-        assert report6["image_quality_score_records"] == 2
-        assert "quality_score_loss" in report6["last_ae"]
-        assert report6["quality_score_steps_run"] == 1
-        assert report6["image_preference_pairs"] == 1
-        assert report6["image_preference_w"] == 0.5
-        assert "quality_preference_pretrain_loss" in report6["last_quality_score"]
-        assert report6["flow_cache_has_quality_targets"] is True
-        assert "flow_quality_score_loss" in report6["last_flow"]
-        assert report6["flow_cache_latents"] is True
-        assert report6["flow_cache_backend"] == "memory"
-        assert report6["flow_cache_latent_dtype"] == "bf16"
-        assert report6["flow_cache_weighted"] is True
-        assert report6["flow_cache_records"] == 2 and report6["flow_cache_bytes"] > 0
-        assert report6["flow_cache_shards"] == 0
-        embed_prompt_grid_path = "/tmp/image_latent_selftest_embed_prompt_grid.ppm"
-        embed_prompt_meta = save_text_prompt_sample_grid(
-            ae6, flow6, ("red color patch", "green color patch"),
-            embed_prompt_grid_path, size=32, device="cpu", conditioner=conditioner6,
-            prompt_vocab=vocab6, caption_max_len=8, sample_steps=1, seed=21,
-            caption_cond_source="embedding", prompt_embed_backend="stats",
-            prompt_embed_stats_dim=4, cfg_scale=1.25,
-            negative_prompts=("low quality", "washed out"), candidates_per_prompt=2,
-            text_guidance_w=0.05, text_guidance_interval=(0.0, 1.0),
-            feature_guidance_w=0.05, feature_guidance_interval=(0.0, 1.0),
-            quality_guidance_w=0.05, quality_guidance_interval=(0.0, 1.0))
-        assert embed_prompt_meta["sample_grid_cond_mode"] == "prompt"
-        assert embed_prompt_meta["sample_grid_caption_cond_source"] == "embedding"
-        assert embed_prompt_meta["sample_grid_prompt_embed_backend"] == "stats"
-        assert embed_prompt_meta["sample_grid_cfg_uncond_mode"] == "negative_prompt"
-        assert embed_prompt_meta["sample_grid_negative_prompt_count"] == 2
-        assert embed_prompt_meta["sample_grid_candidates_per_prompt"] == 2
-        assert embed_prompt_meta["sample_grid_selection_scorer"] == (
-            "text_aligner_cosine+image_feature_aligner_cosine+quality_scorer_score"
-        )
-        assert embed_prompt_meta["sample_grid_selection_component_count"] == 3
-        assert "sample_grid_selection_quality_scorer_mean" in embed_prompt_meta
-        assert "sample_grid_selection_score_mean" in embed_prompt_meta
-        assert embed_prompt_meta["sample_grid_text_guidance_w"] == 0.05
-        assert embed_prompt_meta["sample_grid_text_guidance_scorer"] == "text_aligner"
-        assert embed_prompt_meta["sample_grid_feature_guidance_w"] == 0.05
-        assert embed_prompt_meta["sample_grid_feature_guidance_scorer"] == "image_feature_aligner"
-        assert embed_prompt_meta["sample_grid_quality_guidance_w"] == 0.05
-        assert embed_prompt_meta["sample_grid_quality_guidance_scorer"] == "image_quality_scorer"
-        assert "sample_grid_health_score" in embed_prompt_meta
-        assert "sample_grid_finite_frac" in embed_prompt_meta
-        assert "sample_grid_nonfinite_frac" in embed_prompt_meta
-        assert "sample_grid_trace_min_velocity_finite_frac" in embed_prompt_meta
-        assert "sample_grid_trace_final_latent_finite_frac" in embed_prompt_meta
-        assert "sample_grid_dynamic_range" in embed_prompt_meta
-        _ae_q, _flow_q, _cond_q, _vocab_q, report_q = train_latent_flow(
+        ae, flow, conditioner, vocab, report = train_latent_flow(
             ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=16,
-            flow_arch="dit", dit_depth=1, dit_heads=2, seed=15,
-            device="cpu", cond_mode="text", text_cond_dim=8,
-            image_manifest=manifest, image_root=img_dir, image_split="train",
-            image_max_records=2, caption_max_len=8, sample_steps=1,
-            caption_cond_source="embedding", image_quality_score_w=0.1,
-            flow_quality_score_w=0.1, intervention_samples=0,
-            return_conditioner=True)
-        assert report_q["image_quality_scorer"] is True
-        assert report_q["latent_normalize_requested"] == "auto"
-        assert report_q["latent_normalize"] == "channel"
-        assert "flow_quality_score_loss" in report_q["last_flow"]
-        _ae_qs, _flow_qs, _cond_qs, _vocab_qs, report_qs = train_latent_flow(
-            ae_steps=0, flow_steps=1, batch=2, latent_ch=4, hidden=16,
-            flow_arch="dit", dit_depth=1, dit_heads=2, seed=16,
-            device="cpu", cond_mode="text", text_cond_dim=8,
-            image_manifest=manifest, image_root=img_dir, image_split="train",
-            image_max_records=2, caption_max_len=8, sample_steps=1,
-            caption_cond_source="embedding", image_quality_score_w=0.0,
-            flow_quality_score_w=0.1, quality_score_steps=1,
-            quality_score_rank_w=0.1, flow_quality_rank_w=0.1,
-            flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
-            intervention_samples=0, return_conditioner=True)
-        assert report_qs["image_quality_scorer"] is True
-        assert report_qs["quality_score_steps"] == 1
-        assert report_qs["quality_score_steps_run"] == 1
-        assert report_qs["flow_cache_has_quality_targets"] is True
-        assert "quality_score_pretrain_loss" in report_qs["last_quality_score"]
-        assert "quality_rank_pretrain_loss" in report_qs["last_quality_score"]
-        assert "flow_quality_score_loss" in report_qs["last_flow"]
-        assert "flow_quality_rank_loss" in report_qs["last_flow"]
-        ae_rect, flow_rect, conditioner_rect, vocab_rect, report_rect = train_latent_flow(
-            ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=16,
-            flow_arch="dit", dit_depth=1, dit_heads=2, seed=14,
-            device="cpu", cond_mode="text", text_cond_dim=8,
-            image_manifest=manifest, image_root=img_dir, image_split="train",
-            image_max_records=2, caption_max_len=8, sample_steps=1,
-            size=(32, 48), ae_arch="residual", latent_downsample=8,
-            latent_max_tokens=32, image_crop_mode="pad",
-            intervention_samples=0, return_conditioner=True)
-        assert report_rect["image_size"] == [32, 48]
-        assert report_rect["latent_normalize_requested"] == "auto"
-        assert report_rect["latent_normalize"] == "channel"
-        assert report_rect["image_h"] == 32 and report_rect["image_w"] == 48
-        assert report_rect["latent_h"] == 4 and report_rect["latent_w"] == 6
-        assert report_rect["latent_tokens"] == 24
-        assert ae_latent_shape(ae_rect, (32, 48)) == (4, 4, 6)
-        rect_ckpt = os.path.join(td, "rect.pt")
-        torch.save({
-            "autoencoder_state_dict": ae_rect.state_dict(),
-            "flow_state_dict": flow_rect.state_dict(),
-            "report": report_rect,
-            "fact_vocab": FACT_VOCAB,
-            "latent_ch": 4,
-            "image_size": report_rect["image_size"],
-            "image_h": report_rect["image_h"],
-            "image_w": report_rect["image_w"],
-            "ae_arch": "residual",
-            "latent_downsample": 8,
-            "ae_res_blocks": 1,
-            "latent_max_tokens": 32,
-            "hidden": 16,
-            "flow_arch": "dit",
-            "dit_depth": 1,
-            "dit_heads": 2,
-            "dit_head_width_mult": 1,
-            "cond_mode": "text",
-            "cond_dim": report_rect["cond_dim"],
-            "data_mode": "image_manifest",
-            "image_manifest": manifest,
-            "image_root": img_dir,
-            "image_split": "train",
-            "caption_max_len": 8,
-            "caption_cond_source": "tokens",
-            "latent_stats": latent_stats_state(flow_latent_stats(flow_rect)),
-            "prompt_templates": [],
-            "prompt_vocab": vocab_rect,
-            "conditioner_state_dict": conditioner_rect.state_dict(),
-            "flow_ema_state_dict": {},
-            "conditioner_ema_state_dict": {},
-        }, rect_ckpt)
-        ae_rect2, _flow_rect2, _cond_rect2, _vocab_rect2, _tpl_rect2, meta_rect2 = (
-            load_checkpoint(rect_ckpt, device="cpu", prefer_ema=False))
-        assert meta_rect2["image_size"] == [32, 48]
-        assert meta_rect2["image_h"] == 32 and meta_rect2["image_w"] == 48
-        assert meta_rect2["latent_normalize"] == "channel"
-        assert ae_latent_shape(ae_rect2, meta_rect2["image_size"]) == (4, 4, 6)
-        _ae_bucket, _flow_bucket, _conditioner_bucket, _vocab_bucket, report_bucket = (
-            train_latent_flow(
-                ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=16,
-                flow_arch="dit", dit_depth=1, dit_heads=2, seed=15,
-                device="cpu", cond_mode="text", text_cond_dim=8,
-                image_manifest=manifest, image_root=img_dir, image_split="train",
-                image_max_records=2, caption_max_len=8, sample_steps=1,
-                size=(32, 32), size_buckets=((32, 32), (32, 48)),
-                ae_arch="residual", latent_downsample=8,
-                latent_max_tokens=32, image_crop_mode="pad",
-                image_quality_weight=1.0,
-                image_source_weights="curated=10.0,synthetic=0.1,*=1.0",
-                flow_cache_latents=True, flow_cache_records=2,
-                intervention_samples=0, return_conditioner=True))
-        assert report_bucket["size_buckets"] == [[32, 32], [32, 48]]
-        assert report_bucket["latent_normalize_requested"] == "auto"
-        assert report_bucket["latent_normalize"] == "channel"
-        assert report_bucket["size_bucket_count"] == 2
-        assert report_bucket["max_train_latent_tokens"] == 24
-        assert set(report_bucket["size_bucket_sample_counts"]) == {"32x32", "32x48"}
-        assert sum(report_bucket["size_bucket_sample_counts"].values()) == 2
-        assert report_bucket["size_bucket_missing_dims"] == 0
-        assert report_bucket["size_bucket_sampling_mode"] == "weighted"
-        assert report_bucket["size_bucket_weight_sums"]["32x32"] > (
-            report_bucket["size_bucket_weight_sums"]["32x48"])
-        assert report_bucket["size_bucket_sampling_probs"]["32x32"] > 0.9
-        assert report_bucket["flow_cache_backend"] == "bucketed_memory"
-        assert report_bucket["flow_cache_bucket_count"] == 2
-        assert report_bucket["flow_cache_bucket_sampling_mode"] == "weighted"
-        assert report_bucket["flow_cache_bucket_sampling_probs"]["32x32"] > 0.9
-        assert report_bucket["flow_cache_weighted"] is True
-        disk_cache_dir = os.path.join(td, "latent_cache")
-        _ae_disk, _flow_disk, _cond_disk, _vocab_disk, _aligner_disk, report_disk = (
-            train_latent_flow(
-                ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32,
-                flow_arch="mmdit", dit_depth=1, dit_heads=2, seed=13,
-                device="cpu", cond_mode="text", text_cond_dim=8,
-                image_manifest=manifest, image_root=img_dir, image_split="train",
-                image_max_records=2, caption_max_len=8, sample_steps=1,
-                caption_cond_source="embedding",
-                image_text_align_w=0.1, flow_text_align_w=0.1, text_embed_dim=12,
-                image_feature_align_w=0.1, flow_feature_align_w=0.1,
-                image_feature_embed_dim=10,
-                image_quality_weight=1.0,
-                image_quality_score_w=0.1, flow_quality_score_w=0.1,
-                flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
-                flow_cache_dir=disk_cache_dir, flow_cache_shard_size=1,
-                flow_cache_dtype="fp16", flow_cache_max_loaded_shards=1,
-                latent_normalize="channel", latent_stat_samples=2,
-                intervention_samples=0, return_conditioner=True, return_aligner=True))
-        assert report_disk["flow_cache_backend"] == "disk"
-        assert report_disk["flow_cache_reused"] is False
-        assert report_disk["flow_cache_latent_dtype"] == "fp16"
-        assert report_disk["flow_cache_max_loaded_shards"] == 1
-        assert report_disk["flow_cache_loaded_shards"] <= 1
-        assert report_disk["flow_cache_shard_loads"] >= 1
-        assert report_disk["flow_cache_records"] == 2
-        assert report_disk["flow_cache_shards"] == 2
-        assert report_disk["flow_cache_weighted"] is True
-        assert report_disk["flow_cache_has_quality_targets"] is True
-        assert "flow_quality_score_loss" in report_disk["last_flow"]
-        assert report_disk["flow_cache_text_embedding_ndim"] == 3
-        assert report_disk["flow_cache_text_embedding_seq_len"] == 3
-        assert report_disk["image_feature_aligner"] is True
-        assert report_disk["flow_cache_bytes"] > 0
-        assert os.path.exists(os.path.join(disk_cache_dir, "meta.json"))
-        assert report_disk["latent_normalize"] == "channel"
-        _ae_disk2, _flow_disk2, _cond_disk2, _vocab_disk2, _aligner_disk2, report_disk2 = (
-            train_latent_flow(
-                ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32,
-                flow_arch="mmdit", dit_depth=1, dit_heads=2, seed=13,
-                device="cpu", cond_mode="text", text_cond_dim=8,
-                image_manifest=manifest, image_root=img_dir, image_split="train",
-                image_max_records=2, caption_max_len=8, sample_steps=1,
-                caption_cond_source="embedding",
-                image_text_align_w=0.1, flow_text_align_w=0.1, text_embed_dim=12,
-                image_feature_align_w=0.1, flow_feature_align_w=0.1,
-                image_feature_embed_dim=10,
-                image_quality_weight=1.0,
-                image_quality_score_w=0.1, flow_quality_score_w=0.1,
-                flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
-                flow_cache_dir=disk_cache_dir, flow_cache_shard_size=1,
-                flow_cache_dtype="fp16", flow_cache_max_loaded_shards=1,
-                latent_normalize="channel", latent_stat_samples=2,
-                intervention_samples=0, return_conditioner=True, return_aligner=True))
-        assert report_disk2["flow_cache_backend"] == "disk"
-        assert report_disk2["flow_cache_reused"] is True
-        assert report_disk2["flow_cache_has_quality_targets"] is True
-        assert report_disk2["flow_cache_latent_dtype"] == "fp16"
-        assert report_disk2["flow_cache_max_loaded_shards"] == 1
-        assert report_disk2["flow_cache_loaded_shards"] <= 1
-        assert report_disk2["flow_cache_shard_loads"] >= 1
-        manifest_rows = read_image_manifest(manifest, root=img_dir, split="eval")
-        img_sweep = image_record_sweep(
-            ae6, flow6, manifest_rows, cfg_scales=(1.0,), sample_steps_list=(1,),
-            n=2, batch=2, seed=10, device="cpu", conditioner=conditioner6,
-            prompt_vocab=vocab6, caption_max_len=8, text_aligner=aligner6,
-            image_feature_aligner=getattr(flow6, "image_feature_aligner", None),
-            image_quality_scorer=getattr(flow6, "image_quality_scorer", None),
-            caption_cond_source="embedding", generated_eval_n=3,
-            generated_eval_candidates_per_prompt=2)
-        img_agg = aggregate_sweep_rows([dict(r, eval_seed=10) for r in img_sweep])
-        assert img_sweep[0]["sample_steps"] == 1
-        assert img_sweep[0]["generated_eval_n"] == 3
-        assert img_sweep[0]["generated_eval_n_requested"] == 3
-        assert img_sweep[0]["generated_eval_candidates_per_prompt"] == 2
-        assert img_sweep[0]["generated_eval_raw_candidates"] == 6
-        assert img_sweep[0]["generated_eval_selection_component_count"] >= 2
-        assert len(img_sweep[0]["generated_eval_selected_candidate_indices"]) == 3
-        assert "quality_scorer_score" in img_sweep[0]["generated_eval_selection_scorer"]
-        assert img_agg[0]["generated_eval_candidates_per_prompt"] == 2
-        assert img_agg[0]["generated_eval_raw_candidates_mean"] == 6.0
-        assert "caption_sample_mse_mean" in img_agg[0]
-        assert "generated_caption_retrieval_i2t_acc_mean" in img_agg[0]
-        assert "generated_image_feature_retrieval_i2f_acc_mean" in img_agg[0]
-        assert "generated_image_feature_distribution_frechet_mean" in img_agg[0]
-        assert "generated_image_feature_distribution_support_recall_mean" in img_agg[0]
-        assert "generated_external_text_image_score_cos_mean" in img_agg[0]
-        ckpt = os.path.join(td, "manifest.pt")
-        torch.save({
-            "autoencoder_state_dict": ae6.state_dict(),
-            "flow_state_dict": flow6.state_dict(),
-            "report": report6,
-            "fact_vocab": FACT_VOCAB,
-            "latent_ch": 4,
-            "hidden": 32,
-            "flow_arch": "mmdit",
-            "dit_depth": 1,
-            "dit_heads": 2,
-            "dit_head_width_mult": 1,
-            "cond_mode": "text",
-            "cond_dim": report6["cond_dim"],
-            "data_mode": "image_manifest",
-            "image_manifest": manifest,
-            "image_root": img_dir,
-            "image_split": "train",
-            "caption_max_len": 8,
-            "caption_cond_source": "embedding",
-            "text_embedding_in_dim": 4,
-            "text_embed_dim": 12,
-            "image_embedding_in_dim": 4,
-            "image_feature_embed_dim": 10,
-            "flow_repa_embed_dim": 11,
-            "image_feature_align_w": 0.1,
-            "flow_feature_align_w": 0.1,
-            "image_quality_score_w": 0.1,
-            "flow_quality_score_w": 0.0,
-            "image_quality_scorer": True,
-            "flow_repa_w": 0.1,
-            "flow_repa_steps": 0,
-            "latent_stats": latent_stats_state(flow_latent_stats(flow6)),
-            "prompt_templates": [],
-            "prompt_vocab": vocab6,
-            "conditioner_state_dict": conditioner6.state_dict(),
-            "text_aligner_state_dict": aligner6.state_dict(),
-            "image_feature_aligner_state_dict": (
-                getattr(flow6, "image_feature_aligner").state_dict()
-            ),
-            "image_quality_scorer_state_dict": (
-                getattr(flow6, "image_quality_scorer").state_dict()
-            ),
-            "flow_repa_aligner_state_dict": (
-                getattr(flow6, "flow_repa_aligner").state_dict()
-            ),
-            "flow_ema_state_dict": {},
-            "conditioner_ema_state_dict": {},
-        }, ckpt)
-        eval6 = evaluate_checkpoint(
-            ckpt, cfg_scales=(1.0,), sample_steps_list=(1,), n=2, batch=2,
-            seed=11, eval_seeds=(11,), size=32, device="cpu",
-            eval_image_manifest=manifest, eval_image_root=img_dir,
-            eval_image_split="eval",
-            text_guidance_weights=(0.0, 0.01),
-            feature_guidance_weights=(0.0, 0.01),
-            quality_guidance_weights=(0.0, 0.01),
-            generated_eval_n=3,
-            generated_eval_candidates_per_prompt=2)
-        assert eval6["experiment"] == "image_latent_manifest_sampler_sweep"
-        assert eval6["generated_eval_n_requested"] == 3
-        assert eval6["generated_eval_candidates_per_prompt"] == 2
-        assert all(row["sample_steps"] == 1 for row in eval6["rows"])
-        assert all(row["generated_eval_n"] == 3 for row in eval6["rows"])
-        assert all(row["generated_eval_n_requested"] == 3 for row in eval6["rows"])
-        assert all(row["generated_eval_candidates_per_prompt"] == 2
-                   for row in eval6["rows"])
-        assert all(row["generated_eval_raw_candidates"] == 6 for row in eval6["rows"])
-        assert eval6["best"]["caption_sample_mse_mean"] >= 0.0
-        assert eval6["best"]["generated_eval_candidates_per_prompt"] == 2
-        assert eval6["best"]["generated_eval_raw_candidates_mean"] == 6.0
-        assert eval6["text_aligner"] is True
-        assert eval6["image_feature_aligner"] is True
-        assert eval6["image_quality_scorer"] is True
-        assert eval6["flow_repa_aligner"] is True
-        assert eval6["text_guidance_weights"] == [0.0, 0.01]
-        assert eval6["feature_guidance_weights"] == [0.0, 0.01]
-        assert eval6["quality_guidance_weights"] == [0.0, 0.01]
-        assert len(eval6["aggregate"]) == 8
-        assert "text_guidance_w" in eval6["best"]
-        assert "feature_guidance_w" in eval6["best"]
-        assert "quality_guidance_w" in eval6["best"]
-        assert any(row["text_guidance_w"] > 0.0 for row in eval6["rows"])
-        assert any(row["feature_guidance_w"] > 0.0 for row in eval6["rows"])
-        assert any(row["quality_guidance_w"] > 0.0 for row in eval6["rows"])
-        assert "generated_caption_retrieval_i2t_acc_mean" in eval6["best"]
-        assert "generated_image_feature_retrieval_i2f_acc_mean" in eval6["best"]
-        assert "generated_image_feature_distribution_frechet_mean" in eval6["best"]
-        assert "generated_image_feature_distribution_diversity_l2_ratio_mean" in eval6["best"]
-        assert "generated_external_text_image_score_cos_mean" in eval6["best"]
-        assert "generated_image_quality_score_pred_mean_mean" in eval6["best"]
+            flow_arch="dit", dit_depth=1, dit_heads=2, seed=5, device="cpu",
+            cond_mode="text", text_cond_dim=8, image_manifest=manifest,
+            image_root=td, image_split="train", caption_max_len=8,
+            image_max_records=3, sample_steps=1, return_conditioner=True)
+        assert report["experiment"] == "image_latent_manifest_rectified_flow"
+        assert report["data_mode"] == "image_manifest"
+        assert report["cond_mode"] == "text"
+        assert report["image_records"] == 3
+        assert report["time_shift_mode"] == "auto"
+        assert report["time_shift_effective_mode"] == "manual"
+        assert "recon_mse" in report
+        assert conditioner is not None and vocab
+        sample_path = os.path.join(td, "samples.ppm")
+        meta = save_caption_sample_grid(
+            ae, flow, read_image_manifest(manifest, root=td), sample_path,
+            size=16, device="cpu", conditioner=conditioner, prompt_vocab=vocab,
+            caption_max_len=8, sample_steps=1, samples=1)
+        assert meta["sample_grid_cond_mode"] == "caption"
+        assert os.path.exists(sample_path)
+    mmdit = make_flow(
+        flow_arch="mmdit", latent_ch=4, hidden=16, dit_depth=1, dit_heads=2,
+        cond_dim=8, dit_qk_norm=True, dit_attn_impl="auto", dit_pos_embed="rope2d",
+        dit_mlp="swiglu", latent_max_tokens=16)
+    mmdit_cond = {
+        "vec": torch.randn(2, 8),
+        "tokens": torch.randn(2, 3, 8),
+        "mask": torch.zeros(2, 3, dtype=torch.bool),
+    }
+    mmdit_out = mmdit(torch.randn(2, 4, 4, 4), torch.rand(2, 1, 1, 1), mmdit_cond)
+    assert tuple(mmdit_out.shape) == (2, 4, 4, 4)
+    assert getattr(mmdit, "attn_impl", "") == "auto"
     print("image_latent selftest OK")
 
 
@@ -11076,13 +8970,6 @@ def main(argv=None):
                     help="flow SRA target: pooled hidden state, patch tokens, both, or auto")
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--fact-w", type=float, default=1.0, dest="fact_w")
-    ap.add_argument("--ae-intervention-w", type=float, default=0.0,
-                    dest="ae_intervention_w",
-                    help="semantic AE latent fact-intervention loss weight")
-    ap.add_argument("--ae-factor-orth-w", type=float, default=0.0,
-                    dest="ae_factor_orth_w",
-                    help="semantic AE cross-factor latent orthogonality loss weight")
     ap.add_argument("--flow-arch", default="conv", choices=("conv", "dit", "crossdit", "mmdit"),
                     dest="flow_arch")
     ap.add_argument("--dit-depth", type=int, default=3, dest="dit_depth")
@@ -11092,9 +8979,10 @@ def main(argv=None):
                     help="width multiplier for the DiT/MM-DiT latent velocity head")
     ap.add_argument("--dit-qk-norm", action="store_true", dest="dit_qk_norm",
                     help="enable per-head QK RMSNorm in MM-DiT attention")
-    ap.add_argument("--dit-attn-impl", default="manual", choices=MMDIT_ATTN_IMPLS,
+    ap.add_argument("--dit-attn-impl", default="auto", choices=MMDIT_ATTN_IMPLS,
                     dest="dit_attn_impl",
-                    help="MM-DiT attention implementation: manual, sdpa, or auto")
+                    help=("MM-DiT attention implementation; auto uses exact PyTorch SDPA "
+                          "when available, linear is an explicit approximation"))
     ap.add_argument("--dit-pos-embed", default="learned", choices=DIT_POS_EMBEDS,
                     dest="dit_pos_embed",
                     help=("image-token positional embedding for DiT/CrossDiT/MM-DiT flows; "
@@ -11142,12 +9030,6 @@ def main(argv=None):
     ap.add_argument("--sample-latent-clip", type=float, default=0.0,
                     dest="sample_latent_clip",
                     help="absolute latent clamp during sampling; 0 disables")
-    ap.add_argument("--semantic-guidance-w", type=float, default=0.0,
-                    dest="semantic_guidance_w",
-                    help="sampling-time semantic AE guidance weight")
-    ap.add_argument("--semantic-guidance-weights", default="",
-                    dest="semantic_guidance_weights",
-                    help="comma-separated semantic guidance weights for --eval-checkpoint sweeps")
     ap.add_argument("--eval-text-guidance-weights", default="",
                     dest="eval_text_guidance_weights",
                     help=("comma-separated text-aligner guidance weights for manifest "
@@ -11160,12 +9042,6 @@ def main(argv=None):
                     dest="eval_quality_guidance_weights",
                     help=("comma-separated quality guidance weights for manifest "
                           "--eval-checkpoint sweeps"))
-    ap.add_argument("--semantic-guidance-mode", default="decoded",
-                    choices=("latent", "decoded"), dest="semantic_guidance_mode",
-                    help="guide sampled latents using direct latent heads or decode/re-read heads")
-    ap.add_argument("--semantic-guidance-interval", default="0.0,1.0",
-                    dest="semantic_guidance_interval",
-                    help="semantic guidance active interval over flow time, formatted start,end")
     ap.add_argument("--cfg-scales", default="1.0,1.25,1.5,2.0", dest="cfg_scales",
                     help="comma-separated CFG scales for --eval-checkpoint")
     ap.add_argument("--cfg-rescales", default="0.0", dest="cfg_rescales",
@@ -11176,12 +9052,6 @@ def main(argv=None):
                     help="comma-separated sampler step counts for --eval-checkpoint")
     ap.add_argument("--eval-seeds", default="", dest="eval_seeds",
                     help="comma-separated eval seeds for --eval-checkpoint; default uses --seed")
-    ap.add_argument("--roundtrip-samples", type=int, default=1, dest="roundtrip_samples")
-    ap.add_argument("--intervention-samples", type=int, default=32,
-                    dest="intervention_samples",
-                    help="samples for latent fact intervention diagnostics; 0 disables")
-    ap.add_argument("--flow-semantic-w", type=float, default=0.0, dest="flow_semantic_w",
-                    help="semantic endpoint alignment weight for latent flow training")
     ap.add_argument("--flow-consistency-w", type=float, default=0.0,
                     dest="flow_consistency_w",
                     help="same-path clean-endpoint consistency loss weight for latent flow")
@@ -11235,9 +9105,11 @@ def main(argv=None):
                           "switching timestep sampling to uniform; 0 disables"))
     ap.add_argument("--time-shift", type=float, default=1.0, dest="time_shift",
                     help="rectified-flow data-time shift; >1 biases training toward noise")
-    ap.add_argument("--time-shift-mode", default="manual", choices=TIME_SHIFT_MODES,
+    ap.add_argument("--time-shift-mode", default="auto", choices=TIME_SHIFT_MODES,
                     dest="time_shift_mode",
-                    help="manual uses --time-shift as-is; dim scales it by latent dimension")
+                    help=("manual uses --time-shift as-is; dim scales it by latent "
+                          "dimension; auto uses dim only when latent dimension exceeds "
+                          "--time-shift-ref-dim"))
     ap.add_argument("--time-shift-ref-dim", type=float, default=1024.0,
                     dest="time_shift_ref_dim",
                     help="reference latent element count for --time-shift-mode dim")
@@ -11336,8 +9208,6 @@ def main(argv=None):
     ap.add_argument("--image-hflip-prob", type=float, default=0.0,
                     dest="image_hflip_prob",
                     help="random horizontal flip probability for manifest training images")
-    ap.add_argument("--prompt-templates", default="", dest="prompt_templates",
-                    help="internal fixture prompt templates; production runs use captions/prompts")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="runs/image_latent_flow.pt")
     ap.add_argument("--eval-out", default="", dest="eval_out",
@@ -11419,7 +9289,6 @@ def main(argv=None):
     args = ap.parse_args(argv)
     try:
         cfg_interval = _parse_interval(args.cfg_interval)
-        semantic_guidance_interval = _parse_interval(args.semantic_guidance_interval)
         sample_churn_interval = _parse_interval(args.sample_churn_interval)
         cli_size = normalize_image_size(args.size, default=None)
         cli_size_buckets = normalize_image_size_buckets(args.size_buckets)
@@ -11459,7 +9328,7 @@ def main(argv=None):
         selftest()
         return
     if args.train and not args.image_manifest:
-        ap.error("--train requires --image-manifest; synthetic visual fixtures are not a public training path")
+        ap.error("--train requires --image-manifest")
     if sample_prompts and not args.sample_grid_out:
         ap.error("--sample-prompts requires --sample-grid-out")
     if args.sample_manifest_out and not args.sample_grid_out:
@@ -11571,16 +9440,8 @@ def main(argv=None):
             seed=args.seed,
             size=cli_size,
             eval_seeds=(_parse_number_list(args.eval_seeds, int) if args.eval_seeds else None),
-            roundtrip_samples=args.roundtrip_samples,
             prefer_ema=args.checkpoint_weight_mode != "raw",
             weight_mode=args.checkpoint_weight_mode,
-            intervention_samples=args.intervention_samples,
-            semantic_guidance_w=args.semantic_guidance_w,
-            semantic_guidance_weights=(
-                _parse_number_list(args.semantic_guidance_weights, float)
-                if args.semantic_guidance_weights else None
-            ),
-            semantic_guidance_mode=args.semantic_guidance_mode,
             sample_method=args.sample_method,
             sample_methods=(
                 _parse_string_list(args.sample_methods) if args.sample_methods else None
@@ -11591,7 +9452,6 @@ def main(argv=None):
             sample_churns=sample_churns,
             sample_churn_interval=sample_churn_interval,
             cfg_interval=cfg_interval,
-            semantic_guidance_interval=semantic_guidance_interval,
             text_guidance_weights=eval_text_guidance_weights,
             feature_guidance_weights=eval_feature_guidance_weights,
             quality_guidance_weights=eval_quality_guidance_weights,
@@ -11627,10 +9487,7 @@ def main(argv=None):
                 fallback_sample_velocity_clip=args.sample_velocity_clip,
                 fallback_sample_latent_clip=args.sample_latent_clip,
                 fallback_cfg_mode=args.cfg_mode,
-                fallback_semantic_w=args.semantic_guidance_w,
-                fallback_semantic_mode=args.semantic_guidance_mode,
                 fallback_cfg_interval=cfg_interval,
-                fallback_semantic_interval=semantic_guidance_interval,
                 fallback_sample_time_shift=(
                     args.sample_time_shift if args.sample_time_shift is not None
                     else report.get("sample_time_shift", 1.0)
@@ -11706,30 +9563,9 @@ def main(argv=None):
                     sample_manifest_out=args.sample_manifest_out,
                     sample_image_dir=args.sample_image_dir)
             else:
-                grid_meta = save_sample_grid(
-                    ae, flow, args.sample_grid_out, size=grid_size, cond_mode=meta["cond_mode"],
-                    conditioner=conditioner, prompt_vocab=prompt_vocab,
-                    prompt_templates=prompt_templates,
-                    cfg_scale=settings["cfg_scale"],
-                    cfg_rescale=settings["cfg_rescale"],
-                    cfg_mode=settings["cfg_mode"],
-                    cfg_interval=settings["cfg_interval"],
-                    sample_steps=settings["sample_steps"],
-                    sample_time_shift=settings["sample_time_shift"],
-                    sample_method=settings["sample_method"],
-                    sample_schedule=settings["sample_schedule"],
-                    sample_churn=settings["sample_churn"],
-                    sample_churn_interval=settings["sample_churn_interval"],
-                    semantic_guidance_w=settings["semantic_guidance_w"],
-                    semantic_guidance_mode=settings["semantic_guidance_mode"],
-                    semantic_guidance_interval=settings["semantic_guidance_interval"],
-                    sample_finite_guard=settings["sample_finite_guard"],
-                    sample_velocity_clip=settings["sample_velocity_clip"],
-                    sample_latent_clip=settings["sample_latent_clip"],
-                    samples_per_combo=args.sample_grid_samples,
-                    seed=args.seed + 991,
-                    sample_manifest_out=args.sample_manifest_out,
-                    sample_image_dir=args.sample_image_dir)
+                ap.error(
+                    "--sample-grid-out with --eval-checkpoint requires --sample-prompts "
+                    "or --eval-image-manifest")
             grid_meta["sample_grid_checkpoint_weight_mode"] = (
                 "ema" if meta["ema_loaded"] else "raw")
             report.update(grid_meta)
@@ -11744,12 +9580,11 @@ def main(argv=None):
         return
     if not args.train:
         ap.error("use --selftest, --train, or --eval-checkpoint")
-    templates = _parse_templates(args.prompt_templates)
     run_size = cli_size or (32, 32)
     (ae, flow, conditioner, prompt_vocab, text_aligner, report,
      flow_ema, conditioner_ema) = train_latent_flow(
         ae_steps=args.ae_steps, flow_steps=args.flow_steps, batch=args.batch,
-        latent_ch=args.latent_ch, hidden=args.hidden, lr=args.lr, fact_w=args.fact_w,
+        latent_ch=args.latent_ch, hidden=args.hidden, lr=args.lr,
         seed=args.seed, size=run_size, flow_arch=args.flow_arch, dit_depth=args.dit_depth,
         dit_heads=args.dit_heads, cond_drop=args.cond_drop, cfg_scale=args.cfg_scale,
         cfg_rescale=args.cfg_rescale, cfg_mode=args.cfg_mode,
@@ -11787,8 +9622,7 @@ def main(argv=None):
         flow_sra_steps=args.flow_sra_steps,
         flow_sra_time_gap=args.flow_sra_time_gap,
         flow_sra_mode=args.flow_sra_mode,
-        sample_steps=args.sample_steps, roundtrip_samples=args.roundtrip_samples,
-        flow_semantic_w=args.flow_semantic_w, cond_mode=args.cond_mode,
+        sample_steps=args.sample_steps, cond_mode=args.cond_mode,
         flow_consistency_w=args.flow_consistency_w,
         flow_endpoint_w=args.flow_endpoint_w,
         flow_noise_coupling=args.flow_noise_coupling,
@@ -11801,7 +9635,7 @@ def main(argv=None):
         flow_guidance_distill_w=args.flow_guidance_distill_w,
         flow_guidance_distill_cfg_scale=args.flow_guidance_distill_cfg_scale,
         flow_guidance_distill_cfg_rescale=args.flow_guidance_distill_cfg_rescale,
-        text_cond_dim=args.text_cond_dim, prompt_templates=templates,
+        text_cond_dim=args.text_cond_dim,
         image_manifest=args.image_manifest, image_root=args.image_root,
         image_split=args.image_split, image_min_aesthetic=args.image_min_aesthetic,
         image_max_records=args.image_max_records,
@@ -11833,12 +9667,7 @@ def main(argv=None):
         flow_loss_weight_normalize=not args.no_flow_loss_weight_normalize,
         latent_normalize=args.latent_normalize,
         latent_stat_samples=args.latent_stat_samples,
-        ae_intervention_w=args.ae_intervention_w,
-        ae_factor_orth_w=args.ae_factor_orth_w,
-        semantic_guidance_w=args.semantic_guidance_w,
-        semantic_guidance_mode=args.semantic_guidance_mode,
         cfg_interval=cfg_interval,
-        semantic_guidance_interval=semantic_guidance_interval,
         sample_method=args.sample_method,
         sample_schedule=args.sample_schedule,
         sample_churn=args.sample_churn,
@@ -11850,7 +9679,6 @@ def main(argv=None):
         flow_ema_warmup=not args.no_ema_warmup,
         eval_with_ema=args.ema_eval_mode != "raw",
         eval_weight_mode=args.ema_eval_mode,
-        intervention_samples=args.intervention_samples,
         eval_generated_candidates_per_prompt=args.eval_generated_candidates_per_prompt,
         train_precision=args.train_precision,
         ae_accum_steps=args.ae_accum_steps,
@@ -11886,11 +9714,9 @@ def main(argv=None):
             fallback_sample_velocity_clip=args.sample_velocity_clip,
             fallback_sample_latent_clip=args.sample_latent_clip,
             fallback_cfg_mode=args.cfg_mode,
-            fallback_semantic_w=args.semantic_guidance_w,
-            fallback_semantic_mode=args.semantic_guidance_mode,
             fallback_cfg_interval=cfg_interval,
-            fallback_semantic_interval=semantic_guidance_interval,
-            fallback_sample_time_shift=args.time_shift)
+            fallback_sample_time_shift=report.get(
+                "sample_time_shift", report.get("time_shift", args.time_shift)))
         if sample_prompts:
             grid_meta = save_text_prompt_sample_grid(
                 ae, flow, sample_prompts, args.sample_grid_out, conditioner=conditioner,
@@ -11958,30 +9784,7 @@ def main(argv=None):
                 sample_manifest_out=args.sample_manifest_out,
                 sample_image_dir=args.sample_image_dir)
         else:
-            grid_meta = save_sample_grid(
-                ae, flow, args.sample_grid_out, size=run_size, cond_mode=args.cond_mode,
-                conditioner=conditioner,
-                prompt_vocab=prompt_vocab, prompt_templates=templates,
-                cfg_scale=settings["cfg_scale"],
-                cfg_rescale=settings["cfg_rescale"],
-                cfg_mode=settings["cfg_mode"],
-                cfg_interval=settings["cfg_interval"],
-                sample_steps=settings["sample_steps"],
-                sample_time_shift=settings["sample_time_shift"],
-                sample_method=settings["sample_method"],
-                sample_schedule=settings["sample_schedule"],
-                sample_churn=settings["sample_churn"],
-                sample_churn_interval=settings["sample_churn_interval"],
-                semantic_guidance_w=settings["semantic_guidance_w"],
-                semantic_guidance_mode=settings["semantic_guidance_mode"],
-                semantic_guidance_interval=settings["semantic_guidance_interval"],
-                sample_finite_guard=settings["sample_finite_guard"],
-                sample_velocity_clip=settings["sample_velocity_clip"],
-                sample_latent_clip=settings["sample_latent_clip"],
-                samples_per_combo=args.sample_grid_samples,
-                seed=args.seed + 991,
-                sample_manifest_out=args.sample_manifest_out,
-                sample_image_dir=args.sample_image_dir)
+            ap.error("--sample-grid-out requires --sample-prompts or --image-manifest")
         grid_meta["sample_grid_checkpoint_weight_mode"] = grid_weight_mode
         report.update(grid_meta)
         load_flow_state(flow, raw_flow)
@@ -11994,7 +9797,6 @@ def main(argv=None):
         ),
         "flow_state_dict": flow.state_dict(),
         "report": report,
-        "fact_vocab": FACT_VOCAB,
         "latent_ch": report.get("latent_ch", args.latent_ch),
         "image_size": image_size_value(run_size),
         "image_h": int(run_size[0]),
@@ -12123,13 +9925,6 @@ def main(argv=None):
         "sample_finite_guard": args.sample_finite_guard,
         "sample_velocity_clip": args.sample_velocity_clip,
         "sample_latent_clip": args.sample_latent_clip,
-        "semantic_guidance_w": args.semantic_guidance_w,
-        "semantic_guidance_mode": args.semantic_guidance_mode,
-        "semantic_guidance_interval": list(semantic_guidance_interval),
-        "intervention_samples": args.intervention_samples,
-        "ae_intervention_w": args.ae_intervention_w,
-        "ae_factor_orth_w": args.ae_factor_orth_w,
-        "flow_semantic_w": args.flow_semantic_w,
         "flow_consistency_w": args.flow_consistency_w,
         "flow_distill_steps": report.get("flow_distill_steps", args.flow_distill_steps),
         "flow_distill_steps_run": report.get("flow_distill_steps_run", 0),
@@ -12159,6 +9954,9 @@ def main(argv=None):
         "time_shift": report.get("time_shift", args.time_shift),
         "time_shift_requested": args.time_shift,
         "time_shift_mode": args.time_shift_mode,
+        "time_shift_effective_mode": report.get(
+            "time_shift_effective_mode", args.time_shift_mode),
+        "time_shift_auto_policy": report.get("time_shift_auto_policy", ""),
         "time_shift_ref_dim": args.time_shift_ref_dim,
         "time_shift_dim_power": args.time_shift_dim_power,
         "latent_effective_dim": report.get("latent_effective_dim", 0),
@@ -12175,7 +9973,7 @@ def main(argv=None):
         "latent_normalize_requested": args.latent_normalize,
         "latent_stat_samples": args.latent_stat_samples,
         "latent_stats": latent_stats_state(flow_latent_stats(flow)),
-        "prompt_templates": list(templates) if args.cond_mode == "text" else [],
+        "prompt_templates": [],
         "prompt_vocab": prompt_vocab if prompt_vocab is not None else {},
         "conditioner_state_dict": (conditioner.state_dict() if conditioner is not None else {}),
         "text_aligner_state_dict": (

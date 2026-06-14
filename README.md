@@ -36,12 +36,10 @@ memorization, and curriculum.
 | `datalog.py` | minimal Datalog: least-fixpoint closure with provenance, entailment oracle, proof trees, SLD backward chaining |
 | `surfaces.json` | frontier-distilled surface bank: 1,300+ validated English patterns across 8 education registers (preschool → scholar), with held-out splits |
 | `runpod/` | H100 launchers (tar-over-ssh, timeout-bounded, always-terminate) |
-| `thinking/vision.py`, `thinking/image2.py`, `thinking/image_flow.py`, `thinking/image_data.py`, `thinking/image_caption.py`, `thinking/image_embed.py`, `thinking/image_score.py`, `thinking/image_preferences.py`, `thinking/image_eval.py`, `thinking/image_latent.py` | Image rungs: synthetic visual factors → canonical facts, head-aware FER probes, captioned image data, recaptioning, embedding/quality/preference sidecars, offline image-quality eval, pixel flow, and semantic latent flow |
+| `thinking/vision_understanding.py`, `thinking/image_data.py`, `thinking/image_caption.py`, `thinking/image_embed.py`, `thinking/image_score.py`, `thinking/image_preferences.py`, `thinking/image_curate.py`, `thinking/image_eval.py`, `thinking/image_latent.py` | Image stack: manifest-driven visual concept learning, captioned image data, recaptioning, embedding/quality/preference sidecars, curation, offline image-quality eval, and text-conditioned latent flow |
 | `thinking/text.py` | Text-0 semantic understanding rung: web-imported English records → canonical facts, with artifact controls |
-| `thinking/audio.py`, `thinking/multimodal.py` | Audio factors and the M-0 multimodal bridge: image+audio+transcript prefixes → one canonical extraction trace |
+| `thinking/audio.py`, `thinking/multimodal.py` | Speech experiments and a generic manifest-driven multimodal prefix bridge |
 | `thinking/listen.py`, `thinking/speak.py` | speech: **listen** (transcribe real synthesized speech, speaker-invariant), **speak** (emit audio tokens *verified by round-trip* through the frozen listener — the checker, applied to generation) |
-| `thinking/crossmodal.py` | cross-modal FER probe: does a concept *heard* align with the same concept *seen*? (retrieval 0.92 — unified, not fractured) |
-| `data/multimodal_transcripts.json` | Configurable M-0 language data: template smoke bank plus optional explicit `(text, facts)` examples |
 | `*.md` | research plans and theses (FER bet, reasoning design, training data, validated plan) |
 
 ## Headline results (staircase-validated, 2026-06)
@@ -81,22 +79,17 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --steps 8000 --out runs/demo
 .venv/bin/python -m thinking.cli eval runs/demo --mode verified
 .venv/bin/python -m thinking.cli demo runs/demo --k 3
-.venv/bin/python -m thinking.vision --train --steps 200 --out runs/vision_object_encoder.pt
-.venv/bin/python -m thinking.image2 --steps 40 --seeds 0 --out runs/image2_smoke.json
-.venv/bin/python -m thinking.image_flow --train --steps 40 --out runs/image_flow.pt
-.venv/bin/python -m thinking.image_latent --train --ae-steps 40 --flow-steps 40 \
-    --out runs/image_latent_flow.pt
-.venv/bin/python -m thinking.image_latent --train --flow-arch dit --ae-steps 40 \
-    --flow-steps 40 --cond-drop 0.1 --cfg-scale 1.5 --sample-steps 4 \
-    --flow-semantic-w 0.25 \
-    --out runs/image_latent_dit.pt
+.venv/bin/python -m thinking.vision_understanding --train \
+    --manifest data/images/train_web_ppm_smoke.jsonl --root data/images \
+    --steps 40 --out runs/vision_understanding.pt
 .venv/bin/python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
+    --image-manifest data/images/train_web_ppm_smoke.jsonl --image-root data/images \
     --ae-steps 40 --flow-steps 40 --cond-drop 0.1 --cfg-scale 1.5 \
-    --sample-steps 4 --flow-semantic-w 0.25 --time-sampling logit-normal \
+    --sample-steps 4 --time-sampling logit-normal --time-shift-mode auto \
     --flow-consistency-w 0.05 --flow-endpoint-w 0.1 \
     --flow-noise-coupling sliced_ot --flow-noise-coupling-projections 4 \
     --flow-ema-decay 0.99 --flow-checkpoint-blocks \
-    --dit-mlp swiglu \
+    --dit-attn-impl auto --dit-mlp swiglu \
     --sample-churn 0.05 --sample-churn-interval 0.0,0.8 \
     --out runs/image_latent_mmdit_text.pt
 .venv/bin/python -m thinking.image_fetch --source text-to-image-2m-512-2m \
@@ -113,6 +106,12 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --out data/images/train_web_scored.jsonl \
     --sidecar-out data/images/train_web_quality_scores.jsonl \
     --report-out runs/image_score_report.json
+.venv/bin/python -m thinking.image_curate --manifest data/images/train_web_scored.jsonl \
+    --root data/images --min-caption-tokens 4 --min-width 256 --min-height 256 \
+    --max-nsfw 0.2 --max-watermark 0.2 --min-image-text-cosine 0.2 \
+    --max-image-duplicate-cosine 0.985 --eval-frac 0.02 \
+    --out data/images/train_web_curated.jsonl \
+    --report-out runs/image_curate_report.json
 # To use a web/HF preference model, write any JSONL/CSV/TSV sidecar with image + score fields
 # and merge it generically instead of hardcoding a reward model into training:
 # .venv/bin/python -m thinking.image_score --manifest data/images/train_web_captioned.jsonl \
@@ -148,7 +147,8 @@ installs those when this path is active.
     --image-manifest data/images/train_clean.jsonl --image-root data/images \
     --caption-cond-source auto \
     --size 64 --ae-arch residual --latent-downsample 8 --latent-max-tokens 128 \
-    --dit-pos-embed rope2d --dit-mlp swiglu --latent-patch-size 2 \
+    --dit-pos-embed rope2d --dit-attn-impl auto --dit-mlp swiglu \
+    --latent-patch-size 2 \
     --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 --ae-fft-w 0.05 \
     --image-text-align-w 0.1 --flow-text-align-w 0.05 --text-embed-dim 128 \
     --image-feature-align-w 0.1 --flow-feature-align-w 0.05 \
@@ -203,7 +203,9 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
 # The preset also writes a generated sample manifest, embeds it, and runs image_eval; add
 # --image-generated-eval-fail-on-gate plus threshold flags to make quality gates hard. It also
 # runs image_score before embedding/cleaning so quality_score metadata reaches sampling,
-# duplicate selection, quality-head training, and quality-guided prompt sampling.
+# duplicate selection, quality-head training, and quality-guided prompt sampling. MM-DiT
+# attention defaults to exact auto SDPA on modern PyTorch; use linear only as an explicit
+# memory/speed approximation.
 .venv/bin/python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.5 --sample-steps-list 4,8 --eval-seeds 1,2,3 \
     --eval-out runs/image_latent_dit_sweep.json
@@ -224,50 +226,41 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --steps 1500 --batch 64 --d 192 --layers 4 --heads 6 --semantic-w 0.75 \
     --free-n 200 --max-new 20 \
     --out runs/text_snli_hans.json --checkpoint runs/text_snli_hans.pt
-.venv/bin/python -m thinking.text --import-grounded --grounded-train 8000 \
-    --grounded-eval 1500 --grounded-counterfactual 100 --seed 17 \
-    --out data/text_grounded.jsonl
-.venv/bin/python -m thinking.text --data data/text_grounded.jsonl --steps 600 \
-    --batch 64 --d 192 --layers 4 --heads 6 --semantic-w 0.75 \
-    --free-n 100 --paraphrase-n 50 --counterfactual-n 50 --max-new 32 \
-    --out runs/text_grounded.json --checkpoint runs/text_grounded.pt
 .venv/bin/python -m thinking.text --data data/text_snli.jsonl --data data/text_hans.jsonl \
-    --data data/text_grounded.jsonl --steps 1200 --batch 64 --d 192 \
+    --steps 1200 --batch 64 --d 192 \
     --layers 4 --heads 6 --semantic-w 0.75 \
     --free-n 100 --paraphrase-n 30 --counterfactual-n 30 --max-new 32 \
-    --out runs/text_snli_hans_grounded.json --checkpoint runs/text_snli_hans_grounded.pt
+    --out runs/text_snli_hans_extended.json --checkpoint runs/text_snli_hans_extended.pt
 .venv/bin/python -m thinking.text --data data/text_snli.jsonl --data data/text_hans.jsonl \
-    --data data/text_grounded.jsonl --steps 1200 --batch 64 --d 192 \
+    --steps 1200 --batch 64 --d 192 \
     --layers 4 --heads 6 --semantic-w 0.75 --balance-by kind \
     --free-n 80 --kind-free-n 5 --paraphrase-n 20 --counterfactual-n 20 --max-new 32 \
-    --out runs/text_snli_hans_grounded_balanced.json \
-    --checkpoint runs/text_snli_hans_grounded_balanced.pt
+    --out runs/text_snli_hans_balanced.json \
+    --checkpoint runs/text_snli_hans_balanced.pt
 .venv/bin/python -m thinking.text --data data/text_snli.jsonl --data data/text_mnli.jsonl \
-    --data data/text_hans.jsonl --data data/text_grounded.jsonl \
+    --data data/text_hans.jsonl \
     --steps 120 --batch 48 --d 96 --layers 3 --heads 4 --semantic-w 0.75 \
     --balance-by kind --fact-n 240 --kind-fact-n 40 --artifact-n 240 \
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_snli_mnli_hans_grounded_smoke.json \
-    --checkpoint runs/text_snli_mnli_hans_grounded_smoke.pt
+    --out runs/text_snli_mnli_hans_smoke.json \
+    --checkpoint runs/text_snli_mnli_hans_smoke.pt
 .venv/bin/python -m thinking.text --data data/text_mnli.jsonl \
-    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-checkpoint runs/text_snli_hans_balanced.pt \
     --study-out-checkpoint runs/text_study_mnli_smoke.pt \
     --steps 40 --batch 32 --study-lr 0.0005 --semantic-w 0.75 \
     --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
     --out runs/text_study_mnli_smoke.json
 .venv/bin/python -m thinking.text --data data/text_mnli.jsonl \
-    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-checkpoint runs/text_snli_hans_balanced.pt \
     --study-out-checkpoint runs/text_study_mnli_semantic_replay_smoke.pt \
-    --study-replay-data data/text_grounded.jsonl \
     --steps 80 --batch 32 --study-lr 0.0005 --decode-w 0 --semantic-w 1.0 \
     --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
     --out runs/text_study_mnli_semantic_replay_smoke.json
 .venv/bin/python -m thinking.text --data data/text_mnli.jsonl \
-    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-checkpoint runs/text_snli_hans_balanced.pt \
     --study-out-checkpoint runs/text_study_mnli_error_replay_smoke.pt \
-    --study-replay-data data/text_grounded.jsonl \
     --steps 40 --study-rounds 2 --study-strategy errors \
     --study-probe-n 512 --study-hard-max 256 \
     --batch 32 --study-lr 0.0005 --decode-w 0 --semantic-w 1.0 \
@@ -275,9 +268,8 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
     --out runs/text_study_mnli_error_replay_smoke.json
 .venv/bin/python -m thinking.text --data data/text_mnli.jsonl \
-    --study-checkpoint runs/text_snli_hans_grounded_balanced.pt \
+    --study-checkpoint runs/text_snli_hans_balanced.pt \
     --study-out-checkpoint runs/text_study_mnli_select_both_replay_smoke.pt \
-    --study-replay-data data/text_grounded.jsonl \
     --steps 40 --study-rounds 2 --study-strategy errors \
     --study-probe-n 512 --study-hard-max 256 --study-select-best \
     --study-score-metric both --study-retention-w 2.0 \
@@ -305,9 +297,9 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --reading-cluster-probe-n 32 \
     --out runs/text_raw_reading_graph_study_smoke.json \
     --checkpoint runs/text_raw_reading_graph_study_smoke.pt
-.venv/bin/python -m thinking.multimodal --steps 3 --batch 4 --dim 96 \
-    --layers 1 --heads 4 --eval-n 20 --free-n 0 --counterfactual-n 0 \
-    --free-counterfactual-n 0 --latent-concept-slots 6 \
+.venv/bin/python -m thinking.multimodal --manifest data/multimodal_manifest.jsonl \
+    --steps 3 --batch 4 --dim 96 --layers 1 --heads 4 --eval-n 20 \
+    --latent-concept-slots 6 \
     --latent-concept-memory-size 64 --latent-concept-memory-w 0.05 \
     --latent-concept-association-w 0.05 \
     --latent-concept-association-transitive-steps 3 \
@@ -320,25 +312,9 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --latent-concept-graph-predict-transitive-w 0.25 \
     --latent-concept-neighborhood-w 0.05 \
     --latent-concept-transition-w 0.05 --latent-concept-cluster-w 0.05 \
-    --study-strategy graph --study-probe-n 8 --study-hard-max 4 \
-    --study-refresh-steps 1 \
     --text-checkpoint runs/text_raw_reading_graph_study_smoke.pt \
     --out runs/m0_multimodal_graph_study_smoke.json \
     --checkpoint runs/m0_multimodal_graph_study_smoke.pt
-.venv/bin/python -m thinking.multimodal --steps 240 --eval-n 120 --free-n 20 \
-    --counterfactual-n 40 --free-counterfactual-n 20 --trunk-arch residual \
-    --trunk-width 96 --trunk-depth 2 --txt-tokens 12 --agreement-w 0.1 \
-    --concept-tokens 4 --fusion-layers 1 --concept-prefix \
-    --concept-w 0.25 --concept-agreement-w 0.1 --concept-distill-w 0.1 \
-    --concept-rank-distill-w 0.1 --concept-rank-distill-margin 0.05 \
-    --concept-transfer-w 0.1 --concept-transfer-margin 0.05 \
-    --concept-contrast-w 0.05 --concept-contrast-temperature 0.1 \
-    --concept-centroid-w 0.05 --concept-state-spread-w 0.01 \
-    --concept-prototype-w 0.05 --concept-prototype-spread-w 0.01 \
-    --latent-concept-slots 4 --latent-concept-w 0.02 \
-    --modality-dropout 0.05 \
-    --out runs/m0_multimodal_transfer_real.json \
-    --checkpoint runs/m0_multimodal_transfer_real.pt
 ```
 
 GPU runs: `runpod/launch_thinking.py` (see the package docs).

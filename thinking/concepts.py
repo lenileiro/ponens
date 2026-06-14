@@ -202,6 +202,16 @@ class LatentConceptMemory(nn.Module):
             transitive_steps=transitive_steps, transitive_w=transitive_w,
             target_power=target_power, cycle_w=cycle_w)
 
+    def graph_cycle_scores(self, source_slots, target_slots, temperature=0.1,
+                           self_loop_w=0.05, transitive_steps=2,
+                           transitive_w=0.1, target_power=1.0,
+                           cycle_w=0.5):
+        return latent_concept_graph_cycle_scores(
+            source_slots, target_slots, self.active(), self.active_prediction_relations(),
+            temperature=temperature, self_loop_w=self_loop_w,
+            transitive_steps=transitive_steps, transitive_w=transitive_w,
+            target_power=target_power, cycle_w=cycle_w)
+
     @torch.no_grad()
     def update(self, slots, momentum=0.95, relation_decay=None):
         if slots is None:
@@ -638,11 +648,11 @@ def latent_concept_graph_prediction_loss(source_slots, target_slots, memory,
     return scores.mean()
 
 
-def latent_concept_graph_cycle_loss(source_slots, target_slots, memory, relations,
-                                    temperature=0.1, self_loop_w=0.05,
-                                    transitive_steps=2, transitive_w=0.1,
-                                    target_power=1.0, cycle_w=0.5):
-    """Make learned concept transitions reversible enough to support discovery.
+def latent_concept_graph_cycle_scores(source_slots, target_slots, memory, relations,
+                                      temperature=0.1, self_loop_w=0.05,
+                                      transitive_steps=2, transitive_w=0.1,
+                                      target_power=1.0, cycle_w=0.5):
+    """Score examples by bidirectional concept-graph surprise.
 
     Source slots and target slots are two views of the same example: a context and
     its held-out continuation, or a partial modality and the fuller multimodal
@@ -653,11 +663,23 @@ def latent_concept_graph_cycle_loss(source_slots, target_slots, memory, relation
     language rules.
     """
     if source_slots is None or target_slots is None:
-        return _latent_graph_zero_scores(source_slots, target_slots).sum()
+        zero = _latent_graph_zero_scores(source_slots, target_slots)
+        return zero, {
+            "forward_kl": zero, "reverse_kl": zero,
+            "source_cycle_kl": zero, "target_cycle_kl": zero,
+        }
     if memory is None or memory.numel() == 0:
-        return source_slots.sum() * 0.0
+        zero = _latent_graph_zero_scores(source_slots, target_slots)
+        return zero, {
+            "forward_kl": zero, "reverse_kl": zero,
+            "source_cycle_kl": zero, "target_cycle_kl": zero,
+        }
     if relations is None or relations.numel() == 0:
-        return source_slots.sum() * 0.0
+        zero = _latent_graph_zero_scores(source_slots, target_slots)
+        return zero, {
+            "forward_kl": zero, "reverse_kl": zero,
+            "source_cycle_kl": zero, "target_cycle_kl": zero,
+        }
     if source_slots.ndim != 3 or target_slots.ndim != 3:
         raise ValueError("latent graph cycle expects [batch, slots, dim]")
     if source_slots.shape[0] != target_slots.shape[0]:
@@ -677,7 +699,11 @@ def latent_concept_graph_cycle_loss(source_slots, target_slots, memory, relation
         self_loop_w=self_loop_w, transitive_steps=transitive_steps,
         transitive_w=transitive_w)
     if rel is None or rev is None:
-        return source_slots.sum() * 0.0
+        zero = _latent_graph_zero_scores(source_slots, target_slots)
+        return zero, {
+            "forward_kl": zero, "reverse_kl": zero,
+            "source_cycle_kl": zero, "target_cycle_kl": zero,
+        }
     temp = max(float(temperature), 1e-6)
     power = float(target_power)
     if power <= 0.0:
@@ -702,24 +728,46 @@ def latent_concept_graph_cycle_loss(source_slots, target_slots, memory, relation
     forward = forward / forward.sum(-1, keepdim=True).clamp_min(1e-8)
     reverse = target_dist.matmul(rev)
     reverse = reverse / reverse.sum(-1, keepdim=True).clamp_min(1e-8)
-    losses = [
-        F.kl_div(forward.clamp_min(1e-8).log(), target_target, reduction="batchmean"),
-        F.kl_div(reverse.clamp_min(1e-8).log(), source_target, reduction="batchmean"),
-    ]
+    forward_kl = F.kl_div(
+        forward.clamp_min(1e-8).log(), target_target, reduction="none").sum(-1)
+    reverse_kl = F.kl_div(
+        reverse.clamp_min(1e-8).log(), source_target, reduction="none").sum(-1)
+    pieces = [forward_kl, reverse_kl]
+    source_cycle_kl = torch.zeros_like(forward_kl)
+    target_cycle_kl = torch.zeros_like(forward_kl)
     if cyc_w:
         source_cycle = forward.matmul(rev)
         source_cycle = source_cycle / source_cycle.sum(-1, keepdim=True).clamp_min(1e-8)
         target_cycle = reverse.matmul(rel)
         target_cycle = target_cycle / target_cycle.sum(-1, keepdim=True).clamp_min(1e-8)
-        losses.extend([
-            cyc_w * F.kl_div(
-                source_cycle.clamp_min(1e-8).log(), source_target,
-                reduction="batchmean"),
-            cyc_w * F.kl_div(
-                target_cycle.clamp_min(1e-8).log(), target_target,
-                reduction="batchmean"),
-        ])
-    return torch.stack(losses).mean()
+        source_cycle_kl = F.kl_div(
+            source_cycle.clamp_min(1e-8).log(), source_target,
+            reduction="none").sum(-1)
+        target_cycle_kl = F.kl_div(
+            target_cycle.clamp_min(1e-8).log(), target_target,
+            reduction="none").sum(-1)
+        pieces.extend([cyc_w * source_cycle_kl, cyc_w * target_cycle_kl])
+    score = torch.stack(pieces).mean(0)
+    return score, {
+        "forward_kl": forward_kl,
+        "reverse_kl": reverse_kl,
+        "source_cycle_kl": source_cycle_kl,
+        "target_cycle_kl": target_cycle_kl,
+    }
+
+
+def latent_concept_graph_cycle_loss(source_slots, target_slots, memory, relations,
+                                    temperature=0.1, self_loop_w=0.05,
+                                    transitive_steps=2, transitive_w=0.1,
+                                    target_power=1.0, cycle_w=0.5):
+    scores, _parts = latent_concept_graph_cycle_scores(
+        source_slots, target_slots, memory, relations,
+        temperature=temperature, self_loop_w=self_loop_w,
+        transitive_steps=transitive_steps, transitive_w=transitive_w,
+        target_power=target_power, cycle_w=cycle_w)
+    if scores.numel() == 0:
+        return torch.tensor(0.0)
+    return scores.mean()
 
 
 class SchemaConceptHead(nn.Module):
