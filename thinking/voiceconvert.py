@@ -48,13 +48,14 @@ def load_with_words(root=ROOT):
 class ContentEncoder(nn.Module):
     """mel -> bottlenecked content code (small dim + temporal downsample = AutoVC disentangler)."""
 
-    def __init__(self, n_mels=N_MELS, content_dim=8, down=2):
+    def __init__(self, n_mels=N_MELS, content_dim=4, down=4):
         super().__init__()
         self.down = down
         self.net = nn.Sequential(
             nn.Conv1d(n_mels, 128, 5, padding=2), nn.GELU(),
             nn.Conv1d(128, 128, 5, padding=2), nn.GELU(),
-            nn.Conv1d(128, content_dim, 1))                # tight channel bottleneck
+            nn.Conv1d(128, content_dim, 1))                # TIGHT bottleneck (dim 4, down 4):
+        #                                                    squeeze speaker identity OUT of content
 
     def forward(self, mel):                                # (B, n_mels, T)
         c = self.net(mel)
@@ -137,19 +138,32 @@ def train(steps=8000, seed=0, device=DEV, batch=32, lr=1e-3, T=98):
     spks = [s for s in train_spk if len(train_spk[s]) >= 2]
     for st in range(1, steps + 1):
         model.train()
-        src, ref = [], []
+        src, ref, xref = [], [], []
         for _ in range(batch):
             s = spks[int(rng.integers(len(spks)))]
             utts = train_spk[s]
-            i, j = rng.choice(len(utts), 2, replace=False)   # source + a DIFFERENT ref of same spk
+            i, j = rng.choice(len(utts), 2, replace=False)   # source + same-spk ref (recon)
             src.append(utts[i][1]); ref.append(utts[j][1])
+            o = spks[int(rng.integers(len(spks)))]           # a DIFFERENT speaker (conversion)
+            while o == s:
+                o = spks[int(rng.integers(len(spks)))]
+            xref.append(train_spk[o][int(rng.integers(len(train_spk[o])))][1])
         src = torch.tensor(_pad_to(src, T), dtype=torch.float32, device=device)
         ref = torch.tensor(_pad_to(ref, T), dtype=torch.float32, device=device)
-        out = model.convert(src, ref)
-        loss = F.l1_loss(out, src)                         # reconstruct source (content) in its own voice
+        xref = torch.tensor(_pad_to(xref, T), dtype=torch.float32, device=device)
+        # 1) RECON: content(X) + same-speaker ref -> reconstruct X
+        recon = F.l1_loss(model.convert(src, ref), src)
+        # 2) SPEAKER-CONSISTENCY: content(X) + DIFFERENT-speaker ref -> output must take that voice
+        conv = model.convert(src, xref)
+        with torch.no_grad():
+            tgt_emb = F.normalize(model.spk_enc(xref), dim=-1)
+        gen_emb = F.normalize(model.spk_enc(conv), dim=-1)
+        spk_consist = (1 - (gen_emb * tgt_emb).sum(-1)).mean()   # cosine: gen voice == target voice
+        loss = recon + 3.0 * spk_consist
         opt.zero_grad(); loss.backward(); opt.step()
         if st % max(1, steps // 8) == 0 or st == steps:
-            print(f"  vcv {st}/{steps} recon {loss.item():.4f}", flush=True)
+            print(f"  vcv {st}/{steps} recon {recon.item():.4f} spk-consist {spk_consist.item():.4f}",
+                  flush=True)
     return model, by_spk
 
 
