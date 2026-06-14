@@ -112,6 +112,10 @@ def remote_path_for_arg(path):
     return path if os.path.isabs(path) else os.path.join(REMOTE, path)
 
 
+def is_url_arg(path):
+    return str(path or "").startswith(("http://", "https://"))
+
+
 def path_with_suffix(path, suffix, default_dir="runs"):
     path = str(path or "").strip()
     if not path:
@@ -210,6 +214,161 @@ def preference_upload_paths(path):
                 full = os.path.join(base, *parts)
                 uploads.add(os.path.abspath(top if os.path.isdir(top) else full))
     return sorted(uploads)
+
+
+def reading_upload_paths(args):
+    paths = []
+    paths.extend(args.reading_data or [])
+    paths.extend(args.reading_replay_data or [])
+    if args.reading_checkpoint:
+        paths.append(args.reading_checkpoint)
+    return [path for path in paths if path and not is_url_arg(path)]
+
+
+def text_reading_cmd(args, PY):
+    TXT = PY.replace("thinking.cli", "thinking.text")
+    d = args.text_reading_dim or args.dim or 256
+    ckpt = args.reading_out_checkpoint or args.text_reading_checkpoint_out
+    report = args.text_reading_out
+    cmd = (
+        f"{TXT} --steps {args.train_steps or args.text_reading_steps} "
+        f"--batch {args.batch} --d {d} --layers {args.text_reading_layers} "
+        f"--heads {args.text_reading_heads} --seed {args.text_reading_seed} "
+        f"--text-encoder-arch {args.text_reading_encoder_arch} "
+        f"--text-encoder-layers {args.text_reading_encoder_layers} "
+        f"--latent-concept-layers {args.text_reading_latent_concept_layers} "
+        f"--reading-text-field {shlex_quote(args.reading_text_field)} "
+        f"--reading-max-tokens {args.reading_max_tokens} "
+        f"--reading-min-tokens {args.reading_min_tokens} "
+        f"--reading-eval-frac {args.reading_eval_frac} "
+        f"--reading-eval-n {args.reading_eval_n} "
+        f"--reading-lr {args.reading_lr} "
+        f"--reading-token-drop {args.reading_token_drop} "
+        f"--reading-token-replace {args.reading_token_replace} "
+        f"--reading-feature-dropout {args.reading_feature_dropout} "
+        f"--reading-context-target-w {args.reading_context_target_w} "
+        f"--reading-context-keep-p {args.reading_context_keep_p} "
+        f"--reading-context-target-temperature "
+        f"{args.reading_context_target_temperature} "
+        f"--reading-sequence-w {args.reading_sequence_w} "
+        f"--reading-sequence-batch {args.reading_sequence_batch} "
+        f"--reading-sequence-temperature {args.reading_sequence_temperature} "
+        f"--reading-factorization-w {args.reading_factorization_w} "
+        f"--reading-factorization-variance {args.reading_factorization_variance} "
+        f"--reading-factorization-margin {args.reading_factorization_margin} "
+        f"--reading-factorization-covariance-w "
+        f"{args.reading_factorization_covariance_w} "
+        f"--reading-fer-w {args.reading_fer_w} "
+        f"--reading-fer-fragmentation-w {args.reading_fer_fragmentation_w} "
+        f"--reading-fer-correlation-w {args.reading_fer_correlation_w} "
+        f"--reading-fer-balance-w {args.reading_fer_balance_w} "
+        f"--reading-memory-w {args.reading_memory_w} "
+        f"--reading-memory-size {args.reading_memory_size} "
+        f"--reading-memory-temperature {args.reading_memory_temperature} "
+        f"--reading-memory-momentum {args.reading_memory_momentum} "
+        f"--reading-memory-balance-w {args.reading_memory_balance_w} "
+        f"--reading-association-w {args.reading_association_w} "
+        f"--reading-association-temperature {args.reading_association_temperature} "
+        f"--reading-association-decay {args.reading_association_decay} "
+        f"--reading-association-target-power "
+        f"{args.reading_association_target_power} "
+        f"--reading-association-self-loop-w "
+        f"{args.reading_association_self_loop_w} "
+        f"--reading-association-transitive-steps "
+        f"{args.reading_association_transitive_steps} "
+        f"--reading-association-transitive-w "
+        f"{args.reading_association_transitive_w} "
+        f"--reading-composition-w {args.reading_composition_w} "
+        f"--reading-composition-temperature {args.reading_composition_temperature} "
+        f"--reading-composition-self-loop-w "
+        f"{args.reading_composition_self_loop_w} "
+        f"--reading-composition-transitive-steps "
+        f"{args.reading_composition_transitive_steps} "
+        f"--reading-composition-transitive-w "
+        f"{args.reading_composition_transitive_w} "
+        f"--reading-composition-margin {args.reading_composition_margin} "
+        f"--reading-graph-predict-w {args.reading_graph_predict_w} "
+        f"--reading-graph-predict-temperature "
+        f"{args.reading_graph_predict_temperature} "
+        f"--reading-graph-predict-self-loop-w "
+        f"{args.reading_graph_predict_self_loop_w} "
+        f"--reading-graph-predict-transitive-steps "
+        f"{args.reading_graph_predict_transitive_steps} "
+        f"--reading-graph-predict-transitive-w "
+        f"{args.reading_graph_predict_transitive_w} "
+        f"--reading-graph-predict-target-power "
+        f"{args.reading_graph_predict_target_power} "
+        f"--reading-graph-cycle-w {args.reading_graph_cycle_w} "
+        f"--reading-graph-cycle-temperature {args.reading_graph_cycle_temperature} "
+        f"--reading-graph-cycle-self-loop-w "
+        f"{args.reading_graph_cycle_self_loop_w} "
+        f"--reading-graph-cycle-transitive-steps "
+        f"{args.reading_graph_cycle_transitive_steps} "
+        f"--reading-graph-cycle-transitive-w "
+        f"{args.reading_graph_cycle_transitive_w} "
+        f"--reading-graph-cycle-target-power "
+        f"{args.reading_graph_cycle_target_power} "
+        f"--reading-graph-cycle-consistency-w "
+        f"{args.reading_graph_cycle_consistency_w} "
+        f"--reading-bridge-w {args.reading_bridge_w} "
+        f"--reading-neighborhood-w {args.reading_neighborhood_w} "
+        f"--reading-neighborhood-batch {args.reading_neighborhood_batch} "
+        f"--reading-neighborhood-probe-n {args.reading_neighborhood_probe_n} "
+        f"--reading-neighborhood-refresh-steps "
+        f"{args.reading_neighborhood_refresh_steps} "
+        f"--reading-neighborhood-temperature "
+        f"{args.reading_neighborhood_temperature} "
+        f"--reading-neighborhood-margin {args.reading_neighborhood_margin} "
+        f"--reading-transition-w {args.reading_transition_w} "
+        f"--reading-transition-batch {args.reading_transition_batch} "
+        f"--reading-transition-temperature {args.reading_transition_temperature} "
+        f"--reading-transition-margin {args.reading_transition_margin} "
+        f"--reading-cluster-w {args.reading_cluster_w} "
+        f"--reading-cluster-batch {args.reading_cluster_batch} "
+        f"--reading-cluster-probe-n {args.reading_cluster_probe_n} "
+        f"--reading-cluster-refresh-steps {args.reading_cluster_refresh_steps} "
+        f"--reading-cluster-temperature {args.reading_cluster_temperature} "
+        f"--reading-cluster-margin {args.reading_cluster_margin} "
+        f"--reading-cluster-min-size {args.reading_cluster_min_size} "
+        f"--reading-study-strategy {args.reading_study_strategy} "
+        f"--reading-study-probe-n {args.reading_study_probe_n} "
+        f"--reading-study-hard-max {args.reading_study_hard_max} "
+        f"--reading-study-refresh-steps {args.reading_study_refresh_steps} "
+        f"--reading-study-rounds {args.reading_study_rounds} "
+        f"--reading-study-score-metric {args.reading_study_score_metric} "
+        f"--reading-study-score-margin-w {args.reading_study_score_margin_w} "
+        f"--reading-study-score-min-delta {args.reading_study_score_min_delta} "
+        f"--reading-study-score-patience {args.reading_study_score_patience} "
+        f"--out {shlex_quote(report)}"
+    )
+    for source in args.reading_data or []:
+        cmd += f" --reading-data {shlex_quote(source)}"
+    for source in args.reading_replay_data or []:
+        cmd += f" --reading-replay-data {shlex_quote(source)}"
+    if args.reading_checkpoint:
+        cmd += f" --reading-checkpoint {shlex_quote(args.reading_checkpoint)}"
+        cmd += f" --reading-out-checkpoint {shlex_quote(ckpt)}"
+    else:
+        cmd += f" --checkpoint {shlex_quote(ckpt)}"
+    if args.text_reading_latent_concept_slots > 0:
+        cmd += f" --latent-concept-slots {args.text_reading_latent_concept_slots}"
+    if args.text_reading_latent_concept_prefix:
+        cmd += " --latent-concept-prefix"
+    if args.text_reading_latent_concept_refine:
+        cmd += " --latent-concept-refine"
+    cmd += (
+        f" --latent-concept-refine-gate-init "
+        f"{args.text_reading_latent_concept_refine_gate_init}"
+    )
+    cmd += (" --reading-study-select-best"
+            if args.reading_study_select_best else " --no-reading-study-select-best")
+    if args.reading_replay_w:
+        cmd += f" --reading-replay-w {args.reading_replay_w}"
+    if args.reading_replay_batch:
+        cmd += f" --reading-replay-batch {args.reading_replay_batch}"
+    if args.reading_replay_retention_w:
+        cmd += f" --reading-replay-retention-w {args.reading_replay_retention_w}"
+    return cmd
 
 
 def apply_image_quality_preset(args):
@@ -464,6 +623,13 @@ def payload(args):
         return " && ".join(cmds)                           # lang is a COMPLETE payload: without
         #                                                    this return the default kinship
         #                                                    multi-seed run was appended after it
+    if args.text_reading:
+        cmds.append(text_reading_cmd(args, PY))
+    if args.text_reading and not (
+            args.vision_understanding or args.image_latent or args.image_embed
+            or args.image_fetch or args.image_caption or args.image_score
+            or args.multimodal):
+        return " && ".join(cmds)
     if (args.vision_understanding or args.image_latent or args.image_embed
             or args.image_fetch or args.image_caption or args.image_score
             or args.multimodal):
@@ -1439,6 +1605,231 @@ def main():
                     help="LANG-1: hybrid-vocab fluency pretraining (reasoning-compatible)")
     ap.add_argument("--lang-mb", type=int, default=24, dest="lang_mb")
     ap.add_argument("--lang-ft", type=int, default=6000, dest="lang_ft")
+    ap.add_argument("--text-reading", action="store_true", dest="text_reading",
+                    help="train thinking.text on raw reading corpora with latent discovery")
+    ap.add_argument("--reading-data", action="append",
+                    help="raw reading JSON/JSONL/TXT corpus or URL for --text-reading")
+    ap.add_argument("--upload-reading-data", action="store_true",
+                    dest="upload_reading_data",
+                    help="upload repo-relative --reading-data files before running")
+    ap.add_argument("--reading-checkpoint", default="", dest="reading_checkpoint",
+                    help="optional thinking.text checkpoint to continue with raw reading")
+    ap.add_argument("--reading-out-checkpoint", default="",
+                    dest="reading_out_checkpoint",
+                    help="checkpoint path written by raw-reading continuation")
+    ap.add_argument("--text-reading-checkpoint-out",
+                    default="runs/text_raw_reading_runpod.pt",
+                    dest="text_reading_checkpoint_out",
+                    help="checkpoint path written by fresh raw-reading training")
+    ap.add_argument("--text-reading-out", default="runs/text_raw_reading_runpod.json",
+                    dest="text_reading_out",
+                    help="JSON report path written by raw-reading training")
+    ap.add_argument("--text-reading-steps", type=int, default=40000,
+                    dest="text_reading_steps",
+                    help="raw-reading steps used when --train-steps is not set")
+    ap.add_argument("--text-reading-dim", type=int, default=0,
+                    dest="text_reading_dim",
+                    help="raw-reading model width; 0 uses --dim or 256")
+    ap.add_argument("--text-reading-layers", type=int, default=4,
+                    dest="text_reading_layers")
+    ap.add_argument("--text-reading-heads", type=int, default=8,
+                    dest="text_reading_heads")
+    ap.add_argument("--text-reading-seed", type=int, default=0,
+                    dest="text_reading_seed")
+    ap.add_argument("--text-reading-encoder-arch", default="transformer",
+                    choices=("transformer", "standard", "relational", "abstractor"),
+                    dest="text_reading_encoder_arch")
+    ap.add_argument("--text-reading-encoder-layers", type=int, default=2,
+                    dest="text_reading_encoder_layers")
+    ap.add_argument("--text-reading-latent-concept-slots", type=int, default=0,
+                    dest="text_reading_latent_concept_slots",
+                    help="raw-reading latent concept slots; 0 lets thinking.text choose")
+    ap.add_argument("--text-reading-latent-concept-layers", type=int, default=1,
+                    dest="text_reading_latent_concept_layers")
+    ap.add_argument("--text-reading-latent-concept-prefix", action="store_true",
+                    dest="text_reading_latent_concept_prefix")
+    ap.add_argument("--text-reading-latent-concept-refine", action="store_true",
+                    dest="text_reading_latent_concept_refine")
+    ap.add_argument("--text-reading-latent-concept-refine-gate-init",
+                    type=float, default=-2.0,
+                    dest="text_reading_latent_concept_refine_gate_init")
+    ap.add_argument("--reading-replay-data", action="append",
+                    dest="reading_replay_data",
+                    help="raw reading replay corpus for checkpoint continuation")
+    ap.add_argument("--reading-replay-w", type=float, default=0.0,
+                    dest="reading_replay_w")
+    ap.add_argument("--reading-replay-batch", type=int, default=0,
+                    dest="reading_replay_batch")
+    ap.add_argument("--reading-replay-retention-w", type=float, default=0.0,
+                    dest="reading_replay_retention_w")
+    ap.add_argument("--reading-text-field", default="text", dest="reading_text_field")
+    ap.add_argument("--reading-max-tokens", type=int, default=128,
+                    dest="reading_max_tokens")
+    ap.add_argument("--reading-min-tokens", type=int, default=8,
+                    dest="reading_min_tokens")
+    ap.add_argument("--reading-eval-frac", type=float, default=0.10,
+                    dest="reading_eval_frac")
+    ap.add_argument("--reading-eval-n", type=int, default=256,
+                    dest="reading_eval_n")
+    ap.add_argument("--reading-lr", type=float, default=1e-3, dest="reading_lr")
+    ap.add_argument("--reading-token-drop", type=float, default=0.15,
+                    dest="reading_token_drop")
+    ap.add_argument("--reading-token-replace", type=float, default=0.05,
+                    dest="reading_token_replace")
+    ap.add_argument("--reading-feature-dropout", type=float, default=0.1,
+                    dest="reading_feature_dropout")
+    ap.add_argument("--reading-context-target-w", type=float, default=0.1,
+                    dest="reading_context_target_w")
+    ap.add_argument("--reading-context-keep-p", type=float, default=0.5,
+                    dest="reading_context_keep_p")
+    ap.add_argument("--reading-context-target-temperature", type=float,
+                    default=0.1, dest="reading_context_target_temperature")
+    ap.add_argument("--reading-sequence-w", type=float, default=0.05,
+                    dest="reading_sequence_w")
+    ap.add_argument("--reading-sequence-batch", type=int, default=0,
+                    dest="reading_sequence_batch")
+    ap.add_argument("--reading-sequence-temperature", type=float, default=0.1,
+                    dest="reading_sequence_temperature")
+    ap.add_argument("--reading-factorization-w", type=float, default=0.05,
+                    dest="reading_factorization_w")
+    ap.add_argument("--reading-factorization-variance", type=float, default=0.05,
+                    dest="reading_factorization_variance")
+    ap.add_argument("--reading-factorization-margin", type=float, default=0.2,
+                    dest="reading_factorization_margin")
+    ap.add_argument("--reading-factorization-covariance-w", type=float,
+                    default=0.05, dest="reading_factorization_covariance_w")
+    ap.add_argument("--reading-fer-w", type=float, default=0.0,
+                    dest="reading_fer_w")
+    ap.add_argument("--reading-fer-fragmentation-w", type=float, default=1.0,
+                    dest="reading_fer_fragmentation_w")
+    ap.add_argument("--reading-fer-correlation-w", type=float, default=1.0,
+                    dest="reading_fer_correlation_w")
+    ap.add_argument("--reading-fer-balance-w", type=float, default=0.1,
+                    dest="reading_fer_balance_w")
+    ap.add_argument("--reading-memory-w", type=float, default=0.05,
+                    dest="reading_memory_w")
+    ap.add_argument("--reading-memory-size", type=int, default=64,
+                    dest="reading_memory_size")
+    ap.add_argument("--reading-memory-temperature", type=float, default=0.1,
+                    dest="reading_memory_temperature")
+    ap.add_argument("--reading-memory-momentum", type=float, default=0.95,
+                    dest="reading_memory_momentum")
+    ap.add_argument("--reading-memory-balance-w", type=float, default=0.01,
+                    dest="reading_memory_balance_w")
+    ap.add_argument("--reading-association-w", type=float, default=0.05,
+                    dest="reading_association_w")
+    ap.add_argument("--reading-association-temperature", type=float,
+                    default=0.1, dest="reading_association_temperature")
+    ap.add_argument("--reading-association-decay", type=float, default=0.99,
+                    dest="reading_association_decay")
+    ap.add_argument("--reading-association-target-power", type=float,
+                    default=1.0, dest="reading_association_target_power")
+    ap.add_argument("--reading-association-self-loop-w", type=float,
+                    default=0.05, dest="reading_association_self_loop_w")
+    ap.add_argument("--reading-association-transitive-steps", type=int,
+                    default=2, dest="reading_association_transitive_steps")
+    ap.add_argument("--reading-association-transitive-w", type=float,
+                    default=0.1, dest="reading_association_transitive_w")
+    ap.add_argument("--reading-composition-w", type=float, default=0.0,
+                    dest="reading_composition_w")
+    ap.add_argument("--reading-composition-temperature", type=float,
+                    default=0.1, dest="reading_composition_temperature")
+    ap.add_argument("--reading-composition-self-loop-w", type=float,
+                    default=0.0, dest="reading_composition_self_loop_w")
+    ap.add_argument("--reading-composition-transitive-steps", type=int,
+                    default=2, dest="reading_composition_transitive_steps")
+    ap.add_argument("--reading-composition-transitive-w", type=float,
+                    default=0.1, dest="reading_composition_transitive_w")
+    ap.add_argument("--reading-composition-margin", type=float, default=0.0,
+                    dest="reading_composition_margin")
+    ap.add_argument("--reading-graph-predict-w", type=float, default=0.0,
+                    dest="reading_graph_predict_w")
+    ap.add_argument("--reading-graph-predict-temperature", type=float,
+                    default=0.1, dest="reading_graph_predict_temperature")
+    ap.add_argument("--reading-graph-predict-self-loop-w", type=float,
+                    default=0.05, dest="reading_graph_predict_self_loop_w")
+    ap.add_argument("--reading-graph-predict-transitive-steps", type=int,
+                    default=2, dest="reading_graph_predict_transitive_steps")
+    ap.add_argument("--reading-graph-predict-transitive-w", type=float,
+                    default=0.1, dest="reading_graph_predict_transitive_w")
+    ap.add_argument("--reading-graph-predict-target-power", type=float,
+                    default=1.0, dest="reading_graph_predict_target_power")
+    ap.add_argument("--reading-graph-cycle-w", type=float, default=0.0,
+                    dest="reading_graph_cycle_w")
+    ap.add_argument("--reading-graph-cycle-temperature", type=float, default=0.1,
+                    dest="reading_graph_cycle_temperature")
+    ap.add_argument("--reading-graph-cycle-self-loop-w", type=float, default=0.05,
+                    dest="reading_graph_cycle_self_loop_w")
+    ap.add_argument("--reading-graph-cycle-transitive-steps", type=int,
+                    default=2, dest="reading_graph_cycle_transitive_steps")
+    ap.add_argument("--reading-graph-cycle-transitive-w", type=float, default=0.1,
+                    dest="reading_graph_cycle_transitive_w")
+    ap.add_argument("--reading-graph-cycle-target-power", type=float,
+                    default=1.0, dest="reading_graph_cycle_target_power")
+    ap.add_argument("--reading-graph-cycle-consistency-w", type=float,
+                    default=0.5, dest="reading_graph_cycle_consistency_w")
+    ap.add_argument("--reading-bridge-w", type=float, default=0.0,
+                    dest="reading_bridge_w")
+    ap.add_argument("--reading-neighborhood-w", type=float, default=0.0,
+                    dest="reading_neighborhood_w")
+    ap.add_argument("--reading-neighborhood-batch", type=int, default=0,
+                    dest="reading_neighborhood_batch")
+    ap.add_argument("--reading-neighborhood-probe-n", type=int, default=0,
+                    dest="reading_neighborhood_probe_n")
+    ap.add_argument("--reading-neighborhood-refresh-steps", type=int, default=0,
+                    dest="reading_neighborhood_refresh_steps")
+    ap.add_argument("--reading-neighborhood-temperature", type=float, default=0.1,
+                    dest="reading_neighborhood_temperature")
+    ap.add_argument("--reading-neighborhood-margin", type=float, default=0.0,
+                    dest="reading_neighborhood_margin")
+    ap.add_argument("--reading-transition-w", type=float, default=0.05,
+                    dest="reading_transition_w")
+    ap.add_argument("--reading-transition-batch", type=int, default=0,
+                    dest="reading_transition_batch")
+    ap.add_argument("--reading-transition-temperature", type=float, default=0.1,
+                    dest="reading_transition_temperature")
+    ap.add_argument("--reading-transition-margin", type=float, default=0.0,
+                    dest="reading_transition_margin")
+    ap.add_argument("--reading-cluster-w", type=float, default=0.0,
+                    dest="reading_cluster_w")
+    ap.add_argument("--reading-cluster-batch", type=int, default=0,
+                    dest="reading_cluster_batch")
+    ap.add_argument("--reading-cluster-probe-n", type=int, default=0,
+                    dest="reading_cluster_probe_n")
+    ap.add_argument("--reading-cluster-refresh-steps", type=int, default=0,
+                    dest="reading_cluster_refresh_steps")
+    ap.add_argument("--reading-cluster-temperature", type=float, default=0.1,
+                    dest="reading_cluster_temperature")
+    ap.add_argument("--reading-cluster-margin", type=float, default=0.0,
+                    dest="reading_cluster_margin")
+    ap.add_argument("--reading-cluster-min-size", type=int, default=2,
+                    dest="reading_cluster_min_size")
+    ap.add_argument("--reading-study-strategy", default="auto",
+                    choices=("random", "errors", "fer", "curiosity", "sequence",
+                             "graph", "cycle", "discovery", "auto"),
+                    dest="reading_study_strategy")
+    ap.add_argument("--reading-study-probe-n", type=int, default=0,
+                    dest="reading_study_probe_n")
+    ap.add_argument("--reading-study-hard-max", type=int, default=0,
+                    dest="reading_study_hard_max")
+    ap.add_argument("--reading-study-refresh-steps", type=int, default=0,
+                    dest="reading_study_refresh_steps")
+    ap.add_argument("--reading-study-select-best",
+                    action=argparse.BooleanOptionalAction, default=True,
+                    dest="reading_study_select_best")
+    ap.add_argument("--reading-study-rounds", type=int, default=1,
+                    dest="reading_study_rounds")
+    ap.add_argument("--reading-study-score-metric", default="mastery",
+                    choices=("view", "context", "sequence", "neighborhood",
+                             "cluster", "fer", "bridge", "both", "min", "all",
+                             "balanced", "mastery"),
+                    dest="reading_study_score_metric")
+    ap.add_argument("--reading-study-score-margin-w", type=float, default=0.1,
+                    dest="reading_study_score_margin_w")
+    ap.add_argument("--reading-study-score-min-delta", type=float, default=0.0,
+                    dest="reading_study_score_min_delta")
+    ap.add_argument("--reading-study-score-patience", type=int, default=0,
+                    dest="reading_study_score_patience")
     ap.add_argument("--ref", default="HEAD",
                     help="deploy this git ref (pinned commit); '' = live tree")
     ap.add_argument("--vision-understanding", action="store_true",
@@ -2642,10 +3033,183 @@ def main():
         args.curve_steps = [int(x.strip()) for x in args.curve_steps.split(",") if x.strip()]
     if isinstance(args.curve_arms, str):
         args.curve_arms = [x.strip() for x in args.curve_arms.split(",") if x.strip()]
+    if args.reading_data and not args.text_reading:
+        args.text_reading = True
     try:
         apply_image_quality_preset(args)
     except ValueError as exc:
         sys.exit(f"ERROR: {exc}")
+    if args.text_reading:
+        if args.lang:
+            sys.exit("ERROR: --text-reading cannot be combined with --lang")
+        if not args.reading_data:
+            sys.exit("ERROR: --text-reading requires --reading-data")
+        if args.batch <= 0:
+            sys.exit("ERROR: --batch must be positive for --text-reading")
+        if args.train_steps < 0:
+            sys.exit("ERROR: --train-steps must be non-negative")
+        if args.text_reading_steps <= 0:
+            sys.exit("ERROR: --text-reading-steps must be positive")
+        text_reading_dim = args.text_reading_dim or args.dim or 256
+        if args.text_reading_dim < 0:
+            sys.exit("ERROR: --text-reading-dim must be non-negative")
+        if text_reading_dim <= 0:
+            sys.exit("ERROR: raw-reading width must be positive")
+        positive_text = {
+            "--text-reading-layers": args.text_reading_layers,
+            "--text-reading-heads": args.text_reading_heads,
+            "--text-reading-encoder-layers": args.text_reading_encoder_layers,
+            "--text-reading-latent-concept-layers": (
+                args.text_reading_latent_concept_layers),
+            "--reading-max-tokens": args.reading_max_tokens,
+            "--reading-min-tokens": args.reading_min_tokens,
+            "--reading-association-transitive-steps": (
+                args.reading_association_transitive_steps),
+            "--reading-composition-transitive-steps": (
+                args.reading_composition_transitive_steps),
+            "--reading-graph-predict-transitive-steps": (
+                args.reading_graph_predict_transitive_steps),
+            "--reading-graph-cycle-transitive-steps": (
+                args.reading_graph_cycle_transitive_steps),
+            "--reading-cluster-min-size": args.reading_cluster_min_size,
+            "--reading-study-rounds": args.reading_study_rounds,
+        }
+        for name, value in positive_text.items():
+            if value <= 0:
+                sys.exit(f"ERROR: {name} must be positive")
+        if args.reading_cluster_min_size < 2:
+            sys.exit("ERROR: --reading-cluster-min-size must be at least 2")
+        if args.reading_min_tokens > args.reading_max_tokens:
+            sys.exit("ERROR: --reading-min-tokens cannot exceed --reading-max-tokens")
+        if text_reading_dim % args.text_reading_heads != 0:
+            sys.exit("ERROR: raw-reading width must divide --text-reading-heads")
+        if (text_reading_dim // args.text_reading_heads) % 2 != 0:
+            sys.exit("ERROR: raw-reading head dimension must be even for attention")
+        if args.text_reading_latent_concept_slots < 0:
+            sys.exit("ERROR: --text-reading-latent-concept-slots must be non-negative")
+        text_nonnegative = {
+            "--reading-eval-n": args.reading_eval_n,
+            "--reading-replay-w": args.reading_replay_w,
+            "--reading-replay-batch": args.reading_replay_batch,
+            "--reading-replay-retention-w": args.reading_replay_retention_w,
+            "--reading-context-target-w": args.reading_context_target_w,
+            "--reading-sequence-w": args.reading_sequence_w,
+            "--reading-sequence-batch": args.reading_sequence_batch,
+            "--reading-factorization-w": args.reading_factorization_w,
+            "--reading-factorization-variance": args.reading_factorization_variance,
+            "--reading-factorization-margin": args.reading_factorization_margin,
+            "--reading-factorization-covariance-w": (
+                args.reading_factorization_covariance_w),
+            "--reading-fer-w": args.reading_fer_w,
+            "--reading-fer-fragmentation-w": args.reading_fer_fragmentation_w,
+            "--reading-fer-correlation-w": args.reading_fer_correlation_w,
+            "--reading-fer-balance-w": args.reading_fer_balance_w,
+            "--reading-memory-w": args.reading_memory_w,
+            "--reading-memory-size": args.reading_memory_size,
+            "--reading-memory-balance-w": args.reading_memory_balance_w,
+            "--reading-association-w": args.reading_association_w,
+            "--reading-association-self-loop-w": (
+                args.reading_association_self_loop_w),
+            "--reading-association-transitive-w": (
+                args.reading_association_transitive_w),
+            "--reading-composition-w": args.reading_composition_w,
+            "--reading-composition-self-loop-w": (
+                args.reading_composition_self_loop_w),
+            "--reading-composition-transitive-w": (
+                args.reading_composition_transitive_w),
+            "--reading-composition-margin": args.reading_composition_margin,
+            "--reading-graph-predict-w": args.reading_graph_predict_w,
+            "--reading-graph-predict-self-loop-w": (
+                args.reading_graph_predict_self_loop_w),
+            "--reading-graph-predict-transitive-w": (
+                args.reading_graph_predict_transitive_w),
+            "--reading-graph-cycle-w": args.reading_graph_cycle_w,
+            "--reading-graph-cycle-self-loop-w": (
+                args.reading_graph_cycle_self_loop_w),
+            "--reading-graph-cycle-transitive-w": (
+                args.reading_graph_cycle_transitive_w),
+            "--reading-graph-cycle-consistency-w": (
+                args.reading_graph_cycle_consistency_w),
+            "--reading-bridge-w": args.reading_bridge_w,
+            "--reading-neighborhood-w": args.reading_neighborhood_w,
+            "--reading-neighborhood-batch": args.reading_neighborhood_batch,
+            "--reading-neighborhood-probe-n": args.reading_neighborhood_probe_n,
+            "--reading-neighborhood-refresh-steps": (
+                args.reading_neighborhood_refresh_steps),
+            "--reading-neighborhood-margin": args.reading_neighborhood_margin,
+            "--reading-transition-w": args.reading_transition_w,
+            "--reading-transition-batch": args.reading_transition_batch,
+            "--reading-transition-margin": args.reading_transition_margin,
+            "--reading-cluster-w": args.reading_cluster_w,
+            "--reading-cluster-batch": args.reading_cluster_batch,
+            "--reading-cluster-probe-n": args.reading_cluster_probe_n,
+            "--reading-cluster-refresh-steps": args.reading_cluster_refresh_steps,
+            "--reading-cluster-margin": args.reading_cluster_margin,
+            "--reading-study-probe-n": args.reading_study_probe_n,
+            "--reading-study-hard-max": args.reading_study_hard_max,
+            "--reading-study-refresh-steps": args.reading_study_refresh_steps,
+            "--reading-study-score-margin-w": args.reading_study_score_margin_w,
+            "--reading-study-score-min-delta": args.reading_study_score_min_delta,
+            "--reading-study-score-patience": args.reading_study_score_patience,
+        }
+        bad_text_nonnegative = [
+            name for name, value in text_nonnegative.items() if value < 0
+        ]
+        if bad_text_nonnegative:
+            sys.exit(
+                "ERROR: raw-reading controls must be non-negative: "
+                + ", ".join(bad_text_nonnegative))
+        if args.reading_lr <= 0.0:
+            sys.exit("ERROR: --reading-lr must be positive")
+        if args.reading_eval_frac < 0.0 or args.reading_eval_frac >= 1.0:
+            sys.exit("ERROR: --reading-eval-frac must be in [0, 1)")
+        bounded_text = {
+            "--reading-token-drop": args.reading_token_drop,
+            "--reading-token-replace": args.reading_token_replace,
+            "--reading-context-keep-p": args.reading_context_keep_p,
+        }
+        for name, value in bounded_text.items():
+            if value < 0.0 or value > 1.0:
+                sys.exit(f"ERROR: {name} must be in [0, 1]")
+        if args.reading_feature_dropout < 0.0 or args.reading_feature_dropout >= 1.0:
+            sys.exit("ERROR: --reading-feature-dropout must be in [0, 1)")
+        text_temperatures = {
+            "--reading-context-target-temperature": (
+                args.reading_context_target_temperature),
+            "--reading-sequence-temperature": args.reading_sequence_temperature,
+            "--reading-memory-temperature": args.reading_memory_temperature,
+            "--reading-association-temperature": args.reading_association_temperature,
+            "--reading-composition-temperature": args.reading_composition_temperature,
+            "--reading-graph-predict-temperature": (
+                args.reading_graph_predict_temperature),
+            "--reading-graph-cycle-temperature": (
+                args.reading_graph_cycle_temperature),
+            "--reading-neighborhood-temperature": (
+                args.reading_neighborhood_temperature),
+            "--reading-transition-temperature": args.reading_transition_temperature,
+            "--reading-cluster-temperature": args.reading_cluster_temperature,
+        }
+        if any(value <= 0.0 for value in text_temperatures.values()):
+            sys.exit("ERROR: raw-reading temperatures must be positive")
+        if (args.reading_memory_momentum < 0.0
+                or args.reading_memory_momentum >= 1.0):
+            sys.exit("ERROR: --reading-memory-momentum must be in [0, 1)")
+        if (args.reading_association_decay < 0.0
+                or args.reading_association_decay >= 1.0):
+            sys.exit("ERROR: --reading-association-decay must be in [0, 1)")
+        if (args.reading_association_target_power <= 0.0
+                or args.reading_graph_predict_target_power <= 0.0
+                or args.reading_graph_cycle_target_power <= 0.0):
+            sys.exit("ERROR: raw-reading graph target powers must be positive")
+        if args.reading_sequence_batch == 1:
+            sys.exit("ERROR: --reading-sequence-batch must be 0 or at least 2")
+        if args.reading_replay_data and not args.reading_checkpoint:
+            sys.exit("ERROR: --reading-replay-data requires --reading-checkpoint")
+        if args.reading_replay_w > 0.0 and not args.reading_replay_data:
+            sys.exit("ERROR: --reading-replay-w requires --reading-replay-data")
+        if args.multimodal and not args.multimodal_text_checkpoint:
+            args.multimodal_text_checkpoint = (
+                args.reading_out_checkpoint or args.text_reading_checkpoint_out)
     if args.image_flow_distill_frac < 0.0 or args.image_flow_distill_frac > 1.0:
         sys.exit("ERROR: --image-flow-distill-frac must be in [0, 1]")
     if args.image_flow_distill_frac > 0.0:
@@ -3279,6 +3843,17 @@ def main():
             sys.exit("ERROR: multimodal graph target powers must be positive")
         if args.multimodal_dropout < 0.0 or args.multimodal_dropout > 1.0:
             sys.exit("ERROR: --multimodal-dropout must be in [0, 1]")
+    if args.upload_reading_data:
+        if not args.text_reading:
+            sys.exit("ERROR: --upload-reading-data requires --text-reading")
+        for raw_path in reading_upload_paths(args):
+            if os.path.isabs(raw_path):
+                sys.exit(
+                    "ERROR: --upload-reading-data expects repo-relative paths; "
+                    "omit the upload flag for pod-mounted absolute paths")
+            local_path = local_path_for_arg(raw_path)
+            if not os.path.isfile(local_path):
+                sys.exit(f"ERROR: reading upload path not found: {local_path}")
     if args.upload_image_data:
         if not args.image_manifest:
             sys.exit("ERROR: --upload-image-data requires --image-manifest")
@@ -3356,6 +3931,7 @@ def main():
         f"cp /root/thinking.log {REMOTE}/thinking.log 2>/dev/null; true")
 
     image_jobs = [name for enabled, name in (
+        (args.text_reading, "raw reading latent discovery"),
         (args.image_score, "image quality scoring preprocess"),
         (args.image_embed, "image embedding preprocess"),
         (args.vision_understanding, "vision understanding concept memory"),
@@ -3369,6 +3945,11 @@ def main():
     print(f"gpu/cloud : {args.gpu} / {args.cloud}")
     print(f"seeds     : {args.seeds}")
     print(f"sync up   : {HERE}/ -> pod:{REMOTE}")
+    reading_uploads = reading_upload_paths(args) if args.upload_reading_data else []
+    if reading_uploads:
+        print("reading data:")
+        for local in reading_uploads:
+            print(f"  {local_path_for_arg(local)} -> pod:{remote_path_for_arg(local)}")
     if args.upload_image_data:
         print(f"image data: {local_path_for_arg(args.image_root)} -> "
               f"pod:{remote_path_for_arg(args.image_root)}")
@@ -3432,6 +4013,8 @@ def main():
             sh(upload_path_cmd(root_local, root_remote, ssh))
             if os.path.abspath(manifest_local) != os.path.abspath(root_local):
                 sh(upload_path_cmd(manifest_local, manifest_remote, ssh))
+        for local in reading_uploads:
+            sh(upload_path_cmd(local_path_for_arg(local), remote_path_for_arg(local), ssh))
         for local in preference_uploads:
             sh(upload_path_cmd(local, local_path_remote_destination(local), ssh))
         if args.eval_only_run:
