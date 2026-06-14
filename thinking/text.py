@@ -57,6 +57,7 @@ from .concepts import (
     latent_concept_cluster_prototype_loss,
     latent_concept_neighborhood_loss,
     latent_concept_slot_factorization_loss,
+    latent_concept_transition_consistency_loss,
     latent_concept_vicreg_loss,
     schema_concept_batch_centroid_loss,
     schema_concept_contrastive_loss,
@@ -2203,6 +2204,42 @@ def reading_latent_neighborhood_loss(model, pairs, vocab, device=DEV,
         positive_txt, feature_dropout=feature_dropout, project=True)
     return latent_concept_neighborhood_loss(
         anchor_slots, positive_slots, temperature=temperature, margin=margin)
+
+
+def reading_latent_transition_loss(model, pairs, vocab, device=DEV,
+                                   token_drop_p=0.15, token_replace_p=0.05,
+                                   feature_dropout=0.1, temperature=0.1,
+                                   margin=0.0):
+    if getattr(model, "latent_concepts", None) is None or not pairs:
+        dev = next(model.parameters()).device
+        return torch.tensor(0.0, device=dev)
+    anchors = [a for a, _b in pairs]
+    positives = [b for _a, b in pairs]
+    anchor_raw = pack_reading(anchors, vocab, device)
+    positive_raw = pack_reading(positives, vocab, device)
+    anchor_a = corrupt_reading_tokens(
+        anchor_raw, vocab.pad, vocab.unk, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p)
+    positive_a = corrupt_reading_tokens(
+        positive_raw, vocab.pad, vocab.unk, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p)
+    anchor_b = corrupt_reading_tokens(
+        anchor_raw, vocab.pad, vocab.unk, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p)
+    positive_b = corrupt_reading_tokens(
+        positive_raw, vocab.pad, vocab.unk, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p)
+    anchor_a_slots = model.latent_concept_states(
+        anchor_a, feature_dropout=feature_dropout, project=True)
+    positive_a_slots = model.latent_concept_states(
+        positive_a, feature_dropout=feature_dropout, project=True)
+    anchor_b_slots = model.latent_concept_states(
+        anchor_b, feature_dropout=feature_dropout, project=True)
+    positive_b_slots = model.latent_concept_states(
+        positive_b, feature_dropout=feature_dropout, project=True)
+    return latent_concept_transition_consistency_loss(
+        anchor_a_slots, positive_a_slots, anchor_b_slots, positive_b_slots,
+        temperature=temperature, margin=margin)
 
 
 def reading_latent_cluster_loss(model, records, cluster_ids, vocab, device=DEV,
@@ -4879,6 +4916,9 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          neighborhood_probe_n=0, neighborhood_refresh_steps=0,
                          neighborhood_temperature=0.1,
                          neighborhood_margin=0.0,
+                         transition_w=0.05, transition_batch=0,
+                         transition_temperature=0.1,
+                         transition_margin=0.0,
                          cluster_w=0.0, cluster_batch=0,
                          cluster_probe_n=0, cluster_refresh_steps=0,
                          cluster_temperature=0.1, cluster_margin=0.0,
@@ -4912,6 +4952,14 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading neighborhood temperature must be positive")
     if float(neighborhood_margin) < 0.0:
         raise ValueError("reading neighborhood margin must be non-negative")
+    if float(transition_w) < 0.0:
+        raise ValueError("reading transition loss weight must be non-negative")
+    if int(transition_batch) < 0:
+        raise ValueError("reading transition batch must be non-negative")
+    if float(transition_temperature) <= 0.0:
+        raise ValueError("reading transition temperature must be positive")
+    if float(transition_margin) < 0.0:
+        raise ValueError("reading transition margin must be non-negative")
     if float(cluster_w) < 0.0:
         raise ValueError("reading cluster loss weight must be non-negative")
     if int(cluster_batch) < 0:
@@ -4950,6 +4998,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading replay batch must be non-negative")
     replay_batch = replay_batch or max(1, batch // 2)
     neighborhood_batch = int(neighborhood_batch) or max(1, batch // 2)
+    transition_batch = int(transition_batch) or max(1, batch // 2)
     cluster_batch = int(cluster_batch) or max(2, batch)
     neighborhood_pairs = []
     neighborhood_reports = []
@@ -4962,6 +5011,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_factorization = 0.0
     last_context_target = 0.0
     last_neighborhood = 0.0
+    last_transition = 0.0
     last_cluster = 0.0
     last_replay = 0.0
 
@@ -5018,7 +5068,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 study_refresh_steps and (st - 1) % int(study_refresh_steps) == 0)):
             refresh_study_pool(st)
             model.train()
-        if neighborhood_w and (st == 1 or (
+        if (neighborhood_w or transition_w) and (st == 1 or (
                 neighborhood_refresh_steps
                 and (st - 1) % int(neighborhood_refresh_steps) == 0)):
             refresh_neighborhood_pairs(st)
@@ -5060,6 +5110,17 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 feature_dropout=feature_dropout,
                 temperature=neighborhood_temperature,
                 margin=neighborhood_margin)
+        transition_loss = view_loss * 0.0
+        if transition_w and neighborhood_pairs:
+            transition_pair_batch = batch_reading_neighbor_pairs(
+                neighborhood_pairs, rng, transition_batch)
+            transition_loss = reading_latent_transition_loss(
+                model, transition_pair_batch, vocab, device=device,
+                token_drop_p=token_drop_p,
+                token_replace_p=token_replace_p,
+                feature_dropout=feature_dropout,
+                temperature=transition_temperature,
+                margin=transition_margin)
         cluster_loss = view_loss * 0.0
         if cluster_w and clusters:
             cluster_records, cluster_ids = batch_reading_cluster_records(
@@ -5082,6 +5143,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         loss = (view_loss + float(factorization_w) * factorization_loss
                 + float(context_target_w) * context_target
                 + float(neighborhood_w) * neighborhood_loss
+                + float(transition_w) * transition_loss
                 + float(cluster_w) * cluster_loss
                 + float(replay_w) * replay_loss)
         opt.zero_grad()
@@ -5092,6 +5154,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_factorization = float(factorization_loss.detach())
         last_context_target = float(context_target.detach())
         last_neighborhood = float(neighborhood_loss.detach())
+        last_transition = float(transition_loss.detach())
         last_cluster = float(cluster_loss.detach())
         last_replay = float(replay_loss.detach())
         if st % log_every == 0 or st == steps:
@@ -5100,6 +5163,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                   f"factor {last_factorization:.3f} "
                   f"context-target {last_context_target:.3f} "
                   f"neighborhood {last_neighborhood:.3f} "
+                  f"transition {last_transition:.3f} "
                   f"cluster {last_cluster:.3f} "
                   f"replay {last_replay:.3f}",
                   flush=True)
@@ -5113,6 +5177,12 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "factorization_covariance_w": float(factorization_covariance_w),
         "context_target_loss": last_context_target,
         "neighborhood_loss": last_neighborhood,
+        "transition_loss": last_transition,
+        "transition_w": float(transition_w),
+        "transition_batch": int(transition_batch),
+        "transition_temperature": float(transition_temperature),
+        "transition_margin": float(transition_margin),
+        "transition_pairs": len(neighborhood_pairs),
         "cluster_loss": last_cluster,
         "neighborhood_w": float(neighborhood_w),
         "neighborhood_batch": int(neighborhood_batch),
@@ -5172,6 +5242,8 @@ def fit_reading_concepts_select_best(
         neighborhood_w=0.0, neighborhood_batch=0,
         neighborhood_probe_n=0, neighborhood_refresh_steps=0,
         neighborhood_temperature=0.1, neighborhood_margin=0.0,
+        transition_w=0.05, transition_batch=0,
+        transition_temperature=0.1, transition_margin=0.0,
         cluster_w=0.0, cluster_batch=0,
         cluster_probe_n=0, cluster_refresh_steps=0,
         cluster_temperature=0.1, cluster_margin=0.0,
@@ -5255,6 +5327,10 @@ def fit_reading_concepts_select_best(
             neighborhood_refresh_steps=neighborhood_refresh_steps,
             neighborhood_temperature=neighborhood_temperature,
             neighborhood_margin=neighborhood_margin,
+            transition_w=transition_w,
+            transition_batch=transition_batch,
+            transition_temperature=transition_temperature,
+            transition_margin=transition_margin,
             cluster_w=cluster_w,
             cluster_batch=cluster_batch,
             cluster_probe_n=cluster_probe_n,
@@ -5347,6 +5423,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            neighborhood_probe_n=0, neighborhood_refresh_steps=0,
                            neighborhood_temperature=0.1,
                            neighborhood_margin=0.0,
+                           transition_w=0.05, transition_batch=0,
+                           transition_temperature=0.1, transition_margin=0.0,
                            cluster_w=0.0, cluster_batch=0,
                            cluster_probe_n=0, cluster_refresh_steps=0,
                            cluster_temperature=0.1, cluster_margin=0.0,
@@ -5385,6 +5463,10 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         neighborhood_refresh_steps=neighborhood_refresh_steps,
         neighborhood_temperature=neighborhood_temperature,
         neighborhood_margin=neighborhood_margin,
+        transition_w=transition_w,
+        transition_batch=transition_batch,
+        transition_temperature=transition_temperature,
+        transition_margin=transition_margin,
         cluster_w=cluster_w,
         cluster_batch=cluster_batch,
         cluster_probe_n=cluster_probe_n,
@@ -5415,6 +5497,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          neighborhood_probe_n=0, neighborhood_refresh_steps=0,
                          neighborhood_temperature=0.1,
                          neighborhood_margin=0.0,
+                         transition_w=0.05, transition_batch=0,
+                         transition_temperature=0.1, transition_margin=0.0,
                          cluster_w=0.0, cluster_batch=0,
                          cluster_probe_n=0, cluster_refresh_steps=0,
                          cluster_temperature=0.1, cluster_margin=0.0,
@@ -5465,6 +5549,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             neighborhood_refresh_steps=neighborhood_refresh_steps,
             neighborhood_temperature=neighborhood_temperature,
             neighborhood_margin=neighborhood_margin,
+            transition_w=transition_w,
+            transition_batch=transition_batch,
+            transition_temperature=transition_temperature,
+            transition_margin=transition_margin,
             cluster_w=cluster_w,
             cluster_batch=cluster_batch,
             cluster_probe_n=cluster_probe_n,
@@ -5497,6 +5585,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             neighborhood_refresh_steps=neighborhood_refresh_steps,
             neighborhood_temperature=neighborhood_temperature,
             neighborhood_margin=neighborhood_margin,
+            transition_w=transition_w,
+            transition_batch=transition_batch,
+            transition_temperature=transition_temperature,
+            transition_margin=transition_margin,
             cluster_w=cluster_w,
             cluster_batch=cluster_batch,
             cluster_probe_n=cluster_probe_n,
@@ -5551,6 +5643,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "neighborhood_refresh_steps": int(neighborhood_refresh_steps),
               "neighborhood_temperature": float(neighborhood_temperature),
               "neighborhood_margin": float(neighborhood_margin),
+              "transition_w": float(transition_w),
+              "transition_batch": int(transition_batch),
+              "transition_temperature": float(transition_temperature),
+              "transition_margin": float(transition_margin),
               "cluster_w": float(cluster_w),
               "cluster_batch": int(cluster_batch),
               "cluster_probe_n": int(cluster_probe_n),
@@ -5684,6 +5780,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              neighborhood_probe_n=0, neighborhood_refresh_steps=0,
                              neighborhood_temperature=0.1,
                              neighborhood_margin=0.0,
+                             transition_w=0.05, transition_batch=0,
+                             transition_temperature=0.1, transition_margin=0.0,
                              cluster_w=0.0, cluster_batch=0,
                              cluster_probe_n=0, cluster_refresh_steps=0,
                              cluster_temperature=0.1, cluster_margin=0.0,
@@ -5755,6 +5853,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             neighborhood_refresh_steps=neighborhood_refresh_steps,
             neighborhood_temperature=neighborhood_temperature,
             neighborhood_margin=neighborhood_margin,
+            transition_w=transition_w,
+            transition_batch=transition_batch,
+            transition_temperature=transition_temperature,
+            transition_margin=transition_margin,
             cluster_w=cluster_w,
             cluster_batch=cluster_batch,
             cluster_probe_n=cluster_probe_n,
@@ -5792,6 +5894,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             neighborhood_refresh_steps=neighborhood_refresh_steps,
             neighborhood_temperature=neighborhood_temperature,
             neighborhood_margin=neighborhood_margin,
+            transition_w=transition_w,
+            transition_batch=transition_batch,
+            transition_temperature=transition_temperature,
+            transition_margin=transition_margin,
             cluster_w=cluster_w,
             cluster_batch=cluster_batch,
             cluster_probe_n=cluster_probe_n,
@@ -5864,6 +5970,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "neighborhood_refresh_steps": int(neighborhood_refresh_steps),
               "neighborhood_temperature": float(neighborhood_temperature),
               "neighborhood_margin": float(neighborhood_margin),
+              "transition_w": float(transition_w),
+              "transition_batch": int(transition_batch),
+              "transition_temperature": float(transition_temperature),
+              "transition_margin": float(transition_margin),
               "cluster_w": float(cluster_w),
               "cluster_batch": int(cluster_batch),
               "cluster_probe_n": int(cluster_probe_n),
@@ -9390,6 +9500,10 @@ def selftest():
         reading_model, reading_pairs, reading_vocab, device="cpu",
         token_drop_p=0.1, token_replace_p=0.0, temperature=0.2)
     assert torch.isfinite(reading_neighbor_loss)
+    reading_transition_loss = reading_latent_transition_loss(
+        reading_model, reading_pairs, reading_vocab, device="cpu",
+        token_drop_p=0.1, token_replace_p=0.0, temperature=0.2)
+    assert torch.isfinite(reading_transition_loss)
     reading_clusters, reading_cluster_report = mine_reading_latent_clusters(
         reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0)
     assert reading_cluster_report["n_clusters"] >= 1
@@ -9469,9 +9583,11 @@ def selftest():
         token_replace_p=0.0, study_strategy="errors", study_probe_n=2,
         study_hard_max=2, context_target_w=0.1, context_keep_p=0.5,
         neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2,
+        transition_w=0.1, transition_batch=2,
         cluster_w=0.1, cluster_batch=4, cluster_probe_n=4)
     assert "context_target_loss" in reading_model.reading_train_metrics
     assert reading_model.reading_train_metrics["neighborhood_w"] == 0.1
+    assert reading_model.reading_train_metrics["transition_w"] == 0.1
     assert reading_model.reading_neighborhood_reports
     assert reading_model.reading_train_metrics["cluster_w"] == 0.1
     assert reading_model.reading_cluster_reports
@@ -9508,9 +9624,11 @@ def selftest():
             replay_teacher_model=teacher_model, replay_teacher_vocab=teacher_vocab,
             replay_w=0.1, replay_batch=2,
             neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2,
+            transition_w=0.1, transition_batch=2,
             cluster_w=0.1, cluster_batch=4, cluster_probe_n=4)
         assert expanded_model.reading_train_metrics["replay_w"] == 0.1
         assert expanded_model.reading_train_metrics["neighborhood_w"] == 0.1
+        assert expanded_model.reading_train_metrics["transition_w"] == 0.1
         assert expanded_model.reading_train_metrics["cluster_w"] == 0.1
     score_a = {"semantic_head": {"fact_value_acc": 0.8},
                "teacher_forced": {"fact_value_acc": 0.7},
@@ -9747,6 +9865,15 @@ def main(argv=None):
                     help="contrastive temperature for mined latent neighbors")
     ap.add_argument("--reading-neighborhood-margin", type=float, default=0.0,
                     help="minimum margin over other mined neighbors")
+    ap.add_argument("--reading-transition-w", type=float, default=0.05,
+                    help=("weight for label-free latent transition discovery "
+                          "between self-mined related reading chunks"))
+    ap.add_argument("--reading-transition-batch", type=int, default=0,
+                    help="mined transition pairs per step; 0 = half the main batch")
+    ap.add_argument("--reading-transition-temperature", type=float, default=0.1,
+                    help="contrastive temperature for reading latent transitions")
+    ap.add_argument("--reading-transition-margin", type=float, default=0.0,
+                    help="minimum margin over other latent transitions")
     ap.add_argument("--reading-cluster-w", type=float, default=0.0,
                     help=("weight for self-mined latent cluster prototype "
                           "consolidation on raw reading chunks"))
@@ -10263,6 +10390,14 @@ def main(argv=None):
         ap.error("--reading-neighborhood-temperature must be positive")
     if args.reading_neighborhood_margin < 0.0:
         ap.error("--reading-neighborhood-margin must be non-negative")
+    if args.reading_transition_w < 0.0:
+        ap.error("--reading-transition-w must be non-negative")
+    if args.reading_transition_batch < 0:
+        ap.error("--reading-transition-batch must be non-negative")
+    if args.reading_transition_temperature <= 0.0:
+        ap.error("--reading-transition-temperature must be positive")
+    if args.reading_transition_margin < 0.0:
+        ap.error("--reading-transition-margin must be non-negative")
     if args.reading_cluster_w < 0.0:
         ap.error("--reading-cluster-w must be non-negative")
     if args.reading_cluster_batch < 0:
@@ -10369,6 +10504,10 @@ def main(argv=None):
                 neighborhood_temperature=(
                     args.reading_neighborhood_temperature),
                 neighborhood_margin=args.reading_neighborhood_margin,
+                transition_w=args.reading_transition_w,
+                transition_batch=args.reading_transition_batch,
+                transition_temperature=args.reading_transition_temperature,
+                transition_margin=args.reading_transition_margin,
                 cluster_w=args.reading_cluster_w,
                 cluster_batch=args.reading_cluster_batch,
                 cluster_probe_n=args.reading_cluster_probe_n,
@@ -10440,6 +10579,10 @@ def main(argv=None):
                 neighborhood_temperature=(
                     args.reading_neighborhood_temperature),
                 neighborhood_margin=args.reading_neighborhood_margin,
+                transition_w=args.reading_transition_w,
+                transition_batch=args.reading_transition_batch,
+                transition_temperature=args.reading_transition_temperature,
+                transition_margin=args.reading_transition_margin,
                 cluster_w=args.reading_cluster_w,
                 cluster_batch=args.reading_cluster_batch,
                 cluster_probe_n=args.reading_cluster_probe_n,

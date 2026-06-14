@@ -347,6 +347,51 @@ def latent_concept_neighborhood_loss(anchor_slots, positive_slots,
     return torch.stack(losses).mean()
 
 
+def latent_concept_transition_consistency_loss(anchor_a_slots, positive_a_slots,
+                                               anchor_b_slots, positive_b_slots,
+                                               temperature=0.1, margin=0.0):
+    """Align discovered latent transitions across two views of related records.
+
+    The caller mines related pairs. This loss only sees the latent slots for an
+    anchor and its discovered neighbor under two stochastic or modality views.
+    It makes the slot-space delta reusable without requiring task labels.
+    """
+    if (anchor_a_slots is None or positive_a_slots is None
+            or anchor_b_slots is None or positive_b_slots is None):
+        for slots in (anchor_a_slots, positive_a_slots, anchor_b_slots, positive_b_slots):
+            if slots is not None:
+                return slots.sum() * 0.0
+        return torch.tensor(0.0)
+    if not (anchor_a_slots.shape == positive_a_slots.shape
+            == anchor_b_slots.shape == positive_b_slots.shape):
+        raise ValueError("latent transition views must have matching shapes")
+    delta_a = F.normalize(
+        (positive_a_slots - anchor_a_slots).reshape(anchor_a_slots.shape[0], -1),
+        dim=-1)
+    delta_b = F.normalize(
+        (positive_b_slots - anchor_b_slots).reshape(anchor_b_slots.shape[0], -1),
+        dim=-1)
+    pos_sim = (delta_a * delta_b).sum(-1)
+    losses = [(1.0 - pos_sim).mean()]
+    if delta_a.shape[0] > 1:
+        temp = max(float(temperature), 1e-6)
+        logits = delta_a.matmul(delta_b.t()) / temp
+        labels = torch.arange(logits.shape[0], device=logits.device)
+        losses.append(0.5 * (
+            F.cross_entropy(logits, labels)
+            + F.cross_entropy(logits.t(), labels)))
+        margin_t = float(margin)
+        if margin_t:
+            eye = torch.eye(logits.shape[0], dtype=torch.bool, device=logits.device)
+            sim = delta_a.matmul(delta_b.t())
+            hardest_other = sim.masked_fill(eye, -float("inf")).max(-1).values
+            hardest_other_t = sim.t().masked_fill(eye, -float("inf")).max(-1).values
+            losses.append(0.5 * (
+                F.relu(hardest_other + margin_t - pos_sim).mean()
+                + F.relu(hardest_other_t + margin_t - pos_sim).mean()))
+    return torch.stack(losses).mean()
+
+
 def latent_concept_cluster_prototype_loss(slots, cluster_ids, temperature=0.1,
                                           margin=0.0, min_cluster_size=2):
     """Consolidate self-mined latent clusters into reusable prototypes.
