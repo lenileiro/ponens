@@ -149,6 +149,7 @@ The old synthetic-language modules were removed from the active package:
 - `thinking.induce`
 - `thinking.verbalize`
 - `thinking.hybrid_vocab`
+- `thinking.crossmodal`
 - standalone exam/write/mind/meaning prototypes
 - `datalog.py`
 
