@@ -52,6 +52,7 @@ from scratchpad_model import CausalBlock, ScratchpadLM
 
 from .concepts import (
     LatentConceptHead,
+    LatentConceptMemory,
     SchemaConceptHead,
     SchemaConceptRefiner,
     latent_concept_cluster_prototype_loss,
@@ -1242,7 +1243,8 @@ class TextFactLM(nn.Module):
                  latent_concept_slots=0, latent_concept_layers=1,
                  latent_concept_prefix=False,
                  latent_concept_refine=False,
-                 latent_concept_refine_gate_init=-2.0):
+                 latent_concept_refine_gate_init=-2.0,
+                 latent_concept_memory_size=0):
         super().__init__()
         self.d = int(d)
         self.heads = int(heads)
@@ -1256,9 +1258,14 @@ class TextFactLM(nn.Module):
         self.latent_concept_prefix = bool(latent_concept_prefix)
         self.latent_concept_refine = bool(latent_concept_refine)
         self.latent_concept_refine_gate_init = float(latent_concept_refine_gate_init)
+        self.latent_concept_memory_size = int(latent_concept_memory_size)
         if ((self.latent_concept_prefix or self.latent_concept_refine)
                 and self.latent_concept_slots <= 0):
             raise ValueError("latent concept prefix/refine require latent slots")
+        if self.latent_concept_memory_size < 0:
+            raise ValueError("latent concept memory size must be non-negative")
+        if self.latent_concept_memory_size and self.latent_concept_slots <= 0:
+            raise ValueError("latent concept memory requires latent slots")
         self.text_encoder_arch = str(text_encoder_arch)
         self.text_encoder_layers = int(text_encoder_layers)
         self.txt = TextPrefix(vocab_size, d=d, pad=pad, heads=heads,
@@ -1289,6 +1296,9 @@ class TextFactLM(nn.Module):
             self.latent_concept_slots, d, heads=heads,
             mixer_layers=self.latent_concept_layers)
             if self.latent_concept_slots > 0 else None)
+        self.latent_concept_memory = (LatentConceptMemory(
+            self.latent_concept_memory_size, d)
+            if self.latent_concept_memory_size > 0 else None)
         if self.latent_concept_refine and self.latent_concepts is not None:
             self.latent_concept_refiner = SchemaConceptRefiner(
                 d, heads=heads, gate_init=self.latent_concept_refine_gate_init)
@@ -1344,6 +1354,8 @@ class TextFactLM(nn.Module):
             self.latent_concept_prefix = False
             self.latent_concept_refine = False
             self.latent_concept_refiner = None
+            self.latent_concept_memory = None
+            self.latent_concept_memory_size = 0
             return self
         if (self.latent_concepts is None
                 or self.latent_concept_slots != slots
@@ -1356,6 +1368,33 @@ class TextFactLM(nn.Module):
         self.latent_concept_slots = slots
         self.latent_concept_layers = latent_layers
         return self
+
+    def enable_latent_concept_memory(self, size):
+        size = int(size)
+        if size <= 0 or self.latent_concepts is None:
+            self.latent_concept_memory = None
+            self.latent_concept_memory_size = 0
+            return self
+        if (self.latent_concept_memory is None
+                or self.latent_concept_memory_size != size):
+            self.latent_concept_memory = LatentConceptMemory(size, self.d)
+            self.latent_concept_memory.to(next(self.parameters()).device)
+        self.latent_concept_memory_size = size
+        return self
+
+    def latent_concept_memory_loss(self, slots, temperature=0.1, balance_w=0.0):
+        if self.latent_concept_memory is None:
+            if slots is not None:
+                return slots.sum() * 0.0
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        return self.latent_concept_memory(
+            slots, temperature=temperature, balance_w=balance_w)
+
+    @torch.no_grad()
+    def update_latent_concept_memory(self, slots, momentum=0.95):
+        if self.latent_concept_memory is None:
+            return 0
+        return self.latent_concept_memory.update(slots, momentum=momentum)
 
     def enable_latent_concept_refiner(self, heads=None, gate_init=-2.0):
         if self.latent_concepts is None:
@@ -1933,6 +1972,32 @@ def reading_latent_factorization_loss(model, txt, feature_dropout=0.1,
     return latent_concept_slot_factorization_loss(
         slots, variance_target=variance_target,
         separation_margin=separation_margin, covariance_weight=covariance_w)
+
+
+def reading_latent_memory_loss(model, txt, feature_dropout=0.1,
+                               temperature=0.1, balance_w=0.0):
+    if (getattr(model, "latent_concepts", None) is None
+            or getattr(model, "latent_concept_memory", None) is None):
+        return torch.tensor(0.0, device=txt.device)
+    slots = model.latent_concept_states(
+        txt, feature_dropout=feature_dropout, project=True)
+    return model.latent_concept_memory_loss(
+        slots, temperature=temperature, balance_w=balance_w)
+
+
+@torch.no_grad()
+def update_reading_latent_memory(model, txt, feature_dropout=0.0,
+                                 momentum=0.95):
+    if (getattr(model, "latent_concepts", None) is None
+            or getattr(model, "latent_concept_memory", None) is None):
+        return 0
+    was_training = model.training
+    model.eval()
+    slots = model.latent_concept_states(
+        txt, feature_dropout=feature_dropout, project=True)
+    if was_training:
+        model.train()
+    return model.update_latent_concept_memory(slots, momentum=momentum)
 
 
 def split_reading_context_target(txt, pad, context_keep_p=0.5):
@@ -4910,6 +4975,9 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          factorization_variance=0.05,
                          factorization_margin=0.2,
                          factorization_covariance_w=0.05,
+                         memory_w=0.05, memory_size=64,
+                         memory_temperature=0.1, memory_momentum=0.95,
+                         memory_balance_w=0.01,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
@@ -4940,6 +5008,16 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading factorization margin must be non-negative")
     if float(factorization_covariance_w) < 0.0:
         raise ValueError("reading factorization covariance weight must be non-negative")
+    if float(memory_w) < 0.0:
+        raise ValueError("reading memory loss weight must be non-negative")
+    if int(memory_size) < 0:
+        raise ValueError("reading memory size must be non-negative")
+    if float(memory_temperature) <= 0.0:
+        raise ValueError("reading memory temperature must be positive")
+    if float(memory_momentum) < 0.0 or float(memory_momentum) >= 1.0:
+        raise ValueError("reading memory momentum must be in [0, 1)")
+    if float(memory_balance_w) < 0.0:
+        raise ValueError("reading memory balance weight must be non-negative")
     if float(neighborhood_w) < 0.0:
         raise ValueError("reading neighborhood loss weight must be non-negative")
     if int(neighborhood_batch) < 0:
@@ -4986,6 +5064,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("cannot train reading concepts without train records")
     replay_records = list(replay_records or [])
     replay_sources = [r for r in replay_records if r.split == "train"] or replay_records
+    if int(memory_size) > 0:
+        model.enable_latent_concept_memory(int(memory_size))
     if replay_w and (not replay_sources or replay_teacher_model is None
                      or replay_teacher_vocab is None):
         raise ValueError("reading replay loss requires replay records and teacher checkpoint")
@@ -5009,6 +5089,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_loss = 0.0
     last_view_loss = 0.0
     last_factorization = 0.0
+    last_memory = 0.0
+    last_memory_updates = 0
     last_context_target = 0.0
     last_neighborhood = 0.0
     last_transition = 0.0
@@ -5093,6 +5175,12 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 separation_margin=factorization_margin,
                 covariance_w=factorization_covariance_w)
             if factorization_w else view_loss * 0.0)
+        memory_loss = (
+            reading_latent_memory_loss(
+                model, txt, feature_dropout=feature_dropout,
+                temperature=memory_temperature,
+                balance_w=memory_balance_w)
+            if memory_w else view_loss * 0.0)
         context_target = (
             reading_context_target_loss(
                 model, txt, vocab.pad, context_keep_p=context_keep_p,
@@ -5141,6 +5229,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 replay_teacher_vocab, device=device,
                 feature_dropout=feature_dropout)
         loss = (view_loss + float(factorization_w) * factorization_loss
+                + float(memory_w) * memory_loss
                 + float(context_target_w) * context_target
                 + float(neighborhood_w) * neighborhood_loss
                 + float(transition_w) * transition_loss
@@ -5149,9 +5238,12 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         opt.zero_grad()
         loss.backward()
         opt.step()
+        last_memory_updates = int(update_reading_latent_memory(
+            model, txt, feature_dropout=0.0, momentum=memory_momentum))
         last_loss = float(loss.detach())
         last_view_loss = float(view_loss.detach())
         last_factorization = float(factorization_loss.detach())
+        last_memory = float(memory_loss.detach())
         last_context_target = float(context_target.detach())
         last_neighborhood = float(neighborhood_loss.detach())
         last_transition = float(transition_loss.detach())
@@ -5161,6 +5253,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
             print(f"  reading {st}/{steps} loss {last_loss:.3f} "
                   f"view {last_view_loss:.3f} "
                   f"factor {last_factorization:.3f} "
+                  f"memory {last_memory:.3f} "
                   f"context-target {last_context_target:.3f} "
                   f"neighborhood {last_neighborhood:.3f} "
                   f"transition {last_transition:.3f} "
@@ -5175,6 +5268,19 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "factorization_variance": float(factorization_variance),
         "factorization_margin": float(factorization_margin),
         "factorization_covariance_w": float(factorization_covariance_w),
+        "memory_loss": last_memory,
+        "memory_w": float(memory_w),
+        "memory_size": int(getattr(model, "latent_concept_memory_size", 0)),
+        "memory_active": int(
+            getattr(getattr(model, "latent_concept_memory", None), "filled",
+                    torch.zeros((), dtype=torch.long)).item()),
+        "memory_updates": int(
+            getattr(getattr(model, "latent_concept_memory", None), "updates",
+                    torch.zeros((), dtype=torch.long)).item()),
+        "memory_last_batch_updates": int(last_memory_updates),
+        "memory_temperature": float(memory_temperature),
+        "memory_momentum": float(memory_momentum),
+        "memory_balance_w": float(memory_balance_w),
         "context_target_loss": last_context_target,
         "neighborhood_loss": last_neighborhood,
         "transition_loss": last_transition,
@@ -5237,6 +5343,9 @@ def fit_reading_concepts_select_best(
         covariance_w=1.0, variance_target=1.0,
         factorization_w=0.05, factorization_variance=0.05,
         factorization_margin=0.2, factorization_covariance_w=0.05,
+        memory_w=0.05, memory_size=64,
+        memory_temperature=0.1, memory_momentum=0.95,
+        memory_balance_w=0.01,
         context_target_w=0.1, context_keep_p=0.5,
         context_target_temperature=0.1,
         neighborhood_w=0.0, neighborhood_batch=0,
@@ -5258,6 +5367,8 @@ def fit_reading_concepts_select_best(
     schedule = _step_schedule(steps, rounds)
     if not schedule:
         raise ValueError("reading selected training requires at least one step")
+    if int(memory_size) > 0:
+        model.enable_latent_concept_memory(int(memory_size))
     before_bundle = before_bundle or reading_eval_bundle(
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
@@ -5318,6 +5429,11 @@ def fit_reading_concepts_select_best(
             factorization_variance=factorization_variance,
             factorization_margin=factorization_margin,
             factorization_covariance_w=factorization_covariance_w,
+            memory_w=memory_w,
+            memory_size=memory_size,
+            memory_temperature=memory_temperature,
+            memory_momentum=memory_momentum,
+            memory_balance_w=memory_balance_w,
             context_target_w=context_target_w,
             context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
@@ -5417,6 +5533,9 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            factorization_w=0.05, factorization_variance=0.05,
                            factorization_margin=0.2,
                            factorization_covariance_w=0.05,
+                           memory_w=0.05, memory_size=64,
+                           memory_temperature=0.1, memory_momentum=0.95,
+                           memory_balance_w=0.01,
                            context_target_w=0.1, context_keep_p=0.5,
                            context_target_temperature=0.1,
                            neighborhood_w=0.0, neighborhood_batch=0,
@@ -5444,7 +5563,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                        latent_concept_prefix=latent_concept_prefix,
                        latent_concept_refine=latent_concept_refine,
                        latent_concept_refine_gate_init=(
-                           latent_concept_refine_gate_init)).to(device)
+                           latent_concept_refine_gate_init),
+                       latent_concept_memory_size=memory_size).to(device)
     return fit_reading_concepts(
         model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
         device=device, log_every=log_every, token_drop_p=token_drop_p,
@@ -5455,6 +5575,11 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         factorization_variance=factorization_variance,
         factorization_margin=factorization_margin,
         factorization_covariance_w=factorization_covariance_w,
+        memory_w=memory_w,
+        memory_size=memory_size,
+        memory_temperature=memory_temperature,
+        memory_momentum=memory_momentum,
+        memory_balance_w=memory_balance_w,
         context_target_w=context_target_w, context_keep_p=context_keep_p,
         context_target_temperature=context_target_temperature,
         neighborhood_w=neighborhood_w,
@@ -5491,6 +5616,9 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          factorization_w=0.05, factorization_variance=0.05,
                          factorization_margin=0.2,
                          factorization_covariance_w=0.05,
+                         memory_w=0.05, memory_size=64,
+                         memory_temperature=0.1, memory_momentum=0.95,
+                         memory_balance_w=0.01,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
@@ -5523,7 +5651,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                        latent_concept_prefix=latent_concept_prefix,
                        latent_concept_refine=latent_concept_refine,
                        latent_concept_refine_gate_init=(
-                           latent_concept_refine_gate_init)).to(device)
+                           latent_concept_refine_gate_init),
+                       latent_concept_memory_size=memory_size).to(device)
     before_bundle = reading_eval_bundle(
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
@@ -5541,6 +5670,11 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             factorization_variance=factorization_variance,
             factorization_margin=factorization_margin,
             factorization_covariance_w=factorization_covariance_w,
+            memory_w=memory_w,
+            memory_size=memory_size,
+            memory_temperature=memory_temperature,
+            memory_momentum=memory_momentum,
+            memory_balance_w=memory_balance_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -5577,6 +5711,11 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             factorization_variance=factorization_variance,
             factorization_margin=factorization_margin,
             factorization_covariance_w=factorization_covariance_w,
+            memory_w=memory_w,
+            memory_size=memory_size,
+            memory_temperature=memory_temperature,
+            memory_momentum=memory_momentum,
+            memory_balance_w=memory_balance_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -5634,6 +5773,11 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "factorization_variance": float(factorization_variance),
               "factorization_margin": float(factorization_margin),
               "factorization_covariance_w": float(factorization_covariance_w),
+              "memory_w": float(memory_w),
+              "memory_size": int(memory_size),
+              "memory_temperature": float(memory_temperature),
+              "memory_momentum": float(memory_momentum),
+              "memory_balance_w": float(memory_balance_w),
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
@@ -5722,7 +5866,8 @@ def expanded_reading_checkpoint_model(checkpoint, reading_records, device=DEV,
                                       latent_concept_layers=None,
                                       latent_concept_prefix=None,
                                       latent_concept_refine=None,
-                                      latent_concept_refine_gate_init=None):
+                                      latent_concept_refine_gate_init=None,
+                                      latent_concept_memory_size=None):
     src_model, src_vocab, ckpt = load_checkpoint(checkpoint, device=device)
     vocab = build_reading_vocab(reading_records, base_vocab=src_vocab)
     ckpt_slots = int(getattr(src_model, "latent_concept_slots", 0)
@@ -5740,6 +5885,10 @@ def expanded_reading_checkpoint_model(checkpoint, reading_records, device=DEV,
         latent_concept_refine_gate_init
         if latent_concept_refine_gate_init is not None
         else ckpt.get("latent_concept_refine_gate_init", -2.0))
+    memory_size = int(
+        latent_concept_memory_size
+        if latent_concept_memory_size is not None
+        else ckpt.get("latent_concept_memory_size", 0))
     model = TextFactLM(
         len(vocab), d=int(ckpt.get("d", 96)),
         layers=int(ckpt.get("layers", 3)),
@@ -5758,7 +5907,8 @@ def expanded_reading_checkpoint_model(checkpoint, reading_records, device=DEV,
         latent_concept_layers=layers,
         latent_concept_prefix=use_prefix,
         latent_concept_refine=use_refine,
-        latent_concept_refine_gate_init=refine_gate).to(device)
+        latent_concept_refine_gate_init=refine_gate,
+        latent_concept_memory_size=memory_size).to(device)
     copy_pretrained_text_weights(src_model, src_vocab, model, vocab)
     model.eval()
     return model, vocab, ckpt
@@ -5774,6 +5924,9 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              factorization_w=0.05, factorization_variance=0.05,
                              factorization_margin=0.2,
                              factorization_covariance_w=0.05,
+                             memory_w=0.05, memory_size=64,
+                             memory_temperature=0.1, memory_momentum=0.95,
+                             memory_balance_w=0.01,
                              context_target_w=0.1, context_keep_p=0.5,
                              context_target_temperature=0.1,
                              neighborhood_w=0.0, neighborhood_batch=0,
@@ -5812,7 +5965,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         latent_concept_layers=latent_concept_layers,
         latent_concept_prefix=latent_concept_prefix,
         latent_concept_refine=latent_concept_refine,
-        latent_concept_refine_gate_init=latent_concept_refine_gate_init)
+        latent_concept_refine_gate_init=latent_concept_refine_gate_init,
+        latent_concept_memory_size=memory_size)
     replay_teacher_model = None
     replay_teacher_vocab = None
     if replay_records and (replay_w or replay_retention_w):
@@ -5845,6 +5999,11 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             factorization_variance=factorization_variance,
             factorization_margin=factorization_margin,
             factorization_covariance_w=factorization_covariance_w,
+            memory_w=memory_w,
+            memory_size=memory_size,
+            memory_temperature=memory_temperature,
+            memory_momentum=memory_momentum,
+            memory_balance_w=memory_balance_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -5886,6 +6045,11 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             factorization_variance=factorization_variance,
             factorization_margin=factorization_margin,
             factorization_covariance_w=factorization_covariance_w,
+            memory_w=memory_w,
+            memory_size=memory_size,
+            memory_temperature=memory_temperature,
+            memory_momentum=memory_momentum,
+            memory_balance_w=memory_balance_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -5961,6 +6125,11 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "factorization_variance": float(factorization_variance),
               "factorization_margin": float(factorization_margin),
               "factorization_covariance_w": float(factorization_covariance_w),
+              "memory_w": float(memory_w),
+              "memory_size": int(memory_size),
+              "memory_temperature": float(memory_temperature),
+              "memory_momentum": float(memory_momentum),
+              "memory_balance_w": float(memory_balance_w),
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
@@ -7419,7 +7588,9 @@ def load_checkpoint(path, device=DEV):
                        latent_concept_refine=bool(
                            ckpt.get("latent_concept_refine", False)),
                        latent_concept_refine_gate_init=float(
-                           ckpt.get("latent_concept_refine_gate_init", -2.0))).to(device)
+                           ckpt.get("latent_concept_refine_gate_init", -2.0)),
+                       latent_concept_memory_size=int(
+                           ckpt.get("latent_concept_memory_size", 0))).to(device)
     state = ckpt["state_dict"]
     model.load_state_dict(state, strict=False)
     model.has_fact_concept_state = any(k.startswith("fact_concepts.") for k in state)
@@ -7457,7 +7628,9 @@ def expanded_checkpoint_model(checkpoint, records, device=DEV):
                        latent_concept_refine=bool(
                            ckpt.get("latent_concept_refine", False)),
                        latent_concept_refine_gate_init=float(
-                           ckpt.get("latent_concept_refine_gate_init", -2.0))).to(device)
+                           ckpt.get("latent_concept_refine_gate_init", -2.0)),
+                       latent_concept_memory_size=int(
+                           ckpt.get("latent_concept_memory_size", 0))).to(device)
     copy_pretrained_text_weights(src_model, src_vocab, model, vocab)
     model.eval()
     return model, vocab, ckpt
@@ -7487,6 +7660,8 @@ def checkpoint_payload(model, vocab, d, layers, heads, report):
                 getattr(model, "latent_concept_refine", False)),
             "latent_concept_refine_gate_init": float(
                 getattr(model, "latent_concept_refine_gate_init", -2.0)),
+            "latent_concept_memory_size": int(
+                getattr(model, "latent_concept_memory_size", 0)),
             "text_encoder_arch": getattr(model, "text_encoder_arch", "transformer"),
             "text_encoder_layers": int(getattr(model, "text_encoder_layers", 1)),
             "d": d, "layers": layers, "heads": heads, "fact_schema": fact_schema,
@@ -9484,6 +9659,12 @@ def selftest():
     reading_factorization = reading_latent_factorization_loss(
         reading_model, reading_txt, feature_dropout=0.1)
     assert torch.isfinite(reading_factorization)
+    reading_model.enable_latent_concept_memory(4)
+    memory_updates = update_reading_latent_memory(reading_model, reading_txt)
+    assert memory_updates > 0
+    reading_memory_loss = reading_latent_memory_loss(
+        reading_model, reading_txt, feature_dropout=0.1)
+    assert torch.isfinite(reading_memory_loss)
     context_txt, target_txt = split_reading_context_target(
         reading_txt, reading_vocab.pad, context_keep_p=0.5)
     assert context_txt.ne(reading_vocab.pad).any(1).all()
@@ -9586,6 +9767,8 @@ def selftest():
         transition_w=0.1, transition_batch=2,
         cluster_w=0.1, cluster_batch=4, cluster_probe_n=4)
     assert "context_target_loss" in reading_model.reading_train_metrics
+    assert reading_model.reading_train_metrics["memory_w"] == 0.05
+    assert reading_model.reading_train_metrics["memory_active"] > 0
     assert reading_model.reading_train_metrics["neighborhood_w"] == 0.1
     assert reading_model.reading_train_metrics["transition_w"] == 0.1
     assert reading_model.reading_neighborhood_reports
@@ -9594,6 +9777,7 @@ def selftest():
     reading_payload = checkpoint_payload(reading_model, reading_vocab, 32, 1, 4,
                                          {"experiment": "reading-selftest"})
     assert reading_payload["fact_schema"] is None
+    assert reading_payload["latent_concept_memory_size"] == 64
     with tempfile.TemporaryDirectory() as tmpdir:
         reading_ckpt = os.path.join(tmpdir, "reading.pt")
         torch.save(reading_payload, reading_ckpt)
@@ -9608,6 +9792,7 @@ def selftest():
                 reading_ckpt, expanded_records, device="cpu"))
         assert expanded_model.fact_schema is None
         assert expanded_model.latent_concept_slots == reading_model.latent_concept_slots
+        assert expanded_model.latent_concept_memory_size == 64
         assert "fresh" in expanded_vocab.stoi
         teacher_model, teacher_vocab, _teacher_ckpt = load_checkpoint(
             reading_ckpt, device="cpu")
@@ -9627,6 +9812,7 @@ def selftest():
             transition_w=0.1, transition_batch=2,
             cluster_w=0.1, cluster_batch=4, cluster_probe_n=4)
         assert expanded_model.reading_train_metrics["replay_w"] == 0.1
+        assert expanded_model.reading_train_metrics["memory_active"] > 0
         assert expanded_model.reading_train_metrics["neighborhood_w"] == 0.1
         assert expanded_model.reading_train_metrics["transition_w"] == 0.1
         assert expanded_model.reading_train_metrics["cluster_w"] == 0.1
@@ -9851,6 +10037,17 @@ def main(argv=None):
                     help="allowed same-example cosine before latent slot separation penalty")
     ap.add_argument("--reading-factorization-covariance-w", type=float, default=0.05,
                     help="decorrelation weight inside raw reading slot factorization")
+    ap.add_argument("--reading-memory-w", type=float, default=0.05,
+                    help=("weight for checkpointed self-mined latent concept memory "
+                          "during raw reading"))
+    ap.add_argument("--reading-memory-size", type=int, default=64,
+                    help="number of persistent schema-free concept prototypes")
+    ap.add_argument("--reading-memory-temperature", type=float, default=0.1,
+                    help="contrastive temperature for persistent concept memory")
+    ap.add_argument("--reading-memory-momentum", type=float, default=0.95,
+                    help="EMA momentum used when updating persistent concept memory")
+    ap.add_argument("--reading-memory-balance-w", type=float, default=0.01,
+                    help="usage-balance weight for persistent concept memory")
     ap.add_argument("--reading-neighborhood-w", type=float, default=0.0,
                     help=("weight for self-mined latent neighborhood discovery loss "
                           "on raw reading chunks"))
@@ -10378,6 +10575,16 @@ def main(argv=None):
         ap.error("--reading-factorization-margin must be non-negative")
     if args.reading_factorization_covariance_w < 0.0:
         ap.error("--reading-factorization-covariance-w must be non-negative")
+    if args.reading_memory_w < 0.0:
+        ap.error("--reading-memory-w must be non-negative")
+    if args.reading_memory_size < 0:
+        ap.error("--reading-memory-size must be non-negative")
+    if args.reading_memory_temperature <= 0.0:
+        ap.error("--reading-memory-temperature must be positive")
+    if args.reading_memory_momentum < 0.0 or args.reading_memory_momentum >= 1.0:
+        ap.error("--reading-memory-momentum must be in [0, 1)")
+    if args.reading_memory_balance_w < 0.0:
+        ap.error("--reading-memory-balance-w must be non-negative")
     if args.reading_neighborhood_w < 0.0:
         ap.error("--reading-neighborhood-w must be non-negative")
     if args.reading_neighborhood_batch < 0:
@@ -10492,6 +10699,11 @@ def main(argv=None):
                 factorization_margin=args.reading_factorization_margin,
                 factorization_covariance_w=(
                     args.reading_factorization_covariance_w),
+                memory_w=args.reading_memory_w,
+                memory_size=args.reading_memory_size,
+                memory_temperature=args.reading_memory_temperature,
+                memory_momentum=args.reading_memory_momentum,
+                memory_balance_w=args.reading_memory_balance_w,
                 context_target_w=args.reading_context_target_w,
                 context_keep_p=args.reading_context_keep_p,
                 context_target_temperature=(
@@ -10567,6 +10779,11 @@ def main(argv=None):
                 factorization_margin=args.reading_factorization_margin,
                 factorization_covariance_w=(
                     args.reading_factorization_covariance_w),
+                memory_w=args.reading_memory_w,
+                memory_size=args.reading_memory_size,
+                memory_temperature=args.reading_memory_temperature,
+                memory_momentum=args.reading_memory_momentum,
+                memory_balance_w=args.reading_memory_balance_w,
                 context_target_w=args.reading_context_target_w,
                 context_keep_p=args.reading_context_keep_p,
                 context_target_temperature=(

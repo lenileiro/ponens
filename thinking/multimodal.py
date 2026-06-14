@@ -34,6 +34,7 @@ from scratchpad_model import CausalBlock, ScratchpadLM
 from .audio import (ENVELOPES, PITCH_NAMES, TIMBRES, render_tone, sample_clip, spectrogram)
 from .concepts import (
     LatentConceptHead,
+    LatentConceptMemory,
     SchemaConceptHead,
     SchemaConceptRefiner,
     latent_concept_cluster_prototype_loss,
@@ -238,6 +239,8 @@ def text_checkpoint_latent_config(path, device="cpu"):
         "latent_concept_refine": bool(ckpt.get("latent_concept_refine", False)),
         "latent_concept_refine_gate_init": float(
             ckpt.get("latent_concept_refine_gate_init", -2.0)),
+        "latent_concept_memory_size": int(
+            ckpt.get("latent_concept_memory_size", 0)),
     }
 
 
@@ -264,7 +267,11 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
         "source_text_layers": int(ckpt.get("text_encoder_layers", 0) or 0),
         "target_text_layers": int(model.txt.layers),
         "source_latent_concept_slots": int(ckpt.get("latent_concept_slots", 0)),
+        "source_latent_concept_memory_size": int(
+            ckpt.get("latent_concept_memory_size", 0)),
         "target_latent_concept_slots": int(model.latent_concept_slots),
+        "target_latent_concept_memory_size": int(
+            getattr(model, "latent_concept_memory_size", 0)),
         "copied_token_embeddings": 0,
         "overlap_tokens": 0,
         "copied_position_rows": 0,
@@ -310,7 +317,8 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
             })
 
     text_prefixes = ("txt.enc.", "txt.blocks.", "txt.ln.")
-    latent_prefixes = ("latent_concepts.", "latent_concept_refiner.")
+    latent_prefixes = ("latent_concepts.", "latent_concept_refiner.",
+                       "latent_concept_memory.")
     with torch.no_grad():
         for name, src_val in sorted(state.items()):
             if name in ("txt.emb.weight", "txt.pos.weight"):
@@ -501,7 +509,8 @@ class MultimodalLM(nn.Module):
                  latent_concept_slots=0, latent_concept_layers=1,
                  latent_concept_prefix=False,
                  latent_concept_refine=False,
-                 latent_concept_refine_gate_init=-2.0):
+                 latent_concept_refine_gate_init=-2.0,
+                 latent_concept_memory_size=0):
         super().__init__()
         if img_tokens <= 0 or aud_tokens <= 0 or txt_tokens <= 0:
             raise ValueError("multimodal prefix token counts must be positive")
@@ -513,6 +522,10 @@ class MultimodalLM(nn.Module):
             raise ValueError("latent concept layers must be positive")
         if (latent_concept_prefix or latent_concept_refine) and int(latent_concept_slots) <= 0:
             raise ValueError("latent concept prefix/refine require latent slots")
+        if int(latent_concept_memory_size) < 0:
+            raise ValueError("latent concept memory size must be non-negative")
+        if int(latent_concept_memory_size) and int(latent_concept_slots) <= 0:
+            raise ValueError("latent concept memory requires latent slots")
         trunk_arch = str(trunk_arch)
         text_arch = str(text_arch)
         if text_arch not in TEXT_TRUNK_ARCHES:
@@ -537,6 +550,7 @@ class MultimodalLM(nn.Module):
             "latent_concept_prefix": bool(latent_concept_prefix),
             "latent_concept_refine": bool(latent_concept_refine),
             "latent_concept_refine_gate_init": float(latent_concept_refine_gate_init),
+            "latent_concept_memory_size": int(latent_concept_memory_size),
         }
         self.modality_dropout = float(modality_dropout)
         self.concept_prefix = bool(concept_prefix)
@@ -545,6 +559,7 @@ class MultimodalLM(nn.Module):
         self.latent_concept_layers = int(latent_concept_layers)
         self.latent_concept_prefix = bool(latent_concept_prefix)
         self.latent_concept_refine = bool(latent_concept_refine)
+        self.latent_concept_memory_size = int(latent_concept_memory_size)
         self.lm = ScratchpadLM(vocab_size, d=d, layers=layers, heads=heads, max_len=max_len,
                                pad=pad, pointer=False, loop=False)
         img_pool = _grid_pool(img_tokens)
@@ -570,6 +585,9 @@ class MultimodalLM(nn.Module):
             self.latent_concept_slots, d, heads=heads,
             mixer_layers=self.latent_concept_layers)
             if self.latent_concept_slots > 0 else None)
+        self.latent_concept_memory = (LatentConceptMemory(
+            self.latent_concept_memory_size, d)
+            if self.latent_concept_memory_size > 0 else None)
         self.latent_concept_refiner = (SchemaConceptRefiner(
             d, heads=heads, gate_init=latent_concept_refine_gate_init)
             if self.latent_concept_refine and self.latent_concepts is not None else None)
@@ -584,9 +602,12 @@ class MultimodalLM(nn.Module):
             self.latent_concept_prefix = False
             self.latent_concept_refine = False
             self.latent_concept_refiner = None
+            self.latent_concept_memory = None
+            self.latent_concept_memory_size = 0
             self.config["latent_concept_slots"] = 0
             self.config["latent_concept_prefix"] = False
             self.config["latent_concept_refine"] = False
+            self.config["latent_concept_memory_size"] = 0
             return self
         if (self.latent_concepts is None
                 or self.latent_concept_slots != slots
@@ -602,6 +623,35 @@ class MultimodalLM(nn.Module):
         self.config["latent_concept_slots"] = slots
         self.config["latent_concept_layers"] = latent_layers
         return self
+
+    def enable_latent_concept_memory(self, size):
+        size = int(size)
+        if size <= 0 or self.latent_concepts is None:
+            self.latent_concept_memory = None
+            self.latent_concept_memory_size = 0
+            self.config["latent_concept_memory_size"] = 0
+            return self
+        if (self.latent_concept_memory is None
+                or self.latent_concept_memory_size != size):
+            self.latent_concept_memory = LatentConceptMemory(size, self.config["d"])
+            self.latent_concept_memory.to(next(self.parameters()).device)
+        self.latent_concept_memory_size = size
+        self.config["latent_concept_memory_size"] = size
+        return self
+
+    def latent_concept_memory_loss(self, slots, temperature=0.1, balance_w=0.0):
+        if self.latent_concept_memory is None:
+            if slots is not None:
+                return slots.sum() * 0.0
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        return self.latent_concept_memory(
+            slots, temperature=temperature, balance_w=balance_w)
+
+    @torch.no_grad()
+    def update_latent_concept_memory(self, slots, momentum=0.95):
+        if self.latent_concept_memory is None:
+            return 0
+        return self.latent_concept_memory.update(slots, momentum=momentum)
 
     def enable_latent_concept_refiner(self, heads=None, gate_init=-2.0):
         if self.latent_concepts is None:
@@ -1399,6 +1449,28 @@ def latent_multimodal_factorization_loss_from_views(
     return torch.stack(losses).mean() if losses else next(iter(views.values())).sum() * 0.0
 
 
+def latent_multimodal_memory_loss_from_views(model, views, temperature=0.1,
+                                             balance_w=0.0):
+    views = {mode: slots for mode, slots in views.items() if slots is not None}
+    if not views:
+        return torch.tensor(0.0)
+    if getattr(model, "latent_concept_memory", None) is None:
+        return next(iter(views.values())).sum() * 0.0
+    losses = [
+        model.latent_concept_memory_loss(
+            slots, temperature=temperature, balance_w=balance_w)
+        for slots in views.values()
+    ]
+    return torch.stack(losses).mean() if losses else next(iter(views.values())).sum() * 0.0
+
+
+@torch.no_grad()
+def update_multimodal_latent_memory(model, slots, momentum=0.95):
+    if getattr(model, "latent_concept_memory", None) is None:
+        return 0
+    return model.update_latent_concept_memory(slots, momentum=momentum)
+
+
 def latent_multimodal_neighborhood_loss_from_views(views, temperature=0.1,
                                                    margin=0.0):
     views = {mode: slots for mode, slots in views.items() if slots is not None}
@@ -1670,6 +1742,11 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           latent_concept_factorization_variance=0.05,
           latent_concept_factorization_margin=0.2,
           latent_concept_factorization_covariance_w=0.05,
+          latent_concept_memory_w=0.0,
+          latent_concept_memory_size=0,
+          latent_concept_memory_temperature=0.1,
+          latent_concept_memory_momentum=0.95,
+          latent_concept_memory_balance_w=0.01,
           latent_concept_neighborhood_w=0.0,
           latent_concept_neighborhood_temperature=0.1,
           latent_concept_neighborhood_margin=0.0,
@@ -1695,19 +1772,26 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           concept_state_spread_w=0.0, concept_state_spread_variance=0.05,
           concept_state_spread_margin=0.2,
           concept_state_spread_covariance_w=0.05):
+    ckpt_latents = text_checkpoint_latent_config(
+        text_checkpoint, device="cpu") if text_checkpoint else {}
     if text_checkpoint and latent_concept_slots <= 0:
-        ckpt_latents = text_checkpoint_latent_config(text_checkpoint, device="cpu")
         if ckpt_latents.get("latent_concept_slots", 0) > 0:
             latent_concept_slots = ckpt_latents["latent_concept_slots"]
             latent_concept_layers = ckpt_latents["latent_concept_layers"]
+    if (text_checkpoint and latent_concept_memory_size <= 0
+            and ckpt_latents.get("latent_concept_memory_size", 0) > 0):
+        latent_concept_memory_size = ckpt_latents["latent_concept_memory_size"]
     if (latent_concept_w < 0.0 or latent_concept_factor_w < 0.0
             or latent_concept_factorization_w < 0.0
+            or latent_concept_memory_w < 0.0
             or latent_concept_neighborhood_w < 0.0
             or latent_concept_transition_w < 0.0
             or latent_concept_cluster_w < 0.0):
         raise ValueError("latent concept loss weights must be non-negative")
     if ((latent_concept_w > 0.0 or latent_concept_factor_w > 0.0
          or latent_concept_factorization_w > 0.0
+         or latent_concept_memory_w > 0.0
+         or latent_concept_memory_size > 0
          or latent_concept_neighborhood_w > 0.0
          or latent_concept_transition_w > 0.0
          or latent_concept_cluster_w > 0.0)
@@ -1720,6 +1804,15 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     if latent_concept_factorization_covariance_w < 0.0:
         raise ValueError(
             "latent concept factorization covariance weight must be non-negative")
+    if int(latent_concept_memory_size) < 0:
+        raise ValueError("latent concept memory size must be non-negative")
+    if latent_concept_memory_temperature <= 0.0:
+        raise ValueError("latent concept memory temperature must be positive")
+    if (latent_concept_memory_momentum < 0.0
+            or latent_concept_memory_momentum >= 1.0):
+        raise ValueError("latent concept memory momentum must be in [0, 1)")
+    if latent_concept_memory_balance_w < 0.0:
+        raise ValueError("latent concept memory balance weight must be non-negative")
     if latent_concept_neighborhood_temperature <= 0.0:
         raise ValueError("latent concept neighborhood temperature must be positive")
     if latent_concept_neighborhood_margin < 0.0:
@@ -1764,7 +1857,9 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                          latent_concept_prefix=latent_concept_prefix,
                          latent_concept_refine=latent_concept_refine,
                          latent_concept_refine_gate_init=(
-                             latent_concept_refine_gate_init)).to(device)
+                             latent_concept_refine_gate_init),
+                         latent_concept_memory_size=(
+                             latent_concept_memory_size)).to(device)
     if text_checkpoint:
         import_text_checkpoint(model, vocab, text_checkpoint, device=device)
     else:
@@ -1804,6 +1899,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     last_concept_state_spread = 0.0
     last_latent_concept = 0.0
     last_latent_factorization = 0.0
+    last_latent_memory = 0.0
+    last_latent_memory_updates = 0
     last_latent_neighborhood = 0.0
     last_latent_transition = 0.0
     last_latent_cluster = 0.0
@@ -1830,6 +1927,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
             or concept_state_spread_w)
         needs_latent_batch = bool(
             latent_concept_w or latent_concept_factorization_w
+            or latent_concept_memory_w
             or latent_concept_neighborhood_w
             or latent_concept_transition_w
             or latent_concept_cluster_w)
@@ -1930,6 +2028,14 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                 separation_margin=latent_concept_factorization_margin,
                 covariance_w=latent_concept_factorization_covariance_w)
             if latent_concept_factorization_w else base_loss * 0.0)
+        latent_memory = (
+            latent_multimodal_memory_loss_from_views(
+                model,
+                {mode: bundle["latent_concepts"]
+                 for mode, bundle in bundles_by_mode.items()},
+                temperature=latent_concept_memory_temperature,
+                balance_w=latent_concept_memory_balance_w)
+            if latent_concept_memory_w else base_loss * 0.0)
         latent_neighborhood = (
             latent_multimodal_neighborhood_loss_from_views(
                 {mode: bundle["latent_concepts"]
@@ -1975,6 +2081,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                 + float(concept_state_spread_w) * concept_state_spread
                 + float(latent_concept_w) * latent_concept
                 + float(latent_concept_factorization_w) * latent_factorization
+                + float(latent_concept_memory_w) * latent_memory
                 + float(latent_concept_neighborhood_w) * latent_neighborhood
                 + float(latent_concept_transition_w) * latent_transition
                 + float(latent_concept_cluster_w) * latent_cluster
@@ -1982,6 +2089,11 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         opt.zero_grad()
         loss.backward()
         opt.step()
+        full_latent_for_memory = (
+            bundles_by_mode.get("full", {}).get("latent_concepts")
+            if needs_latent_batch else None)
+        last_latent_memory_updates = int(update_multimodal_latent_memory(
+            model, full_latent_for_memory, momentum=latent_concept_memory_momentum))
         last_base = float(base_loss.detach())
         last_agreement = float(agreement.detach())
         last_concept = float(concept_loss.detach())
@@ -1996,6 +2108,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         last_concept_state_spread = float(concept_state_spread.detach())
         last_latent_concept = float(latent_concept.detach())
         last_latent_factorization = float(latent_factorization.detach())
+        last_latent_memory = float(latent_memory.detach())
         last_latent_neighborhood = float(latent_neighborhood.detach())
         last_latent_transition = float(latent_transition.detach())
         last_latent_cluster = float(latent_cluster.detach())
@@ -2015,6 +2128,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                   f"concept-state-spread {last_concept_state_spread:.3f} "
                   f"latent {last_latent_concept:.3f} "
                   f"latent-factorize {last_latent_factorization:.3f} "
+                  f"latent-memory {last_latent_memory:.3f} "
                   f"latent-neighborhood {last_latent_neighborhood:.3f} "
                   f"latent-transition {last_latent_transition:.3f} "
                   f"latent-cluster {last_latent_cluster:.3f} "
@@ -2034,6 +2148,17 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                            "concept_state_spread_loss": last_concept_state_spread,
                            "latent_concept_loss": last_latent_concept,
                            "latent_factorization_loss": last_latent_factorization,
+                           "latent_memory_loss": last_latent_memory,
+                           "latent_memory_size": int(
+                               getattr(model, "latent_concept_memory_size", 0)),
+                           "latent_memory_active": int(
+                               getattr(getattr(model, "latent_concept_memory", None),
+                                       "filled", torch.zeros((), dtype=torch.long)).item()),
+                           "latent_memory_updates": int(
+                               getattr(getattr(model, "latent_concept_memory", None),
+                                       "updates", torch.zeros((), dtype=torch.long)).item()),
+                           "latent_memory_last_batch_updates": int(
+                               last_latent_memory_updates),
                            "latent_neighborhood_loss": last_latent_neighborhood,
                            "latent_transition_loss": last_latent_transition,
                            "latent_cluster_loss": last_latent_cluster,
@@ -2076,6 +2201,11 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         latent_concept_factorization_variance=0.05,
         latent_concept_factorization_margin=0.2,
         latent_concept_factorization_covariance_w=0.05,
+        latent_concept_memory_w=0.0,
+        latent_concept_memory_size=0,
+        latent_concept_memory_temperature=0.1,
+        latent_concept_memory_momentum=0.95,
+        latent_concept_memory_balance_w=0.01,
         latent_concept_neighborhood_w=0.0,
         latent_concept_neighborhood_temperature=0.1,
         latent_concept_neighborhood_margin=0.0,
@@ -2142,6 +2272,15 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                        latent_concept_factorization_margin),
                                    latent_concept_factorization_covariance_w=(
                                        latent_concept_factorization_covariance_w),
+                                   latent_concept_memory_w=latent_concept_memory_w,
+                                   latent_concept_memory_size=(
+                                       latent_concept_memory_size),
+                                   latent_concept_memory_temperature=(
+                                       latent_concept_memory_temperature),
+                                   latent_concept_memory_momentum=(
+                                       latent_concept_memory_momentum),
+                                   latent_concept_memory_balance_w=(
+                                       latent_concept_memory_balance_w),
                                    latent_concept_neighborhood_w=(
                                        latent_concept_neighborhood_w),
                                    latent_concept_neighborhood_temperature=(
@@ -2271,6 +2410,14 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                   latent_concept_factorization_margin),
               "latent_concept_factorization_covariance_w": float(
                   latent_concept_factorization_covariance_w),
+              "latent_concept_memory_w": float(latent_concept_memory_w),
+              "latent_concept_memory_size": int(
+                  getattr(model, "latent_concept_memory_size", 0)),
+              "latent_concept_memory_temperature": float(
+                  latent_concept_memory_temperature),
+              "latent_concept_memory_momentum": float(latent_concept_memory_momentum),
+              "latent_concept_memory_balance_w": float(
+                  latent_concept_memory_balance_w),
               "latent_concept_neighborhood_w": float(latent_concept_neighborhood_w),
               "latent_concept_neighborhood_temperature": float(
                   latent_concept_neighborhood_temperature),
@@ -2464,6 +2611,10 @@ def selftest():
     }
     assert torch.isfinite(latent_multimodal_factorization_loss_from_views(
         latent_views, variance_target=0.01, separation_margin=0.2))
+    latent_model.enable_latent_concept_memory(4)
+    assert update_multimodal_latent_memory(latent_model, latent_views["full"]) > 0
+    assert torch.isfinite(latent_multimodal_memory_loss_from_views(
+        latent_model, latent_views, temperature=0.2))
     assert torch.isfinite(latent_multimodal_neighborhood_loss_from_views(
         latent_views, temperature=0.2))
     assert torch.isfinite(latent_multimodal_transition_loss_from_views(
@@ -2502,10 +2653,13 @@ def selftest():
         text_model = TextFactLM(
             len(text_vocab), d=32, layers=1, heads=4, pad=text_vocab.pad,
             fact_schema=None, latent_concept_slots=3,
-            latent_concept_layers=1).to("cpu")
+            latent_concept_layers=1, latent_concept_memory_size=5).to("cpu")
         with torch.no_grad():
             text_model.txt.emb.weight[text_vocab.stoi["red"]].fill_(0.314)
             text_model.latent_concepts.queries.fill_(0.271)
+            text_model.latent_concept_memory.memory.fill_(0.123)
+            text_model.latent_concept_memory.filled.fill_(5)
+            text_model.latent_concept_memory.updates.fill_(7)
         text_ckpt = os.path.join(tmpdir, "text-reading.pt")
         torch.save(
             checkpoint_payload(
@@ -2514,9 +2668,11 @@ def selftest():
             text_ckpt)
         transfer_model = MultimodalLM(
             len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
-            latent_concept_slots=3, latent_concept_layers=1).to("cpu")
+            latent_concept_slots=3, latent_concept_layers=1,
+            latent_concept_memory_size=5).to("cpu")
         red_before = transfer_model.txt.emb.weight[vocab.stoi["red"]].clone()
         latent_before = transfer_model.latent_concepts.queries.clone()
+        memory_before = transfer_model.latent_concept_memory.memory.clone()
         transfer = import_text_checkpoint(transfer_model, vocab, text_ckpt, device="cpu")
         assert transfer["copied"] is True
         assert transfer["copied_token_embeddings"] > 0
@@ -2530,18 +2686,28 @@ def selftest():
         assert torch.allclose(
             transfer_model.latent_concepts.queries,
             text_model.latent_concepts.queries)
+        assert not torch.allclose(memory_before,
+                                  transfer_model.latent_concept_memory.memory)
+        assert torch.allclose(transfer_model.latent_concept_memory.memory,
+                              text_model.latent_concept_memory.memory)
+        assert int(transfer_model.latent_concept_memory.filled.item()) == 5
         ckpt_latents = text_checkpoint_latent_config(text_ckpt, device="cpu")
         assert ckpt_latents["latent_concept_slots"] == 3
+        assert ckpt_latents["latent_concept_memory_size"] == 5
         auto_model, _auto_vocab, _auto_surfaces = train(
             steps=1, batch=2, d=32, layers=1, heads=4, seed=9, device="cpu",
             log_every=1, text_checkpoint=text_ckpt,
             latent_concept_factorization_w=0.1,
+            latent_concept_memory_w=0.1,
             latent_concept_neighborhood_w=0.1,
             latent_concept_transition_w=0.1,
             latent_concept_cluster_w=0.1)
         assert auto_model.latent_concept_slots == 3
+        assert auto_model.latent_concept_memory_size == 5
         assert auto_model.text_checkpoint_transfer["copied"] is True
         assert auto_model.train_metrics["latent_factorization_loss"] >= 0.0
+        assert auto_model.train_metrics["latent_memory_loss"] >= 0.0
+        assert auto_model.train_metrics["latent_memory_active"] > 0
         assert auto_model.train_metrics["latent_neighborhood_loss"] >= 0.0
         assert auto_model.train_metrics["latent_transition_loss"] >= 0.0
         assert auto_model.train_metrics["latent_cluster_loss"] >= 0.0
@@ -2709,6 +2875,21 @@ def main(argv=None):
                     default=0.05,
                     dest="latent_concept_factorization_covariance_w",
                     help="decorrelation weight inside latent slot factorization")
+    ap.add_argument("--latent-concept-memory-w", type=float, default=0.0,
+                    dest="latent_concept_memory_w",
+                    help="weight for checkpointed schema-free latent concept memory")
+    ap.add_argument("--latent-concept-memory-size", type=int, default=0,
+                    dest="latent_concept_memory_size",
+                    help="persistent latent concept prototypes; 0 disables memory")
+    ap.add_argument("--latent-concept-memory-temperature", type=float, default=0.1,
+                    dest="latent_concept_memory_temperature",
+                    help="contrastive temperature for latent concept memory")
+    ap.add_argument("--latent-concept-memory-momentum", type=float, default=0.95,
+                    dest="latent_concept_memory_momentum",
+                    help="EMA momentum used when updating latent concept memory")
+    ap.add_argument("--latent-concept-memory-balance-w", type=float, default=0.01,
+                    dest="latent_concept_memory_balance_w",
+                    help="usage-balance weight for latent concept memory")
     ap.add_argument("--latent-concept-neighborhood-w", type=float, default=0.0,
                     dest="latent_concept_neighborhood_w",
                     help=("weight for self-mined latent neighborhood alignment "
@@ -2925,6 +3106,21 @@ def main(argv=None):
         ap.error("--latent-concept-factorization-margin must be non-negative")
     if args.latent_concept_factorization_covariance_w < 0.0:
         ap.error("--latent-concept-factorization-covariance-w must be non-negative")
+    if args.latent_concept_memory_w < 0.0:
+        ap.error("--latent-concept-memory-w must be non-negative")
+    if args.latent_concept_memory_size < 0:
+        ap.error("--latent-concept-memory-size must be non-negative")
+    if ((args.latent_concept_memory_w > 0.0
+         or args.latent_concept_memory_size > 0)
+            and effective_latent_slots <= 0):
+        ap.error("--latent-concept-memory requires --latent-concept-slots > 0")
+    if args.latent_concept_memory_temperature <= 0.0:
+        ap.error("--latent-concept-memory-temperature must be positive")
+    if (args.latent_concept_memory_momentum < 0.0
+            or args.latent_concept_memory_momentum >= 1.0):
+        ap.error("--latent-concept-memory-momentum must be in [0, 1)")
+    if args.latent_concept_memory_balance_w < 0.0:
+        ap.error("--latent-concept-memory-balance-w must be non-negative")
     if args.latent_concept_neighborhood_w < 0.0:
         ap.error("--latent-concept-neighborhood-w must be non-negative")
     if args.latent_concept_neighborhood_w > 0.0 and effective_latent_slots <= 0:
@@ -3022,6 +3218,14 @@ def main(argv=None):
                      args.latent_concept_factorization_margin),
                  latent_concept_factorization_covariance_w=(
                      args.latent_concept_factorization_covariance_w),
+                 latent_concept_memory_w=args.latent_concept_memory_w,
+                 latent_concept_memory_size=args.latent_concept_memory_size,
+                 latent_concept_memory_temperature=(
+                     args.latent_concept_memory_temperature),
+                 latent_concept_memory_momentum=(
+                     args.latent_concept_memory_momentum),
+                 latent_concept_memory_balance_w=(
+                     args.latent_concept_memory_balance_w),
                  latent_concept_neighborhood_w=args.latent_concept_neighborhood_w,
                  latent_concept_neighborhood_temperature=(
                      args.latent_concept_neighborhood_temperature),

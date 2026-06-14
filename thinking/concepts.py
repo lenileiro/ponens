@@ -113,6 +113,98 @@ class LatentConceptHead(nn.Module):
         return slots
 
 
+class LatentConceptMemory(nn.Module):
+    """Checkpointed schema-free prototype memory for latent concept slots."""
+
+    def __init__(self, size, d):
+        super().__init__()
+        self.size = int(size)
+        self.d = int(d)
+        if self.size <= 0:
+            raise ValueError("latent concept memory size must be positive")
+        if self.d <= 0:
+            raise ValueError("latent concept memory dimension must be positive")
+        self.register_buffer("memory", torch.zeros(self.size, self.d))
+        self.register_buffer("filled", torch.zeros((), dtype=torch.long))
+        self.register_buffer("updates", torch.zeros((), dtype=torch.long))
+
+    def active(self):
+        n = int(self.filled.item())
+        return self.memory[:n]
+
+    def forward(self, slots, temperature=0.1, balance_w=0.0):
+        return latent_concept_memory_loss(
+            slots, self.active(), temperature=temperature, balance_w=balance_w)
+
+    @torch.no_grad()
+    def update(self, slots, momentum=0.95):
+        if slots is None:
+            return 0
+        if slots.shape[-1] != self.d:
+            raise ValueError("latent concept memory update dimension mismatch")
+        rows = slots.detach().reshape(-1, self.d)
+        if rows.numel() == 0:
+            return 0
+        rows = F.normalize(rows, dim=-1)
+        rows = rows[torch.isfinite(rows).all(-1)]
+        if rows.numel() == 0:
+            return 0
+        filled = int(self.filled.item())
+        added = 0
+        if filled < self.size:
+            n_new = min(self.size - filled, rows.shape[0])
+            self.memory[filled:filled + n_new].copy_(rows[:n_new].to(self.memory))
+            filled += n_new
+            added += n_new
+            self.filled.fill_(filled)
+            rows = rows[n_new:]
+        if rows.shape[0] and filled:
+            active = F.normalize(self.memory[:filled], dim=-1)
+            nearest = rows.to(active).matmul(active.t()).argmax(-1)
+            mom = float(momentum)
+            if mom < 0.0 or mom >= 1.0:
+                raise ValueError("latent concept memory momentum must be in [0, 1)")
+            for idx in nearest.unique():
+                selected = rows[nearest.eq(idx)].to(self.memory)
+                target = selected.mean(0)
+                updated = mom * self.memory[int(idx)] + (1.0 - mom) * target
+                self.memory[int(idx)].copy_(F.normalize(updated, dim=0))
+            added += int(rows.shape[0])
+        if added:
+            self.updates.add_(1)
+        return int(added)
+
+
+def latent_concept_memory_loss(slots, memory, temperature=0.1, balance_w=0.0):
+    """Align latent slots to a persistent self-mined prototype memory.
+
+    The memory rows are discovered from previous batches and stored in the
+    checkpoint. The loss uses nearest current prototypes as detached targets,
+    so it does not need labels, schema fields, or language-specific rules.
+    """
+    if slots is None:
+        return torch.tensor(0.0)
+    if memory is None or memory.numel() == 0:
+        return slots.sum() * 0.0
+    if slots.shape[-1] != memory.shape[-1]:
+        raise ValueError("latent concept memory dimension mismatch")
+    rows = F.normalize(slots.reshape(-1, slots.shape[-1]), dim=-1)
+    mem = F.normalize(memory.to(device=rows.device, dtype=rows.dtype), dim=-1)
+    if mem.shape[0] <= 0:
+        return slots.sum() * 0.0
+    temp = max(float(temperature), 1e-6)
+    logits = rows.matmul(mem.t()) / temp
+    targets = logits.detach().argmax(-1)
+    nearest_sim = rows.matmul(mem.t()).detach().max(-1).values
+    losses = [F.cross_entropy(logits, targets), (1.0 - nearest_sim).mean()]
+    if float(balance_w) and mem.shape[0] > 1:
+        probs = logits.softmax(-1).mean(0)
+        uniform = torch.full_like(probs, 1.0 / probs.numel())
+        losses.append(float(balance_w) * F.kl_div(
+            probs.clamp_min(1e-8).log(), uniform, reduction="batchmean"))
+    return torch.stack(losses).mean()
+
+
 class SchemaConceptHead(nn.Module):
     """Attend over source states and score values for each schema key."""
 
