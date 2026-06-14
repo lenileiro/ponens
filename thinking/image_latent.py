@@ -7887,8 +7887,16 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
         scale = centered.std(dim=1, keepdim=True, unbiased=False).clamp_min(1.0e-6)
         return centered / scale
 
+    def matrix_list(matrix):
+        return [
+            [float(value) for value in row]
+            for row in matrix.detach().float().cpu().tolist()
+        ]
+
     scorers = []
     z = None
+    health_scores = sample_candidate_health_scores(samples).reshape(
+        n, candidates_per_prompt)
     if text_aligner is not None:
         text_aligner.eval()
         z = ae.encode(samples)
@@ -7918,7 +7926,7 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
             z = ae.encode(samples)
         scorers.append(("quality_scorer", quality_scorer.score(z).float()))
     if not scorers:
-        scores = sample_candidate_health_scores(samples).reshape(n, candidates_per_prompt)
+        scores = health_scores
         best = scores.argmax(dim=1)
         base = torch.arange(n, device=samples.device) * candidates_per_prompt
         selected = base + best.to(device=samples.device)
@@ -7932,6 +7940,8 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
             "sample_grid_selection_score_mean": float(best_scores.mean().detach().cpu()),
             "sample_grid_selection_score_min": float(best_scores.min().detach().cpu()),
             "sample_grid_selection_score_max": float(best_scores.max().detach().cpu()),
+            "sample_grid_selection_scores": matrix_list(scores),
+            "sample_grid_selection_health_scores": matrix_list(health_scores),
             "sample_grid_selection_candidate_health_mean": float(
                 scores.mean().detach().cpu()),
             "sample_grid_selection_candidate_health_min": float(
@@ -7944,6 +7954,7 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
         (name, normalize_candidate_scores(score))
         for name, score in scorers
     ]
+    component_scores.append(("sample_health", normalize_candidate_scores(health_scores)))
     scores = torch.stack([score for _name, score in component_scores], dim=0).mean(dim=0)
     best = scores.argmax(dim=1)
     base = torch.arange(n, device=samples.device) * candidates_per_prompt
@@ -7954,10 +7965,11 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
         "text_aligner": "text_aligner_cosine",
         "image_feature_aligner": "image_feature_aligner_cosine",
         "quality_scorer": "quality_scorer_score",
+        "sample_health": "sample_health_v2",
     }
     selection_meta = {
         "sample_grid_selection_scorer": "+".join(
-            scorer_labels.get(name, name) for name, _score in scorers
+            scorer_labels.get(name, name) for name, _score in component_scores
         ),
         "sample_grid_selection_component_count": int(len(component_scores)),
         "sample_grid_selected_candidate_indices": [
@@ -7966,6 +7978,14 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
         "sample_grid_selection_score_mean": float(best_scores.mean().detach().cpu()),
         "sample_grid_selection_score_min": float(best_scores.min().detach().cpu()),
         "sample_grid_selection_score_max": float(best_scores.max().detach().cpu()),
+        "sample_grid_selection_scores": matrix_list(scores),
+        "sample_grid_selection_health_scores": matrix_list(health_scores),
+        "sample_grid_selection_candidate_health_mean": float(
+            health_scores.mean().detach().cpu()),
+        "sample_grid_selection_candidate_health_min": float(
+            health_scores.min().detach().cpu()),
+        "sample_grid_selection_candidate_health_max": float(
+            health_scores.max().detach().cpu()),
     }
     for name, score in component_scores:
         selected_scores = score.gather(1, best[:, None]).squeeze(1)
@@ -8400,6 +8420,9 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
     meta.update(sample_health_metrics(sample, prefix="sample_grid"))
     if sample_candidates_manifest_out:
         selected = selection_meta.get("sample_grid_selected_candidate_indices", [])
+        selection_scores = selection_meta.get("sample_grid_selection_scores", [])
+        selection_health_scores = selection_meta.get(
+            "sample_grid_selection_health_scores", [])
         prompt_text_embeddings = None
         if caption_cond_source == "embedding" and torch.is_tensor(prompt_features):
             prompt_text_embeddings = (
@@ -8433,6 +8456,18 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                     "sample_churn": float(setting["sample_churn"]),
                     "sample_seed": int(setting["seed"]),
                     "sample_candidate_sweep_mode": "cyclic",
+                    "sample_selection_score": (
+                        float(selection_scores[prompt_idx][candidate_idx])
+                        if prompt_idx < len(selection_scores)
+                        and candidate_idx < len(selection_scores[prompt_idx])
+                        else 0.0),
+                    "sample_health_score": (
+                        float(selection_health_scores[prompt_idx][candidate_idx])
+                        if prompt_idx < len(selection_health_scores)
+                        and candidate_idx < len(selection_health_scores[prompt_idx])
+                        else 0.0),
+                    "sample_selection_scorer": selection_meta.get(
+                        "sample_grid_selection_scorer", "none"),
                     "sample_pixel_dynamic_threshold_percentile": float(
                         sample_pixel_dynamic_threshold_percentile),
                     "sample_pixel_dynamic_threshold_max": float(
@@ -8480,10 +8515,21 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         })
     if sample_manifest_out:
         selected = selection_meta.get("sample_grid_selected_candidate_indices", [])
+        selection_scores = selection_meta.get("sample_grid_selection_scores", [])
+        selection_health_scores = selection_meta.get(
+            "sample_grid_selection_health_scores", [])
         row_meta = []
         for idx, prompt in enumerate(prompts):
             selected_idx = int(selected[idx]) if idx < len(selected) else 0
             setting = candidate_settings[max(0, min(selected_idx, candidates_per_prompt - 1))]
+            selected_score = (
+                float(selection_scores[idx][selected_idx])
+                if idx < len(selection_scores)
+                and selected_idx < len(selection_scores[idx]) else 0.0)
+            selected_health = (
+                float(selection_health_scores[idx][selected_idx])
+                if idx < len(selection_health_scores)
+                and selected_idx < len(selection_health_scores[idx]) else 0.0)
             row_meta.append({
                 "conditioning_mode": "prompt",
                 "conditioning_prompt": prompt,
@@ -8500,6 +8546,10 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                 "sample_churn": float(setting["sample_churn"]),
                 "sample_seed": int(setting["seed"]),
                 "sample_candidate_sweep_mode": "cyclic",
+                "sample_selection_score": selected_score,
+                "sample_health_score": selected_health,
+                "sample_selection_scorer": selection_meta.get(
+                    "sample_grid_selection_scorer", "none"),
                 "sample_pixel_dynamic_threshold_percentile": float(
                     sample_pixel_dynamic_threshold_percentile),
                 "sample_pixel_dynamic_threshold_max": float(
@@ -12232,6 +12282,37 @@ def selftest():
             health_meta, prefix="unit", min_detail_energy=1.0)
         assert gate_fail["unit_quality_gate_passed"] is False
         assert gate_fail["unit_quality_gate_failures"]
+        flat = torch.zeros(3, 16, 16)
+        yy, xx = torch.meshgrid(
+            torch.linspace(-0.8, 0.8, 16),
+            torch.linspace(-0.8, 0.8, 16),
+            indexing="ij")
+        textured = torch.stack([xx, yy, (xx + yy) * 0.5], dim=0)
+        candidate_pixels = torch.stack([flat, textured, textured, flat], dim=0)
+
+        class _IdentityAE:
+            def encode(self, x):
+                return x
+
+        class _FlatQualityScorer:
+            def eval(self):
+                return self
+
+            def score(self, z):
+                return torch.zeros(z.shape[0], device=z.device)
+
+        selected_pixels, selected_meta = select_prompt_candidates(
+            _IdentityAE(), candidate_pixels, None, ("prompt a", "prompt b"),
+            candidates_per_prompt=2, quality_scorer=_FlatQualityScorer())
+        assert tuple(selected_pixels.shape) == (2, 3, 16, 16)
+        assert "sample_health_v2" in selected_meta["sample_grid_selection_scorer"]
+        assert selected_meta["sample_grid_selection_component_count"] == 2
+        assert len(selected_meta["sample_grid_selection_scores"]) == 2
+        assert len(selected_meta["sample_grid_selection_health_scores"][0]) == 2
+        for prompt_idx, chosen_idx in enumerate(
+                selected_meta["sample_grid_selected_candidate_indices"]):
+            health_row = selected_meta["sample_grid_selection_health_scores"][prompt_idx]
+            assert health_row[int(chosen_idx)] == max(health_row)
         structure_aligner = FlowFeatureAligner(
             hidden_dim=6, feature_dim=3, hidden=8, embed_dim=4)
         structure_loss, structure_parts = flow_hidden_feature_structure_loss(
@@ -12437,13 +12518,30 @@ def selftest():
         assert loaded_meta["flow_load"]["missing"] == []
         assert loaded_meta["flow_load"]["unexpected"] == []
         reload_sample_path = os.path.join(td, "reload_samples.ppm")
+        reload_candidates_path = os.path.join(td, "reload_candidates.jsonl")
+        reload_selected_path = os.path.join(td, "reload_selected.jsonl")
         reload_meta = save_text_prompt_sample_grid(
             loaded_ae, loaded_flow, ("manifest texture sample 1",),
             reload_sample_path, size=16, device="cpu", conditioner=loaded_cond,
             prompt_vocab=loaded_vocab, caption_max_len=8, cfg_scale=1.0,
-            sample_steps=1, sample_method="euler")
+            sample_steps=1, sample_method="euler", candidates_per_prompt=2,
+            sample_candidates_manifest_out=reload_candidates_path,
+            sample_manifest_out=reload_selected_path, candidate_seeds=(3, 5))
         assert reload_meta["sample_grid_cond_mode"] == "prompt"
         assert reload_meta["sample_grid_prompt_count"] == 1
+        assert "sample_health_v2" in reload_meta["sample_grid_selection_scorer"]
+        assert len(reload_meta["sample_grid_selection_scores"][0]) == 2
+        with open(reload_candidates_path, encoding="utf-8") as f:
+            candidate_rows = [json.loads(line) for line in f if line.strip()]
+        assert len(candidate_rows) == 2
+        assert "sample_selection_score" in candidate_rows[0]
+        assert "sample_health_score" in candidate_rows[0]
+        assert "sample_selection_scorer" in candidate_rows[0]
+        with open(reload_selected_path, encoding="utf-8") as f:
+            selected_rows = [json.loads(line) for line in f if line.strip()]
+        assert len(selected_rows) == 1
+        assert "sample_selection_score" in selected_rows[0]
+        assert "sample_health_score" in selected_rows[0]
         assert os.path.exists(reload_sample_path)
         _ae2, _flow2, _cond2, _vocab2, resumed = train_latent_flow(
             ae_steps=0, flow_steps=1, batch=2, latent_ch=4, hidden=16,
