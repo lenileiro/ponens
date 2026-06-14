@@ -42,6 +42,8 @@ from .concepts import (
     latent_concept_fer_metrics,
     latent_concept_graph_prediction_loss,
     latent_concept_graph_prediction_scores,
+    latent_concept_graph_ready,
+    latent_concept_graph_snapshot,
     latent_concept_memory_loss,
     latent_concept_neighborhood_loss,
     latent_concept_slot_factorization_loss,
@@ -755,22 +757,51 @@ def latent_multimodal_bridge_loss_from_views(model, views):
     return torch.stack(losses).mean() if losses else next(iter(views.values())).sum() * 0.0
 
 
-def latent_multimodal_bridge_metrics_from_views(model, views):
+def latent_multimodal_bridge_graph_state(model):
+    memory = getattr(model, "latent_concept_memory", None)
+    if getattr(model, "latent_concepts", None) is None or memory is None:
+        return None
+    return latent_concept_graph_snapshot(memory)
+
+
+def latent_multimodal_bridge_metrics_from_views(model, views, bridge_graph=None):
+    graph_source = "snapshot" if bridge_graph is not None else "current"
     views = {mode: slots for mode, slots in views.items() if slots is not None}
     if not views:
         return {"bridge_score": 0.0, "bridge_entropy": 0.0,
-                "bridge_connectivity": 0.0, "mode_count": 0, "modes": {}}
-    memory = getattr(model, "latent_concept_memory", None)
-    if memory is None:
+                "bridge_connectivity": 1.0, "mode_count": 0, "modes": {},
+                "graph_ready": False, "graph_source": graph_source,
+                "skipped": True, "skip_reason": "no_views"}
+    if bridge_graph is None:
+        bridge_graph = latent_multimodal_bridge_graph_state(model)
+    if getattr(model, "latent_concepts", None) is None or bridge_graph is None:
         return {"bridge_score": 0.0, "bridge_entropy": 0.0,
-                "bridge_connectivity": 1.0, "mode_count": 0, "modes": {}}
+                "bridge_connectivity": 1.0, "mode_count": 0, "modes": {},
+                "memory_filled": 0, "relation_updates": 0,
+                "transition_updates": 0, "graph_ready": False,
+                "graph_source": graph_source, "skipped": True,
+                "skip_reason": "latent_concept_memory_unavailable"}
+    active_memory = bridge_graph["memory"]
+    relations = bridge_graph["relations"]
+    transitions = bridge_graph["transitions"]
+    filled = int(active_memory.shape[0])
+    relation_updates = int(bridge_graph.get("relation_updates", 0))
+    transition_updates = int(bridge_graph.get("transition_updates", 0))
+    if not latent_concept_graph_ready(graph_state=bridge_graph):
+        return {"bridge_score": 0.0, "bridge_entropy": 0.0,
+                "bridge_connectivity": 1.0, "mode_count": len(views),
+                "modes": {}, "memory_filled": filled,
+                "relation_updates": relation_updates,
+                "transition_updates": transition_updates,
+                "graph_ready": False, "graph_source": graph_source,
+                "skipped": True,
+                "skip_reason": "latent_concept_graph_unavailable"}
     keys = ("bridge_score", "bridge_entropy", "bridge_connectivity")
     totals = {key: 0.0 for key in keys}
     modes = {}
     for mode, slots in views.items():
         score, entropy, connectivity = latent_concept_bridge_scores(
-            slots, memory.active(), memory.active_relations(),
-            memory.active_transitions())
+            slots, active_memory, relations, transitions, require_graph=True)
         report = {
             "bridge_score": float(score.detach().mean()) if score.numel() else 0.0,
             "bridge_entropy": (
@@ -784,7 +815,13 @@ def latent_multimodal_bridge_metrics_from_views(model, views):
     count = float(max(1, len(modes)))
     return {**{key: totals[key] / count for key in keys},
             "mode_count": len(modes),
-            "modes": modes}
+            "modes": modes,
+            "memory_filled": filled,
+            "relation_updates": relation_updates,
+            "transition_updates": transition_updates,
+            "graph_ready": True,
+            "graph_source": graph_source,
+            "skipped": False}
 
 
 def latent_multimodal_memory_loss_from_views(model, views, temperature=0.1,
@@ -1127,18 +1164,37 @@ def latent_multimodal_fer_eval(model, records, vocab, view_dims, n=200,
 
 def latent_multimodal_bridge_eval(model, records, vocab, view_dims, n=200,
                                   seed=1, device=DEV):
-    if (getattr(model, "latent_concepts", None) is None
-            or getattr(model, "latent_concept_memory", None) is None):
+    bridge_graph = latent_multimodal_bridge_graph_state(model)
+    if getattr(model, "latent_concepts", None) is None or bridge_graph is None:
         return {"bridge_score": 0.0, "bridge_entropy": 0.0,
                 "bridge_connectivity": 1.0, "n_records": 0,
-                "sampled": False, "skipped": True, "modes": {}}
+                "sampled": False, "memory_filled": 0,
+                "relation_updates": 0, "transition_updates": 0,
+                "graph_ready": False, "graph_source": "current",
+                "skipped": True, "modes": {},
+                "skip_reason": "latent_concept_memory_unavailable"}
     rng = np.random.default_rng(seed)
     count = min(int(n), len(records)) if int(n) > 0 else len(records)
     sample = _sample_records(records, count, rng) if count else []
     if not sample:
         return {"bridge_score": 0.0, "bridge_entropy": 0.0,
                 "bridge_connectivity": 1.0, "n_records": 0,
-                "sampled": False, "skipped": True, "modes": {}}
+                "sampled": False, "memory_filled": 0,
+                "relation_updates": 0, "transition_updates": 0,
+                "graph_ready": False, "graph_source": "current",
+                "skipped": True, "modes": {}, "skip_reason": "no_records"}
+    filled = int(bridge_graph["memory"].shape[0])
+    relation_updates = int(bridge_graph.get("relation_updates", 0))
+    transition_updates = int(bridge_graph.get("transition_updates", 0))
+    if not latent_concept_graph_ready(graph_state=bridge_graph):
+        return {"bridge_score": 0.0, "bridge_entropy": 0.0,
+                "bridge_connectivity": 1.0, "n_records": len(sample),
+                "sampled": bool(int(n) > 0 and int(n) < len(records)),
+                "memory_filled": filled, "relation_updates": relation_updates,
+                "transition_updates": transition_updates,
+                "graph_ready": False, "graph_source": "current",
+                "skipped": True, "modes": {},
+                "skip_reason": "latent_concept_graph_unavailable"}
     keys = ("bridge_score", "bridge_entropy", "bridge_connectivity")
     totals = {key: 0.0 for key in keys}
     mode_totals = {mode: {key: 0.0 for key in keys} for mode in MODES}
@@ -1154,7 +1210,8 @@ def latent_multimodal_bridge_eval(model, records, vocab, view_dims, n=200,
                     features, txt, mode=mode, project=True)
                 for mode in MODES
             }
-            metrics = latent_multimodal_bridge_metrics_from_views(model, views)
+            metrics = latent_multimodal_bridge_metrics_from_views(
+                model, views, bridge_graph=bridge_graph)
             weight = len(batch_records)
             total += weight
             for key in keys:
@@ -1170,6 +1227,11 @@ def latent_multimodal_bridge_eval(model, records, vocab, view_dims, n=200,
     report.update({
         "n_records": total,
         "sampled": bool(int(n) > 0 and int(n) < len(records)),
+        "memory_filled": filled,
+        "relation_updates": relation_updates,
+        "transition_updates": transition_updates,
+        "graph_ready": True,
+        "graph_source": "current",
         "skipped": False,
         "modes": {
             mode: {key: vals[key] / float(total) for key in keys}
@@ -1426,6 +1488,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "latent_bridge_entropy": float(bridge_metrics["bridge_entropy"]),
             "latent_bridge_connectivity": float(
                 bridge_metrics["bridge_connectivity"]),
+            "latent_bridge_skipped": bool(bridge_metrics.get("skipped", False)),
+            "latent_bridge_graph_ready": bool(
+                bridge_metrics.get("graph_ready", False)),
             "latent_neighborhood_loss": float(latent_neighborhood.detach()),
             "latent_transition_loss": float(latent_transition.detach()),
             "latent_cluster_loss": float(latent_cluster.detach()),
@@ -1582,6 +1647,10 @@ def selftest():
             model, records, vocab, view_dims, n=4, device="cpu")
         assert fer_eval["skipped"] is False
         assert math.isfinite(fer_eval["fer_score"])
+        cold_bridge_eval = latent_multimodal_bridge_eval(
+            model, records, vocab, view_dims, n=4, device="cpu")
+        assert cold_bridge_eval["skipped"] is True
+        assert cold_bridge_eval["graph_ready"] is False
         assert update_multimodal_latent_memory(
             model, views["full"], relation_decay=0.5) > 0
         assert update_multimodal_latent_transitions(model, views, decay=0.5) > 0
@@ -1596,6 +1665,7 @@ def selftest():
         bridge_eval = latent_multimodal_bridge_eval(
             model, records, vocab, view_dims, n=4, device="cpu")
         assert bridge_eval["skipped"] is False
+        assert bridge_eval["graph_ready"] is True
         assert math.isfinite(bridge_eval["bridge_score"])
         assert torch.isfinite(latent_multimodal_neighborhood_loss_from_views(views))
         assert torch.isfinite(latent_multimodal_transition_loss_from_views(views))
@@ -1617,6 +1687,8 @@ def selftest():
         assert trained_model.train_metrics["latent_fer_w"] == 0.01
         assert math.isfinite(trained_model.train_metrics["latent_fer_score"])
         assert trained_model.train_metrics["latent_bridge_w"] == 0.01
+        assert trained_model.train_metrics["latent_bridge_graph_ready"] is True
+        assert trained_model.train_metrics["latent_bridge_skipped"] is False
         assert math.isfinite(trained_model.train_metrics["latent_bridge_score"])
     print("multimodal selftest OK")
 

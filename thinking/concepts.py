@@ -334,6 +334,53 @@ class LatentConceptMemory(nn.Module):
         return int(usable.sum().item())
 
 
+def _has_offdiag_edges(mat):
+    if mat is None or mat.numel() == 0 or mat.shape[0] <= 1:
+        return False
+    eye = torch.eye(mat.shape[0], dtype=torch.bool, device=mat.device)
+    return bool(mat.masked_fill(eye, 0.0).gt(0.0).any().item())
+
+
+def latent_concept_graph_snapshot(memory):
+    """Freeze the current self-mined concept graph for stable before/after probes."""
+    if memory is None:
+        return None
+    return {
+        "memory": memory.active().detach().clone(),
+        "relations": memory.active_relations().detach().clone(),
+        "transitions": memory.active_transitions().detach().clone(),
+        "memory_filled": int(
+            getattr(memory, "filled", torch.zeros((), dtype=torch.long)).item()),
+        "relation_updates": int(
+            getattr(memory, "relation_updates",
+                    torch.zeros((), dtype=torch.long)).item()),
+        "transition_updates": int(
+            getattr(memory, "transition_updates",
+                    torch.zeros((), dtype=torch.long)).item()),
+    }
+
+
+def latent_concept_graph_ready(memory=None, graph_state=None):
+    """Return true only when a concept graph has learned non-self edges."""
+    graph_state = graph_state if graph_state is not None else (
+        latent_concept_graph_snapshot(memory) if memory is not None else None)
+    if graph_state is None:
+        return False
+    active = graph_state.get("memory")
+    if active is None:
+        return False
+    filled = int(active.shape[0])
+    relations = graph_state.get("relations")
+    transitions = graph_state.get("transitions")
+    relation_updates = int(graph_state.get("relation_updates", 0))
+    transition_updates = int(graph_state.get("transition_updates", 0))
+    has_relation_edges = (
+        relation_updates > 0 and _has_offdiag_edges(relations))
+    has_transition_edges = (
+        transition_updates > 0 and _has_offdiag_edges(transitions))
+    return filled > 1 and (has_relation_edges or has_transition_edges)
+
+
 def latent_concept_memory_loss(slots, memory, temperature=0.1, balance_w=0.0):
     """Align latent slots to a persistent self-mined prototype memory.
 

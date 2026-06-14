@@ -65,6 +65,8 @@ from .concepts import (
     latent_concept_cluster_prototype_loss,
     latent_concept_fer_loss,
     latent_concept_fer_metrics,
+    latent_concept_graph_ready,
+    latent_concept_graph_snapshot,
     latent_concept_neighborhood_loss,
     latent_concept_slot_factorization_loss,
     latent_concept_transition_consistency_loss,
@@ -2373,19 +2375,7 @@ def reading_latent_bridge_graph_state(model):
     memory = getattr(model, "latent_concept_memory", None)
     if getattr(model, "latent_concepts", None) is None or memory is None:
         return None
-    return {
-        "memory": memory.active().detach().clone(),
-        "relations": memory.active_relations().detach().clone(),
-        "transitions": memory.active_transitions().detach().clone(),
-        "memory_filled": int(
-            getattr(memory, "filled", torch.zeros((), dtype=torch.long)).item()),
-        "relation_updates": int(
-            getattr(memory, "relation_updates",
-                    torch.zeros((), dtype=torch.long)).item()),
-        "transition_updates": int(
-            getattr(memory, "transition_updates",
-                    torch.zeros((), dtype=torch.long)).item()),
-    }
+    return latent_concept_graph_snapshot(memory)
 
 
 def reading_latent_bridge_eval(model, vocab, records, device=DEV, n=0, seed=0,
@@ -2421,17 +2411,7 @@ def reading_latent_bridge_eval(model, vocab, records, device=DEV, n=0, seed=0,
     filled = int(active_memory.shape[0])
     relation_updates = int(bridge_graph.get("relation_updates", 0))
     transition_updates = int(bridge_graph.get("transition_updates", 0))
-
-    def has_offdiag_edges(mat):
-        if mat is None or mat.numel() == 0 or mat.shape[0] <= 1:
-            return False
-        eye = torch.eye(mat.shape[0], dtype=torch.bool, device=mat.device)
-        offdiag = mat.masked_fill(eye, 0.0)
-        return bool(offdiag.gt(0.0).any().item())
-
-    has_relation_edges = relation_updates > 0 and has_offdiag_edges(relations)
-    has_transition_edges = transition_updates > 0 and has_offdiag_edges(transitions)
-    graph_ready = filled > 1 and (has_relation_edges or has_transition_edges)
+    graph_ready = latent_concept_graph_ready(graph_state=bridge_graph)
     if not graph_ready:
         return {"n_records": len(candidates), "sampled": sampled,
                 "mean_bridge_score": 0.0, "max_bridge_score": 0.0,
