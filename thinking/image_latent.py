@@ -1663,7 +1663,22 @@ class ImageFeatureAligner(nn.Module):
         pooled = z.float().mean(dim=(2, 3))
         return F.normalize(self.image(pooled), dim=-1)
 
+    def encode_image_tokens(self, z):
+        tokens, _th, _tw = patchify_latents(z.float(), patch_size=1)
+        return F.normalize(self.image(tokens), dim=-1)
+
     def encode_feature(self, features):
+        if features.ndim == 3:
+            features = pool_embedding_sequence(features)
+        return F.normalize(self.feature(features.float()), dim=-1)
+
+    def encode_feature_tokens(self, features):
+        if features.ndim == 2:
+            features = features[:, None, :]
+        if features.ndim != 3:
+            raise ValueError(
+                "expected image feature tokens as B,M,D or B,D, "
+                f"got {tuple(features.shape)}")
         return F.normalize(self.feature(features.float()), dim=-1)
 
     def forward(self, z, features):
@@ -5297,6 +5312,43 @@ def image_feature_alignment_loss(aligner, z, features, prefix="image_feature_ali
     }
 
 
+def image_feature_token_alignment_loss(aligner, z, feature_tokens,
+                                       prefix="image_feature_token_align"):
+    if aligner is None:
+        zero = z.sum() * 0.0
+        return zero, {}
+    feature_tokens = feature_tokens.to(device=z.device)
+    img_tokens = aligner.encode_image_tokens(z)
+    feat_tokens = aligner.encode_feature_tokens(feature_tokens)
+    valid = feature_tokens.float().abs().sum(dim=-1).gt(0)
+    bsz, img_n, _dim = img_tokens.shape
+    feat_n = int(feat_tokens.shape[1])
+    if int(valid.sum()) <= 0 or img_n <= 0 or feat_n <= 0:
+        zero = z.sum() * 0.0 + feature_tokens.sum() * 0.0
+        return zero, {
+            f"{prefix}_loss": zero.detach(),
+            f"{prefix}_i2f_cos": zero.detach(),
+            f"{prefix}_f2i_cos": zero.detach(),
+            f"{prefix}_n": torch.tensor(0.0, device=z.device),
+        }
+    sim = torch.bmm(img_tokens, feat_tokens.transpose(1, 2))
+    masked_sim = sim.masked_fill(~valid[:, None, :], -float("inf"))
+    i2f = masked_sim.max(dim=2).values
+    f2i = sim.max(dim=1).values.masked_fill(~valid, 0.0)
+    valid_count = valid.sum().clamp_min(1).to(f2i.dtype)
+    i2f_mean = i2f[torch.isfinite(i2f)].mean()
+    f2i_mean = f2i.sum() / valid_count
+    loss = 0.5 * ((1.0 - i2f_mean) + (1.0 - f2i_mean))
+    return loss, {
+        f"{prefix}_loss": loss.detach(),
+        f"{prefix}_i2f_cos": i2f_mean.detach(),
+        f"{prefix}_f2i_cos": f2i_mean.detach(),
+        f"{prefix}_n": torch.tensor(float(bsz), device=z.device),
+        f"{prefix}_image_tokens": torch.tensor(float(img_n), device=z.device),
+        f"{prefix}_feature_tokens": valid.float().sum(dim=1).mean().detach(),
+    }
+
+
 def pool_embedding_sequence(x):
     if x.ndim != 3:
         return x
@@ -6482,10 +6534,23 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
             raise ValueError("flow feature alignment requires image_features")
         if z_clean is None:
             z_clean = denormalize_latent(endpoint_pred, latent_stats)
+        feature_losses = []
         feature_align, feature_parts = image_feature_alignment_loss(
-            feature_aligner, z_clean, image_features, prefix="flow_image_feature_align")
+            feature_aligner, z_clean, image_features,
+            prefix="flow_image_feature_align_pooled")
+        feature_losses.append(feature_align)
+        if image_feature_tokens is not None:
+            token_feature_align, token_feature_parts = image_feature_token_alignment_loss(
+                feature_aligner, z_clean, image_feature_tokens,
+                prefix="flow_image_feature_align_token")
+            feature_losses.append(token_feature_align)
+            feature_parts.update(token_feature_parts)
+        feature_align = torch.stack(feature_losses).mean()
         total = total + float(feature_align_w) * feature_align
         parts.update(feature_parts)
+        parts["flow_image_feature_align_loss"] = feature_align.detach()
+        parts["flow_image_feature_align_components"] = torch.tensor(
+            float(len(feature_losses)), device=z1.device)
     if repa_aligner is not None and repa_w > 0.0:
         if flow_features is None or "image_tokens" not in flow_features:
             raise ValueError("flow REPA alignment requires transformer image-token features")
@@ -11636,11 +11701,28 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 if image_feature_aligner is not None and image_feature_align_w > 0.0:
                     image_features = record_image_embedding_tensor(
                         chosen_records, device=device)
+                    feature_losses = []
                     feature_loss, feature_parts = image_feature_alignment_loss(
                         image_feature_aligner, out["latent"], image_features,
-                        prefix="image_feature_align")
+                        prefix="image_feature_align_pooled")
+                    feature_losses.append(feature_loss)
+                    if has_image_embedding_sequences:
+                        image_feature_tokens = record_image_embedding_sequence_tensor(
+                            chosen_records, device=device,
+                            token_cap=image_embedding_sequence_max_len)
+                        token_feature_loss, token_feature_parts = (
+                            image_feature_token_alignment_loss(
+                                image_feature_aligner, out["latent"],
+                                image_feature_tokens,
+                                prefix="image_feature_align_token"))
+                        feature_losses.append(token_feature_loss)
+                        feature_parts.update(token_feature_parts)
+                    feature_loss = torch.stack(feature_losses).mean()
                     loss = loss + float(image_feature_align_w) * feature_loss
                     parts.update(feature_parts)
+                    parts["image_feature_align_loss"] = feature_loss.detach()
+                    parts["image_feature_align_components"] = torch.tensor(
+                        float(len(feature_losses)), device=device)
                 if image_quality_scorer is not None and image_quality_score_w > 0.0:
                     quality_loss, quality_parts = image_quality_score_loss(
                         image_quality_scorer, out["latent"], chosen_records,
@@ -11684,6 +11766,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     quality_score_steps_run = 0
     last_quality_score = {}
     flow_repa_cache_sequences = (
+        (flow_feature_align_w > 0.0 and has_image_embedding_sequences)
+        or
         flow_repa_structure_w > 0.0
         or (
             flow_repa_w > 0.0
@@ -12075,6 +12159,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                         chosen_records, device=device,
                         token_cap=image_embedding_sequence_max_len)
                     if (
+                        (flow_feature_align_w > 0.0 and has_image_embedding_sequences)
+                        or
                         active_flow_repa_structure_w > 0.0
                         or (
                             active_flow_repa_w > 0.0
@@ -13066,6 +13152,19 @@ def selftest():
             structure_aligner, torch.randn(2, 4, 6), torch.randn(2, 3, 3))
         assert torch.isfinite(structure_loss)
         assert "flow_repa_structure_loss" in structure_parts
+        feature_aligner = ImageFeatureAligner(
+            latent_ch=3, feature_dim=3, hidden=8, embed_dim=4)
+        seq_feature_loss, seq_feature_parts = image_feature_alignment_loss(
+            feature_aligner, torch.randn(2, 3, 4, 4), torch.randn(2, 3, 3),
+            prefix="seq_feature_unit")
+        assert torch.isfinite(seq_feature_loss)
+        assert "seq_feature_unit_loss" in seq_feature_parts
+        token_feature_loss, token_feature_parts = image_feature_token_alignment_loss(
+            feature_aligner, torch.randn(2, 3, 4, 4), torch.randn(2, 3, 3))
+        assert torch.isfinite(token_feature_loss)
+        assert "image_feature_token_align_loss" in token_feature_parts
+        assert token_feature_parts[
+            "image_feature_token_align_feature_tokens"].item() == 3.0
         pref_manifest = os.path.join(td, "preferences.jsonl")
         with open(pref_manifest, "w", encoding="utf-8") as f:
             f.write(json.dumps({
@@ -13096,6 +13195,7 @@ def selftest():
             flow_guidance_distill_w=0.01, flow_ema_decay=0.9,
             flow_frequency_w=0.01, flow_straightness_w=0.01,
             flow_endpoint_stats_w=0.01,
+            image_feature_align_w=0.01, flow_feature_align_w=0.01,
             flow_repa_w=0.01, flow_repa_structure_w=0.01,
             flow_repa_frac=1.0,
             flow_repa_mode="auto",
@@ -13136,6 +13236,15 @@ def selftest():
         assert math.isclose(report["flow_frequency_w"], 0.01)
         assert math.isclose(report["flow_endpoint_stats_w"], 0.01)
         assert "flow_endpoint_stats_loss" in report["last_flow"]
+        assert math.isclose(report["image_feature_align_w"], 0.01)
+        assert math.isclose(report["flow_feature_align_w"], 0.01)
+        assert report["image_feature_aligner"] is True
+        assert "image_feature_align_pooled_loss" in report["last_ae"]
+        assert "image_feature_align_token_loss" in report["last_ae"]
+        assert report["last_ae"]["image_feature_align_components"] == 2.0
+        assert "flow_image_feature_align_pooled_loss" in report["last_flow"]
+        assert "flow_image_feature_align_token_loss" in report["last_flow"]
+        assert report["last_flow"]["flow_image_feature_align_components"] == 2.0
         assert math.isclose(report["flow_repa_structure_w"], 0.01)
         assert math.isclose(report["flow_repa_frac"], 1.0)
         assert report["flow_repa_steps"] == 1
