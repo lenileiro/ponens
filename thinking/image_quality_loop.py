@@ -34,18 +34,33 @@ def _read_records(path, *, root="", split="", min_aesthetic=None, max_records=0,
 
 
 def _normalize_embedded_manifest(src_path, out_path, *, root="", split="",
+                                 embedded_manifest="", embedded_root="",
                                  min_aesthetic=None, max_records=0,
                                  max_nsfw=None, max_watermark=None):
-    records = _read_records(
+    source_records = _read_records(
         src_path, root=root, split=split, min_aesthetic=min_aesthetic,
         max_records=max_records, max_nsfw=max_nsfw, max_watermark=max_watermark)
+    source_paths = {os.path.abspath(rec.path) for rec in source_records}
+    embedded_records = _read_records(
+        embedded_manifest, root=embedded_root or root, split=split,
+        min_aesthetic=min_aesthetic,
+        max_records=0, max_nsfw=max_nsfw, max_watermark=max_watermark)
+    records = [
+        rec for rec in embedded_records
+        if os.path.abspath(rec.path) in source_paths
+    ]
     write_image_manifest(records, out_path, root="")
     return {
         "embedded_manifest": out_path,
+        "embedded_source_manifest": embedded_manifest,
+        "embedded_source_root": embedded_root or root,
         "source_manifest": src_path,
         "source_root": root,
         "source_split": split,
         "records": len(records),
+        "source_records": len(source_records),
+        "embedded_records": len(embedded_records),
+        "embedded_records_matched": len(records),
         "embedded_from_existing": True,
         "summary": summarize_records(records),
     }
@@ -80,7 +95,9 @@ def materialize_embedded_manifest(src_path, out_path, *, root="", split="",
     """Return a manifest with absolute image paths and embedding fields."""
     if embedded_manifest:
         return _normalize_embedded_manifest(
-            embedded_manifest, out_path, root=embedded_root or root, split=split,
+            src_path, out_path, root=root, split=split,
+            embedded_manifest=embedded_manifest,
+            embedded_root=embedded_root or root,
             min_aesthetic=min_aesthetic, max_records=max_records,
             max_nsfw=max_nsfw, max_watermark=max_watermark)
     return _embed_manifest(
@@ -365,6 +382,36 @@ def selftest():
         assert report["vision_read_manifest"]["splits"] == {"eval": 2, "train": 2}
         assert report["vision_read_eval"]["manifest"]["view_dims"]["vision"] == 8
         assert "sensor_only" in report["vision_read_eval"]["teacher_forced"]
+        extra_manifest = os.path.join(td, "extra_embedded.jsonl")
+        _write_jsonl(extra_manifest, [
+            {
+                "image": os.path.join(real_dir, "red.ppm"),
+                "caption": "red square",
+                "split": "train",
+                "image_embedding": [1.0, 0.0],
+                "text_embedding": [1.0, 0.0],
+            },
+            {
+                "image": os.path.join(real_dir, "blue.ppm"),
+                "caption": "blue square",
+                "split": "train",
+                "image_embedding": [0.0, 1.0],
+                "text_embedding": [0.0, 1.0],
+            },
+            {
+                "image": os.path.join(real_dir, "extra.ppm"),
+                "caption": "extra square",
+                "split": "train",
+                "image_embedding": [0.5, 0.5],
+                "text_embedding": [0.5, 0.5],
+            },
+        ])
+        filtered = materialize_embedded_manifest(
+            real_manifest, os.path.join(td, "filtered_embedded.jsonl"),
+            root=real_dir, split="train", embedded_manifest=extra_manifest)
+        assert filtered["source_records"] == 2
+        assert filtered["embedded_records"] == 3
+        assert filtered["embedded_records_matched"] == 2
     print("image_quality_loop selftest OK")
 
 

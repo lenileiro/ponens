@@ -179,8 +179,9 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --image-quality-preset web-hf-vae
 RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --image-quality-preset web-hf-vae-hq
-# The preset also writes a generated sample manifest, embeds it, and runs image_eval; add
-# --image-generated-eval-fail-on-gate plus threshold flags to make quality gates hard. It also
+# The preset also writes a generated sample manifest, embeds it, runs image_eval, and runs
+# image_quality_loop for generic vision-read caption recovery; add --image-generated-eval-fail-on-gate
+# or --image-quality-loop-fail-on-gate plus threshold flags to make quality gates hard. It also
 # runs image_score before embedding/cleaning so quality_score metadata reaches sampling,
 # duplicate selection, quality-head training, quality-guided prompt sampling, and direct
 # chosen/rejected latent-flow preference updates. The `web-hf-vae` preset is the broad

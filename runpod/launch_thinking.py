@@ -640,6 +640,18 @@ def apply_image_quality_preset(args):
             args.image_flow_preference_loss = "dpo"
         args.image_flow_preference_batch = max(int(args.image_flow_preference_batch), 1)
     args.image_eval_generated = True
+    args.image_quality_loop_generated = True
+    args.image_quality_loop_reuse_real_embeddings = True
+    args.image_quality_loop_vision_read_steps = max(
+        int(args.image_quality_loop_vision_read_steps), 400 if hq else 100)
+    args.image_quality_loop_vision_read_dim = max(
+        int(args.image_quality_loop_vision_read_dim), 128 if hq else 96)
+    args.image_quality_loop_vision_read_layers = max(
+        int(args.image_quality_loop_vision_read_layers), 2)
+    args.image_quality_loop_vision_read_heads = max(
+        int(args.image_quality_loop_vision_read_heads), 4)
+    args.image_quality_loop_vision_read_eval_n = max(
+        int(args.image_quality_loop_vision_read_eval_n), 64 if hq else 32)
     args.image_prompt_embed_backend = args.image_embed_backend
     args.image_prompt_embed_model = args.image_embed_model
     if not args.image_prompt_embed_text_sequence_model:
@@ -1227,7 +1239,9 @@ def payload(args):
             if args.image_eval_generated:
                 IEVAL = mod("thinking.image_eval")
                 IGEN_EMBED = mod("thinking.image_embed")
+                IQLOOP = mod("thinking.image_quality_loop")
                 generated_manifest = args.image_sample_manifest_out
+                generated_root = os.path.dirname(generated_manifest) or "."
                 generated_embed_out = (
                     args.image_generated_embed_out
                     or path_with_suffix(generated_manifest, "_embeddings.jsonl")
@@ -1239,6 +1253,14 @@ def payload(args):
                 generated_eval_report = (
                     args.image_generated_eval_report_out
                     or path_with_suffix(generated_manifest, "_eval_report.json")
+                )
+                generated_quality_loop_report = (
+                    args.image_quality_loop_report_out
+                    or path_with_suffix(generated_manifest, "_quality_loop_report.json")
+                )
+                generated_quality_loop_work_dir = (
+                    args.image_quality_loop_work_dir
+                    or path_with_suffix(generated_manifest, "_quality_loop")
                 )
                 generated_candidates_manifest = args.image_sample_candidates_manifest_out
                 generated_candidates_score_out = (
@@ -1271,7 +1293,8 @@ def payload(args):
                 generated_embed = (
                     f" && {IGEN_EMBED} --manifest {shlex_quote(generated_manifest)} "
                     f"--backend {args.image_embed_backend} "
-                    f"--features both --text-embed-mode pooled "
+                    f"--features both --text-embed-mode {args.image_embed_text_mode} "
+                    f"--image-embed-mode {args.image_embed_image_mode} "
                     f"--batch {args.image_embed_batch} "
                     f"--device {args.image_embed_device} "
                     f"--dtype {args.image_embed_dtype} "
@@ -1281,6 +1304,14 @@ def payload(args):
                 )
                 if args.image_embed_model:
                     generated_embed += f" --model {shlex_quote(args.image_embed_model)}"
+                if args.image_embed_text_sequence_model:
+                    generated_embed += (
+                        f" --text-sequence-model "
+                        f"{shlex_quote(args.image_embed_text_sequence_model)}")
+                if args.image_embed_text_sequence_max_length:
+                    generated_embed += (
+                        f" --text-sequence-max-length "
+                        f"{args.image_embed_text_sequence_max_length}")
                 if args.image_embed_no_normalize:
                     generated_embed += " --no-normalize"
                 if args.image_embed_trust_remote_code:
@@ -1311,6 +1342,103 @@ def payload(args):
                 if args.image_generated_eval_fail_on_gate:
                     generated_eval += " --fail-on-gate"
                 train += generated_embed + generated_eval
+                if args.image_quality_loop_generated:
+                    real_embedded_manifest = (
+                        args.image_quality_loop_real_embedded_manifest)
+                    if (not real_embedded_manifest
+                            and args.image_quality_loop_reuse_real_embeddings
+                            and args.image_embed
+                            and not args.image_eval_generated_real_manifest):
+                        real_embedded_manifest = args.image_embed_out
+                    quality_loop = (
+                        f" && {IQLOOP} "
+                        f"--real-manifest {shlex_quote(real_eval_manifest)} "
+                        f"--generated-manifest {shlex_quote(generated_manifest)} "
+                        f"--real-root {shlex_quote(args.image_root)} "
+                        f"--generated-root {shlex_quote(generated_root)} "
+                        f"--real-split "
+                        f"{shlex_quote(args.image_quality_loop_real_split)} "
+                        f"--generated-split "
+                        f"{shlex_quote(args.image_quality_loop_generated_split)} "
+                        f"--generated-embedded-manifest "
+                        f"{shlex_quote(generated_embed_out)} "
+                        f"--generated-embedded-root {shlex_quote(generated_root)} "
+                        f"--embedding-backend {args.image_embed_backend} "
+                        f"--embedding-device {shlex_quote(args.image_embed_device)} "
+                        f"--embedding-dtype {args.image_embed_dtype} "
+                        f"--embedding-features {args.image_embed_features} "
+                        f"--text-embed-mode {args.image_embed_text_mode} "
+                        f"--image-embed-mode {args.image_embed_image_mode} "
+                        f"--embedding-batch {args.image_embed_batch} "
+                        f"--eval-max-records {args.image_generated_eval_max_records} "
+                        f"--min-score {args.image_generated_eval_min_score} "
+                        f"--min-support-precision "
+                        f"{args.image_generated_eval_min_support_precision} "
+                        f"--min-support-recall "
+                        f"{args.image_generated_eval_min_support_recall} "
+                        f"--vision-read-steps "
+                        f"{args.image_quality_loop_vision_read_steps} "
+                        f"--vision-read-device "
+                        f"{shlex_quote(args.image_quality_loop_vision_read_device or args.image_embed_device)} "
+                        f"--vision-read-batch "
+                        f"{args.image_quality_loop_vision_read_batch} "
+                        f"--vision-read-dim "
+                        f"{args.image_quality_loop_vision_read_dim} "
+                        f"--vision-read-layers "
+                        f"{args.image_quality_loop_vision_read_layers} "
+                        f"--vision-read-heads "
+                        f"{args.image_quality_loop_vision_read_heads} "
+                        f"--vision-read-max-len "
+                        f"{args.image_quality_loop_vision_read_max_len} "
+                        f"--vision-read-eval-n "
+                        f"{args.image_quality_loop_vision_read_eval_n} "
+                        f"--vision-read-min-sensor-token-acc "
+                        f"{args.image_quality_loop_min_sensor_token_acc} "
+                        f"--vision-read-min-full-token-acc "
+                        f"{args.image_quality_loop_min_full_token_acc} "
+                        f"--work-dir "
+                        f"{shlex_quote(generated_quality_loop_work_dir)} "
+                        f"--report-out {shlex_quote(generated_quality_loop_report)}"
+                    )
+                    if args.image_embed_model:
+                        quality_loop += (
+                            f" --embedding-model {shlex_quote(args.image_embed_model)}")
+                    if args.image_embed_text_sequence_model:
+                        quality_loop += (
+                            f" --text-sequence-model "
+                            f"{shlex_quote(args.image_embed_text_sequence_model)}")
+                    if args.image_embed_text_sequence_max_length:
+                        quality_loop += (
+                            f" --text-sequence-max-length "
+                            f"{args.image_embed_text_sequence_max_length}")
+                    if real_embedded_manifest:
+                        quality_loop += (
+                            f" --real-embedded-manifest "
+                            f"{shlex_quote(real_embedded_manifest)} "
+                            f"--real-embedded-root {shlex_quote(args.image_root)}")
+                    if args.image_embed_no_normalize:
+                        quality_loop += " --no-normalize"
+                    if args.image_embed_trust_remote_code:
+                        quality_loop += " --trust-remote-code"
+                    if args.image_generated_eval_min_image_text_cos is not None:
+                        quality_loop += (
+                            f" --min-image-text-cos "
+                            f"{args.image_generated_eval_min_image_text_cos}")
+                    if args.image_generated_eval_max_frechet is not None:
+                        quality_loop += (
+                            f" --max-frechet "
+                            f"{args.image_generated_eval_max_frechet}")
+                    if args.image_generated_eval_max_mmd_rbf is not None:
+                        quality_loop += (
+                            f" --max-mmd-rbf "
+                            f"{args.image_generated_eval_max_mmd_rbf}")
+                    if args.image_quality_loop_max_sensor_loss is not None:
+                        quality_loop += (
+                            f" --vision-read-max-sensor-loss "
+                            f"{args.image_quality_loop_max_sensor_loss}")
+                    if args.image_quality_loop_fail_on_gate:
+                        quality_loop += " --fail-on-gate"
+                    train += quality_loop
                 if generated_candidates_manifest:
                     IGEN_SCORE = mod("thinking.image_score")
                     IPREF = mod("thinking.image_preferences")
@@ -2682,6 +2810,65 @@ def main():
                     dest="image_generated_eval_report_out",
                     help=("optional image_eval report for generated sample manifest; "
                           "default derives from --image-sample-manifest-out"))
+    ap.add_argument("--image-quality-loop-generated", action="store_true",
+                    dest="image_quality_loop_generated",
+                    help=("after generated-sample image_eval, run closed-loop "
+                          "embedding and vision-read validation"))
+    ap.add_argument("--image-quality-loop-work-dir", default="",
+                    dest="image_quality_loop_work_dir",
+                    help=("optional work directory for generated-sample "
+                          "image_quality_loop artifacts"))
+    ap.add_argument("--image-quality-loop-report-out", default="",
+                    dest="image_quality_loop_report_out",
+                    help=("optional image_quality_loop report for generated samples; "
+                          "default derives from --image-sample-manifest-out"))
+    ap.add_argument("--image-quality-loop-real-split", default="train",
+                    dest="image_quality_loop_real_split",
+                    help="reference split used by generated-sample image_quality_loop")
+    ap.add_argument("--image-quality-loop-generated-split", default="generated",
+                    dest="image_quality_loop_generated_split",
+                    help="generated split used by generated-sample image_quality_loop")
+    ap.add_argument("--image-quality-loop-real-embedded-manifest", default="",
+                    dest="image_quality_loop_real_embedded_manifest",
+                    help=("optional pre-embedded reference sidecar for generated-sample "
+                          "image_quality_loop"))
+    ap.add_argument("--image-quality-loop-reuse-real-embeddings", action="store_true",
+                    dest="image_quality_loop_reuse_real_embeddings",
+                    help=("reuse --image-embed-out as the reference embedding sidecar "
+                          "when the preset already embedded the cleaned manifest"))
+    ap.add_argument("--image-quality-loop-vision-read-steps", type=int, default=0,
+                    dest="image_quality_loop_vision_read_steps",
+                    help="generic vision-read training steps inside image_quality_loop")
+    ap.add_argument("--image-quality-loop-vision-read-device", default="",
+                    dest="image_quality_loop_vision_read_device",
+                    help=("device for image_quality_loop vision-read; default uses "
+                          "--image-embed-device"))
+    ap.add_argument("--image-quality-loop-vision-read-batch", type=int, default=8,
+                    dest="image_quality_loop_vision_read_batch")
+    ap.add_argument("--image-quality-loop-vision-read-dim", type=int, default=96,
+                    dest="image_quality_loop_vision_read_dim")
+    ap.add_argument("--image-quality-loop-vision-read-layers", type=int, default=2,
+                    dest="image_quality_loop_vision_read_layers")
+    ap.add_argument("--image-quality-loop-vision-read-heads", type=int, default=4,
+                    dest="image_quality_loop_vision_read_heads")
+    ap.add_argument("--image-quality-loop-vision-read-max-len", type=int, default=128,
+                    dest="image_quality_loop_vision_read_max_len")
+    ap.add_argument("--image-quality-loop-vision-read-eval-n", type=int, default=64,
+                    dest="image_quality_loop_vision_read_eval_n")
+    ap.add_argument("--image-quality-loop-min-sensor-token-acc", type=float,
+                    default=0.0, dest="image_quality_loop_min_sensor_token_acc",
+                    help=("minimum caption-token accuracy recoverable from vision-only "
+                          "features in generated-sample image_quality_loop"))
+    ap.add_argument("--image-quality-loop-min-full-token-acc", type=float,
+                    default=0.0, dest="image_quality_loop_min_full_token_acc",
+                    help=("minimum caption-token accuracy recoverable from full multimodal "
+                          "features in generated-sample image_quality_loop"))
+    ap.add_argument("--image-quality-loop-max-sensor-loss", type=float, default=None,
+                    dest="image_quality_loop_max_sensor_loss",
+                    help="maximum vision-only caption recovery loss for image_quality_loop")
+    ap.add_argument("--image-quality-loop-fail-on-gate", action="store_true",
+                    dest="image_quality_loop_fail_on_gate",
+                    help="fail the RunPod job if image_quality_loop gates fail")
     ap.add_argument("--image-generated-candidates-score-out", default="",
                     dest="image_generated_candidates_score_out",
                     help=("optional scored manifest for generated prompt candidates; "
@@ -3259,6 +3446,8 @@ def main():
                     help="drop full-mode modality prefixes during M-0 training")
     ap.add_argument("--multimodal-eval-n", type=int, default=200, dest="multimodal_eval_n")
     ap.add_argument("--max-minutes", type=int, default=150)
+    ap.add_argument("--print-payload", action="store_true",
+                    help="print the pod-side command assembled for this launch")
     ap.add_argument("--go", action="store_true", help="actually create the pod (spends money)")
     args = ap.parse_args()
     if args.reading_data and not args.text_reading:
@@ -3830,6 +4019,11 @@ def main():
         sys.exit(
             "ERROR: --image-eval-generated requires --image-eval-generated-real-manifest, "
             "--image-manifest, or --image-fetch")
+    if args.image_quality_loop_generated and not args.image_eval_generated:
+        sys.exit("ERROR: --image-quality-loop-generated requires --image-eval-generated")
+    if args.image_quality_loop_generated and not args.image_sample_manifest_out:
+        sys.exit(
+            "ERROR: --image-quality-loop-generated requires --image-sample-manifest-out")
     if args.image_generated_eval_max_records < 0:
         sys.exit("ERROR: --image-generated-eval-max-records must be non-negative")
     if args.image_generated_eval_min_score < 0.0:
@@ -3850,6 +4044,50 @@ def main():
     if (args.image_generated_eval_max_mmd_rbf is not None
             and args.image_generated_eval_max_mmd_rbf < 0.0):
         sys.exit("ERROR: --image-generated-eval-max-mmd-rbf must be non-negative")
+    if args.image_quality_loop_vision_read_steps < 0:
+        sys.exit("ERROR: --image-quality-loop-vision-read-steps must be non-negative")
+    quality_loop_positive = {
+        "--image-quality-loop-vision-read-batch": (
+            args.image_quality_loop_vision_read_batch),
+        "--image-quality-loop-vision-read-dim": (
+            args.image_quality_loop_vision_read_dim),
+        "--image-quality-loop-vision-read-layers": (
+            args.image_quality_loop_vision_read_layers),
+        "--image-quality-loop-vision-read-heads": (
+            args.image_quality_loop_vision_read_heads),
+        "--image-quality-loop-vision-read-max-len": (
+            args.image_quality_loop_vision_read_max_len),
+        "--image-quality-loop-vision-read-eval-n": (
+            args.image_quality_loop_vision_read_eval_n),
+    }
+    bad_quality_loop_positive = [
+        name for name, value in quality_loop_positive.items() if value <= 0
+    ]
+    if bad_quality_loop_positive:
+        sys.exit(
+            "ERROR: image_quality_loop vision-read controls must be positive: "
+            + ", ".join(bad_quality_loop_positive))
+    if (args.image_quality_loop_vision_read_dim
+            % args.image_quality_loop_vision_read_heads) != 0:
+        sys.exit(
+            "ERROR: --image-quality-loop-vision-read-dim must divide "
+            "--image-quality-loop-vision-read-heads")
+    if ((args.image_quality_loop_vision_read_dim
+            // args.image_quality_loop_vision_read_heads) % 2) != 0:
+        sys.exit(
+            "ERROR: image_quality_loop vision-read head dimension must be even")
+    quality_loop_accs = {
+        "--image-quality-loop-min-sensor-token-acc": (
+            args.image_quality_loop_min_sensor_token_acc),
+        "--image-quality-loop-min-full-token-acc": (
+            args.image_quality_loop_min_full_token_acc),
+    }
+    for name, value in quality_loop_accs.items():
+        if value < 0.0 or value > 1.0:
+            sys.exit(f"ERROR: {name} must be in [0, 1]")
+    if (args.image_quality_loop_max_sensor_loss is not None
+            and args.image_quality_loop_max_sensor_loss < 0.0):
+        sys.exit("ERROR: --image-quality-loop-max-sensor-loss must be non-negative")
     if args.image_generated_preference_min_score_gap < 0.0:
         sys.exit("ERROR: --image-generated-preference-min-score-gap must be non-negative")
     if args.image_generated_preference_max_pairs_per_group < 0:
@@ -4333,7 +4571,7 @@ def main():
     except ValueError as exc:
         sys.exit(f"ERROR: {exc}")
     image_embed_deps = bool(
-        (args.image_embed or args.image_eval_generated)
+        (args.image_embed or args.image_eval_generated or args.image_quality_loop_generated)
         and args.image_embed_backend == "hf")
     image_score_deps = bool(args.image_score and (
         args.image_score_backend == "pickscore"
@@ -4416,6 +4654,9 @@ def main():
             print(f"  {local} -> pod:{local_path_remote_destination(local)}")
     print(f"fetch     : thinking.log + runs/ (models, config, results) -> {HERE}/")
     print(f"guard     : pod-side timeout {cap}s + always-terminate; SSH-wait cap {args.max_minutes}m")
+    if args.print_payload:
+        print("\n=== POD PAYLOAD ===")
+        print(remote_cmd)
     if not args.go:
         print("\n[dry-run] nothing created. Re-run with --go to launch (spends money).")
         return
