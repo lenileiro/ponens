@@ -31,6 +31,7 @@ import os
 import tempfile
 from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -5280,12 +5281,43 @@ def flow_hidden_feature_token_alignment_loss(aligner, hidden_tokens, feature_tok
     }
 
 
+def _square_token_side(n):
+    n = int(n)
+    if n <= 0:
+        return 0
+    side = math.isqrt(n)
+    return side if side * side == n else 0
+
+
+def image_embedding_sequence_target_len(length, cap=0):
+    length = int(length)
+    cap = int(cap or 0)
+    if length <= 0:
+        return 0
+    if cap <= 0 or length <= cap:
+        return length
+    source_side = _square_token_side(length)
+    if source_side:
+        target_side = max(1, math.isqrt(cap))
+        return min(length, target_side * target_side)
+    return cap
+
+
 def _resize_token_sequence(tokens, target_len):
     target_len = int(target_len)
     if int(tokens.shape[0]) == target_len:
         return tokens
     if target_len <= 0:
         raise ValueError("target token length must be positive")
+    source_side = _square_token_side(tokens.shape[0])
+    target_side = _square_token_side(target_len)
+    if source_side and target_side:
+        grid = tokens.reshape(source_side, source_side, tokens.shape[-1])
+        grid = grid.permute(2, 0, 1).unsqueeze(0)
+        resized = F.interpolate(
+            grid, size=(target_side, target_side), mode="bilinear",
+            align_corners=False)
+        return resized.squeeze(0).permute(1, 2, 0).reshape(target_len, tokens.shape[-1])
     return F.interpolate(
         tokens.t()[None], size=target_len, mode="linear", align_corners=False
     )[0].t()
@@ -6567,14 +6599,10 @@ def records_have_image_embedding_sequences(records):
 
 
 def image_embedding_sequence_max_len(records, cap=0):
-    length = max(
-        (len(rec.image_embedding_sequence)
+    return max(
+        (image_embedding_sequence_target_len(len(rec.image_embedding_sequence), cap)
          for rec in records if rec.image_embedding_sequence is not None),
         default=0)
-    cap = int(cap or 0)
-    if cap > 0 and length > cap:
-        return cap
-    return length
 
 
 def resolve_caption_cond_source(source, records):
@@ -6671,8 +6699,9 @@ def record_image_embedding_sequence_tensor(records, device=DEV, max_len=0, token
     for rec in records:
         if rec.image_embedding_sequence is not None:
             row = torch.tensor(rec.image_embedding_sequence, dtype=torch.float32, device=device)
-            if token_cap > 0 and int(row.shape[0]) > token_cap:
-                row = _resize_token_sequence(row, token_cap)
+            target_len = image_embedding_sequence_target_len(int(row.shape[0]), token_cap)
+            if target_len > 0 and int(row.shape[0]) != target_len:
+                row = _resize_token_sequence(row, target_len)
         elif rec.image_embedding is not None:
             row = torch.tensor([rec.image_embedding], dtype=torch.float32, device=device)
         else:
@@ -11887,6 +11916,20 @@ def selftest():
             manifest_records[:2], device="cpu", token_cap=2)
         assert tuple(capped_image_tokens.shape) == (2, 2, 3)
         assert image_embedding_sequence_max_len(manifest_records, cap=2) == 2
+        assert image_embedding_sequence_target_len(3, cap=2) == 2
+        assert image_embedding_sequence_target_len(16, cap=10) == 9
+        grid_tokens = torch.arange(16 * 2, dtype=torch.float32).reshape(16, 2)
+        grid_tokens_down = _resize_token_sequence(grid_tokens, 9)
+        assert tuple(grid_tokens_down.shape) == (9, 2)
+        grid_records = [replace(
+            manifest_records[0],
+            image_embedding=[0.0, 1.0],
+            image_embedding_sequence=grid_tokens.tolist(),
+        )]
+        capped_grid_tokens = record_image_embedding_sequence_tensor(
+            grid_records, device="cpu", token_cap=10)
+        assert tuple(capped_grid_tokens.shape) == (1, 9, 2)
+        assert image_embedding_sequence_max_len(grid_records, cap=10) == 9
         candidate_settings = prompt_candidate_sampler_settings(
             3, seed=11, cfg_scale=1.0, cfg_rescale=0.0,
             cfg_scales=(1.0, 2.0), cfg_rescales=(0.0, 0.5),
