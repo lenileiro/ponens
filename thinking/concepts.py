@@ -307,6 +307,46 @@ def latent_concept_vicreg_loss(slots_a, slots_b, invariance_weight=25.0,
             + float(covariance_weight) * cov)
 
 
+def latent_concept_neighborhood_loss(anchor_slots, positive_slots,
+                                     temperature=0.1, margin=0.0):
+    """Align self-mined latent concept neighbors while using the batch as negatives.
+
+    The caller decides how neighbors were mined. This loss only sees two batches
+    of schema-free latent slots: each row in `positive_slots` is treated as the
+    discovered neighbor of the corresponding row in `anchor_slots`. No labels,
+    task ids, or language-specific rules are required.
+    """
+    if anchor_slots is None or positive_slots is None:
+        if anchor_slots is not None:
+            return anchor_slots.sum() * 0.0
+        if positive_slots is not None:
+            return positive_slots.sum() * 0.0
+        return torch.tensor(0.0)
+    if anchor_slots.shape != positive_slots.shape:
+        raise ValueError("latent concept neighbors must have matching shapes")
+    anchor = F.normalize(anchor_slots.reshape(anchor_slots.shape[0], -1), dim=-1)
+    positive = F.normalize(positive_slots.reshape(positive_slots.shape[0], -1), dim=-1)
+    pos_sim = (anchor * positive).sum(-1)
+    losses = [(1.0 - pos_sim).mean()]
+    if anchor.shape[0] > 1:
+        temp = max(float(temperature), 1e-6)
+        logits = anchor.matmul(positive.t()) / temp
+        labels = torch.arange(logits.shape[0], device=logits.device)
+        losses.append(0.5 * (
+            F.cross_entropy(logits, labels)
+            + F.cross_entropy(logits.t(), labels)))
+        margin_t = float(margin)
+        if margin_t:
+            eye = torch.eye(logits.shape[0], dtype=torch.bool, device=logits.device)
+            sim = anchor.matmul(positive.t())
+            hardest_other = sim.masked_fill(eye, -float("inf")).max(-1).values
+            hardest_other_t = sim.t().masked_fill(eye, -float("inf")).max(-1).values
+            losses.append(0.5 * (
+                F.relu(hardest_other + margin_t - pos_sim).mean()
+                + F.relu(hardest_other_t + margin_t - pos_sim).mean()))
+    return torch.stack(losses).mean()
+
+
 def schema_concept_contrastive_loss(states_by_key, target_ids_by_key, temperature=0.1):
     """Cluster same-value concept states and separate other values for the same key.
 

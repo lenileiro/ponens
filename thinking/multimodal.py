@@ -36,6 +36,7 @@ from .concepts import (
     LatentConceptHead,
     SchemaConceptHead,
     SchemaConceptRefiner,
+    latent_concept_neighborhood_loss,
     latent_concept_vicreg_loss,
     schema_concept_batch_centroid_loss,
     schema_concept_contrastive_loss,
@@ -1360,6 +1361,27 @@ def latent_multimodal_concept_loss_from_views(views, invariance_w=25.0,
     return torch.stack(losses).mean()
 
 
+def latent_multimodal_neighborhood_loss_from_views(views, temperature=0.1,
+                                                   margin=0.0):
+    views = {mode: slots for mode, slots in views.items() if slots is not None}
+    if not views:
+        return torch.tensor(0.0)
+    anchor = views.get("full", next(iter(views.values())))
+    if anchor.shape[0] <= 1:
+        return anchor.sum() * 0.0
+    with torch.no_grad():
+        z = F.normalize(anchor.detach().reshape(anchor.shape[0], -1), dim=-1)
+        sim = z.matmul(z.t())
+        eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+        nearest = sim.masked_fill(eye, -float("inf")).argmax(-1)
+    losses = []
+    for slots in views.values():
+        positive = slots.index_select(0, nearest)
+        losses.append(latent_concept_neighborhood_loss(
+            anchor, positive, temperature=temperature, margin=margin))
+    return torch.stack(losses).mean() if losses else anchor.sum() * 0.0
+
+
 def latent_multimodal_concept_loss(model, img, aud, txt, view_dropout=0.1,
                                    invariance_w=25.0, variance_w=25.0,
                                    covariance_w=1.0, variance_target=1.0):
@@ -1522,6 +1544,9 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           latent_concept_w=0.0, latent_concept_view_dropout=0.1,
           latent_concept_invariance_w=25.0, latent_concept_variance_w=25.0,
           latent_concept_covariance_w=1.0, latent_concept_variance_target=1.0,
+          latent_concept_neighborhood_w=0.0,
+          latent_concept_neighborhood_temperature=0.1,
+          latent_concept_neighborhood_margin=0.0,
           latent_concept_factor_w=0.0,
           study_strategy="random", study_score_metric="latent",
           study_probe_n=0, study_hard_max=0, study_refresh_steps=0,
@@ -1542,11 +1567,17 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         if ckpt_latents.get("latent_concept_slots", 0) > 0:
             latent_concept_slots = ckpt_latents["latent_concept_slots"]
             latent_concept_layers = ckpt_latents["latent_concept_layers"]
-    if latent_concept_w < 0.0 or latent_concept_factor_w < 0.0:
+    if (latent_concept_w < 0.0 or latent_concept_factor_w < 0.0
+            or latent_concept_neighborhood_w < 0.0):
         raise ValueError("latent concept loss weights must be non-negative")
-    if ((latent_concept_w > 0.0 or latent_concept_factor_w > 0.0)
+    if ((latent_concept_w > 0.0 or latent_concept_factor_w > 0.0
+         or latent_concept_neighborhood_w > 0.0)
             and latent_concept_slots <= 0):
         raise ValueError("latent concept losses require latent_concept_slots > 0")
+    if latent_concept_neighborhood_temperature <= 0.0:
+        raise ValueError("latent concept neighborhood temperature must be positive")
+    if latent_concept_neighborhood_margin < 0.0:
+        raise ValueError("latent concept neighborhood margin must be non-negative")
     study_strategy = str(study_strategy)
     study_score_metric = str(study_score_metric)
     if study_strategy not in ("random", "errors"):
@@ -1616,6 +1647,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     last_concept_prototype = last_concept_prototype_spread = 0.0
     last_concept_state_spread = 0.0
     last_latent_concept = 0.0
+    last_latent_neighborhood = 0.0
     last_latent_factor = 0.0
     for st in range(1, steps + 1):
         model.train()
@@ -1637,7 +1669,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         needs_geometry_batch = (
             concept_contrast_w or concept_centroid_w or concept_prototype_w
             or concept_state_spread_w)
-        needs_latent_batch = bool(latent_concept_w)
+        needs_latent_batch = bool(latent_concept_w or latent_concept_neighborhood_w)
         needs_latent_factor_batch = bool(latent_concept_factor_w)
         bundles_by_mode = {
             mode: model.mode_bundle(
@@ -1727,6 +1759,13 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                 covariance_w=latent_concept_covariance_w,
                 variance_target=latent_concept_variance_target)
             if latent_concept_w else base_loss * 0.0)
+        latent_neighborhood = (
+            latent_multimodal_neighborhood_loss_from_views(
+                {mode: bundle["latent_concepts"]
+                 for mode, bundle in bundles_by_mode.items()},
+                temperature=latent_concept_neighborhood_temperature,
+                margin=latent_concept_neighborhood_margin)
+            if latent_concept_neighborhood_w else base_loss * 0.0)
         latent_factor = (
             latent_factor_loss(
                 {mode: bundle["latent_factor_logits"]
@@ -1749,6 +1788,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                 + float(concept_prototype_spread_w) * concept_prototype_spread
                 + float(concept_state_spread_w) * concept_state_spread
                 + float(latent_concept_w) * latent_concept
+                + float(latent_concept_neighborhood_w) * latent_neighborhood
                 + float(latent_concept_factor_w) * latent_factor)
         opt.zero_grad()
         loss.backward()
@@ -1766,6 +1806,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         last_concept_prototype_spread = float(concept_prototype_spread.detach())
         last_concept_state_spread = float(concept_state_spread.detach())
         last_latent_concept = float(latent_concept.detach())
+        last_latent_neighborhood = float(latent_neighborhood.detach())
         last_latent_factor = float(latent_factor.detach())
         if st % log_every == 0 or st == steps:
             print(f"  m0 {st}/{steps} loss {loss.item():.3f} "
@@ -1781,6 +1822,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                   f"concept-proto-spread {last_concept_prototype_spread:.3f} "
                   f"concept-state-spread {last_concept_state_spread:.3f} "
                   f"latent {last_latent_concept:.3f} "
+                  f"latent-neighborhood {last_latent_neighborhood:.3f} "
                   f"latent-factor {last_latent_factor:.3f}",
                   flush=True)
     model.train_metrics = {"token_loss": last_base, "agreement_loss": last_agreement,
@@ -1796,6 +1838,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                                last_concept_prototype_spread),
                            "concept_state_spread_loss": last_concept_state_spread,
                            "latent_concept_loss": last_latent_concept,
+                           "latent_neighborhood_loss": last_latent_neighborhood,
                            "latent_factor_loss": last_latent_factor}
     model.study_reports = study_reports
     return model, vocab, surfaces
@@ -1831,6 +1874,9 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         latent_concept_w=0.0, latent_concept_view_dropout=0.1,
         latent_concept_invariance_w=25.0, latent_concept_variance_w=25.0,
         latent_concept_covariance_w=1.0, latent_concept_variance_target=1.0,
+        latent_concept_neighborhood_w=0.0,
+        latent_concept_neighborhood_temperature=0.1,
+        latent_concept_neighborhood_margin=0.0,
         latent_concept_factor_w=0.0,
         study_strategy="random", study_score_metric="latent",
         study_probe_n=0, study_hard_max=0, study_refresh_steps=0,
@@ -1879,6 +1925,12 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                        latent_concept_covariance_w),
                                    latent_concept_variance_target=(
                                        latent_concept_variance_target),
+                                   latent_concept_neighborhood_w=(
+                                       latent_concept_neighborhood_w),
+                                   latent_concept_neighborhood_temperature=(
+                                       latent_concept_neighborhood_temperature),
+                                   latent_concept_neighborhood_margin=(
+                                       latent_concept_neighborhood_margin),
                                    latent_concept_factor_w=latent_concept_factor_w,
                                    study_strategy=study_strategy,
                                    study_score_metric=study_score_metric,
@@ -1982,6 +2034,11 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
               "latent_concept_variance_w": float(latent_concept_variance_w),
               "latent_concept_covariance_w": float(latent_concept_covariance_w),
               "latent_concept_variance_target": float(latent_concept_variance_target),
+              "latent_concept_neighborhood_w": float(latent_concept_neighborhood_w),
+              "latent_concept_neighborhood_temperature": float(
+                  latent_concept_neighborhood_temperature),
+              "latent_concept_neighborhood_margin": float(
+                  latent_concept_neighborhood_margin),
               "latent_concept_factor_w": float(latent_concept_factor_w),
               "study_strategy": study_strategy,
               "study_score_metric": study_score_metric,
@@ -2153,6 +2210,13 @@ def selftest():
     assert latent_bundle["latent_concepts"].shape == (2, 3, 32)
     assert torch.isfinite(latent_multimodal_concept_loss(
         latent_model, x, a, tt, view_dropout=0.1))
+    latent_views = {
+        mode: latent_model.latent_concept_states(
+            x, a, tt, mode=mode, project=True)
+        for mode in MODES
+    }
+    assert torch.isfinite(latent_multimodal_neighborhood_loss_from_views(
+        latent_views, temperature=0.2))
     latent_prefix_model = MultimodalLM(
         len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
         latent_concept_slots=3, latent_concept_prefix=True,
@@ -2217,9 +2281,11 @@ def selftest():
         assert ckpt_latents["latent_concept_slots"] == 3
         auto_model, _auto_vocab, _auto_surfaces = train(
             steps=1, batch=2, d=32, layers=1, heads=4, seed=9, device="cpu",
-            log_every=1, text_checkpoint=text_ckpt)
+            log_every=1, text_checkpoint=text_ckpt,
+            latent_concept_neighborhood_w=0.1)
         assert auto_model.latent_concept_slots == 3
         assert auto_model.text_checkpoint_transfer["copied"] is True
+        assert auto_model.train_metrics["latent_neighborhood_loss"] >= 0.0
     latent_errors, latent_correct, latent_report = multimodal_factor_record_outcomes(
         latent_prefix_model, vocab, surfaces, n=4, seed=7, device="cpu",
         metric="latent")
@@ -2362,6 +2428,16 @@ def main(argv=None):
     ap.add_argument("--latent-concept-variance-target", type=float, default=1.0,
                     dest="latent_concept_variance_target",
                     help="minimum per-dimension std target for latent concept slots")
+    ap.add_argument("--latent-concept-neighborhood-w", type=float, default=0.0,
+                    dest="latent_concept_neighborhood_w",
+                    help=("weight for self-mined latent neighborhood alignment "
+                          "across multimodal views"))
+    ap.add_argument("--latent-concept-neighborhood-temperature", type=float,
+                    default=0.1, dest="latent_concept_neighborhood_temperature",
+                    help="contrastive temperature for multimodal latent neighborhoods")
+    ap.add_argument("--latent-concept-neighborhood-margin", type=float, default=0.0,
+                    dest="latent_concept_neighborhood_margin",
+                    help="minimum margin over other multimodal latent neighbors")
     ap.add_argument("--latent-concept-factor-w", type=float, default=0.0,
                     dest="latent_concept_factor_w",
                     help=("weight for predicting data-defined multimodal factors "
@@ -2535,6 +2611,14 @@ def main(argv=None):
         ap.error("--latent-concept-w must be non-negative")
     if args.latent_concept_w > 0.0 and effective_latent_slots <= 0:
         ap.error("--latent-concept-w requires --latent-concept-slots > 0")
+    if args.latent_concept_neighborhood_w < 0.0:
+        ap.error("--latent-concept-neighborhood-w must be non-negative")
+    if args.latent_concept_neighborhood_w > 0.0 and effective_latent_slots <= 0:
+        ap.error("--latent-concept-neighborhood-w requires --latent-concept-slots > 0")
+    if args.latent_concept_neighborhood_temperature <= 0.0:
+        ap.error("--latent-concept-neighborhood-temperature must be positive")
+    if args.latent_concept_neighborhood_margin < 0.0:
+        ap.error("--latent-concept-neighborhood-margin must be non-negative")
     if args.latent_concept_factor_w < 0.0:
         ap.error("--latent-concept-factor-w must be non-negative")
     if args.latent_concept_factor_w > 0.0 and effective_latent_slots <= 0:
@@ -2598,6 +2682,11 @@ def main(argv=None):
                  latent_concept_variance_w=args.latent_concept_variance_w,
                  latent_concept_covariance_w=args.latent_concept_covariance_w,
                  latent_concept_variance_target=args.latent_concept_variance_target,
+                 latent_concept_neighborhood_w=args.latent_concept_neighborhood_w,
+                 latent_concept_neighborhood_temperature=(
+                     args.latent_concept_neighborhood_temperature),
+                 latent_concept_neighborhood_margin=(
+                     args.latent_concept_neighborhood_margin),
                  latent_concept_factor_w=args.latent_concept_factor_w,
                  study_strategy=args.study_strategy,
                  study_score_metric=args.study_score_metric,

@@ -54,6 +54,7 @@ from .concepts import (
     LatentConceptHead,
     SchemaConceptHead,
     SchemaConceptRefiner,
+    latent_concept_neighborhood_loss,
     latent_concept_vicreg_loss,
     schema_concept_batch_centroid_loss,
     schema_concept_contrastive_loss,
@@ -2023,6 +2024,89 @@ def _reading_context_target_embeddings(model, txt, pad, seed=0, context_keep_p=0
     return predicted, target
 
 
+def _reading_latent_embeddings(model, vocab, records, device=DEV, batch=64):
+    if getattr(model, "latent_concepts", None) is None or not records:
+        return None
+    chunks = []
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(records), int(batch)):
+            txt = pack_reading(records[off:off + int(batch)], vocab, device)
+            slots = model.latent_concept_states(txt, project=True)
+            if slots is None:
+                return None
+            chunks.append(F.normalize(slots.reshape(slots.shape[0], -1), dim=-1))
+    return torch.cat(chunks, dim=0) if chunks else None
+
+
+def mine_reading_latent_neighbors(model, vocab, records, device=DEV, n=0, seed=0,
+                                  split="train"):
+    """Mine nearest reading chunks from the model's current latent concept space."""
+    if getattr(model, "latent_concepts", None) is None:
+        return [], {"n_records": 0, "n_pairs": 0, "sampled": False,
+                    "split": split, "skipped": True}
+    candidates = [r for r in records if r.split == split]
+    sampled = bool(n and n < len(candidates))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=int(n), replace=False)
+        candidates = [candidates[int(i)] for i in idx]
+    if len(candidates) < 2:
+        return [], {"n_records": len(candidates), "n_pairs": 0,
+                    "sampled": sampled, "split": split, "skipped": True}
+    emb = _reading_latent_embeddings(model, vocab, candidates, device=device)
+    if emb is None or emb.shape[0] < 2:
+        return [], {"n_records": len(candidates), "n_pairs": 0,
+                    "sampled": sampled, "split": split, "skipped": True}
+    sim = emb.matmul(emb.t())
+    eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+    masked = sim.masked_fill(eye, -float("inf"))
+    nearest = masked.argmax(-1).detach().cpu().tolist()
+    nearest_scores = masked.max(-1).values.detach().cpu().tolist()
+    pairs = [(candidates[i], candidates[int(j)]) for i, j in enumerate(nearest)
+             if int(j) != i]
+    mutual = sum(1 for i, j in enumerate(nearest)
+                 if int(j) != i and int(nearest[int(j)]) == i)
+    return pairs, {"n_records": len(candidates),
+                   "n_pairs": len(pairs),
+                   "sampled": sampled,
+                   "split": split,
+                   "mean_neighbor_cosine": float(np.mean(nearest_scores)),
+                   "min_neighbor_cosine": float(np.min(nearest_scores)),
+                   "max_neighbor_cosine": float(np.max(nearest_scores)),
+                   "mutual_pairs": int(mutual),
+                   "skipped": False}
+
+
+def batch_reading_neighbor_pairs(pairs, rng, batch):
+    if not pairs:
+        return []
+    return [pairs[int(rng.integers(len(pairs)))] for _ in range(int(batch))]
+
+
+def reading_latent_neighborhood_loss(model, pairs, vocab, device=DEV,
+                                     token_drop_p=0.15, token_replace_p=0.05,
+                                     feature_dropout=0.1, temperature=0.1,
+                                     margin=0.0):
+    if getattr(model, "latent_concepts", None) is None or not pairs:
+        dev = next(model.parameters()).device
+        return torch.tensor(0.0, device=dev)
+    anchors = [a for a, _b in pairs]
+    positives = [b for _a, b in pairs]
+    anchor_txt = corrupt_reading_tokens(
+        pack_reading(anchors, vocab, device), vocab.pad, vocab.unk,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    positive_txt = corrupt_reading_tokens(
+        pack_reading(positives, vocab, device), vocab.pad, vocab.unk,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    anchor_slots = model.latent_concept_states(
+        anchor_txt, feature_dropout=feature_dropout, project=True)
+    positive_slots = model.latent_concept_states(
+        positive_txt, feature_dropout=feature_dropout, project=True)
+    return latent_concept_neighborhood_loss(
+        anchor_slots, positive_slots, temperature=temperature, margin=margin)
+
+
 def eval_reading_records(records, n=0, seed=0):
     rows = [r for r in records if r.split == "eval"]
     if n < 0:
@@ -2120,11 +2204,68 @@ def reading_context_target_retrieval_eval(model, vocab, records, device=DEV, n=0
             "skipped": False}
 
 
-READING_SCORE_METRICS = ("view", "context", "both", "min")
+def reading_neighborhood_retrieval_eval(model, vocab, records, device=DEV, n=0,
+                                        seed=0, token_drop_p=0.15,
+                                        token_replace_p=0.05):
+    pairs, mine_report = mine_reading_latent_neighbors(
+        model, vocab, records, device=device, n=n, seed=seed, split="eval")
+    if not pairs:
+        return {"neighbor_acc": 0.0, "n_records": mine_report.get("n_records", 0),
+                "n_pairs": 0, "sampled": mine_report.get("sampled", False),
+                "skipped": True, "mining": mine_report}
+    anchors = [a for a, _b in pairs]
+    positives = [b for _a, b in pairs]
+    correct = total = 0
+    pos_sum = neg_sum = 0.0
+    neg_count = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(pairs), 64):
+            anchor_batch = anchors[off:off + 64]
+            positive_batch = positives[off:off + 64]
+            if len(anchor_batch) <= 1:
+                continue
+            anchor_txt = corrupt_reading_tokens(
+                pack_reading(anchor_batch, vocab, device), vocab.pad, vocab.unk,
+                token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+            positive_txt = corrupt_reading_tokens(
+                pack_reading(positive_batch, vocab, device), vocab.pad, vocab.unk,
+                token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+            anchor_slots = model.latent_concept_states(anchor_txt, project=True)
+            positive_slots = model.latent_concept_states(positive_txt, project=True)
+            anchor = F.normalize(anchor_slots.reshape(anchor_slots.shape[0], -1),
+                                 dim=-1)
+            positive = F.normalize(
+                positive_slots.reshape(positive_slots.shape[0], -1), dim=-1)
+            sim = anchor.matmul(positive.t())
+            labels = torch.arange(sim.shape[0], device=sim.device)
+            nearest = sim.argmax(-1)
+            correct += int(nearest.eq(labels).sum())
+            total += int(sim.shape[0])
+            pos_sum += float(sim.diag().sum())
+            eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+            neg_sum += float(sim.masked_select(~eye).sum())
+            neg_count += int((~eye).sum())
+    if total == 0:
+        return {"neighbor_acc": 0.0, "n_records": mine_report.get("n_records", 0),
+                "n_pairs": len(pairs), "sampled": mine_report.get("sampled", False),
+                "skipped": True, "mining": mine_report}
+    return {"neighbor_acc": correct / max(1, total),
+            "positive_cosine": pos_sum / max(1, total),
+            "negative_cosine": neg_sum / max(1, neg_count),
+            "margin": (pos_sum / max(1, total)) - (neg_sum / max(1, neg_count)),
+            "n_records": mine_report.get("n_records", 0),
+            "n_pairs": len(pairs),
+            "sampled": mine_report.get("sampled", False),
+            "skipped": False,
+            "mining": mine_report}
+
+
+READING_SCORE_METRICS = ("view", "context", "neighborhood", "both", "min", "all")
 
 
 def reading_discovery_score_components(view_eval, context_eval, metric="both",
-                                       margin_w=0.1):
+                                       margin_w=0.1, neighborhood_eval=None):
     metric = str(metric)
     if metric not in READING_SCORE_METRICS:
         raise ValueError(f"unknown reading score metric {metric!r}")
@@ -2133,14 +2274,22 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     view_margin = float(view_eval.get("margin", 0.0))
     context_acc = float(context_eval.get("context_target_acc", 0.0))
     context_margin = float(context_eval.get("margin", 0.0))
+    neighborhood_eval = neighborhood_eval or {}
+    neighborhood_acc = float(neighborhood_eval.get("neighbor_acc", 0.0))
+    neighborhood_margin = float(neighborhood_eval.get("margin", 0.0))
     view_score = view_acc + margin_w * view_margin
     context_score = context_acc + margin_w * context_margin
+    neighborhood_score = neighborhood_acc + margin_w * neighborhood_margin
     if metric == "view":
         score = view_score
     elif metric == "context":
         score = context_score
+    elif metric == "neighborhood":
+        score = neighborhood_score
     elif metric == "min":
         score = min(view_score, context_score)
+    elif metric == "all":
+        score = (view_score + context_score + neighborhood_score) / 3.0
     else:
         score = 0.5 * (view_score + context_score)
     return {"metric": metric,
@@ -2148,12 +2297,16 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "score": float(score),
             "view_score": float(view_score),
             "context_score": float(context_score),
+            "neighborhood_score": float(neighborhood_score),
             "paired_view_acc": view_acc,
             "paired_view_margin": view_margin,
             "context_target_acc": context_acc,
             "context_target_margin": context_margin,
+            "neighborhood_acc": neighborhood_acc,
+            "neighborhood_margin": neighborhood_margin,
             "view_skipped": bool(view_eval.get("skipped", False)),
-            "context_skipped": bool(context_eval.get("skipped", False))}
+            "context_skipped": bool(context_eval.get("skipped", False)),
+            "neighborhood_skipped": bool(neighborhood_eval.get("skipped", False))}
 
 
 def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
@@ -2166,10 +2319,15 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
     context = reading_context_target_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 23,
         context_keep_p=context_keep_p)
+    neighborhood = reading_neighborhood_retrieval_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 29,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
     return {"view": view,
             "context_target": context,
+            "neighborhood": neighborhood,
             "score_components": reading_discovery_score_components(
-                view, context, metric=score_metric, margin_w=score_margin_w)}
+                view, context, metric=score_metric, margin_w=score_margin_w,
+                neighborhood_eval=neighborhood)}
 
 
 def reading_latent_record_outcomes(model, vocab, records, device=DEV, n=0, seed=0,
@@ -4477,6 +4635,10 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          covariance_w=1.0, variance_target=1.0,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
+                         neighborhood_w=0.0, neighborhood_batch=0,
+                         neighborhood_probe_n=0, neighborhood_refresh_steps=0,
+                         neighborhood_temperature=0.1,
+                         neighborhood_margin=0.0,
                          study_strategy="errors", study_probe_n=0,
                          study_hard_max=0, study_refresh_steps=0,
                          replay_records=None, replay_teacher_model=None,
@@ -4486,6 +4648,18 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("raw reading concept training requires latent concept slots")
     if float(context_target_w) < 0.0:
         raise ValueError("reading context-target loss weight must be non-negative")
+    if float(neighborhood_w) < 0.0:
+        raise ValueError("reading neighborhood loss weight must be non-negative")
+    if int(neighborhood_batch) < 0:
+        raise ValueError("reading neighborhood batch must be non-negative")
+    if int(neighborhood_probe_n) < 0:
+        raise ValueError("reading neighborhood probe count must be non-negative")
+    if int(neighborhood_refresh_steps) < 0:
+        raise ValueError("reading neighborhood refresh steps must be non-negative")
+    if float(neighborhood_temperature) <= 0.0:
+        raise ValueError("reading neighborhood temperature must be positive")
+    if float(neighborhood_margin) < 0.0:
+        raise ValueError("reading neighborhood margin must be non-negative")
     if float(replay_w) < 0.0:
         raise ValueError("reading replay loss weight must be non-negative")
     study_strategy = str(study_strategy)
@@ -4509,11 +4683,15 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     if replay_batch < 0:
         raise ValueError("reading replay batch must be non-negative")
     replay_batch = replay_batch or max(1, batch // 2)
+    neighborhood_batch = int(neighborhood_batch) or max(1, batch // 2)
+    neighborhood_pairs = []
+    neighborhood_reports = []
     study_pool = []
     study_reports = []
     last_loss = 0.0
     last_view_loss = 0.0
     last_context_target = 0.0
+    last_neighborhood = 0.0
     last_replay = 0.0
 
     def refresh_study_pool(step):
@@ -4536,11 +4714,29 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                            "pool_size": len(study_pool)}
         study_reports.append(report)
 
+    def refresh_neighborhood_pairs(step):
+        nonlocal neighborhood_pairs
+        probe_n = (int(neighborhood_probe_n) if int(neighborhood_probe_n) > 0
+                   else max(batch * 8, 2))
+        pairs, report = mine_reading_latent_neighbors(
+            model, vocab, train_records, device=device, n=probe_n,
+            seed=seed + 2203 + int(step), split="train")
+        if pairs:
+            neighborhood_pairs = pairs
+        report = report | {"step": int(step), "pool_active": bool(neighborhood_pairs),
+                           "pool_size": len(neighborhood_pairs)}
+        neighborhood_reports.append(report)
+
     for st in range(1, steps + 1):
         model.train()
         if study_strategy == "errors" and (st == 1 or (
                 study_refresh_steps and (st - 1) % int(study_refresh_steps) == 0)):
             refresh_study_pool(st)
+            model.train()
+        if neighborhood_w and (st == 1 or (
+                neighborhood_refresh_steps
+                and (st - 1) % int(neighborhood_refresh_steps) == 0)):
+            refresh_neighborhood_pairs(st)
             model.train()
         source = study_pool if study_strategy == "errors" and study_pool else train_records
         rec_batch = batch_records(source, rng, batch)
@@ -4556,6 +4752,17 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 feature_dropout=feature_dropout,
                 temperature=context_target_temperature)
             if context_target_w else view_loss * 0.0)
+        neighborhood_loss = view_loss * 0.0
+        if neighborhood_w and neighborhood_pairs:
+            pair_batch = batch_reading_neighbor_pairs(
+                neighborhood_pairs, rng, neighborhood_batch)
+            neighborhood_loss = reading_latent_neighborhood_loss(
+                model, pair_batch, vocab, device=device,
+                token_drop_p=token_drop_p,
+                token_replace_p=token_replace_p,
+                feature_dropout=feature_dropout,
+                temperature=neighborhood_temperature,
+                margin=neighborhood_margin)
         replay_loss = view_loss * 0.0
         if replay_w and replay_sources:
             replay_batch_records = batch_records(replay_sources, rng, replay_batch)
@@ -4564,6 +4771,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 replay_teacher_vocab, device=device,
                 feature_dropout=feature_dropout)
         loss = (view_loss + float(context_target_w) * context_target
+                + float(neighborhood_w) * neighborhood_loss
                 + float(replay_w) * replay_loss)
         opt.zero_grad()
         loss.backward()
@@ -4571,17 +4779,27 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_loss = float(loss.detach())
         last_view_loss = float(view_loss.detach())
         last_context_target = float(context_target.detach())
+        last_neighborhood = float(neighborhood_loss.detach())
         last_replay = float(replay_loss.detach())
         if st % log_every == 0 or st == steps:
             print(f"  reading {st}/{steps} loss {last_loss:.3f} "
                   f"view {last_view_loss:.3f} "
                   f"context-target {last_context_target:.3f} "
+                  f"neighborhood {last_neighborhood:.3f} "
                   f"replay {last_replay:.3f}",
                   flush=True)
     model.reading_train_metrics = {
         "loss": last_loss,
         "latent_view_loss": last_view_loss,
         "context_target_loss": last_context_target,
+        "neighborhood_loss": last_neighborhood,
+        "neighborhood_w": float(neighborhood_w),
+        "neighborhood_batch": int(neighborhood_batch),
+        "neighborhood_probe_n": int(neighborhood_probe_n),
+        "neighborhood_refresh_steps": int(neighborhood_refresh_steps),
+        "neighborhood_temperature": float(neighborhood_temperature),
+        "neighborhood_margin": float(neighborhood_margin),
+        "neighborhood_pairs": len(neighborhood_pairs),
         "replay_loss": last_replay,
         "replay_w": float(replay_w),
         "replay_batch": int(replay_batch),
@@ -4591,6 +4809,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "context_target_temperature": float(context_target_temperature),
     }
     model.reading_study_reports = study_reports
+    model.reading_neighborhood_reports = neighborhood_reports
     return model, vocab
 
 
@@ -4617,6 +4836,9 @@ def fit_reading_concepts_select_best(
         covariance_w=1.0, variance_target=1.0,
         context_target_w=0.1, context_keep_p=0.5,
         context_target_temperature=0.1,
+        neighborhood_w=0.0, neighborhood_batch=0,
+        neighborhood_probe_n=0, neighborhood_refresh_steps=0,
+        neighborhood_temperature=0.1, neighborhood_margin=0.0,
         study_strategy="errors", study_probe_n=0,
         study_hard_max=0, study_refresh_steps=0,
         replay_records=None, replay_teacher_model=None,
@@ -4673,6 +4895,7 @@ def fit_reading_concepts_select_best(
     best_metrics = dict(getattr(model, "reading_train_metrics", {}))
     rounds_report = [initial_row]
     all_study_reports = []
+    all_neighborhood_reports = []
     for round_i, round_steps in enumerate(schedule, start=1):
         fit_reading_concepts(
             model, vocab, records, steps=round_steps, batch=batch, lr=lr,
@@ -4683,6 +4906,12 @@ def fit_reading_concepts_select_best(
             variance_target=variance_target, context_target_w=context_target_w,
             context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            neighborhood_w=neighborhood_w,
+            neighborhood_batch=neighborhood_batch,
+            neighborhood_probe_n=neighborhood_probe_n,
+            neighborhood_refresh_steps=neighborhood_refresh_steps,
+            neighborhood_temperature=neighborhood_temperature,
+            neighborhood_margin=neighborhood_margin,
             study_strategy=study_strategy, study_probe_n=study_probe_n,
             study_hard_max=study_hard_max,
             study_refresh_steps=study_refresh_steps,
@@ -4693,6 +4922,9 @@ def fit_reading_concepts_select_best(
         all_study_reports.extend(
             report | {"round": int(round_i)}
             for report in getattr(model, "reading_study_reports", []))
+        all_neighborhood_reports.extend(
+            report | {"round": int(round_i)}
+            for report in getattr(model, "reading_neighborhood_reports", []))
         bundle = reading_eval_bundle(
             model, vocab, records, device=device, eval_n=eval_n, seed=seed,
             token_drop_p=token_drop_p, token_replace_p=token_replace_p,
@@ -4736,6 +4968,7 @@ def fit_reading_concepts_select_best(
     best_metrics = best_metrics | {"selection": selection}
     model.reading_train_metrics = best_metrics
     model.reading_study_reports = all_study_reports
+    model.reading_neighborhood_reports = all_neighborhood_reports
     model.reading_selection_report = selection
     return model, vocab, selection
 
@@ -4753,6 +4986,10 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            covariance_w=1.0, variance_target=1.0,
                            context_target_w=0.1, context_keep_p=0.5,
                            context_target_temperature=0.1,
+                           neighborhood_w=0.0, neighborhood_batch=0,
+                           neighborhood_probe_n=0, neighborhood_refresh_steps=0,
+                           neighborhood_temperature=0.1,
+                           neighborhood_margin=0.0,
                            study_strategy="errors", study_probe_n=0,
                            study_hard_max=0, study_refresh_steps=0):
     if int(latent_concept_slots) <= 0:
@@ -4777,6 +5014,12 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         covariance_w=covariance_w, variance_target=variance_target,
         context_target_w=context_target_w, context_keep_p=context_keep_p,
         context_target_temperature=context_target_temperature,
+        neighborhood_w=neighborhood_w,
+        neighborhood_batch=neighborhood_batch,
+        neighborhood_probe_n=neighborhood_probe_n,
+        neighborhood_refresh_steps=neighborhood_refresh_steps,
+        neighborhood_temperature=neighborhood_temperature,
+        neighborhood_margin=neighborhood_margin,
         study_strategy=study_strategy, study_probe_n=study_probe_n,
         study_hard_max=study_hard_max, study_refresh_steps=study_refresh_steps)
 
@@ -4793,6 +5036,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          covariance_w=1.0, variance_target=1.0,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
+                         neighborhood_w=0.0, neighborhood_batch=0,
+                         neighborhood_probe_n=0, neighborhood_refresh_steps=0,
+                         neighborhood_temperature=0.1,
+                         neighborhood_margin=0.0,
                          study_strategy="errors", study_probe_n=0,
                          study_hard_max=0, study_refresh_steps=0,
                          study_select_best=False, study_rounds=1,
@@ -4829,6 +5076,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             covariance_w=covariance_w, variance_target=variance_target,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            neighborhood_w=neighborhood_w,
+            neighborhood_batch=neighborhood_batch,
+            neighborhood_probe_n=neighborhood_probe_n,
+            neighborhood_refresh_steps=neighborhood_refresh_steps,
+            neighborhood_temperature=neighborhood_temperature,
+            neighborhood_margin=neighborhood_margin,
             study_strategy=study_strategy, study_probe_n=study_probe_n,
             study_hard_max=study_hard_max,
             study_refresh_steps=study_refresh_steps, eval_n=eval_n,
@@ -4844,6 +5097,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             covariance_w=covariance_w, variance_target=variance_target,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            neighborhood_w=neighborhood_w,
+            neighborhood_batch=neighborhood_batch,
+            neighborhood_probe_n=neighborhood_probe_n,
+            neighborhood_refresh_steps=neighborhood_refresh_steps,
+            neighborhood_temperature=neighborhood_temperature,
+            neighborhood_margin=neighborhood_margin,
             study_strategy=study_strategy, study_probe_n=study_probe_n,
             study_hard_max=study_hard_max,
             study_refresh_steps=study_refresh_steps)
@@ -4856,6 +5115,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
     after = after_bundle["view"]
     before_context = before_bundle["context_target"]
     after_context = after_bundle["context_target"]
+    before_neighborhood = before_bundle["neighborhood"]
+    after_neighborhood = after_bundle["neighborhood"]
     report = {"experiment": "text_raw_reading_concept_pretrain",
               "data": data,
               "steps": int(steps), "batch": int(batch), "lr": float(lr),
@@ -4877,6 +5138,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
+              "neighborhood_w": float(neighborhood_w),
+              "neighborhood_batch": int(neighborhood_batch),
+              "neighborhood_probe_n": int(neighborhood_probe_n),
+              "neighborhood_refresh_steps": int(neighborhood_refresh_steps),
+              "neighborhood_temperature": float(neighborhood_temperature),
+              "neighborhood_margin": float(neighborhood_margin),
               "study_strategy": study_strategy,
               "study_probe_n": int(study_probe_n),
               "study_hard_max": int(study_hard_max),
@@ -4892,6 +5159,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "after": after,
               "before_context_target": before_context,
               "after_context_target": after_context,
+              "before_neighborhood": before_neighborhood,
+              "after_neighborhood": after_neighborhood,
               "before_score_components": before_bundle["score_components"],
               "after_score_components": after_bundle["score_components"],
               "selection": selection,
@@ -4905,9 +5174,17 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                   "context_target_margin": (
                       after_context.get("margin", 0.0)
                       - before_context.get("margin", 0.0)),
+                  "neighborhood_acc": (
+                      after_neighborhood.get("neighbor_acc", 0.0)
+                      - before_neighborhood.get("neighbor_acc", 0.0)),
+                  "neighborhood_margin": (
+                      after_neighborhood.get("margin", 0.0)
+                      - before_neighborhood.get("margin", 0.0)),
               },
               "train_metrics": getattr(model, "reading_train_metrics", {}),
-              "study_hard_examples": getattr(model, "reading_study_reports", [])}
+              "study_hard_examples": getattr(model, "reading_study_reports", []),
+              "study_neighborhoods": getattr(
+                  model, "reading_neighborhood_reports", [])}
     if checkpoint:
         os.makedirs(os.path.dirname(checkpoint) or ".", exist_ok=True)
         torch.save(checkpoint_payload(model, vocab, d, layers, heads, report),
@@ -4977,6 +5254,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              covariance_w=1.0, variance_target=1.0,
                              context_target_w=0.1, context_keep_p=0.5,
                              context_target_temperature=0.1,
+                             neighborhood_w=0.0, neighborhood_batch=0,
+                             neighborhood_probe_n=0, neighborhood_refresh_steps=0,
+                             neighborhood_temperature=0.1,
+                             neighborhood_margin=0.0,
                              study_strategy="errors", study_probe_n=0,
                              study_hard_max=0, study_refresh_steps=0,
                              study_select_best=False, study_rounds=1,
@@ -5034,6 +5315,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             covariance_w=covariance_w, variance_target=variance_target,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            neighborhood_w=neighborhood_w,
+            neighborhood_batch=neighborhood_batch,
+            neighborhood_probe_n=neighborhood_probe_n,
+            neighborhood_refresh_steps=neighborhood_refresh_steps,
+            neighborhood_temperature=neighborhood_temperature,
+            neighborhood_margin=neighborhood_margin,
             study_strategy=study_strategy, study_probe_n=study_probe_n,
             study_hard_max=study_hard_max,
             study_refresh_steps=study_refresh_steps, eval_n=eval_n,
@@ -5054,6 +5341,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             covariance_w=covariance_w, variance_target=variance_target,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            neighborhood_w=neighborhood_w,
+            neighborhood_batch=neighborhood_batch,
+            neighborhood_probe_n=neighborhood_probe_n,
+            neighborhood_refresh_steps=neighborhood_refresh_steps,
+            neighborhood_temperature=neighborhood_temperature,
+            neighborhood_margin=neighborhood_margin,
             study_strategy=study_strategy, study_probe_n=study_probe_n,
             study_hard_max=study_hard_max,
             study_refresh_steps=study_refresh_steps,
@@ -5076,6 +5369,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
     after = after_bundle["view"]
     before_context = before_bundle["context_target"]
     after_context = after_bundle["context_target"]
+    before_neighborhood = before_bundle["neighborhood"]
+    after_neighborhood = after_bundle["neighborhood"]
     d = int(ckpt.get("d", 96))
     layers = int(ckpt.get("layers", 3))
     heads = int(ckpt.get("heads", 4))
@@ -5105,6 +5400,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
+              "neighborhood_w": float(neighborhood_w),
+              "neighborhood_batch": int(neighborhood_batch),
+              "neighborhood_probe_n": int(neighborhood_probe_n),
+              "neighborhood_refresh_steps": int(neighborhood_refresh_steps),
+              "neighborhood_temperature": float(neighborhood_temperature),
+              "neighborhood_margin": float(neighborhood_margin),
               "study_strategy": study_strategy,
               "study_probe_n": int(study_probe_n),
               "study_hard_max": int(study_hard_max),
@@ -5127,6 +5428,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "after": after,
               "before_context_target": before_context,
               "after_context_target": after_context,
+              "before_neighborhood": before_neighborhood,
+              "after_neighborhood": after_neighborhood,
               "before_score_components": before_bundle["score_components"],
               "after_score_components": after_bundle["score_components"],
               "before_replay": before_replay_bundle,
@@ -5142,6 +5445,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                   "context_target_margin": (
                       after_context.get("margin", 0.0)
                       - before_context.get("margin", 0.0)),
+                  "neighborhood_acc": (
+                      after_neighborhood.get("neighbor_acc", 0.0)
+                      - before_neighborhood.get("neighbor_acc", 0.0)),
+                  "neighborhood_margin": (
+                      after_neighborhood.get("margin", 0.0)
+                      - before_neighborhood.get("margin", 0.0)),
                   "replay_score": (
                       (after_replay_bundle or {}).get("score_components", {}).get(
                           "score", 0.0)
@@ -5149,7 +5458,9 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                           "score", 0.0)),
               },
               "train_metrics": getattr(model, "reading_train_metrics", {}),
-              "study_hard_examples": getattr(model, "reading_study_reports", [])}
+              "study_hard_examples": getattr(model, "reading_study_reports", []),
+              "study_neighborhoods": getattr(
+                  model, "reading_neighborhood_reports", [])}
     if out_checkpoint:
         os.makedirs(os.path.dirname(out_checkpoint) or ".", exist_ok=True)
         torch.save(checkpoint_payload(model, vocab, d, layers, heads, report),
@@ -8594,6 +8905,14 @@ def selftest():
         reading_model, reading_txt, reading_vocab.pad, context_keep_p=0.5,
         temperature=0.2)
     assert torch.isfinite(reading_context_loss)
+    reading_pairs, reading_pair_report = mine_reading_latent_neighbors(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0)
+    assert reading_pair_report["n_pairs"] == 2
+    assert reading_pairs
+    reading_neighbor_loss = reading_latent_neighborhood_loss(
+        reading_model, reading_pairs, reading_vocab, device="cpu",
+        token_drop_p=0.1, token_replace_p=0.0, temperature=0.2)
+    assert torch.isfinite(reading_neighbor_loss)
     reading_errors, reading_correct, reading_report = reading_latent_record_outcomes(
         reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0,
         token_drop_p=0.1, token_replace_p=0.0)
@@ -8607,11 +8926,20 @@ def selftest():
         reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0,
         context_keep_p=0.5)
     assert reading_context_eval["n_records"] == 2
+    reading_neighborhood_eval = reading_neighborhood_retrieval_eval(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0,
+        token_drop_p=0.1, token_replace_p=0.0)
+    assert reading_neighborhood_eval["n_pairs"] == 2
     reading_bundle = reading_eval_bundle(
         reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
         seed=0, token_drop_p=0.1, token_replace_p=0.0, context_keep_p=0.5,
         score_metric="min", score_margin_w=0.1)
     assert reading_bundle["score_components"]["metric"] == "min"
+    reading_neighborhood_bundle = reading_eval_bundle(
+        reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
+        seed=0, token_drop_p=0.1, token_replace_p=0.0, context_keep_p=0.5,
+        score_metric="neighborhood", score_margin_w=0.1)
+    assert "neighborhood_score" in reading_neighborhood_bundle["score_components"]
     selected_reading_model = TextFactLM(
         len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
         fact_schema=None, latent_concept_slots=2).to("cpu")
@@ -8630,8 +8958,11 @@ def selftest():
         reading_model, reading_vocab, reading_records, steps=1, batch=2, lr=1e-4,
         seed=5, device="cpu", log_every=1, token_drop_p=0.1,
         token_replace_p=0.0, study_strategy="errors", study_probe_n=2,
-        study_hard_max=2, context_target_w=0.1, context_keep_p=0.5)
+        study_hard_max=2, context_target_w=0.1, context_keep_p=0.5,
+        neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2)
     assert "context_target_loss" in reading_model.reading_train_metrics
+    assert reading_model.reading_train_metrics["neighborhood_w"] == 0.1
+    assert reading_model.reading_neighborhood_reports
     reading_payload = checkpoint_payload(reading_model, reading_vocab, 32, 1, 4,
                                          {"experiment": "reading-selftest"})
     assert reading_payload["fact_schema"] is None
@@ -8663,8 +8994,10 @@ def selftest():
             study_probe_n=2, study_hard_max=2, context_target_w=0.1,
             context_keep_p=0.5, replay_records=reading_records,
             replay_teacher_model=teacher_model, replay_teacher_vocab=teacher_vocab,
-            replay_w=0.1, replay_batch=2)
+            replay_w=0.1, replay_batch=2,
+            neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2)
         assert expanded_model.reading_train_metrics["replay_w"] == 0.1
+        assert expanded_model.reading_train_metrics["neighborhood_w"] == 0.1
     score_a = {"semantic_head": {"fact_value_acc": 0.8},
                "teacher_forced": {"fact_value_acc": 0.7},
                "latent_fact_concept_head": {"fact_value_acc": 0.65,
@@ -8877,6 +9210,20 @@ def main(argv=None):
                     help="probability that a token stays in the context fragment")
     ap.add_argument("--reading-context-target-temperature", type=float, default=0.1,
                     help="contrastive temperature for context-to-target reading retrieval")
+    ap.add_argument("--reading-neighborhood-w", type=float, default=0.0,
+                    help=("weight for self-mined latent neighborhood discovery loss "
+                          "on raw reading chunks"))
+    ap.add_argument("--reading-neighborhood-batch", type=int, default=0,
+                    help="mined neighbor pairs per step; 0 = half the main batch")
+    ap.add_argument("--reading-neighborhood-probe-n", type=int, default=0,
+                    help=("number of train chunks to mine for latent neighbors; "
+                          "0 = 8x main batch"))
+    ap.add_argument("--reading-neighborhood-refresh-steps", type=int, default=0,
+                    help="refresh mined latent neighbors every N steps; 0 means once")
+    ap.add_argument("--reading-neighborhood-temperature", type=float, default=0.1,
+                    help="contrastive temperature for mined latent neighbors")
+    ap.add_argument("--reading-neighborhood-margin", type=float, default=0.0,
+                    help="minimum margin over other mined neighbors")
     ap.add_argument("--reading-study-strategy", choices=("random", "errors"),
                     default="errors",
                     help="train raw reading on random chunks or mined retrieval failures")
@@ -9357,6 +9704,18 @@ def main(argv=None):
         ap.error("--reading-context-keep-p must be in (0, 1)")
     if args.reading_context_target_temperature <= 0.0:
         ap.error("--reading-context-target-temperature must be positive")
+    if args.reading_neighborhood_w < 0.0:
+        ap.error("--reading-neighborhood-w must be non-negative")
+    if args.reading_neighborhood_batch < 0:
+        ap.error("--reading-neighborhood-batch must be non-negative")
+    if args.reading_neighborhood_probe_n < 0:
+        ap.error("--reading-neighborhood-probe-n must be non-negative")
+    if args.reading_neighborhood_refresh_steps < 0:
+        ap.error("--reading-neighborhood-refresh-steps must be non-negative")
+    if args.reading_neighborhood_temperature <= 0.0:
+        ap.error("--reading-neighborhood-temperature must be positive")
+    if args.reading_neighborhood_margin < 0.0:
+        ap.error("--reading-neighborhood-margin must be non-negative")
     if args.reading_study_probe_n < 0:
         ap.error("--reading-study-probe-n must be non-negative")
     if args.reading_study_hard_max < 0:
@@ -9436,6 +9795,14 @@ def main(argv=None):
                 context_keep_p=args.reading_context_keep_p,
                 context_target_temperature=(
                     args.reading_context_target_temperature),
+                neighborhood_w=args.reading_neighborhood_w,
+                neighborhood_batch=args.reading_neighborhood_batch,
+                neighborhood_probe_n=args.reading_neighborhood_probe_n,
+                neighborhood_refresh_steps=(
+                    args.reading_neighborhood_refresh_steps),
+                neighborhood_temperature=(
+                    args.reading_neighborhood_temperature),
+                neighborhood_margin=args.reading_neighborhood_margin,
                 study_strategy=args.reading_study_strategy,
                 study_probe_n=args.reading_study_probe_n,
                 study_hard_max=args.reading_study_hard_max,
@@ -9487,6 +9854,14 @@ def main(argv=None):
                 context_keep_p=args.reading_context_keep_p,
                 context_target_temperature=(
                     args.reading_context_target_temperature),
+                neighborhood_w=args.reading_neighborhood_w,
+                neighborhood_batch=args.reading_neighborhood_batch,
+                neighborhood_probe_n=args.reading_neighborhood_probe_n,
+                neighborhood_refresh_steps=(
+                    args.reading_neighborhood_refresh_steps),
+                neighborhood_temperature=(
+                    args.reading_neighborhood_temperature),
+                neighborhood_margin=args.reading_neighborhood_margin,
                 study_strategy=args.reading_study_strategy,
                 study_probe_n=args.reading_study_probe_n,
                 study_hard_max=args.reading_study_hard_max,
