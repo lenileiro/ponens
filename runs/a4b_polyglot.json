@@ -1,0 +1,11 @@
+{
+ "experiment": "a4b_polyglot",
+ "steps": 8000,
+ "n_phonemes": 16,
+ "n_letters": 16,
+ "support_k": 24,
+ "chance": 0.0625,
+ "holdout_lang_phoneme_acc": 1.0,
+ "holdout_lang_digraph_acc": 0.983271375464684,
+ "learns_rules_from_listening": true
+}

@@ -1597,7 +1597,7 @@ def main():
                     dest="image_hflip_prob",
                     help="random horizontal flip probability for manifest image training")
     ap.add_argument("--image-prompt-templates", default="", dest="image_prompt_templates",
-                    help="semicolon-separated prompt templates using {color} and {shape}")
+                    help="internal fixture prompt templates; production runs use captions/prompts")
     ap.add_argument("--image-cond-drop", type=float, default=0.0, dest="image_cond_drop",
                     help="condition dropout for classifier-free latent image guidance")
     ap.add_argument("--image-cfg-scale", type=float, default=1.0, dest="image_cfg_scale",
@@ -1646,7 +1646,7 @@ def main():
                     help="absolute latent clamp during sampling; 0 disables")
     ap.add_argument("--image-sample-grid", action="store_true",
                     dest="image_sample_grid",
-                    help="save a generated color x shape PPM grid for latent image jobs")
+                    help="save a generated prompt/caption PPM grid for latent image jobs")
     ap.add_argument("--image-sample-grid-samples", type=int, default=1,
                     dest="image_sample_grid_samples",
                     help="generated samples per color/shape condition in the image PPM grid")
@@ -2091,6 +2091,23 @@ def main():
     bad_arms = sorted(set(args.curve_arms) - {"aux", "noaux"})
     if bad_arms:
         sys.exit(f"ERROR: unsupported --curve-arms values: {','.join(bad_arms)}")
+    legacy_image_flags = [
+        name for enabled, name in (
+            (args.vision, "--vision"),
+            (args.image2, "--image2"),
+            (args.image_flow, "--image-flow"),
+        ) if enabled
+    ]
+    if legacy_image_flags:
+        sys.exit(
+            "ERROR: legacy synthetic image harness flags were removed from GPU launch: "
+            + ", ".join(legacy_image_flags)
+            + ". Use --vision-understanding and --image-latent with --image-manifest "
+            "or --image-fetch.")
+    if args.vision_understanding and not (args.image_manifest or args.image_fetch):
+        sys.exit("ERROR: --vision-understanding requires --image-manifest or --image-fetch")
+    if args.image_latent and not (args.image_manifest or args.image_fetch):
+        sys.exit("ERROR: --image-latent requires --image-manifest or --image-fetch")
     if args.image_caption and not (args.image_manifest or args.image_fetch):
         sys.exit("ERROR: --image-caption requires --image-manifest or --image-fetch")
     if args.image_embed and not (args.image_manifest or args.image_fetch):
@@ -2393,6 +2410,32 @@ def main():
         sys.exit("ERROR: --image-latent-patch-size must be positive")
     if args.image_latent_patch_size != 1 and args.image_latent_arch == "conv":
         sys.exit("ERROR: --image-latent-patch-size requires --image-latent-arch dit/crossdit/mmdit")
+    if args.vision_understanding:
+        positive = {
+            "--vision-understanding-patch": args.vision_understanding_patch,
+            "--vision-understanding-slots": args.vision_understanding_slots,
+            "--vision-understanding-heads": args.vision_understanding_heads,
+            "--vision-understanding-layers": args.vision_understanding_layers,
+            "--vision-understanding-memory-size": args.vision_understanding_memory_size,
+        }
+        if args.vision_understanding_steps < 0:
+            sys.exit("ERROR: --vision-understanding-steps must be non-negative")
+        if args.vision_understanding_batch < 0:
+            sys.exit("ERROR: --vision-understanding-batch must be non-negative")
+        if args.vision_understanding_dim < 0:
+            sys.exit("ERROR: --vision-understanding-dim must be non-negative")
+        for name, value in positive.items():
+            if value <= 0:
+                sys.exit(f"ERROR: {name} must be positive")
+        vu_dim = args.vision_understanding_dim or args.dim or 128
+        if vu_dim % args.vision_understanding_heads != 0:
+            sys.exit("ERROR: vision understanding width must divide --vision-understanding-heads")
+        if (args.vision_understanding_memory_w < 0.0
+                or args.vision_understanding_association_w < 0.0
+                or args.vision_understanding_composition_w < 0.0
+                or args.vision_understanding_text_align_w < 0.0
+                or args.vision_understanding_image_align_w < 0.0):
+            sys.exit("ERROR: vision understanding loss weights must be non-negative")
     if args.multimodal:
         positive = {
             "--multimodal-layers": args.multimodal_layers,
@@ -2553,9 +2596,7 @@ def main():
     image_jobs = [name for enabled, name in (
         (args.image_score, "image quality scoring preprocess"),
         (args.image_embed, "image embedding preprocess"),
-        (args.vision, "vision factor encoder"),
-        (args.image2, "image2 FER arms"),
-        (args.image_flow, "fact-conditioned flow"),
+        (args.vision_understanding, "vision understanding concept memory"),
         (args.image_latent,
          f"latent {args.image_latent_arch} {args.image_cond_mode}-conditioned flow"),
         (args.audio, "audio FER arms"),
@@ -2563,7 +2604,7 @@ def main():
     ) if enabled]
     job = " + ".join(image_jobs) if image_jobs else "kinship multi-seed"
     print("=== PLAN === thinking package on H100: " + job
-          + (" + chain grid" if args.sweep and not args.vision else ""))
+          + (" + chain grid" if args.sweep and not args.vision_understanding else ""))
     print(f"gpu/cloud : {args.gpu} / {args.cloud}")
     print(f"seeds     : {args.seeds}")
     print(f"sync up   : {HERE}/ -> pod:{REMOTE}")

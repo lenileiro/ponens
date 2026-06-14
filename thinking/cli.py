@@ -395,9 +395,9 @@ def cmd_selftest(_args):
     assert bm["rule_reuse_margin"] < 0.1
     assert "low_same_vs_different_rule_margin" in bs["risk_flags"]
 
-    # IMAGE-0: synthetic visual factors produce canonical facts and probeable embeddings.
-    from .vision import selftest as vision_selftest
-    vision_selftest()
+    # Vision understanding learns schema-free visual concepts from manifest images.
+    from .vision_understanding import selftest as vision_understanding_selftest
+    vision_understanding_selftest()
     from .image_data import selftest as image_data_selftest
     image_data_selftest()
     from .image_embed import selftest as image_embed_selftest

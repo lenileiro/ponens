@@ -168,6 +168,15 @@ class LatentConceptMemory(nn.Module):
             transitive_steps=transitive_steps, transitive_w=transitive_w,
             target_power=target_power)
 
+    def graph_prediction_scores(self, source_slots, target_slots, temperature=0.1,
+                                self_loop_w=0.05, transitive_steps=2,
+                                transitive_w=0.1, target_power=1.0):
+        return latent_concept_graph_prediction_scores(
+            source_slots, target_slots, self.active(), self.active_relations(),
+            temperature=temperature, self_loop_w=self_loop_w,
+            transitive_steps=transitive_steps, transitive_w=transitive_w,
+            target_power=target_power)
+
     @torch.no_grad()
     def update(self, slots, momentum=0.95, relation_decay=None):
         if slots is None:
@@ -473,12 +482,21 @@ def latent_concept_composition_loss(slots, memory, relations, temperature=0.1,
     return torch.stack(losses).mean()
 
 
-def latent_concept_graph_prediction_loss(source_slots, target_slots, memory,
-                                         relations, temperature=0.1,
-                                         self_loop_w=0.05,
-                                         transitive_steps=2,
-                                         transitive_w=0.1,
-                                         target_power=1.0):
+def _latent_graph_zero_scores(source_slots, target_slots):
+    slots = source_slots if source_slots is not None else target_slots
+    if slots is None:
+        return torch.zeros(0)
+    if slots.ndim == 0:
+        return slots.reshape(1) * 0.0
+    return slots.reshape(slots.shape[0], -1).sum(-1) * 0.0
+
+
+def latent_concept_graph_prediction_scores(source_slots, target_slots, memory,
+                                           relations, temperature=0.1,
+                                           self_loop_w=0.05,
+                                           transitive_steps=2,
+                                           transitive_w=0.1,
+                                           target_power=1.0):
     """Infer held-out/full latent concepts through the self-mined graph.
 
     Source slots form a distribution over persistent latent concepts. The
@@ -488,14 +506,14 @@ def latent_concept_graph_prediction_loss(source_slots, target_slots, memory,
     not a token prediction or task-label objective.
     """
     if source_slots is None or target_slots is None:
-        for slots in (source_slots, target_slots):
-            if slots is not None:
-                return slots.sum() * 0.0
-        return torch.tensor(0.0)
+        zero = _latent_graph_zero_scores(source_slots, target_slots)
+        return zero, {"kl": zero, "cosine": zero}
     if memory is None or memory.numel() == 0:
-        return source_slots.sum() * 0.0
+        zero = _latent_graph_zero_scores(source_slots, target_slots)
+        return zero, {"kl": zero, "cosine": zero}
     if relations is None or relations.numel() == 0:
-        return source_slots.sum() * 0.0
+        zero = _latent_graph_zero_scores(source_slots, target_slots)
+        return zero, {"kl": zero, "cosine": zero}
     if source_slots.ndim != 3 or target_slots.ndim != 3:
         raise ValueError("latent graph prediction expects [batch, slots, dim]")
     if source_slots.shape[0] != target_slots.shape[0]:
@@ -511,7 +529,8 @@ def latent_concept_graph_prediction_loss(source_slots, target_slots, memory,
         self_loop_w=self_loop_w, transitive_steps=transitive_steps,
         transitive_w=transitive_w)
     if rel is None:
-        return source_slots.sum() * 0.0
+        zero = _latent_graph_zero_scores(source_slots, target_slots)
+        return zero, {"kl": zero, "cosine": zero}
     temp = max(float(temperature), 1e-6)
     source = F.normalize(source_slots, dim=-1)
     target = F.normalize(target_slots.to(source_slots), dim=-1)
@@ -528,11 +547,27 @@ def latent_concept_graph_prediction_loss(source_slots, target_slots, memory,
         target_dist = target_dist / target_dist.sum(-1, keepdim=True).clamp_min(1e-8)
         target_center = F.normalize(target_dist.matmul(mem), dim=-1)
     pred_center = F.normalize(pred.matmul(mem), dim=-1)
-    losses = [
-        F.kl_div(pred.clamp_min(1e-8).log(), target_dist, reduction="batchmean"),
-        (1.0 - (pred_center * target_center).sum(-1)).mean(),
-    ]
-    return torch.stack(losses).mean()
+    kl = F.kl_div(
+        pred.clamp_min(1e-8).log(), target_dist, reduction="none").sum(-1)
+    cosine = 1.0 - (pred_center * target_center).sum(-1)
+    score = 0.5 * (kl + cosine)
+    return score, {"kl": kl, "cosine": cosine}
+
+
+def latent_concept_graph_prediction_loss(source_slots, target_slots, memory,
+                                         relations, temperature=0.1,
+                                         self_loop_w=0.05,
+                                         transitive_steps=2,
+                                         transitive_w=0.1,
+                                         target_power=1.0):
+    scores, _parts = latent_concept_graph_prediction_scores(
+        source_slots, target_slots, memory, relations,
+        temperature=temperature, self_loop_w=self_loop_w,
+        transitive_steps=transitive_steps, transitive_w=transitive_w,
+        target_power=target_power)
+    if scores.numel() == 0:
+        return torch.tensor(0.0)
+    return scores.mean()
 
 
 class SchemaConceptHead(nn.Module):

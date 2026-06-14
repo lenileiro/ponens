@@ -57,6 +57,7 @@ from .concepts import (
     SchemaConceptRefiner,
     latent_concept_composition_loss,
     latent_concept_graph_prediction_loss,
+    latent_concept_graph_prediction_scores,
     latent_concept_graph_curiosity_scores,
     latent_concept_cluster_prototype_loss,
     latent_concept_neighborhood_loss,
@@ -1428,6 +1429,22 @@ class TextFactLM(nn.Module):
                 return target_slots.sum() * 0.0
             return torch.tensor(0.0, device=next(self.parameters()).device)
         return self.latent_concept_memory.graph_prediction_loss(
+            source_slots, target_slots, temperature=temperature,
+            self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+            transitive_w=transitive_w, target_power=target_power)
+
+    def latent_concept_graph_prediction_scores(
+            self, source_slots, target_slots, temperature=0.1,
+            self_loop_w=0.05, transitive_steps=2, transitive_w=0.1,
+            target_power=1.0):
+        if self.latent_concept_memory is None:
+            zero = source_slots if source_slots is not None else target_slots
+            if zero is None:
+                zero = torch.zeros(0, device=next(self.parameters()).device)
+            else:
+                zero = zero.reshape(zero.shape[0], -1).sum(-1) * 0.0
+            return zero, {"kl": zero, "cosine": zero}
+        return self.latent_concept_memory.graph_prediction_scores(
             source_slots, target_slots, temperature=temperature,
             self_loop_w=self_loop_w, transitive_steps=transitive_steps,
             transitive_w=transitive_w, target_power=target_power)
@@ -2865,6 +2882,70 @@ def reading_latent_curiosity_records(
                       "mean_association": (
                           float(np.mean(association_values))
                           if association_values else 0.0),
+                      "skipped": False}
+
+
+def reading_latent_graph_prediction_records(
+        model, vocab, records, device=DEV, n=0, seed=0, context_keep_p=0.5,
+        feature_dropout=0.0, temperature=0.1, self_loop_w=0.05,
+        transitive_steps=2, transitive_w=0.1, target_power=1.0):
+    memory = getattr(model, "latent_concept_memory", None)
+    if getattr(model, "latent_concepts", None) is None or memory is None:
+        return [], {"n_records": 0, "sampled": False, "n_selected": 0,
+                    "mean_score": 0.0, "max_score": 0.0,
+                    "mean_kl": 0.0, "mean_cosine": 0.0,
+                    "skipped": True}
+    candidates = [r for r in records if r.split == "train"]
+    sampled = bool(n and n < len(candidates))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=n, replace=False)
+        candidates = [candidates[int(i)] for i in idx]
+    scored = []
+    score_values = []
+    kl_values = []
+    cosine_values = []
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(candidates), 64):
+            batch = candidates[off:off + 64]
+            txt = pack_reading(batch, vocab, device)
+            context_txt, heldout_txt = split_reading_context_target(
+                txt, vocab.pad, context_keep_p=context_keep_p)
+            source_slots = model.latent_concept_states(
+                context_txt, feature_dropout=feature_dropout, project=True)
+            heldout_slots = model.latent_concept_states(
+                heldout_txt, feature_dropout=0.0, project=True)
+            if hasattr(model, "latent_concept_graph_prediction_scores"):
+                scores, parts = model.latent_concept_graph_prediction_scores(
+                    source_slots, heldout_slots, temperature=temperature,
+                    self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+                    transitive_w=transitive_w, target_power=target_power)
+            else:
+                scores, parts = latent_concept_graph_prediction_scores(
+                    source_slots, heldout_slots, memory.active(),
+                    memory.active_relations(), temperature=temperature,
+                    self_loop_w=self_loop_w,
+                    transitive_steps=transitive_steps,
+                    transitive_w=transitive_w, target_power=target_power)
+            kl = parts.get("kl", scores.new_zeros(scores.shape))
+            cosine = parts.get("cosine", scores.new_zeros(scores.shape))
+            for i, rec in enumerate(batch):
+                score = float(scores[i].detach().cpu())
+                scored.append((score, rec))
+                score_values.append(score)
+                kl_values.append(float(kl[i].detach().cpu()))
+                cosine_values.append(float(cosine[i].detach().cpu()))
+    scored.sort(key=lambda row: row[0], reverse=True)
+    selected = [rec for _score, rec in scored]
+    return selected, {"n_records": len(candidates),
+                      "sampled": sampled,
+                      "n_selected": len(selected),
+                      "mean_score": float(np.mean(score_values)) if score_values else 0.0,
+                      "max_score": float(max(score_values)) if score_values else 0.0,
+                      "mean_kl": float(np.mean(kl_values)) if kl_values else 0.0,
+                      "mean_cosine": (
+                          float(np.mean(cosine_values)) if cosine_values else 0.0),
                       "skipped": False}
 
 
@@ -5271,7 +5352,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     if float(replay_w) < 0.0:
         raise ValueError("reading replay loss weight must be non-negative")
     study_strategy = str(study_strategy)
-    if study_strategy not in ("random", "errors", "curiosity"):
+    if study_strategy not in ("random", "errors", "curiosity", "graph"):
         raise ValueError(f"unknown reading study strategy {study_strategy!r}")
     rng = np.random.default_rng(seed)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
@@ -5290,6 +5371,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading graph prediction requires latent concept memory")
     if study_strategy == "curiosity" and getattr(model, "latent_concept_memory", None) is None:
         raise ValueError("reading curiosity study requires latent concept memory")
+    if study_strategy == "graph" and getattr(model, "latent_concept_memory", None) is None:
+        raise ValueError("reading graph study requires latent concept memory")
     if replay_w and (not replay_sources or replay_teacher_model is None
                      or replay_teacher_vocab is None):
         raise ValueError("reading replay loss requires replay records and teacher checkpoint")
@@ -5336,6 +5419,18 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 transitive_steps=association_transitive_steps,
                 transitive_w=association_transitive_w)
             report = report | {"strategy": "curiosity"}
+        elif study_strategy == "graph":
+            selected, report = reading_latent_graph_prediction_records(
+                model, vocab, records, device=device, n=probe_n,
+                seed=seed + 1301 + int(step),
+                context_keep_p=context_keep_p,
+                feature_dropout=0.0,
+                temperature=graph_predict_temperature,
+                self_loop_w=graph_predict_self_loop_w,
+                transitive_steps=graph_predict_transitive_steps,
+                transitive_w=graph_predict_transitive_w,
+                target_power=graph_predict_target_power)
+            report = report | {"strategy": "graph"}
         else:
             hard, _correct, report = reading_latent_record_outcomes(
                 model, vocab, records, device=device, n=probe_n,
@@ -5345,7 +5440,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
             selected = list(hard)
             report = report | {"strategy": "errors"}
         if study_hard_max and len(selected) > int(study_hard_max):
-            if study_strategy == "curiosity":
+            if study_strategy in ("curiosity", "graph"):
                 selected = selected[:int(study_hard_max)]
             else:
                 cap_rng = np.random.default_rng(seed + 1759 + int(step))
@@ -5389,7 +5484,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
 
     for st in range(1, steps + 1):
         model.train()
-        if study_strategy in ("errors", "curiosity") and (st == 1 or (
+        if study_strategy in ("errors", "curiosity", "graph") and (st == 1 or (
                 study_refresh_steps and (st - 1) % int(study_refresh_steps) == 0)):
             refresh_study_pool(st)
             model.train()
@@ -5403,7 +5498,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 and (st - 1) % int(cluster_refresh_steps) == 0)):
             refresh_clusters(st)
             model.train()
-        source = (study_pool if study_strategy in ("errors", "curiosity")
+        source = (study_pool if study_strategy in ("errors", "curiosity", "graph")
                   and study_pool else train_records)
         rec_batch = batch_records(source, rng, batch)
         txt = pack_reading(rec_batch, vocab, device)
@@ -10680,10 +10775,11 @@ def main(argv=None):
                     help="minimum margin over other mined cluster prototypes")
     ap.add_argument("--reading-cluster-min-size", type=int, default=2,
                     help="minimum records per mined latent cluster")
-    ap.add_argument("--reading-study-strategy", choices=("random", "errors", "curiosity"),
+    ap.add_argument("--reading-study-strategy",
+                    choices=("random", "errors", "curiosity", "graph"),
                     default="errors",
                     help=("train raw reading on random chunks, retrieval failures, "
-                          "or concept-graph curiosity"))
+                          "concept-graph curiosity, or graph-prediction surprise"))
     ap.add_argument("--reading-study-probe-n", type=int, default=0,
                     help="number of train chunks to probe for raw reading hard examples")
     ap.add_argument("--reading-study-hard-max", type=int, default=0,
