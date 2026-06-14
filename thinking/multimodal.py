@@ -2,7 +2,7 @@
 
 This module intentionally has no built-in sensory oracle or fixed modality schema.
 It trains from a JSONL manifest where each record supplies optional named feature
-views, text tokens, and a target token sequence.  The bridge learns to fuse those
+views, text tokens, and an optional target token sequence.  The bridge learns to fuse those
 views into continuous prefixes for one ScratchpadLM decoder.
 
 Example manifest row:
@@ -142,8 +142,9 @@ def _record_from_json(obj, idx, root=None):
         text = _tokens(text_value, field=text_key, rec_id=rec_id)
     target_key, target_value = _first_present(obj, TARGET_KEYS)
     if target_key is None:
-        raise ValueError(f"{rec_id}: manifest record must contain target tokens")
-    target = _tokens(target_value, field=target_key, rec_id=rec_id)
+        target = ()
+    else:
+        target = _tokens(target_value, field=target_key, rec_id=rec_id)
     views = _feature_views(obj, root=root, rec_id=rec_id)
     meta = dict(obj.get("meta", {})) if isinstance(obj.get("meta", {}), dict) else {}
     return MultimodalRecord(rec_id, split, text, target, views, meta)
@@ -603,8 +604,13 @@ class MultimodalLM(nn.Module):
         prefix, _concepts = self.encode_prefix(features, txt, mode=mode)
         return self.decoder_prefix_from_encoded(prefix)
 
+    def _empty_logits(self, ids, prefix):
+        return prefix.new_zeros(
+            (ids.shape[0], ids.shape[1], int(self.config["vocab_size"])))
+
     def mode_bundle(self, features, txt, ids, mode="full", need_latent=False,
-                    latent_view_dropout=0.0, latent_project=False):
+                    latent_view_dropout=0.0, latent_project=False,
+                    need_logits=True):
         prefix, concepts = self.encode_prefix(features, txt, mode=mode)
         latent_state_tensor = None
         if (self.latent_concept_prefix or need_latent) and self.latent_concepts is not None:
@@ -612,7 +618,10 @@ class MultimodalLM(nn.Module):
                 prefix, view_dropout=latent_view_dropout, project=latent_project)
         decoder_prefix = self.decoder_prefix_from_encoded(
             prefix, latent_state_tensor=latent_state_tensor)
-        logits = self.lm(ids, prefix=decoder_prefix)[:, decoder_prefix.shape[1]:]
+        if need_logits and ids.shape[1] > 0:
+            logits = self.lm(ids, prefix=decoder_prefix)[:, decoder_prefix.shape[1]:]
+        else:
+            logits = self._empty_logits(ids, decoder_prefix)
         out = {"logits": logits, "prefix": prefix, "concepts": concepts}
         if need_latent:
             out["latent_concepts"] = latent_state_tensor
@@ -620,6 +629,8 @@ class MultimodalLM(nn.Module):
 
     def forward(self, features, txt, ids, mode="full"):
         prefix = self.decoder_prefix(features, txt, mode=mode)
+        if ids.shape[1] == 0:
+            return self._empty_logits(ids, prefix)
         logits = self.lm(ids, prefix=prefix)
         return logits[:, prefix.shape[1]:]
 
@@ -1322,6 +1333,10 @@ def evaluate(model, records, vocab, view_dims, n=200, seed=1,
         "loss": float(np.mean(losses)) if losses else 0.0,
         "token_acc": correct / max(1, total),
         "exact": exact / max(1, rows),
+        "target_tokens": int(total),
+        "target_rows": int(rows),
+        "token_skipped": total == 0,
+        "exact_skipped": rows == 0,
         "n_records": int(len(sample)),
         "mode": mode,
     }
@@ -1529,8 +1544,14 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
         row for row in mode_metrics.values()
         if int(row.get("n_records", 0)) > 0
     ]
-    token_values = [float(row.get("token_acc", 0.0)) for row in active_modes]
-    exact_values = [float(row.get("exact", 0.0)) for row in active_modes]
+    token_values = [
+        float(row.get("token_acc", 0.0)) for row in active_modes
+        if not bool(row.get("token_skipped", False))
+    ]
+    exact_values = [
+        float(row.get("exact", 0.0)) for row in active_modes
+        if not bool(row.get("exact_skipped", False))
+    ]
     token_score = float(np.mean(token_values)) if token_values else 0.0
     exact_score = float(np.mean(exact_values)) if exact_values else 0.0
     mode_floor = float(min(token_values)) if token_values else 0.0
@@ -1567,10 +1588,11 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
     all_score = float(np.mean(list(scores.values())))
     signal_coverage = sum(0 if skipped[name] else 1 for name in scores) / float(
         len(scores))
+    mode_floor_score = mode_floor if token_values else active_mean_score
     mastery_score = (
         0.4 * active_mean_score
         + 0.2 * balanced_score
-        + 0.2 * mode_floor
+        + 0.2 * mode_floor_score
         + 0.2 * signal_coverage)
     if metric == "token":
         score = token_score
@@ -1600,6 +1622,7 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
             "token_score": float(token_score),
             "exact_score": float(exact_score),
             "mode_floor": float(mode_floor),
+            "mode_floor_score": float(mode_floor_score),
             "mode_gap": float(mode_gap),
             "fer_score": float(fer_score),
             "fer_raw_score": float(fer_raw_score),
@@ -1624,6 +1647,10 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
                     "token_acc": float(row.get("token_acc", 0.0)),
                     "exact": float(row.get("exact", 0.0)),
                     "loss": float(row.get("loss", 0.0)),
+                    "target_tokens": int(row.get("target_tokens", 0)),
+                    "target_rows": int(row.get("target_rows", 0)),
+                    "token_skipped": bool(row.get("token_skipped", False)),
+                    "exact_skipped": bool(row.get("exact_skipped", False)),
                 }
                 for mode, row in sorted(mode_metrics.items())
             }}
@@ -1932,7 +1959,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           device=DEV, log_every=100, layers=3, heads=4, max_len=128,
           view_tokens=4, txt_tokens=8, trunk_arch="mlp",
           trunk_width=128, trunk_depth=1, text_layers=1,
-          text_arch="transformer", modality_dropout=0.0, agreement_w=0.0,
+          text_arch="transformer", modality_dropout=0.0, decode_w=1.0,
+          agreement_w=0.0,
           text_checkpoint=None, concept_tokens=4, fusion_layers=1,
           latent_concept_slots=0, latent_concept_layers=1,
           latent_concept_prefix=False, latent_concept_w=0.0,
@@ -2015,6 +2043,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_concept_sequence_w,
         latent_concept_neighborhood_w,
         latent_concept_transition_w, latent_concept_cluster_w)
+    if float(decode_w) < 0.0:
+        raise ValueError("decoder loss weight must be non-negative")
     if any(float(w) < 0.0 for w in latent_weights):
         raise ValueError("latent concept loss weights must be non-negative")
     if int(latent_concept_fer_probe_n) < 0:
@@ -2202,7 +2232,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             mode: model.mode_bundle(
                 features, txt, ids, mode=mode, need_latent=needs_latent,
                 latent_view_dropout=latent_concept_view_dropout,
-                latent_project=True)
+                latent_project=True,
+                need_logits=bool(float(decode_w) > 0.0 or float(agreement_w) > 0.0))
             for mode in MODES
         }
         logits_by_mode = {mode: bundle["logits"]
@@ -2293,7 +2324,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 margin=latent_concept_cluster_margin,
                 min_cluster_size=latent_concept_cluster_min_size)
             if latent_concept_cluster_w else base_loss * 0.0)
-        loss = (base_loss + float(agreement_w) * agreement
+        loss = (float(decode_w) * base_loss + float(agreement_w) * agreement
                 + float(latent_concept_w) * latent_concept
                 + float(latent_concept_factorization_w) * latent_factorization
                 + float(latent_concept_fer_w) * latent_fer
@@ -2334,6 +2365,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         bridge_metrics = latent_multimodal_bridge_metrics_from_views(model, latent_views)
         last = {
             "loss": float(loss.detach()),
+            "decode_w": float(decode_w),
             "token_loss": float(base_loss.detach()),
             "agreement_loss": float(agreement.detach()),
             "latent_concept_loss": float(latent_concept.detach()),
@@ -2740,6 +2772,36 @@ def selftest():
         assert math.isfinite(trained_model.train_metrics["latent_sequence_loss"])
         assert (trained_model.train_metrics[
             "latent_sequence_transition_last_batch_updates"] > 0)
+        no_target_manifest = os.path.join(tmpdir, "mm_no_target.jsonl")
+        no_target_rows = []
+        for i in range(6):
+            base = np.zeros(3, dtype=np.float32)
+            base[i % 3] = 1.0
+            no_target_rows.append({
+                "id": f"untargeted-{i}",
+                "split": "eval" if i >= 4 else "train",
+                "text": ["caption", "cluster", str(i % 3)],
+                "views": {"sensor": base.astype(float).tolist()},
+                "meta": {"source": "untargeted", "chunk_index": i},
+            })
+        with open(no_target_manifest, "w") as f:
+            for row in no_target_rows:
+                f.write(json.dumps(row) + "\n")
+        no_target_records = load_manifest(no_target_manifest)
+        assert no_target_records[0].target == ()
+        no_target_model, no_target_vocab, _all, _trn, no_target_eval, no_target_dims = train(
+            no_target_manifest, steps=1, batch=2, d=32, layers=1, heads=4,
+            device="cpu", log_every=10, view_tokens=2, txt_tokens=4,
+            decode_w=0.0, concept_tokens=2, latent_concept_slots=3,
+            latent_concept_memory_size=8, latent_concept_memory_w=0.01,
+            latent_concept_bridge_w=0.01)
+        assert no_target_model.train_metrics["decode_w"] == 0.0
+        no_target_bundle = multimodal_eval_bundle(
+            no_target_model, no_target_eval, no_target_vocab, no_target_dims,
+            n=0, device="cpu", score_metric="mastery")
+        assert no_target_bundle["score_components"]["token_skipped"] is True
+        assert no_target_bundle["score_components"]["exact_skipped"] is True
+        assert no_target_bundle["score_components"]["bridge_skipped"] is False
         discovery_model, *_ = train(
             manifest, steps=2, batch=2, d=32, layers=1, heads=4, device="cpu",
             log_every=2, view_tokens=2, txt_tokens=4,
@@ -2792,7 +2854,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--manifest", default=None,
-                    help="JSONL manifest with text/features/target tokens")
+                    help="JSONL manifest with text/features and optional target tokens")
     ap.add_argument("--root", default=None,
                     help="root for relative .npy feature paths inside the manifest")
     ap.add_argument("--steps", type=int, default=400)
@@ -2807,6 +2869,8 @@ def main(argv=None):
     ap.add_argument("--log-every", type=int, default=100, dest="log_every")
     ap.add_argument("--agreement-w", type=float, default=0.0, dest="agreement_w",
                     help="cross-mode token-distribution agreement loss weight")
+    ap.add_argument("--decode-w", type=float, default=1.0, dest="decode_w",
+                    help="target-token decoder loss weight; set 0 for latent-only bridge training")
     ap.add_argument("--text-checkpoint", default=None, dest="text_checkpoint",
                     help="optional thinking.text checkpoint for text/latent warm start")
     ap.add_argument("--concept-tokens", type=int, default=4, dest="concept_tokens",
@@ -3007,8 +3071,8 @@ def main(argv=None):
         args.latent_concept_neighborhood_w, args.latent_concept_transition_w,
         args.latent_concept_cluster_w,
     ]
-    if any(w < 0.0 for w in latent_weights) or args.agreement_w < 0.0:
-        ap.error("agreement/latent loss weights must be non-negative")
+    if any(w < 0.0 for w in latent_weights) or args.agreement_w < 0.0 or args.decode_w < 0.0:
+        ap.error("decoder/agreement/latent loss weights must be non-negative")
     if args.latent_concept_view_dropout < 0.0 or args.latent_concept_view_dropout >= 1.0:
         ap.error("--latent-concept-view-dropout must be in [0, 1)")
     if (args.latent_concept_fer_fragmentation_w < 0.0
@@ -3072,7 +3136,8 @@ def main(argv=None):
         trunk_arch=args.trunk_arch, trunk_width=args.trunk_width,
         trunk_depth=args.trunk_depth, text_layers=args.text_layers,
         text_arch=args.text_arch, modality_dropout=args.modality_dropout,
-        agreement_w=args.agreement_w, text_checkpoint=args.text_checkpoint,
+        decode_w=args.decode_w, agreement_w=args.agreement_w,
+        text_checkpoint=args.text_checkpoint,
         concept_tokens=args.concept_tokens, fusion_layers=args.fusion_layers,
         latent_concept_slots=args.latent_concept_slots,
         latent_concept_layers=args.latent_concept_layers,

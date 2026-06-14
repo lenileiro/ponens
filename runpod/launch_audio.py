@@ -61,6 +61,8 @@ def payload(args):
         jobs.append(f"{PY}.mimic --train --steps 16000 --out runs/a5_mimic_gpu.json")
     if args.job in ("all", "vocoder"):
         jobs.append(f"{PY}.neuralvocoder --train --steps 30000 --out runs/neural_vocoder.json --checkpoint runs/neural_vocoder.pt")
+    if args.job in ("all", "vocoder-gan"):
+        jobs.append(f"{PY}.vocoder_gan --train --steps 60000 --out runs/vocoder_gan.json --checkpoint runs/vocoder_gan.pt")
     # non-fatal chaining: one job's failure must not kill the rest
     return " ; ".join(jobs)
 
@@ -69,7 +71,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--go", action="store_true")
     ap.add_argument("--job", default="all",
-                    choices=("all", "sing-sweep", "polyglot", "pronounce", "mimic", "vocoder"))
+                    choices=("all", "sing-sweep", "polyglot", "pronounce", "mimic", "vocoder", "vocoder-gan"))
     ap.add_argument("--gpu", default="NVIDIA H100 80GB HBM3")
     ap.add_argument("--cloud", default="SECURE")
     ap.add_argument("--disk", type=int, default=40)
@@ -86,7 +88,7 @@ def main(argv=None):
     cap = args.max_minutes * 60
     run = payload(args)
     # say-banks needed by pronounce/mimic (pods have no macOS `say`)
-    need_banks = args.job in ("all", "pronounce", "mimic", "vocoder")
+    need_banks = args.job in ("all", "pronounce", "mimic", "vocoder", "vocoder-gan")
 
     setup = "pip install -q numpy tokenizers pandas pyarrow"
     remote = (f"cd {REMOTE} && rm -f /root/thinking.log && "

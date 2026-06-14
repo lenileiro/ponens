@@ -1091,6 +1091,7 @@ def payload(args):
                 f"--batch {args.multimodal_batch} --dim {mm_dim} "
                 f"--layers {args.multimodal_layers} --heads {args.multimodal_heads} "
                 f"--lr {args.multimodal_lr} --log-every {args.multimodal_log_every} "
+                f"--decode-w {args.multimodal_decode_w} "
                 f"--agreement-w {args.multimodal_agreement_w} "
                 f"--concept-tokens {args.multimodal_concept_tokens} "
                 f"--fusion-layers {args.multimodal_fusion_layers} "
@@ -2402,6 +2403,9 @@ def main():
     ap.add_argument("--multimodal-lr", type=float, default=1e-3, dest="multimodal_lr")
     ap.add_argument("--multimodal-log-every", type=int, default=100,
                     dest="multimodal_log_every")
+    ap.add_argument("--multimodal-decode-w", type=float, default=1.0,
+                    dest="multimodal_decode_w",
+                    help="M-0 target-token decoder loss weight; set 0 for latent-only runs")
     ap.add_argument("--multimodal-agreement-w", type=float, default=0.0,
                     dest="multimodal_agreement_w",
                     help="cross-mode token-distribution agreement loss weight")
@@ -3104,6 +3108,7 @@ def main():
         if args.multimodal_lr <= 0.0:
             sys.exit("ERROR: --multimodal-lr must be positive")
         multimodal_nonnegative = {
+            "--multimodal-decode-w": args.multimodal_decode_w,
             "--multimodal-agreement-w": args.multimodal_agreement_w,
             "--multimodal-latent-concept-w": args.multimodal_latent_concept_w,
             "--multimodal-latent-concept-invariance-w": (
