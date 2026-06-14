@@ -1,17 +1,15 @@
-"""M-0: the multimodal bridge — ONE ScratchpadLM that SEES, HEARS, READS, and emits facts.
+"""Multimodal bridge: one ScratchpadLM that sees, hears, reads, and emits facts.
 
 Image patches and audio spectrogram frames enter as continuous prefix embeddings (modality-tagged)
 before the token stream.  A transcript/caption enters through the same prefix interface.  The
 model emits the SAME extract-trace grammar used everywhere else:
 
-  [IMG prefix][AUD prefix][TXT prefix] extract fact p0 color red . fact p0 shape circle .
-                                        fact a0 pitch n440 . fact a0 timbre saw . fact a0 env decay . done .
+  [IMG prefix][AUD prefix][TXT prefix] extract fact a0 pitch n440 .
+                                        fact a0 timbre saw . fact a0 env decay . done .
 
-Both worlds are synthetic with oracle factors (vision.py shapes, audio.py tones), so supervision
-is oracle-sound and the FER question becomes cross-modal: one unified extraction circuit fed by
-three readers, or three entangled task-specific ones. The language gate is intentionally not
-"predict the next token in the caption": held-out transcript phrasings are encoded as a sensory
-prefix and must map to the same canonical facts with image/audio zeroed.
+The language gate is intentionally not "predict the next token in the caption": held-out
+transcript phrasings are encoded as a sensory prefix and must map to the same facts with
+the audio prefix zeroed.
 
   python -m thinking.multimodal --selftest
   python -m thinking.multimodal --steps 400 --out runs/m0_multimodal.json
@@ -52,11 +50,9 @@ from .concepts import (
     schema_concept_prototype_spread_loss,
     schema_concept_state_spread_loss,
 )
-from .vision import COLORS, SHAPES, ObjectSpec, render_object, sample_object
 from .trace import Vocab
 
 DEV = get_device()
-COLOR_NAMES = tuple(COLORS)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_SURFACES = os.path.join(ROOT, "data", "multimodal_transcripts.json")
 MODES = ("full", "sensor_only", "text_only")
@@ -64,20 +60,16 @@ MULTIMODAL_STUDY_METRICS = ("latent", "concept", "decoder", "balanced")
 TRUNK_ARCHES = ("conv", "residual")
 TEXT_TRUNK_ARCHES = ("transformer", "standard", "relational", "abstractor")
 FACTOR_VALUES = {
-    "color": COLOR_NAMES,
-    "shape": SHAPES,
     "pitch": PITCH_NAMES,
     "timbre": TIMBRES,
     "env": ENVELOPES,
 }
 FACTOR_KEYS = {
-    "color": ("p0", "color"),
-    "shape": ("p0", "shape"),
     "pitch": ("a0", "pitch"),
     "timbre": ("a0", "timbre"),
     "env": ("a0", "env"),
 }
-VALUE_POS = {"color": 4, "shape": 9, "pitch": 14, "timbre": 19, "env": 24}  # value tokens
+VALUE_POS = {"pitch": 4, "timbre": 9, "env": 14}  # value tokens
 FACTOR_INDEX = {k: {v: i for i, v in enumerate(vals)}
                 for k, vals in FACTOR_VALUES.items()}
 FORMATTER = string.Formatter()
@@ -165,10 +157,8 @@ def render_transcript(gold, rng, surfaces, split="train"):
 
 
 def sample_gold(rng):
-    obj = sample_object(rng, slot="p0")
     clip = sample_clip(rng)
-    return {"color": obj.color, "shape": obj.shape, "pitch": clip["pitch"],
-            "timbre": clip["timbre"], "env": clip["envelope"]}
+    return {"pitch": clip["pitch"], "timbre": clip["timbre"], "env": clip["envelope"]}
 
 
 def sample_text_and_gold(rng, surfaces, split="train"):
@@ -184,10 +174,8 @@ def sample_text_and_gold(rng, surfaces, split="train"):
 
 
 def render_modalities(gold, rng):
-    base = sample_object(rng, slot="p0")
-    obj = ObjectSpec("p0", gold["color"], gold["shape"], x=base.x, y=base.y, scale=base.scale)
     clip = sample_clip(rng)
-    img = render_object(obj, size=32)
+    img = rng.random((3, 32, 32), dtype=np.float32)
     aud = spectrogram(render_tone(gold["pitch"], gold["timbre"], gold["env"],
                                   clip["detune"], clip["amp"], clip["phase"], rng=rng))
     return img, aud
@@ -195,8 +183,6 @@ def render_modalities(gold, rng):
 
 def trace_tokens(gold):
     return ["extract",
-            "fact", "p0", "color", gold["color"], ".",
-            "fact", "p0", "shape", gold["shape"], ".",
             "fact", "a0", "pitch", gold["pitch"], ".",
             "fact", "a0", "timbre", gold["timbre"], ".",
             "fact", "a0", "env", gold["env"], ".",
@@ -908,9 +894,9 @@ class MultimodalLM(nn.Module):
 
 def build_vocab(surfaces=None):
     surfaces = surfaces or load_text_surfaces()
-    toks = ["extract", "fact", "done", ".", "p0", "a0", "color", "shape", "pitch", "timbre",
-            "env"]
-    toks += list(COLOR_NAMES) + list(SHAPES) + list(PITCH_NAMES) + list(TIMBRES) + list(ENVELOPES)
+    toks = ["extract", "fact", "done", ".", "a0", "pitch", "timbre", "env"]
+    for values in FACTOR_VALUES.values():
+        toks += list(values)
     for tpl in surfaces["train"] + surfaces["eval"]:
         toks += [w for w in _split_words(tpl)
                  if not (w.startswith("{") and w.endswith("}"))]
@@ -1188,6 +1174,95 @@ def multimodal_latent_curiosity_examples(
                       "skipped": False}
 
 
+def multimodal_latent_graph_prediction_examples(
+        model, vocab, surfaces, n=0, seed=0, device=DEV, text_split="train",
+        source_modes=None, temperature=0.1, self_loop_w=0.05,
+        transitive_steps=2, transitive_w=0.1, target_power=1.0,
+        examples=None):
+    memory = getattr(model, "latent_concept_memory", None)
+    if getattr(model, "latent_concepts", None) is None or memory is None:
+        return [], {"n_records": 0, "sampled": False, "n_selected": 0,
+                    "mean_score": 0.0, "max_score": 0.0,
+                    "mean_kl": 0.0, "mean_cosine": 0.0,
+                    "source_modes": [], "skipped": True}
+    source_modes = tuple(m for m in (source_modes or MODES) if m != "full")
+    if not source_modes:
+        return [], {"n_records": 0, "sampled": False, "n_selected": 0,
+                    "mean_score": 0.0, "max_score": 0.0,
+                    "mean_kl": 0.0, "mean_cosine": 0.0,
+                    "source_modes": [], "skipped": True}
+    if examples is None:
+        rng = np.random.default_rng(seed)
+        count = int(n) if int(n) > 0 else 1
+        examples = _sample_examples(count, rng, surfaces, text_split=text_split)
+        sampled = True
+    else:
+        examples = list(examples)
+        sampled = False
+        if n and n < len(examples):
+            rng = np.random.default_rng(seed)
+            idx = rng.choice(len(examples), size=int(n), replace=False)
+            examples = [examples[int(i)] for i in idx]
+            sampled = True
+    scored = []
+    score_values = []
+    kl_values = []
+    cosine_values = []
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(examples), 64):
+            batch_examples = examples[off:off + 64]
+            img, aud, txt, _ids, _golds = _batch_from_examples(
+                batch_examples, vocab, device)
+            target = model.latent_concept_states(
+                img, aud, txt, mode="full", project=True)
+            scores_by_mode = []
+            kl_by_mode = []
+            cosine_by_mode = []
+            for mode in source_modes:
+                source = model.latent_concept_states(
+                    img, aud, txt, mode=mode, project=True)
+                if hasattr(model, "latent_concept_graph_prediction_scores"):
+                    scores, parts = model.latent_concept_graph_prediction_scores(
+                        source, target, temperature=temperature,
+                        self_loop_w=self_loop_w,
+                        transitive_steps=transitive_steps,
+                        transitive_w=transitive_w,
+                        target_power=target_power)
+                else:
+                    scores, parts = latent_concept_graph_prediction_scores(
+                        source, target, memory.active(), memory.active_relations(),
+                        temperature=temperature, self_loop_w=self_loop_w,
+                        transitive_steps=transitive_steps,
+                        transitive_w=transitive_w,
+                        target_power=target_power)
+                scores_by_mode.append(scores)
+                kl_by_mode.append(parts.get("kl", scores.new_zeros(scores.shape)))
+                cosine_by_mode.append(
+                    parts.get("cosine", scores.new_zeros(scores.shape)))
+            batch_scores = torch.stack(scores_by_mode).mean(0)
+            batch_kl = torch.stack(kl_by_mode).mean(0)
+            batch_cosine = torch.stack(cosine_by_mode).mean(0)
+            for i, ex in enumerate(batch_examples):
+                score = float(batch_scores[i].detach().cpu())
+                scored.append((score, ex))
+                score_values.append(score)
+                kl_values.append(float(batch_kl[i].detach().cpu()))
+                cosine_values.append(float(batch_cosine[i].detach().cpu()))
+    scored.sort(key=lambda row: row[0], reverse=True)
+    selected = [ex for _score, ex in scored]
+    return selected, {"n_records": len(examples),
+                      "sampled": sampled,
+                      "n_selected": len(selected),
+                      "mean_score": float(np.mean(score_values)) if score_values else 0.0,
+                      "max_score": float(max(score_values)) if score_values else 0.0,
+                      "mean_kl": float(np.mean(kl_values)) if kl_values else 0.0,
+                      "mean_cosine": (
+                          float(np.mean(cosine_values)) if cosine_values else 0.0),
+                      "source_modes": list(source_modes),
+                      "skipped": False}
+
+
 def concept_geometry_evaluate(model, vocab, surfaces, n=200, seed=13, device=DEV,
                               text_split="eval", mode="full"):
     """Same-value geometry diagnostic for schema concept states.
@@ -1271,9 +1346,7 @@ def parse_facts(tokens):
             i += 1
             continue
         slot, pred, val = tokens[i + 1], tokens[i + 2], tokens[i + 3]
-        if slot == "p0" and pred in ("color", "shape"):
-            out[pred] = val
-        elif slot == "a0" and pred in ("pitch", "timbre", "env"):
+        if slot == "a0" and pred in ("pitch", "timbre", "env"):
             out[pred] = val
         i += 5
     return out
@@ -2117,7 +2190,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         raise ValueError("latent concept cluster min size must be at least two")
     study_strategy = str(study_strategy)
     study_score_metric = str(study_score_metric)
-    if study_strategy not in ("random", "errors", "curiosity"):
+    if study_strategy not in ("random", "errors", "curiosity", "graph"):
         raise ValueError(f"unknown multimodal study strategy {study_strategy!r}")
     if study_score_metric not in MULTIMODAL_STUDY_METRICS:
         raise ValueError(f"unknown multimodal study score metric {study_score_metric!r}")
@@ -2125,6 +2198,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         raise ValueError("latent multimodal study requires latent_concept_slots > 0")
     if study_strategy == "curiosity" and latent_concept_memory_size <= 0:
         raise ValueError("multimodal curiosity study requires latent concept memory")
+    if study_strategy == "graph" and latent_concept_memory_size <= 0:
+        raise ValueError("multimodal graph study requires latent concept memory")
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     surfaces = load_text_surfaces(surfaces_path)
@@ -2158,6 +2233,16 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     study_reports = []
     study_pool = []
 
+    def graph_study_ready():
+        memory = getattr(model, "latent_concept_memory", None)
+        if study_strategy != "graph":
+            return True
+        if memory is None:
+            return False
+        filled = int(getattr(memory, "filled", torch.zeros((), dtype=torch.long)).item())
+        updates = int(getattr(memory, "relation_updates", torch.zeros((), dtype=torch.long)).item())
+        return filled > 0 and updates > 0
+
     def refresh_study_pool(step):
         nonlocal study_pool
         probe_n = int(study_probe_n) if int(study_probe_n) > 0 else max(batch * 4, 1)
@@ -2169,6 +2254,16 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                 transitive_steps=latent_concept_association_transitive_steps,
                 transitive_w=latent_concept_association_transitive_w)
             hard_report = hard_report | {"strategy": "curiosity"}
+        elif study_strategy == "graph":
+            selected, hard_report = multimodal_latent_graph_prediction_examples(
+                model, vocab, surfaces, n=probe_n, seed=seed + 1009 + int(step),
+                device=device, text_split="train",
+                temperature=latent_concept_graph_predict_temperature,
+                self_loop_w=latent_concept_graph_predict_self_loop_w,
+                transitive_steps=latent_concept_graph_predict_transitive_steps,
+                transitive_w=latent_concept_graph_predict_transitive_w,
+                target_power=latent_concept_graph_predict_target_power)
+            hard_report = hard_report | {"strategy": "graph"}
         else:
             errors, _correct, hard_report = multimodal_factor_record_outcomes(
                 model, vocab, surfaces, n=probe_n, seed=seed + 1009 + int(step),
@@ -2176,7 +2271,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
             selected = list(errors)
             hard_report = hard_report | {"strategy": "errors"}
         if study_hard_max and len(selected) > int(study_hard_max):
-            if study_strategy == "curiosity":
+            if study_strategy in ("curiosity", "graph"):
                 selected = selected[:int(study_hard_max)]
             else:
                 cap_rng = np.random.default_rng(seed + 2003 + int(step))
@@ -2213,11 +2308,13 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     last_latent_factor = 0.0
     for st in range(1, steps + 1):
         model.train()
-        if study_strategy in ("errors", "curiosity") and (st == 1 or (
-                study_refresh_steps and (st - 1) % int(study_refresh_steps) == 0)):
-            refresh_study_pool(st)
-            model.train()
-        if study_strategy in ("errors", "curiosity") and study_pool:
+        refresh_due = (not study_pool or st == 1 or (
+            study_refresh_steps and (st - 1) % int(study_refresh_steps) == 0))
+        if study_strategy in ("errors", "curiosity", "graph") and refresh_due:
+            if study_strategy != "graph" or graph_study_ready():
+                refresh_study_pool(st)
+                model.train()
+        if study_strategy in ("errors", "curiosity", "graph") and study_pool:
             img, aud, txt, ids, golds = _batch_from_examples(
                 _sample_from_pool(study_pool, batch, rng), vocab, device)
         else:
@@ -2570,8 +2667,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     return model, vocab, surfaces
 
 
-CHANCE = {"color": 1 / len(COLORS), "shape": 1 / len(SHAPES),
-          "pitch": 1 / len(PITCH_NAMES), "timbre": 1 / len(TIMBRES),
+CHANCE = {"pitch": 1 / len(PITCH_NAMES), "timbre": 1 / len(TIMBRES),
           "env": 1 / len(ENVELOPES)}
 
 
@@ -3019,23 +3115,23 @@ def selftest():
     vocab = build_vocab(surfaces)
     img, aud, txt, toks, gold = sample_example(rng, surfaces)
     txt_eval = render_transcript(gold, rng, surfaces, split="eval")
-    assert toks[VALUE_POS["color"]] == gold["color"] and toks[VALUE_POS["env"]] == gold["env"]
+    assert toks[VALUE_POS["pitch"]] == gold["pitch"] and toks[VALUE_POS["env"]] == gold["env"]
     assert all(t in vocab.stoi for t in toks + txt + txt_eval), \
         "grammar/text token missing from vocab"
     example_surfaces = {
         "train": [],
         "eval": [],
-        "train_examples": [{"tokens": ["external", "sentence", "says", "red", "circle"],
-                            "facts": {"color": "red", "shape": "circle", "pitch": "n440",
-                                      "timbre": "saw", "env": "decay"}}],
-        "eval_examples": [{"tokens": ["external", "sentence", "says", "blue", "square"],
-                           "facts": {"color": "blue", "shape": "square", "pitch": "n262",
-                                     "timbre": "sine", "env": "flat"}}],
+        "train_examples": [{"tokens": ["external", "sentence", "says", "n440", "saw"],
+                            "facts": {"pitch": "n440", "timbre": "saw",
+                                      "env": "decay"}}],
+        "eval_examples": [{"tokens": ["external", "sentence", "says", "n262", "sine"],
+                           "facts": {"pitch": "n262", "timbre": "sine",
+                                     "env": "flat"}}],
     }
     ex_vocab = build_vocab(example_surfaces)
     _img2, _aud2, ex_txt, ex_toks, ex_gold = sample_example(
         np.random.default_rng(1), example_surfaces)
-    assert ex_gold["color"] == "red" and ex_txt[0] == "external"
+    assert ex_gold["pitch"] == "n440" and ex_txt[0] == "external"
     assert all(t in ex_vocab.stoi for t in ex_txt + ex_toks)
     model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad).to("cpu")
     x, a, tt, ids, golds = _batch(2, rng, vocab, "cpu", surfaces)
@@ -3128,6 +3224,12 @@ def selftest():
         latent_model, vocab, surfaces, n=4, seed=5, device="cpu",
         transitive_steps=2, transitive_w=0.1)
     assert curious_examples and curious_report["skipped"] is False
+    graph_examples, graph_report = multimodal_latent_graph_prediction_examples(
+        latent_model, vocab, surfaces, n=4, seed=5, device="cpu",
+        transitive_steps=2, transitive_w=0.1)
+    assert graph_examples and graph_report["skipped"] is False
+    assert graph_report["n_selected"] == graph_report["n_records"]
+    assert graph_report["mean_score"] >= 0.0
     assert torch.isfinite(latent_multimodal_neighborhood_loss_from_views(
         latent_views, temperature=0.2))
     assert torch.isfinite(latent_multimodal_transition_loss_from_views(
@@ -3158,9 +3260,9 @@ def selftest():
 
         reading_records = [
             ReadingRecord("transfer-train-0", "train",
-                          tuple(_split_words("red circle shared language"))),
+                          tuple(_split_words("n440 saw shared language"))),
             ReadingRecord("transfer-eval-0", "eval",
-                          tuple(_split_words("blue square shared language"))),
+                          tuple(_split_words("n262 sine shared language"))),
         ]
         text_vocab = build_reading_vocab(reading_records)
         text_model = TextFactLM(
@@ -3168,7 +3270,7 @@ def selftest():
             fact_schema=None, latent_concept_slots=3,
             latent_concept_layers=1, latent_concept_memory_size=5).to("cpu")
         with torch.no_grad():
-            text_model.txt.emb.weight[text_vocab.stoi["red"]].fill_(0.314)
+            text_model.txt.emb.weight[text_vocab.stoi["n440"]].fill_(0.314)
             text_model.latent_concepts.queries.fill_(0.271)
             text_model.latent_concept_memory.memory.fill_(0.123)
             text_model.latent_concept_memory.relations.fill_(0.456)
@@ -3185,7 +3287,7 @@ def selftest():
             len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
             latent_concept_slots=3, latent_concept_layers=1,
             latent_concept_memory_size=5).to("cpu")
-        red_before = transfer_model.txt.emb.weight[vocab.stoi["red"]].clone()
+        n440_before = transfer_model.txt.emb.weight[vocab.stoi["n440"]].clone()
         latent_before = transfer_model.latent_concepts.queries.clone()
         memory_before = transfer_model.latent_concept_memory.memory.clone()
         transfer = import_text_checkpoint(transfer_model, vocab, text_ckpt, device="cpu")
@@ -3194,9 +3296,9 @@ def selftest():
         assert transfer["copied_position_rows"] > 0
         assert transfer["copied_text_tensor_count"] > 0
         assert transfer["copied_latent_tensor_count"] > 0
-        red_after = transfer_model.txt.emb.weight[vocab.stoi["red"]]
-        assert not torch.allclose(red_before, red_after)
-        assert torch.allclose(red_after, torch.full_like(red_after, 0.314))
+        n440_after = transfer_model.txt.emb.weight[vocab.stoi["n440"]]
+        assert not torch.allclose(n440_before, n440_after)
+        assert torch.allclose(n440_after, torch.full_like(n440_after, 0.314))
         assert not torch.allclose(latent_before, transfer_model.latent_concepts.queries)
         assert torch.allclose(
             transfer_model.latent_concepts.queries,
@@ -3223,7 +3325,7 @@ def selftest():
             latent_concept_neighborhood_w=0.1,
             latent_concept_transition_w=0.1,
             latent_concept_cluster_w=0.1,
-            study_strategy="curiosity", study_probe_n=4, study_hard_max=2)
+            study_strategy="graph", study_probe_n=4, study_hard_max=2)
         assert auto_model.latent_concept_slots == 3
         assert auto_model.latent_concept_memory_size == 5
         assert auto_model.text_checkpoint_transfer["copied"] is True
@@ -3239,7 +3341,7 @@ def selftest():
         assert auto_model.train_metrics["latent_graph_predict_w"] == 0.1
         assert math.isfinite(auto_model.train_metrics["latent_graph_predict_loss"])
         assert auto_model.train_metrics["latent_graph_predict_loss"] >= -1e-6
-        assert auto_model.study_reports[-1]["strategy"] == "curiosity"
+        assert auto_model.study_reports[-1]["strategy"] == "graph"
         assert auto_model.train_metrics["latent_neighborhood_loss"] >= 0.0
         assert auto_model.train_metrics["latent_transition_loss"] >= 0.0
         assert auto_model.train_metrics["latent_cluster_loss"] >= 0.0
@@ -3275,7 +3377,7 @@ def selftest():
     }
     assert set(factor_logits["full"]) == set(VALUE_POS)
     assert set(factor_states["full"]) == set(VALUE_POS)
-    assert factor_states["full"]["color"].shape == (2, 32)
+    assert factor_states["full"]["pitch"].shape == (2, 32)
     concept_loss = concept_factor_loss(factor_logits, golds)
     assert torch.isfinite(concept_loss), concept_loss
     assert torch.isfinite(concept_factor_contrastive_loss(
@@ -3518,11 +3620,11 @@ def main(argv=None):
                     dest="latent_concept_factor_w",
                     help=("weight for predicting data-defined multimodal factors "
                           "from schema-free latent slots"))
-    ap.add_argument("--study-strategy", choices=("random", "errors", "curiosity"),
+    ap.add_argument("--study-strategy", choices=("random", "errors", "curiosity", "graph"),
                     default="random",
                     dest="study_strategy",
                     help=("sample normal batches, train on current errors, "
-                          "or use concept-graph curiosity"))
+                          "concept-graph curiosity, or graph-prediction surprise"))
     ap.add_argument("--study-score-metric", choices=MULTIMODAL_STUDY_METRICS,
                     default="balanced", dest="study_score_metric",
                     help="metric used to mine multimodal hard examples")
