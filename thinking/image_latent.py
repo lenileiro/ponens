@@ -8561,6 +8561,114 @@ def clone_state_dict(module):
     return {k: v.detach().clone() for k, v in module.state_dict().items()}
 
 
+def clone_compatible_state_dict(module, state_dict, name):
+    current = module.state_dict()
+    missing = sorted(set(current) - set(state_dict))
+    unexpected = sorted(set(state_dict) - set(current))
+    shape_mismatch = []
+    cloned = {}
+    for key, cur in current.items():
+        if key not in state_dict:
+            continue
+        val = state_dict[key]
+        if tuple(val.shape) != tuple(cur.shape):
+            shape_mismatch.append((key, tuple(val.shape), tuple(cur.shape)))
+            continue
+        cloned[key] = val.detach().to(
+            device=cur.device,
+            dtype=cur.dtype if torch.is_floating_point(cur) else cur.dtype
+        ).clone()
+    if missing or unexpected or shape_mismatch:
+        raise RuntimeError(
+            f"{name} checkpoint mismatch: missing={missing}, "
+            f"unexpected={unexpected}, shape_mismatch={shape_mismatch}"
+        )
+    return cloned
+
+
+def load_optional_module_state(module, state_dict, name):
+    if module is None:
+        return "skipped" if state_dict else "disabled"
+    if not state_dict:
+        return "initialized"
+    module.load_state_dict(state_dict)
+    return "loaded"
+
+
+def load_image_training_resume_checkpoint(
+        path, ae, flow, conditioner=None, text_aligner=None,
+        image_feature_aligner=None, image_quality_scorer=None,
+        flow_repa_aligner=None, flow_self_repa_aligner=None, device=DEV):
+    ckpt = torch.load(path, map_location=device)
+    report = ckpt.get("report", {})
+    ae_state = ckpt.get("autoencoder_state_dict", {})
+    if ae_state:
+        ae.load_state_dict(ae_state)
+        ae_status = "loaded"
+    elif any(p.requires_grad for p in ae.parameters()):
+        raise ValueError("resume checkpoint is missing trainable autoencoder weights")
+    else:
+        ae_status = "external"
+    if "flow_state_dict" not in ckpt:
+        raise ValueError("resume checkpoint is missing flow_state_dict")
+    flow_load = load_flow_state(flow, ckpt["flow_state_dict"])
+    if conditioner is not None:
+        cond_state = ckpt.get("conditioner_state_dict")
+        if not cond_state:
+            raise ValueError("resume checkpoint is missing conditioner_state_dict")
+        cond_load = load_conditioner_state(conditioner, cond_state)
+        conditioner_status = "loaded"
+    else:
+        cond_load = {}
+        conditioner_status = "disabled"
+    module_status = {
+        "text_aligner": load_optional_module_state(
+            text_aligner, ckpt.get("text_aligner_state_dict", {}), "text_aligner"),
+        "image_feature_aligner": load_optional_module_state(
+            image_feature_aligner, ckpt.get("image_feature_aligner_state_dict", {}),
+            "image_feature_aligner"),
+        "image_quality_scorer": load_optional_module_state(
+            image_quality_scorer, ckpt.get("image_quality_scorer_state_dict", {}),
+            "image_quality_scorer"),
+        "flow_repa_aligner": load_optional_module_state(
+            flow_repa_aligner, ckpt.get("flow_repa_aligner_state_dict", {}),
+            "flow_repa_aligner"),
+        "flow_self_repa_aligner": load_optional_module_state(
+            flow_self_repa_aligner, ckpt.get("flow_self_repa_aligner_state_dict", {}),
+            "flow_self_repa_aligner"),
+    }
+    flow_ema_state = {}
+    if ckpt.get("flow_ema_state_dict"):
+        flow_ema_state = clone_compatible_state_dict(
+            flow, ckpt["flow_ema_state_dict"], "flow EMA")
+    conditioner_ema_state = {}
+    if conditioner is not None and ckpt.get("conditioner_ema_state_dict"):
+        conditioner_ema_state = clone_compatible_state_dict(
+            conditioner, ckpt["conditioner_ema_state_dict"], "conditioner EMA")
+    resume_report = {
+        "resume_checkpoint": path,
+        "resume_checkpoint_loaded": True,
+        "resume_ae_state": ae_status,
+        "resume_flow_load_missing": flow_load.get("missing", []),
+        "resume_flow_load_unexpected": flow_load.get("unexpected", []),
+        "resume_conditioner_state": conditioner_status,
+        "resume_conditioner_load_missing": cond_load.get("missing", []),
+        "resume_conditioner_load_unexpected": cond_load.get("unexpected", []),
+        "resume_module_state": module_status,
+        "resume_flow_ema_loaded": bool(flow_ema_state),
+        "resume_conditioner_ema_loaded": bool(conditioner_ema_state),
+        "resume_flow_ema_updates": int(ckpt.get(
+            "flow_ema_updates", report.get("flow_ema_updates", 0)) or 0),
+        "resume_flow_ema_effective_decay": float(ckpt.get(
+            "flow_ema_effective_decay", report.get("flow_ema_effective_decay", 0.0)) or 0.0),
+        "resume_checkpoint_experiment": str(report.get("experiment", "")),
+        "resume_checkpoint_flow_steps": int(report.get("flow_steps", 0) or 0),
+        "resume_checkpoint_selected_eval_weights": str(
+            report.get("selected_eval_weights", "")),
+    }
+    return resume_report, flow_ema_state, conditioner_ema_state
+
+
 def ema_effective_decay(target_decay, step, warmup=True):
     if target_decay <= 0.0:
         return 0.0
@@ -9834,6 +9942,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       flow_cache_latents=False, flow_cache_records=0, flow_cache_batch=64,
                       flow_cache_dir="", flow_cache_shard_size=1024, flow_cache_dtype="fp32",
                       flow_cache_max_loaded_shards=0,
+                      resume_checkpoint="",
                       return_conditioner=False, return_ema=False, return_aligner=False):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -10332,6 +10441,28 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     attach_flow_repa_aligner(flow, flow_repa_aligner)
     attach_flow_self_repa_aligner(flow, flow_self_repa_aligner)
     attach_flow_boundary_mode(flow, flow_boundary_mode)
+    resume_checkpoint = str(resume_checkpoint or "")
+    resume_report = {
+        "resume_checkpoint": resume_checkpoint,
+        "resume_checkpoint_loaded": False,
+        "resume_ae_state": "",
+        "resume_flow_ema_loaded": False,
+        "resume_conditioner_ema_loaded": False,
+        "resume_flow_ema_updates": 0,
+        "resume_flow_ema_effective_decay": 0.0,
+    }
+    resume_flow_ema_state = {}
+    resume_conditioner_ema_state = {}
+    if resume_checkpoint:
+        (resume_report, resume_flow_ema_state, resume_conditioner_ema_state) = (
+            load_image_training_resume_checkpoint(
+                resume_checkpoint, ae, flow, conditioner=conditioner,
+                text_aligner=text_aligner,
+                image_feature_aligner=image_feature_aligner,
+                image_quality_scorer=image_quality_scorer,
+                flow_repa_aligner=flow_repa_aligner,
+                flow_self_repa_aligner=flow_self_repa_aligner,
+                device=device))
     ae_params = [p for p in ae.parameters() if p.requires_grad]
     if text_aligner is not None and image_text_align_w > 0.0:
         ae_params += list(conditioner.parameters()) + list(text_aligner.parameters())
@@ -10710,11 +10841,24 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_preference_steps_run = 0
     flow_preference_skipped = 0
     flow_preference_skip_reason = ""
-    flow_ema = clone_state_dict(flow) if flow_ema_decay > 0.0 else None
-    conditioner_ema = (clone_state_dict(conditioner)
-                       if flow_ema_decay > 0.0 and conditioner is not None else None)
-    ema_updates = 0
-    last_ema_decay = 0.0
+    flow_ema = None
+    conditioner_ema = None
+    if flow_ema_decay > 0.0:
+        flow_ema = resume_flow_ema_state or clone_state_dict(flow)
+        conditioner_ema = (
+            resume_conditioner_ema_state
+            if resume_conditioner_ema_state else (
+                clone_state_dict(conditioner) if conditioner is not None else None
+            )
+        )
+    ema_updates = (
+        int(resume_report.get("resume_flow_ema_updates", 0))
+        if flow_ema is not None and resume_flow_ema_state else 0
+    )
+    last_ema_decay = (
+        float(resume_report.get("resume_flow_ema_effective_decay", 0.0))
+        if ema_updates > 0 else 0.0
+    )
     curriculum_switch_step = time_curriculum_switch_step(flow_steps, time_curriculum_frac)
     adaptive_time_sampler = (
         AdaptiveTimestepSampler(
@@ -11128,6 +11272,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_cache_latent_dtype": (
             latent_cache_dtype_name(flow_cache) if flow_cache is not None else flow_cache_dtype
         ),
+        **resume_report,
         "flow_cache_shards": (
             int(flow_cache.get("shard_count", len(flow_cache.get("shards", []))))
             if flow_cache is not None else 0
@@ -11746,6 +11891,76 @@ def selftest():
         assert meta["sample_grid_trace_self_condition_updates"] >= 1
         assert meta["sample_grid_trace_self_condition_rollbacks"] >= 0
         assert os.path.exists(sample_path)
+        resume_path = os.path.join(td, "resume.pt")
+        torch.save({
+            "autoencoder_state_dict": ae.state_dict(),
+            "flow_state_dict": flow.state_dict(),
+            "conditioner_state_dict": conditioner.state_dict(),
+            "text_aligner_state_dict": (
+                getattr(flow, "text_aligner", None).state_dict()
+                if getattr(flow, "text_aligner", None) is not None else {}
+            ),
+            "image_feature_aligner_state_dict": (
+                getattr(flow, "image_feature_aligner", None).state_dict()
+                if getattr(flow, "image_feature_aligner", None) is not None else {}
+            ),
+            "image_quality_scorer_state_dict": (
+                getattr(flow, "image_quality_scorer", None).state_dict()
+                if getattr(flow, "image_quality_scorer", None) is not None else {}
+            ),
+            "flow_repa_aligner_state_dict": (
+                getattr(flow, "flow_repa_aligner", None).state_dict()
+                if getattr(flow, "flow_repa_aligner", None) is not None else {}
+            ),
+            "flow_self_repa_aligner_state_dict": (
+                getattr(flow, "flow_self_repa_aligner", None).state_dict()
+                if getattr(flow, "flow_self_repa_aligner", None) is not None else {}
+            ),
+            "flow_ema_state_dict": {},
+            "conditioner_ema_state_dict": {},
+            "prompt_vocab": vocab,
+            "latent_ch": report["latent_ch"],
+            "hidden": report["hidden"],
+            "flow_arch": report["flow_arch"],
+            "dit_depth": report["dit_depth"],
+            "dit_heads": report["dit_heads"],
+            "dit_head_width_mult": report["dit_head_width_mult"],
+            "dit_pos_embed": report["dit_pos_embed"],
+            "dit_mlp": report["dit_mlp"],
+            "flow_time_embed": report["flow_time_embed"],
+            "flow_time_embed_dim": report["flow_time_embed_dim"],
+            "flow_self_condition": report["flow_self_condition"],
+            "latent_max_tokens": report["latent_max_tokens"],
+            "latent_patch_size": report["latent_patch_size"],
+            "ae_arch": report["ae_arch"],
+            "latent_downsample": report["latent_downsample"],
+            "cond_mode": report["cond_mode"],
+            "cond_dim": report["cond_dim"],
+            "caption_max_len": report["caption_max_len"],
+            "caption_cond_source": report["caption_cond_source"],
+            "image_embedding_in_dim": report["image_embedding_in_dim"],
+            "flow_repa_embed_dim": report["flow_repa_embed_dim"],
+            "flow_repa_mode": report["flow_repa_mode"],
+            "text_embed_dim": report["text_embed_dim"],
+            "image_feature_embed_dim": report["image_feature_embed_dim"],
+            "data_mode": "image_manifest",
+            "report": report,
+        }, resume_path)
+        _ae2, _flow2, _cond2, _vocab2, resumed = train_latent_flow(
+            ae_steps=0, flow_steps=1, batch=2, latent_ch=4, hidden=16,
+            flow_arch="dit", dit_depth=1, dit_heads=2, seed=6, device="cpu",
+            cond_mode="text", text_cond_dim=8, image_manifest=manifest,
+            image_root=td, image_split="train", caption_max_len=8,
+            image_max_records=3, sample_steps=1,
+            flow_repa_w=0.01, flow_repa_structure_w=0.01,
+            flow_repa_frac=1.0, flow_repa_mode="auto",
+            flow_time_embed="fourier", flow_time_embed_dim=8,
+            flow_self_condition=True, flow_self_condition_p=1.0,
+            dit_mlp="swiglu", resume_checkpoint=resume_path,
+            return_conditioner=True)
+        assert resumed["resume_checkpoint_loaded"] is True
+        assert resumed["resume_ae_state"] == "loaded"
+        assert resumed["resume_module_state"]["flow_repa_aligner"] == "loaded"
     crossdit = make_flow(
         flow_arch="crossdit", latent_ch=4, hidden=16, dit_depth=1, dit_heads=2,
         cond_dim=8, dit_mlp="swiglu", latent_max_tokens=16,
@@ -11814,6 +12029,8 @@ def main(argv=None):
                     dest="eval_generated_candidates_per_prompt",
                     help=("manifest eval candidates drawn per caption before learned "
                           "aligner/quality reranking"))
+    ap.add_argument("--resume-checkpoint", default="", dest="resume_checkpoint",
+                    help="image_latent checkpoint to continue training from")
     ap.add_argument("--ae-steps", type=int, default=200, dest="ae_steps")
     ap.add_argument("--flow-steps", type=int, default=200, dest="flow_steps")
     ap.add_argument("--batch", type=int, default=64)
@@ -12436,6 +12653,8 @@ def main(argv=None):
         return
     if args.train and not args.image_manifest:
         ap.error("--train requires --image-manifest")
+    if args.resume_checkpoint and not args.train:
+        ap.error("--resume-checkpoint requires --train")
     if sample_prompts and not args.sample_grid_out:
         ap.error("--sample-prompts requires --sample-grid-out")
     if args.sample_manifest_out and not args.sample_grid_out:
@@ -12941,6 +13160,7 @@ def main(argv=None):
         flow_cache_shard_size=args.flow_cache_shard_size,
         flow_cache_dtype=args.flow_cache_dtype,
         flow_cache_max_loaded_shards=args.flow_cache_max_loaded_shards,
+        resume_checkpoint=args.resume_checkpoint,
         return_conditioner=True, return_ema=True, return_aligner=True)
     if args.sample_grid_out:
         raw_flow = clone_state_dict(flow)
@@ -13144,6 +13364,11 @@ def main(argv=None):
         "flow_cache_bytes": report.get("flow_cache_bytes", 0),
         "flow_cache_weighted": report.get("flow_cache_weighted", False),
         "flow_cache_has_quality_targets": report.get("flow_cache_has_quality_targets", False),
+        "resume_checkpoint": report.get("resume_checkpoint", args.resume_checkpoint),
+        "resume_checkpoint_loaded": report.get("resume_checkpoint_loaded", False),
+        "resume_ae_state": report.get("resume_ae_state", ""),
+        "resume_flow_ema_loaded": report.get("resume_flow_ema_loaded", False),
+        "resume_conditioner_ema_loaded": report.get("resume_conditioner_ema_loaded", False),
         "train_precision": args.train_precision,
         "train_amp_enabled": report.get("train_amp_enabled", False),
         "grad_clip": args.grad_clip,

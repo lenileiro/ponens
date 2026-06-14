@@ -231,6 +231,14 @@ def reading_upload_paths(args):
     return [path for path in paths if path and not is_url_arg(path)]
 
 
+def image_resume_upload_path(args):
+    path = str(getattr(args, "image_resume_checkpoint", "") or "").strip()
+    if not path or is_url_arg(path):
+        return ""
+    local = local_path_for_arg(path)
+    return os.path.abspath(local) if os.path.isfile(local) else ""
+
+
 def text_reading_cmd(args, py):
     TXT = f"{py} -m thinking.text"
     d = args.text_reading_dim or args.dim or 256
@@ -1121,6 +1129,8 @@ def payload(args):
                 train += " --flow-checkpoint-blocks"
             if args.image_flow_self_condition:
                 train += " --flow-self-condition"
+            if args.image_resume_checkpoint:
+                train += f" --resume-checkpoint {shlex_quote(args.image_resume_checkpoint)}"
             if args.image_geometry_cond:
                 train += " --image-geometry-cond"
             if args.image_flow_cache_latents:
@@ -1894,6 +1904,9 @@ def main():
                     help="optional image_embedding alignment weight")
     ap.add_argument("--image-latent", action="store_true", dest="image_latent",
                     help="train manifest-conditioned autoencoder + latent image flow")
+    ap.add_argument("--image-resume-checkpoint", default="",
+                    dest="image_resume_checkpoint",
+                    help="image_latent checkpoint to continue training from")
     ap.add_argument("--image-quality-preset", default="none",
                     choices=("none", "web-hf-vae", "web-hf-vae-hq"),
                     dest="image_quality_preset",
@@ -4183,6 +4196,13 @@ def main():
                 sys.exit(f"ERROR: {label} not found or not a directory: {local_path}")
             if not want_dir and not os.path.isfile(local_path):
                 sys.exit(f"ERROR: {label} not found or not a file: {local_path}")
+    image_resume_upload = ""
+    if args.image_resume_checkpoint:
+        if not args.image_latent:
+            sys.exit("ERROR: --image-resume-checkpoint requires --image-latent")
+        image_resume_upload = image_resume_upload_path(args)
+        if image_resume_upload:
+            args.image_resume_checkpoint = local_path_remote_destination(image_resume_upload)
 
     key = os.environ.get("RUNPOD_API_KEY")
     if not key and args.go:
@@ -4267,6 +4287,11 @@ def main():
               f"pod:{remote_path_for_arg(args.image_root)}")
         print(f"manifest  : {local_path_for_arg(args.image_manifest)} -> "
               f"pod:{remote_path_for_arg(args.image_manifest)}")
+    if image_resume_upload:
+        print(
+            f"image resume: {image_resume_upload} -> "
+            f"pod:{args.image_resume_checkpoint}"
+        )
     preference_uploads = (
         preference_upload_paths(args.image_preference_manifest)
         if getattr(args, "image_auto_preference_manifest", False) else []
@@ -4327,6 +4352,8 @@ def main():
                 sh(upload_path_cmd(manifest_local, manifest_remote, ssh))
         for local in reading_uploads:
             sh(upload_path_cmd(local_path_for_arg(local), remote_path_for_arg(local), ssh))
+        if image_resume_upload:
+            sh(upload_path_cmd(image_resume_upload, args.image_resume_checkpoint, ssh))
         for local in preference_uploads:
             sh(upload_path_cmd(local, local_path_remote_destination(local), ssh))
         # DETACHED execution: nohup on the pod + short-poll. A dropped SSH pipe killed three
