@@ -3467,9 +3467,9 @@ def selftest():
             heads=4, pad=vocab.pad, view_tokens=2, txt_tokens=4,
             concept_tokens=2, latent_concept_slots=3,
             latent_concept_memory_size=8).to("cpu")
-        from .text import TextFactLM, checkpoint_payload as text_checkpoint_payload
+        from .text import TextReadingLM, checkpoint_payload as text_checkpoint_payload
         text_ckpt = os.path.join(tmpdir, "text_reading.pt")
-        text_model = TextFactLM(
+        text_model = TextReadingLM(
             len(vocab), d=32, layers=1, heads=4, pad=vocab.pad,
             fact_schema=None, latent_concept_slots=3,
             latent_concept_memory_size=8).to("cpu")

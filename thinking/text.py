@@ -578,8 +578,8 @@ class TextPrefix(nn.Module):
         return self.ln(h).masked_fill(mask.unsqueeze(-1), 0.0)
 
 
-class TextFactLM(nn.Module):
-    """Text prefix -> canonical fact trace decoder."""
+class TextReadingLM(nn.Module):
+    """Raw text reader with latent concept memory and decoder prefix support."""
 
     def __init__(self, vocab_size, d=96, layers=3, heads=4, pad=0, max_len=512,
                  fact_schema=None, fact_concept_prefix=False,
@@ -3594,7 +3594,7 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4,
     torch.manual_seed(seed)
     vocab = build_vocab(records)
     schema = build_fact_schema(records)
-    model = TextFactLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
+    model = TextReadingLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
                        fact_schema=schema,
                        fact_concept_prefix=fact_concept_prefix,
                        text_encoder_arch=text_encoder_arch,
@@ -5324,7 +5324,7 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         raise ValueError("raw reading concept training requires latent_concept_slots > 0")
     torch.manual_seed(seed)
     vocab = build_reading_vocab(records)
-    model = TextFactLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
+    model = TextReadingLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
                        fact_schema=None,
                        text_encoder_arch=text_encoder_arch,
                        text_encoder_layers=text_encoder_layers,
@@ -5614,7 +5614,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
         eval_frac=eval_frac, seed=seed)
     torch.manual_seed(seed)
     vocab = build_reading_vocab(records)
-    model = TextFactLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
+    model = TextReadingLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
                        fact_schema=None,
                        text_encoder_arch=text_encoder_arch,
                        text_encoder_layers=text_encoder_layers,
@@ -6077,7 +6077,7 @@ def expanded_reading_checkpoint_model(checkpoint, reading_records, device=DEV,
         latent_concept_memory_size
         if latent_concept_memory_size is not None
         else ckpt.get("latent_concept_memory_size", 0))
-    model = TextFactLM(
+    model = TextReadingLM(
         len(vocab), d=int(ckpt.get("d", 96)),
         layers=int(ckpt.get("layers", 3)),
         heads=int(ckpt.get("heads", 4)), pad=vocab.pad,
@@ -7226,7 +7226,7 @@ def load_checkpoint(path, device=DEV):
     ckpt = _torch_load(path, device)
     vocab = vocab_from_itos(ckpt["vocab"])
     schema = fact_schema_from_payload(ckpt.get("fact_schema"))
-    model = TextFactLM(len(vocab), d=int(ckpt.get("d", 96)),
+    model = TextReadingLM(len(vocab), d=int(ckpt.get("d", 96)),
                        layers=int(ckpt.get("layers", 3)),
                        heads=int(ckpt.get("heads", 4)), pad=vocab.pad,
                        fact_schema=schema,
@@ -7266,7 +7266,7 @@ def expanded_checkpoint_model(checkpoint, records, device=DEV):
     src_model, src_vocab, ckpt = load_checkpoint(checkpoint, device=device)
     schema = build_fact_schema(records, base_schema=src_model.fact_schema)
     vocab = build_vocab(records, base_vocab=src_vocab)
-    model = TextFactLM(len(vocab), d=int(ckpt.get("d", 96)),
+    model = TextReadingLM(len(vocab), d=int(ckpt.get("d", 96)),
                        layers=int(ckpt.get("layers", 3)),
                        heads=int(ckpt.get("heads", 4)), pad=vocab.pad,
                        fact_schema=schema,
@@ -7912,7 +7912,7 @@ def selftest():
     assert {r.kind for r in balanced} == {"plain", "counterfactual"}
     vocab = build_vocab(records)
     schema = build_fact_schema(records)
-    model = TextFactLM(len(vocab), d=32, layers=1, heads=4, pad=vocab.pad,
+    model = TextReadingLM(len(vocab), d=32, layers=1, heads=4, pad=vocab.pad,
                        fact_schema=schema, fact_concept_prefix=True,
                        fact_concept_refine=True, fact_concept_mixer_layers=1,
                        latent_concept_slots=3, latent_concept_layers=1,
@@ -7931,7 +7931,7 @@ def selftest():
     assert torch.isfinite(fact_concept_state_spread_loss(model, txt, records[:2], schema))
     assert torch.isfinite(latent_text_concept_loss(model, txt, view_dropout=0.1))
     assert torch.isfinite(latent_fact_concept_loss(model, txt, records[:2], schema))
-    rel_model = TextFactLM(len(vocab), d=32, layers=1, heads=4, pad=vocab.pad,
+    rel_model = TextReadingLM(len(vocab), d=32, layers=1, heads=4, pad=vocab.pad,
                            fact_schema=schema, text_encoder_arch="relational",
                            text_encoder_layers=1, latent_concept_slots=2).to("cpu")
     rel_logits = rel_model(txt, ids)
@@ -7981,11 +7981,11 @@ def selftest():
                       meta={"source": "selftest-eval", "chunk_index": 2}),
     ]
     reading_vocab = build_reading_vocab(reading_records)
-    reading_model = TextFactLM(
+    reading_model = TextReadingLM(
         len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
         fact_schema=None, latent_concept_slots=2,
         latent_concept_memory_size=8).to("cpu")
-    memoryless_reading_model = TextFactLM(
+    memoryless_reading_model = TextReadingLM(
         len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
         fact_schema=None, latent_concept_slots=2,
         latent_concept_memory_size=0).to("cpu")
@@ -8259,7 +8259,7 @@ def selftest():
         bridge_insight_gate=True, insight_accept_w=1.0,
         insight_min_delta=0.3)
     assert no_insight_decision["selected"] is False
-    patience_model = TextFactLM(
+    patience_model = TextReadingLM(
         len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
         fact_schema=None, latent_concept_slots=2,
         latent_concept_memory_size=8).to("cpu")
