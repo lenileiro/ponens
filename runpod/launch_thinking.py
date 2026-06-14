@@ -279,6 +279,12 @@ def text_reading_cmd(args, PY):
         f"--reading-consolidation-anchor-w "
         f"{args.reading_consolidation_anchor_w} "
         f"--reading-consolidation-fer-w {args.reading_consolidation_fer_w} "
+        f"--reading-discovery-w {args.reading_discovery_w} "
+        f"--reading-discovery-curiosity-w {args.reading_discovery_curiosity_w} "
+        f"--reading-discovery-graph-w {args.reading_discovery_graph_w} "
+        f"--reading-discovery-cycle-w {args.reading_discovery_cycle_w} "
+        f"--reading-discovery-bridge-w {args.reading_discovery_bridge_w} "
+        f"--reading-discovery-fer-w {args.reading_discovery_fer_w} "
         f"--reading-association-w {args.reading_association_w} "
         f"--reading-association-temperature {args.reading_association_temperature} "
         f"--reading-association-decay {args.reading_association_decay} "
@@ -1377,6 +1383,18 @@ def payload(args):
                 f"{args.multimodal_latent_concept_consolidation_anchor_w} "
                 f"--latent-concept-consolidation-fer-w "
                 f"{args.multimodal_latent_concept_consolidation_fer_w} "
+                f"--latent-concept-discovery-w "
+                f"{args.multimodal_latent_concept_discovery_w} "
+                f"--latent-concept-discovery-curiosity-w "
+                f"{args.multimodal_latent_concept_discovery_curiosity_w} "
+                f"--latent-concept-discovery-graph-w "
+                f"{args.multimodal_latent_concept_discovery_graph_w} "
+                f"--latent-concept-discovery-cycle-w "
+                f"{args.multimodal_latent_concept_discovery_cycle_w} "
+                f"--latent-concept-discovery-bridge-w "
+                f"{args.multimodal_latent_concept_discovery_bridge_w} "
+                f"--latent-concept-discovery-fer-w "
+                f"{args.multimodal_latent_concept_discovery_fer_w} "
                 f"--latent-concept-association-w "
                 f"{args.multimodal_latent_concept_association_w} "
                 f"--latent-concept-association-temperature "
@@ -1796,6 +1814,18 @@ def main():
                     dest="reading_consolidation_anchor_w")
     ap.add_argument("--reading-consolidation-fer-w", type=float, default=0.0,
                     dest="reading_consolidation_fer_w")
+    ap.add_argument("--reading-discovery-w", type=float, default=0.0,
+                    dest="reading_discovery_w")
+    ap.add_argument("--reading-discovery-curiosity-w", type=float, default=1.0,
+                    dest="reading_discovery_curiosity_w")
+    ap.add_argument("--reading-discovery-graph-w", type=float, default=1.0,
+                    dest="reading_discovery_graph_w")
+    ap.add_argument("--reading-discovery-cycle-w", type=float, default=1.0,
+                    dest="reading_discovery_cycle_w")
+    ap.add_argument("--reading-discovery-bridge-w", type=float, default=1.0,
+                    dest="reading_discovery_bridge_w")
+    ap.add_argument("--reading-discovery-fer-w", type=float, default=0.0,
+                    dest="reading_discovery_fer_w")
     ap.add_argument("--reading-association-w", type=float, default=0.05,
                     dest="reading_association_w")
     ap.add_argument("--reading-association-temperature", type=float,
@@ -3002,6 +3032,23 @@ def main():
     ap.add_argument("--multimodal-latent-concept-consolidation-fer-w",
                     type=float, default=0.0,
                     dest="multimodal_latent_concept_consolidation_fer_w")
+    ap.add_argument("--multimodal-latent-concept-discovery-w", type=float,
+                    default=0.0, dest="multimodal_latent_concept_discovery_w")
+    ap.add_argument("--multimodal-latent-concept-discovery-curiosity-w",
+                    type=float, default=1.0,
+                    dest="multimodal_latent_concept_discovery_curiosity_w")
+    ap.add_argument("--multimodal-latent-concept-discovery-graph-w",
+                    type=float, default=1.0,
+                    dest="multimodal_latent_concept_discovery_graph_w")
+    ap.add_argument("--multimodal-latent-concept-discovery-cycle-w",
+                    type=float, default=1.0,
+                    dest="multimodal_latent_concept_discovery_cycle_w")
+    ap.add_argument("--multimodal-latent-concept-discovery-bridge-w",
+                    type=float, default=1.0,
+                    dest="multimodal_latent_concept_discovery_bridge_w")
+    ap.add_argument("--multimodal-latent-concept-discovery-fer-w",
+                    type=float, default=0.0,
+                    dest="multimodal_latent_concept_discovery_fer_w")
     ap.add_argument("--multimodal-latent-concept-association-w", type=float,
                     default=0.0, dest="multimodal_latent_concept_association_w")
     ap.add_argument("--multimodal-latent-concept-association-temperature",
@@ -3249,6 +3296,12 @@ def main():
                 args.reading_consolidation_balance_w),
             "--reading-consolidation-anchor-w": args.reading_consolidation_anchor_w,
             "--reading-consolidation-fer-w": args.reading_consolidation_fer_w,
+            "--reading-discovery-w": args.reading_discovery_w,
+            "--reading-discovery-curiosity-w": args.reading_discovery_curiosity_w,
+            "--reading-discovery-graph-w": args.reading_discovery_graph_w,
+            "--reading-discovery-cycle-w": args.reading_discovery_cycle_w,
+            "--reading-discovery-bridge-w": args.reading_discovery_bridge_w,
+            "--reading-discovery-fer-w": args.reading_discovery_fer_w,
             "--reading-association-w": args.reading_association_w,
             "--reading-association-self-loop-w": (
                 args.reading_association_self_loop_w),
@@ -3342,6 +3395,10 @@ def main():
         if (args.reading_memory_momentum < 0.0
                 or args.reading_memory_momentum >= 1.0):
             sys.exit("ERROR: --reading-memory-momentum must be in [0, 1)")
+        if args.reading_discovery_w > 0.0 and args.reading_memory_size <= 0:
+            sys.exit(
+                "ERROR: --reading-discovery-w requires "
+                "--reading-memory-size > 0")
         if (args.reading_association_decay < 0.0
                 or args.reading_association_decay >= 1.0):
             sys.exit("ERROR: --reading-association-decay must be in [0, 1)")
@@ -3890,6 +3947,18 @@ def main():
                 args.multimodal_latent_concept_consolidation_anchor_w),
             "--multimodal-latent-concept-consolidation-fer-w": (
                 args.multimodal_latent_concept_consolidation_fer_w),
+            "--multimodal-latent-concept-discovery-w": (
+                args.multimodal_latent_concept_discovery_w),
+            "--multimodal-latent-concept-discovery-curiosity-w": (
+                args.multimodal_latent_concept_discovery_curiosity_w),
+            "--multimodal-latent-concept-discovery-graph-w": (
+                args.multimodal_latent_concept_discovery_graph_w),
+            "--multimodal-latent-concept-discovery-cycle-w": (
+                args.multimodal_latent_concept_discovery_cycle_w),
+            "--multimodal-latent-concept-discovery-bridge-w": (
+                args.multimodal_latent_concept_discovery_bridge_w),
+            "--multimodal-latent-concept-discovery-fer-w": (
+                args.multimodal_latent_concept_discovery_fer_w),
             "--multimodal-latent-concept-association-w": (
                 args.multimodal_latent_concept_association_w),
             "--multimodal-latent-concept-association-self-loop-w": (
@@ -3955,6 +4024,7 @@ def main():
             args.multimodal_latent_concept_fer_w,
             args.multimodal_latent_concept_memory_w,
             args.multimodal_latent_concept_consolidation_w,
+            args.multimodal_latent_concept_discovery_w,
             args.multimodal_latent_concept_association_w,
             args.multimodal_latent_concept_composition_w,
             args.multimodal_latent_concept_graph_predict_w,
@@ -4020,6 +4090,11 @@ def main():
                 and args.multimodal_latent_concept_memory_size <= 0):
             sys.exit(
                 "ERROR: --multimodal-latent-concept-consolidation-w requires "
+                "--multimodal-latent-concept-memory-size > 0")
+        if (args.multimodal_latent_concept_discovery_w > 0.0
+                and args.multimodal_latent_concept_memory_size <= 0):
+            sys.exit(
+                "ERROR: --multimodal-latent-concept-discovery-w requires "
                 "--multimodal-latent-concept-memory-size > 0")
         if (args.multimodal_latent_concept_association_decay < 0.0
                 or args.multimodal_latent_concept_association_decay >= 1.0):
