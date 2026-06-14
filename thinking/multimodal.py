@@ -56,6 +56,7 @@ from .concepts import (
     latent_concept_transition_consistency_loss,
     latent_concept_vicreg_loss,
 )
+from .selection import concept_round_selection_decision
 from .trace import Vocab
 
 DEV = get_device()
@@ -1694,6 +1695,61 @@ def _step_schedule(steps, rounds):
             if base + (1 if i < rem else 0) > 0]
 
 
+def _bridge_quality(report):
+    report = dict(report or {})
+    if bool(report.get("skipped", True)):
+        return 0.0
+    raw = max(0.0, float(report.get("bridge_score", 0.0)))
+    resolution = 1.0 / (1.0 + raw)
+    connectivity = min(1.0, max(0.0, float(
+        report.get("bridge_connectivity", 1.0))))
+    return float(0.5 * (resolution + connectivity))
+
+
+def multimodal_bridge_selection_insight(before_bridge, after_bridge, enabled=True):
+    if not enabled or before_bridge is None or after_bridge is None:
+        return {
+            "skipped": True,
+            "bridge_insight_delta": 0.0,
+            "bridge_insight_allowed": True,
+        }
+    before_bridge = dict(before_bridge or {})
+    after_bridge = dict(after_bridge or {})
+    before_skipped = bool(before_bridge.get("skipped", True))
+    after_skipped = bool(after_bridge.get("skipped", True))
+    before_quality = _bridge_quality(before_bridge)
+    after_quality = _bridge_quality(after_bridge)
+    before_score = (
+        max(0.0, float(before_bridge.get("bridge_score", 0.0)))
+        if not before_skipped else 0.0)
+    after_score = (
+        max(0.0, float(after_bridge.get("bridge_score", 0.0)))
+        if not after_skipped else 0.0)
+    before_connectivity = (
+        min(1.0, max(0.0, float(before_bridge.get("bridge_connectivity", 1.0))))
+        if not before_skipped else 0.0)
+    after_connectivity = (
+        min(1.0, max(0.0, float(after_bridge.get("bridge_connectivity", 1.0))))
+        if not after_skipped else 0.0)
+    quality_gain = float(after_quality - before_quality)
+    return {
+        "skipped": bool(before_skipped and after_skipped),
+        "bridge_insight_delta": quality_gain,
+        "bridge_insight_allowed": bool(quality_gain >= -1e-9),
+        "bridge_quality_before": float(before_quality),
+        "bridge_quality_after": float(after_quality),
+        "bridge_quality_gain": quality_gain,
+        "bridge_score_before": float(before_score),
+        "bridge_score_after": float(after_score),
+        "bridge_score_reduction": float(before_score - after_score),
+        "bridge_connectivity_before": float(before_connectivity),
+        "bridge_connectivity_after": float(after_connectivity),
+        "bridge_connectivity_gain": float(after_connectivity - before_connectivity),
+        "bridge_before_skipped": bool(before_skipped),
+        "bridge_after_skipped": bool(after_skipped),
+    }
+
+
 def _compact_multimodal_train_metrics(metrics):
     omitted = {
         "latent_fer_study_reports",
@@ -2026,7 +2082,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           selection_score_margin_w=0.1,
           selection_score_min_delta=0.0,
           selection_score_patience=0,
-          selection_eval_n=200):
+          selection_eval_n=200,
+          selection_insight_accept_w=0.25,
+          selection_insight_min_delta=0.0):
     ckpt_latents = text_checkpoint_latent_config(
         text_checkpoint, device="cpu") if text_checkpoint else {}
     if text_checkpoint and latent_concept_slots <= 0:
@@ -2086,6 +2144,12 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         raise ValueError("multimodal selection score patience must be non-negative")
     if int(selection_eval_n) < 0:
         raise ValueError("multimodal selection eval count must be non-negative")
+    selection_insight_accept_w = float(selection_insight_accept_w)
+    if selection_insight_accept_w < 0.0:
+        raise ValueError("multimodal selection insight accept weight must be non-negative")
+    selection_insight_min_delta = float(selection_insight_min_delta)
+    if selection_insight_min_delta < 0.0:
+        raise ValueError("multimodal selection insight min delta must be non-negative")
     records = load_manifest(manifest, root=root)
     train_records, eval_records = split_records(records)
     sequence_batch = int(latent_concept_sequence_batch) or max(2, batch // 2)
@@ -2119,6 +2183,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     best_state = None
     best_score = 0.0
     best_round = 0
+    best_bridge_eval = None
     best_metrics = {}
     best_study_reports = []
     rounds_report = []
@@ -2155,6 +2220,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         initial_row = selection_row(0, 0, before_bundle)
         best_state = _model_state_copy(model)
         best_score = float(initial_row["score"])
+        best_bridge_eval = initial_row["latent_bridge"]
         best_metrics = {"selection_initial": True}
         rounds_report = [initial_row]
 
@@ -2464,10 +2530,32 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 score_margin_w=selection_score_margin_w)
             row = selection_row(round_id, round_steps, bundle)
             score_delta_from_best = float(row["score"] - best_score)
-            selected = score_delta_from_best > float(selection_score_min_delta)
+            bridge_insight_gate = bool(
+                latent_concept_bridge_w and latent_concept_memory_size > 0)
+            insight = multimodal_bridge_selection_insight(
+                best_bridge_eval, row["latent_bridge"],
+                enabled=bridge_insight_gate)
+            decision = concept_round_selection_decision(
+                score_delta_from_best, selection_score_min_delta,
+                insight_delta=insight["bridge_insight_delta"],
+                insight_allowed=insight["bridge_insight_allowed"],
+                insight_gate=bridge_insight_gate,
+                insight_accept_w=selection_insight_accept_w,
+                insight_min_delta=selection_insight_min_delta)
+            selected = decision["selected"]
             row = row | {
                 "selected": bool(selected),
                 "score_delta_from_best": score_delta_from_best,
+                "bridge_insight_gate": bool(bridge_insight_gate),
+                "bridge_insight_delta": float(insight["bridge_insight_delta"]),
+                "bridge_insight_allowed": bool(
+                    insight["bridge_insight_allowed"]),
+                "bridge_insight": insight,
+                "selected_by_score": bool(decision["selected_by_score"]),
+                "selected_by_insight": bool(decision["selected_by_insight"]),
+                "insight_score_boost": float(decision["insight_score_boost"]),
+                "insight_effective_delta": float(
+                    decision["insight_effective_delta"]),
                 "train_metrics": _compact_multimodal_train_metrics(last),
             }
             rounds_report.append(row)
@@ -2475,6 +2563,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 best_score = float(row["score"])
                 best_round = int(round_id)
                 best_state = _model_state_copy(model)
+                best_bridge_eval = row["latent_bridge"]
                 best_metrics = dict(last)
                 best_study_reports = list(study_reports)
                 no_improve_rounds = 0
@@ -2499,6 +2588,10 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "score_min_delta": float(selection_score_min_delta),
             "score_patience": int(selection_score_patience),
             "selection_eval_n": int(selection_eval_n),
+            "bridge_insight_gate": bool(
+                latent_concept_bridge_w and latent_concept_memory_size > 0),
+            "insight_accept_w": float(selection_insight_accept_w),
+            "insight_min_delta": float(selection_insight_min_delta),
             "stopped_early": bool(stopped_early),
             "stop_round": int(stop_round),
             "no_improve_rounds": int(no_improve_rounds),
@@ -2509,6 +2602,19 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "selected_score_delta": float(best_score - rounds_report[0]["score"]),
             "rounds": rounds_report,
         }
+        selected_rows = [row for row in rounds_report if row["round"] == best_round]
+        if selected_rows:
+            selected_row = selected_rows[0]
+            selection["selected_by_score"] = bool(
+                selected_row.get("selected_by_score", False))
+            selection["selected_by_insight"] = bool(
+                selected_row.get("selected_by_insight", False))
+            selection["selected_insight_score_boost"] = float(
+                selected_row.get("insight_score_boost", 0.0))
+            selection["selected_insight_effective_delta"] = float(
+                selected_row.get("insight_effective_delta", 0.0))
+            selection["selected_bridge_insight"] = selected_row.get(
+                "bridge_insight")
         active_study_reports = list(best_study_reports)
         best_metrics = best_metrics | {
             "selection": selection,
@@ -2726,6 +2832,25 @@ def selftest():
         assert bridge_eval["skipped"] is False
         assert bridge_eval["graph_ready"] is True
         assert math.isfinite(bridge_eval["bridge_score"])
+        positive_insight = multimodal_bridge_selection_insight(
+            {"skipped": False, "bridge_score": 0.8, "bridge_connectivity": 0.2},
+            {"skipped": False, "bridge_score": 0.4, "bridge_connectivity": 0.5})
+        assert positive_insight["bridge_insight_allowed"] is True
+        assert positive_insight["bridge_insight_delta"] > 0.0
+        positive_decision = concept_round_selection_decision(
+            -0.01, 0.0, insight_delta=positive_insight["bridge_insight_delta"],
+            insight_allowed=positive_insight["bridge_insight_allowed"],
+            insight_gate=True, insight_accept_w=1.0)
+        assert positive_decision["selected_by_insight"] is True
+        negative_insight = multimodal_bridge_selection_insight(
+            {"skipped": False, "bridge_score": 0.4, "bridge_connectivity": 0.5},
+            {"skipped": False, "bridge_score": 0.8, "bridge_connectivity": 0.2})
+        assert negative_insight["bridge_insight_allowed"] is False
+        negative_decision = concept_round_selection_decision(
+            0.2, 0.0, insight_delta=negative_insight["bridge_insight_delta"],
+            insight_allowed=negative_insight["bridge_insight_allowed"],
+            insight_gate=True, insight_accept_w=1.0)
+        assert negative_decision["selected"] is False
         graph_selected, graph_report = latent_multimodal_graph_prediction_examples(
             model, records, vocab, view_dims, n=4, device="cpu")
         assert graph_selected and graph_report["skipped"] is False
@@ -2843,6 +2968,10 @@ def selftest():
         assert selection["accepted_update"] is False
         assert selection["selected_round"] == 0
         assert "score_delta_from_best" in selection["rounds"][1]
+        assert "bridge_insight_delta" in selection["rounds"][1]
+        assert selection["bridge_insight_gate"] is True
+        assert selection["selected_by_score"] is False
+        assert selection["selected_by_insight"] is False
         assert selected_model.train_metrics["latent_study_reports"] == []
         assert selected_model.train_metrics["latent_discovery_study_reports"] == []
         assert selected_model.train_metrics["latent_study_pool_size"] == 0
@@ -3027,6 +3156,11 @@ def main(argv=None):
                     dest="selection_score_patience")
     ap.add_argument("--selection-eval-n", type=int, default=200,
                     dest="selection_eval_n")
+    ap.add_argument("--selection-insight-accept-w", "--selection-insight-w",
+                    type=float, default=0.25,
+                    dest="selection_insight_accept_w")
+    ap.add_argument("--selection-insight-min-delta", type=float, default=0.0,
+                    dest="selection_insight_min_delta")
     ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--out", default="runs/multimodal.json")
     args = ap.parse_args(argv)
@@ -3127,6 +3261,10 @@ def main(argv=None):
         ap.error("--selection-score-patience must be non-negative")
     if args.selection_eval_n < 0:
         ap.error("--selection-eval-n must be non-negative")
+    if args.selection_insight_accept_w < 0.0:
+        ap.error("--selection-insight-accept-w must be non-negative")
+    if args.selection_insight_min_delta < 0.0:
+        ap.error("--selection-insight-min-delta must be non-negative")
     report = run(
         args.manifest, root=args.root, steps=args.steps, seed=args.seed,
         device=args.device, eval_n=args.eval_n, checkpoint=args.checkpoint,
@@ -3229,6 +3367,8 @@ def main(argv=None):
         selection_score_min_delta=args.selection_score_min_delta,
         selection_score_patience=args.selection_score_patience,
         selection_eval_n=args.selection_eval_n,
+        selection_insight_accept_w=args.selection_insight_accept_w,
+        selection_insight_min_delta=args.selection_insight_min_delta,
         log_every=args.log_every)
     return report
 

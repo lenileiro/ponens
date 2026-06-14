@@ -1399,6 +1399,10 @@ def payload(args):
                 f"--selection-score-patience "
                 f"{args.multimodal_selection_score_patience} "
                 f"--selection-eval-n {args.multimodal_selection_eval_n} "
+                f"--selection-insight-accept-w "
+                f"{args.multimodal_selection_insight_accept_w} "
+                f"--selection-insight-min-delta "
+                f"{args.multimodal_selection_insight_min_delta} "
                 f"--out runs/m0_multimodal.json --checkpoint runs/m0_multimodal.pt"
             )
             if args.multimodal_root:
@@ -2981,6 +2985,11 @@ def main():
                     default=0, dest="multimodal_selection_score_patience")
     ap.add_argument("--multimodal-selection-eval-n", type=int, default=200,
                     dest="multimodal_selection_eval_n")
+    ap.add_argument("--multimodal-selection-insight-accept-w",
+                    "--multimodal-selection-insight-w", type=float, default=0.25,
+                    dest="multimodal_selection_insight_accept_w")
+    ap.add_argument("--multimodal-selection-insight-min-delta", type=float,
+                    default=0.0, dest="multimodal_selection_insight_min_delta")
     ap.add_argument("--multimodal-view-tokens", type=int, default=4,
                     dest="multimodal_view_tokens")
     ap.add_argument("--multimodal-txt-tokens", type=int, default=8,
@@ -3773,6 +3782,10 @@ def main():
             "--multimodal-selection-score-patience": (
                 args.multimodal_selection_score_patience),
             "--multimodal-selection-eval-n": args.multimodal_selection_eval_n,
+            "--multimodal-selection-insight-accept-w": (
+                args.multimodal_selection_insight_accept_w),
+            "--multimodal-selection-insight-min-delta": (
+                args.multimodal_selection_insight_min_delta),
         }
         bad_nonnegative = [
             name for name, value in multimodal_nonnegative.items()
