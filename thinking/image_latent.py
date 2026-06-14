@@ -3388,6 +3388,18 @@ def flow_time_schedule(steps, device=DEV, shift=1.0, schedule="linear"):
     return apply_flow_time_shift(base, shift=shift)
 
 
+def flow_time_schedule_window(schedule, start_t=0.0, end_t=1.0):
+    start_t = float(start_t)
+    end_t = float(end_t)
+    if start_t < 0.0 or start_t > 1.0:
+        raise ValueError("sample start time must be in [0, 1]")
+    if end_t < 0.0 or end_t > 1.0:
+        raise ValueError("sample end time must be in [0, 1]")
+    if end_t < start_t:
+        raise ValueError("sample end time must be >= start time")
+    return start_t + (end_t - start_t) * schedule
+
+
 def sample_flow_times(batch, device=DEV, mode="uniform", logit_mean=0.0, logit_std=1.0,
                       mode_scale=DEFAULT_TIME_MODE_SCALE,
                       u_shape_scale=DEFAULT_TIME_U_SHAPE_SCALE,
@@ -7407,7 +7419,8 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                    quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                    sample_finite_guard=False, sample_velocity_clip=0.0,
                    sample_latent_clip=0.0, cfg_mode="standard",
-                   reference_latent=None, return_trace=False):
+                   reference_latent=None, reference_denoise_strength=1.0,
+                   return_trace=False):
     batch = condition_batch(cond)
     if cfg_uncond is not None and condition_batch(cfg_uncond) != batch:
         raise ValueError("cfg_uncond batch must match cond batch")
@@ -7419,6 +7432,12 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
     self_cond_state = torch.zeros_like(z) if flow_uses_self_condition(flow) else None
     fixed_self_condition = False
     reference_condition = reference_latent is not None
+    reference_denoise_strength = float(reference_denoise_strength)
+    if reference_denoise_strength < 0.0 or reference_denoise_strength > 1.0:
+        raise ValueError("reference_denoise_strength must be in [0, 1]")
+    if not reference_condition and reference_denoise_strength != 1.0:
+        raise ValueError("reference_denoise_strength requires reference_latent")
+    reference_start_t = 0.0
     if reference_condition:
         if not flow_uses_self_condition(flow):
             raise ValueError("reference_latent sampling requires flow self-conditioning")
@@ -7444,6 +7463,10 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                 f"condition batch {batch}")
         self_cond_state = ref.detach()
         fixed_self_condition = True
+        reference_start_t = 1.0 - reference_denoise_strength
+        if reference_start_t > 0.0:
+            z = ((1.0 - reference_start_t) * z
+                 + reference_start_t * self_cond_state.to(dtype=z.dtype))
     flow.eval()
     if ae is not None:
         ae.eval()
@@ -7504,6 +7527,7 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         quality_guidance_interval, name="quality_guidance_interval")
     schedule = flow_time_schedule(
         steps, device=device, shift=sample_time_shift, schedule=sample_schedule)
+    schedule = flow_time_schedule_window(schedule, start_t=reference_start_t, end_t=1.0)
     trace = init_sample_trace(
         steps, sample_finite_guard=sample_finite_guard,
         sample_velocity_clip=sample_velocity_clip,
@@ -7513,6 +7537,8 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
     trace["sample_trace_self_condition"] = bool(flow_uses_self_condition(flow))
     trace["sample_trace_reference_condition"] = bool(reference_condition)
     trace["sample_trace_reference_condition_fixed"] = bool(fixed_self_condition)
+    trace["sample_trace_reference_denoise_strength"] = float(reference_denoise_strength)
+    trace["sample_trace_reference_start_t"] = float(reference_start_t)
     trace["sample_trace_self_condition_updates"] = 0
     trace["sample_trace_self_condition_rollbacks"] = 0
     update_sample_trace(trace, "latent", z)
@@ -7759,7 +7785,8 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
                   sample_latent_clip=0.0, cfg_mode="standard",
                   sample_pixel_dynamic_threshold_percentile=0.0,
                   sample_pixel_dynamic_threshold_max=1.0,
-                  reference_latent=None, return_trace=False):
+                  reference_latent=None, reference_denoise_strength=1.0,
+                  return_trace=False):
     latent_out = sample_latents(
         flow, cond, latent_shape=latent_shape, steps=steps, device=device,
         seed=seed, cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
@@ -7785,6 +7812,7 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
         sample_latent_clip=sample_latent_clip,
         cfg_mode=cfg_mode,
         reference_latent=reference_latent,
+        reference_denoise_strength=reference_denoise_strength,
         return_trace=return_trace)
     if return_trace:
         z, trace = latent_out
@@ -8556,7 +8584,8 @@ def save_reference_reproduction_grid(ae, flow, records, path, size=32, device=DE
                                      sample_latent_clip=0.0,
                                      cfg_mode="standard",
                                      sample_pixel_dynamic_threshold_percentile=0.0,
-                                     sample_pixel_dynamic_threshold_max=1.0):
+                                     sample_pixel_dynamic_threshold_max=1.0,
+                                     reference_denoise_strength=1.0):
     ae.eval()
     flow.eval()
     if not flow_uses_self_condition(flow):
@@ -8594,6 +8623,7 @@ def save_reference_reproduction_grid(ae, flow, records, path, size=32, device=DE
         sample_pixel_dynamic_threshold_max=sample_pixel_dynamic_threshold_max,
         cfg_mode=cfg_mode,
         reference_latent=z_ref,
+        reference_denoise_strength=reference_denoise_strength,
         return_trace=True)
     grid = torch.stack((x, recon, sample), dim=1).reshape(n * 3, *x.shape[1:])
     meta = write_ppm_grid(grid, path, rows=n, cols=3)
@@ -8607,6 +8637,7 @@ def save_reference_reproduction_grid(ae, flow, records, path, size=32, device=DE
         "sample_grid_sample_method": sample_method,
         "sample_grid_sample_schedule": sample_schedule,
         "sample_grid_sample_churn": float(sample_churn),
+        "sample_grid_reference_denoise_strength": float(reference_denoise_strength),
         "sample_grid_sample_churn_interval": list(validate_guidance_interval(
             sample_churn_interval, name="sample_churn_interval")),
         "sample_grid_cfg_interval": list(validate_guidance_interval(cfg_interval)),
@@ -13144,11 +13175,17 @@ def selftest():
         reference_meta = save_reference_reproduction_grid(
             ae, flow, read_image_manifest(manifest, root=td), reference_sample_path,
             size=16, device="cpu", conditioner=conditioner, prompt_vocab=vocab,
-            caption_max_len=8, cfg_scale=1.0, sample_steps=2, samples=1)
+            caption_max_len=8, cfg_scale=1.0, sample_steps=2, samples=1,
+            reference_denoise_strength=0.5)
         assert reference_meta["sample_grid_cond_mode"] == "reference_image"
         assert reference_meta["sample_grid_cols"] == 3
         assert reference_meta["reference_flow_sample_trace_reference_condition"] is True
         assert reference_meta["reference_flow_sample_trace_reference_condition_fixed"] is True
+        assert math.isclose(
+            reference_meta["reference_flow_sample_trace_reference_denoise_strength"],
+            0.5)
+        assert math.isclose(
+            reference_meta["reference_flow_sample_trace_reference_start_t"], 0.5)
         assert reference_meta["reference_flow_sample_trace_self_condition_updates"] == 0
         assert "reference_flow_structure_edge_l1" in reference_meta
         assert os.path.exists(reference_sample_path)
@@ -13895,6 +13932,10 @@ def main(argv=None):
     ap.add_argument("--sample-reference-samples", type=int, default=4,
                     dest="sample_reference_samples",
                     help="number of reference-image reproduction rows")
+    ap.add_argument("--sample-reference-denoise-strength", type=float, default=1.0,
+                    dest="sample_reference_denoise_strength",
+                    help=("reference reproduction strength in [0, 1]; 1 starts from "
+                          "noise, lower values start closer to the encoded reference"))
     ap.add_argument("--sample-grid-samples", type=int, default=1,
                     dest="sample_grid_samples",
                     help="generated samples per color/shape condition in --sample-grid-out")
@@ -14126,6 +14167,9 @@ def main(argv=None):
         ap.error("--flow-reference-condition-p requires --flow-self-condition")
     if args.sample_reference_samples <= 0:
         ap.error("--sample-reference-samples must be positive")
+    if (args.sample_reference_denoise_strength < 0.0
+            or args.sample_reference_denoise_strength > 1.0):
+        ap.error("--sample-reference-denoise-strength must be in [0, 1]")
     if args.flow_endpoint_w < 0.0:
         ap.error("--flow-endpoint-w must be non-negative")
     if args.flow_frequency_w < 0.0:
@@ -14554,7 +14598,8 @@ def main(argv=None):
                     args.sample_pixel_dynamic_threshold_max),
                 samples=args.sample_reference_samples,
                 seed=args.seed + 1499,
-                caption_cond_source=meta["caption_cond_source"] or "tokens")
+                caption_cond_source=meta["caption_cond_source"] or "tokens",
+                reference_denoise_strength=args.sample_reference_denoise_strength)
             reference_meta["sample_grid_checkpoint_weight_mode"] = (
                 "ema" if meta["ema_loaded"] else "raw")
             report.update(reference_meta)
@@ -14923,7 +14968,8 @@ def main(argv=None):
             sample_pixel_dynamic_threshold_max=args.sample_pixel_dynamic_threshold_max,
             samples=args.sample_reference_samples,
             seed=args.seed + 1499,
-            caption_cond_source=report.get("caption_cond_source", "tokens") or "tokens")
+            caption_cond_source=report.get("caption_cond_source", "tokens") or "tokens",
+            reference_denoise_strength=args.sample_reference_denoise_strength)
         reference_meta["sample_grid_checkpoint_weight_mode"] = grid_weight_mode
         report.update(reference_meta)
         report.update(cli_sample_quality_gate_report(report, args))
