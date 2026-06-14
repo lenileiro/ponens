@@ -61,10 +61,12 @@ FLOW_NOISE_COUPLINGS = ("random", "sliced_ot")
 FLOW_REPA_MODES = ("pooled", "token", "both", "auto")
 FLOW_BOUNDARY_MODES = ("none", "right-linear", "double-linear", "double-cosine")
 FLOW_PREFERENCE_LOSSES = ("margin", "dpo", "gap")
-TIME_SAMPLINGS = ("uniform", "logit-normal", "mode", "adaptive")
-TIME_ADAPTIVE_PRIORS = ("uniform", "logit-normal", "mode")
+TIME_SAMPLINGS = ("uniform", "logit-normal", "mode", "u-shaped", "adaptive")
+TIME_ADAPTIVE_PRIORS = ("uniform", "logit-normal", "mode", "u-shaped")
 DEFAULT_TIME_MODE_SCALE = 1.29
 MAX_TIME_MODE_SCALE = 1.75
+DEFAULT_TIME_U_SHAPE_SCALE = 4.0
+MAX_TIME_U_SHAPE_SCALE = 20.0
 TIME_SHIFT_MODES = ("manual", "dim", "auto")
 AE_ARCHES = ("semantic", "residual", "hf-vae")
 FLOW_DISTILL_TEACHERS = ("raw", "ema", "auto")
@@ -1229,6 +1231,7 @@ def latent_flow_preference_pair_loss(flow, z_chosen, z_rejected, cond, score_gap
                                      cond_drop=0.0, time_sampling="uniform",
                                      time_logit_mean=0.0, time_logit_std=1.0,
                                      time_mode_scale=DEFAULT_TIME_MODE_SCALE,
+                                     time_u_shape_scale=DEFAULT_TIME_U_SHAPE_SCALE,
                                      time_shift=1.0, time_stratified=False,
                                      latent_stats=None,
                                      flow_loss_weight="none",
@@ -1256,7 +1259,9 @@ def latent_flow_preference_pair_loss(flow, z_chosen, z_rejected, cond, score_gap
     x0 = torch.randn_like(zc)
     t = sample_flow_times(zc.shape[0], device=zc.device, mode=time_sampling,
                           logit_mean=time_logit_mean, logit_std=time_logit_std,
-                          mode_scale=time_mode_scale, time_shift=time_shift,
+                          mode_scale=time_mode_scale,
+                          u_shape_scale=time_u_shape_scale,
+                          time_shift=time_shift,
                           adaptive_sampler=adaptive_sampler,
                           stratified=time_stratified)
     cond_model = condition_dropout(cond, cond_drop)
@@ -3060,8 +3065,30 @@ def mode_flow_time_base(u, mode_scale=DEFAULT_TIME_MODE_SCALE):
     return base.clamp(0.0, 1.0)
 
 
+def u_shaped_flow_time_base(u, scale=DEFAULT_TIME_U_SHAPE_SCALE):
+    """Centered RF++ U-shaped data-time density on the repo's [0, 1] convention.
+
+    RF++ defines an endpoint-heavy density with a=4.  Mapping that idea onto
+    data-time t in [0, 1] gives p(t) proportional to cosh(a * (2t - 1)), which
+    allocates extra mass to both the noise and clean endpoints while preserving
+    symmetric coverage.
+    """
+    scale = float(scale)
+    if scale < 0.0 or scale > MAX_TIME_U_SHAPE_SCALE:
+        raise ValueError(
+            f"time_u_shape_scale must be in [0, {MAX_TIME_U_SHAPE_SCALE:g}]")
+    u = u.clamp(0.0, 1.0)
+    if scale == 0.0:
+        return u
+    sinh_scale = math.sinh(scale)
+    centered = torch.asinh((2.0 * u - 1.0) * sinh_scale) / scale
+    return (0.5 * (centered + 1.0)).clamp(0.0, 1.0)
+
+
 def timestep_prior_bin_probs(bins, prior="uniform", logit_mean=0.0, logit_std=1.0,
-                             mode_scale=DEFAULT_TIME_MODE_SCALE, samples=0):
+                             mode_scale=DEFAULT_TIME_MODE_SCALE,
+                             u_shape_scale=DEFAULT_TIME_U_SHAPE_SCALE,
+                             samples=0):
     """Approximate a timestep prior as per-bin probabilities in pre-shift data time."""
     bins = int(bins)
     if bins <= 1:
@@ -3086,8 +3113,11 @@ def timestep_prior_bin_probs(bins, prior="uniform", logit_mean=0.0, logit_std=1.
             + float(logit_mean)
         )
         t = torch.sigmoid(eps)
-    else:
+    elif prior == "mode":
         t = mode_flow_time_base(q.to(torch.float32), mode_scale=mode_scale).to(torch.float64)
+    else:
+        t = u_shaped_flow_time_base(
+            q.to(torch.float32), scale=u_shape_scale).to(torch.float64)
     idx = torch.clamp((t.clamp(0.0, 1.0 - 1.0e-12) * float(bins)).long(), 0, bins - 1)
     probs = torch.bincount(idx, minlength=bins).to(torch.float64)
     return probs / probs.sum().clamp_min(1.0e-12)
@@ -3106,7 +3136,8 @@ class AdaptiveTimestepSampler:
     def __init__(self, bins=32, momentum=0.95, uniform_mix=0.05,
                  min_prob=0.001, loss_power=1.0, prior="uniform",
                  prior_mix=0.0, logit_mean=0.0, logit_std=1.0,
-                 mode_scale=DEFAULT_TIME_MODE_SCALE):
+                 mode_scale=DEFAULT_TIME_MODE_SCALE,
+                 u_shape_scale=DEFAULT_TIME_U_SHAPE_SCALE):
         bins = int(bins)
         if bins <= 1:
             raise ValueError("adaptive timestep bins must be > 1")
@@ -3135,9 +3166,10 @@ class AdaptiveTimestepSampler:
         self.loss_power = loss_power
         self.prior = prior
         self.prior_mix = prior_mix
+        self.u_shape_scale = float(u_shape_scale)
         self.prior_probs = timestep_prior_bin_probs(
             bins, prior=prior, logit_mean=logit_mean, logit_std=logit_std,
-            mode_scale=mode_scale)
+            mode_scale=mode_scale, u_shape_scale=u_shape_scale)
         self.loss_ema = torch.ones(bins, dtype=torch.float64)
         self.counts = torch.zeros(bins, dtype=torch.long)
         self.samples = torch.zeros(bins, dtype=torch.long)
@@ -3226,6 +3258,7 @@ class AdaptiveTimestepSampler:
             f"{prefix}_loss_power": float(self.loss_power),
             f"{prefix}_prior": str(self.prior),
             f"{prefix}_prior_mix": float(self.prior_mix),
+            f"{prefix}_u_shape_scale": float(self.u_shape_scale),
             f"{prefix}_prior_prob_min": float(self.prior_probs.min().item()),
             f"{prefix}_prior_prob_max": float(self.prior_probs.max().item()),
             f"{prefix}_prior_prob_entropy": float(
@@ -3354,8 +3387,9 @@ def flow_time_schedule(steps, device=DEV, shift=1.0, schedule="linear"):
 
 
 def sample_flow_times(batch, device=DEV, mode="uniform", logit_mean=0.0, logit_std=1.0,
-                      mode_scale=DEFAULT_TIME_MODE_SCALE, time_shift=1.0,
-                      adaptive_sampler=None, stratified=False):
+                      mode_scale=DEFAULT_TIME_MODE_SCALE,
+                      u_shape_scale=DEFAULT_TIME_U_SHAPE_SCALE,
+                      time_shift=1.0, adaptive_sampler=None, stratified=False):
     """Sample rectified-flow interpolation times.
 
     Uniform is the original rectified-flow baseline.  Logit-normal follows the SD3-style
@@ -3380,6 +3414,9 @@ def sample_flow_times(batch, device=DEV, mode="uniform", logit_mean=0.0, logit_s
     elif mode == "mode":
         u = u if u is not None else torch.rand(batch, 1, 1, 1, device=device)
         t = mode_flow_time_base(u, mode_scale=mode_scale)
+    elif mode == "u-shaped":
+        u = u if u is not None else torch.rand(batch, 1, 1, 1, device=device)
+        t = u_shaped_flow_time_base(u, scale=u_shape_scale)
     elif mode == "adaptive":
         if adaptive_sampler is not None:
             return adaptive_sampler.sample(
@@ -5971,7 +6008,9 @@ def flow_repa_mode_id(mode):
 def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        time_sampling="uniform", time_logit_mean=0.0,
                        time_logit_std=1.0,
-                       time_mode_scale=DEFAULT_TIME_MODE_SCALE, time_shift=1.0,
+                       time_mode_scale=DEFAULT_TIME_MODE_SCALE,
+                       time_u_shape_scale=DEFAULT_TIME_U_SHAPE_SCALE,
+                       time_shift=1.0,
                        time_stratified=False,
                        latent_stats=None, consistency_w=0.0,
                        endpoint_w=0.0, frequency_w=0.0,
@@ -6041,7 +6080,9 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         projections=flow_noise_coupling_projections)
     t = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                           logit_mean=time_logit_mean, logit_std=time_logit_std,
-                          mode_scale=time_mode_scale, time_shift=time_shift,
+                          mode_scale=time_mode_scale,
+                          u_shape_scale=time_u_shape_scale,
+                          time_shift=time_shift,
                           adaptive_sampler=adaptive_sampler,
                           stratified=time_stratified)
     zt = (1.0 - t) * x0 + t * z1_model
@@ -6148,7 +6189,9 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     if consistency_w > 0.0 or straightness_w > 0.0:
         t2 = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                                logit_mean=time_logit_mean, logit_std=time_logit_std,
-                               mode_scale=time_mode_scale, time_shift=time_shift,
+                               mode_scale=time_mode_scale,
+                               u_shape_scale=time_u_shape_scale,
+                               time_shift=time_shift,
                                adaptive_sampler=adaptive_sampler,
                                stratified=time_stratified)
         zt2 = (1.0 - t2) * x0 + t2 * z1_model
@@ -6360,6 +6403,7 @@ def latent_flow_self_distill_losses(flow, teacher_flow, z1, cond, teacher_cond=N
                                     time_sampling="uniform", time_logit_mean=0.0,
                                     time_logit_std=1.0,
                                     time_mode_scale=DEFAULT_TIME_MODE_SCALE,
+                                    time_u_shape_scale=DEFAULT_TIME_U_SHAPE_SCALE,
                                     time_shift=1.0, time_stratified=False,
                                     latent_stats=None, time_gap=0.25,
                                     guidance_w=0.0, guidance_cfg_scale=1.0,
@@ -6378,7 +6422,9 @@ def latent_flow_self_distill_losses(flow, teacher_flow, z1, cond, teacher_cond=N
     x0 = torch.randn_like(z1_model)
     t = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                           logit_mean=time_logit_mean, logit_std=time_logit_std,
-                          mode_scale=time_mode_scale, time_shift=time_shift,
+                          mode_scale=time_mode_scale,
+                          u_shape_scale=time_u_shape_scale,
+                          time_shift=time_shift,
                           stratified=time_stratified)
     t_teacher = (t + gap * (1.0 - t)).clamp(max=1.0 - 1.0e-4)
     zt = (1.0 - t) * x0 + t * z1_model
@@ -6443,6 +6489,7 @@ def latent_flow_self_distill_losses(flow, teacher_flow, z1, cond, teacher_cond=N
 def flow_endpoint_metrics(flow, z1, cond, time_sampling="uniform", time_logit_mean=0.0,
                           time_logit_std=1.0,
                           time_mode_scale=DEFAULT_TIME_MODE_SCALE,
+                          time_u_shape_scale=DEFAULT_TIME_U_SHAPE_SCALE,
                           time_shift=1.0, time_stratified=False, latent_stats=None):
     """Measure whether different times on the same path predict the same clean endpoint."""
     latent_stats = flow_latent_stats(flow) if latent_stats is None else latent_stats
@@ -6450,11 +6497,15 @@ def flow_endpoint_metrics(flow, z1, cond, time_sampling="uniform", time_logit_me
     x0 = torch.randn_like(z1_model)
     t1 = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                            logit_mean=time_logit_mean, logit_std=time_logit_std,
-                           mode_scale=time_mode_scale, time_shift=time_shift,
+                           mode_scale=time_mode_scale,
+                           u_shape_scale=time_u_shape_scale,
+                           time_shift=time_shift,
                            stratified=time_stratified)
     t2 = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                            logit_mean=time_logit_mean, logit_std=time_logit_std,
-                           mode_scale=time_mode_scale, time_shift=time_shift,
+                           mode_scale=time_mode_scale,
+                           u_shape_scale=time_u_shape_scale,
+                           time_shift=time_shift,
                            stratified=time_stratified)
 
     def endpoint_at(t):
@@ -6475,7 +6526,9 @@ def flow_endpoint_metrics(flow, z1, cond, time_sampling="uniform", time_logit_me
 
 def latent_flow_loss(flow, z1, cond, cond_drop=0.0, time_sampling="uniform",
                      time_logit_mean=0.0, time_logit_std=1.0,
-                     time_mode_scale=DEFAULT_TIME_MODE_SCALE, time_shift=1.0,
+                     time_mode_scale=DEFAULT_TIME_MODE_SCALE,
+                     time_u_shape_scale=DEFAULT_TIME_U_SHAPE_SCALE,
+                     time_shift=1.0,
                      time_stratified=False, latent_stats=None, flow_loss_weight="none",
                      flow_loss_weight_gamma=5.0, flow_loss_weight_normalize=True):
     loss, _parts = latent_flow_losses(flow, z1, cond, cond_drop=cond_drop,
@@ -6483,6 +6536,7 @@ def latent_flow_loss(flow, z1, cond, cond_drop=0.0, time_sampling="uniform",
                                       time_logit_mean=time_logit_mean,
                                       time_logit_std=time_logit_std,
                                       time_mode_scale=time_mode_scale,
+                                      time_u_shape_scale=time_u_shape_scale,
                                       time_shift=time_shift,
                                       time_stratified=time_stratified,
                                       latent_stats=latent_stats,
@@ -9458,6 +9512,9 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "time_curriculum_final_sampling": str(ckpt.get(
             "time_curriculum_final_sampling",
             report.get("time_curriculum_final_sampling", "uniform"))),
+        "time_u_shape_scale": float(ckpt.get(
+            "time_u_shape_scale",
+            report.get("time_u_shape_scale", DEFAULT_TIME_U_SHAPE_SCALE))),
         "size_curriculum_frac": float(ckpt.get(
             "size_curriculum_frac", report.get("size_curriculum_frac", 0.0))),
         "size_curriculum_switch_step": int(ckpt.get(
@@ -10458,7 +10515,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       dit_qk_norm=False, dit_attn_impl="auto",
                       time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0,
-                      time_mode_scale=DEFAULT_TIME_MODE_SCALE, time_shift=1.0,
+                      time_mode_scale=DEFAULT_TIME_MODE_SCALE,
+                      time_u_shape_scale=DEFAULT_TIME_U_SHAPE_SCALE,
+                      time_shift=1.0,
                       time_stratified=False, time_curriculum_frac=0.0,
                       time_adaptive_bins=32, time_adaptive_momentum=0.95,
                       time_adaptive_uniform_mix=0.05,
@@ -10566,6 +10625,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     time_mode_scale = float(time_mode_scale)
     if time_mode_scale < 0.0 or time_mode_scale >= MAX_TIME_MODE_SCALE:
         raise ValueError(f"time_mode_scale must be in [0, {MAX_TIME_MODE_SCALE})")
+    time_u_shape_scale = float(time_u_shape_scale)
+    if time_u_shape_scale < 0.0 or time_u_shape_scale > MAX_TIME_U_SHAPE_SCALE:
+        raise ValueError(
+            f"time_u_shape_scale must be in [0, {MAX_TIME_U_SHAPE_SCALE:g}]")
     time_curriculum_frac = float(time_curriculum_frac)
     if time_curriculum_frac < 0.0 or time_curriculum_frac > 1.0:
         raise ValueError("time_curriculum_frac must be in [0, 1]")
@@ -11453,7 +11516,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             prior_mix=time_adaptive_prior_mix,
             logit_mean=time_logit_mean,
             logit_std=time_logit_std,
-            mode_scale=time_mode_scale)
+            mode_scale=time_mode_scale,
+            u_shape_scale=time_u_shape_scale)
         if time_sampling == "adaptive" else None
     )
     size_curriculum_switch = size_curriculum_switch_step(
@@ -11587,7 +11651,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     flow, z1, cond, cond_drop=cond_drop, ae=ae,
                     time_sampling=active_time_sampling, time_logit_mean=time_logit_mean,
                     time_logit_std=time_logit_std,
-                    time_mode_scale=time_mode_scale, time_shift=effective_time_shift,
+                    time_mode_scale=time_mode_scale,
+                    time_u_shape_scale=time_u_shape_scale,
+                    time_shift=effective_time_shift,
                     time_stratified=time_stratified,
                     flow_noise_coupling=flow_noise_coupling,
                     flow_noise_coupling_projections=flow_noise_coupling_projections,
@@ -11641,6 +11707,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                         time_logit_mean=time_logit_mean,
                         time_logit_std=time_logit_std,
                         time_mode_scale=time_mode_scale,
+                        time_u_shape_scale=time_u_shape_scale,
                         time_shift=effective_time_shift,
                         time_stratified=time_stratified,
                         flow_loss_weight=flow_loss_weight,
@@ -11744,6 +11811,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                         time_sampling=distill_time_sampling,
                         time_logit_mean=time_logit_mean, time_logit_std=time_logit_std,
                         time_mode_scale=time_mode_scale,
+                        time_u_shape_scale=time_u_shape_scale,
                         time_shift=effective_time_shift, latent_stats=latent_stats,
                         time_stratified=time_stratified,
                         time_gap=flow_distill_time_gap,
@@ -12100,6 +12168,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "time_logit_mean": float(time_logit_mean),
         "time_logit_std": float(time_logit_std),
         "time_mode_scale": float(time_mode_scale),
+        "time_u_shape_scale": float(time_u_shape_scale),
         "time_adaptive_requested": time_sampling == "adaptive",
         "time_adaptive_bins": int(time_adaptive_bins),
         "time_adaptive_momentum": float(time_adaptive_momentum),
@@ -12235,9 +12304,22 @@ def selftest():
     assert torch.allclose(
         mode_flow_time_base(torch.linspace(0.0, 1.0, 5), mode_scale=0.0),
         torch.linspace(0.0, 1.0, 5))
+    u_grid = u_shaped_flow_time_base(torch.linspace(0.0, 1.0, 9), scale=4.0)
+    assert torch.allclose(u_grid[:1], torch.zeros(1))
+    assert torch.allclose(u_grid[-1:], torch.ones(1))
+    assert bool(torch.all(u_grid[1:] > u_grid[:-1]))
+    assert torch.allclose(
+        u_shaped_flow_time_base(torch.linspace(0.0, 1.0, 5), scale=0.0),
+        torch.linspace(0.0, 1.0, 5))
     mode_times = sample_flow_times(8, device="cpu", mode="mode", mode_scale=1.29)
     assert tuple(mode_times.shape) == (8, 1, 1, 1)
     assert float(mode_times.min()) >= 0.0 and float(mode_times.max()) <= 1.0
+    u_times = sample_flow_times(2048, device="cpu", mode="u-shaped")
+    assert tuple(u_times.shape) == (2048, 1, 1, 1)
+    assert float(u_times.min()) >= 0.0 and float(u_times.max()) <= 1.0
+    u_bins = torch.bincount(
+        torch.clamp((u_times.flatten() * 8).long(), 0, 7), minlength=8)
+    assert int(u_bins[0] + u_bins[-1]) > int(u_bins[3] + u_bins[4])
     stratified_times = sample_flow_times(
         8, device="cpu", mode="logit-normal", stratified=True)
     assert tuple(stratified_times.shape) == (8, 1, 1, 1)
@@ -12253,11 +12335,19 @@ def selftest():
     assert tuple(prior_probs.shape) == (8,)
     assert torch.allclose(prior_probs.sum(), torch.ones((), dtype=torch.float64))
     assert float(prior_probs.max()) > float(prior_probs.min())
+    u_prior_probs = timestep_prior_bin_probs(8, prior="u-shaped", u_shape_scale=4.0)
+    assert tuple(u_prior_probs.shape) == (8,)
+    assert torch.allclose(u_prior_probs.sum(), torch.ones((), dtype=torch.float64))
+    assert float(u_prior_probs[0] + u_prior_probs[-1]) > float(
+        u_prior_probs[3] + u_prior_probs[4])
     adaptive_prior = AdaptiveTimestepSampler(
         bins=8, prior="mode", prior_mix=0.5, mode_scale=1.29)
     adaptive_probs = adaptive_prior.probabilities()
     assert tuple(adaptive_probs.shape) == (8,)
     assert float(adaptive_probs.max()) > float(adaptive_probs.min())
+    adaptive_u_prior = AdaptiveTimestepSampler(
+        bins=8, prior="u-shaped", prior_mix=0.5, u_shape_scale=4.0)
+    assert math.isclose(adaptive_u_prior.report()["time_adaptive_u_shape_scale"], 4.0)
     curriculum_buckets = normalize_image_size_buckets("16x16,32x16,32x32")
     assert [image_size_key(b) for b in size_curriculum_bucket_order(
         curriculum_buckets)] == ["16x16", "32x16", "32x32"]
@@ -13143,6 +13233,11 @@ def main(argv=None):
                     dest="time_mode_scale",
                     help=("curvature for --time-sampling mode; 0 is uniform, "
                           f"must be < {MAX_TIME_MODE_SCALE:g}"))
+    ap.add_argument("--time-u-shape-scale", type=float,
+                    default=DEFAULT_TIME_U_SHAPE_SCALE,
+                    dest="time_u_shape_scale",
+                    help=("endpoint emphasis for --time-sampling u-shaped and "
+                          "--time-adaptive-prior u-shaped"))
     ap.add_argument("--time-curriculum-frac", type=float, default=0.0,
                     dest="time_curriculum_frac",
                     help=("fraction of flow training that uses --time-sampling before "
@@ -13613,6 +13708,10 @@ def main(argv=None):
         ap.error("--image-preference-w requires --image-preference-manifest")
     if args.image_preference_w > 0.0 and args.quality_score_steps <= 0:
         ap.error("--image-preference-w requires --quality-score-steps > 0")
+    if (args.time_u_shape_scale < 0.0
+            or args.time_u_shape_scale > MAX_TIME_U_SHAPE_SCALE):
+        ap.error(
+            f"--time-u-shape-scale must be in [0, {MAX_TIME_U_SHAPE_SCALE:g}]")
     if args.flow_preference_w < 0.0:
         ap.error("--flow-preference-w must be non-negative")
     if args.flow_preference_beta <= 0.0:
@@ -13983,6 +14082,7 @@ def main(argv=None):
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
         time_logit_std=args.time_logit_std,
         time_mode_scale=args.time_mode_scale,
+        time_u_shape_scale=args.time_u_shape_scale,
         time_stratified=args.time_stratified,
         time_curriculum_frac=args.time_curriculum_frac,
         time_adaptive_bins=args.time_adaptive_bins,
@@ -14398,6 +14498,8 @@ def main(argv=None):
         "time_logit_mean": args.time_logit_mean,
         "time_logit_std": args.time_logit_std,
         "time_mode_scale": args.time_mode_scale,
+        "time_u_shape_scale": report.get(
+            "time_u_shape_scale", args.time_u_shape_scale),
         "time_adaptive_requested": report.get(
             "time_adaptive_requested", args.time_sampling == "adaptive"),
         "time_adaptive_enabled": report.get("time_adaptive_enabled", False),
