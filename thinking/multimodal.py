@@ -319,6 +319,12 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
     text_prefixes = ("txt.enc.", "txt.blocks.", "txt.ln.")
     latent_prefixes = ("latent_concepts.", "latent_concept_refiner.",
                        "latent_concept_memory.")
+    memory_key = "latent_concept_memory.memory"
+    src_memory = state.get(memory_key)
+    dst_memory = dst_state.get(memory_key)
+    memory_compatible = (
+        src_memory is not None and dst_memory is not None
+        and tuple(src_memory.shape) == tuple(dst_memory.shape))
     with torch.no_grad():
         for name, src_val in sorted(state.items()):
             if name in ("txt.emb.weight", "txt.pos.weight"):
@@ -332,6 +338,16 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
             dst_val = dst_state.get(name)
             if dst_val is None:
                 report["skipped_missing"].append(name)
+                continue
+            if (name.startswith("latent_concept_memory.")
+                    and name != memory_key
+                    and not memory_compatible):
+                report["skipped_shape"].append({
+                    "name": name,
+                    "source": list(src_val.shape),
+                    "target": list(dst_val.shape),
+                    "requires": memory_key,
+                })
                 continue
             if tuple(src_val.shape) != tuple(dst_val.shape):
                 report["skipped_shape"].append({
@@ -647,11 +663,23 @@ class MultimodalLM(nn.Module):
         return self.latent_concept_memory(
             slots, temperature=temperature, balance_w=balance_w)
 
+    def latent_concept_association_loss(self, slots, temperature=0.1,
+                                        target_power=1.0, self_loop_w=0.05):
+        if self.latent_concept_memory is None:
+            if slots is not None:
+                return slots.sum() * 0.0
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        return self.latent_concept_memory.association_loss(
+            slots, temperature=temperature, target_power=target_power,
+            self_loop_w=self_loop_w)
+
     @torch.no_grad()
-    def update_latent_concept_memory(self, slots, momentum=0.95):
+    def update_latent_concept_memory(self, slots, momentum=0.95,
+                                     relation_decay=None):
         if self.latent_concept_memory is None:
             return 0
-        return self.latent_concept_memory.update(slots, momentum=momentum)
+        return self.latent_concept_memory.update(
+            slots, momentum=momentum, relation_decay=relation_decay)
 
     def enable_latent_concept_refiner(self, heads=None, gate_init=-2.0):
         if self.latent_concepts is None:
@@ -1464,11 +1492,29 @@ def latent_multimodal_memory_loss_from_views(model, views, temperature=0.1,
     return torch.stack(losses).mean() if losses else next(iter(views.values())).sum() * 0.0
 
 
+def latent_multimodal_association_loss_from_views(
+        model, views, temperature=0.1, target_power=1.0, self_loop_w=0.05):
+    views = {mode: slots for mode, slots in views.items() if slots is not None}
+    if not views:
+        return torch.tensor(0.0)
+    if getattr(model, "latent_concept_memory", None) is None:
+        return next(iter(views.values())).sum() * 0.0
+    losses = [
+        model.latent_concept_association_loss(
+            slots, temperature=temperature, target_power=target_power,
+            self_loop_w=self_loop_w)
+        for slots in views.values()
+    ]
+    return torch.stack(losses).mean() if losses else next(iter(views.values())).sum() * 0.0
+
+
 @torch.no_grad()
-def update_multimodal_latent_memory(model, slots, momentum=0.95):
+def update_multimodal_latent_memory(model, slots, momentum=0.95,
+                                    relation_decay=None):
     if getattr(model, "latent_concept_memory", None) is None:
         return 0
-    return model.update_latent_concept_memory(slots, momentum=momentum)
+    return model.update_latent_concept_memory(
+        slots, momentum=momentum, relation_decay=relation_decay)
 
 
 def latent_multimodal_neighborhood_loss_from_views(views, temperature=0.1,
@@ -1747,6 +1793,11 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           latent_concept_memory_temperature=0.1,
           latent_concept_memory_momentum=0.95,
           latent_concept_memory_balance_w=0.01,
+          latent_concept_association_w=0.0,
+          latent_concept_association_temperature=0.1,
+          latent_concept_association_decay=0.99,
+          latent_concept_association_target_power=1.0,
+          latent_concept_association_self_loop_w=0.05,
           latent_concept_neighborhood_w=0.0,
           latent_concept_neighborhood_temperature=0.1,
           latent_concept_neighborhood_margin=0.0,
@@ -1781,9 +1832,12 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     if (text_checkpoint and latent_concept_memory_size <= 0
             and ckpt_latents.get("latent_concept_memory_size", 0) > 0):
         latent_concept_memory_size = ckpt_latents["latent_concept_memory_size"]
+    if latent_concept_association_w > 0.0 and latent_concept_memory_size <= 0:
+        raise ValueError("latent concept association requires latent concept memory")
     if (latent_concept_w < 0.0 or latent_concept_factor_w < 0.0
             or latent_concept_factorization_w < 0.0
             or latent_concept_memory_w < 0.0
+            or latent_concept_association_w < 0.0
             or latent_concept_neighborhood_w < 0.0
             or latent_concept_transition_w < 0.0
             or latent_concept_cluster_w < 0.0):
@@ -1791,6 +1845,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     if ((latent_concept_w > 0.0 or latent_concept_factor_w > 0.0
          or latent_concept_factorization_w > 0.0
          or latent_concept_memory_w > 0.0
+         or latent_concept_association_w > 0.0
          or latent_concept_memory_size > 0
          or latent_concept_neighborhood_w > 0.0
          or latent_concept_transition_w > 0.0
@@ -1813,6 +1868,16 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         raise ValueError("latent concept memory momentum must be in [0, 1)")
     if latent_concept_memory_balance_w < 0.0:
         raise ValueError("latent concept memory balance weight must be non-negative")
+    if latent_concept_association_temperature <= 0.0:
+        raise ValueError("latent concept association temperature must be positive")
+    if (latent_concept_association_decay < 0.0
+            or latent_concept_association_decay >= 1.0):
+        raise ValueError("latent concept association decay must be in [0, 1)")
+    if latent_concept_association_target_power <= 0.0:
+        raise ValueError("latent concept association target power must be positive")
+    if latent_concept_association_self_loop_w < 0.0:
+        raise ValueError(
+            "latent concept association self-loop weight must be non-negative")
     if latent_concept_neighborhood_temperature <= 0.0:
         raise ValueError("latent concept neighborhood temperature must be positive")
     if latent_concept_neighborhood_margin < 0.0:
@@ -1901,6 +1966,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     last_latent_factorization = 0.0
     last_latent_memory = 0.0
     last_latent_memory_updates = 0
+    last_latent_association = 0.0
     last_latent_neighborhood = 0.0
     last_latent_transition = 0.0
     last_latent_cluster = 0.0
@@ -1928,6 +1994,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         needs_latent_batch = bool(
             latent_concept_w or latent_concept_factorization_w
             or latent_concept_memory_w
+            or latent_concept_association_w
             or latent_concept_neighborhood_w
             or latent_concept_transition_w
             or latent_concept_cluster_w)
@@ -2036,6 +2103,15 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                 temperature=latent_concept_memory_temperature,
                 balance_w=latent_concept_memory_balance_w)
             if latent_concept_memory_w else base_loss * 0.0)
+        latent_association = (
+            latent_multimodal_association_loss_from_views(
+                model,
+                {mode: bundle["latent_concepts"]
+                 for mode, bundle in bundles_by_mode.items()},
+                temperature=latent_concept_association_temperature,
+                target_power=latent_concept_association_target_power,
+                self_loop_w=latent_concept_association_self_loop_w)
+            if latent_concept_association_w else base_loss * 0.0)
         latent_neighborhood = (
             latent_multimodal_neighborhood_loss_from_views(
                 {mode: bundle["latent_concepts"]
@@ -2082,6 +2158,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                 + float(latent_concept_w) * latent_concept
                 + float(latent_concept_factorization_w) * latent_factorization
                 + float(latent_concept_memory_w) * latent_memory
+                + float(latent_concept_association_w) * latent_association
                 + float(latent_concept_neighborhood_w) * latent_neighborhood
                 + float(latent_concept_transition_w) * latent_transition
                 + float(latent_concept_cluster_w) * latent_cluster
@@ -2093,7 +2170,9 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
             bundles_by_mode.get("full", {}).get("latent_concepts")
             if needs_latent_batch else None)
         last_latent_memory_updates = int(update_multimodal_latent_memory(
-            model, full_latent_for_memory, momentum=latent_concept_memory_momentum))
+            model, full_latent_for_memory, momentum=latent_concept_memory_momentum,
+            relation_decay=(latent_concept_association_decay
+                            if latent_concept_association_w else None)))
         last_base = float(base_loss.detach())
         last_agreement = float(agreement.detach())
         last_concept = float(concept_loss.detach())
@@ -2109,6 +2188,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         last_latent_concept = float(latent_concept.detach())
         last_latent_factorization = float(latent_factorization.detach())
         last_latent_memory = float(latent_memory.detach())
+        last_latent_association = float(latent_association.detach())
         last_latent_neighborhood = float(latent_neighborhood.detach())
         last_latent_transition = float(latent_transition.detach())
         last_latent_cluster = float(latent_cluster.detach())
@@ -2129,6 +2209,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                   f"latent {last_latent_concept:.3f} "
                   f"latent-factorize {last_latent_factorization:.3f} "
                   f"latent-memory {last_latent_memory:.3f} "
+                  f"latent-assoc {last_latent_association:.3f} "
                   f"latent-neighborhood {last_latent_neighborhood:.3f} "
                   f"latent-transition {last_latent_transition:.3f} "
                   f"latent-cluster {last_latent_cluster:.3f} "
@@ -2149,6 +2230,24 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                            "latent_concept_loss": last_latent_concept,
                            "latent_factorization_loss": last_latent_factorization,
                            "latent_memory_loss": last_latent_memory,
+                           "latent_association_loss": last_latent_association,
+                           "latent_association_w": float(
+                               latent_concept_association_w),
+                           "latent_association_temperature": float(
+                               latent_concept_association_temperature),
+                           "latent_association_decay": float(
+                               latent_concept_association_decay),
+                           "latent_association_target_power": float(
+                               latent_concept_association_target_power),
+                           "latent_association_self_loop_w": float(
+                               latent_concept_association_self_loop_w),
+                           "latent_association_relation_updates": int(
+                               getattr(getattr(model, "latent_concept_memory", None),
+                                       "relation_updates",
+                                       torch.zeros((), dtype=torch.long)).item()),
+                           "latent_association_active_edges": int(
+                               getattr(getattr(model, "latent_concept_memory", None),
+                                       "relations", torch.zeros(0)).gt(0).sum().item()),
                            "latent_memory_size": int(
                                getattr(model, "latent_concept_memory_size", 0)),
                            "latent_memory_active": int(
@@ -2206,6 +2305,11 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         latent_concept_memory_temperature=0.1,
         latent_concept_memory_momentum=0.95,
         latent_concept_memory_balance_w=0.01,
+        latent_concept_association_w=0.0,
+        latent_concept_association_temperature=0.1,
+        latent_concept_association_decay=0.99,
+        latent_concept_association_target_power=1.0,
+        latent_concept_association_self_loop_w=0.05,
         latent_concept_neighborhood_w=0.0,
         latent_concept_neighborhood_temperature=0.1,
         latent_concept_neighborhood_margin=0.0,
@@ -2281,6 +2385,16 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                        latent_concept_memory_momentum),
                                    latent_concept_memory_balance_w=(
                                        latent_concept_memory_balance_w),
+                                   latent_concept_association_w=(
+                                       latent_concept_association_w),
+                                   latent_concept_association_temperature=(
+                                       latent_concept_association_temperature),
+                                   latent_concept_association_decay=(
+                                       latent_concept_association_decay),
+                                   latent_concept_association_target_power=(
+                                       latent_concept_association_target_power),
+                                   latent_concept_association_self_loop_w=(
+                                       latent_concept_association_self_loop_w),
                                    latent_concept_neighborhood_w=(
                                        latent_concept_neighborhood_w),
                                    latent_concept_neighborhood_temperature=(
@@ -2418,6 +2532,15 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
               "latent_concept_memory_momentum": float(latent_concept_memory_momentum),
               "latent_concept_memory_balance_w": float(
                   latent_concept_memory_balance_w),
+              "latent_concept_association_w": float(latent_concept_association_w),
+              "latent_concept_association_temperature": float(
+                  latent_concept_association_temperature),
+              "latent_concept_association_decay": float(
+                  latent_concept_association_decay),
+              "latent_concept_association_target_power": float(
+                  latent_concept_association_target_power),
+              "latent_concept_association_self_loop_w": float(
+                  latent_concept_association_self_loop_w),
               "latent_concept_neighborhood_w": float(latent_concept_neighborhood_w),
               "latent_concept_neighborhood_temperature": float(
                   latent_concept_neighborhood_temperature),
@@ -2612,8 +2735,12 @@ def selftest():
     assert torch.isfinite(latent_multimodal_factorization_loss_from_views(
         latent_views, variance_target=0.01, separation_margin=0.2))
     latent_model.enable_latent_concept_memory(4)
-    assert update_multimodal_latent_memory(latent_model, latent_views["full"]) > 0
+    assert update_multimodal_latent_memory(
+        latent_model, latent_views["full"], relation_decay=0.5) > 0
+    assert int(latent_model.latent_concept_memory.relation_updates.item()) > 0
     assert torch.isfinite(latent_multimodal_memory_loss_from_views(
+        latent_model, latent_views, temperature=0.2))
+    assert torch.isfinite(latent_multimodal_association_loss_from_views(
         latent_model, latent_views, temperature=0.2))
     assert torch.isfinite(latent_multimodal_neighborhood_loss_from_views(
         latent_views, temperature=0.2))
@@ -2658,8 +2785,10 @@ def selftest():
             text_model.txt.emb.weight[text_vocab.stoi["red"]].fill_(0.314)
             text_model.latent_concepts.queries.fill_(0.271)
             text_model.latent_concept_memory.memory.fill_(0.123)
+            text_model.latent_concept_memory.relations.fill_(0.456)
             text_model.latent_concept_memory.filled.fill_(5)
             text_model.latent_concept_memory.updates.fill_(7)
+            text_model.latent_concept_memory.relation_updates.fill_(9)
         text_ckpt = os.path.join(tmpdir, "text-reading.pt")
         torch.save(
             checkpoint_payload(
@@ -2690,7 +2819,10 @@ def selftest():
                                   transfer_model.latent_concept_memory.memory)
         assert torch.allclose(transfer_model.latent_concept_memory.memory,
                               text_model.latent_concept_memory.memory)
+        assert torch.allclose(transfer_model.latent_concept_memory.relations,
+                              text_model.latent_concept_memory.relations)
         assert int(transfer_model.latent_concept_memory.filled.item()) == 5
+        assert int(transfer_model.latent_concept_memory.relation_updates.item()) == 9
         ckpt_latents = text_checkpoint_latent_config(text_ckpt, device="cpu")
         assert ckpt_latents["latent_concept_slots"] == 3
         assert ckpt_latents["latent_concept_memory_size"] == 5
@@ -2699,6 +2831,7 @@ def selftest():
             log_every=1, text_checkpoint=text_ckpt,
             latent_concept_factorization_w=0.1,
             latent_concept_memory_w=0.1,
+            latent_concept_association_w=0.1,
             latent_concept_neighborhood_w=0.1,
             latent_concept_transition_w=0.1,
             latent_concept_cluster_w=0.1)
@@ -2708,6 +2841,8 @@ def selftest():
         assert auto_model.train_metrics["latent_factorization_loss"] >= 0.0
         assert auto_model.train_metrics["latent_memory_loss"] >= 0.0
         assert auto_model.train_metrics["latent_memory_active"] > 0
+        assert auto_model.train_metrics["latent_association_loss"] >= 0.0
+        assert auto_model.train_metrics["latent_association_relation_updates"] > 0
         assert auto_model.train_metrics["latent_neighborhood_loss"] >= 0.0
         assert auto_model.train_metrics["latent_transition_loss"] >= 0.0
         assert auto_model.train_metrics["latent_cluster_loss"] >= 0.0
@@ -2890,6 +3025,21 @@ def main(argv=None):
     ap.add_argument("--latent-concept-memory-balance-w", type=float, default=0.01,
                     dest="latent_concept_memory_balance_w",
                     help="usage-balance weight for latent concept memory")
+    ap.add_argument("--latent-concept-association-w", type=float, default=0.0,
+                    dest="latent_concept_association_w",
+                    help="weight for persistent self-mined latent concept association graph")
+    ap.add_argument("--latent-concept-association-temperature", type=float,
+                    default=0.1, dest="latent_concept_association_temperature",
+                    help="contrastive temperature for latent concept associations")
+    ap.add_argument("--latent-concept-association-decay", type=float, default=0.99,
+                    dest="latent_concept_association_decay",
+                    help="EMA decay for persistent latent association graph updates")
+    ap.add_argument("--latent-concept-association-target-power", type=float,
+                    default=1.0, dest="latent_concept_association_target_power",
+                    help="sharpening power for association graph targets")
+    ap.add_argument("--latent-concept-association-self-loop-w", type=float,
+                    default=0.05, dest="latent_concept_association_self_loop_w",
+                    help="self-loop weight in latent association graph targets")
     ap.add_argument("--latent-concept-neighborhood-w", type=float, default=0.0,
                     dest="latent_concept_neighborhood_w",
                     help=("weight for self-mined latent neighborhood alignment "
@@ -3111,9 +3261,10 @@ def main(argv=None):
     if args.latent_concept_memory_size < 0:
         ap.error("--latent-concept-memory-size must be non-negative")
     if ((args.latent_concept_memory_w > 0.0
+         or args.latent_concept_association_w > 0.0
          or args.latent_concept_memory_size > 0)
             and effective_latent_slots <= 0):
-        ap.error("--latent-concept-memory requires --latent-concept-slots > 0")
+        ap.error("--latent-concept-memory/association requires --latent-concept-slots > 0")
     if args.latent_concept_memory_temperature <= 0.0:
         ap.error("--latent-concept-memory-temperature must be positive")
     if (args.latent_concept_memory_momentum < 0.0
@@ -3121,6 +3272,17 @@ def main(argv=None):
         ap.error("--latent-concept-memory-momentum must be in [0, 1)")
     if args.latent_concept_memory_balance_w < 0.0:
         ap.error("--latent-concept-memory-balance-w must be non-negative")
+    if args.latent_concept_association_w < 0.0:
+        ap.error("--latent-concept-association-w must be non-negative")
+    if args.latent_concept_association_temperature <= 0.0:
+        ap.error("--latent-concept-association-temperature must be positive")
+    if (args.latent_concept_association_decay < 0.0
+            or args.latent_concept_association_decay >= 1.0):
+        ap.error("--latent-concept-association-decay must be in [0, 1)")
+    if args.latent_concept_association_target_power <= 0.0:
+        ap.error("--latent-concept-association-target-power must be positive")
+    if args.latent_concept_association_self_loop_w < 0.0:
+        ap.error("--latent-concept-association-self-loop-w must be non-negative")
     if args.latent_concept_neighborhood_w < 0.0:
         ap.error("--latent-concept-neighborhood-w must be non-negative")
     if args.latent_concept_neighborhood_w > 0.0 and effective_latent_slots <= 0:
@@ -3226,6 +3388,16 @@ def main(argv=None):
                      args.latent_concept_memory_momentum),
                  latent_concept_memory_balance_w=(
                      args.latent_concept_memory_balance_w),
+                 latent_concept_association_w=(
+                     args.latent_concept_association_w),
+                 latent_concept_association_temperature=(
+                     args.latent_concept_association_temperature),
+                 latent_concept_association_decay=(
+                     args.latent_concept_association_decay),
+                 latent_concept_association_target_power=(
+                     args.latent_concept_association_target_power),
+                 latent_concept_association_self_loop_w=(
+                     args.latent_concept_association_self_loop_w),
                  latent_concept_neighborhood_w=args.latent_concept_neighborhood_w,
                  latent_concept_neighborhood_temperature=(
                      args.latent_concept_neighborhood_temperature),

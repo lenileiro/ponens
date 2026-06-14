@@ -127,17 +127,30 @@ class LatentConceptMemory(nn.Module):
         self.register_buffer("memory", torch.zeros(self.size, self.d))
         self.register_buffer("filled", torch.zeros((), dtype=torch.long))
         self.register_buffer("updates", torch.zeros((), dtype=torch.long))
+        self.register_buffer("relations", torch.zeros(self.size, self.size))
+        self.register_buffer("relation_updates", torch.zeros((), dtype=torch.long))
 
     def active(self):
         n = int(self.filled.item())
         return self.memory[:n]
 
+    def active_relations(self):
+        n = int(self.filled.item())
+        return self.relations[:n, :n]
+
     def forward(self, slots, temperature=0.1, balance_w=0.0):
         return latent_concept_memory_loss(
             slots, self.active(), temperature=temperature, balance_w=balance_w)
 
+    def association_loss(self, slots, temperature=0.1, target_power=1.0,
+                         self_loop_w=0.05):
+        return latent_concept_association_loss(
+            slots, self.active(), self.active_relations(),
+            temperature=temperature, target_power=target_power,
+            self_loop_w=self_loop_w)
+
     @torch.no_grad()
-    def update(self, slots, momentum=0.95):
+    def update(self, slots, momentum=0.95, relation_decay=None):
         if slots is None:
             return 0
         if slots.shape[-1] != self.d:
@@ -172,7 +185,45 @@ class LatentConceptMemory(nn.Module):
             added += int(rows.shape[0])
         if added:
             self.updates.add_(1)
+        if relation_decay is not None:
+            self.update_relations(slots, decay=relation_decay)
         return int(added)
+
+    @torch.no_grad()
+    def update_relations(self, slots, decay=0.99):
+        if slots is None:
+            return 0
+        if slots.ndim != 3:
+            raise ValueError("latent concept relation update expects [batch, slots, dim]")
+        if slots.shape[-1] != self.d:
+            raise ValueError("latent concept relation update dimension mismatch")
+        filled = int(self.filled.item())
+        if filled <= 0:
+            return 0
+        dec = float(decay)
+        if dec < 0.0 or dec >= 1.0:
+            raise ValueError("latent concept relation decay must be in [0, 1)")
+        rows = F.normalize(slots.detach(), dim=-1)
+        valid = torch.isfinite(rows).all(-1)
+        if not bool(valid.any()):
+            return 0
+        active = F.normalize(self.memory[:filled], dim=-1)
+        nearest = rows.to(active).matmul(active.t()).argmax(-1)
+        one_hot = F.one_hot(nearest, num_classes=filled).to(dtype=active.dtype)
+        one_hot = one_hot * valid.to(dtype=active.dtype).unsqueeze(-1)
+        present = one_hot.sum(1).gt(0).to(dtype=active.dtype)
+        if not bool(present.any()):
+            return 0
+        rel = present[:, :, None] * present[:, None, :]
+        eye = torch.eye(filled, dtype=torch.bool, device=rel.device)
+        rel = rel.masked_fill(eye[None], 0.0)
+        batch_rel = rel.mean(0)
+        if float(batch_rel.sum()) <= 0.0:
+            return 0
+        target = self.relations[:filled, :filled]
+        target.mul_(dec).add_(batch_rel.to(target), alpha=1.0 - dec)
+        self.relation_updates.add_(1)
+        return int(present.shape[0])
 
 
 def latent_concept_memory_loss(slots, memory, temperature=0.1, balance_w=0.0):
@@ -203,6 +254,54 @@ def latent_concept_memory_loss(slots, memory, temperature=0.1, balance_w=0.0):
         losses.append(float(balance_w) * F.kl_div(
             probs.clamp_min(1e-8).log(), uniform, reduction="batchmean"))
     return torch.stack(losses).mean()
+
+
+def latent_concept_association_loss(slots, memory, relations, temperature=0.1,
+                                    target_power=1.0, self_loop_w=0.05):
+    """Train current slots against a self-mined concept association graph.
+
+    Memory rows are persistent latent concepts; relation rows are discovered
+    co-activations between those concepts across previous examples. The target
+    distribution is produced from the graph itself, so the objective can connect
+    concepts without hand-authored labels, schemas, or language-specific rules.
+    """
+    if slots is None:
+        return torch.tensor(0.0)
+    if memory is None or memory.numel() == 0:
+        return slots.sum() * 0.0
+    if relations is None or relations.numel() == 0:
+        return slots.sum() * 0.0
+    if slots.ndim != 3:
+        raise ValueError("latent concept association expects [batch, slots, dim]")
+    if slots.shape[-1] != memory.shape[-1]:
+        raise ValueError("latent concept association dimension mismatch")
+    n = int(memory.shape[0])
+    rel = relations[:n, :n].to(device=slots.device, dtype=slots.dtype)
+    if rel.shape != (n, n):
+        raise ValueError("latent concept association relation shape mismatch")
+    rel = rel.clamp_min(0.0)
+    if float(self_loop_w):
+        rel = rel + float(self_loop_w) * torch.eye(
+            n, dtype=rel.dtype, device=rel.device)
+    row_sum = rel.sum(-1, keepdim=True)
+    active_rows = row_sum.squeeze(-1).gt(0.0)
+    if not bool(active_rows.any()):
+        return slots.sum() * 0.0
+    rel = rel / row_sum.clamp_min(1e-8)
+    rows = F.normalize(slots, dim=-1)
+    mem = F.normalize(memory.to(device=slots.device, dtype=slots.dtype), dim=-1)
+    temp = max(float(temperature), 1e-6)
+    logits = rows.matmul(mem.t()) / temp
+    pred = logits.softmax(-1).mean(1)
+    nearest = logits.detach().argmax(-1)
+    target = rel[nearest].mean(1).detach()
+    power = float(target_power)
+    if power <= 0.0:
+        raise ValueError("latent concept association target power must be positive")
+    if power != 1.0:
+        target = target.clamp_min(1e-8).pow(power)
+    target = target / target.sum(-1, keepdim=True).clamp_min(1e-8)
+    return F.kl_div(pred.clamp_min(1e-8).log(), target, reduction="batchmean")
 
 
 class SchemaConceptHead(nn.Module):
