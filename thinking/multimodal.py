@@ -21,6 +21,7 @@ import json
 import math
 import os
 import string
+import tempfile
 
 import numpy as np
 import torch
@@ -205,6 +206,138 @@ def _grid_pool(n_tokens):
     while h > 1 and n % h:
         h -= 1
     return h, n // h
+
+
+def _torch_load(path, device):
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def load_text_checkpoint_payload(path, device="cpu"):
+    ckpt = _torch_load(path, device)
+    if not isinstance(ckpt, dict) or "state_dict" not in ckpt or "vocab" not in ckpt:
+        raise ValueError(f"{path} is not a text checkpoint with state_dict and vocab")
+    return ckpt
+
+
+def text_checkpoint_latent_config(path, device="cpu"):
+    if not path:
+        return {}
+    ckpt = load_text_checkpoint_payload(path, device=device)
+    return {
+        "latent_concept_slots": int(ckpt.get("latent_concept_slots", 0)),
+        "latent_concept_layers": int(ckpt.get("latent_concept_layers", 1)),
+        "latent_concept_prefix": bool(ckpt.get("latent_concept_prefix", False)),
+        "latent_concept_refine": bool(ckpt.get("latent_concept_refine", False)),
+        "latent_concept_refine_gate_init": float(
+            ckpt.get("latent_concept_refine_gate_init", -2.0)),
+    }
+
+
+def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
+    """Warm-start multimodal text/concept modules from a text learner checkpoint.
+
+    The transfer is identity-based and shape-checked: shared vocabulary rows are copied by token
+    string, position rows are copied up to the common length, and encoder/latent concept tensors
+    move only when the current multimodal architecture actually matches the source tensor.
+    """
+    ckpt = load_text_checkpoint_payload(checkpoint, device=device)
+    state = ckpt["state_dict"]
+    src_vocab = {tok: i for i, tok in enumerate(ckpt["vocab"])}
+    dst_state = model.state_dict()
+    report = {
+        "checkpoint": checkpoint,
+        "checkpoint_experiment": ckpt.get("report", {}).get("experiment"),
+        "source_vocab_size": len(src_vocab),
+        "target_vocab_size": len(vocab),
+        "source_d": int(ckpt.get("d", 0) or 0),
+        "target_d": int(model.config["d"]),
+        "source_text_arch": ckpt.get("text_encoder_arch", "transformer"),
+        "target_text_arch": model.txt.arch,
+        "source_text_layers": int(ckpt.get("text_encoder_layers", 0) or 0),
+        "target_text_layers": int(model.txt.layers),
+        "source_latent_concept_slots": int(ckpt.get("latent_concept_slots", 0)),
+        "target_latent_concept_slots": int(model.latent_concept_slots),
+        "copied_token_embeddings": 0,
+        "overlap_tokens": 0,
+        "copied_position_rows": 0,
+        "copied_text_tensors": [],
+        "copied_latent_tensors": [],
+        "skipped_shape": [],
+        "skipped_missing": [],
+    }
+    src_emb = state.get("txt.emb.weight")
+    if src_emb is not None and src_emb.ndim == 2:
+        report["overlap_tokens"] = sum(1 for tok in vocab.stoi if tok in src_vocab)
+        dst_emb = model.txt.emb.weight
+        if src_emb.shape[1] == dst_emb.shape[1]:
+            with torch.no_grad():
+                for tok, dst_idx in vocab.stoi.items():
+                    src_idx = src_vocab.get(tok)
+                    if src_idx is None or src_idx >= src_emb.shape[0]:
+                        continue
+                    dst_emb[dst_idx].copy_(
+                        src_emb[src_idx].to(device=dst_emb.device, dtype=dst_emb.dtype))
+                    report["copied_token_embeddings"] += 1
+        else:
+            report["skipped_shape"].append({
+                "name": "txt.emb.weight",
+                "source": list(src_emb.shape),
+                "target": list(dst_emb.shape),
+            })
+
+    src_pos = state.get("txt.pos.weight")
+    if src_pos is not None and src_pos.ndim == 2:
+        dst_pos = model.txt.pos.weight
+        if src_pos.shape[1] == dst_pos.shape[1]:
+            rows = min(src_pos.shape[0], dst_pos.shape[0])
+            with torch.no_grad():
+                dst_pos[:rows].copy_(
+                    src_pos[:rows].to(device=dst_pos.device, dtype=dst_pos.dtype))
+            report["copied_position_rows"] = int(rows)
+        else:
+            report["skipped_shape"].append({
+                "name": "txt.pos.weight",
+                "source": list(src_pos.shape),
+                "target": list(dst_pos.shape),
+            })
+
+    text_prefixes = ("txt.enc.", "txt.blocks.", "txt.ln.")
+    latent_prefixes = ("latent_concepts.", "latent_concept_refiner.")
+    with torch.no_grad():
+        for name, src_val in sorted(state.items()):
+            if name in ("txt.emb.weight", "txt.pos.weight"):
+                continue
+            if name.startswith(text_prefixes):
+                copied_key = "copied_text_tensors"
+            elif name.startswith(latent_prefixes):
+                copied_key = "copied_latent_tensors"
+            else:
+                continue
+            dst_val = dst_state.get(name)
+            if dst_val is None:
+                report["skipped_missing"].append(name)
+                continue
+            if tuple(src_val.shape) != tuple(dst_val.shape):
+                report["skipped_shape"].append({
+                    "name": name,
+                    "source": list(src_val.shape),
+                    "target": list(dst_val.shape),
+                })
+                continue
+            dst_val.copy_(src_val.to(device=dst_val.device, dtype=dst_val.dtype))
+            report[copied_key].append(name)
+    report["copied_text_tensor_count"] = len(report["copied_text_tensors"])
+    report["copied_latent_tensor_count"] = len(report["copied_latent_tensors"])
+    report["copied"] = bool(
+        report["copied_token_embeddings"]
+        or report["copied_position_rows"]
+        or report["copied_text_tensor_count"]
+        or report["copied_latent_tensor_count"])
+    model.text_checkpoint_transfer = report
+    return report
 
 
 class ResidualConvBlock(nn.Module):
@@ -1378,6 +1511,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           surfaces_path=None, layers=3, heads=4, max_len=128, img_tokens=4, aud_tokens=8,
           txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
           text_arch="transformer", modality_dropout=0.0, agreement_w=0.0,
+          text_checkpoint=None,
           concept_tokens=4, fusion_layers=1,
           concept_prefix=False, concept_refine=False,
           concept_refine_gate_init=-2.0,
@@ -1403,6 +1537,11 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           concept_state_spread_w=0.0, concept_state_spread_variance=0.05,
           concept_state_spread_margin=0.2,
           concept_state_spread_covariance_w=0.05):
+    if text_checkpoint and latent_concept_slots <= 0:
+        ckpt_latents = text_checkpoint_latent_config(text_checkpoint, device="cpu")
+        if ckpt_latents.get("latent_concept_slots", 0) > 0:
+            latent_concept_slots = ckpt_latents["latent_concept_slots"]
+            latent_concept_layers = ckpt_latents["latent_concept_layers"]
     if latent_concept_w < 0.0 or latent_concept_factor_w < 0.0:
         raise ValueError("latent concept loss weights must be non-negative")
     if ((latent_concept_w > 0.0 or latent_concept_factor_w > 0.0)
@@ -1439,6 +1578,10 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                          latent_concept_refine=latent_concept_refine,
                          latent_concept_refine_gate_init=(
                              latent_concept_refine_gate_init)).to(device)
+    if text_checkpoint:
+        import_text_checkpoint(model, vocab, text_checkpoint, device=device)
+    else:
+        model.text_checkpoint_transfer = {}
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     study_reports = []
     study_pool = []
@@ -1677,6 +1820,7 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         batch=32, d=96, lr=1e-3, layers=3, heads=4, max_len=128, img_tokens=4, aud_tokens=8,
         txt_tokens=8, trunk_arch="conv", trunk_width=64, trunk_depth=1, text_layers=1,
         text_arch="transformer", modality_dropout=0.0, agreement_w=0.0,
+        text_checkpoint=None,
         concept_tokens=4, fusion_layers=1,
         concept_prefix=False, concept_refine=False,
         concept_refine_gate_init=-2.0,
@@ -1710,7 +1854,9 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                    trunk_width=trunk_width, trunk_depth=trunk_depth,
                                    text_layers=text_layers,
                                    text_arch=text_arch, modality_dropout=modality_dropout,
-                                   agreement_w=agreement_w, concept_tokens=concept_tokens,
+                                   agreement_w=agreement_w,
+                                   text_checkpoint=text_checkpoint,
+                                   concept_tokens=concept_tokens,
                                    fusion_layers=fusion_layers,
                                    concept_prefix=concept_prefix,
                                    concept_refine=concept_refine,
@@ -1807,22 +1953,25 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
     architecture["schema_concept_prefix_tokens"] = (
         len(VALUE_POS) if bool(concept_prefix) else 0)
     architecture["latent_concept_prefix_tokens"] = (
-        int(latent_concept_slots) if bool(latent_concept_prefix) else 0)
+        int(model.latent_concept_slots) if bool(latent_concept_prefix) else 0)
     architecture["prefix_tokens"] = (
         architecture["reader_prefix_tokens"] + int(concept_tokens)
         + architecture["schema_concept_prefix_tokens"]
         + architecture["latent_concept_prefix_tokens"])
+    text_transfer = getattr(model, "text_checkpoint_transfer", {})
     report = {"experiment": "m0_multimodal_bridge", "steps": steps, "batch": int(batch),
               "lr": float(lr), "value_w": float(value_w),
               "agreement_w": float(agreement_w),
+              "text_checkpoint": text_checkpoint,
+              "text_checkpoint_transfer": text_transfer,
               "text_arch": text_arch,
               "concept_prefix": bool(concept_prefix),
               "concept_refine": bool(concept_refine),
               "concept_refine_gate_init": float(concept_refine_gate_init),
               "concept_mixer_layers": int(concept_mixer_layers),
               "concept_mixer_gate_init": float(concept_mixer_gate_init),
-              "latent_concept_slots": int(latent_concept_slots),
-              "latent_concept_layers": int(latent_concept_layers),
+              "latent_concept_slots": int(model.latent_concept_slots),
+              "latent_concept_layers": int(model.latent_concept_layers),
               "latent_concept_prefix": bool(latent_concept_prefix),
               "latent_concept_refine": bool(latent_concept_refine),
               "latent_concept_refine_gate_init": float(
@@ -2023,6 +2172,54 @@ def selftest():
     assert set(VALUE_POS).issubset(latent_factor_eval)
     assert latent_factor_eval["n_records"] == 4
     assert latent_factor_eval["skipped"] is False
+    with tempfile.TemporaryDirectory() as tmpdir:
+        from .text import ReadingRecord, TextFactLM, build_reading_vocab, checkpoint_payload
+
+        reading_records = [
+            ReadingRecord("transfer-train-0", "train",
+                          tuple(_split_words("red circle shared language"))),
+            ReadingRecord("transfer-eval-0", "eval",
+                          tuple(_split_words("blue square shared language"))),
+        ]
+        text_vocab = build_reading_vocab(reading_records)
+        text_model = TextFactLM(
+            len(text_vocab), d=32, layers=1, heads=4, pad=text_vocab.pad,
+            fact_schema=None, latent_concept_slots=3,
+            latent_concept_layers=1).to("cpu")
+        with torch.no_grad():
+            text_model.txt.emb.weight[text_vocab.stoi["red"]].fill_(0.314)
+            text_model.latent_concepts.queries.fill_(0.271)
+        text_ckpt = os.path.join(tmpdir, "text-reading.pt")
+        torch.save(
+            checkpoint_payload(
+                text_model, text_vocab, 32, 1, 4,
+                {"experiment": "multimodal-transfer-selftest"}),
+            text_ckpt)
+        transfer_model = MultimodalLM(
+            len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
+            latent_concept_slots=3, latent_concept_layers=1).to("cpu")
+        red_before = transfer_model.txt.emb.weight[vocab.stoi["red"]].clone()
+        latent_before = transfer_model.latent_concepts.queries.clone()
+        transfer = import_text_checkpoint(transfer_model, vocab, text_ckpt, device="cpu")
+        assert transfer["copied"] is True
+        assert transfer["copied_token_embeddings"] > 0
+        assert transfer["copied_position_rows"] > 0
+        assert transfer["copied_text_tensor_count"] > 0
+        assert transfer["copied_latent_tensor_count"] > 0
+        red_after = transfer_model.txt.emb.weight[vocab.stoi["red"]]
+        assert not torch.allclose(red_before, red_after)
+        assert torch.allclose(red_after, torch.full_like(red_after, 0.314))
+        assert not torch.allclose(latent_before, transfer_model.latent_concepts.queries)
+        assert torch.allclose(
+            transfer_model.latent_concepts.queries,
+            text_model.latent_concepts.queries)
+        ckpt_latents = text_checkpoint_latent_config(text_ckpt, device="cpu")
+        assert ckpt_latents["latent_concept_slots"] == 3
+        auto_model, _auto_vocab, _auto_surfaces = train(
+            steps=1, batch=2, d=32, layers=1, heads=4, seed=9, device="cpu",
+            log_every=1, text_checkpoint=text_ckpt)
+        assert auto_model.latent_concept_slots == 3
+        assert auto_model.text_checkpoint_transfer["copied"] is True
     latent_errors, latent_correct, latent_report = multimodal_factor_record_outcomes(
         latent_prefix_model, vocab, surfaces, n=4, seed=7, device="cpu",
         metric="latent")
@@ -2111,6 +2308,9 @@ def main(argv=None):
     ap.add_argument("--value-w", type=float, default=6.0, dest="value_w")
     ap.add_argument("--agreement-w", type=float, default=0.0, dest="agreement_w",
                     help="cross-mode factor-value distribution agreement loss weight")
+    ap.add_argument("--text-checkpoint", default=None, dest="text_checkpoint",
+                    help=("optional thinking.text checkpoint used to warm-start the "
+                          "multimodal transcript encoder and matching latent concept slots"))
     ap.add_argument("--concept-tokens", type=int, default=4, dest="concept_tokens",
                     help="shared concept tokens prepended before the decoder in concept fusion")
     ap.add_argument("--fusion-layers", type=int, default=1, dest="fusion_layers",
@@ -2319,20 +2519,28 @@ def main(argv=None):
         ap.error("--concept-mixer-layers must be non-negative")
     if not math.isfinite(args.concept_mixer_gate_init):
         ap.error("--concept-mixer-gate-init must be finite")
+    checkpoint_latent_slots = 0
+    if args.text_checkpoint:
+        try:
+            checkpoint_latent_slots = text_checkpoint_latent_config(
+                args.text_checkpoint, device="cpu").get("latent_concept_slots", 0)
+        except Exception as exc:
+            ap.error(f"--text-checkpoint could not be loaded: {exc}")
+    effective_latent_slots = args.latent_concept_slots or checkpoint_latent_slots
     if args.latent_concept_slots < 0:
         ap.error("--latent-concept-slots must be non-negative")
     if args.latent_concept_layers <= 0:
         ap.error("--latent-concept-layers must be positive")
     if args.latent_concept_w < 0.0:
         ap.error("--latent-concept-w must be non-negative")
-    if args.latent_concept_w > 0.0 and args.latent_concept_slots <= 0:
+    if args.latent_concept_w > 0.0 and effective_latent_slots <= 0:
         ap.error("--latent-concept-w requires --latent-concept-slots > 0")
     if args.latent_concept_factor_w < 0.0:
         ap.error("--latent-concept-factor-w must be non-negative")
-    if args.latent_concept_factor_w > 0.0 and args.latent_concept_slots <= 0:
+    if args.latent_concept_factor_w > 0.0 and effective_latent_slots <= 0:
         ap.error("--latent-concept-factor-w requires --latent-concept-slots > 0")
     if ((args.latent_concept_prefix or args.latent_concept_refine)
-            and args.latent_concept_slots <= 0):
+            and effective_latent_slots <= 0):
         ap.error("latent concept prefix/refine require --latent-concept-slots > 0")
     if not math.isfinite(args.latent_concept_refine_gate_init):
         ap.error("--latent-concept-refine-gate-init must be finite")
@@ -2351,7 +2559,7 @@ def main(argv=None):
     if args.study_refresh_steps < 0:
         ap.error("--study-refresh-steps must be non-negative")
     if (args.study_strategy == "errors" and args.study_score_metric == "latent"
-            and args.latent_concept_slots <= 0):
+            and effective_latent_slots <= 0):
         ap.error("--study-score-metric latent requires --latent-concept-slots > 0")
     if args.modality_dropout < 0.0 or args.modality_dropout > 1.0:
         ap.error("--modality-dropout must be in [0, 1]")
@@ -2371,7 +2579,9 @@ def main(argv=None):
                  trunk_width=args.trunk_width, trunk_depth=args.trunk_depth,
                  text_layers=args.text_layers, text_arch=args.text_arch,
                  modality_dropout=args.modality_dropout,
-                 agreement_w=args.agreement_w, concept_tokens=args.concept_tokens,
+                 agreement_w=args.agreement_w,
+                 text_checkpoint=args.text_checkpoint,
+                 concept_tokens=args.concept_tokens,
                  fusion_layers=args.fusion_layers, concept_prefix=args.concept_prefix,
                  concept_refine=args.concept_refine,
                  concept_refine_gate_init=args.concept_refine_gate_init,
