@@ -181,6 +181,44 @@ class LatentConceptMemory(nn.Module):
             fer_fragmentation_w=fer_fragmentation_w,
             fer_correlation_w=fer_correlation_w, fer_balance_w=fer_balance_w)
 
+    def discovery_loss(self, full_slots, source_slots=None, target_slots=None,
+                       curiosity_w=1.0, graph_w=1.0, cycle_w=1.0,
+                       bridge_w=1.0, fer_w=0.0,
+                       curiosity_temperature=0.1, curiosity_self_loop_w=0.05,
+                       curiosity_transitive_steps=2, curiosity_transitive_w=0.1,
+                       graph_temperature=0.1, graph_self_loop_w=0.05,
+                       graph_transitive_steps=2, graph_transitive_w=0.1,
+                       graph_target_power=1.0, cycle_temperature=0.1,
+                       cycle_self_loop_w=0.05, cycle_transitive_steps=2,
+                       cycle_transitive_w=0.1, cycle_target_power=1.0,
+                       cycle_consistency_w=0.5, fer_fragmentation_w=1.0,
+                       fer_correlation_w=1.0, fer_balance_w=0.1):
+        return latent_concept_discovery_loss(
+            full_slots, self.active(), relations=self.active_relations(),
+            transitions=self.active_transitions(),
+            prediction_relations=self.active_prediction_relations(),
+            source_slots=source_slots, target_slots=target_slots,
+            curiosity_w=curiosity_w, graph_w=graph_w, cycle_w=cycle_w,
+            bridge_w=bridge_w, fer_w=fer_w,
+            curiosity_temperature=curiosity_temperature,
+            curiosity_self_loop_w=curiosity_self_loop_w,
+            curiosity_transitive_steps=curiosity_transitive_steps,
+            curiosity_transitive_w=curiosity_transitive_w,
+            graph_temperature=graph_temperature,
+            graph_self_loop_w=graph_self_loop_w,
+            graph_transitive_steps=graph_transitive_steps,
+            graph_transitive_w=graph_transitive_w,
+            graph_target_power=graph_target_power,
+            cycle_temperature=cycle_temperature,
+            cycle_self_loop_w=cycle_self_loop_w,
+            cycle_transitive_steps=cycle_transitive_steps,
+            cycle_transitive_w=cycle_transitive_w,
+            cycle_target_power=cycle_target_power,
+            cycle_consistency_w=cycle_consistency_w,
+            fer_fragmentation_w=fer_fragmentation_w,
+            fer_correlation_w=fer_correlation_w,
+            fer_balance_w=fer_balance_w)
+
     def association_loss(self, slots, temperature=0.1, target_power=1.0,
                          self_loop_w=0.05, transitive_steps=1,
                          transitive_w=0.0):
@@ -476,6 +514,157 @@ def latent_concept_memory_consolidation_loss(
                "nearest_cosine": nearest_cosine.detach().mean(),
                "memory_active": active_n, "skipped": False}
     return loss, metrics
+
+
+def _latent_discovery_zero(full_slots, source_slots=None, target_slots=None):
+    for slots in (full_slots, source_slots, target_slots):
+        if slots is not None:
+            return slots.reshape(slots.shape[0], -1).sum() * 0.0
+    return torch.tensor(0.0)
+
+
+def latent_concept_discovery_loss(
+        full_slots, memory, relations=None, transitions=None,
+        prediction_relations=None, source_slots=None, target_slots=None,
+        curiosity_w=1.0, graph_w=1.0, cycle_w=1.0, bridge_w=1.0,
+        fer_w=0.0, curiosity_temperature=0.1, curiosity_self_loop_w=0.05,
+        curiosity_transitive_steps=2, curiosity_transitive_w=0.1,
+        graph_temperature=0.1, graph_self_loop_w=0.05,
+        graph_transitive_steps=2, graph_transitive_w=0.1,
+        graph_target_power=1.0, cycle_temperature=0.1,
+        cycle_self_loop_w=0.05, cycle_transitive_steps=2,
+        cycle_transitive_w=0.1, cycle_target_power=1.0,
+        cycle_consistency_w=0.5, fer_fragmentation_w=1.0,
+        fer_correlation_w=1.0, fer_balance_w=0.1):
+    """Train the model to resolve self-discovered concept surprise.
+
+    This loss is schema-free and label-free. It uses the same ingredients that
+    rank examples for discovery study: novelty against persistent concept
+    memory, mismatch with the self-mined relation graph, source->target graph
+    prediction, graph-cycle consistency, bridge resolution, and optional FER
+    cleanup. The caller supplies slots from text, multimodal views, or any other
+    stream; no language facts, answer choices, or task rules are baked in.
+    """
+    weights = {
+        "curiosity_w": curiosity_w, "graph_w": graph_w, "cycle_w": cycle_w,
+        "bridge_w": bridge_w, "fer_w": fer_w,
+    }
+    if any(float(w) < 0.0 for w in weights.values()):
+        raise ValueError("latent concept discovery weights must be non-negative")
+    zero = _latent_discovery_zero(full_slots, source_slots, target_slots)
+    metrics = {
+        "curiosity_loss": zero,
+        "curiosity_novelty": zero,
+        "curiosity_association": zero,
+        "graph_loss": zero,
+        "graph_kl": zero,
+        "graph_cosine": zero,
+        "cycle_loss": zero,
+        "cycle_forward_kl": zero,
+        "cycle_reverse_kl": zero,
+        "cycle_source_cycle_kl": zero,
+        "cycle_target_cycle_kl": zero,
+        "bridge_loss": zero,
+        "bridge_score": zero,
+        "bridge_entropy": zero,
+        "bridge_connectivity": zero,
+        "fer_loss": zero,
+        "memory_active": 0,
+        "graph_ready": False,
+        "skipped": True,
+    }
+    if full_slots is None or memory is None or memory.numel() == 0:
+        return zero, metrics
+    if full_slots.ndim != 3:
+        raise ValueError("latent concept discovery expects [batch, slots, dim]")
+    if full_slots.shape[-1] != memory.shape[-1]:
+        raise ValueError("latent concept discovery memory dimension mismatch")
+    active_n = int(memory.shape[0])
+    metrics["memory_active"] = active_n
+    if active_n <= 0:
+        return zero, metrics
+    rel = relations
+    trans = transitions
+    pred_rel = prediction_relations
+    if pred_rel is None:
+        pred_rel = trans if _has_offdiag_edges(trans) else rel
+    graph_ready = bool(active_n > 1 and (
+        _has_offdiag_edges(rel) or _has_offdiag_edges(trans)
+        or _has_offdiag_edges(pred_rel)))
+    metrics["graph_ready"] = graph_ready
+    losses = []
+    if float(curiosity_w):
+        curiosity, curiosity_parts = latent_concept_graph_curiosity_scores(
+            full_slots, memory, rel, temperature=curiosity_temperature,
+            self_loop_w=curiosity_self_loop_w,
+            transitive_steps=curiosity_transitive_steps,
+            transitive_w=curiosity_transitive_w)
+        curiosity_loss = curiosity.mean() if curiosity.numel() else zero
+        losses.append(float(curiosity_w) * curiosity_loss)
+        metrics["curiosity_loss"] = curiosity_loss
+        novelty = curiosity_parts.get("novelty")
+        association = curiosity_parts.get("association")
+        metrics["curiosity_novelty"] = (
+            novelty.mean() if novelty is not None and novelty.numel() else zero)
+        metrics["curiosity_association"] = (
+            association.mean()
+            if association is not None and association.numel() else zero)
+    if float(graph_w) and source_slots is not None and target_slots is not None:
+        graph_scores, graph_parts = latent_concept_graph_prediction_scores(
+            source_slots, target_slots, memory, pred_rel,
+            temperature=graph_temperature, self_loop_w=graph_self_loop_w,
+            transitive_steps=graph_transitive_steps,
+            transitive_w=graph_transitive_w,
+            target_power=graph_target_power)
+        graph_loss = graph_scores.mean() if graph_scores.numel() else zero
+        losses.append(float(graph_w) * graph_loss)
+        metrics["graph_loss"] = graph_loss
+        for metric_key, part_key in (("graph_kl", "kl"),
+                                     ("graph_cosine", "cosine")):
+            part = graph_parts.get(part_key)
+            metrics[metric_key] = (
+                part.mean() if part is not None and part.numel() else zero)
+    if float(cycle_w) and source_slots is not None and target_slots is not None:
+        cycle_scores, cycle_parts = latent_concept_graph_cycle_scores(
+            source_slots, target_slots, memory, pred_rel,
+            temperature=cycle_temperature, self_loop_w=cycle_self_loop_w,
+            transitive_steps=cycle_transitive_steps,
+            transitive_w=cycle_transitive_w,
+            target_power=cycle_target_power, cycle_w=cycle_consistency_w)
+        cycle_loss = cycle_scores.mean() if cycle_scores.numel() else zero
+        losses.append(float(cycle_w) * cycle_loss)
+        metrics["cycle_loss"] = cycle_loss
+        part_map = {
+            "cycle_forward_kl": "forward_kl",
+            "cycle_reverse_kl": "reverse_kl",
+            "cycle_source_cycle_kl": "source_cycle_kl",
+            "cycle_target_cycle_kl": "target_cycle_kl",
+        }
+        for metric_key, part_key in part_map.items():
+            part = cycle_parts.get(part_key)
+            metrics[metric_key] = (
+                part.mean() if part is not None and part.numel() else zero)
+    if float(bridge_w):
+        bridge_loss = latent_concept_bridge_loss(
+            full_slots, memory, relations=rel, transitions=trans)
+        losses.append(float(bridge_w) * bridge_loss)
+        bridge, entropy, connectivity = latent_concept_bridge_scores(
+            full_slots, memory, rel, trans, require_graph=True)
+        metrics["bridge_loss"] = bridge_loss
+        metrics["bridge_score"] = bridge.mean() if bridge.numel() else zero
+        metrics["bridge_entropy"] = entropy.mean() if entropy.numel() else zero
+        metrics["bridge_connectivity"] = (
+            connectivity.mean() if connectivity.numel() else zero)
+    if float(fer_w):
+        fer_loss = latent_concept_fer_loss(
+            full_slots, fragmentation_w=fer_fragmentation_w,
+            correlation_w=fer_correlation_w, balance_w=fer_balance_w)
+        losses.append(float(fer_w) * fer_loss)
+        metrics["fer_loss"] = fer_loss
+    if not losses:
+        return zero, metrics
+    metrics["skipped"] = False
+    return torch.stack(losses).mean(), metrics
 
 
 def latent_concept_sequence_prediction_loss(predictor, source_slots, target_slots,

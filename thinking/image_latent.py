@@ -59,7 +59,9 @@ FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
 FLOW_NOISE_COUPLINGS = ("random", "sliced_ot")
 FLOW_REPA_MODES = ("pooled", "token", "both", "auto")
 FLOW_BOUNDARY_MODES = ("none", "right-linear", "double-linear", "double-cosine")
-TIME_SAMPLINGS = ("uniform", "logit-normal", "adaptive")
+TIME_SAMPLINGS = ("uniform", "logit-normal", "mode", "adaptive")
+DEFAULT_TIME_MODE_SCALE = 1.29
+MAX_TIME_MODE_SCALE = 1.75
 TIME_SHIFT_MODES = ("manual", "dim", "auto")
 AE_ARCHES = ("semantic", "residual", "hf-vae")
 FLOW_DISTILL_TEACHERS = ("raw", "ema", "auto")
@@ -1213,6 +1215,7 @@ def image_preference_pair_condition(pairs, conditioner, prompt_vocab, source="to
 def latent_flow_preference_pair_loss(flow, z_chosen, z_rejected, cond, score_gaps=None,
                                      cond_drop=0.0, time_sampling="uniform",
                                      time_logit_mean=0.0, time_logit_std=1.0,
+                                     time_mode_scale=DEFAULT_TIME_MODE_SCALE,
                                      time_shift=1.0, latent_stats=None,
                                      flow_loss_weight="none",
                                      flow_loss_weight_gamma=5.0,
@@ -1230,7 +1233,8 @@ def latent_flow_preference_pair_loss(flow, z_chosen, z_rejected, cond, score_gap
     x0 = torch.randn_like(zc)
     t = sample_flow_times(zc.shape[0], device=zc.device, mode=time_sampling,
                           logit_mean=time_logit_mean, logit_std=time_logit_std,
-                          time_shift=time_shift, adaptive_sampler=adaptive_sampler)
+                          mode_scale=time_mode_scale, time_shift=time_shift,
+                          adaptive_sampler=adaptive_sampler)
     cond_model = condition_dropout(cond, cond_drop)
     ztc = (1.0 - t) * x0 + t * zc
     ztr = (1.0 - t) * x0 + t * zr
@@ -2852,6 +2856,21 @@ def invert_flow_time_shift(t, shift=1.0, eps=1.0e-12):
     return (t * shift / denom).clamp(0.0, 1.0)
 
 
+def mode_flow_time_base(u, mode_scale=DEFAULT_TIME_MODE_SCALE):
+    """SD3-style mode-biased data-time density for rectified-flow training.
+
+    The transform keeps endpoints fixed and bends uniform samples toward perceptually
+    useful middle noise scales.  The monotonicity bound prevents folded densities.
+    """
+    scale = float(mode_scale)
+    if scale < 0.0 or scale >= MAX_TIME_MODE_SCALE:
+        raise ValueError(f"time_mode_scale must be in [0, {MAX_TIME_MODE_SCALE})")
+    if scale == 0.0:
+        return u
+    base = u + scale * (torch.cos(0.5 * math.pi * u).square() - 1.0 + u)
+    return base.clamp(0.0, 1.0)
+
+
 class AdaptiveTimestepSampler:
     """Loss-adaptive rectified-flow timestep sampler.
 
@@ -3061,7 +3080,8 @@ def flow_time_schedule(steps, device=DEV, shift=1.0, schedule="linear"):
 
 
 def sample_flow_times(batch, device=DEV, mode="uniform", logit_mean=0.0, logit_std=1.0,
-                      time_shift=1.0, adaptive_sampler=None):
+                      mode_scale=DEFAULT_TIME_MODE_SCALE, time_shift=1.0,
+                      adaptive_sampler=None):
     """Sample rectified-flow interpolation times.
 
     Uniform is the original rectified-flow baseline.  Logit-normal follows the SD3-style
@@ -3072,6 +3092,9 @@ def sample_flow_times(batch, device=DEV, mode="uniform", logit_mean=0.0, logit_s
     elif mode == "logit-normal":
         eps = torch.randn(batch, 1, 1, 1, device=device) * float(logit_std) + float(logit_mean)
         t = torch.sigmoid(eps)
+    elif mode == "mode":
+        u = torch.rand(batch, 1, 1, 1, device=device)
+        t = mode_flow_time_base(u, mode_scale=mode_scale)
     elif mode == "adaptive":
         if adaptive_sampler is not None:
             return adaptive_sampler.sample(batch, device=device, time_shift=time_shift)
@@ -5380,7 +5403,8 @@ def flow_repa_mode_id(mode):
 
 def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        time_sampling="uniform", time_logit_mean=0.0,
-                       time_logit_std=1.0, time_shift=1.0,
+                       time_logit_std=1.0,
+                       time_mode_scale=DEFAULT_TIME_MODE_SCALE, time_shift=1.0,
                        latent_stats=None, consistency_w=0.0,
                        endpoint_w=0.0,
                        flow_noise_coupling="random", flow_noise_coupling_projections=1,
@@ -5408,7 +5432,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         projections=flow_noise_coupling_projections)
     t = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                           logit_mean=time_logit_mean, logit_std=time_logit_std,
-                          time_shift=time_shift, adaptive_sampler=adaptive_sampler)
+                          mode_scale=time_mode_scale, time_shift=time_shift,
+                          adaptive_sampler=adaptive_sampler)
     zt = (1.0 - t) * x0 + t * z1_model
     target = z1_model - x0
     cond_model = condition_dropout(cond, cond_drop)
@@ -5459,7 +5484,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     if consistency_w > 0.0:
         t2 = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                                logit_mean=time_logit_mean, logit_std=time_logit_std,
-                               time_shift=time_shift, adaptive_sampler=adaptive_sampler)
+                               mode_scale=time_mode_scale, time_shift=time_shift,
+                               adaptive_sampler=adaptive_sampler)
         zt2 = (1.0 - t2) * x0 + t2 * z1_model
         pred2 = flow_velocity(flow, zt2, t2, cond_model)
         endpoint1 = endpoint_pred
@@ -5622,7 +5648,9 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
 
 def latent_flow_self_distill_losses(flow, teacher_flow, z1, cond, teacher_cond=None,
                                     time_sampling="uniform", time_logit_mean=0.0,
-                                    time_logit_std=1.0, time_shift=1.0,
+                                    time_logit_std=1.0,
+                                    time_mode_scale=DEFAULT_TIME_MODE_SCALE,
+                                    time_shift=1.0,
                                     latent_stats=None, time_gap=0.25,
                                     guidance_w=0.0, guidance_cfg_scale=1.0,
                                     guidance_cfg_rescale=0.0):
@@ -5640,7 +5668,7 @@ def latent_flow_self_distill_losses(flow, teacher_flow, z1, cond, teacher_cond=N
     x0 = torch.randn_like(z1_model)
     t = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                           logit_mean=time_logit_mean, logit_std=time_logit_std,
-                          time_shift=time_shift)
+                          mode_scale=time_mode_scale, time_shift=time_shift)
     t_teacher = (t + gap * (1.0 - t)).clamp(max=1.0 - 1.0e-4)
     zt = (1.0 - t) * x0 + t * z1_model
     zt_teacher = (1.0 - t_teacher) * x0 + t_teacher * z1_model
@@ -5700,17 +5728,19 @@ def latent_flow_self_distill_losses(flow, teacher_flow, z1, cond, teacher_cond=N
 
 @torch.no_grad()
 def flow_endpoint_metrics(flow, z1, cond, time_sampling="uniform", time_logit_mean=0.0,
-                          time_logit_std=1.0, time_shift=1.0, latent_stats=None):
+                          time_logit_std=1.0,
+                          time_mode_scale=DEFAULT_TIME_MODE_SCALE,
+                          time_shift=1.0, latent_stats=None):
     """Measure whether different times on the same path predict the same clean endpoint."""
     latent_stats = flow_latent_stats(flow) if latent_stats is None else latent_stats
     z1_model = normalize_latent(z1, latent_stats)
     x0 = torch.randn_like(z1_model)
     t1 = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                            logit_mean=time_logit_mean, logit_std=time_logit_std,
-                           time_shift=time_shift)
+                           mode_scale=time_mode_scale, time_shift=time_shift)
     t2 = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                            logit_mean=time_logit_mean, logit_std=time_logit_std,
-                           time_shift=time_shift)
+                           mode_scale=time_mode_scale, time_shift=time_shift)
 
     def endpoint_at(t):
         zt = (1.0 - t) * x0 + t * z1_model
@@ -5729,13 +5759,15 @@ def flow_endpoint_metrics(flow, z1, cond, time_sampling="uniform", time_logit_me
 
 
 def latent_flow_loss(flow, z1, cond, cond_drop=0.0, time_sampling="uniform",
-                     time_logit_mean=0.0, time_logit_std=1.0, time_shift=1.0,
+                     time_logit_mean=0.0, time_logit_std=1.0,
+                     time_mode_scale=DEFAULT_TIME_MODE_SCALE, time_shift=1.0,
                      latent_stats=None, flow_loss_weight="none",
                      flow_loss_weight_gamma=5.0, flow_loss_weight_normalize=True):
     loss, _parts = latent_flow_losses(flow, z1, cond, cond_drop=cond_drop,
                                       time_sampling=time_sampling,
                                       time_logit_mean=time_logit_mean,
                                       time_logit_std=time_logit_std,
+                                      time_mode_scale=time_mode_scale,
                                       time_shift=time_shift,
                                       latent_stats=latent_stats,
                                       flow_loss_weight=flow_loss_weight,
@@ -9146,7 +9178,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       image_crop_mode="center", image_hflip_prob=0.0,
                       dit_qk_norm=False, dit_attn_impl="auto",
                       time_sampling="uniform",
-                      time_logit_mean=0.0, time_logit_std=1.0, time_shift=1.0,
+                      time_logit_mean=0.0, time_logit_std=1.0,
+                      time_mode_scale=DEFAULT_TIME_MODE_SCALE, time_shift=1.0,
                       time_curriculum_frac=0.0,
                       time_adaptive_bins=32, time_adaptive_momentum=0.95,
                       time_adaptive_uniform_mix=0.05,
@@ -9237,6 +9270,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         image_records, train_size_buckets)
     if time_sampling not in TIME_SAMPLINGS:
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
+    time_mode_scale = float(time_mode_scale)
+    if time_mode_scale < 0.0 or time_mode_scale >= MAX_TIME_MODE_SCALE:
+        raise ValueError(f"time_mode_scale must be in [0, {MAX_TIME_MODE_SCALE})")
     time_curriculum_frac = float(time_curriculum_frac)
     if time_curriculum_frac < 0.0 or time_curriculum_frac > 1.0:
         raise ValueError("time_curriculum_frac must be in [0, 1]")
@@ -10117,7 +10153,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 loss, parts = latent_flow_losses(
                     flow, z1, cond, cond_drop=cond_drop, ae=ae,
                     time_sampling=active_time_sampling, time_logit_mean=time_logit_mean,
-                    time_logit_std=time_logit_std, time_shift=effective_time_shift,
+                    time_logit_std=time_logit_std,
+                    time_mode_scale=time_mode_scale, time_shift=effective_time_shift,
                     flow_noise_coupling=flow_noise_coupling,
                     flow_noise_coupling_projections=flow_noise_coupling_projections,
                     flow_loss_weight=flow_loss_weight,
@@ -10154,6 +10191,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                         time_sampling=active_time_sampling,
                         time_logit_mean=time_logit_mean,
                         time_logit_std=time_logit_std,
+                        time_mode_scale=time_mode_scale,
                         time_shift=effective_time_shift,
                         flow_loss_weight=flow_loss_weight,
                         flow_loss_weight_gamma=flow_loss_weight_gamma,

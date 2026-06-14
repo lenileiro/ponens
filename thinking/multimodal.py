@@ -42,6 +42,7 @@ from .concepts import (
     latent_concept_fer_loss,
     latent_concept_fer_metrics,
     latent_concept_fer_scores,
+    latent_concept_discovery_loss,
     latent_concept_graph_curiosity_scores,
     latent_concept_graph_cycle_scores,
     latent_concept_graph_prediction_loss,
@@ -1000,6 +1001,93 @@ def latent_multimodal_memory_consolidation_loss_from_views(
     metrics = {key: torch.stack(values).mean() for key, values in by_key.items()}
     metrics["memory_active"] = int(active.shape[0])
     metrics["skipped"] = False
+    return torch.stack(losses).mean(), metrics
+
+
+def latent_multimodal_discovery_loss_from_views(
+        model, views, curiosity_w=1.0, graph_w=1.0, cycle_w=1.0,
+        bridge_w=1.0, fer_w=0.0, curiosity_temperature=0.1,
+        curiosity_self_loop_w=0.05, curiosity_transitive_steps=2,
+        curiosity_transitive_w=0.1, graph_temperature=0.1,
+        graph_self_loop_w=0.05, graph_transitive_steps=2,
+        graph_transitive_w=0.1, graph_target_power=1.0,
+        cycle_temperature=0.1, cycle_self_loop_w=0.05,
+        cycle_transitive_steps=2, cycle_transitive_w=0.1,
+        cycle_target_power=1.0, cycle_consistency_w=0.5,
+        fer_fragmentation_w=1.0, fer_correlation_w=1.0,
+        fer_balance_w=0.1):
+    views = {mode: slots for mode, slots in views.items() if slots is not None}
+    zero = (next(iter(views.values())).sum() * 0.0
+            if views else torch.tensor(0.0))
+    metric_keys = (
+        "curiosity_loss", "curiosity_novelty", "curiosity_association",
+        "graph_loss", "graph_kl", "graph_cosine",
+        "cycle_loss", "cycle_forward_kl", "cycle_reverse_kl",
+        "cycle_source_cycle_kl", "cycle_target_cycle_kl",
+        "bridge_loss", "bridge_score", "bridge_entropy",
+        "bridge_connectivity", "fer_loss")
+    metrics = {key: zero for key in metric_keys}
+    metrics.update({"memory_active": 0, "graph_ready": False, "skipped": True})
+    if not views:
+        return zero, metrics
+    memory = getattr(model, "latent_concept_memory", None)
+    if memory is None:
+        return zero, metrics
+    active = memory.active()
+    metrics["memory_active"] = int(active.shape[0])
+    if active.numel() == 0:
+        return zero, metrics
+    full = views.get("full")
+    if full is None:
+        full = next(iter(views.values()))
+    base_loss, base_metrics = latent_concept_discovery_loss(
+        full, active, relations=memory.active_relations(),
+        transitions=memory.active_transitions(),
+        prediction_relations=memory.active_prediction_relations(),
+        curiosity_w=curiosity_w, graph_w=0.0, cycle_w=0.0,
+        bridge_w=bridge_w, fer_w=fer_w,
+        curiosity_temperature=curiosity_temperature,
+        curiosity_self_loop_w=curiosity_self_loop_w,
+        curiosity_transitive_steps=curiosity_transitive_steps,
+        curiosity_transitive_w=curiosity_transitive_w,
+        fer_fragmentation_w=fer_fragmentation_w,
+        fer_correlation_w=fer_correlation_w,
+        fer_balance_w=fer_balance_w)
+    losses = [base_loss]
+    by_key = {key: [base_metrics[key]] for key in metric_keys}
+    graph_modes = [mode for mode in ("sensor_only", "text_only")
+                   if mode in views and views[mode] is not full]
+    for mode in graph_modes:
+        loss, view_metrics = latent_concept_discovery_loss(
+            full, active, relations=memory.active_relations(),
+            transitions=memory.active_transitions(),
+            prediction_relations=memory.active_prediction_relations(),
+            source_slots=views[mode], target_slots=full,
+            curiosity_w=0.0, graph_w=graph_w, cycle_w=cycle_w,
+            bridge_w=0.0, fer_w=0.0,
+            graph_temperature=graph_temperature,
+            graph_self_loop_w=graph_self_loop_w,
+            graph_transitive_steps=graph_transitive_steps,
+            graph_transitive_w=graph_transitive_w,
+            graph_target_power=graph_target_power,
+            cycle_temperature=cycle_temperature,
+            cycle_self_loop_w=cycle_self_loop_w,
+            cycle_transitive_steps=cycle_transitive_steps,
+            cycle_transitive_w=cycle_transitive_w,
+            cycle_target_power=cycle_target_power,
+            cycle_consistency_w=cycle_consistency_w)
+        losses.append(loss)
+        for key in metric_keys:
+            by_key[key].append(view_metrics[key])
+        metrics["graph_ready"] = bool(
+            metrics["graph_ready"] or view_metrics["graph_ready"])
+    metrics = {
+        key: torch.stack(values).mean() for key, values in by_key.items()
+    } | {
+        "memory_active": int(active.shape[0]),
+        "graph_ready": bool(metrics["graph_ready"] or base_metrics["graph_ready"]),
+        "skipped": bool(base_metrics.get("skipped", True) and not graph_modes),
+    }
     return torch.stack(losses).mean(), metrics
 
 
