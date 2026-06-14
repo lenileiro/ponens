@@ -4385,6 +4385,9 @@ def fit_reading_concepts_select_best(
         "study_strategy_requested": str(study_strategy),
         "study_strategy": initial_study_strategy,
     } | dict(getattr(model, "reading_train_metrics", {}))
+    best_study_reports = []
+    best_neighborhood_reports = []
+    best_cluster_reports = []
     rounds_report = [initial_row]
     all_study_reports = []
     all_neighborhood_reports = []
@@ -4471,15 +4474,18 @@ def fit_reading_concepts_select_best(
             replay_teacher_vocab=replay_teacher_vocab,
             replay_w=replay_w, replay_batch=replay_batch)
         round_train_metrics = dict(getattr(model, "reading_train_metrics", {}))
-        all_study_reports.extend(
+        round_study_reports = [
             report | {"round": int(round_i)}
-            for report in getattr(model, "reading_study_reports", []))
-        all_neighborhood_reports.extend(
+            for report in getattr(model, "reading_study_reports", [])]
+        round_neighborhood_reports = [
             report | {"round": int(round_i)}
-            for report in getattr(model, "reading_neighborhood_reports", []))
-        all_cluster_reports.extend(
+            for report in getattr(model, "reading_neighborhood_reports", [])]
+        round_cluster_reports = [
             report | {"round": int(round_i)}
-            for report in getattr(model, "reading_cluster_reports", []))
+            for report in getattr(model, "reading_cluster_reports", [])]
+        all_study_reports.extend(round_study_reports)
+        all_neighborhood_reports.extend(round_neighborhood_reports)
+        all_cluster_reports.extend(round_cluster_reports)
         bundle = reading_eval_bundle(
             model, vocab, records, device=device, eval_n=eval_n, seed=seed,
             token_drop_p=token_drop_p, token_replace_p=token_replace_p,
@@ -4514,6 +4520,9 @@ def fit_reading_concepts_select_best(
             best_round = round_i
             best_state = _model_state_copy(model)
             best_metrics = round_train_metrics
+            best_study_reports = list(round_study_reports)
+            best_neighborhood_reports = list(round_neighborhood_reports)
+            best_cluster_reports = list(round_cluster_reports)
             no_improve_rounds = 0
         else:
             no_improve_rounds += 1
@@ -4554,9 +4563,12 @@ def fit_reading_concepts_select_best(
         selection["selected_insight"] = selected_rows[0].get("study_pool_insight")
     best_metrics = best_metrics | {"selection": selection}
     model.reading_train_metrics = best_metrics
-    model.reading_study_reports = all_study_reports
-    model.reading_neighborhood_reports = all_neighborhood_reports
-    model.reading_cluster_reports = all_cluster_reports
+    model.reading_study_reports = best_study_reports
+    model.reading_neighborhood_reports = best_neighborhood_reports
+    model.reading_cluster_reports = best_cluster_reports
+    model.reading_attempted_study_reports = all_study_reports
+    model.reading_attempted_neighborhood_reports = all_neighborhood_reports
+    model.reading_attempted_cluster_reports = all_cluster_reports
     model.reading_selection_report = selection
     return model, vocab, selection
 
@@ -4617,7 +4629,13 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            cluster_temperature=0.1, cluster_margin=0.0,
                            cluster_min_size=2,
                            study_strategy="auto", study_probe_n=0,
-                           study_hard_max=0, study_refresh_steps=0):
+                           study_hard_max=0, study_refresh_steps=0,
+                           study_select_best=True, study_rounds=1,
+                           study_score_metric="mastery",
+                           study_score_margin_w=0.1,
+                           study_score_min_delta=0.0,
+                           study_score_patience=0,
+                           eval_n=64):
     if int(latent_concept_slots) <= 0:
         raise ValueError("raw reading concept training requires latent_concept_slots > 0")
     torch.manual_seed(seed)
@@ -4633,6 +4651,83 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                        latent_concept_refine_gate_init=(
                            latent_concept_refine_gate_init),
                        latent_concept_memory_size=memory_size).to(device)
+    if study_select_best:
+        model, vocab, _selection = fit_reading_concepts_select_best(
+            model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
+            device=device, log_every=log_every, token_drop_p=token_drop_p,
+            token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+            invariance_w=invariance_w, variance_w=variance_w,
+            covariance_w=covariance_w, variance_target=variance_target,
+            factorization_w=factorization_w,
+            factorization_variance=factorization_variance,
+            factorization_margin=factorization_margin,
+            factorization_covariance_w=factorization_covariance_w,
+            fer_w=fer_w,
+            fer_fragmentation_w=fer_fragmentation_w,
+            fer_correlation_w=fer_correlation_w,
+            fer_balance_w=fer_balance_w,
+            memory_w=memory_w,
+            memory_size=memory_size,
+            memory_temperature=memory_temperature,
+            memory_momentum=memory_momentum,
+            memory_balance_w=memory_balance_w,
+            association_w=association_w,
+            association_temperature=association_temperature,
+            association_decay=association_decay,
+            association_target_power=association_target_power,
+            association_self_loop_w=association_self_loop_w,
+            association_transitive_steps=association_transitive_steps,
+            association_transitive_w=association_transitive_w,
+            composition_w=composition_w,
+            composition_temperature=composition_temperature,
+            composition_self_loop_w=composition_self_loop_w,
+            composition_transitive_steps=composition_transitive_steps,
+            composition_transitive_w=composition_transitive_w,
+            composition_margin=composition_margin,
+            graph_predict_w=graph_predict_w,
+            graph_predict_temperature=graph_predict_temperature,
+            graph_predict_self_loop_w=graph_predict_self_loop_w,
+            graph_predict_transitive_steps=graph_predict_transitive_steps,
+            graph_predict_transitive_w=graph_predict_transitive_w,
+            graph_predict_target_power=graph_predict_target_power,
+            graph_cycle_w=graph_cycle_w,
+            graph_cycle_temperature=graph_cycle_temperature,
+            graph_cycle_self_loop_w=graph_cycle_self_loop_w,
+            graph_cycle_transitive_steps=graph_cycle_transitive_steps,
+            graph_cycle_transitive_w=graph_cycle_transitive_w,
+            graph_cycle_target_power=graph_cycle_target_power,
+            graph_cycle_consistency_w=graph_cycle_consistency_w,
+            bridge_w=bridge_w,
+            context_target_w=context_target_w, context_keep_p=context_keep_p,
+            context_target_temperature=context_target_temperature,
+            sequence_w=sequence_w, sequence_batch=sequence_batch,
+            sequence_temperature=sequence_temperature,
+            neighborhood_w=neighborhood_w,
+            neighborhood_batch=neighborhood_batch,
+            neighborhood_probe_n=neighborhood_probe_n,
+            neighborhood_refresh_steps=neighborhood_refresh_steps,
+            neighborhood_temperature=neighborhood_temperature,
+            neighborhood_margin=neighborhood_margin,
+            transition_w=transition_w,
+            transition_batch=transition_batch,
+            transition_temperature=transition_temperature,
+            transition_margin=transition_margin,
+            cluster_w=cluster_w,
+            cluster_batch=cluster_batch,
+            cluster_probe_n=cluster_probe_n,
+            cluster_refresh_steps=cluster_refresh_steps,
+            cluster_temperature=cluster_temperature,
+            cluster_margin=cluster_margin,
+            cluster_min_size=cluster_min_size,
+            study_strategy=study_strategy, study_probe_n=study_probe_n,
+            study_hard_max=study_hard_max,
+            study_refresh_steps=study_refresh_steps, eval_n=eval_n,
+            score_metric=study_score_metric,
+            score_margin_w=study_score_margin_w,
+            score_min_delta=study_score_min_delta,
+            score_patience=study_score_patience,
+            rounds=study_rounds)
+        return model, vocab
     return fit_reading_concepts(
         model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
         device=device, log_every=log_every, token_drop_p=token_drop_p,
@@ -7306,6 +7401,21 @@ def selftest():
     assert patience_selection["accepted_update"] is False
     assert "score_delta_from_best" in patience_selection["rounds"][1]
     assert "selected_insight" in patience_selection
+    helper_model, _helper_vocab = train_reading_concepts(
+        reading_records, steps=2, batch=2, d=32, layers=1, heads=4, lr=1e-4,
+        seed=11, device="cpu", log_every=10,
+        token_drop_p=0.1, token_replace_p=0.0,
+        latent_concept_slots=2, memory_size=8,
+        bridge_w=0.1, study_strategy="auto",
+        study_probe_n=2, study_hard_max=1, study_refresh_steps=1,
+        study_select_best=True, study_rounds=2,
+        study_score_min_delta=999.0, study_score_patience=1,
+        eval_n=0)
+    helper_selection = helper_model.reading_train_metrics["selection"]
+    assert helper_selection["enabled"] is True
+    assert helper_selection["accepted_update"] is False
+    assert helper_selection["selected_round"] == 0
+    assert helper_model.reading_study_reports == []
     reading_payload = checkpoint_payload(reading_model, reading_vocab, 32, 1, 4,
                                          {"experiment": "reading-selftest"})
     assert reading_payload["fact_schema"] is None
