@@ -3077,7 +3077,8 @@ def reading_latent_discovery_records(
         cycle_temperature=0.1, cycle_self_loop_w=0.05,
         cycle_transitive_steps=2, cycle_transitive_w=0.1,
         cycle_target_power=1.0, cycle_w=0.5,
-        sequence_temperature=0.1):
+        sequence_temperature=0.1, context_closure_split_frac=0.5,
+        context_closure_temperature=0.1):
     memory = getattr(model, "latent_concept_memory", None)
     if getattr(model, "latent_concepts", None) is None or memory is None:
         return [], {"n_records": 0, "sampled": False, "n_selected": 0,
@@ -3116,6 +3117,18 @@ def reading_latent_discovery_records(
             txt = pack_reading(batch, vocab, device)
             full_slots = model.latent_concept_states(
                 txt, feature_dropout=feature_dropout, project=True)
+            prefix_txt, suffix_txt, _used = split_reading_context_closure(
+                txt, vocab.pad, split_frac=context_closure_split_frac)
+            prefix_slots = model.latent_concept_states(
+                prefix_txt, feature_dropout=feature_dropout, project=False)
+            suffix_slots = model.latent_concept_states(
+                suffix_txt, feature_dropout=feature_dropout, project=False)
+            closure_target_slots = model.latent_concept_states(
+                txt, feature_dropout=0.0, project=False)
+            closure, closure_parts = latent_concept_completion_scores(
+                model.reading_predictor,
+                {"prefix": prefix_slots, "suffix": suffix_slots},
+                closure_target_slots, temperature=context_closure_temperature)
             curiosity, curiosity_parts = latent_concept_graph_curiosity_scores(
                 full_slots, memory.active(), memory.active_relations(),
                 temperature=curiosity_temperature,
@@ -3210,10 +3223,23 @@ def reading_latent_discovery_records(
             insight_reachable_mass = insight_parts.get(
                 "reachable_mass", insight.new_zeros(insight.shape))
             insight_gain = insight_parts.get("gain", insight.new_zeros(insight.shape))
+            closure_ce = closure_parts.get(
+                "cross_entropy", closure.new_zeros(closure.shape))
+            closure_cosine = closure_parts.get(
+                "positive_cosine", closure.new_zeros(closure.shape))
+            closure_gap = closure_parts.get(
+                "closure_gap", closure.new_zeros(closure.shape))
+            closure_rank = closure_parts.get("rank", closure.new_zeros(closure.shape))
             for i, rec in enumerate(batch):
                 seq = sequence_by_id.get(rec.rec_id, {})
                 rows.append({
                     "record": rec,
+                    "closure_surprise": float(closure[i].detach().cpu()),
+                    "closure_cross_entropy": float(
+                        closure_ce[i].detach().cpu()),
+                    "closure_cosine": float(closure_cosine[i].detach().cpu()),
+                    "closure_gap": float(closure_gap[i].detach().cpu()),
+                    "closure_rank": float(closure_rank[i].detach().cpu()),
                     "curiosity": float(curiosity[i].detach().cpu()),
                     "novelty": float(novelty[i].detach().cpu()),
                     "association": float(association[i].detach().cpu()),
@@ -3263,8 +3289,8 @@ def reading_latent_discovery_records(
                     "sequence_rank": float(seq.get("sequence_rank", 0.0)),
                 })
     components = (
-        "curiosity", "gap", "insight", "graph", "cycle", "fer_score", "bridge",
-        "sequence_surprise")
+        "curiosity", "gap", "insight", "closure_surprise", "graph", "cycle",
+        "fer_score", "bridge", "sequence_surprise")
     for name in components:
         scaled = _minmax_scale([row[name] for row in rows])
         for row, value in zip(rows, scaled):
@@ -3288,6 +3314,13 @@ def reading_latent_discovery_records(
                       "mean_curiosity": mean_field("curiosity"),
                       "mean_novelty": mean_field("novelty"),
                       "mean_association": mean_field("association"),
+                      "mean_closure_surprise": mean_field("closure_surprise"),
+                      "max_closure_surprise": max_field("closure_surprise"),
+                      "mean_closure_cross_entropy": mean_field(
+                          "closure_cross_entropy"),
+                      "mean_closure_cosine": mean_field("closure_cosine"),
+                      "mean_closure_gap": mean_field("closure_gap"),
+                      "mean_closure_rank": mean_field("closure_rank"),
                       "mean_graph_score": mean_field("graph"),
                       "mean_graph_kl": mean_field("graph_kl"),
                       "mean_graph_cosine": mean_field("graph_cosine"),
@@ -3831,7 +3864,9 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 cycle_transitive_w=graph_cycle_transitive_w,
                 cycle_target_power=graph_cycle_target_power,
                 cycle_w=graph_cycle_consistency_w,
-                sequence_temperature=sequence_temperature)
+                sequence_temperature=sequence_temperature,
+                context_closure_split_frac=context_closure_split_frac,
+                context_closure_temperature=context_closure_temperature)
             report = report | {"strategy": "discovery"}
         else:
             hard, _correct, report = reading_latent_record_outcomes(
@@ -6836,6 +6871,7 @@ def selftest():
     assert "mean_gap_score" in discovery_report
     assert "mean_insight_score" in discovery_report
     assert "mean_bridge_score" in discovery_report
+    assert "mean_closure_surprise" in discovery_report
     assert "mean_sequence_surprise" in discovery_report
     assert discovery_report["n_sequence_pairs"] == 2
     bridge_eval = reading_latent_bridge_eval(
@@ -6983,6 +7019,9 @@ def selftest():
                for r in reading_model.reading_study_reports
                if r.get("strategy") == "discovery")
     assert any("mean_sequence_surprise" in r
+               for r in reading_model.reading_study_reports
+               if r.get("strategy") == "discovery")
+    assert any("mean_closure_surprise" in r
                for r in reading_model.reading_study_reports
                if r.get("strategy") == "discovery")
     assert any("pool_bridge_before" in r for r in reading_model.reading_study_reports
