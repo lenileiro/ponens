@@ -19,8 +19,8 @@ new work on the current entry points:
 `thinking.text` accepts either structured semantic records or raw reading corpora. The raw-reading
 path is the language-mastery path: text chunks are read directly, latent slots are trained with
 sequence, factorization, association, graph, neighborhood, transition, cluster, discovery,
-reanalysis, and memory-gap objectives. No English rules or prompt templates are embedded in the
-module.
+reanalysis, memory-gap, and graph-closure insight objectives. No English rules or prompt
+templates are embedded in the module.
 
 ```bash
 python -m thinking.text --selftest
@@ -139,4 +139,6 @@ The old synthetic-language modules were removed from the active package:
 Do not add replacements for these as hard-coded QA/rule/template layers. New data handling should
 be expressed through manifests, corpora, feature views, targets, and learned objectives. For text
 self-study, prefer `--reading-study-strategy gap` when latent memory is enabled; it ranks raw
-chunks by the model's own graph-predicted missing-concept score.
+chunks by the model's own graph-predicted missing-concept score. Use `--reading-discovery-w` to
+activate the broader discovery objective, including graph-closure insight from partial reading
+contexts into fuller concept states.

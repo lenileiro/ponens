@@ -8,8 +8,8 @@ multimodal bridge.
 ## Why
 
 The current bet is that language mastery should come from reading, latent structure, replay,
-reanalysis, self-generated memory gaps, and cross-modal concept pressure, not from hand-authored QA
-harnesses or templated phrasing rules. The code keeps model inputs manifest-driven: datasets
+reanalysis, self-generated memory gaps, graph-closure insight, and cross-modal concept pressure,
+not from hand-authored QA harnesses or templated phrasing rules. The code keeps model inputs manifest-driven: datasets
 provide text, feature views, image records, and optional target tokens; model code learns the
 representations.
 
@@ -21,8 +21,8 @@ representations.
 | `scratchpad_model.py` | the model: small transformer with a **pointer/copy head**, learnable attention temperature, optional recurrence (looped / HRM / TRM / mHC) and Ouro-style learned halting |
 | `runpod/` | H100 launchers (tar-over-ssh, timeout-bounded, always-terminate) |
 | `thinking/vision_understanding.py`, `thinking/image_data.py`, `thinking/image_caption.py`, `thinking/image_embed.py`, `thinking/image_score.py`, `thinking/image_preferences.py`, `thinking/image_curate.py`, `thinking/image_eval.py`, `thinking/image_latent.py` | Image stack: manifest-driven visual concept learning, captioned image data, recaptioning, embedding/quality/preference sidecars, curation, offline image-quality eval, and text-conditioned latent flow |
-| `thinking/text.py` | raw-reading and semantic text learning with latent concept memory, replay, discovery, reanalysis, and memory-gap training |
-| `thinking/multimodal.py` | Generic manifest-driven multimodal prefix bridge with named feature views, text tokens, targets, latent slots, concept memory, and memory-gap training |
+| `thinking/text.py` | raw-reading and semantic text learning with latent concept memory, replay, discovery, reanalysis, graph-closure insight, and memory-gap training |
+| `thinking/multimodal.py` | Generic manifest-driven multimodal prefix bridge with named feature views, text tokens, targets, latent slots, concept memory, graph-closure insight, and memory-gap training |
 | `*.md` | research notes and plans; historical synthetic-language docs are no longer package APIs |
 
 ## Quickstart
@@ -274,6 +274,7 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --reading-composition-transitive-w 0.25 \
     --reading-graph-predict-w 0.2 --reading-graph-predict-transitive-steps 3 \
     --reading-graph-predict-transitive-w 0.25 \
+    --reading-discovery-w 0.05 \
     --reading-gap-w 0.05 --reading-gap-transitive-steps 3 \
     --reading-gap-transitive-w 0.25 \
     --reading-context-target-w 0.1 --reading-neighborhood-w 0.05 \

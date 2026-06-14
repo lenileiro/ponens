@@ -47,6 +47,7 @@ from .concepts import (
     latent_concept_graph_cycle_scores,
     latent_concept_graph_prediction_loss,
     latent_concept_graph_prediction_scores,
+    latent_concept_insight_scores,
     latent_concept_graph_ready,
     latent_concept_graph_snapshot,
     latent_concept_memory_gap_loss,
@@ -1027,6 +1028,8 @@ def latent_multimodal_discovery_loss_from_views(
         "graph_loss", "graph_kl", "graph_cosine",
         "cycle_loss", "cycle_forward_kl", "cycle_reverse_kl",
         "cycle_source_cycle_kl", "cycle_target_cycle_kl",
+        "insight_loss", "insight_score", "insight_kl", "insight_cosine",
+        "insight_missing_mass", "insight_reachable_mass", "insight_gain",
         "bridge_loss", "bridge_score", "bridge_entropy",
         "bridge_connectivity", "fer_loss")
     metrics = {key: zero for key in metric_keys}
@@ -2121,11 +2124,15 @@ def latent_multimodal_discovery_examples(
                 target_power=graph_target_power)
             graph_rows = []
             cycle_rows = []
+            insight_rows = []
             graph_parts_rows = {
                 "kl": [], "cosine": []}
             cycle_parts_rows = {
                 "forward_kl": [], "reverse_kl": [],
                 "source_cycle_kl": [], "target_cycle_kl": []}
+            insight_parts_rows = {
+                "loss": [], "kl": [], "cosine": [], "missing_mass": [],
+                "reachable_mass": [], "gain": []}
             for mode in ("sensor_only", "text_only"):
                 source = views.get(mode)
                 if source is None:
@@ -2142,23 +2149,39 @@ def latent_multimodal_discovery_examples(
                     transitive_steps=cycle_transitive_steps,
                     transitive_w=cycle_transitive_w,
                     target_power=cycle_target_power, cycle_w=cycle_w)
+                insight, insight_parts = latent_concept_insight_scores(
+                    source, full_slots, active_memory, relations=active_relations,
+                    transitions=active_transitions, temperature=graph_temperature,
+                    self_loop_w=graph_self_loop_w,
+                    transitive_steps=graph_transitive_steps,
+                    transitive_w=graph_transitive_w,
+                    target_power=graph_target_power)
                 graph_rows.append(graph)
                 cycle_rows.append(cycle)
+                insight_rows.append(insight)
                 for key in graph_parts_rows:
                     graph_parts_rows[key].append(
                         graph_parts.get(key, graph.new_zeros(graph.shape)))
                 for key in cycle_parts_rows:
                     cycle_parts_rows[key].append(
                         cycle_parts.get(key, cycle.new_zeros(cycle.shape)))
+                for key in insight_parts_rows:
+                    insight_parts_rows[key].append(
+                        insight_parts.get(
+                            key, insight.new_zeros(insight.shape)))
             zero = full_slots.reshape(full_slots.shape[0], -1).sum(-1) * 0.0
             graph = torch.stack(graph_rows).mean(0) if graph_rows else zero
             cycle = torch.stack(cycle_rows).mean(0) if cycle_rows else zero
+            insight = torch.stack(insight_rows).mean(0) if insight_rows else zero
             graph_parts = {
                 key: (torch.stack(values).mean(0) if values else zero)
                 for key, values in graph_parts_rows.items()}
             cycle_parts = {
                 key: (torch.stack(values).mean(0) if values else zero)
                 for key, values in cycle_parts_rows.items()}
+            insight_parts = {
+                key: (torch.stack(values).mean(0) if values else zero)
+                for key, values in insight_parts_rows.items()}
             fer_scores, fer_parts = latent_multimodal_fer_scores_from_views(views)
             bridge, bridge_entropy, bridge_connectivity = latent_concept_bridge_scores(
                 full_slots, active_memory, active_relations, active_transitions)
@@ -2191,6 +2214,19 @@ def latent_multimodal_discovery_examples(
                         cycle_parts["source_cycle_kl"][i].detach().cpu()),
                     "target_cycle_kl": float(
                         cycle_parts["target_cycle_kl"][i].detach().cpu()),
+                    "insight": float(insight[i].detach().cpu()),
+                    "insight_loss": float(
+                        insight_parts["loss"][i].detach().cpu()),
+                    "insight_kl": float(
+                        insight_parts["kl"][i].detach().cpu()),
+                    "insight_cosine": float(
+                        insight_parts["cosine"][i].detach().cpu()),
+                    "insight_missing_mass": float(
+                        insight_parts["missing_mass"][i].detach().cpu()),
+                    "insight_reachable_mass": float(
+                        insight_parts["reachable_mass"][i].detach().cpu()),
+                    "insight_gain": float(
+                        insight_parts["gain"][i].detach().cpu()),
                     "fer_score": float(fer_scores[i].detach().cpu()),
                     "fer_fragmentation": float(
                         fer_parts["fragmentation"][i].detach().cpu()),
@@ -2220,7 +2256,7 @@ def latent_multimodal_discovery_examples(
                     "sequence_rank": float(seq.get("sequence_rank", 0.0)),
                 })
     components = (
-        "curiosity", "gap", "graph", "cycle", "fer_score", "bridge",
+        "curiosity", "gap", "insight", "graph", "cycle", "fer_score", "bridge",
         "sequence_surprise")
     for name in components:
         scaled = _minmax_scale([row[name] for row in rows])
@@ -2252,6 +2288,16 @@ def latent_multimodal_discovery_examples(
                       "mean_reverse_kl": mean_field("reverse_kl"),
                       "mean_source_cycle_kl": mean_field("source_cycle_kl"),
                       "mean_target_cycle_kl": mean_field("target_cycle_kl"),
+                      "mean_insight_score": mean_field("insight"),
+                      "max_insight_score": max_field("insight"),
+                      "mean_insight_loss": mean_field("insight_loss"),
+                      "mean_insight_kl": mean_field("insight_kl"),
+                      "mean_insight_cosine": mean_field("insight_cosine"),
+                      "mean_insight_missing_mass": mean_field(
+                          "insight_missing_mass"),
+                      "mean_insight_reachable_mass": mean_field(
+                          "insight_reachable_mass"),
+                      "mean_insight_gain": mean_field("insight_gain"),
                       "mean_fer_score": mean_field("fer_score"),
                       "max_fer_score": max_field("fer_score"),
                       "mean_fer_fragmentation": mean_field("fer_fragmentation"),
@@ -2763,6 +2809,13 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 "cycle_reverse_kl": discovery_zero,
                 "cycle_source_cycle_kl": discovery_zero,
                 "cycle_target_cycle_kl": discovery_zero,
+                "insight_loss": discovery_zero,
+                "insight_score": discovery_zero,
+                "insight_kl": discovery_zero,
+                "insight_cosine": discovery_zero,
+                "insight_missing_mass": discovery_zero,
+                "insight_reachable_mass": discovery_zero,
+                "insight_gain": discovery_zero,
                 "bridge_loss": discovery_zero,
                 "bridge_score": discovery_zero,
                 "bridge_entropy": discovery_zero,
@@ -3007,6 +3060,16 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 discovery_metrics["graph_loss"].detach()),
             "latent_discovery_cycle_loss": float(
                 discovery_metrics["cycle_loss"].detach()),
+            "latent_discovery_insight_loss": float(
+                discovery_metrics["insight_loss"].detach()),
+            "latent_discovery_insight_score": float(
+                discovery_metrics["insight_score"].detach()),
+            "latent_discovery_insight_missing_mass": float(
+                discovery_metrics["insight_missing_mass"].detach()),
+            "latent_discovery_insight_reachable_mass": float(
+                discovery_metrics["insight_reachable_mass"].detach()),
+            "latent_discovery_insight_gain": float(
+                discovery_metrics["insight_gain"].detach()),
             "latent_discovery_bridge_loss": float(
                 discovery_metrics["bridge_loss"].detach()),
             "latent_discovery_fer_loss": float(
@@ -3461,6 +3524,7 @@ def selftest():
         assert discovery_selected and discovery_report["skipped"] is False
         assert math.isfinite(discovery_report["mean_score"])
         assert "mean_gap_score" in discovery_report
+        assert "mean_insight_score" in discovery_report
         assert "mean_cycle_score" in discovery_report
         assert "mean_sequence_surprise" in discovery_report
         discovery_loss, discovery_metrics = (
@@ -3471,6 +3535,7 @@ def selftest():
         assert discovery_metrics["skipped"] is False
         assert discovery_metrics["memory_active"] > 0
         assert torch.isfinite(discovery_metrics["graph_loss"])
+        assert torch.isfinite(discovery_metrics["insight_loss"])
         assert torch.isfinite(discovery_metrics["bridge_loss"])
         reanalysis_loss, reanalysis_metrics = (
             latent_multimodal_reanalysis_loss_from_views(
@@ -3515,6 +3580,8 @@ def selftest():
         assert math.isfinite(trained_model.train_metrics["latent_discovery_loss"])
         assert math.isfinite(
             trained_model.train_metrics["latent_discovery_graph_loss"])
+        assert math.isfinite(
+            trained_model.train_metrics["latent_discovery_insight_loss"])
         assert trained_model.train_metrics["latent_reanalysis_w"] == 0.01
         assert trained_model.train_metrics["latent_reanalysis_fer_w"] == 0.01
         assert trained_model.train_metrics["latent_reanalysis_skipped"] is False
@@ -3594,6 +3661,9 @@ def selftest():
         assert any(r.get("strategy") == "discovery"
                    for r in discovery_model.train_metrics["latent_study_reports"])
         assert any("mean_gap_score" in r
+                   for r in discovery_model.train_metrics["latent_study_reports"]
+                   if r.get("strategy") == "discovery")
+        assert any("mean_insight_score" in r
                    for r in discovery_model.train_metrics["latent_study_reports"]
                    if r.get("strategy") == "discovery")
         selected_model, *_ = train(

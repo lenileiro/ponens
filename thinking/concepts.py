@@ -183,7 +183,7 @@ class LatentConceptMemory(nn.Module):
 
     def discovery_loss(self, full_slots, source_slots=None, target_slots=None,
                        curiosity_w=1.0, graph_w=1.0, cycle_w=1.0,
-                       bridge_w=1.0, fer_w=0.0,
+                       insight_w=1.0, bridge_w=1.0, fer_w=0.0,
                        curiosity_temperature=0.1, curiosity_self_loop_w=0.05,
                        curiosity_transitive_steps=2, curiosity_transitive_w=0.1,
                        graph_temperature=0.1, graph_self_loop_w=0.05,
@@ -199,7 +199,7 @@ class LatentConceptMemory(nn.Module):
             prediction_relations=self.active_prediction_relations(),
             source_slots=source_slots, target_slots=target_slots,
             curiosity_w=curiosity_w, graph_w=graph_w, cycle_w=cycle_w,
-            bridge_w=bridge_w, fer_w=fer_w,
+            insight_w=insight_w, bridge_w=bridge_w, fer_w=fer_w,
             curiosity_temperature=curiosity_temperature,
             curiosity_self_loop_w=curiosity_self_loop_w,
             curiosity_transitive_steps=curiosity_transitive_steps,
@@ -565,8 +565,9 @@ def _latent_discovery_zero(full_slots, source_slots=None, target_slots=None):
 def latent_concept_discovery_loss(
         full_slots, memory, relations=None, transitions=None,
         prediction_relations=None, source_slots=None, target_slots=None,
-        curiosity_w=1.0, graph_w=1.0, cycle_w=1.0, bridge_w=1.0,
-        fer_w=0.0, curiosity_temperature=0.1, curiosity_self_loop_w=0.05,
+        curiosity_w=1.0, graph_w=1.0, cycle_w=1.0, insight_w=1.0,
+        bridge_w=1.0, fer_w=0.0, curiosity_temperature=0.1,
+        curiosity_self_loop_w=0.05,
         curiosity_transitive_steps=2, curiosity_transitive_w=0.1,
         graph_temperature=0.1, graph_self_loop_w=0.05,
         graph_transitive_steps=2, graph_transitive_w=0.1,
@@ -580,13 +581,14 @@ def latent_concept_discovery_loss(
     This loss is schema-free and label-free. It uses the same ingredients that
     rank examples for discovery study: novelty against persistent concept
     memory, mismatch with the self-mined relation graph, source->target graph
-    prediction, graph-cycle consistency, bridge resolution, and optional FER
-    cleanup. The caller supplies slots from text, multimodal views, or any other
-    stream; no language facts, answer choices, or task rules are baked in.
+    prediction, graph-cycle consistency, missing-concept insight, bridge
+    resolution, and optional FER cleanup. The caller supplies slots from text,
+    multimodal views, or any other stream; no language facts, answer choices, or
+    task rules are baked in.
     """
     weights = {
         "curiosity_w": curiosity_w, "graph_w": graph_w, "cycle_w": cycle_w,
-        "bridge_w": bridge_w, "fer_w": fer_w,
+        "insight_w": insight_w, "bridge_w": bridge_w, "fer_w": fer_w,
     }
     if any(float(w) < 0.0 for w in weights.values()):
         raise ValueError("latent concept discovery weights must be non-negative")
@@ -603,6 +605,13 @@ def latent_concept_discovery_loss(
         "cycle_reverse_kl": zero,
         "cycle_source_cycle_kl": zero,
         "cycle_target_cycle_kl": zero,
+        "insight_loss": zero,
+        "insight_score": zero,
+        "insight_kl": zero,
+        "insight_cosine": zero,
+        "insight_missing_mass": zero,
+        "insight_reachable_mass": zero,
+        "insight_gain": zero,
         "bridge_loss": zero,
         "bridge_score": zero,
         "bridge_entropy": zero,
@@ -681,6 +690,33 @@ def latent_concept_discovery_loss(
         }
         for metric_key, part_key in part_map.items():
             part = cycle_parts.get(part_key)
+            metrics[metric_key] = (
+                part.mean() if part is not None and part.numel() else zero)
+    if float(insight_w) and source_slots is not None and target_slots is not None:
+        insight_scores, insight_parts = latent_concept_insight_scores(
+            source_slots, target_slots, memory, pred_rel,
+            temperature=graph_temperature, self_loop_w=graph_self_loop_w,
+            transitive_steps=graph_transitive_steps,
+            transitive_w=graph_transitive_w,
+            target_power=graph_target_power)
+        usable = insight_parts.get("usable")
+        insight_losses = insight_parts.get("loss", insight_scores)
+        insight_loss = (
+            insight_losses[usable].mean()
+            if (usable is not None and bool(usable.any()))
+            else (insight_losses.mean() if insight_losses.numel() else zero))
+        losses.append(float(insight_w) * insight_loss)
+        metrics["insight_loss"] = insight_loss
+        part_map = {
+            "insight_score": "score",
+            "insight_kl": "kl",
+            "insight_cosine": "cosine",
+            "insight_missing_mass": "missing_mass",
+            "insight_reachable_mass": "reachable_mass",
+            "insight_gain": "gain",
+        }
+        for metric_key, part_key in part_map.items():
+            part = insight_parts.get(part_key)
             metrics[metric_key] = (
                 part.mean() if part is not None and part.numel() else zero)
     if float(bridge_w):
@@ -1439,6 +1475,163 @@ def latent_concept_graph_prediction_loss(source_slots, target_slots, memory,
     if scores.numel() == 0:
         return torch.tensor(0.0)
     return scores.mean()
+
+
+def _latent_concept_graph_from_relations(slots, memory, relations=None,
+                                         transitions=None, relation_w=1.0,
+                                         transition_w=1.0):
+    n = int(memory.shape[0])
+    graph = torch.zeros(n, n, dtype=slots.dtype, device=slots.device)
+    if relations is not None and relations.numel() and float(relation_w):
+        rel = relations[:n, :n].to(device=slots.device, dtype=slots.dtype)
+        if rel.shape != (n, n):
+            raise ValueError("latent concept insight relation shape mismatch")
+        graph = graph + float(relation_w) * rel.clamp_min(0.0)
+    if transitions is not None and transitions.numel() and float(transition_w):
+        trans = transitions[:n, :n].to(device=slots.device, dtype=slots.dtype)
+        if trans.shape != (n, n):
+            raise ValueError("latent concept insight transition shape mismatch")
+        trans = trans.clamp_min(0.0)
+        graph = graph + float(transition_w) * (trans + trans.t())
+    return graph
+
+
+def latent_concept_insight_scores(
+        source_slots, target_slots, memory, relations=None, transitions=None,
+        temperature=0.1, self_loop_w=0.05, transitive_steps=2,
+        transitive_w=0.1, target_power=1.0, relation_w=1.0,
+        transition_w=1.0):
+    """Score graph-closed concepts that are missing from a partial view.
+
+    The partial/source view supplies what the model currently sees. The target
+    view supplies a fuller observation. The model's own relation/transition
+    graph predicts which missing target concepts are reachable from the partial
+    view. High scores identify "connect the concepts" moments; the paired loss
+    trains the partial view toward that self-discovered closure.
+    """
+    zero = _latent_graph_zero_scores(source_slots, target_slots)
+    parts = {
+        "score": zero,
+        "loss": zero,
+        "kl": zero,
+        "cosine": zero,
+        "missing_mass": zero,
+        "reachable_mass": zero,
+        "gain": zero,
+        "usable": torch.zeros_like(zero, dtype=torch.bool),
+        "graph_ready": False,
+        "memory_active": 0,
+    }
+    if source_slots is None or target_slots is None:
+        return zero, parts
+    if memory is None or memory.numel() == 0:
+        return zero, parts
+    if source_slots.ndim != 3 or target_slots.ndim != 3:
+        raise ValueError("latent concept insight expects [batch, slots, dim]")
+    if source_slots.shape[0] != target_slots.shape[0]:
+        raise ValueError("latent concept insight batch mismatch")
+    if source_slots.shape[-1] != target_slots.shape[-1]:
+        raise ValueError("latent concept insight source/target dimension mismatch")
+    if source_slots.shape[-1] != memory.shape[-1]:
+        raise ValueError("latent concept insight memory dimension mismatch")
+    if float(temperature) <= 0.0:
+        raise ValueError("latent concept insight temperature must be positive")
+    if float(self_loop_w) < 0.0:
+        raise ValueError("latent concept insight self-loop weight must be non-negative")
+    if int(transitive_steps) < 1:
+        raise ValueError("latent concept insight transitive steps must be positive")
+    if float(transitive_w) < 0.0:
+        raise ValueError("latent concept insight transitive weight must be non-negative")
+    if float(target_power) <= 0.0:
+        raise ValueError("latent concept insight target power must be positive")
+    if float(relation_w) < 0.0 or float(transition_w) < 0.0:
+        raise ValueError("latent concept insight graph weights must be non-negative")
+    n = int(memory.shape[0])
+    parts["memory_active"] = n
+    if n <= 1:
+        return zero, parts
+    graph = _latent_concept_graph_from_relations(
+        source_slots, memory, relations=relations, transitions=transitions,
+        relation_w=relation_w, transition_w=transition_w)
+    if not _has_offdiag_edges(graph):
+        return zero, parts
+    rel = _latent_relation_targets(
+        graph, n, source_slots.device, source_slots.dtype,
+        self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+        transitive_w=transitive_w)
+    if rel is None:
+        return zero, parts
+    parts["graph_ready"] = True
+    temp = max(float(temperature), 1e-6)
+    mem = F.normalize(
+        memory.to(device=source_slots.device, dtype=source_slots.dtype), dim=-1)
+    source = F.normalize(source_slots, dim=-1)
+    target = F.normalize(target_slots.to(source_slots), dim=-1)
+    source_dist = (source.matmul(mem.t()) / temp).softmax(-1).mean(1)
+    target_dist = (target.detach().matmul(mem.t()) / temp).softmax(-1).mean(1)
+    power = float(target_power)
+    if power != 1.0:
+        target_dist = target_dist.clamp_min(1e-8).pow(power)
+    target_dist = target_dist / target_dist.sum(-1, keepdim=True).clamp_min(1e-8)
+    target_dist = target_dist.detach()
+    missing = target_dist * (1.0 - source_dist.detach()).clamp_min(0.0)
+    missing_mass = missing.sum(-1)
+    reachable = source_dist.matmul(rel)
+    reachable = reachable / reachable.sum(-1, keepdim=True).clamp_min(1e-8)
+    reachable_mass = (reachable.detach() * missing).sum(-1)
+    usable = missing_mass.gt(1e-8)
+    parts["missing_mass"] = missing_mass.detach()
+    parts["reachable_mass"] = reachable_mass.detach()
+    parts["usable"] = usable
+    if not bool(usable.any()):
+        return zero, parts
+    insight_target = missing[usable] / missing_mass[usable, None].clamp_min(1e-8)
+    pred = reachable[usable]
+    target_center = F.normalize(insight_target.matmul(mem).detach(), dim=-1)
+    pred_center = F.normalize(pred.matmul(mem), dim=-1)
+    kl = F.kl_div(pred.clamp_min(1e-8).log(), insight_target,
+                  reduction="none").sum(-1)
+    cosine = 1.0 - (pred_center * target_center).sum(-1)
+    loss = 0.5 * (kl + cosine)
+
+    raw_center = F.normalize(source_dist[usable].matmul(mem), dim=-1)
+    raw_kl = F.kl_div(source_dist[usable].clamp_min(1e-8).log(),
+                      insight_target, reduction="none").sum(-1)
+    raw_cosine = 1.0 - (raw_center * target_center).sum(-1)
+    gain = (0.5 * (raw_kl + raw_cosine) - loss).detach()
+    score = zero.clone()
+    score[usable] = (
+        missing_mass[usable].detach() * reachable_mass[usable].detach()
+        + F.relu(gain))
+    parts["score"] = score
+    parts["loss"] = zero.clone()
+    parts["loss"][usable] = loss
+    parts["kl"] = zero.clone()
+    parts["kl"][usable] = kl
+    parts["cosine"] = zero.clone()
+    parts["cosine"][usable] = cosine
+    parts["gain"] = zero.clone()
+    parts["gain"][usable] = gain
+    return score, parts
+
+
+def latent_concept_insight_loss(
+        source_slots, target_slots, memory, relations=None, transitions=None,
+        temperature=0.1, self_loop_w=0.05, transitive_steps=2,
+        transitive_w=0.1, target_power=1.0, relation_w=1.0,
+        transition_w=1.0):
+    scores, parts = latent_concept_insight_scores(
+        source_slots, target_slots, memory, relations=relations,
+        transitions=transitions, temperature=temperature,
+        self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+        transitive_w=transitive_w, target_power=target_power,
+        relation_w=relation_w, transition_w=transition_w)
+    usable = parts.get("usable")
+    losses = parts.get("loss", scores)
+    if losses.numel() == 0 or usable is None or not bool(usable.any()):
+        zero = _latent_graph_zero_scores(source_slots, target_slots)
+        return zero.sum() * 0.0 if zero.numel() else torch.tensor(0.0)
+    return losses[usable].mean()
 
 
 def latent_concept_graph_cycle_scores(source_slots, target_slots, memory, relations,

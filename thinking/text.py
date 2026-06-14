@@ -63,6 +63,7 @@ from .concepts import (
     latent_concept_graph_prediction_loss,
     latent_concept_graph_prediction_scores,
     latent_concept_graph_curiosity_scores,
+    latent_concept_insight_scores,
     latent_concept_discovery_loss,
     latent_concept_cluster_prototype_loss,
     latent_concept_fer_loss,
@@ -1668,6 +1669,10 @@ def reading_latent_discovery_loss(
                "cycle_loss": zero, "cycle_forward_kl": zero,
                "cycle_reverse_kl": zero, "cycle_source_cycle_kl": zero,
                "cycle_target_cycle_kl": zero, "bridge_loss": zero,
+               "insight_loss": zero, "insight_score": zero,
+               "insight_kl": zero, "insight_cosine": zero,
+               "insight_missing_mass": zero,
+               "insight_reachable_mass": zero, "insight_gain": zero,
                "bridge_score": zero, "bridge_entropy": zero,
                "bridge_connectivity": zero, "fer_loss": zero,
                "memory_active": 0, "graph_ready": False, "skipped": True}
@@ -3429,6 +3434,14 @@ def reading_latent_discovery_records(
                     transitive_w=cycle_transitive_w,
                     target_power=cycle_target_power,
                     cycle_w=cycle_w)
+            insight, insight_parts = latent_concept_insight_scores(
+                source_slots, heldout_slots, memory.active(),
+                relations=memory.active_relations(),
+                transitions=memory.active_transitions(),
+                temperature=graph_temperature, self_loop_w=graph_self_loop_w,
+                transitive_steps=graph_transitive_steps,
+                transitive_w=graph_transitive_w,
+                target_power=graph_target_power)
             fer_parts = _latent_slot_fer_parts(full_slots)
             disorder = fer_parts["fer_score"]
             fer_fragmentation = fer_parts["fragmentation"]
@@ -3455,6 +3468,15 @@ def reading_latent_discovery_records(
                 "source_cycle_kl", cycle.new_zeros(cycle.shape))
             target_cycle = cycle_parts.get(
                 "target_cycle_kl", cycle.new_zeros(cycle.shape))
+            insight_loss = insight_parts.get("loss", insight.new_zeros(insight.shape))
+            insight_kl = insight_parts.get("kl", insight.new_zeros(insight.shape))
+            insight_cosine = insight_parts.get(
+                "cosine", insight.new_zeros(insight.shape))
+            insight_missing_mass = insight_parts.get(
+                "missing_mass", insight.new_zeros(insight.shape))
+            insight_reachable_mass = insight_parts.get(
+                "reachable_mass", insight.new_zeros(insight.shape))
+            insight_gain = insight_parts.get("gain", insight.new_zeros(insight.shape))
             for i, rec in enumerate(batch):
                 seq = sequence_by_id.get(rec.rec_id, {})
                 rows.append({
@@ -3470,6 +3492,15 @@ def reading_latent_discovery_records(
                     "reverse_kl": float(reverse[i].detach().cpu()),
                     "source_cycle_kl": float(source_cycle[i].detach().cpu()),
                     "target_cycle_kl": float(target_cycle[i].detach().cpu()),
+                    "insight": float(insight[i].detach().cpu()),
+                    "insight_loss": float(insight_loss[i].detach().cpu()),
+                    "insight_kl": float(insight_kl[i].detach().cpu()),
+                    "insight_cosine": float(insight_cosine[i].detach().cpu()),
+                    "insight_missing_mass": float(
+                        insight_missing_mass[i].detach().cpu()),
+                    "insight_reachable_mass": float(
+                        insight_reachable_mass[i].detach().cpu()),
+                    "insight_gain": float(insight_gain[i].detach().cpu()),
                     "fer_score": float(disorder[i].detach().cpu()),
                     "fer_fragmentation": float(
                         fer_fragmentation[i].detach().cpu()),
@@ -3499,7 +3530,7 @@ def reading_latent_discovery_records(
                     "sequence_rank": float(seq.get("sequence_rank", 0.0)),
                 })
     components = (
-        "curiosity", "gap", "graph", "cycle", "fer_score", "bridge",
+        "curiosity", "gap", "insight", "graph", "cycle", "fer_score", "bridge",
         "sequence_surprise")
     for name in components:
         scaled = _minmax_scale([row[name] for row in rows])
@@ -3532,6 +3563,16 @@ def reading_latent_discovery_records(
                       "mean_reverse_kl": mean_field("reverse_kl"),
                       "mean_source_cycle_kl": mean_field("source_cycle_kl"),
                       "mean_target_cycle_kl": mean_field("target_cycle_kl"),
+                      "mean_insight_score": mean_field("insight"),
+                      "max_insight_score": max_field("insight"),
+                      "mean_insight_loss": mean_field("insight_loss"),
+                      "mean_insight_kl": mean_field("insight_kl"),
+                      "mean_insight_cosine": mean_field("insight_cosine"),
+                      "mean_insight_missing_mass": mean_field(
+                          "insight_missing_mass"),
+                      "mean_insight_reachable_mass": mean_field(
+                          "insight_reachable_mass"),
+                      "mean_insight_gain": mean_field("insight_gain"),
                       "mean_fer_score": mean_field("fer_score"),
                       "max_fer_score": max_field("fer_score"),
                       "mean_fer_fragmentation": mean_field("fer_fragmentation"),
@@ -4085,6 +4126,11 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_discovery_curiosity = 0.0
     last_discovery_graph = 0.0
     last_discovery_cycle = 0.0
+    last_discovery_insight = 0.0
+    last_discovery_insight_score = 0.0
+    last_discovery_insight_missing_mass = 0.0
+    last_discovery_insight_reachable_mass = 0.0
+    last_discovery_insight_gain = 0.0
     last_discovery_bridge = 0.0
     last_discovery_fer = 0.0
     last_discovery_memory_active = 0
@@ -4413,6 +4459,13 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 "cycle_reverse_kl": zero_metric,
                 "cycle_source_cycle_kl": zero_metric,
                 "cycle_target_cycle_kl": zero_metric,
+                "insight_loss": zero_metric,
+                "insight_score": zero_metric,
+                "insight_kl": zero_metric,
+                "insight_cosine": zero_metric,
+                "insight_missing_mass": zero_metric,
+                "insight_reachable_mass": zero_metric,
+                "insight_gain": zero_metric,
                 "bridge_loss": zero_metric,
                 "bridge_score": zero_metric,
                 "bridge_entropy": zero_metric,
@@ -4652,6 +4705,16 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
             discovery_metrics["curiosity_loss"].detach())
         last_discovery_graph = float(discovery_metrics["graph_loss"].detach())
         last_discovery_cycle = float(discovery_metrics["cycle_loss"].detach())
+        last_discovery_insight = float(
+            discovery_metrics["insight_loss"].detach())
+        last_discovery_insight_score = float(
+            discovery_metrics["insight_score"].detach())
+        last_discovery_insight_missing_mass = float(
+            discovery_metrics["insight_missing_mass"].detach())
+        last_discovery_insight_reachable_mass = float(
+            discovery_metrics["insight_reachable_mass"].detach())
+        last_discovery_insight_gain = float(
+            discovery_metrics["insight_gain"].detach())
         last_discovery_bridge = float(discovery_metrics["bridge_loss"].detach())
         last_discovery_fer = float(discovery_metrics["fer_loss"].detach())
         last_discovery_memory_active = int(discovery_metrics["memory_active"])
@@ -4698,6 +4761,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                   f"memory {last_memory:.3f} "
                   f"consolidate {last_consolidation:.3f} "
                   f"discover {last_discovery:.3f} "
+                  f"insight {last_discovery_insight:.3f} "
                   f"reanalyze {last_reanalysis:.3f} "
                   f"gap {last_gap:.3f} "
                   f"assoc {last_association:.3f} "
@@ -4815,6 +4879,11 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "discovery_curiosity_loss": last_discovery_curiosity,
         "discovery_graph_loss": last_discovery_graph,
         "discovery_cycle_loss": last_discovery_cycle,
+        "discovery_insight_loss": last_discovery_insight,
+        "discovery_insight_score": last_discovery_insight_score,
+        "discovery_insight_missing_mass": last_discovery_insight_missing_mass,
+        "discovery_insight_reachable_mass": last_discovery_insight_reachable_mass,
+        "discovery_insight_gain": last_discovery_insight_gain,
         "discovery_bridge_loss": last_discovery_bridge,
         "discovery_fer_loss": last_discovery_fer,
         "discovery_memory_active": int(last_discovery_memory_active),
@@ -8225,6 +8294,7 @@ def selftest():
     assert discovery_metrics["skipped"] is False
     assert discovery_metrics["memory_active"] > 0
     assert torch.isfinite(discovery_metrics["graph_loss"])
+    assert torch.isfinite(discovery_metrics["insight_loss"])
     assert torch.isfinite(discovery_metrics["bridge_loss"])
     graph_records, graph_report = reading_latent_graph_prediction_records(
         reading_model, reading_vocab, reading_records, device="cpu", n=0,
@@ -8250,6 +8320,7 @@ def selftest():
     assert "mean_fer_score" in discovery_report
     assert "mean_slot_disorder" in discovery_report
     assert "mean_gap_score" in discovery_report
+    assert "mean_insight_score" in discovery_report
     assert "mean_bridge_score" in discovery_report
     assert "mean_sequence_surprise" in discovery_report
     assert discovery_report["n_sequence_pairs"] == 2
@@ -8329,6 +8400,8 @@ def selftest():
     assert math.isfinite(reading_model.reading_train_metrics["discovery_loss"])
     assert math.isfinite(
         reading_model.reading_train_metrics["discovery_graph_loss"])
+    assert math.isfinite(
+        reading_model.reading_train_metrics["discovery_insight_loss"])
     assert reading_model.reading_train_metrics["reanalysis_w"] == 0.1
     assert reading_model.reading_train_metrics["reanalysis_fer_w"] == 0.1
     assert reading_model.reading_train_metrics["reanalysis_skipped"] is False
@@ -8367,6 +8440,9 @@ def selftest():
     assert any("pool_bridge_before" in r for r in reading_model.reading_study_reports
                if r.get("strategy") == "discovery")
     assert any("mean_gap_score" in r for r in reading_model.reading_study_reports
+               if r.get("strategy") == "discovery")
+    assert any("mean_insight_score" in r
+               for r in reading_model.reading_study_reports
                if r.get("strategy") == "discovery")
     fit_reading_concepts(
         reading_model, reading_vocab, reading_records, steps=1, batch=2, lr=1e-4,
