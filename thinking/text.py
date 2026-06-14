@@ -2095,6 +2095,58 @@ def reading_context_target_retrieval_eval(model, vocab, records, device=DEV, n=0
             "skipped": False}
 
 
+READING_SCORE_METRICS = ("view", "context", "both", "min")
+
+
+def reading_discovery_score_components(view_eval, context_eval, metric="both",
+                                       margin_w=0.1):
+    metric = str(metric)
+    if metric not in READING_SCORE_METRICS:
+        raise ValueError(f"unknown reading score metric {metric!r}")
+    margin_w = float(margin_w)
+    view_acc = float(view_eval.get("paired_view_acc", 0.0))
+    view_margin = float(view_eval.get("margin", 0.0))
+    context_acc = float(context_eval.get("context_target_acc", 0.0))
+    context_margin = float(context_eval.get("margin", 0.0))
+    view_score = view_acc + margin_w * view_margin
+    context_score = context_acc + margin_w * context_margin
+    if metric == "view":
+        score = view_score
+    elif metric == "context":
+        score = context_score
+    elif metric == "min":
+        score = min(view_score, context_score)
+    else:
+        score = 0.5 * (view_score + context_score)
+    return {"metric": metric,
+            "margin_w": margin_w,
+            "score": float(score),
+            "view_score": float(view_score),
+            "context_score": float(context_score),
+            "paired_view_acc": view_acc,
+            "paired_view_margin": view_margin,
+            "context_target_acc": context_acc,
+            "context_target_margin": context_margin,
+            "view_skipped": bool(view_eval.get("skipped", False)),
+            "context_skipped": bool(context_eval.get("skipped", False))}
+
+
+def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
+                        token_drop_p=0.15, token_replace_p=0.05,
+                        context_keep_p=0.5, score_metric="both",
+                        score_margin_w=0.1):
+    view = reading_latent_retrieval_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 17,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    context = reading_context_target_retrieval_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 23,
+        context_keep_p=context_keep_p)
+    return {"view": view,
+            "context_target": context,
+            "score_components": reading_discovery_score_components(
+                view, context, metric=score_metric, margin_w=score_margin_w)}
+
+
 def reading_latent_record_outcomes(model, vocab, records, device=DEV, n=0, seed=0,
                                    token_drop_p=0.15, token_replace_p=0.05):
     if getattr(model, "latent_concepts", None) is None:
@@ -4484,6 +4536,107 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     return model, vocab
 
 
+def _model_state_copy(model):
+    return {name: tensor.detach().cpu().clone()
+            for name, tensor in model.state_dict().items()}
+
+
+def _step_schedule(steps, rounds):
+    rounds = max(1, int(rounds))
+    steps = max(0, int(steps))
+    base = steps // rounds
+    rem = steps % rounds
+    return [base + (1 if i < rem else 0) for i in range(rounds)
+            if base + (1 if i < rem else 0) > 0]
+
+
+def fit_reading_concepts_select_best(
+        model, vocab, records, steps=400, batch=32, lr=1e-3,
+        seed=0, device=DEV, log_every=100,
+        token_drop_p=0.15, token_replace_p=0.05,
+        feature_dropout=0.1,
+        invariance_w=25.0, variance_w=25.0,
+        covariance_w=1.0, variance_target=1.0,
+        context_target_w=0.1, context_keep_p=0.5,
+        context_target_temperature=0.1,
+        study_strategy="errors", study_probe_n=0,
+        study_hard_max=0, study_refresh_steps=0,
+        eval_n=64, score_metric="both", score_margin_w=0.1,
+        rounds=1, before_bundle=None):
+    schedule = _step_schedule(steps, rounds)
+    if not schedule:
+        raise ValueError("reading selected training requires at least one step")
+    before_bundle = before_bundle or reading_eval_bundle(
+        model, vocab, records, device=device, eval_n=eval_n, seed=seed,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p,
+        context_keep_p=context_keep_p, score_metric=score_metric,
+        score_margin_w=score_margin_w)
+    best_state = _model_state_copy(model)
+    best_score = float(before_bundle["score_components"]["score"])
+    best_round = 0
+    best_metrics = dict(getattr(model, "reading_train_metrics", {}))
+    rounds_report = [{
+        "round": 0,
+        "steps": 0,
+        "selected": True,
+        "score_components": before_bundle["score_components"],
+    }]
+    all_study_reports = []
+    for round_i, round_steps in enumerate(schedule, start=1):
+        fit_reading_concepts(
+            model, vocab, records, steps=round_steps, batch=batch, lr=lr,
+            seed=seed + round_i * 1009, device=device, log_every=log_every,
+            token_drop_p=token_drop_p, token_replace_p=token_replace_p,
+            feature_dropout=feature_dropout, invariance_w=invariance_w,
+            variance_w=variance_w, covariance_w=covariance_w,
+            variance_target=variance_target, context_target_w=context_target_w,
+            context_keep_p=context_keep_p,
+            context_target_temperature=context_target_temperature,
+            study_strategy=study_strategy, study_probe_n=study_probe_n,
+            study_hard_max=study_hard_max,
+            study_refresh_steps=study_refresh_steps)
+        all_study_reports.extend(
+            report | {"round": int(round_i)}
+            for report in getattr(model, "reading_study_reports", []))
+        bundle = reading_eval_bundle(
+            model, vocab, records, device=device, eval_n=eval_n, seed=seed,
+            token_drop_p=token_drop_p, token_replace_p=token_replace_p,
+            context_keep_p=context_keep_p, score_metric=score_metric,
+            score_margin_w=score_margin_w)
+        score = float(bundle["score_components"]["score"])
+        selected = score > best_score
+        rounds_report.append({
+            "round": int(round_i),
+            "steps": int(round_steps),
+            "selected": bool(selected),
+            "score_components": bundle["score_components"],
+        })
+        if selected:
+            best_score = score
+            best_round = round_i
+            best_state = _model_state_copy(model)
+            best_metrics = dict(getattr(model, "reading_train_metrics", {}))
+    model.load_state_dict(best_state, strict=False)
+    for row in rounds_report:
+        row["selected"] = row["round"] == best_round
+    selection = {
+        "enabled": True,
+        "rounds_requested": int(rounds),
+        "rounds_run": len(schedule),
+        "score_metric": score_metric,
+        "score_margin_w": float(score_margin_w),
+        "selected_round": int(best_round),
+        "selected_score": float(best_score),
+        "before_score": float(before_bundle["score_components"]["score"]),
+        "rounds": rounds_report,
+    }
+    best_metrics = best_metrics | {"selection": selection}
+    model.reading_train_metrics = best_metrics
+    model.reading_study_reports = all_study_reports
+    model.reading_selection_report = selection
+    return model, vocab, selection
+
+
 def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4,
                            text_encoder_arch="transformer", text_encoder_layers=1,
                            latent_concept_slots=4, latent_concept_layers=1,
@@ -4539,6 +4692,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          context_target_temperature=0.1,
                          study_strategy="errors", study_probe_n=0,
                          study_hard_max=0, study_refresh_steps=0,
+                         study_select_best=False, study_rounds=1,
+                         study_score_metric="both", study_score_margin_w=0.1,
                          text_field="text", max_tokens=128, min_tokens=8,
                          eval_frac=0.10, eval_n=64, out=None, checkpoint=None):
     records = load_reading_records(
@@ -4556,28 +4711,48 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                        latent_concept_refine=latent_concept_refine,
                        latent_concept_refine_gate_init=(
                            latent_concept_refine_gate_init)).to(device)
-    before = reading_latent_retrieval_eval(
-        model, vocab, records, device=device, n=eval_n, seed=seed + 17,
-        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
-    before_context = reading_context_target_retrieval_eval(
-        model, vocab, records, device=device, n=eval_n, seed=seed + 23,
-        context_keep_p=context_keep_p)
-    fit_reading_concepts(
-        model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
-        device=device, log_every=log_every, token_drop_p=token_drop_p,
-        token_replace_p=token_replace_p, feature_dropout=feature_dropout,
-        invariance_w=invariance_w, variance_w=variance_w,
-        covariance_w=covariance_w, variance_target=variance_target,
-        context_target_w=context_target_w, context_keep_p=context_keep_p,
-        context_target_temperature=context_target_temperature,
-        study_strategy=study_strategy, study_probe_n=study_probe_n,
-        study_hard_max=study_hard_max, study_refresh_steps=study_refresh_steps)
-    after = reading_latent_retrieval_eval(
-        model, vocab, records, device=device, n=eval_n, seed=seed + 17,
-        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
-    after_context = reading_context_target_retrieval_eval(
-        model, vocab, records, device=device, n=eval_n, seed=seed + 23,
-        context_keep_p=context_keep_p)
+    before_bundle = reading_eval_bundle(
+        model, vocab, records, device=device, eval_n=eval_n, seed=seed,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p,
+        context_keep_p=context_keep_p, score_metric=study_score_metric,
+        score_margin_w=study_score_margin_w)
+    selection = {"enabled": False}
+    if study_select_best:
+        _model, _vocab, selection = fit_reading_concepts_select_best(
+            model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
+            device=device, log_every=log_every, token_drop_p=token_drop_p,
+            token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+            invariance_w=invariance_w, variance_w=variance_w,
+            covariance_w=covariance_w, variance_target=variance_target,
+            context_target_w=context_target_w, context_keep_p=context_keep_p,
+            context_target_temperature=context_target_temperature,
+            study_strategy=study_strategy, study_probe_n=study_probe_n,
+            study_hard_max=study_hard_max,
+            study_refresh_steps=study_refresh_steps, eval_n=eval_n,
+            score_metric=study_score_metric,
+            score_margin_w=study_score_margin_w, rounds=study_rounds,
+            before_bundle=before_bundle)
+    else:
+        fit_reading_concepts(
+            model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
+            device=device, log_every=log_every, token_drop_p=token_drop_p,
+            token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+            invariance_w=invariance_w, variance_w=variance_w,
+            covariance_w=covariance_w, variance_target=variance_target,
+            context_target_w=context_target_w, context_keep_p=context_keep_p,
+            context_target_temperature=context_target_temperature,
+            study_strategy=study_strategy, study_probe_n=study_probe_n,
+            study_hard_max=study_hard_max,
+            study_refresh_steps=study_refresh_steps)
+    after_bundle = reading_eval_bundle(
+        model, vocab, records, device=device, eval_n=eval_n, seed=seed,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p,
+        context_keep_p=context_keep_p, score_metric=study_score_metric,
+        score_margin_w=study_score_margin_w)
+    before = before_bundle["view"]
+    after = after_bundle["view"]
+    before_context = before_bundle["context_target"]
+    after_context = after_bundle["context_target"]
     report = {"experiment": "text_raw_reading_concept_pretrain",
               "data": data,
               "steps": int(steps), "batch": int(batch), "lr": float(lr),
@@ -4603,6 +4778,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "study_probe_n": int(study_probe_n),
               "study_hard_max": int(study_hard_max),
               "study_refresh_steps": int(study_refresh_steps),
+              "study_select_best": bool(study_select_best),
+              "study_rounds": int(study_rounds),
+              "study_score_metric": study_score_metric,
+              "study_score_margin_w": float(study_score_margin_w),
               "train_records": sum(r.split == "train" for r in records),
               "eval_records": sum(r.split == "eval" for r in records),
               "vocab_size": len(vocab),
@@ -4610,6 +4789,9 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "after": after,
               "before_context_target": before_context,
               "after_context_target": after_context,
+              "before_score_components": before_bundle["score_components"],
+              "after_score_components": after_bundle["score_components"],
+              "selection": selection,
               "delta": {
                   "paired_view_acc": (
                       after["paired_view_acc"] - before["paired_view_acc"]),
@@ -4693,6 +4875,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              context_target_temperature=0.1,
                              study_strategy="errors", study_probe_n=0,
                              study_hard_max=0, study_refresh_steps=0,
+                             study_select_best=False, study_rounds=1,
+                             study_score_metric="both", study_score_margin_w=0.1,
                              text_field="text", max_tokens=128, min_tokens=8,
                              eval_frac=0.10, eval_n=64,
                              latent_concept_slots=0, latent_concept_layers=None,
@@ -4711,28 +4895,48 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         latent_concept_refine=latent_concept_refine,
         latent_concept_refine_gate_init=latent_concept_refine_gate_init)
     old_vocab_size = len(ckpt["vocab"])
-    before = reading_latent_retrieval_eval(
-        model, vocab, records, device=device, n=eval_n, seed=seed + 17,
-        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
-    before_context = reading_context_target_retrieval_eval(
-        model, vocab, records, device=device, n=eval_n, seed=seed + 23,
-        context_keep_p=context_keep_p)
-    fit_reading_concepts(
-        model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
-        device=device, log_every=log_every, token_drop_p=token_drop_p,
-        token_replace_p=token_replace_p, feature_dropout=feature_dropout,
-        invariance_w=invariance_w, variance_w=variance_w,
-        covariance_w=covariance_w, variance_target=variance_target,
-        context_target_w=context_target_w, context_keep_p=context_keep_p,
-        context_target_temperature=context_target_temperature,
-        study_strategy=study_strategy, study_probe_n=study_probe_n,
-        study_hard_max=study_hard_max, study_refresh_steps=study_refresh_steps)
-    after = reading_latent_retrieval_eval(
-        model, vocab, records, device=device, n=eval_n, seed=seed + 17,
-        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
-    after_context = reading_context_target_retrieval_eval(
-        model, vocab, records, device=device, n=eval_n, seed=seed + 23,
-        context_keep_p=context_keep_p)
+    before_bundle = reading_eval_bundle(
+        model, vocab, records, device=device, eval_n=eval_n, seed=seed,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p,
+        context_keep_p=context_keep_p, score_metric=study_score_metric,
+        score_margin_w=study_score_margin_w)
+    selection = {"enabled": False}
+    if study_select_best:
+        _model, _vocab, selection = fit_reading_concepts_select_best(
+            model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
+            device=device, log_every=log_every, token_drop_p=token_drop_p,
+            token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+            invariance_w=invariance_w, variance_w=variance_w,
+            covariance_w=covariance_w, variance_target=variance_target,
+            context_target_w=context_target_w, context_keep_p=context_keep_p,
+            context_target_temperature=context_target_temperature,
+            study_strategy=study_strategy, study_probe_n=study_probe_n,
+            study_hard_max=study_hard_max,
+            study_refresh_steps=study_refresh_steps, eval_n=eval_n,
+            score_metric=study_score_metric,
+            score_margin_w=study_score_margin_w, rounds=study_rounds,
+            before_bundle=before_bundle)
+    else:
+        fit_reading_concepts(
+            model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
+            device=device, log_every=log_every, token_drop_p=token_drop_p,
+            token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+            invariance_w=invariance_w, variance_w=variance_w,
+            covariance_w=covariance_w, variance_target=variance_target,
+            context_target_w=context_target_w, context_keep_p=context_keep_p,
+            context_target_temperature=context_target_temperature,
+            study_strategy=study_strategy, study_probe_n=study_probe_n,
+            study_hard_max=study_hard_max,
+            study_refresh_steps=study_refresh_steps)
+    after_bundle = reading_eval_bundle(
+        model, vocab, records, device=device, eval_n=eval_n, seed=seed,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p,
+        context_keep_p=context_keep_p, score_metric=study_score_metric,
+        score_margin_w=study_score_margin_w)
+    before = before_bundle["view"]
+    after = after_bundle["view"]
+    before_context = before_bundle["context_target"]
+    after_context = after_bundle["context_target"]
     d = int(ckpt.get("d", 96))
     layers = int(ckpt.get("layers", 3))
     heads = int(ckpt.get("heads", 4))
@@ -4765,6 +4969,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "study_probe_n": int(study_probe_n),
               "study_hard_max": int(study_hard_max),
               "study_refresh_steps": int(study_refresh_steps),
+              "study_select_best": bool(study_select_best),
+              "study_rounds": int(study_rounds),
+              "study_score_metric": study_score_metric,
+              "study_score_margin_w": float(study_score_margin_w),
               "train_records": sum(r.split == "train" for r in records),
               "eval_records": sum(r.split == "eval" for r in records),
               "old_vocab_size": old_vocab_size,
@@ -4774,6 +4982,9 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "after": after,
               "before_context_target": before_context,
               "after_context_target": after_context,
+              "before_score_components": before_bundle["score_components"],
+              "after_score_components": after_bundle["score_components"],
+              "selection": selection,
               "delta": {
                   "paired_view_acc": (
                       after["paired_view_acc"] - before["paired_view_acc"]),
@@ -8244,6 +8455,25 @@ def selftest():
         reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0,
         context_keep_p=0.5)
     assert reading_context_eval["n_records"] == 2
+    reading_bundle = reading_eval_bundle(
+        reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
+        seed=0, token_drop_p=0.1, token_replace_p=0.0, context_keep_p=0.5,
+        score_metric="min", score_margin_w=0.1)
+    assert reading_bundle["score_components"]["metric"] == "min"
+    selected_reading_model = TextFactLM(
+        len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
+        fact_schema=None, latent_concept_slots=2).to("cpu")
+    _selected_model, _selected_vocab, selection_report = (
+        fit_reading_concepts_select_best(
+            selected_reading_model, reading_vocab, reading_records,
+            steps=2, rounds=2, batch=2, lr=1e-4, seed=3, device="cpu",
+            log_every=1, token_drop_p=0.1, token_replace_p=0.0,
+            context_target_w=0.1, context_keep_p=0.5, eval_n=0,
+            score_metric="both", score_margin_w=0.1,
+            study_strategy="errors", study_probe_n=2, study_hard_max=2))
+    assert selection_report["enabled"] is True
+    assert selection_report["selected_round"] in {0, 1, 2}
+    assert "selection" in selected_reading_model.reading_train_metrics
     fit_reading_concepts(
         reading_model, reading_vocab, reading_records, steps=1, batch=2, lr=1e-4,
         seed=5, device="cpu", log_every=1, token_drop_p=0.1,
@@ -8486,6 +8716,16 @@ def main(argv=None):
                     help="cap raw reading hard-example pool size")
     ap.add_argument("--reading-study-refresh-steps", type=int, default=0,
                     help="refresh raw reading hard examples every N steps; 0 means once")
+    ap.add_argument("--reading-study-select-best", action="store_true",
+                    help=("split raw-reading study into rounds and restore the best "
+                          "held-out latent discovery checkpoint"))
+    ap.add_argument("--reading-study-rounds", type=int, default=1,
+                    help="number of selection rounds for raw reading study")
+    ap.add_argument("--reading-study-score-metric", choices=READING_SCORE_METRICS,
+                    default="both",
+                    help="held-out schema-free metric used to select raw reading rounds")
+    ap.add_argument("--reading-study-score-margin-w", type=float, default=0.1,
+                    help="margin weight inside raw reading selection score")
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--d", type=int, default=96)
@@ -8953,6 +9193,10 @@ def main(argv=None):
         ap.error("--reading-study-hard-max must be non-negative")
     if args.reading_study_refresh_steps < 0:
         ap.error("--reading-study-refresh-steps must be non-negative")
+    if args.reading_study_rounds <= 0:
+        ap.error("--reading-study-rounds must be positive")
+    if args.reading_study_score_margin_w < 0.0:
+        ap.error("--reading-study-score-margin-w must be non-negative")
     if args.import_scan:
         import_scan(args.out, url=args.scan_url, max_records=args.scan_max,
                     eval_frac=args.scan_eval_frac, seed=args.seed)
@@ -9015,6 +9259,10 @@ def main(argv=None):
                 study_probe_n=args.reading_study_probe_n,
                 study_hard_max=args.reading_study_hard_max,
                 study_refresh_steps=args.reading_study_refresh_steps,
+                study_select_best=args.reading_study_select_best,
+                study_rounds=args.reading_study_rounds,
+                study_score_metric=args.reading_study_score_metric,
+                study_score_margin_w=args.reading_study_score_margin_w,
                 text_field=args.reading_text_field,
                 max_tokens=args.reading_max_tokens,
                 min_tokens=args.reading_min_tokens,
@@ -9059,6 +9307,10 @@ def main(argv=None):
                 study_probe_n=args.reading_study_probe_n,
                 study_hard_max=args.reading_study_hard_max,
                 study_refresh_steps=args.reading_study_refresh_steps,
+                study_select_best=args.reading_study_select_best,
+                study_rounds=args.reading_study_rounds,
+                study_score_metric=args.reading_study_score_metric,
+                study_score_margin_w=args.reading_study_score_margin_w,
                 text_field=args.reading_text_field,
                 max_tokens=args.reading_max_tokens,
                 min_tokens=args.reading_min_tokens,
