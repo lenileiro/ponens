@@ -37,6 +37,7 @@ import json
 import math
 import os
 import re
+import tempfile
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
@@ -4471,6 +4472,149 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
     return report
 
 
+def expanded_reading_checkpoint_model(checkpoint, reading_records, device=DEV,
+                                      latent_concept_slots=0,
+                                      latent_concept_layers=None,
+                                      latent_concept_prefix=None,
+                                      latent_concept_refine=None,
+                                      latent_concept_refine_gate_init=None):
+    src_model, src_vocab, ckpt = load_checkpoint(checkpoint, device=device)
+    vocab = build_reading_vocab(reading_records, base_vocab=src_vocab)
+    ckpt_slots = int(getattr(src_model, "latent_concept_slots", 0)
+                     or ckpt.get("latent_concept_slots", 0))
+    slots = int(latent_concept_slots or ckpt_slots or 4)
+    layers = int(latent_concept_layers if latent_concept_layers is not None
+                 else ckpt.get("latent_concept_layers", 1))
+    use_prefix = (bool(latent_concept_prefix)
+                  if latent_concept_prefix is not None
+                  else bool(ckpt.get("latent_concept_prefix", False)))
+    use_refine = (bool(latent_concept_refine)
+                  if latent_concept_refine is not None
+                  else bool(ckpt.get("latent_concept_refine", False)))
+    refine_gate = float(
+        latent_concept_refine_gate_init
+        if latent_concept_refine_gate_init is not None
+        else ckpt.get("latent_concept_refine_gate_init", -2.0))
+    model = TextFactLM(
+        len(vocab), d=int(ckpt.get("d", 96)),
+        layers=int(ckpt.get("layers", 3)),
+        heads=int(ckpt.get("heads", 4)), pad=vocab.pad,
+        fact_schema=src_model.fact_schema,
+        fact_concept_prefix=bool(ckpt.get("fact_concept_prefix", False)),
+        text_encoder_arch=ckpt.get("text_encoder_arch", "transformer"),
+        text_encoder_layers=int(ckpt.get("text_encoder_layers", 1)),
+        fact_concept_refine=bool(ckpt.get("fact_concept_refine", False)),
+        fact_concept_refine_gate_init=float(
+            ckpt.get("fact_concept_refine_gate_init", -2.0)),
+        fact_concept_mixer_layers=int(ckpt.get("fact_concept_mixer_layers", 0)),
+        fact_concept_mixer_gate_init=float(
+            ckpt.get("fact_concept_mixer_gate_init", -2.0)),
+        latent_concept_slots=slots,
+        latent_concept_layers=layers,
+        latent_concept_prefix=use_prefix,
+        latent_concept_refine=use_refine,
+        latent_concept_refine_gate_init=refine_gate).to(device)
+    copy_pretrained_text_weights(src_model, src_vocab, model, vocab)
+    model.eval()
+    return model, vocab, ckpt
+
+
+def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
+                             steps=400, batch=32, lr=1e-3, seed=0, device=DEV,
+                             log_every=100, token_drop_p=0.15,
+                             token_replace_p=0.05, feature_dropout=0.1,
+                             invariance_w=25.0, variance_w=25.0,
+                             covariance_w=1.0, variance_target=1.0,
+                             study_strategy="errors", study_probe_n=0,
+                             study_hard_max=0, study_refresh_steps=0,
+                             text_field="text", max_tokens=128, min_tokens=8,
+                             eval_frac=0.10, eval_n=64,
+                             latent_concept_slots=0, latent_concept_layers=None,
+                             latent_concept_prefix=None,
+                             latent_concept_refine=None,
+                             latent_concept_refine_gate_init=None):
+    records = load_reading_records(
+        data, text_field=text_field, max_tokens=max_tokens, min_tokens=min_tokens,
+        eval_frac=eval_frac, seed=seed)
+    torch.manual_seed(seed)
+    model, vocab, ckpt = expanded_reading_checkpoint_model(
+        checkpoint, records, device=device,
+        latent_concept_slots=latent_concept_slots,
+        latent_concept_layers=latent_concept_layers,
+        latent_concept_prefix=latent_concept_prefix,
+        latent_concept_refine=latent_concept_refine,
+        latent_concept_refine_gate_init=latent_concept_refine_gate_init)
+    old_vocab_size = len(ckpt["vocab"])
+    before = reading_latent_retrieval_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 17,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    fit_reading_concepts(
+        model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
+        device=device, log_every=log_every, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+        invariance_w=invariance_w, variance_w=variance_w,
+        covariance_w=covariance_w, variance_target=variance_target,
+        study_strategy=study_strategy, study_probe_n=study_probe_n,
+        study_hard_max=study_hard_max, study_refresh_steps=study_refresh_steps)
+    after = reading_latent_retrieval_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 17,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    d = int(ckpt.get("d", 96))
+    layers = int(ckpt.get("layers", 3))
+    heads = int(ckpt.get("heads", 4))
+    report = {"experiment": "text_raw_reading_checkpoint_study",
+              "checkpoint": checkpoint,
+              "checkpoint_experiment": ckpt.get("report", {}).get("experiment"),
+              "data": data,
+              "steps": int(steps), "batch": int(batch), "lr": float(lr),
+              "text_encoder_arch": ckpt.get("text_encoder_arch", "transformer"),
+              "text_encoder_layers": int(ckpt.get("text_encoder_layers", 1)),
+              "latent_concept_slots": int(getattr(model, "latent_concept_slots", 0)),
+              "latent_concept_layers": int(getattr(model, "latent_concept_layers", 1)),
+              "latent_concept_prefix": bool(
+                  getattr(model, "latent_concept_prefix", False)),
+              "latent_concept_refine": bool(
+                  getattr(model, "latent_concept_refine", False)),
+              "latent_concept_refine_gate_init": float(
+                  getattr(model, "latent_concept_refine_gate_init", -2.0)),
+              "token_drop_p": float(token_drop_p),
+              "token_replace_p": float(token_replace_p),
+              "feature_dropout": float(feature_dropout),
+              "invariance_w": float(invariance_w),
+              "variance_w": float(variance_w),
+              "covariance_w": float(covariance_w),
+              "variance_target": float(variance_target),
+              "study_strategy": study_strategy,
+              "study_probe_n": int(study_probe_n),
+              "study_hard_max": int(study_hard_max),
+              "study_refresh_steps": int(study_refresh_steps),
+              "train_records": sum(r.split == "train" for r in records),
+              "eval_records": sum(r.split == "eval" for r in records),
+              "old_vocab_size": old_vocab_size,
+              "new_vocab_size": len(vocab),
+              "new_tokens": max(0, len(vocab) - old_vocab_size),
+              "before": before,
+              "after": after,
+              "delta": {
+                  "paired_view_acc": (
+                      after["paired_view_acc"] - before["paired_view_acc"]),
+                  "margin": after.get("margin", 0.0) - before.get("margin", 0.0),
+              },
+              "train_metrics": getattr(model, "reading_train_metrics", {}),
+              "study_hard_examples": getattr(model, "reading_study_reports", [])}
+    if out_checkpoint:
+        os.makedirs(os.path.dirname(out_checkpoint) or ".", exist_ok=True)
+        torch.save(checkpoint_payload(model, vocab, d, layers, heads, report),
+                   out_checkpoint)
+        report["out_checkpoint"] = out_checkpoint
+    if out:
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        with open(out, "w") as f:
+            json.dump(report, f, indent=1)
+    print(json.dumps(report, indent=1), flush=True)
+    return report
+
+
 def fact_scores(pred, gold):
     p, g = set(pred), set(gold)
     tp = len(p & g)
@@ -7897,6 +8041,26 @@ def selftest():
     reading_payload = checkpoint_payload(reading_model, reading_vocab, 32, 1, 4,
                                          {"experiment": "reading-selftest"})
     assert reading_payload["fact_schema"] is None
+    with tempfile.TemporaryDirectory() as tmpdir:
+        reading_ckpt = os.path.join(tmpdir, "reading.pt")
+        torch.save(reading_payload, reading_ckpt)
+        expanded_records = reading_records + [
+            ReadingRecord("read-train-3", "train",
+                          tuple(split_words("fresh vocabulary enters during study"))),
+            ReadingRecord("read-eval-3", "eval",
+                          tuple(split_words("fresh vocabulary can still be encoded"))),
+        ]
+        expanded_model, expanded_vocab, _expanded_ckpt = (
+            expanded_reading_checkpoint_model(
+                reading_ckpt, expanded_records, device="cpu"))
+        assert expanded_model.fact_schema is None
+        assert expanded_model.latent_concept_slots == reading_model.latent_concept_slots
+        assert "fresh" in expanded_vocab.stoi
+        fit_reading_concepts(
+            expanded_model, expanded_vocab, expanded_records, steps=1, batch=2,
+            lr=1e-4, seed=7, device="cpu", log_every=1,
+            token_drop_p=0.1, token_replace_p=0.0, study_strategy="errors",
+            study_probe_n=2, study_hard_max=2)
     score_a = {"semantic_head": {"fact_value_acc": 0.8},
                "teacher_forced": {"fact_value_acc": 0.7},
                "latent_fact_concept_head": {"fact_value_acc": 0.65,
@@ -8069,6 +8233,12 @@ def main(argv=None):
     ap.add_argument("--reading-data", action="append",
                     help=("raw reading JSON/JSONL/TXT corpus; trains schema-free latent "
                           "concepts without fact labels"))
+    ap.add_argument("--reading-checkpoint", default=None,
+                    help=("existing text checkpoint to continue with raw reading data; "
+                          "expands vocab and updates weights"))
+    ap.add_argument("--reading-out-checkpoint", default=None,
+                    help=("where to save the raw-reading studied checkpoint; defaults to "
+                          "--checkpoint when set"))
     ap.add_argument("--reading-text-field", default="text",
                     help="JSON object field to read for --reading-data records")
     ap.add_argument("--reading-max-tokens", type=int, default=128,
@@ -8596,36 +8766,72 @@ def main(argv=None):
                         counterfactual_n=args.grounded_counterfactual, seed=args.seed)
         return
     if args.reading_data:
-        run_reading_concepts(
-            args.reading_data, steps=args.steps, batch=args.batch, d=args.d,
-            layers=args.layers, heads=args.heads,
-            text_encoder_arch=args.text_encoder_arch,
-            text_encoder_layers=args.text_encoder_layers,
-            latent_concept_slots=args.latent_concept_slots or 4,
-            latent_concept_layers=args.latent_concept_layers,
-            latent_concept_prefix=args.latent_concept_prefix,
-            latent_concept_refine=args.latent_concept_refine,
-            latent_concept_refine_gate_init=args.latent_concept_refine_gate_init,
-            lr=args.reading_lr, seed=args.seed, device=DEV,
-            log_every=max(1, args.steps if args.steps < args.batch else args.batch),
-            token_drop_p=args.reading_token_drop,
-            token_replace_p=args.reading_token_replace,
-            feature_dropout=args.reading_feature_dropout,
-            invariance_w=args.latent_concept_invariance_w,
-            variance_w=args.latent_concept_variance_w,
-            covariance_w=args.latent_concept_covariance_w,
-            variance_target=args.latent_concept_variance_target,
-            study_strategy=args.reading_study_strategy,
-            study_probe_n=args.reading_study_probe_n,
-            study_hard_max=args.reading_study_hard_max,
-            study_refresh_steps=args.reading_study_refresh_steps,
-            text_field=args.reading_text_field,
-            max_tokens=args.reading_max_tokens,
-            min_tokens=args.reading_min_tokens,
-            eval_frac=args.reading_eval_frac,
-            eval_n=args.reading_eval_n,
-            out=args.out,
-            checkpoint=args.checkpoint)
+        reading_log_every = max(1, args.steps if args.steps < args.batch else args.batch)
+        if args.reading_checkpoint:
+            study_reading_checkpoint(
+                args.reading_checkpoint, args.reading_data,
+                out_checkpoint=args.reading_out_checkpoint or args.checkpoint,
+                out=args.out, steps=args.steps, batch=args.batch,
+                lr=args.reading_lr, seed=args.seed, device=DEV,
+                log_every=reading_log_every,
+                token_drop_p=args.reading_token_drop,
+                token_replace_p=args.reading_token_replace,
+                feature_dropout=args.reading_feature_dropout,
+                invariance_w=args.latent_concept_invariance_w,
+                variance_w=args.latent_concept_variance_w,
+                covariance_w=args.latent_concept_covariance_w,
+                variance_target=args.latent_concept_variance_target,
+                study_strategy=args.reading_study_strategy,
+                study_probe_n=args.reading_study_probe_n,
+                study_hard_max=args.reading_study_hard_max,
+                study_refresh_steps=args.reading_study_refresh_steps,
+                text_field=args.reading_text_field,
+                max_tokens=args.reading_max_tokens,
+                min_tokens=args.reading_min_tokens,
+                eval_frac=args.reading_eval_frac,
+                eval_n=args.reading_eval_n,
+                latent_concept_slots=args.latent_concept_slots,
+                latent_concept_layers=(
+                    args.latent_concept_layers
+                    if args.latent_concept_slots else None),
+                latent_concept_prefix=(
+                    True if args.latent_concept_prefix else None),
+                latent_concept_refine=(
+                    True if args.latent_concept_refine else None),
+                latent_concept_refine_gate_init=(
+                    args.latent_concept_refine_gate_init
+                    if args.latent_concept_refine else None))
+        else:
+            run_reading_concepts(
+                args.reading_data, steps=args.steps, batch=args.batch, d=args.d,
+                layers=args.layers, heads=args.heads,
+                text_encoder_arch=args.text_encoder_arch,
+                text_encoder_layers=args.text_encoder_layers,
+                latent_concept_slots=args.latent_concept_slots or 4,
+                latent_concept_layers=args.latent_concept_layers,
+                latent_concept_prefix=args.latent_concept_prefix,
+                latent_concept_refine=args.latent_concept_refine,
+                latent_concept_refine_gate_init=args.latent_concept_refine_gate_init,
+                lr=args.reading_lr, seed=args.seed, device=DEV,
+                log_every=reading_log_every,
+                token_drop_p=args.reading_token_drop,
+                token_replace_p=args.reading_token_replace,
+                feature_dropout=args.reading_feature_dropout,
+                invariance_w=args.latent_concept_invariance_w,
+                variance_w=args.latent_concept_variance_w,
+                covariance_w=args.latent_concept_covariance_w,
+                variance_target=args.latent_concept_variance_target,
+                study_strategy=args.reading_study_strategy,
+                study_probe_n=args.reading_study_probe_n,
+                study_hard_max=args.reading_study_hard_max,
+                study_refresh_steps=args.reading_study_refresh_steps,
+                text_field=args.reading_text_field,
+                max_tokens=args.reading_max_tokens,
+                min_tokens=args.reading_min_tokens,
+                eval_frac=args.reading_eval_frac,
+                eval_n=args.reading_eval_n,
+                out=args.out,
+                checkpoint=args.checkpoint)
         return
     if not args.data:
         raise SystemExit("--data is required unless --selftest is set")
