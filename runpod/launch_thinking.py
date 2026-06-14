@@ -620,6 +620,11 @@ def apply_image_quality_preset(args):
         int(args.image_eval_generated_candidates_per_prompt), 4 if hq else 2)
     args.image_sample_candidates_per_prompt = max(
         int(args.image_sample_candidates_per_prompt), 4 if hq else 2)
+    if hq:
+        args.image_sample_selection_quality_w = max(
+            float(args.image_sample_selection_quality_w), 2.0)
+        args.image_sample_selection_health_w = max(
+            float(args.image_sample_selection_health_w), 1.0)
     args.image_sample_grid = True
     if not args.image_sample_manifest_out:
         args.image_sample_manifest_out = (
@@ -941,6 +946,15 @@ def payload(args):
                 prompt_grid_args += (
                     f" --sample-candidates-per-prompt "
                     f"{args.image_sample_candidates_per_prompt}")
+                prompt_grid_args += (
+                    f" --sample-selection-text-w "
+                    f"{args.image_sample_selection_text_w} "
+                    f"--sample-selection-feature-w "
+                    f"{args.image_sample_selection_feature_w} "
+                    f"--sample-selection-quality-w "
+                    f"{args.image_sample_selection_quality_w} "
+                    f"--sample-selection-health-w "
+                    f"{args.image_sample_selection_health_w}")
                 if int(args.image_sample_candidates_per_prompt) > 1:
                     prompt_grid_args += (
                         f" --cfg-scales {shlex_quote(args.image_cfg_sweep)} "
@@ -1101,6 +1115,14 @@ def payload(args):
                      f"{args.image_sample_pixel_dynamic_threshold_max} "
                      f"--eval-generated-candidates-per-prompt "
                      f"{args.image_eval_generated_candidates_per_prompt} "
+                     f"--sample-selection-text-w "
+                     f"{args.image_sample_selection_text_w} "
+                     f"--sample-selection-feature-w "
+                     f"{args.image_sample_selection_feature_w} "
+                     f"--sample-selection-quality-w "
+                     f"{args.image_sample_selection_quality_w} "
+                     f"--sample-selection-health-w "
+                     f"{args.image_sample_selection_health_w} "
                      f"--flow-consistency-w {args.image_flow_consistency_w} "
                      f"--flow-endpoint-w {args.image_flow_endpoint_w} "
                      f"--flow-frequency-w {args.image_flow_frequency_w} "
@@ -1221,6 +1243,14 @@ def payload(args):
                                  f"{args.image_eval_generated_samples} "
                                  f"--eval-generated-candidates-per-prompt "
                                  f"{args.image_eval_generated_candidates_per_prompt} "
+                                 f"--sample-selection-text-w "
+                                 f"{args.image_sample_selection_text_w} "
+                                 f"--sample-selection-feature-w "
+                                 f"{args.image_sample_selection_feature_w} "
+                                 f"--sample-selection-quality-w "
+                                 f"{args.image_sample_selection_quality_w} "
+                                 f"--sample-selection-health-w "
+                                 f"{args.image_sample_selection_health_w} "
                                  f"--eval-text-guidance-weights "
                                  f"{shlex_quote(args.image_eval_text_guidance_sweep)} "
                                  f"--eval-feature-guidance-weights "
@@ -2937,6 +2967,18 @@ def main():
                     dest="image_sample_candidates_per_prompt",
                     help=("number of candidates to draw per latent image sample prompt; "
                           "compatible aligners/quality scorers select the best candidate"))
+    ap.add_argument("--image-sample-selection-text-w", type=float, default=1.0,
+                    dest="image_sample_selection_text_w",
+                    help="latent prompt candidate-selection weight for text alignment")
+    ap.add_argument("--image-sample-selection-feature-w", type=float, default=1.0,
+                    dest="image_sample_selection_feature_w",
+                    help="latent prompt candidate-selection weight for feature alignment")
+    ap.add_argument("--image-sample-selection-quality-w", type=float, default=1.0,
+                    dest="image_sample_selection_quality_w",
+                    help="latent prompt candidate-selection weight for quality reward")
+    ap.add_argument("--image-sample-selection-health-w", type=float, default=1.0,
+                    dest="image_sample_selection_health_w",
+                    help="latent prompt candidate-selection weight for sample health")
     ap.add_argument("--image-sample-text-guidance-w", type=float, default=0.0,
                     dest="image_sample_text_guidance_w",
                     help=("sampling-time text-image alignment guidance weight for latent "
@@ -4112,6 +4154,11 @@ def main():
         sys.exit("ERROR: --image-sample-candidates-per-prompt must be positive")
     if args.image_sample_candidates_per_prompt > 1 and not args.image_sample_prompts:
         sys.exit("ERROR: --image-sample-candidates-per-prompt > 1 requires --image-sample-prompts")
+    if (args.image_sample_selection_text_w < 0.0
+            or args.image_sample_selection_feature_w < 0.0
+            or args.image_sample_selection_quality_w < 0.0
+            or args.image_sample_selection_health_w < 0.0):
+        sys.exit("ERROR: image sample selection weights must be non-negative")
     if args.image_sample_pixel_dynamic_threshold_percentile > 1.0:
         sys.exit(
             "ERROR: --image-sample-pixel-dynamic-threshold-percentile must be <= 1")

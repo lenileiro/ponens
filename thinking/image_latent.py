@@ -7863,10 +7863,42 @@ def write_sample_manifest(samples, manifest_path, captions, image_dir="", metada
 @torch.no_grad()
 def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1,
                              text_aligner=None, image_feature_aligner=None,
-                             prompt_features=None, quality_scorer=None):
+                             prompt_features=None, quality_scorer=None,
+                             selection_text_w=1.0, selection_feature_w=1.0,
+                             selection_quality_w=1.0, selection_health_w=1.0):
     candidates_per_prompt = int(candidates_per_prompt)
     if candidates_per_prompt <= 0:
         raise ValueError("candidates_per_prompt must be positive")
+    scorer_labels = {
+        "text_aligner": "text_aligner_cosine",
+        "image_feature_aligner": "image_feature_aligner_cosine",
+        "quality_scorer": "quality_scorer_score",
+        "sample_health": "sample_health_v2",
+    }
+
+    def selection_weight(value, name):
+        value = float(value)
+        if value < 0.0:
+            raise ValueError(f"{name} must be non-negative")
+        return value
+
+    selection_weights = {
+        "text_aligner": selection_weight(
+            selection_text_w, "selection_text_w"),
+        "image_feature_aligner": selection_weight(
+            selection_feature_w, "selection_feature_w"),
+        "quality_scorer": selection_weight(
+            selection_quality_w, "selection_quality_w"),
+        "sample_health": selection_weight(
+            selection_health_w, "selection_health_w"),
+    }
+
+    def label_weights(weights):
+        return {
+            scorer_labels.get(name, name): float(weight)
+            for name, weight in weights.items()
+        }
+
     n = len(prompts)
     expected = n * candidates_per_prompt
     if int(samples.shape[0]) != expected:
@@ -7877,6 +7909,7 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
         "sample_grid_candidates_per_prompt": candidates_per_prompt,
         "sample_grid_selection_scorer": "none",
         "sample_grid_selected_candidate_indices": [0 for _ in range(n)],
+        "sample_grid_selection_configured_weights": label_weights(selection_weights),
     }
     if candidates_per_prompt == 1:
         return samples, meta
@@ -7897,12 +7930,13 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
     z = None
     health_scores = sample_candidate_health_scores(samples).reshape(
         n, candidates_per_prompt)
-    if text_aligner is not None:
+    if text_aligner is not None and selection_weights["text_aligner"] > 0.0:
         text_aligner.eval()
         z = ae.encode(samples)
         img_emb, txt_emb = text_aligner(z, cond)
         scorers.append(("text_aligner", (img_emb.float() * txt_emb.float()).sum(dim=-1)))
-    if image_feature_aligner is not None and prompt_features is not None:
+    if (image_feature_aligner is not None and prompt_features is not None
+            and selection_weights["image_feature_aligner"] > 0.0):
         feature_dim = int(getattr(image_feature_aligner, "feature_dim", 0) or 0)
         feature_rows = pool_embedding_sequence(prompt_features).to(device=samples.device)
         if int(feature_rows.shape[-1]) == feature_dim:
@@ -7920,12 +7954,16 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
                 f"prompt feature dim {int(feature_rows.shape[-1])} != "
                 f"image feature dim {feature_dim}"
             )
-    if quality_scorer is not None:
+    if quality_scorer is not None and selection_weights["quality_scorer"] > 0.0:
         quality_scorer.eval()
         if z is None:
             z = ae.encode(samples)
         scorers.append(("quality_scorer", quality_scorer.score(z).float()))
     if not scorers:
+        health_weight = selection_weights["sample_health"]
+        if health_weight <= 0.0:
+            health_weight = 1.0
+            meta["sample_grid_selection_weight_fallback"] = "sample_health_v2"
         scores = health_scores
         best = scores.argmax(dim=1)
         base = torch.arange(n, device=samples.device) * candidates_per_prompt
@@ -7934,6 +7972,11 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
         best_scores = scores.gather(1, best[:, None]).squeeze(1)
         meta.update({
             "sample_grid_selection_scorer": "sample_health_v2",
+            "sample_grid_selection_component_count": 1,
+            "sample_grid_selection_component_weight_total": float(health_weight),
+            "sample_grid_selection_component_weights": {
+                "sample_health_v2": float(health_weight),
+            },
             "sample_grid_selected_candidate_indices": [
                 int(x) for x in best.detach().cpu().tolist()
             ],
@@ -7951,27 +7994,38 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
         })
         return chosen.contiguous(), meta
     component_scores = [
-        (name, normalize_candidate_scores(score))
+        (name, normalize_candidate_scores(score), selection_weights[name])
         for name, score in scorers
+        if selection_weights[name] > 0.0
     ]
-    component_scores.append(("sample_health", normalize_candidate_scores(health_scores)))
-    scores = torch.stack([score for _name, score in component_scores], dim=0).mean(dim=0)
+    if selection_weights["sample_health"] > 0.0:
+        component_scores.append((
+            "sample_health",
+            normalize_candidate_scores(health_scores),
+            selection_weights["sample_health"],
+        ))
+    if not component_scores:
+        component_scores.append((
+            "sample_health", normalize_candidate_scores(health_scores), 1.0))
+        meta["sample_grid_selection_weight_fallback"] = "sample_health_v2"
+    total_weight = sum(weight for _name, _score, weight in component_scores)
+    scores = sum(
+        score * float(weight) for _name, score, weight in component_scores
+    ) / max(float(total_weight), 1.0e-8)
     best = scores.argmax(dim=1)
     base = torch.arange(n, device=samples.device) * candidates_per_prompt
     selected = base + best.to(device=samples.device)
     chosen = samples.index_select(0, selected)
     best_scores = scores.gather(1, best[:, None]).squeeze(1)
-    scorer_labels = {
-        "text_aligner": "text_aligner_cosine",
-        "image_feature_aligner": "image_feature_aligner_cosine",
-        "quality_scorer": "quality_scorer_score",
-        "sample_health": "sample_health_v2",
-    }
     selection_meta = {
         "sample_grid_selection_scorer": "+".join(
-            scorer_labels.get(name, name) for name, _score in component_scores
+            scorer_labels.get(name, name) for name, _score, _weight in component_scores
         ),
         "sample_grid_selection_component_count": int(len(component_scores)),
+        "sample_grid_selection_component_weight_total": float(total_weight),
+        "sample_grid_selection_component_weights": label_weights({
+            name: weight for name, _score, weight in component_scores
+        }),
         "sample_grid_selected_candidate_indices": [
             int(x) for x in best.detach().cpu().tolist()
         ],
@@ -7987,8 +8041,9 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
         "sample_grid_selection_candidate_health_max": float(
             health_scores.max().detach().cpu()),
     }
-    for name, score in component_scores:
+    for name, score, weight in component_scores:
         selected_scores = score.gather(1, best[:, None]).squeeze(1)
+        selection_meta[f"sample_grid_selection_{name}_weight"] = float(weight)
         selection_meta[f"sample_grid_selection_{name}_mean"] = float(
             selected_scores.mean().detach().cpu())
         selection_meta[f"sample_grid_selection_{name}_min"] = float(
@@ -8193,6 +8248,10 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                                  prompt_embed_text_sequence_model="",
                                  prompt_embed_text_sequence_max_length=0,
                                  negative_prompts=(), candidates_per_prompt=1,
+                                 sample_selection_text_w=1.0,
+                                 sample_selection_feature_w=1.0,
+                                 sample_selection_quality_w=1.0,
+                                 sample_selection_health_w=1.0,
                                  text_guidance_w=0.0,
                                  text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                                  feature_guidance_w=0.0,
@@ -8325,7 +8384,11 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         ae, candidate_sample, sample_text_only_cond, prompts,
         candidates_per_prompt=candidates_per_prompt,
         text_aligner=text_aligner, image_feature_aligner=image_feature_aligner,
-        prompt_features=prompt_features, quality_scorer=quality_scorer)
+        prompt_features=prompt_features, quality_scorer=quality_scorer,
+        selection_text_w=sample_selection_text_w,
+        selection_feature_w=sample_selection_feature_w,
+        selection_quality_w=sample_selection_quality_w,
+        selection_health_w=sample_selection_health_w)
     n = len(prompts)
     cols = int(np.ceil(np.sqrt(n)))
     rows = int(np.ceil(n / cols))
@@ -8394,6 +8457,10 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         "sample_grid_seed": int(seed),
         "sample_grid_prompt_count": int(n),
         "sample_grid_prompts": list(prompts[:min(8, len(prompts))]),
+        "sample_grid_selection_text_w": float(sample_selection_text_w),
+        "sample_grid_selection_feature_w": float(sample_selection_feature_w),
+        "sample_grid_selection_quality_w": float(sample_selection_quality_w),
+        "sample_grid_selection_health_w": float(sample_selection_health_w),
         "sample_grid_prompt_embed_backend": (
             prompt_embed_backend if caption_cond_source == "embedding" else ""
         ),
@@ -8602,6 +8669,10 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                            quality_guidance_w=0.0,
                            quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                            generated_eval_n=0, generated_eval_candidates_per_prompt=1,
+                           sample_selection_text_w=1.0,
+                           sample_selection_feature_w=1.0,
+                           sample_selection_quality_w=1.0,
+                           sample_selection_health_w=1.0,
                            sample_finite_guard=False, sample_velocity_clip=0.0,
                            sample_latent_clip=0.0, cfg_mode="standard"):
     rng = np.random.default_rng(seed)
@@ -8627,6 +8698,14 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
     generated_eval_candidates_per_prompt = int(generated_eval_candidates_per_prompt)
     if generated_eval_candidates_per_prompt <= 0:
         raise ValueError("generated_eval_candidates_per_prompt must be positive")
+    sample_selection_text_w = float(sample_selection_text_w)
+    sample_selection_feature_w = float(sample_selection_feature_w)
+    sample_selection_quality_w = float(sample_selection_quality_w)
+    sample_selection_health_w = float(sample_selection_health_w)
+    if (sample_selection_text_w < 0.0 or sample_selection_feature_w < 0.0
+            or sample_selection_quality_w < 0.0
+            or sample_selection_health_w < 0.0):
+        raise ValueError("sample selection weights must be non-negative")
     if text_guidance_w < 0.0:
         raise ValueError("text_guidance_w must be non-negative")
     if text_guidance_w > 0.0 and text_aligner is None:
@@ -8773,7 +8852,11 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
             ae, chunk_sample, chunk_text_sample_cond, chunk_captions,
             candidates_per_prompt=generated_eval_candidates_per_prompt,
             text_aligner=text_aligner, image_feature_aligner=image_feature_aligner,
-            prompt_features=chunk_text_features, quality_scorer=image_quality_scorer)
+            prompt_features=chunk_text_features, quality_scorer=image_quality_scorer,
+            selection_text_w=sample_selection_text_w,
+            selection_feature_w=sample_selection_feature_w,
+            selection_quality_w=sample_selection_quality_w,
+            selection_health_w=sample_selection_health_w)
         sample_parts.append(chunk_sample)
         sample_trace = merge_sample_traces(sample_trace, chunk_trace)
         sample_x_parts.append(chunk_x)
@@ -8825,6 +8908,10 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         "generated_eval_raw_candidates": int(
             sample.shape[0] * generated_eval_candidates_per_prompt),
         "generated_eval_selection_scorer": selection_scorer,
+        "generated_eval_selection_text_w": float(sample_selection_text_w),
+        "generated_eval_selection_feature_w": float(sample_selection_feature_w),
+        "generated_eval_selection_quality_w": float(sample_selection_quality_w),
+        "generated_eval_selection_health_w": float(sample_selection_health_w),
         "generated_eval_selection_component_count": int(selection_component_count),
         "generated_eval_selected_candidate_indices": selected_candidate_indices,
         "generated_eval_selection_score_mean": (
@@ -9545,6 +9632,10 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                        quality_guidance_weights=(0.0,),
                        quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                        generated_eval_n=0, generated_eval_candidates_per_prompt=1,
+                       sample_selection_text_w=1.0,
+                       sample_selection_feature_w=1.0,
+                       sample_selection_quality_w=1.0,
+                       sample_selection_health_w=1.0,
                        sample_finite_guard=False, sample_velocity_clip=0.0,
                        sample_latent_clip=0.0):
     if sample_methods is None:
@@ -9574,6 +9665,14 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
     generated_eval_candidates_per_prompt = int(generated_eval_candidates_per_prompt)
     if generated_eval_candidates_per_prompt <= 0:
         raise ValueError("generated_eval_candidates_per_prompt must be positive")
+    sample_selection_text_w = float(sample_selection_text_w)
+    sample_selection_feature_w = float(sample_selection_feature_w)
+    sample_selection_quality_w = float(sample_selection_quality_w)
+    sample_selection_health_w = float(sample_selection_health_w)
+    if (sample_selection_text_w < 0.0 or sample_selection_feature_w < 0.0
+            or sample_selection_quality_w < 0.0
+            or sample_selection_health_w < 0.0):
+        raise ValueError("sample selection weights must be non-negative")
     rows = []
     for cfg_scale in cfg_scales:
         for cfg_rescale in cfg_rescales:
@@ -9619,6 +9718,14 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                                                     generated_eval_n=generated_eval_n,
                                                     generated_eval_candidates_per_prompt=(
                                                         generated_eval_candidates_per_prompt),
+                                                    sample_selection_text_w=(
+                                                        sample_selection_text_w),
+                                                    sample_selection_feature_w=(
+                                                        sample_selection_feature_w),
+                                                    sample_selection_quality_w=(
+                                                        sample_selection_quality_w),
+                                                    sample_selection_health_w=(
+                                                        sample_selection_health_w),
                                                     sample_finite_guard=sample_finite_guard,
                                                     sample_velocity_clip=sample_velocity_clip,
                                                     sample_latent_clip=sample_latent_clip)
@@ -9643,6 +9750,14 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                                                     f"text={float(text_w):g};"
                                                     f"feature={float(feature_w):g};"
                                                     f"quality={float(quality_w):g};"
+                                                    f"select_text="
+                                                    f"{float(sample_selection_text_w):g};"
+                                                    f"select_feature="
+                                                    f"{float(sample_selection_feature_w):g};"
+                                                    f"select_quality="
+                                                    f"{float(sample_selection_quality_w):g};"
+                                                    f"select_health="
+                                                    f"{float(sample_selection_health_w):g};"
                                                     f"cfgint={format_interval(cfg_interval)};"
                                                     f"textint="
                                                     f"{format_interval(text_guidance_interval)};"
@@ -10044,6 +10159,10 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         eval_image_min_aesthetic=None, eval_image_max_records=0,
                         sample_time_shift=None, generated_eval_n=0,
                         generated_eval_candidates_per_prompt=1,
+                        sample_selection_text_w=1.0,
+                        sample_selection_feature_w=1.0,
+                        sample_selection_quality_w=1.0,
+                        sample_selection_health_w=1.0,
                         sample_finite_guard=False, sample_velocity_clip=0.0,
                         sample_latent_clip=0.0):
     if weight_mode is None:
@@ -10072,12 +10191,20 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
         sample_churn_interval, name="sample_churn_interval")
     generated_eval_n = int(generated_eval_n)
     generated_eval_candidates_per_prompt = int(generated_eval_candidates_per_prompt)
+    sample_selection_text_w = float(sample_selection_text_w)
+    sample_selection_feature_w = float(sample_selection_feature_w)
+    sample_selection_quality_w = float(sample_selection_quality_w)
+    sample_selection_health_w = float(sample_selection_health_w)
     if any(w < 0.0 for w in text_guidance_weights):
         raise ValueError("text guidance weights must be non-negative")
     if any(w < 0.0 for w in feature_guidance_weights):
         raise ValueError("feature guidance weights must be non-negative")
     if any(w < 0.0 for w in quality_guidance_weights):
         raise ValueError("quality guidance weights must be non-negative")
+    if (sample_selection_text_w < 0.0 or sample_selection_feature_w < 0.0
+            or sample_selection_quality_w < 0.0
+            or sample_selection_health_w < 0.0):
+        raise ValueError("sample selection weights must be non-negative")
     if generated_eval_n < 0:
         raise ValueError("generated_eval_n must be non-negative")
     if generated_eval_candidates_per_prompt <= 0:
@@ -10143,6 +10270,10 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                     generated_eval_n=generated_eval_n,
                     generated_eval_candidates_per_prompt=(
                         generated_eval_candidates_per_prompt),
+                    sample_selection_text_w=sample_selection_text_w,
+                    sample_selection_feature_w=sample_selection_feature_w,
+                    sample_selection_quality_w=sample_selection_quality_w,
+                    sample_selection_health_w=sample_selection_health_w,
                     sample_finite_guard=sample_finite_guard,
                     sample_velocity_clip=sample_velocity_clip,
                     sample_latent_clip=sample_latent_clip):
@@ -10353,6 +10484,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       flow_ema_decay=0.0, flow_ema_warmup=True, eval_with_ema=True,
                       eval_weight_mode="auto",
                       eval_generated_candidates_per_prompt=1,
+                      sample_selection_text_w=1.0,
+                      sample_selection_feature_w=1.0,
+                      sample_selection_quality_w=1.0,
+                      sample_selection_health_w=1.0,
                       train_precision="fp32", ae_accum_steps=1, flow_accum_steps=1,
                       grad_clip=0.0,
                       flow_cache_latents=False, flow_cache_records=0, flow_cache_batch=64,
@@ -10659,6 +10794,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     eval_generated_candidates_per_prompt = int(eval_generated_candidates_per_prompt)
     if eval_generated_candidates_per_prompt <= 0:
         raise ValueError("eval_generated_candidates_per_prompt must be positive")
+    sample_selection_text_w = float(sample_selection_text_w)
+    sample_selection_feature_w = float(sample_selection_feature_w)
+    sample_selection_quality_w = float(sample_selection_quality_w)
+    sample_selection_health_w = float(sample_selection_health_w)
+    if (sample_selection_text_w < 0.0 or sample_selection_feature_w < 0.0
+            or sample_selection_quality_w < 0.0
+            or sample_selection_health_w < 0.0):
+        raise ValueError("sample selection weights must be non-negative")
     cfg_interval = validate_guidance_interval(cfg_interval, name="cfg_interval")
     if dit_head_width_mult <= 0:
         raise ValueError("dit_head_width_mult must be positive")
@@ -11682,6 +11825,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             sample_churn_interval=sample_churn_interval,
             generated_eval_candidates_per_prompt=(
                 eval_generated_candidates_per_prompt),
+            sample_selection_text_w=sample_selection_text_w,
+            sample_selection_feature_w=sample_selection_feature_w,
+            sample_selection_quality_w=sample_selection_quality_w,
+            sample_selection_health_w=sample_selection_health_w,
             sample_finite_guard=sample_finite_guard,
             sample_velocity_clip=sample_velocity_clip,
             sample_latent_clip=sample_latent_clip)
@@ -11934,6 +12081,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "eval_with_ema": selected_eval_weights == "ema",
         "eval_generated_candidates_per_prompt": int(
             eval_generated_candidates_per_prompt),
+        "sample_selection_text_w": float(sample_selection_text_w),
+        "sample_selection_feature_w": float(sample_selection_feature_w),
+        "sample_selection_quality_w": float(sample_selection_quality_w),
+        "sample_selection_health_w": float(sample_selection_health_w),
         "weight_eval_candidates": {
             mode: eval_report_summary(candidate)
             for mode, candidate in candidate_reports.items()
@@ -12307,12 +12458,23 @@ def selftest():
         assert tuple(selected_pixels.shape) == (2, 3, 16, 16)
         assert "sample_health_v2" in selected_meta["sample_grid_selection_scorer"]
         assert selected_meta["sample_grid_selection_component_count"] == 2
+        assert selected_meta["sample_grid_selection_component_weights"][
+            "quality_scorer_score"] == 1.0
+        assert selected_meta["sample_grid_selection_component_weights"][
+            "sample_health_v2"] == 1.0
         assert len(selected_meta["sample_grid_selection_scores"]) == 2
         assert len(selected_meta["sample_grid_selection_health_scores"][0]) == 2
         for prompt_idx, chosen_idx in enumerate(
                 selected_meta["sample_grid_selected_candidate_indices"]):
             health_row = selected_meta["sample_grid_selection_health_scores"][prompt_idx]
             assert health_row[int(chosen_idx)] == max(health_row)
+        _health_only_pixels, health_only_meta = select_prompt_candidates(
+            _IdentityAE(), candidate_pixels, None, ("prompt a", "prompt b"),
+            candidates_per_prompt=2, quality_scorer=_FlatQualityScorer(),
+            selection_quality_w=0.0, selection_health_w=1.0)
+        assert health_only_meta["sample_grid_selection_component_count"] == 1
+        assert health_only_meta["sample_grid_selection_component_weights"][
+            "sample_health_v2"] == 1.0
         structure_aligner = FlowFeatureAligner(
             hidden_dim=6, feature_dim=3, hidden=8, embed_dim=4)
         structure_loss, structure_parts = flow_hidden_feature_structure_loss(
@@ -12525,11 +12687,14 @@ def selftest():
             reload_sample_path, size=16, device="cpu", conditioner=loaded_cond,
             prompt_vocab=loaded_vocab, caption_max_len=8, cfg_scale=1.0,
             sample_steps=1, sample_method="euler", candidates_per_prompt=2,
+            sample_selection_quality_w=2.0, sample_selection_health_w=1.0,
             sample_candidates_manifest_out=reload_candidates_path,
             sample_manifest_out=reload_selected_path, candidate_seeds=(3, 5))
         assert reload_meta["sample_grid_cond_mode"] == "prompt"
         assert reload_meta["sample_grid_prompt_count"] == 1
         assert "sample_health_v2" in reload_meta["sample_grid_selection_scorer"]
+        assert reload_meta["sample_grid_selection_quality_w"] == 2.0
+        assert reload_meta["sample_grid_selection_health_w"] == 1.0
         assert len(reload_meta["sample_grid_selection_scores"][0]) == 2
         with open(reload_candidates_path, encoding="utf-8") as f:
             candidate_rows = [json.loads(line) for line in f if line.strip()]
@@ -13164,6 +13329,18 @@ def main(argv=None):
                     dest="sample_candidates_per_prompt",
                     help=("number of candidates to draw per sample prompt; compatible "
                           "aligners/quality scorers select the best candidate"))
+    ap.add_argument("--sample-selection-text-w", type=float, default=1.0,
+                    dest="sample_selection_text_w",
+                    help="candidate-selection weight for checkpoint text aligner score")
+    ap.add_argument("--sample-selection-feature-w", type=float, default=1.0,
+                    dest="sample_selection_feature_w",
+                    help="candidate-selection weight for external feature aligner score")
+    ap.add_argument("--sample-selection-quality-w", type=float, default=1.0,
+                    dest="sample_selection_quality_w",
+                    help="candidate-selection weight for checkpoint image quality score")
+    ap.add_argument("--sample-selection-health-w", type=float, default=1.0,
+                    dest="sample_selection_health_w",
+                    help="candidate-selection weight for sample health guardrail score")
     ap.add_argument("--sample-text-guidance-w", type=float, default=0.0,
                     dest="sample_text_guidance_w",
                     help=("sampling-time text-image alignment guidance weight for "
@@ -13322,6 +13499,11 @@ def main(argv=None):
         ap.error("--sample-candidates-per-prompt must be positive")
     if args.sample_candidates_per_prompt > 1 and not sample_prompts:
         ap.error("--sample-candidates-per-prompt > 1 requires --sample-prompts")
+    if (args.sample_selection_text_w < 0.0
+            or args.sample_selection_feature_w < 0.0
+            or args.sample_selection_quality_w < 0.0
+            or args.sample_selection_health_w < 0.0):
+        ap.error("sample selection weights must be non-negative")
     if args.eval_generated_samples < 0:
         ap.error("--eval-generated-samples must be non-negative")
     if args.eval_generated_candidates_per_prompt <= 0:
@@ -13542,6 +13724,10 @@ def main(argv=None):
             generated_eval_n=args.eval_generated_samples,
             generated_eval_candidates_per_prompt=(
                 args.eval_generated_candidates_per_prompt),
+            sample_selection_text_w=args.sample_selection_text_w,
+            sample_selection_feature_w=args.sample_selection_feature_w,
+            sample_selection_quality_w=args.sample_selection_quality_w,
+            sample_selection_health_w=args.sample_selection_health_w,
             sample_finite_guard=args.sample_finite_guard,
             sample_velocity_clip=args.sample_velocity_clip,
             sample_latent_clip=args.sample_latent_clip,
@@ -13603,6 +13789,10 @@ def main(argv=None):
                     prompt_embed_trust_remote_code=args.prompt_embed_trust_remote_code,
                     negative_prompts=sample_negative_prompts,
                     candidates_per_prompt=args.sample_candidates_per_prompt,
+                    sample_selection_text_w=args.sample_selection_text_w,
+                    sample_selection_feature_w=args.sample_selection_feature_w,
+                    sample_selection_quality_w=args.sample_selection_quality_w,
+                    sample_selection_health_w=args.sample_selection_health_w,
                     text_guidance_w=args.sample_text_guidance_w,
                     text_guidance_interval=sample_text_guidance_interval,
                     feature_guidance_w=args.sample_feature_guidance_w,
@@ -13824,6 +14014,10 @@ def main(argv=None):
         eval_with_ema=args.ema_eval_mode != "raw",
         eval_weight_mode=args.ema_eval_mode,
         eval_generated_candidates_per_prompt=args.eval_generated_candidates_per_prompt,
+        sample_selection_text_w=args.sample_selection_text_w,
+        sample_selection_feature_w=args.sample_selection_feature_w,
+        sample_selection_quality_w=args.sample_selection_quality_w,
+        sample_selection_health_w=args.sample_selection_health_w,
         train_precision=args.train_precision,
         ae_accum_steps=args.ae_accum_steps,
         flow_accum_steps=args.flow_accum_steps,
@@ -13893,6 +14087,10 @@ def main(argv=None):
                 prompt_embed_trust_remote_code=args.prompt_embed_trust_remote_code,
                 negative_prompts=sample_negative_prompts,
                 candidates_per_prompt=args.sample_candidates_per_prompt,
+                sample_selection_text_w=args.sample_selection_text_w,
+                sample_selection_feature_w=args.sample_selection_feature_w,
+                sample_selection_quality_w=args.sample_selection_quality_w,
+                sample_selection_health_w=args.sample_selection_health_w,
                 text_guidance_w=args.sample_text_guidance_w,
                 text_guidance_interval=sample_text_guidance_interval,
                 feature_guidance_w=args.sample_feature_guidance_w,
@@ -14154,6 +14352,10 @@ def main(argv=None):
         "sample_schedule": args.sample_schedule,
         "sample_churn": args.sample_churn,
         "sample_churn_interval": list(sample_churn_interval),
+        "sample_selection_text_w": args.sample_selection_text_w,
+        "sample_selection_feature_w": args.sample_selection_feature_w,
+        "sample_selection_quality_w": args.sample_selection_quality_w,
+        "sample_selection_health_w": args.sample_selection_health_w,
         "sample_finite_guard": args.sample_finite_guard,
         "sample_velocity_clip": args.sample_velocity_clip,
         "sample_latent_clip": args.sample_latent_clip,
