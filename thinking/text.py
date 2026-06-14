@@ -1969,6 +1969,31 @@ def reading_context_target_loss(model, txt, pad, context_keep_p=0.5,
     return F.cross_entropy(logits, labels)
 
 
+def reading_teacher_latent_consistency_loss(model, teacher_model, records, vocab,
+                                            teacher_vocab, device=DEV,
+                                            feature_dropout=0.0):
+    if (teacher_model is None or teacher_vocab is None
+            or getattr(model, "latent_concepts", None) is None
+            or getattr(teacher_model, "latent_concepts", None) is None):
+        dev = next(model.parameters()).device
+        return torch.tensor(0.0, device=dev)
+    if not records:
+        dev = next(model.parameters()).device
+        return torch.tensor(0.0, device=dev)
+    student_txt = pack_reading(records, vocab, device)
+    teacher_txt = pack_reading(records, teacher_vocab, device)
+    student = model.latent_concept_states(
+        student_txt, feature_dropout=feature_dropout, project=True)
+    with torch.no_grad():
+        teacher_model.eval()
+        teacher = teacher_model.latent_concept_states(teacher_txt, project=True)
+    if student is None or teacher is None or tuple(student.shape) != tuple(teacher.shape):
+        return student_txt.float().sum() * 0.0
+    student = F.normalize(student.reshape(student.shape[0], -1), dim=-1)
+    teacher = F.normalize(teacher.reshape(teacher.shape[0], -1), dim=-1)
+    return (1.0 - (student * teacher).sum(-1)).mean()
+
+
 def _reading_latent_pair_embeddings(model, txt, vocab, seed=0, token_drop_p=0.15,
                                     token_replace_p=0.05):
     torch.manual_seed(int(seed))
@@ -4453,11 +4478,16 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
                          study_strategy="errors", study_probe_n=0,
-                         study_hard_max=0, study_refresh_steps=0):
+                         study_hard_max=0, study_refresh_steps=0,
+                         replay_records=None, replay_teacher_model=None,
+                         replay_teacher_vocab=None, replay_w=0.0,
+                         replay_batch=0):
     if getattr(model, "latent_concepts", None) is None:
         raise ValueError("raw reading concept training requires latent concept slots")
     if float(context_target_w) < 0.0:
         raise ValueError("reading context-target loss weight must be non-negative")
+    if float(replay_w) < 0.0:
+        raise ValueError("reading replay loss weight must be non-negative")
     study_strategy = str(study_strategy)
     if study_strategy not in ("random", "errors"):
         raise ValueError(f"unknown reading study strategy {study_strategy!r}")
@@ -4466,11 +4496,25 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     train_records = [r for r in records if r.split == "train"]
     if not train_records:
         raise ValueError("cannot train reading concepts without train records")
+    replay_records = list(replay_records or [])
+    replay_sources = [r for r in replay_records if r.split == "train"] or replay_records
+    if replay_w and (not replay_sources or replay_teacher_model is None
+                     or replay_teacher_vocab is None):
+        raise ValueError("reading replay loss requires replay records and teacher checkpoint")
+    if replay_teacher_model is not None:
+        replay_teacher_model.eval()
+        for param in replay_teacher_model.parameters():
+            param.requires_grad_(False)
+    replay_batch = int(replay_batch)
+    if replay_batch < 0:
+        raise ValueError("reading replay batch must be non-negative")
+    replay_batch = replay_batch or max(1, batch // 2)
     study_pool = []
     study_reports = []
     last_loss = 0.0
     last_view_loss = 0.0
     last_context_target = 0.0
+    last_replay = 0.0
 
     def refresh_study_pool(step):
         nonlocal study_pool
@@ -4512,22 +4556,36 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 feature_dropout=feature_dropout,
                 temperature=context_target_temperature)
             if context_target_w else view_loss * 0.0)
-        loss = view_loss + float(context_target_w) * context_target
+        replay_loss = view_loss * 0.0
+        if replay_w and replay_sources:
+            replay_batch_records = batch_records(replay_sources, rng, replay_batch)
+            replay_loss = reading_teacher_latent_consistency_loss(
+                model, replay_teacher_model, replay_batch_records, vocab,
+                replay_teacher_vocab, device=device,
+                feature_dropout=feature_dropout)
+        loss = (view_loss + float(context_target_w) * context_target
+                + float(replay_w) * replay_loss)
         opt.zero_grad()
         loss.backward()
         opt.step()
         last_loss = float(loss.detach())
         last_view_loss = float(view_loss.detach())
         last_context_target = float(context_target.detach())
+        last_replay = float(replay_loss.detach())
         if st % log_every == 0 or st == steps:
             print(f"  reading {st}/{steps} loss {last_loss:.3f} "
                   f"view {last_view_loss:.3f} "
-                  f"context-target {last_context_target:.3f}",
+                  f"context-target {last_context_target:.3f} "
+                  f"replay {last_replay:.3f}",
                   flush=True)
     model.reading_train_metrics = {
         "loss": last_loss,
         "latent_view_loss": last_view_loss,
         "context_target_loss": last_context_target,
+        "replay_loss": last_replay,
+        "replay_w": float(replay_w),
+        "replay_batch": int(replay_batch),
+        "replay_records": len(replay_sources),
         "context_target_w": float(context_target_w),
         "context_keep_p": float(context_keep_p),
         "context_target_temperature": float(context_target_temperature),
@@ -4561,6 +4619,9 @@ def fit_reading_concepts_select_best(
         context_target_temperature=0.1,
         study_strategy="errors", study_probe_n=0,
         study_hard_max=0, study_refresh_steps=0,
+        replay_records=None, replay_teacher_model=None,
+        replay_teacher_vocab=None, replay_w=0.0, replay_batch=0,
+        replay_retention_w=0.0,
         eval_n=64, score_metric="both", score_margin_w=0.1,
         rounds=1, before_bundle=None):
     schedule = _step_schedule(steps, rounds)
@@ -4571,16 +4632,46 @@ def fit_reading_concepts_select_best(
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=score_metric,
         score_margin_w=score_margin_w)
+    replay_records = list(replay_records or [])
+    before_replay_bundle = None
+    if replay_records and replay_retention_w:
+        before_replay_bundle = reading_eval_bundle(
+            model, vocab, replay_records, device=device, eval_n=eval_n,
+            seed=seed + 4093, token_drop_p=token_drop_p,
+            token_replace_p=token_replace_p, context_keep_p=context_keep_p,
+            score_metric=score_metric, score_margin_w=score_margin_w)
+
+    def selection_row(round_id, round_steps, bundle, replay_bundle=None):
+        base_score = float(bundle["score_components"]["score"])
+        replay_score = None
+        replay_drop = 0.0
+        penalty = 0.0
+        if before_replay_bundle is not None and replay_bundle is not None:
+            replay_score = float(replay_bundle["score_components"]["score"])
+            replay_before = float(before_replay_bundle["score_components"]["score"])
+            replay_drop = max(0.0, replay_before - replay_score)
+            penalty = float(replay_retention_w) * replay_drop
+        return {
+            "round": int(round_id),
+            "steps": int(round_steps),
+            "selected": False,
+            "score": float(base_score - penalty),
+            "base_score": base_score,
+            "retention_penalty": float(penalty),
+            "replay_retention_drop": float(replay_drop),
+            "score_components": bundle["score_components"],
+            "replay_score": replay_score,
+            "replay_score_components": (
+                replay_bundle["score_components"] if replay_bundle is not None else None),
+        }
+
     best_state = _model_state_copy(model)
-    best_score = float(before_bundle["score_components"]["score"])
+    initial_replay_bundle = before_replay_bundle
+    initial_row = selection_row(0, 0, before_bundle, initial_replay_bundle)
+    best_score = float(initial_row["score"])
     best_round = 0
     best_metrics = dict(getattr(model, "reading_train_metrics", {}))
-    rounds_report = [{
-        "round": 0,
-        "steps": 0,
-        "selected": True,
-        "score_components": before_bundle["score_components"],
-    }]
+    rounds_report = [initial_row]
     all_study_reports = []
     for round_i, round_steps in enumerate(schedule, start=1):
         fit_reading_concepts(
@@ -4594,7 +4685,11 @@ def fit_reading_concepts_select_best(
             context_target_temperature=context_target_temperature,
             study_strategy=study_strategy, study_probe_n=study_probe_n,
             study_hard_max=study_hard_max,
-            study_refresh_steps=study_refresh_steps)
+            study_refresh_steps=study_refresh_steps,
+            replay_records=replay_records,
+            replay_teacher_model=replay_teacher_model,
+            replay_teacher_vocab=replay_teacher_vocab,
+            replay_w=replay_w, replay_batch=replay_batch)
         all_study_reports.extend(
             report | {"round": int(round_i)}
             for report in getattr(model, "reading_study_reports", []))
@@ -4603,14 +4698,17 @@ def fit_reading_concepts_select_best(
             token_drop_p=token_drop_p, token_replace_p=token_replace_p,
             context_keep_p=context_keep_p, score_metric=score_metric,
             score_margin_w=score_margin_w)
-        score = float(bundle["score_components"]["score"])
+        replay_bundle = None
+        if before_replay_bundle is not None:
+            replay_bundle = reading_eval_bundle(
+                model, vocab, replay_records, device=device, eval_n=eval_n,
+                seed=seed + 4093, token_drop_p=token_drop_p,
+                token_replace_p=token_replace_p, context_keep_p=context_keep_p,
+                score_metric=score_metric, score_margin_w=score_margin_w)
+        row = selection_row(round_i, round_steps, bundle, replay_bundle)
+        score = float(row["score"])
         selected = score > best_score
-        rounds_report.append({
-            "round": int(round_i),
-            "steps": int(round_steps),
-            "selected": bool(selected),
-            "score_components": bundle["score_components"],
-        })
+        rounds_report.append(row | {"selected": bool(selected)})
         if selected:
             best_score = score
             best_round = round_i
@@ -4625,9 +4723,14 @@ def fit_reading_concepts_select_best(
         "rounds_run": len(schedule),
         "score_metric": score_metric,
         "score_margin_w": float(score_margin_w),
+        "replay_retention_w": float(replay_retention_w),
         "selected_round": int(best_round),
         "selected_score": float(best_score),
-        "before_score": float(before_bundle["score_components"]["score"]),
+        "before_score": float(initial_row["score"]),
+        "before_base_score": float(initial_row["base_score"]),
+        "before_replay_score": (
+            float(before_replay_bundle["score_components"]["score"])
+            if before_replay_bundle is not None else None),
         "rounds": rounds_report,
     }
     best_metrics = best_metrics | {"selection": selection}
@@ -4866,6 +4969,7 @@ def expanded_reading_checkpoint_model(checkpoint, reading_records, device=DEV,
 
 
 def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
+                             replay_data=None,
                              steps=400, batch=32, lr=1e-3, seed=0, device=DEV,
                              log_every=100, token_drop_p=0.15,
                              token_replace_p=0.05, feature_dropout=0.1,
@@ -4877,6 +4981,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              study_hard_max=0, study_refresh_steps=0,
                              study_select_best=False, study_rounds=1,
                              study_score_metric="both", study_score_margin_w=0.1,
+                             replay_w=0.0, replay_batch=0,
+                             replay_retention_w=0.0,
                              text_field="text", max_tokens=128, min_tokens=8,
                              eval_frac=0.10, eval_n=64,
                              latent_concept_slots=0, latent_concept_layers=None,
@@ -4886,20 +4992,38 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
     records = load_reading_records(
         data, text_field=text_field, max_tokens=max_tokens, min_tokens=min_tokens,
         eval_frac=eval_frac, seed=seed)
+    replay_records = (load_reading_records(
+        replay_data, require_train=False, require_eval=False, text_field=text_field,
+        max_tokens=max_tokens, min_tokens=min_tokens, eval_frac=eval_frac,
+        seed=seed + 313) if replay_data else [])
     torch.manual_seed(seed)
     model, vocab, ckpt = expanded_reading_checkpoint_model(
-        checkpoint, records, device=device,
+        checkpoint, records + replay_records, device=device,
         latent_concept_slots=latent_concept_slots,
         latent_concept_layers=latent_concept_layers,
         latent_concept_prefix=latent_concept_prefix,
         latent_concept_refine=latent_concept_refine,
         latent_concept_refine_gate_init=latent_concept_refine_gate_init)
+    replay_teacher_model = None
+    replay_teacher_vocab = None
+    if replay_records and (replay_w or replay_retention_w):
+        replay_teacher_model, replay_teacher_vocab, _teacher_ckpt = load_checkpoint(
+            checkpoint, device=device)
+        replay_teacher_model.eval()
+        for param in replay_teacher_model.parameters():
+            param.requires_grad_(False)
     old_vocab_size = len(ckpt["vocab"])
     before_bundle = reading_eval_bundle(
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=study_score_metric,
         score_margin_w=study_score_margin_w)
+    before_replay_bundle = (reading_eval_bundle(
+        model, vocab, replay_records, device=device, eval_n=eval_n,
+        seed=seed + 4093, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p, context_keep_p=context_keep_p,
+        score_metric=study_score_metric, score_margin_w=study_score_margin_w)
+        if replay_records else None)
     selection = {"enabled": False}
     if study_select_best:
         _model, _vocab, selection = fit_reading_concepts_select_best(
@@ -4914,7 +5038,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             study_hard_max=study_hard_max,
             study_refresh_steps=study_refresh_steps, eval_n=eval_n,
             score_metric=study_score_metric,
-            score_margin_w=study_score_margin_w, rounds=study_rounds,
+            score_margin_w=study_score_margin_w,
+            replay_records=replay_records,
+            replay_teacher_model=replay_teacher_model,
+            replay_teacher_vocab=replay_teacher_vocab,
+            replay_w=replay_w, replay_batch=replay_batch,
+            replay_retention_w=replay_retention_w, rounds=study_rounds,
             before_bundle=before_bundle)
     else:
         fit_reading_concepts(
@@ -4927,12 +5056,22 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             context_target_temperature=context_target_temperature,
             study_strategy=study_strategy, study_probe_n=study_probe_n,
             study_hard_max=study_hard_max,
-            study_refresh_steps=study_refresh_steps)
+            study_refresh_steps=study_refresh_steps,
+            replay_records=replay_records,
+            replay_teacher_model=replay_teacher_model,
+            replay_teacher_vocab=replay_teacher_vocab,
+            replay_w=replay_w, replay_batch=replay_batch)
     after_bundle = reading_eval_bundle(
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=study_score_metric,
         score_margin_w=study_score_margin_w)
+    after_replay_bundle = (reading_eval_bundle(
+        model, vocab, replay_records, device=device, eval_n=eval_n,
+        seed=seed + 4093, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p, context_keep_p=context_keep_p,
+        score_metric=study_score_metric, score_margin_w=study_score_margin_w)
+        if replay_records else None)
     before = before_bundle["view"]
     after = after_bundle["view"]
     before_context = before_bundle["context_target"]
@@ -4944,6 +5083,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "checkpoint": checkpoint,
               "checkpoint_experiment": ckpt.get("report", {}).get("experiment"),
               "data": data,
+              "replay_data": replay_data or [],
               "steps": int(steps), "batch": int(batch), "lr": float(lr),
               "text_encoder_arch": ckpt.get("text_encoder_arch", "transformer"),
               "text_encoder_layers": int(ckpt.get("text_encoder_layers", 1)),
@@ -4973,8 +5113,13 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "study_rounds": int(study_rounds),
               "study_score_metric": study_score_metric,
               "study_score_margin_w": float(study_score_margin_w),
+              "replay_w": float(replay_w),
+              "replay_batch": int(replay_batch),
+              "replay_retention_w": float(replay_retention_w),
               "train_records": sum(r.split == "train" for r in records),
               "eval_records": sum(r.split == "eval" for r in records),
+              "replay_train_records": sum(r.split == "train" for r in replay_records),
+              "replay_eval_records": sum(r.split == "eval" for r in replay_records),
               "old_vocab_size": old_vocab_size,
               "new_vocab_size": len(vocab),
               "new_tokens": max(0, len(vocab) - old_vocab_size),
@@ -4984,6 +5129,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "after_context_target": after_context,
               "before_score_components": before_bundle["score_components"],
               "after_score_components": after_bundle["score_components"],
+              "before_replay": before_replay_bundle,
+              "after_replay": after_replay_bundle,
               "selection": selection,
               "delta": {
                   "paired_view_acc": (
@@ -4995,6 +5142,11 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                   "context_target_margin": (
                       after_context.get("margin", 0.0)
                       - before_context.get("margin", 0.0)),
+                  "replay_score": (
+                      (after_replay_bundle or {}).get("score_components", {}).get(
+                          "score", 0.0)
+                      - (before_replay_bundle or {}).get("score_components", {}).get(
+                          "score", 0.0)),
               },
               "train_metrics": getattr(model, "reading_train_metrics", {}),
               "study_hard_examples": getattr(model, "reading_study_reports", [])}
@@ -8498,12 +8650,21 @@ def selftest():
         assert expanded_model.fact_schema is None
         assert expanded_model.latent_concept_slots == reading_model.latent_concept_slots
         assert "fresh" in expanded_vocab.stoi
+        teacher_model, teacher_vocab, _teacher_ckpt = load_checkpoint(
+            reading_ckpt, device="cpu")
+        replay_loss = reading_teacher_latent_consistency_loss(
+            expanded_model, teacher_model, reading_records[:2],
+            expanded_vocab, teacher_vocab, device="cpu")
+        assert torch.isfinite(replay_loss)
         fit_reading_concepts(
             expanded_model, expanded_vocab, expanded_records, steps=1, batch=2,
             lr=1e-4, seed=7, device="cpu", log_every=1,
             token_drop_p=0.1, token_replace_p=0.0, study_strategy="errors",
             study_probe_n=2, study_hard_max=2, context_target_w=0.1,
-            context_keep_p=0.5)
+            context_keep_p=0.5, replay_records=reading_records,
+            replay_teacher_model=teacher_model, replay_teacher_vocab=teacher_vocab,
+            replay_w=0.1, replay_batch=2)
+        assert expanded_model.reading_train_metrics["replay_w"] == 0.1
     score_a = {"semantic_head": {"fact_value_acc": 0.8},
                "teacher_forced": {"fact_value_acc": 0.7},
                "latent_fact_concept_head": {"fact_value_acc": 0.65,
@@ -8682,6 +8843,15 @@ def main(argv=None):
     ap.add_argument("--reading-out-checkpoint", default=None,
                     help=("where to save the raw-reading studied checkpoint; defaults to "
                           "--checkpoint when set"))
+    ap.add_argument("--reading-replay-data", action="append",
+                    help=("raw reading JSON/JSONL/TXT replay corpus used during checkpoint "
+                          "continuation to preserve prior latent concepts"))
+    ap.add_argument("--reading-replay-w", type=float, default=0.0,
+                    help="weight for frozen-checkpoint latent consistency on replay text")
+    ap.add_argument("--reading-replay-batch", type=int, default=0,
+                    help="replay records per raw-reading step; 0 = half the main batch")
+    ap.add_argument("--reading-replay-retention-w", type=float, default=0.0,
+                    help=("selection penalty weight for held-out replay discovery score drops"))
     ap.add_argument("--reading-text-field", default="text",
                     help="JSON object field to read for --reading-data records")
     ap.add_argument("--reading-max-tokens", type=int, default=128,
@@ -9197,6 +9367,16 @@ def main(argv=None):
         ap.error("--reading-study-rounds must be positive")
     if args.reading_study_score_margin_w < 0.0:
         ap.error("--reading-study-score-margin-w must be non-negative")
+    if args.reading_replay_w < 0.0:
+        ap.error("--reading-replay-w must be non-negative")
+    if args.reading_replay_batch < 0:
+        ap.error("--reading-replay-batch must be non-negative")
+    if args.reading_replay_retention_w < 0.0:
+        ap.error("--reading-replay-retention-w must be non-negative")
+    if args.reading_replay_data and not args.reading_checkpoint:
+        ap.error("--reading-replay-data requires --reading-checkpoint")
+    if args.reading_replay_w > 0.0 and not args.reading_replay_data:
+        ap.error("--reading-replay-w requires --reading-replay-data")
     if args.import_scan:
         import_scan(args.out, url=args.scan_url, max_records=args.scan_max,
                     eval_frac=args.scan_eval_frac, seed=args.seed)
@@ -9241,6 +9421,7 @@ def main(argv=None):
             study_reading_checkpoint(
                 args.reading_checkpoint, args.reading_data,
                 out_checkpoint=args.reading_out_checkpoint or args.checkpoint,
+                replay_data=args.reading_replay_data,
                 out=args.out, steps=args.steps, batch=args.batch,
                 lr=args.reading_lr, seed=args.seed, device=DEV,
                 log_every=reading_log_every,
@@ -9263,6 +9444,9 @@ def main(argv=None):
                 study_rounds=args.reading_study_rounds,
                 study_score_metric=args.reading_study_score_metric,
                 study_score_margin_w=args.reading_study_score_margin_w,
+                replay_w=args.reading_replay_w,
+                replay_batch=args.reading_replay_batch,
+                replay_retention_w=args.reading_replay_retention_w,
                 text_field=args.reading_text_field,
                 max_tokens=args.reading_max_tokens,
                 min_tokens=args.reading_min_tokens,
