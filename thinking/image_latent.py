@@ -60,6 +60,7 @@ FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
 FLOW_NOISE_COUPLINGS = ("random", "sliced_ot")
 FLOW_REPA_MODES = ("pooled", "token", "both", "auto")
 FLOW_BOUNDARY_MODES = ("none", "right-linear", "double-linear", "double-cosine")
+FLOW_PREFERENCE_LOSSES = ("margin", "dpo")
 TIME_SAMPLINGS = ("uniform", "logit-normal", "mode", "adaptive")
 TIME_ADAPTIVE_PRIORS = ("uniform", "logit-normal", "mode")
 DEFAULT_TIME_MODE_SCALE = 1.29
@@ -1234,12 +1235,21 @@ def latent_flow_preference_pair_loss(flow, z_chosen, z_rejected, cond, score_gap
                                      flow_loss_weight_gamma=5.0,
                                      flow_loss_weight_normalize=True,
                                      margin=0.0, prefix="flow_preference",
-                                     adaptive_sampler=None):
+                                     adaptive_sampler=None, loss_mode="margin",
+                                     reference_flow=None, beta=1.0):
     """Direct pairwise preference loss on the generator's rectified-flow objective."""
     if z_chosen.shape != z_rejected.shape:
         raise ValueError(
             f"preference latent shapes differ: {tuple(z_chosen.shape)} vs "
             f"{tuple(z_rejected.shape)}")
+    loss_mode = str(loss_mode or "margin")
+    if loss_mode not in FLOW_PREFERENCE_LOSSES:
+        raise ValueError(f"unknown flow preference loss {loss_mode!r}")
+    beta = float(beta)
+    if beta <= 0.0:
+        raise ValueError("flow preference beta must be positive")
+    if loss_mode == "dpo" and reference_flow is None:
+        raise ValueError("flow preference DPO loss requires a reference flow")
     latent_stats = flow_latent_stats(flow) if latent_stats is None else latent_stats
     zc = normalize_latent(z_chosen, latent_stats)
     zr = normalize_latent(z_rejected, latent_stats)
@@ -1268,17 +1278,36 @@ def latent_flow_preference_pair_loss(flow, z_chosen, z_rejected, cond, score_gap
         gap_weight = torch.ones_like(loss_c)
     else:
         gap_weight = torch.log1p(score_gaps.to(device=loss_c.device).float()).clamp(0.1, 5.0)
-    logits = (loss_r - loss_c - float(margin)) * gap_weight
+    policy_gap = loss_r - loss_c
+    ref_gap = torch.zeros_like(policy_gap)
+    if loss_mode == "dpo":
+        with torch.no_grad():
+            ref_pred_c = flow_velocity(reference_flow, ztc, t, cond_model)
+            ref_pred_r = flow_velocity(reference_flow, ztr, t, cond_model)
+            ref_loss_c = (ref_pred_c - target_c).float().pow(2).flatten(1).mean(dim=1)
+            ref_loss_r = (ref_pred_r - target_r).float().pow(2).flatten(1).mean(dim=1)
+            if flow_loss_weight != "none":
+                ref_loss_c = ref_loss_c * weights
+                ref_loss_r = ref_loss_r * weights
+            ref_gap = ref_loss_r - ref_loss_c
+        logits = float(beta) * (policy_gap - ref_gap - float(margin)) * gap_weight
+    else:
+        logits = (policy_gap - float(margin)) * gap_weight
     loss = F.softplus(-logits).mean()
     return loss, {
         f"{prefix}_loss": loss.detach(),
         f"{prefix}_chosen_velocity_mse": loss_c.mean().detach(),
         f"{prefix}_rejected_velocity_mse": loss_r.mean().detach(),
-        f"{prefix}_loss_gap": (loss_r - loss_c).mean().detach(),
+        f"{prefix}_loss_gap": policy_gap.mean().detach(),
+        f"{prefix}_ref_loss_gap": ref_gap.mean().detach(),
+        f"{prefix}_policy_ref_gap": (policy_gap - ref_gap).mean().detach(),
         f"{prefix}_acc": loss_c.lt(loss_r).float().mean().detach(),
         f"{prefix}_time_stratified": torch.tensor(
             float(bool(time_stratified)), device=zc.device),
         f"{prefix}_margin": torch.tensor(float(margin), device=loss_c.device),
+        f"{prefix}_beta": torch.tensor(float(beta), device=loss_c.device),
+        f"{prefix}_loss_mode_id": torch.tensor(
+            float(FLOW_PREFERENCE_LOSSES.index(loss_mode)), device=loss_c.device),
         f"{prefix}_gap_weight_mean": gap_weight.mean().detach(),
         f"{prefix}_pairs": torch.tensor(float(loss_c.numel()), device=loss_c.device),
     }
@@ -10138,7 +10167,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       image_preference_manifest="", image_preference_root="",
                       image_preference_max_pairs=0, image_preference_w=0.0,
                       flow_preference_w=0.0, flow_preference_margin=0.0,
-                      flow_preference_batch=0,
+                      flow_preference_batch=0, flow_preference_loss="margin",
+                      flow_preference_beta=1.0,
                       image_geometry_cond=False,
                       caption_vocab_max=8192, caption_max_len=64,
                       caption_cond_source="tokens",
@@ -10321,6 +10351,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_preference_w = float(flow_preference_w)
     if flow_preference_w < 0.0:
         raise ValueError("flow_preference_w must be non-negative")
+    flow_preference_loss = str(flow_preference_loss or "margin")
+    if flow_preference_loss not in FLOW_PREFERENCE_LOSSES:
+        raise ValueError(f"unknown flow preference loss {flow_preference_loss!r}")
+    flow_preference_beta = float(flow_preference_beta)
+    if flow_preference_beta <= 0.0:
+        raise ValueError("flow_preference_beta must be positive")
     flow_preference_margin = float(flow_preference_margin)
     if flow_preference_margin < 0.0:
         raise ValueError("flow_preference_margin must be non-negative")
@@ -10707,6 +10743,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 flow_repa_aligner=flow_repa_aligner,
                 flow_self_repa_aligner=flow_self_repa_aligner,
                 device=device))
+    flow_preference_reference = None
+    if (flow_preference_w > 0.0 and flow_preference_loss == "dpo"
+            and image_preference_pairs):
+        flow_preference_reference = copy.deepcopy(flow).to(device)
+        flow_preference_reference.eval()
+        for p in flow_preference_reference.parameters():
+            p.requires_grad_(False)
     ae_params = [p for p in ae.parameters() if p.requires_grad]
     if text_aligner is not None and image_text_align_w > 0.0:
         ae_params += list(conditioner.parameters()) + list(text_aligner.parameters())
@@ -11310,7 +11353,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                         flow_loss_weight_gamma=flow_loss_weight_gamma,
                         flow_loss_weight_normalize=flow_loss_weight_normalize,
                         margin=flow_preference_margin,
-                        adaptive_sampler=adaptive_time_sampler)
+                        adaptive_sampler=adaptive_time_sampler,
+                        loss_mode=flow_preference_loss,
+                        reference_flow=flow_preference_reference,
+                        beta=flow_preference_beta)
                     loss = loss + float(flow_preference_w) * pref_loss
                     parts.update(pref_parts)
                     parts["flow_preference_w"] = torch.tensor(
@@ -11693,6 +11739,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_sra_time_gap": float(flow_sra_time_gap),
         "flow_sra_mode": str(flow_sra_mode),
         "flow_preference_w": float(flow_preference_w),
+        "flow_preference_loss": str(flow_preference_loss),
+        "flow_preference_beta": float(flow_preference_beta),
+        "flow_preference_reference": bool(flow_preference_reference is not None),
         "flow_preference_margin": float(flow_preference_margin),
         "flow_preference_batch": int(flow_preference_batch),
         "flow_preference_steps_run": int(flow_preference_steps_run),
@@ -12101,7 +12150,10 @@ def selftest():
             flow_arch="dit", dit_depth=1, dit_heads=2, seed=5, device="cpu",
             cond_mode="text", text_cond_dim=8, image_manifest=manifest,
             image_root=td, image_split="train", caption_max_len=8,
-            image_max_records=3, sample_steps=1, flow_distill_steps=1,
+            image_max_records=3, image_preference_manifest=pref_manifest,
+            flow_preference_w=0.01, flow_preference_loss="dpo",
+            flow_preference_beta=0.5, flow_preference_batch=1,
+            sample_steps=1, flow_distill_steps=1,
             flow_guidance_distill_w=0.01, flow_ema_decay=0.9,
             flow_frequency_w=0.01, flow_straightness_w=0.01,
             flow_endpoint_stats_w=0.01,
@@ -12160,6 +12212,11 @@ def selftest():
         assert math.isclose(report["flow_self_condition_p"], 1.0)
         assert report["dit_mlp"] == "swiglu"
         assert report["dit_register_tokens"] == 1
+        assert report["flow_preference_loss"] == "dpo"
+        assert math.isclose(report["flow_preference_beta"], 0.5)
+        assert report["flow_preference_reference"] is True
+        assert report["flow_preference_steps_run"] >= 1
+        assert "flow_preference_policy_ref_gap" in report["last_flow"]
         assert report["uses_swiglu_mlp"] is True
         assert report["adaptive_modulation"] is True
         assert report["residual_gating"] is True
@@ -12797,6 +12854,14 @@ def main(argv=None):
                     dest="flow_preference_w",
                     help=("direct chosen/rejected preference loss weight on the "
                           "latent rectified-flow generator"))
+    ap.add_argument("--flow-preference-loss", default="margin",
+                    choices=FLOW_PREFERENCE_LOSSES, dest="flow_preference_loss",
+                    help=("direct flow preference objective: margin compares "
+                          "chosen/rejected velocity loss; dpo anchors that gap "
+                          "to a frozen reference flow"))
+    ap.add_argument("--flow-preference-beta", type=float, default=1.0,
+                    dest="flow_preference_beta",
+                    help="inverse-temperature for --flow-preference-loss dpo")
     ap.add_argument("--flow-preference-margin", type=float, default=0.0,
                     dest="flow_preference_margin",
                     help="minimum per-pair velocity-loss gap for direct flow preference")
@@ -13095,6 +13160,8 @@ def main(argv=None):
         ap.error("--image-preference-w requires --quality-score-steps > 0")
     if args.flow_preference_w < 0.0:
         ap.error("--flow-preference-w must be non-negative")
+    if args.flow_preference_beta <= 0.0:
+        ap.error("--flow-preference-beta must be positive")
     if args.flow_preference_margin < 0.0:
         ap.error("--flow-preference-margin must be non-negative")
     if args.flow_preference_batch < 0:
@@ -13426,6 +13493,8 @@ def main(argv=None):
         image_preference_max_pairs=args.image_preference_max_pairs,
         image_preference_w=args.image_preference_w,
         flow_preference_w=args.flow_preference_w,
+        flow_preference_loss=args.flow_preference_loss,
+        flow_preference_beta=args.flow_preference_beta,
         flow_preference_margin=args.flow_preference_margin,
         flow_preference_batch=args.flow_preference_batch,
         image_geometry_cond=args.image_geometry_cond,
@@ -13760,6 +13829,11 @@ def main(argv=None):
         "image_preference_rejected_cfg_schedules": report.get(
             "image_preference_rejected_cfg_schedules", {}),
         "flow_preference_w": args.flow_preference_w,
+        "flow_preference_loss": report.get(
+            "flow_preference_loss", args.flow_preference_loss),
+        "flow_preference_beta": report.get(
+            "flow_preference_beta", args.flow_preference_beta),
+        "flow_preference_reference": report.get("flow_preference_reference", False),
         "flow_preference_margin": args.flow_preference_margin,
         "flow_preference_batch": args.flow_preference_batch,
         "flow_preference_steps_run": report.get("flow_preference_steps_run", 0),
