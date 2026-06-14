@@ -2446,7 +2446,9 @@ def reading_cluster_retrieval_eval(model, vocab, records, device=DEV, n=0,
 
 
 READING_SCORE_METRICS = (
-    "view", "context", "neighborhood", "cluster", "both", "min", "all")
+    "view", "context", "neighborhood", "cluster", "both", "min", "all",
+    "balanced")
+READING_DISCOVERY_SIGNALS = ("view", "context", "neighborhood", "cluster")
 
 
 def reading_discovery_score_components(view_eval, context_eval, metric="both",
@@ -2470,6 +2472,20 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     context_score = context_acc + margin_w * context_margin
     neighborhood_score = neighborhood_acc + margin_w * neighborhood_margin
     cluster_score = cluster_acc + margin_w * cluster_margin
+    scores = {"view": view_score, "context": context_score,
+              "neighborhood": neighborhood_score, "cluster": cluster_score}
+    skipped = {"view": bool(view_eval.get("skipped", False)),
+               "context": bool(context_eval.get("skipped", False)),
+               "neighborhood": bool(neighborhood_eval.get("skipped", False)),
+               "cluster": bool(cluster_eval.get("skipped", False))}
+    active_scores = [scores[name] for name in READING_DISCOVERY_SIGNALS
+                     if not skipped[name]]
+    if not active_scores:
+        active_scores = [0.0]
+    all_score = sum(scores.values()) / float(len(scores))
+    active_mean_score = sum(active_scores) / float(len(active_scores))
+    floor_score = min(active_scores)
+    balanced_score = 0.5 * (active_mean_score + floor_score)
     if metric == "view":
         score = view_score
     elif metric == "context":
@@ -2481,13 +2497,18 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     elif metric == "min":
         score = min(view_score, context_score)
     elif metric == "all":
-        score = (view_score + context_score + neighborhood_score
-                 + cluster_score) / 4.0
+        score = all_score
+    elif metric == "balanced":
+        score = balanced_score
     else:
         score = 0.5 * (view_score + context_score)
     return {"metric": metric,
             "margin_w": margin_w,
             "score": float(score),
+            "all_score": float(all_score),
+            "active_mean_score": float(active_mean_score),
+            "floor_score": float(floor_score),
+            "balanced_score": float(balanced_score),
             "view_score": float(view_score),
             "context_score": float(context_score),
             "neighborhood_score": float(neighborhood_score),
@@ -2500,15 +2521,15 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "neighborhood_margin": neighborhood_margin,
             "cluster_acc": cluster_acc,
             "cluster_margin": cluster_margin,
-            "view_skipped": bool(view_eval.get("skipped", False)),
-            "context_skipped": bool(context_eval.get("skipped", False)),
-            "neighborhood_skipped": bool(neighborhood_eval.get("skipped", False)),
-            "cluster_skipped": bool(cluster_eval.get("skipped", False))}
+            "view_skipped": skipped["view"],
+            "context_skipped": skipped["context"],
+            "neighborhood_skipped": skipped["neighborhood"],
+            "cluster_skipped": skipped["cluster"]}
 
 
 def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
                         token_drop_p=0.15, token_replace_p=0.05,
-                        context_keep_p=0.5, score_metric="both",
+                        context_keep_p=0.5, score_metric="balanced",
                         score_margin_w=0.1):
     view = reading_latent_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 17,
@@ -5116,7 +5137,7 @@ def fit_reading_concepts_select_best(
         replay_records=None, replay_teacher_model=None,
         replay_teacher_vocab=None, replay_w=0.0, replay_batch=0,
         replay_retention_w=0.0,
-        eval_n=64, score_metric="both", score_margin_w=0.1,
+        eval_n=64, score_metric="balanced", score_margin_w=0.1,
         rounds=1, before_bundle=None):
     schedule = _step_schedule(steps, rounds)
     if not schedule:
@@ -5342,7 +5363,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          study_strategy="errors", study_probe_n=0,
                          study_hard_max=0, study_refresh_steps=0,
                          study_select_best=False, study_rounds=1,
-                         study_score_metric="both", study_score_margin_w=0.1,
+                         study_score_metric="balanced", study_score_margin_w=0.1,
                          text_field="text", max_tokens=128, min_tokens=8,
                          eval_frac=0.10, eval_n=64, out=None, checkpoint=None):
     records = load_reading_records(
@@ -5596,7 +5617,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              study_strategy="errors", study_probe_n=0,
                              study_hard_max=0, study_refresh_steps=0,
                              study_select_best=False, study_rounds=1,
-                             study_score_metric="both", study_score_margin_w=0.1,
+                             study_score_metric="balanced", study_score_margin_w=0.1,
                              replay_w=0.0, replay_batch=0,
                              replay_retention_w=0.0,
                              text_field="text", max_tokens=128, min_tokens=8,
@@ -9326,6 +9347,19 @@ def selftest():
         seed=0, token_drop_p=0.1, token_replace_p=0.0, context_keep_p=0.5,
         score_metric="cluster", score_margin_w=0.1)
     assert "cluster_score" in reading_cluster_bundle["score_components"]
+    reading_balanced_bundle = reading_eval_bundle(
+        reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
+        seed=0, token_drop_p=0.1, token_replace_p=0.0, context_keep_p=0.5,
+        score_metric="balanced", score_margin_w=0.1)
+    assert reading_balanced_bundle["score_components"]["metric"] == "balanced"
+    lopsided_components = reading_discovery_score_components(
+        {"paired_view_acc": 1.0}, {"context_target_acc": 1.0},
+        metric="balanced",
+        neighborhood_eval={"neighbor_acc": 0.0},
+        cluster_eval={"cluster_acc": 0.0})
+    assert abs(lopsided_components["all_score"] - 0.5) < 1e-6
+    assert lopsided_components["floor_score"] == 0.0
+    assert lopsided_components["score"] < lopsided_components["all_score"]
     selected_reading_model = TextFactLM(
         len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
         fact_schema=None, latent_concept_slots=2).to("cpu")
@@ -9646,7 +9680,7 @@ def main(argv=None):
     ap.add_argument("--reading-study-rounds", type=int, default=1,
                     help="number of selection rounds for raw reading study")
     ap.add_argument("--reading-study-score-metric", choices=READING_SCORE_METRICS,
-                    default="both",
+                    default="balanced",
                     help="held-out schema-free metric used to select raw reading rounds")
     ap.add_argument("--reading-study-score-margin-w", type=float, default=0.1,
                     help="margin weight inside raw reading selection score")

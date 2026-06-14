@@ -53,6 +53,7 @@ COLOR_NAMES = tuple(COLORS)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_SURFACES = os.path.join(ROOT, "data", "multimodal_transcripts.json")
 MODES = ("full", "sensor_only", "text_only")
+MULTIMODAL_STUDY_METRICS = ("latent", "concept", "decoder", "balanced")
 TRUNK_ARCHES = ("conv", "residual")
 TEXT_TRUNK_ARCHES = ("transformer", "standard", "relational", "abstractor")
 FACTOR_VALUES = {
@@ -897,14 +898,26 @@ def multimodal_factor_record_outcomes(model, vocab, surfaces, n=0, seed=0, devic
                                       examples=None):
     """Return examples currently wrong/right under an upstream factor metric."""
     metric = str(metric)
-    if metric not in ("latent", "concept", "decoder"):
+    if metric not in MULTIMODAL_STUDY_METRICS:
         raise ValueError(f"unknown multimodal study score metric {metric!r}")
-    if metric == "latent" and getattr(model, "latent_concepts", None) is None:
+    active_metrics = (
+        ("latent", "concept", "decoder") if metric == "balanced" else (metric,))
+    if "latent" in active_metrics and getattr(model, "latent_concepts", None) is None:
+        if metric == "latent":
+            return [], [], {"n_records": 0, "sampled": False, "n_error_records": 0,
+                            "n_correct_records": 0, "n_factor_checks": 0,
+                            "n_errors": 0, "factor_error_rate": 0.0,
+                            "metric": metric, "active_metrics": [],
+                            "modes": list(modes), "by_metric": {},
+                            "by_mode": {}, "by_factor": {}, "skipped": True}
+        active_metrics = tuple(name for name in active_metrics if name != "latent")
+    if not active_metrics:
         return [], [], {"n_records": 0, "sampled": False, "n_error_records": 0,
                         "n_correct_records": 0, "n_factor_checks": 0,
                         "n_errors": 0, "factor_error_rate": 0.0,
-                        "metric": metric, "modes": list(modes), "by_mode": {},
-                        "by_factor": {}, "skipped": True}
+                        "metric": metric, "active_metrics": [],
+                        "modes": list(modes), "by_metric": {},
+                        "by_mode": {}, "by_factor": {}, "skipped": True}
     if examples is None:
         rng = np.random.default_rng(seed)
         count = int(n)
@@ -922,6 +935,7 @@ def multimodal_factor_record_outcomes(model, vocab, surfaces, n=0, seed=0, devic
             sampled = True
     errors = []
     correct = []
+    by_metric = {name: {"checks": 0, "errors": 0} for name in active_metrics}
     by_mode = {mode: {"checks": 0, "errors": 0} for mode in modes}
     by_factor = {factor: {"checks": 0, "errors": 0} for factor in VALUE_POS}
     n_checks = 0
@@ -933,30 +947,34 @@ def multimodal_factor_record_outcomes(model, vocab, surfaces, n=0, seed=0, devic
             img, aud, txt, ids, golds = _batch_from_examples(batch_examples, vocab, device)
             wrong_rows = torch.zeros(len(batch_examples), dtype=torch.bool, device=device)
             for mode in modes:
-                if metric == "latent":
-                    logits_by_factor = model.latent_factor_logits(img, aud, txt, mode=mode)
-                elif metric == "concept":
-                    logits_by_factor = model.factor_logits(img, aud, txt, mode=mode)
-                else:
-                    logits = model(img, aud, txt, ids, mode=mode)
-                    logits_by_factor = {
-                        factor: logits[:, pos - 1].index_select(
-                            -1, _candidate_ids(vocab, factor, device))
-                        for factor, pos in VALUE_POS.items()
-                    }
-                for factor in VALUE_POS:
-                    targets = concept_factor_targets(golds, factor, device)
-                    pred = logits_by_factor[factor].argmax(-1)
-                    misses = pred.ne(targets)
-                    wrong_rows |= misses
-                    err_count = int(misses.sum())
-                    check_count = int(misses.numel())
-                    by_mode[mode]["checks"] += check_count
-                    by_mode[mode]["errors"] += err_count
-                    by_factor[factor]["checks"] += check_count
-                    by_factor[factor]["errors"] += err_count
-                    n_checks += check_count
-                    n_errors += err_count
+                for active_metric in active_metrics:
+                    if active_metric == "latent":
+                        logits_by_factor = model.latent_factor_logits(
+                            img, aud, txt, mode=mode)
+                    elif active_metric == "concept":
+                        logits_by_factor = model.factor_logits(img, aud, txt, mode=mode)
+                    else:
+                        logits = model(img, aud, txt, ids, mode=mode)
+                        logits_by_factor = {
+                            factor: logits[:, pos - 1].index_select(
+                                -1, _candidate_ids(vocab, factor, device))
+                            for factor, pos in VALUE_POS.items()
+                        }
+                    for factor in VALUE_POS:
+                        targets = concept_factor_targets(golds, factor, device)
+                        pred = logits_by_factor[factor].argmax(-1)
+                        misses = pred.ne(targets)
+                        wrong_rows |= misses
+                        err_count = int(misses.sum())
+                        check_count = int(misses.numel())
+                        by_metric[active_metric]["checks"] += check_count
+                        by_metric[active_metric]["errors"] += err_count
+                        by_mode[mode]["checks"] += check_count
+                        by_mode[mode]["errors"] += err_count
+                        by_factor[factor]["checks"] += check_count
+                        by_factor[factor]["errors"] += err_count
+                        n_checks += check_count
+                        n_errors += err_count
             for i, ex in enumerate(batch_examples):
                 if bool(wrong_rows[i]):
                     errors.append(ex)
@@ -970,7 +988,9 @@ def multimodal_factor_record_outcomes(model, vocab, surfaces, n=0, seed=0, devic
                              "n_errors": n_errors,
                              "factor_error_rate": n_errors / max(1, n_checks),
                              "metric": metric,
+                             "active_metrics": list(active_metrics),
                              "modes": list(modes),
+                             "by_metric": by_metric,
                              "by_mode": by_mode,
                              "by_factor": by_factor,
                              "skipped": False}
@@ -1613,7 +1633,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           latent_concept_cluster_margin=0.0,
           latent_concept_cluster_min_size=2,
           latent_concept_factor_w=0.0,
-          study_strategy="random", study_score_metric="latent",
+          study_strategy="random", study_score_metric="balanced",
           study_probe_n=0, study_hard_max=0, study_refresh_steps=0,
           concept_w=0.0, concept_agreement_w=0.0,
           concept_distill_w=0.0, concept_distill_temperature=1.0,
@@ -1655,7 +1675,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     study_score_metric = str(study_score_metric)
     if study_strategy not in ("random", "errors"):
         raise ValueError(f"unknown multimodal study strategy {study_strategy!r}")
-    if study_score_metric not in ("latent", "concept", "decoder"):
+    if study_score_metric not in MULTIMODAL_STUDY_METRICS:
         raise ValueError(f"unknown multimodal study score metric {study_score_metric!r}")
     if study_strategy == "errors" and study_score_metric == "latent" and latent_concept_slots <= 0:
         raise ValueError("latent multimodal study requires latent_concept_slots > 0")
@@ -1970,7 +1990,7 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         latent_concept_cluster_margin=0.0,
         latent_concept_cluster_min_size=2,
         latent_concept_factor_w=0.0,
-        study_strategy="random", study_score_metric="latent",
+        study_strategy="random", study_score_metric="balanced",
         study_probe_n=0, study_hard_max=0, study_refresh_steps=0,
         concept_w=0.0, concept_agreement_w=0.0,
         concept_distill_w=0.0, concept_distill_temperature=1.0,
@@ -2405,6 +2425,15 @@ def selftest():
         metric="decoder", modes=("text_only",))
     assert decoder_report["metric"] == "decoder"
     assert len(decoder_errors) + len(decoder_correct) == 4
+    balanced_errors, balanced_correct, balanced_report = (
+        multimodal_factor_record_outcomes(
+            latent_prefix_model, vocab, surfaces, n=4, seed=9, device="cpu",
+            metric="balanced", modes=("text_only",)))
+    assert balanced_report["metric"] == "balanced"
+    assert set(balanced_report["active_metrics"]) == {
+        "latent", "concept", "decoder"}
+    assert set(balanced_report["by_metric"]) == set(balanced_report["active_metrics"])
+    assert len(balanced_errors) + len(balanced_correct) == 4
     rel_txt_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
                                  text_arch="relational", text_layers=1).to("cpu")
     assert rel_txt_model.txt.arch == "relational"
@@ -2566,8 +2595,8 @@ def main(argv=None):
     ap.add_argument("--study-strategy", choices=("random", "errors"), default="random",
                     dest="study_strategy",
                     help="sample normal batches or train on mined current model errors")
-    ap.add_argument("--study-score-metric", choices=("latent", "concept", "decoder"),
-                    default="latent", dest="study_score_metric",
+    ap.add_argument("--study-score-metric", choices=MULTIMODAL_STUDY_METRICS,
+                    default="balanced", dest="study_score_metric",
                     help="metric used to mine multimodal hard examples")
     ap.add_argument("--study-probe-n", type=int, default=0, dest="study_probe_n",
                     help="number of generated train examples to probe for current errors")
