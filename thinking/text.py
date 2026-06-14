@@ -2337,11 +2337,11 @@ READING_SCORE_METRICS = (
 READING_DISCOVERY_SIGNALS = (
     "view", "context", "sequence", "neighborhood", "cluster", "fer", "bridge")
 READING_STUDY_STRATEGIES = (
-    "random", "errors", "curiosity", "sequence", "graph", "cycle",
+    "random", "errors", "fer", "curiosity", "sequence", "graph", "cycle",
     "discovery", "auto")
 READING_MEMORY_STUDY_STRATEGIES = ("curiosity", "graph", "discovery")
 READING_POOL_STUDY_STRATEGIES = (
-    "errors", "curiosity", "sequence", "graph", "cycle", "discovery")
+    "errors", "fer", "curiosity", "sequence", "graph", "cycle", "discovery")
 READING_TRANSITION_STUDY_STRATEGIES = ("sequence", "graph", "cycle", "discovery")
 READING_GRAPH_READY_STUDY_STRATEGIES = ("graph", "cycle")
 
@@ -2351,9 +2351,11 @@ def resolve_reading_study_strategy(study_strategy, model):
     if requested not in READING_STUDY_STRATEGIES:
         raise ValueError(f"unknown reading study strategy {requested!r}")
     if requested == "auto":
+        if getattr(model, "latent_concepts", None) is None:
+            return "errors"
         return ("discovery"
                 if getattr(model, "latent_concept_memory", None) is not None
-                else "errors")
+                else "fer")
     return requested
 
 
@@ -2699,6 +2701,99 @@ def reading_latent_curiosity_records(
                       "skipped": False}
 
 
+def _latent_slot_fer_parts(slots, eps=1e-8):
+    if slots is None or slots.ndim != 3:
+        zero = torch.zeros(0)
+        return {"fer_score": zero, "fragmentation": zero,
+                "slot_correlation": zero, "slot_imbalance": zero}
+    if slots.shape[0] == 0:
+        zero = slots.reshape(slots.shape[0], -1).sum(-1) * 0.0
+        return {"fer_score": zero, "fragmentation": zero,
+                "slot_correlation": zero, "slot_imbalance": zero}
+    if slots.shape[1] <= 1:
+        zero = slots.reshape(slots.shape[0], -1).sum(-1) * 0.0
+        return {"fer_score": zero, "fragmentation": zero,
+                "slot_correlation": zero, "slot_imbalance": zero}
+    eps_t = float(eps)
+    energy = slots.pow(2).mean(-1)
+    usage = energy / energy.sum(-1, keepdim=True).clamp_min(eps_t)
+    fragmentation = -(usage.clamp_min(eps_t).log() * usage).sum(-1)
+    fragmentation = fragmentation / math.log(float(slots.shape[1]))
+    uniform = torch.full_like(usage, 1.0 / usage.shape[-1])
+    imbalance = F.kl_div(
+        usage.clamp_min(eps_t).log(), uniform, reduction="none").sum(-1)
+    z = F.normalize(slots, dim=-1)
+    corr = z.matmul(z.transpose(1, 2))
+    eye = torch.eye(slots.shape[1], dtype=torch.bool, device=slots.device)
+    correlation = corr.masked_select(~eye[None]).view(
+        slots.shape[0], slots.shape[1], slots.shape[1] - 1).pow(2).mean((1, 2))
+    fer_score = (fragmentation + correlation + imbalance) / 3.0
+    return {"fer_score": fer_score,
+            "fragmentation": fragmentation,
+            "slot_correlation": correlation,
+            "slot_imbalance": imbalance}
+
+
+def reading_latent_fer_records(
+        model, vocab, records, device=DEV, n=0, seed=0, feature_dropout=0.0):
+    if getattr(model, "latent_concepts", None) is None:
+        return [], {"n_records": 0, "sampled": False, "n_selected": 0,
+                    "mean_fer_score": 0.0, "max_fer_score": 0.0,
+                    "mean_fer_fragmentation": 0.0,
+                    "mean_fer_slot_correlation": 0.0,
+                    "mean_fer_slot_imbalance": 0.0,
+                    "skipped": True}
+    candidates = [r for r in records if r.split == "train"]
+    sampled = bool(n and n < len(candidates))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=n, replace=False)
+        candidates = [candidates[int(i)] for i in idx]
+    scored = []
+    score_values = []
+    fragmentation_values = []
+    correlation_values = []
+    imbalance_values = []
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(candidates), 64):
+            batch = candidates[off:off + 64]
+            txt = pack_reading(batch, vocab, device)
+            slots = model.latent_concept_states(
+                txt, feature_dropout=feature_dropout, project=True)
+            parts = _latent_slot_fer_parts(slots)
+            scores = parts["fer_score"]
+            fragmentation = parts["fragmentation"]
+            correlation = parts["slot_correlation"]
+            imbalance = parts["slot_imbalance"]
+            for i, rec in enumerate(batch):
+                score = float(scores[i].detach().cpu())
+                scored.append((score, rec))
+                score_values.append(score)
+                fragmentation_values.append(float(fragmentation[i].detach().cpu()))
+                correlation_values.append(float(correlation[i].detach().cpu()))
+                imbalance_values.append(float(imbalance[i].detach().cpu()))
+    scored.sort(key=lambda row: row[0], reverse=True)
+    selected = [rec for _score, rec in scored]
+    return selected, {"n_records": len(candidates),
+                      "sampled": sampled,
+                      "n_selected": len(selected),
+                      "mean_fer_score": (
+                          float(np.mean(score_values)) if score_values else 0.0),
+                      "max_fer_score": (
+                          float(max(score_values)) if score_values else 0.0),
+                      "mean_fer_fragmentation": (
+                          float(np.mean(fragmentation_values))
+                          if fragmentation_values else 0.0),
+                      "mean_fer_slot_correlation": (
+                          float(np.mean(correlation_values))
+                          if correlation_values else 0.0),
+                      "mean_fer_slot_imbalance": (
+                          float(np.mean(imbalance_values))
+                          if imbalance_values else 0.0),
+                      "skipped": False}
+
+
 def _reading_sequence_surprise_rows(
         model, vocab, pairs, device=DEV, token_drop_p=0.15,
         token_replace_p=0.05, feature_dropout=0.0, temperature=0.1):
@@ -2950,20 +3045,7 @@ def _minmax_scale(values):
 
 
 def _latent_slot_disorder_scores(slots):
-    if slots is None or slots.ndim != 3:
-        return torch.zeros(0)
-    if slots.shape[1] <= 1:
-        return slots.reshape(slots.shape[0], -1).sum(-1) * 0.0
-    z = F.normalize(slots, dim=-1)
-    corr = z.matmul(z.transpose(1, 2))
-    eye = torch.eye(slots.shape[1], dtype=torch.bool, device=slots.device)
-    correlation = corr.masked_select(~eye[None]).view(
-        slots.shape[0], slots.shape[1], slots.shape[1] - 1).pow(2).mean((1, 2))
-    energy = slots.pow(2).mean(-1)
-    usage = energy / energy.sum(-1, keepdim=True).clamp_min(1e-8)
-    uniform = torch.full_like(usage, 1.0 / usage.shape[-1])
-    imbalance = F.kl_div(usage.clamp_min(1e-8).log(), uniform, reduction="none").sum(-1)
-    return 0.5 * (correlation + imbalance)
+    return _latent_slot_fer_parts(slots)["fer_score"]
 
 
 def reading_latent_discovery_records(
@@ -3059,7 +3141,11 @@ def reading_latent_discovery_records(
                     transitive_w=cycle_transitive_w,
                     target_power=cycle_target_power,
                     cycle_w=cycle_w)
-            disorder = _latent_slot_disorder_scores(full_slots)
+            fer_parts = _latent_slot_fer_parts(full_slots)
+            disorder = fer_parts["fer_score"]
+            fer_fragmentation = fer_parts["fragmentation"]
+            fer_correlation = fer_parts["slot_correlation"]
+            fer_imbalance = fer_parts["slot_imbalance"]
             bridge, bridge_entropy, bridge_connectivity = latent_concept_bridge_scores(
                 full_slots, memory.active(), memory.active_relations(),
                 memory.active_transitions())
@@ -3089,6 +3175,12 @@ def reading_latent_discovery_records(
                     "reverse_kl": float(reverse[i].detach().cpu()),
                     "source_cycle_kl": float(source_cycle[i].detach().cpu()),
                     "target_cycle_kl": float(target_cycle[i].detach().cpu()),
+                    "fer_score": float(disorder[i].detach().cpu()),
+                    "fer_fragmentation": float(
+                        fer_fragmentation[i].detach().cpu()),
+                    "fer_slot_correlation": float(
+                        fer_correlation[i].detach().cpu()),
+                    "fer_slot_imbalance": float(fer_imbalance[i].detach().cpu()),
                     "slot_disorder": float(disorder[i].detach().cpu()),
                     "bridge": float(bridge[i].detach().cpu()),
                     "bridge_entropy": float(bridge_entropy[i].detach().cpu()),
@@ -3105,7 +3197,7 @@ def reading_latent_discovery_records(
                     "sequence_rank": float(seq.get("sequence_rank", 0.0)),
                 })
     components = (
-        "curiosity", "graph", "cycle", "slot_disorder", "bridge",
+        "curiosity", "graph", "cycle", "fer_score", "bridge",
         "sequence_surprise")
     for name in components:
         scaled = _minmax_scale([row[name] for row in rows])
@@ -3138,6 +3230,12 @@ def reading_latent_discovery_records(
                       "mean_reverse_kl": mean_field("reverse_kl"),
                       "mean_source_cycle_kl": mean_field("source_cycle_kl"),
                       "mean_target_cycle_kl": mean_field("target_cycle_kl"),
+                      "mean_fer_score": mean_field("fer_score"),
+                      "max_fer_score": max_field("fer_score"),
+                      "mean_fer_fragmentation": mean_field("fer_fragmentation"),
+                      "mean_fer_slot_correlation": mean_field(
+                          "fer_slot_correlation"),
+                      "mean_fer_slot_imbalance": mean_field("fer_slot_imbalance"),
                       "mean_slot_disorder": mean_field("slot_disorder"),
                       "mean_bridge_score": mean_field("bridge"),
                       "max_bridge_score": max_field("bridge"),
@@ -3646,6 +3744,12 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 transitive_steps=association_transitive_steps,
                 transitive_w=association_transitive_w)
             report = report | {"strategy": "curiosity"}
+        elif study_strategy == "fer":
+            selected, report = reading_latent_fer_records(
+                model, vocab, records, device=device, n=probe_n,
+                seed=seed + 1301 + int(step),
+                feature_dropout=0.0)
+            report = report | {"strategy": "fer"}
         elif study_strategy == "graph":
             selected, report = reading_latent_graph_prediction_records(
                 model, vocab, records, device=device, n=probe_n,
@@ -4253,7 +4357,7 @@ def fit_reading_concepts_select_best(
         score_margin_w=score_margin_w)
     bridge_insight_gate = bool(
         bridge_w and initial_study_strategy in READING_POOL_STUDY_STRATEGIES
-        and initial_study_strategy != "sequence")
+        and initial_study_strategy not in ("sequence", "fer"))
     replay_records = list(replay_records or [])
     before_replay_bundle = None
     if replay_records and replay_retention_w:
@@ -7034,7 +7138,7 @@ def selftest():
         latent_concept_memory_size=0).to("cpu")
     assert resolve_reading_study_strategy("auto", reading_model) == "discovery"
     assert (resolve_reading_study_strategy("auto", memoryless_reading_model)
-            == "errors")
+            == "fer")
     reading_txt = pack_reading(reading_records[:2], reading_vocab, "cpu")
     assert torch.isfinite(reading_latent_view_loss(
         reading_model, reading_txt, reading_vocab.pad, reading_vocab.unk,
@@ -7045,6 +7149,10 @@ def selftest():
         reading_model, reading_txt, feature_dropout=0.1)
     assert torch.isfinite(fer_loss)
     assert torch.isfinite(fer_metrics["fer_score"])
+    fer_selected, fer_study_report = reading_latent_fer_records(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0)
+    assert fer_selected and fer_study_report["skipped"] is False
+    assert math.isfinite(fer_study_report["mean_fer_score"])
     cold_bridge_eval = reading_latent_bridge_eval(
         reading_model, reading_vocab, reading_records, device="cpu", n=0)
     assert cold_bridge_eval["skipped"] is True
@@ -7105,6 +7213,7 @@ def selftest():
         cycle_transitive_w=0.1)
     assert discovery_records and discovery_report["skipped"] is False
     assert math.isfinite(discovery_report["mean_score"])
+    assert "mean_fer_score" in discovery_report
     assert "mean_slot_disorder" in discovery_report
     assert "mean_bridge_score" in discovery_report
     assert "mean_sequence_surprise" in discovery_report
@@ -7188,6 +7297,9 @@ def selftest():
     assert any("mean_reverse_kl" in r for r in reading_model.reading_study_reports
                if r.get("strategy") == "discovery")
     assert any("mean_bridge_score" in r for r in reading_model.reading_study_reports
+               if r.get("strategy") == "discovery")
+    assert any("mean_fer_score" in r
+               for r in reading_model.reading_study_reports
                if r.get("strategy") == "discovery")
     assert any("mean_sequence_surprise" in r
                for r in reading_model.reading_study_reports
