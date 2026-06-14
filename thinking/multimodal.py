@@ -42,6 +42,8 @@ from .concepts import (
     latent_concept_fer_loss,
     latent_concept_fer_metrics,
     latent_concept_fer_scores,
+    latent_concept_graph_curiosity_scores,
+    latent_concept_graph_cycle_scores,
     latent_concept_graph_prediction_loss,
     latent_concept_graph_prediction_scores,
     latent_concept_graph_ready,
@@ -49,6 +51,7 @@ from .concepts import (
     latent_concept_memory_loss,
     latent_concept_neighborhood_loss,
     latent_concept_sequence_prediction_loss,
+    latent_concept_sequence_prediction_scores,
     latent_concept_slot_factorization_loss,
     latent_concept_transition_consistency_loss,
     latent_concept_vicreg_loss,
@@ -659,6 +662,17 @@ def _sample_unique_records(records, n, rng):
     return [records[int(i)] for i in idx]
 
 
+def _minmax_scale(values):
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return arr
+    lo = float(np.min(arr))
+    hi = float(np.max(arr))
+    if hi <= lo + 1e-12:
+        return np.zeros_like(arr)
+    return (arr - lo) / (hi - lo)
+
+
 def _sequence_order(rec, fallback):
     meta = rec.meta if isinstance(rec.meta, dict) else {}
     raw_order = meta.get(
@@ -1184,7 +1198,8 @@ def latent_multimodal_graph_prediction_examples(
     if getattr(model, "latent_concepts", None) is None or memory is None:
         return [], {"n_records": 0, "n_selected": 0, "skipped": True}
     rng = np.random.default_rng(seed)
-    sample = _sample_records(records, int(n) if int(n) > 0 else len(records), rng)
+    sample = _sample_unique_records(
+        records, int(n) if int(n) > 0 else len(records), rng)
     scored = []
     model.eval()
     with torch.no_grad():
@@ -1500,6 +1515,256 @@ def latent_multimodal_sequence_eval(model, records, vocab, view_dims, n=200,
             "mining": mine_report}
 
 
+def _multimodal_sequence_surprise_rows(
+        model, pairs, vocab, view_dims, device=DEV, temperature=0.1):
+    rows = []
+    if (getattr(model, "latent_concepts", None) is None
+            or getattr(model, "concept_sequence_predictor", None) is None
+            or len(pairs) <= 1):
+        return rows
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(pairs), 64):
+            pair_batch = pairs[off:off + 64]
+            if len(pair_batch) <= 1:
+                continue
+            anchors = [a for a, _b in pair_batch]
+            positives = [b for _a, b in pair_batch]
+            anchor_features, anchor_txt, _anchor_ids = _batch_from_records(
+                anchors, vocab, device, view_dims)
+            positive_features, positive_txt, _positive_ids = _batch_from_records(
+                positives, vocab, device, view_dims)
+            source_slots = model.latent_concept_states(
+                anchor_features, anchor_txt, mode="full", project=False)
+            target_slots = model.latent_concept_states(
+                positive_features, positive_txt, mode="full", project=False)
+            scores, parts = latent_concept_sequence_prediction_scores(
+                model.concept_sequence_predictor, source_slots, target_slots,
+                temperature=temperature)
+            ce = parts.get("cross_entropy", scores.new_zeros(scores.shape))
+            pos = parts.get("positive_cosine", scores.new_zeros(scores.shape))
+            neg = parts.get("hard_negative_cosine", scores.new_zeros(scores.shape))
+            rank = parts.get("rank", scores.new_zeros(scores.shape))
+            for i, (anchor, positive) in enumerate(pair_batch):
+                rows.append({
+                    "anchor": anchor,
+                    "positive": positive,
+                    "sequence_surprise": float(scores[i].detach().cpu()),
+                    "sequence_cross_entropy": float(ce[i].detach().cpu()),
+                    "sequence_positive_cosine": float(pos[i].detach().cpu()),
+                    "sequence_hard_negative_cosine": float(neg[i].detach().cpu()),
+                    "sequence_rank": float(rank[i].detach().cpu()),
+                })
+    return rows
+
+
+def latent_multimodal_discovery_examples(
+        model, records, vocab, view_dims, n=0, seed=0, device=DEV,
+        curiosity_temperature=0.1, curiosity_self_loop_w=0.05,
+        curiosity_transitive_steps=2, curiosity_transitive_w=0.1,
+        graph_temperature=0.1, graph_self_loop_w=0.05,
+        graph_transitive_steps=2, graph_transitive_w=0.1,
+        graph_target_power=1.0, cycle_temperature=0.1,
+        cycle_self_loop_w=0.05, cycle_transitive_steps=2,
+        cycle_transitive_w=0.1, cycle_target_power=1.0, cycle_w=0.5,
+        sequence_temperature=0.1):
+    memory = getattr(model, "latent_concept_memory", None)
+    if getattr(model, "latent_concepts", None) is None or memory is None:
+        return [], {"n_records": 0, "n_selected": 0,
+                    "mean_score": 0.0, "max_score": 0.0, "skipped": True}
+    rng = np.random.default_rng(seed)
+    candidates = _sample_unique_records(
+        records, int(n) if int(n) > 0 else len(records), rng)
+    candidate_ids = {rec.rec_id for rec in candidates}
+    sequence_pairs, sequence_mining = mine_multimodal_sequence_pairs(
+        records, split="train")
+    if candidate_ids:
+        sequence_pairs = [
+            (a, b) for a, b in sequence_pairs
+            if a.rec_id in candidate_ids and b.rec_id in candidate_ids
+        ]
+    sequence_rows = _multimodal_sequence_surprise_rows(
+        model, sequence_pairs, vocab, view_dims, device=device,
+        temperature=sequence_temperature)
+    sequence_by_id = {}
+    for seq_row in sequence_rows:
+        for key in ("anchor", "positive"):
+            rec = seq_row[key]
+            current = sequence_by_id.get(rec.rec_id)
+            if (current is None
+                    or seq_row["sequence_surprise"] > current["sequence_surprise"]):
+                sequence_by_id[rec.rec_id] = seq_row
+
+    rows = []
+    model.eval()
+    with torch.no_grad():
+        active_memory = memory.active()
+        active_relations = memory.active_relations()
+        prediction_relations = memory.active_prediction_relations()
+        active_transitions = memory.active_transitions()
+        graph_ready = latent_concept_graph_ready(memory)
+        for off in range(0, len(candidates), 64):
+            batch_records = candidates[off:off + 64]
+            features, txt, _ids = _batch_from_records(
+                batch_records, vocab, device, view_dims)
+            views = {
+                mode: model.latent_concept_states(
+                    features, txt, mode=mode, project=True)
+                for mode in MODES
+            }
+            full_slots = views["full"]
+            curiosity, curiosity_parts = latent_concept_graph_curiosity_scores(
+                full_slots, active_memory, active_relations,
+                temperature=curiosity_temperature,
+                self_loop_w=curiosity_self_loop_w,
+                transitive_steps=curiosity_transitive_steps,
+                transitive_w=curiosity_transitive_w)
+            graph_rows = []
+            cycle_rows = []
+            graph_parts_rows = {
+                "kl": [], "cosine": []}
+            cycle_parts_rows = {
+                "forward_kl": [], "reverse_kl": [],
+                "source_cycle_kl": [], "target_cycle_kl": []}
+            for mode in ("sensor_only", "text_only"):
+                source = views.get(mode)
+                if source is None:
+                    continue
+                graph, graph_parts = latent_concept_graph_prediction_scores(
+                    source, full_slots, active_memory, prediction_relations,
+                    temperature=graph_temperature, self_loop_w=graph_self_loop_w,
+                    transitive_steps=graph_transitive_steps,
+                    transitive_w=graph_transitive_w,
+                    target_power=graph_target_power)
+                cycle, cycle_parts = latent_concept_graph_cycle_scores(
+                    source, full_slots, active_memory, prediction_relations,
+                    temperature=cycle_temperature, self_loop_w=cycle_self_loop_w,
+                    transitive_steps=cycle_transitive_steps,
+                    transitive_w=cycle_transitive_w,
+                    target_power=cycle_target_power, cycle_w=cycle_w)
+                graph_rows.append(graph)
+                cycle_rows.append(cycle)
+                for key in graph_parts_rows:
+                    graph_parts_rows[key].append(
+                        graph_parts.get(key, graph.new_zeros(graph.shape)))
+                for key in cycle_parts_rows:
+                    cycle_parts_rows[key].append(
+                        cycle_parts.get(key, cycle.new_zeros(cycle.shape)))
+            zero = full_slots.reshape(full_slots.shape[0], -1).sum(-1) * 0.0
+            graph = torch.stack(graph_rows).mean(0) if graph_rows else zero
+            cycle = torch.stack(cycle_rows).mean(0) if cycle_rows else zero
+            graph_parts = {
+                key: (torch.stack(values).mean(0) if values else zero)
+                for key, values in graph_parts_rows.items()}
+            cycle_parts = {
+                key: (torch.stack(values).mean(0) if values else zero)
+                for key, values in cycle_parts_rows.items()}
+            fer_scores, fer_parts = latent_multimodal_fer_scores_from_views(views)
+            bridge, bridge_entropy, bridge_connectivity = latent_concept_bridge_scores(
+                full_slots, active_memory, active_relations, active_transitions)
+            novelty = curiosity_parts.get(
+                "novelty", curiosity.new_zeros(curiosity.shape))
+            association = curiosity_parts.get(
+                "association", curiosity.new_zeros(curiosity.shape))
+            for i, rec in enumerate(batch_records):
+                seq = sequence_by_id.get(rec.rec_id, {})
+                rows.append({
+                    "record": rec,
+                    "curiosity": float(curiosity[i].detach().cpu()),
+                    "novelty": float(novelty[i].detach().cpu()),
+                    "association": float(association[i].detach().cpu()),
+                    "graph": float(graph[i].detach().cpu()),
+                    "graph_kl": float(graph_parts["kl"][i].detach().cpu()),
+                    "graph_cosine": float(graph_parts["cosine"][i].detach().cpu()),
+                    "cycle": float(cycle[i].detach().cpu()),
+                    "forward_kl": float(
+                        cycle_parts["forward_kl"][i].detach().cpu()),
+                    "reverse_kl": float(
+                        cycle_parts["reverse_kl"][i].detach().cpu()),
+                    "source_cycle_kl": float(
+                        cycle_parts["source_cycle_kl"][i].detach().cpu()),
+                    "target_cycle_kl": float(
+                        cycle_parts["target_cycle_kl"][i].detach().cpu()),
+                    "fer_score": float(fer_scores[i].detach().cpu()),
+                    "fer_fragmentation": float(
+                        fer_parts["fragmentation"][i].detach().cpu()),
+                    "fer_slot_correlation": float(
+                        fer_parts["slot_correlation"][i].detach().cpu()),
+                    "fer_slot_imbalance": float(
+                        fer_parts["slot_imbalance"][i].detach().cpu()),
+                    "bridge": float(bridge[i].detach().cpu()),
+                    "bridge_entropy": float(bridge_entropy[i].detach().cpu()),
+                    "bridge_connectivity": float(
+                        bridge_connectivity[i].detach().cpu()),
+                    "sequence_surprise": float(
+                        seq.get("sequence_surprise", 0.0)),
+                    "sequence_cross_entropy": float(
+                        seq.get("sequence_cross_entropy", 0.0)),
+                    "sequence_positive_cosine": float(
+                        seq.get("sequence_positive_cosine", 0.0)),
+                    "sequence_hard_negative_cosine": float(
+                        seq.get("sequence_hard_negative_cosine", 0.0)),
+                    "sequence_rank": float(seq.get("sequence_rank", 0.0)),
+                })
+    components = (
+        "curiosity", "graph", "cycle", "fer_score", "bridge",
+        "sequence_surprise")
+    for name in components:
+        scaled = _minmax_scale([row[name] for row in rows])
+        for row, value in zip(rows, scaled):
+            row[f"{name}_scaled"] = float(value)
+    for row in rows:
+        row["score"] = float(np.mean([row[f"{name}_scaled"] for name in components]))
+    rows.sort(key=lambda row: row["score"], reverse=True)
+    selected = [row["record"] for row in rows]
+
+    def mean_field(name):
+        return float(np.mean([row[name] for row in rows])) if rows else 0.0
+
+    def max_field(name):
+        return float(max([row[name] for row in rows])) if rows else 0.0
+
+    return selected, {"n_records": len(candidates),
+                      "n_selected": len(selected),
+                      "mean_score": mean_field("score"),
+                      "max_score": max_field("score"),
+                      "mean_curiosity": mean_field("curiosity"),
+                      "mean_novelty": mean_field("novelty"),
+                      "mean_association": mean_field("association"),
+                      "mean_graph_score": mean_field("graph"),
+                      "mean_graph_kl": mean_field("graph_kl"),
+                      "mean_graph_cosine": mean_field("graph_cosine"),
+                      "mean_cycle_score": mean_field("cycle"),
+                      "mean_forward_kl": mean_field("forward_kl"),
+                      "mean_reverse_kl": mean_field("reverse_kl"),
+                      "mean_source_cycle_kl": mean_field("source_cycle_kl"),
+                      "mean_target_cycle_kl": mean_field("target_cycle_kl"),
+                      "mean_fer_score": mean_field("fer_score"),
+                      "max_fer_score": max_field("fer_score"),
+                      "mean_fer_fragmentation": mean_field("fer_fragmentation"),
+                      "mean_fer_slot_correlation": mean_field(
+                          "fer_slot_correlation"),
+                      "mean_fer_slot_imbalance": mean_field("fer_slot_imbalance"),
+                      "mean_bridge_score": mean_field("bridge"),
+                      "max_bridge_score": max_field("bridge"),
+                      "mean_bridge_entropy": mean_field("bridge_entropy"),
+                      "mean_bridge_connectivity": mean_field("bridge_connectivity"),
+                      "mean_sequence_surprise": mean_field("sequence_surprise"),
+                      "max_sequence_surprise": max_field("sequence_surprise"),
+                      "mean_sequence_cross_entropy": mean_field(
+                          "sequence_cross_entropy"),
+                      "mean_sequence_positive_cosine": mean_field(
+                          "sequence_positive_cosine"),
+                      "mean_sequence_hard_negative_cosine": mean_field(
+                          "sequence_hard_negative_cosine"),
+                      "mean_sequence_rank": mean_field("sequence_rank"),
+                      "n_sequence_pairs": len(sequence_rows),
+                      "sequence_mining": sequence_mining,
+                      "memory_filled": int(active_memory.shape[0]),
+                      "graph_ready": bool(graph_ready),
+                      "skipped": False}
+
+
 def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           device=DEV, log_every=100, layers=3, heads=4, max_len=128,
           view_tokens=4, txt_tokens=8, trunk_arch="mlp",
@@ -1524,6 +1789,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           latent_concept_fer_probe_n=0,
           latent_concept_fer_hard_max=0,
           latent_concept_fer_refresh_steps=0,
+          latent_concept_discovery_probe_n=0,
+          latent_concept_discovery_hard_max=0,
+          latent_concept_discovery_refresh_steps=0,
           latent_concept_memory_w=0.0,
           latent_concept_memory_size=0,
           latent_concept_memory_temperature=0.1,
@@ -1586,10 +1854,23 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         raise ValueError("latent concept FER hard max must be non-negative")
     if int(latent_concept_fer_refresh_steps) < 0:
         raise ValueError("latent concept FER refresh steps must be non-negative")
+    if int(latent_concept_discovery_probe_n) < 0:
+        raise ValueError("latent concept discovery probe count must be non-negative")
+    if int(latent_concept_discovery_hard_max) < 0:
+        raise ValueError("latent concept discovery hard max must be non-negative")
+    if int(latent_concept_discovery_refresh_steps) < 0:
+        raise ValueError("latent concept discovery refresh steps must be non-negative")
     fer_hard_enabled = int(latent_concept_fer_hard_max) > 0
+    discovery_hard_enabled = int(latent_concept_discovery_hard_max) > 0
+    hard_study_enabled = bool(fer_hard_enabled or discovery_hard_enabled)
+    hard_study_strategy = (
+        "discovery" if discovery_hard_enabled
+        else "fer" if fer_hard_enabled else "none")
+    if discovery_hard_enabled and latent_concept_memory_size <= 0:
+        raise ValueError("latent concept discovery hard study requires memory_size > 0")
     if (any(float(w) > 0.0 for w in latent_weights)
             or latent_concept_memory_size > 0
-            or fer_hard_enabled) and latent_concept_slots <= 0:
+            or hard_study_enabled) and latent_concept_slots <= 0:
         raise ValueError("latent concept losses require latent_concept_slots > 0")
     if int(latent_concept_sequence_batch) < 0 or int(latent_concept_sequence_batch) == 1:
         raise ValueError("latent concept sequence batch must be 0 or at least 2")
@@ -1620,52 +1901,80 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     else:
         model.text_checkpoint_transfer = {}
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    fer_study_pool = []
-    fer_study_reports = []
+    study_pool = []
+    study_reports = []
     last = {}
 
     def selected_id_sample(selected, limit=16):
         return [rec.rec_id for rec in selected[:int(limit)]]
 
-    def refresh_fer_pool(step):
-        nonlocal fer_study_pool
-        probe_n = (int(latent_concept_fer_probe_n)
-                   if int(latent_concept_fer_probe_n) > 0
-                   else max(batch * 4, 1))
-        selected, report = latent_multimodal_fer_examples(
-            model, train_records, vocab, view_dims, n=probe_n,
-            seed=seed + 1301 + int(step), device=device)
-        selected = selected[:int(latent_concept_fer_hard_max)]
+    def refresh_study_pool(step):
+        nonlocal study_pool
+        if hard_study_strategy == "discovery":
+            probe_n = (int(latent_concept_discovery_probe_n)
+                       if int(latent_concept_discovery_probe_n) > 0
+                       else max(batch * 4, 1))
+            hard_max = int(latent_concept_discovery_hard_max)
+            selected, report = latent_multimodal_discovery_examples(
+                model, train_records, vocab, view_dims, n=probe_n,
+                seed=seed + 1301 + int(step), device=device,
+                curiosity_temperature=latent_concept_association_temperature,
+                curiosity_self_loop_w=latent_concept_association_self_loop_w,
+                curiosity_transitive_steps=latent_concept_association_transitive_steps,
+                curiosity_transitive_w=latent_concept_association_transitive_w,
+                graph_temperature=latent_concept_graph_predict_temperature,
+                graph_self_loop_w=latent_concept_graph_predict_self_loop_w,
+                graph_transitive_steps=latent_concept_graph_predict_transitive_steps,
+                graph_transitive_w=latent_concept_graph_predict_transitive_w,
+                graph_target_power=latent_concept_graph_predict_target_power,
+                cycle_temperature=latent_concept_graph_predict_temperature,
+                cycle_self_loop_w=latent_concept_graph_predict_self_loop_w,
+                cycle_transitive_steps=latent_concept_graph_predict_transitive_steps,
+                cycle_transitive_w=latent_concept_graph_predict_transitive_w,
+                cycle_target_power=latent_concept_graph_predict_target_power,
+                sequence_temperature=latent_concept_sequence_temperature)
+        else:
+            probe_n = (int(latent_concept_fer_probe_n)
+                       if int(latent_concept_fer_probe_n) > 0
+                       else max(batch * 4, 1))
+            hard_max = int(latent_concept_fer_hard_max)
+            selected, report = latent_multimodal_fer_examples(
+                model, train_records, vocab, view_dims, n=probe_n,
+                seed=seed + 1301 + int(step), device=device)
+        selected = selected[:hard_max]
         if selected:
-            fer_study_pool = selected
+            study_pool = selected
         report = report | {
             "step": int(step),
-            "strategy": "fer",
+            "strategy": hard_study_strategy,
             "capped": True,
             "n_error_records_used": len(selected),
-            "pool_active": bool(fer_study_pool),
-            "pool_size": len(fer_study_pool),
+            "pool_active": bool(study_pool),
+            "pool_size": len(study_pool),
             "hard_record_ids": selected_id_sample(selected),
             "hard_record_count": len(selected),
         }
-        fer_study_reports.append(report)
+        study_reports.append(report)
 
     for st in range(1, int(steps) + 1):
         model.train()
+        refresh_steps = (
+            int(latent_concept_discovery_refresh_steps)
+            if hard_study_strategy == "discovery"
+            else int(latent_concept_fer_refresh_steps))
         refresh_due = (
-            fer_hard_enabled
-            and (not fer_study_pool or st == 1 or (
-                latent_concept_fer_refresh_steps
-                and (st - 1) % int(latent_concept_fer_refresh_steps) == 0)))
+            hard_study_enabled
+            and (not study_pool or st == 1 or (
+                refresh_steps and (st - 1) % refresh_steps == 0)))
         if refresh_due:
-            refresh_fer_pool(st)
+            refresh_study_pool(st)
             model.train()
-        batch_source = fer_study_pool if fer_study_pool else train_records
+        batch_source = study_pool if study_pool else train_records
         features, txt, ids = _batch_from_records(
             _sample_records(batch_source, batch, rng), vocab, device, view_dims)
         needs_latent = bool(any(float(w) > 0.0 for w in latent_weights)
                             or latent_concept_memory_size > 0
-                            or fer_hard_enabled)
+                            or hard_study_enabled)
         bundles_by_mode = {
             mode: model.mode_bundle(
                 features, txt, ids, mode=mode, need_latent=needs_latent,
@@ -1818,9 +2127,28 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "latent_fer_probe_n": int(latent_concept_fer_probe_n),
             "latent_fer_hard_max": int(latent_concept_fer_hard_max),
             "latent_fer_refresh_steps": int(latent_concept_fer_refresh_steps),
-            "latent_fer_study_pool_size": len(fer_study_pool),
-            "latent_fer_hard_record_ids": selected_id_sample(fer_study_pool),
-            "latent_fer_study_reports": fer_study_reports,
+            "latent_fer_study_pool_size": (
+                len(study_pool) if hard_study_strategy == "fer" else 0),
+            "latent_fer_hard_record_ids": (
+                selected_id_sample(study_pool) if hard_study_strategy == "fer"
+                else []),
+            "latent_fer_study_reports": (
+                study_reports if hard_study_strategy == "fer" else []),
+            "latent_discovery_probe_n": int(latent_concept_discovery_probe_n),
+            "latent_discovery_hard_max": int(latent_concept_discovery_hard_max),
+            "latent_discovery_refresh_steps": int(
+                latent_concept_discovery_refresh_steps),
+            "latent_discovery_study_pool_size": (
+                len(study_pool) if hard_study_strategy == "discovery" else 0),
+            "latent_discovery_hard_record_ids": (
+                selected_id_sample(study_pool)
+                if hard_study_strategy == "discovery" else []),
+            "latent_discovery_study_reports": (
+                study_reports if hard_study_strategy == "discovery" else []),
+            "latent_study_strategy": hard_study_strategy,
+            "latent_study_pool_size": len(study_pool),
+            "latent_study_hard_record_ids": selected_id_sample(study_pool),
+            "latent_study_reports": study_reports,
             "latent_memory_loss": float(latent_memory.detach()),
             "latent_association_loss": float(latent_association.detach()),
             "latent_composition_loss": float(latent_composition.detach()),
@@ -1873,7 +2201,11 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                   f"sequence {last['latent_sequence_loss']:.3f}",
                   flush=True)
     model.train_metrics = last
-    model.latent_fer_study_reports = fer_study_reports
+    model.latent_fer_study_reports = (
+        study_reports if hard_study_strategy == "fer" else [])
+    model.latent_discovery_study_reports = (
+        study_reports if hard_study_strategy == "discovery" else [])
+    model.latent_study_reports = study_reports
     model.manifest_info = {
         "path": manifest,
         "root": root,
@@ -1910,6 +2242,12 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         n=min(64, len(train_records)), seed=seed + 30, device=device)
     latent_fer_hard_probe["top_ids"] = [
         r.rec_id for r in latent_fer_hard_selected[:8]]
+    latent_discovery_selected, latent_discovery_probe = (
+        latent_multimodal_discovery_examples(
+            model, train_records, vocab, view_dims,
+            n=min(64, len(train_records)), seed=seed + 32, device=device))
+    latent_discovery_probe["top_ids"] = [
+        r.rec_id for r in latent_discovery_selected[:8]]
     latent_bridge_probe = latent_multimodal_bridge_eval(
         model, eval_records, vocab, view_dims, n=eval_n, seed=seed + 31,
         device=device)
@@ -1936,6 +2274,7 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         "latent_graph_probe": latent_probe,
         "latent_fer_probe": latent_fer_probe,
         "latent_fer_hard_probe": latent_fer_hard_probe,
+        "latent_discovery_probe": latent_discovery_probe,
         "latent_bridge_probe": latent_bridge_probe,
         "latent_sequence_probe": latent_sequence_probe,
         "text_checkpoint_transfer": getattr(model, "text_checkpoint_transfer", {}),
@@ -2052,6 +2391,16 @@ def selftest():
         assert bridge_eval["skipped"] is False
         assert bridge_eval["graph_ready"] is True
         assert math.isfinite(bridge_eval["bridge_score"])
+        graph_selected, graph_report = latent_multimodal_graph_prediction_examples(
+            model, records, vocab, view_dims, n=4, device="cpu")
+        assert graph_selected and graph_report["skipped"] is False
+        assert len({r.rec_id for r in graph_selected}) == len(graph_selected)
+        discovery_selected, discovery_report = latent_multimodal_discovery_examples(
+            model, records, vocab, view_dims, n=4, device="cpu")
+        assert discovery_selected and discovery_report["skipped"] is False
+        assert math.isfinite(discovery_report["mean_score"])
+        assert "mean_cycle_score" in discovery_report
+        assert "mean_sequence_surprise" in discovery_report
         assert torch.isfinite(latent_multimodal_neighborhood_loss_from_views(views))
         assert torch.isfinite(latent_multimodal_transition_loss_from_views(views))
         assert torch.isfinite(latent_multimodal_cluster_loss_from_views(views))
@@ -2088,6 +2437,25 @@ def selftest():
         assert math.isfinite(trained_model.train_metrics["latent_sequence_loss"])
         assert (trained_model.train_metrics[
             "latent_sequence_transition_last_batch_updates"] > 0)
+        discovery_model, *_ = train(
+            manifest, steps=2, batch=2, d=32, layers=1, heads=4, device="cpu",
+            log_every=2, view_tokens=2, txt_tokens=4,
+            concept_tokens=2, latent_concept_slots=3,
+            latent_concept_memory_size=8,
+            latent_concept_discovery_probe_n=4,
+            latent_concept_discovery_hard_max=2,
+            latent_concept_discovery_refresh_steps=1,
+            latent_concept_graph_predict_w=0.01,
+            latent_concept_bridge_w=0.01,
+            latent_concept_sequence_w=0.01,
+            latent_concept_sequence_batch=2)
+        assert discovery_model.train_metrics["latent_study_strategy"] == "discovery"
+        assert discovery_model.train_metrics["latent_discovery_study_pool_size"] == 2
+        assert discovery_model.train_metrics["latent_discovery_study_reports"]
+        assert len(set(discovery_model.train_metrics[
+            "latent_discovery_hard_record_ids"])) == 2
+        assert any(r.get("strategy") == "discovery"
+                   for r in discovery_model.train_metrics["latent_study_reports"])
     print("multimodal selftest OK")
 
 
@@ -2156,6 +2524,12 @@ def main(argv=None):
                     dest="latent_concept_fer_hard_max")
     ap.add_argument("--latent-concept-fer-refresh-steps", type=int, default=0,
                     dest="latent_concept_fer_refresh_steps")
+    ap.add_argument("--latent-concept-discovery-probe-n", type=int, default=0,
+                    dest="latent_concept_discovery_probe_n")
+    ap.add_argument("--latent-concept-discovery-hard-max", type=int, default=0,
+                    dest="latent_concept_discovery_hard_max")
+    ap.add_argument("--latent-concept-discovery-refresh-steps", type=int, default=0,
+                    dest="latent_concept_discovery_refresh_steps")
     ap.add_argument("--latent-concept-memory-w", type=float, default=0.0,
                     dest="latent_concept_memory_w")
     ap.add_argument("--latent-concept-memory-size", type=int, default=0,
@@ -2303,10 +2677,19 @@ def main(argv=None):
         ap.error("--latent-concept-fer-hard-max must be non-negative")
     if args.latent_concept_fer_refresh_steps < 0:
         ap.error("--latent-concept-fer-refresh-steps must be non-negative")
-    if (any(w > 0.0 for w in latent_weights)
-            or args.latent_concept_memory_size > 0
-            or args.latent_concept_prefix
-            or args.latent_concept_fer_hard_max > 0) and args.latent_concept_slots <= 0:
+    if args.latent_concept_discovery_probe_n < 0:
+        ap.error("--latent-concept-discovery-probe-n must be non-negative")
+    if args.latent_concept_discovery_hard_max < 0:
+        ap.error("--latent-concept-discovery-hard-max must be non-negative")
+    if args.latent_concept_discovery_refresh_steps < 0:
+        ap.error("--latent-concept-discovery-refresh-steps must be non-negative")
+    latent_options_need_slots = (
+        any(w > 0.0 for w in latent_weights)
+        or args.latent_concept_memory_size > 0
+        or args.latent_concept_prefix
+        or args.latent_concept_fer_hard_max > 0
+        or args.latent_concept_discovery_hard_max > 0)
+    if latent_options_need_slots and args.latent_concept_slots <= 0:
         ap.error("latent concept options require --latent-concept-slots > 0")
     if args.latent_concept_memory_temperature <= 0.0:
         ap.error("--latent-concept-memory-temperature must be positive")
@@ -2363,6 +2746,10 @@ def main(argv=None):
         latent_concept_fer_probe_n=args.latent_concept_fer_probe_n,
         latent_concept_fer_hard_max=args.latent_concept_fer_hard_max,
         latent_concept_fer_refresh_steps=args.latent_concept_fer_refresh_steps,
+        latent_concept_discovery_probe_n=args.latent_concept_discovery_probe_n,
+        latent_concept_discovery_hard_max=args.latent_concept_discovery_hard_max,
+        latent_concept_discovery_refresh_steps=(
+            args.latent_concept_discovery_refresh_steps),
         latent_concept_memory_w=args.latent_concept_memory_w,
         latent_concept_memory_size=args.latent_concept_memory_size,
         latent_concept_memory_temperature=args.latent_concept_memory_temperature,
