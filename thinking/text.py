@@ -2111,12 +2111,12 @@ READING_DISCOVERY_SIGNALS = (
     "view", "context", "span", "closure", "sequence", "neighborhood", "cluster",
     "fer", "bridge")
 READING_STUDY_STRATEGIES = (
-    "random", "errors", "fer", "curiosity", "sequence", "graph", "cycle",
-    "gap", "discovery", "auto")
+    "random", "errors", "fer", "curiosity", "sequence", "closure", "graph",
+    "cycle", "gap", "discovery", "auto")
 READING_MEMORY_STUDY_STRATEGIES = ("curiosity", "graph", "gap", "discovery")
 READING_POOL_STUDY_STRATEGIES = (
-    "errors", "fer", "curiosity", "sequence", "graph", "cycle", "gap",
-    "discovery")
+    "errors", "fer", "curiosity", "sequence", "closure", "graph", "cycle",
+    "gap", "discovery")
 READING_TRANSITION_STUDY_STRATEGIES = (
     "sequence", "graph", "cycle", "gap", "discovery")
 READING_GRAPH_READY_STUDY_STRATEGIES = ("graph", "cycle", "gap")
@@ -2131,7 +2131,7 @@ def resolve_reading_study_strategy(study_strategy, model):
             return "errors"
         return ("discovery"
                 if getattr(model, "latent_concept_memory", None) is not None
-                else "fer")
+                else "closure")
     return requested
 
 
@@ -2670,6 +2670,176 @@ def reading_sequence_surprise_records(
                       "mean_sequence_rank": mean_field("sequence_rank"),
                       "skipped": not bool(rows),
                       "mining": mine_report}
+
+
+def reading_context_closure_surprise_records(
+        model, vocab, records, device=DEV, n=0, seed=0, split="train",
+        split_frac=0.5, feature_dropout=0.0, temperature=0.1):
+    if (getattr(model, "latent_concepts", None) is None
+            or not hasattr(model, "reading_predictor")):
+        return [], {"n_records": 0, "sampled": False, "split": split,
+                    "n_selected": 0, "mean_score": 0.0,
+                    "max_score": 0.0, "mean_closure_surprise": 0.0,
+                    "max_closure_surprise": 0.0, "n_usable": 0,
+                    "skipped": True}
+    candidates = [r for r in records if r.split == split]
+    sampled = bool(n and n < len(candidates))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=int(n), replace=False)
+        candidates = [candidates[int(i)] for i in idx]
+    rows = []
+    temp = max(float(temperature), 1e-6)
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(candidates), 64):
+            batch = candidates[off:off + 64]
+            txt = pack_reading(batch, vocab, device)
+            prefix_txt, suffix_txt, used = split_reading_context_closure(
+                txt, vocab.pad, split_frac=split_frac)
+            usable = used.any(1)
+            if not bool(usable.any()):
+                continue
+            usable_idx = torch.where(usable)[0]
+            batch = [batch[int(i.detach().cpu())] for i in usable_idx]
+            txt = txt.index_select(0, usable_idx)
+            prefix_txt = prefix_txt.index_select(0, usable_idx)
+            suffix_txt = suffix_txt.index_select(0, usable_idx)
+            prefix_slots = model.latent_concept_states(
+                prefix_txt, feature_dropout=feature_dropout, project=False)
+            suffix_slots = model.latent_concept_states(
+                suffix_txt, feature_dropout=feature_dropout, project=False)
+            full_slots = model.latent_concept_states(
+                txt, feature_dropout=0.0, project=False)
+            prefix_pred = model.reading_predictor(prefix_slots)
+            suffix_pred = model.reading_predictor(suffix_slots)
+            prefix_pred = F.normalize(
+                prefix_pred.reshape(prefix_pred.shape[0], -1), dim=-1)
+            suffix_pred = F.normalize(
+                suffix_pred.reshape(suffix_pred.shape[0], -1), dim=-1)
+            target = F.normalize(
+                full_slots.detach().reshape(full_slots.shape[0], -1), dim=-1)
+            prefix_sim = prefix_pred.matmul(target.t())
+            suffix_sim = suffix_pred.matmul(target.t())
+            labels = torch.arange(prefix_sim.shape[0], device=prefix_sim.device)
+            if prefix_sim.shape[0] > 1:
+                prefix_ce = F.cross_entropy(
+                    prefix_sim / temp, labels, reduction="none")
+                suffix_ce = F.cross_entropy(
+                    suffix_sim / temp, labels, reduction="none")
+                eye = torch.eye(
+                    prefix_sim.shape[0], dtype=torch.bool,
+                    device=prefix_sim.device)
+                prefix_pos = prefix_sim.diag()
+                suffix_pos = suffix_sim.diag()
+                prefix_hard = prefix_sim.masked_fill(eye, -float("inf")).max(-1).values
+                suffix_hard = suffix_sim.masked_fill(eye, -float("inf")).max(-1).values
+                prefix_hard = torch.where(
+                    torch.isfinite(prefix_hard), prefix_hard,
+                    torch.zeros_like(prefix_pos))
+                suffix_hard = torch.where(
+                    torch.isfinite(suffix_hard), suffix_hard,
+                    torch.zeros_like(suffix_pos))
+                prefix_rank = (
+                    prefix_sim.ge(prefix_pos[:, None]).sum(-1).to(prefix_sim.dtype)
+                    - 1.0)
+                suffix_rank = (
+                    suffix_sim.ge(suffix_pos[:, None]).sum(-1).to(suffix_sim.dtype)
+                    - 1.0)
+                prefix_surprise = prefix_ce + F.relu(prefix_hard - prefix_pos)
+                suffix_surprise = suffix_ce + F.relu(suffix_hard - suffix_pos)
+            else:
+                prefix_pos = (prefix_pred * target).sum(-1)
+                suffix_pos = (suffix_pred * target).sum(-1)
+                zero = prefix_pos * 0.0
+                prefix_ce = zero
+                suffix_ce = zero
+                prefix_hard = zero
+                suffix_hard = zero
+                prefix_rank = zero
+                suffix_rank = zero
+                prefix_surprise = zero
+                suffix_surprise = zero
+            mean_cosine = 0.5 * (prefix_pos + suffix_pos)
+            closure_surprise = (
+                0.5 * (prefix_surprise + suffix_surprise)
+                + F.relu(1.0 - mean_cosine))
+            valid_count = txt.ne(vocab.pad).sum(1).clamp_min(1)
+            prefix_rate = (
+                prefix_txt.ne(vocab.pad).sum(1).to(dtype=torch.float32)
+                / valid_count.to(dtype=torch.float32))
+            suffix_rate = (
+                suffix_txt.ne(vocab.pad).sum(1).to(dtype=torch.float32)
+                / valid_count.to(dtype=torch.float32))
+            for i, rec in enumerate(batch):
+                rows.append({
+                    "record": rec,
+                    "closure_surprise": float(
+                        closure_surprise[i].detach().cpu()),
+                    "prefix_surprise": float(prefix_surprise[i].detach().cpu()),
+                    "suffix_surprise": float(suffix_surprise[i].detach().cpu()),
+                    "closure_cross_entropy": float(
+                        (0.5 * (prefix_ce[i] + suffix_ce[i])).detach().cpu()),
+                    "prefix_cross_entropy": float(prefix_ce[i].detach().cpu()),
+                    "suffix_cross_entropy": float(suffix_ce[i].detach().cpu()),
+                    "closure_cosine": float(mean_cosine[i].detach().cpu()),
+                    "prefix_cosine": float(prefix_pos[i].detach().cpu()),
+                    "suffix_cosine": float(suffix_pos[i].detach().cpu()),
+                    "prefix_hard_negative_cosine": float(
+                        prefix_hard[i].detach().cpu()),
+                    "suffix_hard_negative_cosine": float(
+                        suffix_hard[i].detach().cpu()),
+                    "prefix_rank": float(prefix_rank[i].detach().cpu()),
+                    "suffix_rank": float(suffix_rank[i].detach().cpu()),
+                    "prefix_token_rate": float(prefix_rate[i].detach().cpu()),
+                    "suffix_token_rate": float(suffix_rate[i].detach().cpu()),
+                })
+    rows.sort(key=lambda row: row["closure_surprise"], reverse=True)
+    selected = [row["record"] for row in rows]
+
+    def mean_field(name):
+        return float(np.mean([row[name] for row in rows])) if rows else 0.0
+
+    def max_field(name):
+        return float(max([row[name] for row in rows])) if rows else 0.0
+
+    return selected, {"n_records": len(candidates),
+                      "sampled": sampled,
+                      "split": split,
+                      "n_selected": len(selected),
+                      "n_usable": len(rows),
+                      "mean_score": mean_field("closure_surprise"),
+                      "max_score": max_field("closure_surprise"),
+                      "mean_closure_surprise": mean_field(
+                          "closure_surprise"),
+                      "max_closure_surprise": max_field(
+                          "closure_surprise"),
+                      "mean_prefix_surprise": mean_field(
+                          "prefix_surprise"),
+                      "mean_suffix_surprise": mean_field(
+                          "suffix_surprise"),
+                      "mean_closure_cross_entropy": mean_field(
+                          "closure_cross_entropy"),
+                      "mean_prefix_cross_entropy": mean_field(
+                          "prefix_cross_entropy"),
+                      "mean_suffix_cross_entropy": mean_field(
+                          "suffix_cross_entropy"),
+                      "mean_closure_cosine": mean_field("closure_cosine"),
+                      "mean_prefix_cosine": mean_field("prefix_cosine"),
+                      "mean_suffix_cosine": mean_field("suffix_cosine"),
+                      "mean_prefix_hard_negative_cosine": mean_field(
+                          "prefix_hard_negative_cosine"),
+                      "mean_suffix_hard_negative_cosine": mean_field(
+                          "suffix_hard_negative_cosine"),
+                      "mean_prefix_rank": mean_field("prefix_rank"),
+                      "mean_suffix_rank": mean_field("suffix_rank"),
+                      "mean_prefix_token_rate": mean_field(
+                          "prefix_token_rate"),
+                      "mean_suffix_token_rate": mean_field(
+                          "suffix_token_rate"),
+                      "split_frac": float(split_frac),
+                      "temperature": float(temperature),
+                      "skipped": not bool(rows)}
 
 
 def reading_latent_graph_prediction_records(
@@ -3641,6 +3811,14 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 feature_dropout=0.0,
                 temperature=sequence_temperature)
             report = report | {"strategy": "sequence"}
+        elif study_strategy == "closure":
+            selected, report = reading_context_closure_surprise_records(
+                model, vocab, records, device=device, n=probe_n,
+                seed=seed + 1301 + int(step),
+                split_frac=context_closure_split_frac,
+                feature_dropout=0.0,
+                temperature=context_closure_temperature)
+            report = report | {"strategy": "closure"}
         elif study_strategy == "cycle":
             selected, report = reading_latent_graph_cycle_records(
                 model, vocab, records, device=device, n=probe_n,
@@ -6560,7 +6738,7 @@ def selftest():
         latent_concept_slots=2, latent_concept_memory_size=0).to("cpu")
     assert resolve_reading_study_strategy("auto", reading_model) == "discovery"
     assert (resolve_reading_study_strategy("auto", memoryless_reading_model)
-            == "fer")
+            == "closure")
     reading_txt = pack_reading(reading_records[:2], reading_vocab, "cpu")
     assert torch.isfinite(reading_latent_view_loss(
         reading_model, reading_txt, reading_vocab.pad, reading_vocab.unk,
@@ -6648,6 +6826,12 @@ def selftest():
     assert closure_metrics["skipped"] is False
     assert float(closure_metrics["prefix_token_rate"]) > 0.0
     assert float(closure_metrics["suffix_token_rate"]) > 0.0
+    closure_records, closure_report = reading_context_closure_surprise_records(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0,
+        split_frac=0.5, temperature=0.1)
+    assert closure_records and closure_report["skipped"] is False
+    assert math.isfinite(closure_report["mean_closure_surprise"])
+    assert math.isfinite(closure_report["mean_closure_cosine"])
     discovery_loss, discovery_metrics = reading_latent_discovery_loss(
         reading_model, reading_txt, reading_vocab.pad, feature_dropout=0.1,
         context_keep_p=0.5, graph_transitive_steps=2,
@@ -6841,6 +7025,20 @@ def selftest():
     assert any("mean_insight_score" in r
                for r in reading_model.reading_study_reports
                if r.get("strategy") == "discovery")
+    closure_study_model = TextReadingLM(
+        len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
+        latent_concept_slots=2, latent_concept_memory_size=0).to("cpu")
+    fit_reading_concepts(
+        closure_study_model, reading_vocab, reading_records, steps=1, batch=2,
+        lr=1e-4, seed=6, device="cpu", log_every=1, token_drop_p=0.1,
+        token_replace_p=0.0, study_strategy="closure", study_probe_n=4,
+        study_hard_max=2, study_refresh_steps=1, context_closure_w=0.1,
+        context_closure_split_frac=0.5, context_target_w=0.0, sequence_w=0.0)
+    assert closure_study_model.reading_train_metrics["study_strategy"] == "closure"
+    assert closure_study_model.reading_train_metrics["context_closure_w"] == 0.1
+    assert any(r.get("strategy") == "closure"
+               and "mean_closure_surprise" in r
+               for r in closure_study_model.reading_study_reports)
     fit_reading_concepts(
         reading_model, reading_vocab, reading_records, steps=1, batch=2, lr=1e-4,
         seed=7, device="cpu", log_every=1, token_drop_p=0.1,
