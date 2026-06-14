@@ -1714,7 +1714,7 @@ def main():
                     help="cleaned manifest written after embedding merge")
     ap.add_argument("--image-clean-report-out", default="runs/image_manifest_report.json",
                     dest="image_clean_report_out",
-                    help="manifest QA report written after embedding merge")
+                    help="manifest inspection report written after embedding merge")
     ap.add_argument("--image-clean-min-side", type=int, default=0,
                     dest="image_clean_min_side",
                     help="reject manifest images whose smaller side is below this size")

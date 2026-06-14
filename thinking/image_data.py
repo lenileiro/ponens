@@ -1462,11 +1462,11 @@ def selftest():
         assert summary["image_embedding_records"] == 1 and summary["image_embedding_dims"] == [4]
         assert summary["image_embedding_sequence_records"] == 1
         assert summary["image_embedding_sequence_dims"] == [2]
-        qa_manifest = os.path.join(td, "qa.jsonl")
-        with open(qa_manifest, "w", encoding="utf-8") as f:
+        clean_manifest = os.path.join(td, "clean_manifest.jsonl")
+        with open(clean_manifest, "w", encoding="utf-8") as f:
             for row in (
                     {"image": "sample.ppm", "caption": "red green blocks",
-                     "split": "train", "source": "qa", "text_embedding": [1.0, 0.0],
+                     "split": "train", "source": "fixture", "text_embedding": [1.0, 0.0],
                      "text_embedding_sequence": [[1.0, 0.0], [0.0, 1.0]],
                      "image_embedding": [0.0, 1.0],
                      "image_embedding_sequence": [[0.0, 1.0], [1.0, 0.0]],
@@ -1478,7 +1478,7 @@ def selftest():
                     {"image": "sample.ppm", "caption": "held out patch", "split": "eval"}):
                 f.write(json.dumps(row) + "\n")
         report, kept, rejected = inspect_image_manifest(
-            qa_manifest, split="train", min_caption_tokens=2, check_images=True)
+            clean_manifest, split="train", min_caption_tokens=2, check_images=True)
         assert report["records_kept"] == 1 and len(kept) == 1
         assert report["reject_causes"]["duplicate_path"] == 2
         assert report["reject_causes"]["missing_file"] == 1
@@ -1486,7 +1486,7 @@ def selftest():
         assert report["records_skipped_split"] == 1 and rejected
         assert report["width_stats"]["min"] == 8.0 and report["height_stats"]["min"] == 6.0
         quality_report, quality_kept, quality_rejected = inspect_image_manifest(
-            qa_manifest, split="train", min_caption_tokens=1, check_images=True,
+            clean_manifest, split="train", min_caption_tokens=1, check_images=True,
             dedupe_paths=False, min_caption_unique_ratio=0.5,
             max_caption_token_frequency=0.6, max_caption_token_run=0.6)
         assert len(quality_kept) == 2 and quality_rejected
@@ -1500,7 +1500,7 @@ def selftest():
         with open(filtered, "r", encoding="utf-8") as f:
             filtered_row = json.loads(f.readline())
         assert filtered_row["image"] == "sample.ppm"
-        assert filtered_row["source"] == "qa"
+        assert filtered_row["source"] == "fixture"
         assert filtered_row["nsfw"] == 0.0 and filtered_row["watermark"] == 0.0
         assert filtered_row["text_embedding"] == [1.0, 0.0]
         assert filtered_row["text_embedding_sequence"] == [[1.0, 0.0], [0.0, 1.0]]
@@ -1538,7 +1538,7 @@ def selftest():
         assert overwritten[0].image_embedding_sequence == ((7.0, 6.0), (5.0, 4.0))
         reread = read_image_manifest(filtered, root=td, split="train")
         assert len(reread) == 1 and reread[0].width == 8 and reread[0].height == 6
-        assert reread[0].source == "qa"
+        assert reread[0].source == "fixture"
         scored_manifest = os.path.join(td, "scored.jsonl")
         with open(scored_manifest, "w", encoding="utf-8") as f:
             for row in (

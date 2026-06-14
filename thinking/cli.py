@@ -458,7 +458,7 @@ def cmd_train(args):
         cfg.train_hops, cfg.test_hops = (2, 3), (2, 3)
         cfg.block = 512                                    # family trees need the full window
     if args.simple:                                        # STAIRCASE RUNG A: minimal world --
-        cfg.extract_frac = cfg.write_frac = 0.0            # shallow QA only, built-in surfaces,
+        cfg.extract_frac = cfg.write_frac = 0.0            # shallow goal traces, built-in surfaces,
         cfg.math_frac = cfg.def_frac = cfg.novel_frac = 0.0   # no curriculum, no exams
         cfg.curriculum = False
         cfg.lang_level = "canonical" if args.canon else "builtin"
@@ -665,7 +665,7 @@ def main(argv=None):
     p.add_argument("--world", default="chain", choices=("chain", "kinship"))
     p.add_argument("--deep-depth", type=int, default=0, dest="deep_depth")
     p.add_argument("--simple", action="store_true",
-                   help="staircase rung A: shallow QA, built-in surfaces, no exams")
+                   help="staircase rung A: shallow goal traces, built-in surfaces, no exams")
     p.add_argument("--canon", action="store_true",
                    help="rung A0: canonical fact surfaces (chain-world conditions)")
     p.add_argument("--bank", action="store_true",

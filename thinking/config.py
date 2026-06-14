@@ -20,11 +20,12 @@ class Config:
     #                                   never queried in training; their COMPONENT rules are (via
     #                                   the gender-mirrored targets) -- tests unseen composition
     deep_depth: int = 0               # kinship: >0 mixes deep spines, depths 4..N
-    deep_frac: float = 0.3            # deep share of QA examples (0.5 starved shallow at 15k -- C4;
+    deep_frac: float = 0.3            # deep share of goal-trace examples
+    #                                   (0.5 starved shallow at 15k -- C4;
     #                                   0.3 kept shallow alive while preserving deep signal -- C5)
     deep_preds: tuple = ()            # restrict DEEP-regime query types, e.g. ('ancestor',) for
     #                                   pure recursive length-generalization training
-    contrastive_frac: float = 0.5     # shallow QA share arriving as same-tree question TRIPLETS
+    contrastive_frac: float = 0.5     # shallow goal-trace share arriving as same-tree prompts
     #                                   (question-conditioning: the k=2 fix -- C6d)
     extract_frac: float = 0.25        # fraction of training examples that are READING tasks
     #                                   (NL surface -> exhaustive canonical fact list)

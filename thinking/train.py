@@ -145,7 +145,7 @@ class Trainer:
                         from .trace import render_def_example
                         lv = wlevels[int(rng.integers(len(wlevels)))]
                         dfs = definitions(lv, "train")
-                        if not dfs:                            # no bank: skip to a QA example
+                        if not dfs:                            # no bank: use a goal trace
                             ex = render_goal_example(p, lines, TPL, QS, rng)
                         else:
                             w = list(dfs)[int(rng.integers(len(dfs)))]
@@ -221,7 +221,7 @@ class Trainer:
         return FlowRuntime(m, vocab, StepChecker(RULES), self.cfg, DEV)
 
     def _sample_trace_rank_problem(self, rng):
-        """Sample a QA problem for verifier-action ranking."""
+        """Sample a goal-trace problem for verifier-action ranking."""
         cfg = self.cfg
         if cfg.world != "kinship":
             return None
