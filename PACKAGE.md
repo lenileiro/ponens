@@ -38,8 +38,11 @@ a generic "new connection discovered" acceptance path without English-specific r
 Checkpoint continuation also turns on replay and retention from the checkpoint's own
 reading replay bank when available; replay rows carry model-derived priority and
 reasons such as hard-study examples or concept-insight records, and continuation
-sampling uses those priorities before falling back to uniform replay. Use `manual`
-for exact low-level ablations.
+sampling uses those priorities before falling back to uniform replay. Checkpoints also
+carry a compact reading-mastery history, so long training runs preserve each session's
+score deltas, accepted update, self-teach signal, replay priority counts, and concept
+insight evidence without task-specific labels. Use `manual` for exact low-level
+ablations.
 Optional `--latent-concept-topk` applies the shared latent-slot sparsity gate used by
 multimodal, keeping only the strongest schema-free concept slots per record so reading
 runs can encourage slot specialization without task-specific rules.

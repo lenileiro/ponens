@@ -69,6 +69,14 @@ TOKEN_RE = re.compile(r"[a-z0-9_]+|[^\s\w]", re.ASCII)
 READING_DEFAULT_LATENT_CONCEPT_SLOTS = 4
 READING_REPLAY_BANK_VERSION = 1
 READING_REPLAY_BANK_SIZE = 128
+READING_MASTERY_HISTORY_VERSION = 1
+READING_MASTERY_HISTORY_SIZE = 32
+READING_MASTERY_SCORE_KEYS = (
+    "score", "mastery_score", "active_mean_score", "signal_coverage",
+    "balanced_score", "floor_score", "fer_score", "bridge_score",
+    "bridge_connectivity", "sequence_score", "context_score", "span_score",
+    "context_closure_score", "neighborhood_score", "cluster_score",
+)
 
 
 @dataclass(frozen=True)
@@ -274,6 +282,159 @@ def reading_replay_bank_records_from_payload(payload):
 def reading_replay_bank_records_from_checkpoint(path, device="cpu"):
     ckpt = _torch_load(path, device)
     return reading_replay_bank_records_from_payload(ckpt)
+
+
+def _reading_float(value, default=0.0):
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return out if math.isfinite(out) else float(default)
+
+
+def _reading_int_or_none(value):
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def reading_score_digest(score_components):
+    if not isinstance(score_components, dict):
+        return {}
+    return {
+        key: _reading_float(score_components.get(key, 0.0))
+        for key in READING_MASTERY_SCORE_KEYS
+        if key in score_components
+    }
+
+
+def reading_mastery_history_from_payload(payload):
+    if not isinstance(payload, dict):
+        history = None
+    else:
+        history = payload.get("reading_mastery_history")
+        if history is None:
+            history = (payload.get("report") or {}).get("reading_mastery_history")
+    if isinstance(history, dict):
+        rows = history.get("entries", ())
+    elif isinstance(history, list):
+        rows = history
+    else:
+        rows = ()
+    entries = [dict(row) for row in rows if isinstance(row, dict)]
+    entries = entries[-READING_MASTERY_HISTORY_SIZE:]
+    return {
+        "version": READING_MASTERY_HISTORY_VERSION,
+        "max_entries": READING_MASTERY_HISTORY_SIZE,
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+
+
+def reading_mastery_history_entry(report, session_index=None):
+    report = report if isinstance(report, dict) else {}
+    selection = report.get("selection") if isinstance(
+        report.get("selection"), dict) else {}
+    train_metrics = report.get("train_metrics") if isinstance(
+        report.get("train_metrics"), dict) else {}
+    if not selection and isinstance(train_metrics.get("selection"), dict):
+        selection = train_metrics["selection"]
+    rounds = selection.get("rounds", ()) if isinstance(selection, dict) else ()
+    rounds = [row for row in rounds if isinstance(row, dict)]
+    concept_deltas = [
+        _reading_float(row.get("concept_insight_delta", 0.0))
+        for row in rounds
+    ]
+    replay_priority_counts = [
+        _reading_int_or_none(row.get("replay_priority_record_count"))
+        for row in rounds
+    ]
+    replay_priority_counts = [
+        value for value in replay_priority_counts if value is not None
+    ]
+    self_teach_reports = selection.get("self_teach_reports", ())
+    if not self_teach_reports and isinstance(train_metrics.get("self_teach_plan"), dict):
+        self_teach_reports = (train_metrics["self_teach_plan"],)
+    self_teach_reports = [
+        row for row in self_teach_reports if isinstance(row, dict)
+    ]
+    top_self_teach = self_teach_reports[0] if self_teach_reports else {}
+    bank = report.get("reading_replay_bank")
+    bank = bank if isinstance(bank, dict) else {}
+    delta = report.get("delta") if isinstance(report.get("delta"), dict) else {}
+    data = report.get("data", ())
+    if isinstance(data, (str, bytes)):
+        data = [data]
+    elif not isinstance(data, (list, tuple)):
+        data = []
+    entry = {
+        "version": READING_MASTERY_HISTORY_VERSION,
+        "session_index": _reading_int_or_none(session_index),
+        "experiment": str(report.get("experiment", "")),
+        "checkpoint_experiment": str(report.get("checkpoint_experiment", "")),
+        "data": [str(item) for item in data[:16]],
+        "steps": int(report.get("steps", 0) or 0),
+        "batch": int(report.get("batch", 0) or 0),
+        "reading_objective_profile": str(
+            report.get("reading_objective_profile", "")),
+        "study_strategy_requested": str(
+            report.get("study_strategy_requested", "")),
+        "study_strategy": str(report.get("study_strategy", "")),
+        "latent_concept_slots": int(report.get("latent_concept_slots", 0) or 0),
+        "latent_concept_topk": int(report.get("latent_concept_topk", 0) or 0),
+        "memory_size": int(report.get("memory_size", 0) or 0),
+        "train_records": int(report.get("train_records", 0) or 0),
+        "eval_records": int(report.get("eval_records", 0) or 0),
+        "replay_bank_used": bool(report.get("replay_bank_used", False)),
+        "replay_bank_record_count": int(bank.get("record_count", 0) or 0),
+        "replay_priority_record_count": int(
+            bank.get("priority_record_count", 0) or 0),
+        "selection_enabled": bool(selection.get("enabled", False)),
+        "accepted_update": bool(selection.get("accepted_update", False)),
+        "selected_round": _reading_int_or_none(selection.get("selected_round")),
+        "selected_by_score": bool(selection.get("selected_by_score", False)),
+        "selected_by_insight": bool(selection.get("selected_by_insight", False)),
+        "selected_score_delta": _reading_float(
+            selection.get("selected_score_delta", delta.get("score", 0.0))),
+        "max_concept_insight_delta": max(concept_deltas) if concept_deltas else 0.0,
+        "replay_priority_sampling": any(
+            bool(row.get("replay_priority_sampling", False)) for row in rounds),
+        "replay_priority_round_record_count": (
+            max(replay_priority_counts) if replay_priority_counts else 0),
+        "self_teach_top_signal": str(top_self_teach.get("top_signal", "")),
+        "self_teach_active_signals": [
+            str(item) for item in top_self_teach.get("active_signals", ())],
+        "before_score_components": reading_score_digest(
+            report.get("before_score_components")),
+        "after_score_components": reading_score_digest(
+            report.get("after_score_components")),
+        "delta": {
+            key: _reading_float(delta.get(key, 0.0))
+            for key in (
+                "score", "mastery_score", "active_mean_score",
+                "signal_coverage", "balanced_score", "replay_score")
+            if key in delta
+        },
+    }
+    return entry
+
+
+def reading_mastery_history_with_entry(previous_history, report):
+    previous = reading_mastery_history_from_payload(
+        {"reading_mastery_history": previous_history})
+    entries = list(previous["entries"])
+    entries.append(reading_mastery_history_entry(
+        report, session_index=len(entries) + 1))
+    entries = entries[-READING_MASTERY_HISTORY_SIZE:]
+    return {
+        "version": READING_MASTERY_HISTORY_VERSION,
+        "max_entries": READING_MASTERY_HISTORY_SIZE,
+        "entry_count": len(entries),
+        "entries": entries,
+    }
 
 
 def normalize_reading_record(raw, default_split=None, idx=0, text_field="text"):
@@ -6572,6 +6733,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "study_neighborhoods": getattr(
                   model, "reading_neighborhood_reports", []),
               "study_clusters": getattr(model, "reading_cluster_reports", [])}
+    report["reading_mastery_history"] = reading_mastery_history_with_entry(
+        [], report)
+    report["reading_mastery_history_count"] = report[
+        "reading_mastery_history"]["entry_count"]
     if checkpoint:
         os.makedirs(os.path.dirname(checkpoint) or ".", exist_ok=True)
         torch.save(checkpoint_payload(model, vocab, d, layers, heads, report),
@@ -7332,6 +7497,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "study_neighborhoods": getattr(
                   model, "reading_neighborhood_reports", []),
               "study_clusters": getattr(model, "reading_cluster_reports", [])}
+    report["reading_mastery_history"] = reading_mastery_history_with_entry(
+        reading_mastery_history_from_payload(ckpt), report)
+    report["reading_mastery_history_count"] = report[
+        "reading_mastery_history"]["entry_count"]
     if out_checkpoint:
         os.makedirs(os.path.dirname(out_checkpoint) or ".", exist_ok=True)
         torch.save(checkpoint_payload(model, vocab, d, layers, heads, report),
@@ -7404,6 +7573,8 @@ def checkpoint_payload(model, vocab, d, layers, heads, report):
     }
     if isinstance(report, dict) and report.get("reading_replay_bank") is not None:
         payload["reading_replay_bank"] = report["reading_replay_bank"]
+    if isinstance(report, dict) and report.get("reading_mastery_history") is not None:
+        payload["reading_mastery_history"] = report["reading_mastery_history"]
     return payload
 
 
@@ -7955,13 +8126,57 @@ def selftest():
     reading_replay_bank = build_reading_replay_bank(
         reading_records, study_reports=getattr(reading_model, "reading_study_reports", []),
         max_records=4)
+    reading_selftest_report = {
+        "experiment": "reading-selftest",
+        "data": ["selftest-base"],
+        "steps": 3,
+        "batch": 2,
+        "reading_objective_profile": "mastery",
+        "study_strategy_requested": "auto",
+        "study_strategy": "sequence",
+        "latent_concept_slots": 2,
+        "latent_concept_topk": 0,
+        "memory_size": 8,
+        "train_records": 3,
+        "eval_records": 2,
+        "reading_replay_bank": reading_replay_bank,
+        "before_score_components": {"mastery_score": 0.2, "signal_coverage": 0.4},
+        "after_score_components": {"mastery_score": 0.3, "signal_coverage": 0.6},
+        "delta": {"mastery_score": 0.1, "signal_coverage": 0.2},
+        "selection": {
+            "enabled": True,
+            "accepted_update": True,
+            "selected_round": 1,
+            "selected_by_score": True,
+            "selected_score_delta": 0.1,
+            "rounds": [{
+                "concept_insight_delta": 0.05,
+                "replay_priority_sampling": True,
+                "replay_priority_record_count": 1,
+            }],
+            "self_teach_reports": [{
+                "top_signal": "sequence",
+                "active_signals": ["sequence", "context"],
+            }],
+        },
+    }
+    reading_selftest_report["reading_mastery_history"] = (
+        reading_mastery_history_with_entry([], reading_selftest_report))
+    reading_selftest_report["reading_mastery_history_count"] = (
+        reading_selftest_report["reading_mastery_history"]["entry_count"])
     reading_payload = checkpoint_payload(
         reading_model, reading_vocab, 32, 1, 4,
-        {"experiment": "reading-selftest",
-         "reading_replay_bank": reading_replay_bank})
+        reading_selftest_report)
     assert reading_payload["reading_replay_bank"]["record_count"] > 0
     assert reading_replay_bank_records_from_payload(reading_payload)
     assert reading_payload["latent_concept_memory_size"] == 8
+    assert reading_payload["reading_mastery_history"]["entry_count"] == 1
+    first_history_entry = reading_payload["reading_mastery_history"]["entries"][0]
+    assert first_history_entry["experiment"] == "reading-selftest"
+    assert first_history_entry["accepted_update"] is True
+    assert first_history_entry["self_teach_top_signal"] == "sequence"
+    assert (first_history_entry["replay_priority_round_record_count"] == 1)
+    assert reading_mastery_history_from_payload({})["entry_count"] == 0
     priority_replay_bank = build_reading_replay_bank(
         reading_records,
         study_reports=[{
@@ -8077,6 +8292,14 @@ def selftest():
         assert (studied_payload["report"]["experiment"]
                 == "text_raw_reading_checkpoint_study")
         assert studied_payload["reading_replay_bank"]["record_count"] > 0
+        assert studied_payload["reading_mastery_history"]["entry_count"] == 2
+        assert study_report["reading_mastery_history_count"] == 2
+        history_entries = studied_payload["reading_mastery_history"]["entries"]
+        assert history_entries[0]["experiment"] == "reading-selftest"
+        assert history_entries[1]["experiment"] == (
+            "text_raw_reading_checkpoint_study")
+        assert history_entries[1]["replay_bank_used"] is True
+        assert history_entries[1]["self_teach_top_signal"]
     print("text selftest OK")
 
 
