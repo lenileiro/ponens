@@ -69,6 +69,7 @@ from .concepts import (
     latent_concept_fer_scores,
     latent_concept_graph_ready,
     latent_concept_graph_snapshot,
+    latent_concept_memory_consolidation_loss,
     latent_concept_neighborhood_loss,
     latent_concept_sequence_prediction_loss,
     latent_concept_sequence_prediction_scores,
@@ -1468,27 +1469,11 @@ def reading_latent_memory_consolidation_loss(
         token_replace_p=token_replace_p)
     slots = model.latent_concept_states(
         view, feature_dropout=feature_dropout, project=True)
-    memory_loss = model.latent_concept_memory_loss(
-        slots, temperature=temperature, balance_w=balance_w)
-    rows = F.normalize(slots.reshape(-1, slots.shape[-1]), dim=-1)
-    prototypes = F.normalize(
-        active.detach().to(device=rows.device, dtype=rows.dtype), dim=-1)
-    sims = rows.matmul(prototypes.t())
-    nearest = prototypes[sims.detach().argmax(-1)]
-    nearest_cosine = (rows * nearest).sum(-1)
-    anchor_loss = (1.0 - nearest_cosine).mean()
-    if fer_w:
-        fer_loss = latent_concept_fer_loss(
-            slots, fragmentation_w=fer_fragmentation_w,
-            correlation_w=fer_correlation_w, balance_w=fer_balance_w)
-    else:
-        fer_loss = memory_loss * 0.0
-    loss = memory_loss + float(anchor_w) * anchor_loss + float(fer_w) * fer_loss
-    metrics = {"memory_loss": memory_loss, "anchor_loss": anchor_loss,
-               "fer_loss": fer_loss,
-               "nearest_cosine": nearest_cosine.detach().mean(),
-               "memory_active": active_n, "skipped": False}
-    return loss, metrics
+    return latent_concept_memory_consolidation_loss(
+        slots, active, temperature=temperature, balance_w=balance_w,
+        anchor_w=anchor_w, fer_w=fer_w,
+        fer_fragmentation_w=fer_fragmentation_w,
+        fer_correlation_w=fer_correlation_w, fer_balance_w=fer_balance_w)
 
 
 def reading_latent_association_loss(model, txt, feature_dropout=0.1,

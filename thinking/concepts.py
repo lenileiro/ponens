@@ -171,6 +171,16 @@ class LatentConceptMemory(nn.Module):
         return latent_concept_memory_loss(
             slots, self.active(), temperature=temperature, balance_w=balance_w)
 
+    def consolidation_loss(self, slots, temperature=0.1, balance_w=0.0,
+                           anchor_w=1.0, fer_w=0.0,
+                           fer_fragmentation_w=1.0,
+                           fer_correlation_w=1.0, fer_balance_w=0.1):
+        return latent_concept_memory_consolidation_loss(
+            slots, self.active(), temperature=temperature, balance_w=balance_w,
+            anchor_w=anchor_w, fer_w=fer_w,
+            fer_fragmentation_w=fer_fragmentation_w,
+            fer_correlation_w=fer_correlation_w, fer_balance_w=fer_balance_w)
+
     def association_loss(self, slots, temperature=0.1, target_power=1.0,
                          self_loop_w=0.05, transitive_steps=1,
                          transitive_w=0.0):
@@ -421,6 +431,51 @@ def latent_concept_memory_loss(slots, memory, temperature=0.1, balance_w=0.0):
         losses.append(float(balance_w) * F.kl_div(
             probs.clamp_min(1e-8).log(), uniform, reduction="batchmean"))
     return torch.stack(losses).mean()
+
+
+def latent_concept_memory_consolidation_loss(
+        slots, memory, temperature=0.1, balance_w=0.0, anchor_w=1.0,
+        fer_w=0.0, fer_fragmentation_w=1.0, fer_correlation_w=1.0,
+        fer_balance_w=0.1):
+    """Consolidate current latent slots against self-mined memory prototypes.
+
+    This is a label-free objective: memory rows come from prior batches, and the
+    nearest active prototype becomes the temporary anchor for the current slots.
+    Callers decide what produced the slots, so the same objective works for text,
+    images, multimodal prefixes, or future sensory streams.
+    """
+    zero = torch.tensor(0.0) if slots is None else slots.sum() * 0.0
+    metrics = {"memory_loss": zero, "anchor_loss": zero, "fer_loss": zero,
+               "nearest_cosine": zero, "memory_active": 0, "skipped": True}
+    if slots is None or memory is None or memory.numel() == 0:
+        return zero, metrics
+    if slots.shape[-1] != memory.shape[-1]:
+        raise ValueError("latent concept consolidation dimension mismatch")
+    active_n = int(memory.shape[0])
+    metrics["memory_active"] = active_n
+    if active_n <= 0:
+        return zero, metrics
+    memory_loss = latent_concept_memory_loss(
+        slots, memory, temperature=temperature, balance_w=balance_w)
+    rows = F.normalize(slots.reshape(-1, slots.shape[-1]), dim=-1)
+    prototypes = F.normalize(
+        memory.detach().to(device=rows.device, dtype=rows.dtype), dim=-1)
+    sims = rows.matmul(prototypes.t())
+    nearest = prototypes[sims.detach().argmax(-1)]
+    nearest_cosine = (rows * nearest).sum(-1)
+    anchor_loss = (1.0 - nearest_cosine).mean()
+    if fer_w:
+        fer_loss = latent_concept_fer_loss(
+            slots, fragmentation_w=fer_fragmentation_w,
+            correlation_w=fer_correlation_w, balance_w=fer_balance_w)
+    else:
+        fer_loss = memory_loss * 0.0
+    loss = memory_loss + float(anchor_w) * anchor_loss + float(fer_w) * fer_loss
+    metrics = {"memory_loss": memory_loss, "anchor_loss": anchor_loss,
+               "fer_loss": fer_loss,
+               "nearest_cosine": nearest_cosine.detach().mean(),
+               "memory_active": active_n, "skipped": False}
+    return loss, metrics
 
 
 def latent_concept_sequence_prediction_loss(predictor, source_slots, target_slots,

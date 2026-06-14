@@ -1363,6 +1363,16 @@ def payload(args):
                 f"{args.multimodal_latent_concept_memory_momentum} "
                 f"--latent-concept-memory-balance-w "
                 f"{args.multimodal_latent_concept_memory_balance_w} "
+                f"--latent-concept-consolidation-w "
+                f"{args.multimodal_latent_concept_consolidation_w} "
+                f"--latent-concept-consolidation-temperature "
+                f"{args.multimodal_latent_concept_consolidation_temperature} "
+                f"--latent-concept-consolidation-balance-w "
+                f"{args.multimodal_latent_concept_consolidation_balance_w} "
+                f"--latent-concept-consolidation-anchor-w "
+                f"{args.multimodal_latent_concept_consolidation_anchor_w} "
+                f"--latent-concept-consolidation-fer-w "
+                f"{args.multimodal_latent_concept_consolidation_fer_w} "
                 f"--latent-concept-association-w "
                 f"{args.multimodal_latent_concept_association_w} "
                 f"--latent-concept-association-temperature "
@@ -2969,6 +2979,20 @@ def main():
                     default=0.95, dest="multimodal_latent_concept_memory_momentum")
     ap.add_argument("--multimodal-latent-concept-memory-balance-w", type=float,
                     default=0.01, dest="multimodal_latent_concept_memory_balance_w")
+    ap.add_argument("--multimodal-latent-concept-consolidation-w", type=float,
+                    default=0.0, dest="multimodal_latent_concept_consolidation_w")
+    ap.add_argument("--multimodal-latent-concept-consolidation-temperature",
+                    type=float, default=0.1,
+                    dest="multimodal_latent_concept_consolidation_temperature")
+    ap.add_argument("--multimodal-latent-concept-consolidation-balance-w",
+                    type=float, default=0.01,
+                    dest="multimodal_latent_concept_consolidation_balance_w")
+    ap.add_argument("--multimodal-latent-concept-consolidation-anchor-w",
+                    type=float, default=1.0,
+                    dest="multimodal_latent_concept_consolidation_anchor_w")
+    ap.add_argument("--multimodal-latent-concept-consolidation-fer-w",
+                    type=float, default=0.0,
+                    dest="multimodal_latent_concept_consolidation_fer_w")
     ap.add_argument("--multimodal-latent-concept-association-w", type=float,
                     default=0.0, dest="multimodal_latent_concept_association_w")
     ap.add_argument("--multimodal-latent-concept-association-temperature",
@@ -3845,6 +3869,14 @@ def main():
                 args.multimodal_latent_concept_memory_size),
             "--multimodal-latent-concept-memory-balance-w": (
                 args.multimodal_latent_concept_memory_balance_w),
+            "--multimodal-latent-concept-consolidation-w": (
+                args.multimodal_latent_concept_consolidation_w),
+            "--multimodal-latent-concept-consolidation-balance-w": (
+                args.multimodal_latent_concept_consolidation_balance_w),
+            "--multimodal-latent-concept-consolidation-anchor-w": (
+                args.multimodal_latent_concept_consolidation_anchor_w),
+            "--multimodal-latent-concept-consolidation-fer-w": (
+                args.multimodal_latent_concept_consolidation_fer_w),
             "--multimodal-latent-concept-association-w": (
                 args.multimodal_latent_concept_association_w),
             "--multimodal-latent-concept-association-self-loop-w": (
@@ -3909,6 +3941,7 @@ def main():
             args.multimodal_latent_concept_factorization_w,
             args.multimodal_latent_concept_fer_w,
             args.multimodal_latent_concept_memory_w,
+            args.multimodal_latent_concept_consolidation_w,
             args.multimodal_latent_concept_association_w,
             args.multimodal_latent_concept_composition_w,
             args.multimodal_latent_concept_graph_predict_w,
@@ -3943,6 +3976,8 @@ def main():
         multimodal_temperatures = {
             "--multimodal-latent-concept-memory-temperature": (
                 args.multimodal_latent_concept_memory_temperature),
+            "--multimodal-latent-concept-consolidation-temperature": (
+                args.multimodal_latent_concept_consolidation_temperature),
             "--multimodal-latent-concept-association-temperature": (
                 args.multimodal_latent_concept_association_temperature),
             "--multimodal-latent-concept-composition-temperature": (
@@ -3968,6 +4003,11 @@ def main():
                 or args.multimodal_latent_concept_memory_momentum >= 1.0):
             sys.exit(
                 "ERROR: --multimodal-latent-concept-memory-momentum must be in [0, 1)")
+        if (args.multimodal_latent_concept_consolidation_w > 0.0
+                and args.multimodal_latent_concept_memory_size <= 0):
+            sys.exit(
+                "ERROR: --multimodal-latent-concept-consolidation-w requires "
+                "--multimodal-latent-concept-memory-size > 0")
         if (args.multimodal_latent_concept_association_decay < 0.0
                 or args.multimodal_latent_concept_association_decay >= 1.0):
             sys.exit(
