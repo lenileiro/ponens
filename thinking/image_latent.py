@@ -60,6 +60,7 @@ FLOW_NOISE_COUPLINGS = ("random", "sliced_ot")
 FLOW_REPA_MODES = ("pooled", "token", "both", "auto")
 FLOW_BOUNDARY_MODES = ("none", "right-linear", "double-linear", "double-cosine")
 TIME_SAMPLINGS = ("uniform", "logit-normal", "mode", "adaptive")
+TIME_ADAPTIVE_PRIORS = ("uniform", "logit-normal", "mode")
 DEFAULT_TIME_MODE_SCALE = 1.29
 MAX_TIME_MODE_SCALE = 1.75
 TIME_SHIFT_MODES = ("manual", "dim", "auto")
@@ -2871,17 +2872,53 @@ def mode_flow_time_base(u, mode_scale=DEFAULT_TIME_MODE_SCALE):
     return base.clamp(0.0, 1.0)
 
 
+def timestep_prior_bin_probs(bins, prior="uniform", logit_mean=0.0, logit_std=1.0,
+                             mode_scale=DEFAULT_TIME_MODE_SCALE, samples=0):
+    """Approximate a timestep prior as per-bin probabilities in pre-shift data time."""
+    bins = int(bins)
+    if bins <= 1:
+        raise ValueError("adaptive timestep bins must be > 1")
+    prior = str(prior or "uniform")
+    if prior not in TIME_ADAPTIVE_PRIORS:
+        raise ValueError(f"unknown adaptive timestep prior {prior!r}")
+    if prior == "uniform":
+        return torch.full((bins,), 1.0 / float(bins), dtype=torch.float64)
+    samples = int(samples or max(4096, bins * 256))
+    if samples <= 0:
+        raise ValueError("adaptive timestep prior samples must be positive")
+    q = (torch.arange(samples, dtype=torch.float64) + 0.5) / float(samples)
+    if prior == "logit-normal":
+        logit_std = float(logit_std)
+        if logit_std <= 0.0:
+            raise ValueError("time_logit_std must be positive for logit-normal prior")
+        eps = (
+            math.sqrt(2.0)
+            * torch.erfinv((2.0 * q - 1.0).clamp(-1.0 + 1.0e-12, 1.0 - 1.0e-12))
+            * logit_std
+            + float(logit_mean)
+        )
+        t = torch.sigmoid(eps)
+    else:
+        t = mode_flow_time_base(q.to(torch.float32), mode_scale=mode_scale).to(torch.float64)
+    idx = torch.clamp((t.clamp(0.0, 1.0 - 1.0e-12) * float(bins)).long(), 0, bins - 1)
+    probs = torch.bincount(idx, minlength=bins).to(torch.float64)
+    return probs / probs.sum().clamp_min(1.0e-12)
+
+
 class AdaptiveTimestepSampler:
     """Loss-adaptive rectified-flow timestep sampler.
 
     The sampler keeps an EMA of per-bin velocity loss and samples higher-loss bins
-    more often, with uniform mixing and probability floors so coverage stays broad.
-    Bins live in pre-shift time; the returned times still pass through the configured
-    flow time shift.
+    more often.  A configurable prior can keep early training on a known-good time
+    density while the online loss tracker warms up. Uniform mixing and probability
+    floors keep broad coverage. Bins live in pre-shift time; returned times still
+    pass through the configured flow time shift.
     """
 
     def __init__(self, bins=32, momentum=0.95, uniform_mix=0.05,
-                 min_prob=0.001, loss_power=1.0):
+                 min_prob=0.001, loss_power=1.0, prior="uniform",
+                 prior_mix=0.0, logit_mean=0.0, logit_std=1.0,
+                 mode_scale=DEFAULT_TIME_MODE_SCALE):
         bins = int(bins)
         if bins <= 1:
             raise ValueError("adaptive timestep bins must be > 1")
@@ -2891,17 +2928,28 @@ class AdaptiveTimestepSampler:
         uniform_mix = float(uniform_mix)
         min_prob = float(min_prob)
         loss_power = float(loss_power)
+        prior = str(prior or "uniform")
+        prior_mix = float(prior_mix)
         if uniform_mix < 0.0 or uniform_mix > 1.0:
             raise ValueError("adaptive timestep uniform mix must be in [0, 1]")
         if min_prob < 0.0 or min_prob >= 1.0:
             raise ValueError("adaptive timestep min probability must be in [0, 1)")
         if loss_power <= 0.0:
             raise ValueError("adaptive timestep loss power must be positive")
+        if prior not in TIME_ADAPTIVE_PRIORS:
+            raise ValueError(f"unknown adaptive timestep prior {prior!r}")
+        if prior_mix < 0.0 or prior_mix > 1.0:
+            raise ValueError("adaptive timestep prior mix must be in [0, 1]")
         self.bins = bins
         self.momentum = momentum
         self.uniform_mix = uniform_mix
         self.min_prob = min_prob
         self.loss_power = loss_power
+        self.prior = prior
+        self.prior_mix = prior_mix
+        self.prior_probs = timestep_prior_bin_probs(
+            bins, prior=prior, logit_mean=logit_mean, logit_std=logit_std,
+            mode_scale=mode_scale)
         self.loss_ema = torch.ones(bins, dtype=torch.float64)
         self.counts = torch.zeros(bins, dtype=torch.long)
         self.samples = torch.zeros(bins, dtype=torch.long)
@@ -2910,6 +2958,11 @@ class AdaptiveTimestepSampler:
     def probabilities(self):
         scores = self.loss_ema.clamp_min(1.0e-12).pow(float(self.loss_power))
         probs = scores / scores.sum().clamp_min(1.0e-12)
+        if self.prior_mix > 0.0:
+            probs = (
+                (1.0 - self.prior_mix) * probs
+                + self.prior_mix * self.prior_probs.to(dtype=probs.dtype)
+            )
         if self.uniform_mix > 0.0:
             probs = (
                 (1.0 - self.uniform_mix) * probs
@@ -2968,6 +3021,13 @@ class AdaptiveTimestepSampler:
             f"{prefix}_uniform_mix": float(self.uniform_mix),
             f"{prefix}_min_prob": float(self.min_prob),
             f"{prefix}_loss_power": float(self.loss_power),
+            f"{prefix}_prior": str(self.prior),
+            f"{prefix}_prior_mix": float(self.prior_mix),
+            f"{prefix}_prior_prob_min": float(self.prior_probs.min().item()),
+            f"{prefix}_prior_prob_max": float(self.prior_probs.max().item()),
+            f"{prefix}_prior_prob_entropy": float(
+                -(self.prior_probs * self.prior_probs.clamp_min(1.0e-12).log()).sum().item()
+            ),
             f"{prefix}_updates": int(self.updates),
             f"{prefix}_observed_bins": int((self.counts > 0).sum().item()),
             f"{prefix}_sampled_bins": int((self.samples > 0).sum().item()),
@@ -9185,6 +9245,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       time_adaptive_uniform_mix=0.05,
                       time_adaptive_min_prob=0.001,
                       time_adaptive_loss_power=1.0,
+                      time_adaptive_prior="uniform",
+                      time_adaptive_prior_mix=0.0,
                       time_shift_mode="auto", time_shift_ref_dim=1024.0,
                       time_shift_dim_power=0.5,
                       flow_noise_coupling="random", flow_noise_coupling_projections=1,
@@ -9300,6 +9362,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     time_adaptive_uniform_mix = float(time_adaptive_uniform_mix)
     time_adaptive_min_prob = float(time_adaptive_min_prob)
     time_adaptive_loss_power = float(time_adaptive_loss_power)
+    time_adaptive_prior = str(time_adaptive_prior or "uniform")
+    time_adaptive_prior_mix = float(time_adaptive_prior_mix)
     if time_adaptive_bins <= 1:
         raise ValueError("time_adaptive_bins must be > 1")
     if time_adaptive_momentum < 0.0 or time_adaptive_momentum >= 1.0:
@@ -9310,6 +9374,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("time_adaptive_min_prob must be in [0, 1)")
     if time_adaptive_loss_power <= 0.0:
         raise ValueError("time_adaptive_loss_power must be positive")
+    if time_adaptive_prior not in TIME_ADAPTIVE_PRIORS:
+        raise ValueError(f"unknown time adaptive prior {time_adaptive_prior!r}")
+    if time_adaptive_prior_mix < 0.0 or time_adaptive_prior_mix > 1.0:
+        raise ValueError("time_adaptive_prior_mix must be in [0, 1]")
     requested_latent_normalize = str(latent_normalize or "none")
     effective_latent_normalize = resolve_latent_normalize(
         requested_latent_normalize, image_records=image_records, ae_arch=ae_arch)
@@ -10032,7 +10100,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             momentum=time_adaptive_momentum,
             uniform_mix=time_adaptive_uniform_mix,
             min_prob=time_adaptive_min_prob,
-            loss_power=time_adaptive_loss_power)
+            loss_power=time_adaptive_loss_power,
+            prior=time_adaptive_prior,
+            prior_mix=time_adaptive_prior_mix,
+            logit_mean=time_logit_mean,
+            logit_std=time_logit_std,
+            mode_scale=time_mode_scale)
         if time_sampling == "adaptive" else None
     )
     size_curriculum_switch = size_curriculum_switch_step(
@@ -10605,6 +10678,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "time_adaptive_uniform_mix": float(time_adaptive_uniform_mix),
         "time_adaptive_min_prob": float(time_adaptive_min_prob),
         "time_adaptive_loss_power": float(time_adaptive_loss_power),
+        "time_adaptive_prior": time_adaptive_prior,
+        "time_adaptive_prior_mix": float(time_adaptive_prior_mix),
         **(
             adaptive_time_sampler.report()
             if adaptive_time_sampler is not None else {
@@ -10735,6 +10810,15 @@ def selftest():
     mode_times = sample_flow_times(8, device="cpu", mode="mode", mode_scale=1.29)
     assert tuple(mode_times.shape) == (8, 1, 1, 1)
     assert float(mode_times.min()) >= 0.0 and float(mode_times.max()) <= 1.0
+    prior_probs = timestep_prior_bin_probs(8, prior="mode", mode_scale=1.29)
+    assert tuple(prior_probs.shape) == (8,)
+    assert torch.allclose(prior_probs.sum(), torch.ones((), dtype=torch.float64))
+    assert float(prior_probs.max()) > float(prior_probs.min())
+    adaptive_prior = AdaptiveTimestepSampler(
+        bins=8, prior="mode", prior_mix=0.5, mode_scale=1.29)
+    adaptive_probs = adaptive_prior.probabilities()
+    assert tuple(adaptive_probs.shape) == (8,)
+    assert float(adaptive_probs.max()) > float(adaptive_probs.min())
     curriculum_buckets = normalize_image_size_buckets("16x16,32x16,32x32")
     assert [image_size_key(b) for b in size_curriculum_bucket_order(
         curriculum_buckets)] == ["16x16", "32x16", "32x32"]
@@ -10889,6 +10973,7 @@ def selftest():
             dit_mlp="swiglu",
             time_sampling="adaptive", time_adaptive_bins=4,
             time_adaptive_uniform_mix=0.1,
+            time_adaptive_prior="mode", time_adaptive_prior_mix=0.25,
             image_geometry_cond=True,
             return_conditioner=True)
         assert report["experiment"] == "image_latent_manifest_rectified_flow"
@@ -10900,6 +10985,9 @@ def selftest():
         assert report["time_sampling"] == "adaptive"
         assert math.isclose(report["time_mode_scale"], DEFAULT_TIME_MODE_SCALE)
         assert report["time_adaptive_enabled"] is True
+        assert report["time_adaptive_prior"] == "mode"
+        assert math.isclose(report["time_adaptive_prior_mix"], 0.25)
+        assert report["time_adaptive_prior_prob_max"] > report["time_adaptive_prior_prob_min"]
         assert report["time_adaptive_updates"] >= 1
         assert report["time_adaptive_observed_bins"] >= 1
         assert report["image_geometry_cond"] is True
@@ -11294,6 +11382,13 @@ def main(argv=None):
     ap.add_argument("--time-adaptive-loss-power", type=float, default=1.0,
                     dest="time_adaptive_loss_power",
                     help="power applied to adaptive timestep loss EMA before sampling")
+    ap.add_argument("--time-adaptive-prior", default="uniform",
+                    choices=TIME_ADAPTIVE_PRIORS, dest="time_adaptive_prior",
+                    help=("base timestep prior mixed into adaptive sampling before "
+                          "uniform coverage"))
+    ap.add_argument("--time-adaptive-prior-mix", type=float, default=0.0,
+                    dest="time_adaptive_prior_mix",
+                    help="probability mass taken from --time-adaptive-prior")
     ap.add_argument("--time-shift", type=float, default=1.0, dest="time_shift",
                     help="rectified-flow data-time shift; >1 biases training toward noise")
     ap.add_argument("--time-shift-mode", default="auto", choices=TIME_SHIFT_MODES,
@@ -11615,6 +11710,8 @@ def main(argv=None):
         ap.error("--time-adaptive-min-prob must be in [0, 1)")
     if args.time_adaptive_loss_power <= 0.0:
         ap.error("--time-adaptive-loss-power must be positive")
+    if args.time_adaptive_prior_mix < 0.0 or args.time_adaptive_prior_mix > 1.0:
+        ap.error("--time-adaptive-prior-mix must be in [0, 1]")
     if args.time_mode_scale < 0.0 or args.time_mode_scale >= MAX_TIME_MODE_SCALE:
         ap.error(f"--time-mode-scale must be in [0, {MAX_TIME_MODE_SCALE:g})")
     if args.flow_guidance_distill_w < 0.0:
@@ -11969,6 +12066,8 @@ def main(argv=None):
         time_adaptive_uniform_mix=args.time_adaptive_uniform_mix,
         time_adaptive_min_prob=args.time_adaptive_min_prob,
         time_adaptive_loss_power=args.time_adaptive_loss_power,
+        time_adaptive_prior=args.time_adaptive_prior,
+        time_adaptive_prior_mix=args.time_adaptive_prior_mix,
         time_shift=args.time_shift,
         time_shift_mode=args.time_shift_mode,
         time_shift_ref_dim=args.time_shift_ref_dim,
@@ -12337,6 +12436,10 @@ def main(argv=None):
             "time_adaptive_min_prob", args.time_adaptive_min_prob),
         "time_adaptive_loss_power": report.get(
             "time_adaptive_loss_power", args.time_adaptive_loss_power),
+        "time_adaptive_prior": report.get(
+            "time_adaptive_prior", args.time_adaptive_prior),
+        "time_adaptive_prior_mix": report.get(
+            "time_adaptive_prior_mix", args.time_adaptive_prior_mix),
         "time_adaptive_updates": report.get("time_adaptive_updates", 0),
         "time_adaptive_observed_bins": report.get("time_adaptive_observed_bins", 0),
         "time_adaptive_prob_min": report.get("time_adaptive_prob_min", 0.0),

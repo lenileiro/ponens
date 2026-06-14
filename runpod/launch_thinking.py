@@ -24,6 +24,7 @@ REMOTE = "/workspace/fer_relational"
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IMAGE_SAMPLE_SCHEDULES = ("linear", "quadratic", "sqrt", "cosine", "karras")
 IMAGE_TIME_SAMPLINGS = ("uniform", "logit-normal", "mode", "adaptive")
+IMAGE_TIME_ADAPTIVE_PRIORS = ("uniform", "logit-normal", "mode")
 IMAGE_DEFAULT_TIME_MODE_SCALE = 1.29
 IMAGE_MAX_TIME_MODE_SCALE = 1.75
 
@@ -531,6 +532,10 @@ def apply_image_quality_preset(args):
     args.image_time_sampling = "adaptive" if hq else "logit-normal"
     if hq:
         args.image_time_adaptive_bins = max(int(args.image_time_adaptive_bins), 32)
+        if str(args.image_time_adaptive_prior or "uniform") == "uniform":
+            args.image_time_adaptive_prior = "mode"
+        args.image_time_adaptive_prior_mix = max(
+            float(args.image_time_adaptive_prior_mix), 0.25)
         args.image_time_adaptive_uniform_mix = max(
             float(args.image_time_adaptive_uniform_mix), 0.05)
         args.image_time_adaptive_min_prob = max(
@@ -1069,6 +1074,9 @@ def payload(args):
                      f"--time-adaptive-min-prob {args.image_time_adaptive_min_prob} "
                      f"--time-adaptive-loss-power "
                      f"{args.image_time_adaptive_loss_power} "
+                     f"--time-adaptive-prior {args.image_time_adaptive_prior} "
+                     f"--time-adaptive-prior-mix "
+                     f"{args.image_time_adaptive_prior_mix} "
                      f"--time-shift {args.image_time_shift} "
                      f"--time-shift-mode {args.image_time_shift_mode} "
                      f"--time-shift-ref-dim {args.image_time_shift_ref_dim} "
@@ -2873,6 +2881,13 @@ def main():
     ap.add_argument("--image-time-adaptive-loss-power", type=float, default=1.0,
                     dest="image_time_adaptive_loss_power",
                     help="power applied to adaptive image timestep loss EMA")
+    ap.add_argument("--image-time-adaptive-prior", default="uniform",
+                    choices=IMAGE_TIME_ADAPTIVE_PRIORS,
+                    dest="image_time_adaptive_prior",
+                    help="base timestep prior mixed into adaptive image sampling")
+    ap.add_argument("--image-time-adaptive-prior-mix", type=float, default=0.0,
+                    dest="image_time_adaptive_prior_mix",
+                    help="probability mass taken from --image-time-adaptive-prior")
     ap.add_argument("--image-time-shift", type=float, default=1.0,
                     dest="image_time_shift",
                     help="latent image RF data-time shift; >1 biases training toward noise")
@@ -3574,6 +3589,9 @@ def main():
         sys.exit("ERROR: --image-time-adaptive-min-prob must be in [0, 1)")
     if args.image_time_adaptive_loss_power <= 0.0:
         sys.exit("ERROR: --image-time-adaptive-loss-power must be positive")
+    if (args.image_time_adaptive_prior_mix < 0.0
+            or args.image_time_adaptive_prior_mix > 1.0):
+        sys.exit("ERROR: --image-time-adaptive-prior-mix must be in [0, 1]")
     if args.image_time_shift_ref_dim <= 0.0:
         sys.exit("ERROR: --image-time-shift-ref-dim must be positive")
     if args.image_flow_loss_weight_gamma <= 0.0:

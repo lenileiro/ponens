@@ -227,7 +227,7 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
 # geometry conditioning for multi-aspect targets, Fourier flow-time conditioning, decoded-pixel
 # dynamic thresholding for high-CFG samples, progressive bucket curriculum, CFG dropout,
 # boundary-enforced double-cosine rectified-flow velocity, logit-normal flow times with soft
-# Min-SNR velocity weighting, SD3-style mode-biased timestep sampling, adaptive
+# Min-SNR velocity weighting, SD3-style mode-biased timestep priors inside adaptive
 # loss-tracked timestep sampling, EMA-teacher guided self-distillation, triangular
 # middle-window CFG scheduling, Karras/cosine/linear timestep sweeps,
 # adaLN-Zero residual-gated DiT/CrossDiT/MM-DiT blocks,
