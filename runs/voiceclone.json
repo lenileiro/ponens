@@ -1,0 +1,19 @@
+{
+ "experiment": "voiceclone_speaker_encoder",
+ "steps": 8000,
+ "n_train_speakers": 340,
+ "n_holdout_speakers": 113,
+ "seen_speaker_verification": {
+  "auc": 0.88064075,
+  "eer": 0.196,
+  "same_mean": 0.28129208300355824,
+  "diff_mean": 0.006854337790748104
+ },
+ "ZEROSHOT_unseen_speaker_verification": {
+  "auc": 0.8443995,
+  "eer": 0.244,
+  "same_mean": 0.2753051463267766,
+  "diff_mean": 0.00674164003203623
+ },
+ "generalizes_to_unseen_voices": false
+}

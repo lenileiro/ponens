@@ -1,0 +1,8 @@
+{
+ "experiment": "realvoice_ljspeech",
+ "sr": 22050,
+ "steps": 120000,
+ "gan_dist": 0.06372914034873248,
+ "griffinlim_dist": 0.10954762510955333,
+ "n": 20
+}

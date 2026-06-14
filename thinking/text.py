@@ -73,9 +73,10 @@ READING_MASTERY_HISTORY_VERSION = 1
 READING_MASTERY_HISTORY_SIZE = 32
 READING_MASTERY_SCORE_KEYS = (
     "score", "mastery_score", "active_mean_score", "signal_coverage",
-    "balanced_score", "floor_score", "fer_score", "bridge_score",
-    "bridge_connectivity", "sequence_score", "context_score", "span_score",
-    "context_closure_score", "neighborhood_score", "cluster_score",
+    "balanced_score", "floor_score", "view_score", "fer_score",
+    "bridge_score", "bridge_connectivity", "sequence_score", "context_score",
+    "span_score", "context_closure_score", "neighborhood_score",
+    "cluster_score",
 )
 
 
@@ -304,11 +305,16 @@ def _reading_int_or_none(value):
 def reading_score_digest(score_components):
     if not isinstance(score_components, dict):
         return {}
-    return {
+    digest = {
         key: _reading_float(score_components.get(key, 0.0))
         for key in READING_MASTERY_SCORE_KEYS
         if key in score_components
     }
+    for signal in READING_DISCOVERY_SIGNALS:
+        skip_key = f"{signal}_skipped"
+        if skip_key in score_components:
+            digest[skip_key] = bool(score_components.get(skip_key, False))
+    return digest
 
 
 def reading_mastery_history_from_payload(payload):
@@ -2581,12 +2587,72 @@ def reading_profile_report_with_checkpoint(base_report, checkpoint_report):
     return report
 
 
-def reading_self_teach_weight_plan(score_components, budget=0.0):
+def reading_mastery_history_self_teach_prior(history, enabled=True,
+                                             max_entries=8, decay=0.75):
+    if not enabled:
+        return {"enabled": False, "entry_count": 0, "signal_deficits": {}}
+    history = reading_mastery_history_from_payload(
+        {"reading_mastery_history": history})
+    entries = history["entries"][-max(1, int(max_entries)):]
+    decay = min(1.0, max(0.0, float(decay)))
+    weighted = {signal: 0.0 for signal in READING_DISCOVERY_SIGNALS}
+    weights = {signal: 0.0 for signal in READING_DISCOVERY_SIGNALS}
+    top_counts = {signal: 0 for signal in READING_DISCOVERY_SIGNALS}
+    for offset, entry in enumerate(reversed(entries)):
+        if not isinstance(entry, dict):
+            continue
+        score_components = entry.get("after_score_components")
+        if not isinstance(score_components, dict):
+            continue
+        recency_weight = decay ** offset
+        for signal in READING_DISCOVERY_SIGNALS:
+            skip_key = f"{signal}_skipped"
+            if bool(score_components.get(skip_key, False)):
+                continue
+            score_key = READING_SELF_TEACH_SCORE_KEYS[signal]
+            if score_key not in score_components:
+                continue
+            quality = min(1.0, max(0.0, _reading_float(
+                score_components.get(score_key, 0.0))))
+            weighted[signal] += recency_weight * max(0.0, 1.0 - quality)
+            weights[signal] += recency_weight
+        top_signal = str(entry.get("self_teach_top_signal", ""))
+        if top_signal in top_counts:
+            top_counts[top_signal] += 1
+    deficits = {
+        signal: float(weighted[signal] / weights[signal])
+        for signal in READING_DISCOVERY_SIGNALS
+        if weights[signal] > 0.0 and weighted[signal] > 0.0
+    }
+    top_signal = None
+    if deficits:
+        top_signal = max(deficits.items(), key=lambda item: item[1])[0]
+    return {
+        "enabled": True,
+        "entry_count": int(len(entries)),
+        "decay": float(decay),
+        "signal_deficits": deficits,
+        "top_signal": top_signal,
+        "top_signal_counts": {
+            signal: count for signal, count in top_counts.items() if count},
+    }
+
+
+def reading_self_teach_weight_plan(score_components, budget=0.0,
+                                   history_prior=None, history_prior_w=0.5):
     budget = float(budget)
     if budget < 0.0:
         raise ValueError("reading self-teach budget must be non-negative")
+    history_prior_w = float(history_prior_w)
+    if history_prior_w < 0.0:
+        raise ValueError("reading self-teach history prior weight must be non-negative")
+    history_prior = history_prior if isinstance(history_prior, dict) else {}
+    history_deficits = (
+        history_prior.get("signal_deficits")
+        if isinstance(history_prior.get("signal_deficits"), dict) else {})
     extras = {key: 0.0 for key in READING_SELF_TEACH_WEIGHT_KEYS}
     deficits = {}
+    current_deficits = {}
     active = []
     for signal in READING_DISCOVERY_SIGNALS:
         if bool(score_components.get(f"{signal}_skipped", False)):
@@ -2594,7 +2660,11 @@ def reading_self_teach_weight_plan(score_components, budget=0.0):
         score_key = READING_SELF_TEACH_SCORE_KEYS[signal]
         score = float(score_components.get(score_key, 0.0))
         quality = min(1.0, max(0.0, score))
-        deficit = max(0.0, 1.0 - quality)
+        current_deficit = max(0.0, 1.0 - quality)
+        history_deficit = max(
+            0.0, _reading_float(history_deficits.get(signal, 0.0)))
+        deficit = max(current_deficit, history_prior_w * history_deficit)
+        current_deficits[signal] = float(current_deficit)
         deficits[signal] = float(deficit)
         if deficit > 0.0:
             active.append((signal, deficit))
@@ -2615,12 +2685,22 @@ def reading_self_teach_weight_plan(score_components, budget=0.0):
         "total_deficit": float(total_deficit),
         "top_signal": top_signal,
         "signal_deficits": deficits,
+        "current_signal_deficits": current_deficits,
+        "history_signal_deficits": {
+            signal: float(value)
+            for signal, value in history_deficits.items()
+            if signal in READING_DISCOVERY_SIGNALS},
+        "history_prior_enabled": bool(history_prior.get("enabled", False)),
+        "history_prior_entry_count": int(history_prior.get("entry_count", 0) or 0),
+        "history_prior_top_signal": history_prior.get("top_signal"),
+        "history_prior_w": float(history_prior_w),
         "active_signals": [signal for signal, _deficit in active],
         "weight_extras": {key: float(value) for key, value in extras.items()},
     }
 
 
 def reading_self_teach_weight_maps(score_components=None, budget=0.0,
+                                   history_prior=None, history_prior_w=0.5,
                                    **base_weights):
     budget = float(budget)
     if budget < 0.0:
@@ -2641,7 +2721,9 @@ def reading_self_teach_weight_maps(score_components=None, budget=0.0,
     if score_components is None:
         raise ValueError(
             "reading self-teach needs score components when budget is positive")
-    plan = reading_self_teach_weight_plan(score_components, budget=budget)
+    plan = reading_self_teach_weight_plan(
+        score_components, budget=budget,
+        history_prior=history_prior, history_prior_w=history_prior_w)
     extras = plan["weight_extras"]
     effective = {
         key: float(base[key]) + float(extras.get(key, 0.0))
@@ -5349,6 +5431,8 @@ def fit_reading_concepts_select_best(
         replay_teacher_vocab=None, replay_w=0.0, replay_batch=0,
         replay_retention_w=0.0,
         study_self_teach_w=0.0,
+        self_teach_history_prior=None,
+        self_teach_history_prior_w=0.5,
         eval_n=64, score_metric="mastery", score_margin_w=0.1,
         score_min_delta=0.0, score_patience=0, score_target=0.0,
         insight_accept_w=0.25, insight_min_delta=0.0,
@@ -5458,7 +5542,9 @@ def fit_reading_concepts_select_best(
         current_bundle = best_bundle
         branch_from_round = int(best_round)
         self_teach_plan = reading_self_teach_weight_plan(
-            current_bundle["score_components"], budget=study_self_teach_w)
+            current_bundle["score_components"], budget=study_self_teach_w,
+            history_prior=self_teach_history_prior,
+            history_prior_w=self_teach_history_prior_w)
         round_study_strategy = reading_self_teach_study_strategy(
             self_teach_plan, study_strategy, initial_study_strategy, model)
         self_teach_reports.append(
@@ -5865,6 +5951,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            study_insight_accept_w=0.25,
                            study_insight_min_delta=0.0,
                            study_self_teach_w=0.0,
+                           self_teach_history_prior=None,
+                           self_teach_history_prior_w=0.5,
                            eval_n=64):
     if int(latent_concept_slots) <= 0:
         raise ValueError("raw reading concept training requires latent_concept_slots > 0")
@@ -5988,6 +6076,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             insight_accept_w=study_insight_accept_w,
             insight_min_delta=study_insight_min_delta,
             study_self_teach_w=study_self_teach_w,
+            self_teach_history_prior=self_teach_history_prior,
+            self_teach_history_prior_w=self_teach_history_prior_w,
             rounds=study_rounds)
         return model, vocab
     self_teach_before_bundle = None
@@ -6003,6 +6093,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             (self_teach_before_bundle["score_components"]
              if self_teach_before_bundle is not None else None),
             budget=study_self_teach_w,
+            history_prior=self_teach_history_prior,
+            history_prior_w=self_teach_history_prior_w,
             factorization_w=factorization_w,
             fer_w=fer_w,
             discovery_w=discovery_w,
@@ -6925,6 +7017,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         latent_concept_refine=latent_concept_refine,
         latent_concept_refine_gate_init=latent_concept_refine_gate_init,
         latent_concept_memory_size=memory_size)
+    self_teach_history_prior = reading_mastery_history_self_teach_prior(
+        reading_mastery_history_from_payload(ckpt),
+        enabled=(str(reading_objective_profile) == "mastery"
+                 and float(study_self_teach_w) > 0.0))
     replay_teacher_model = None
     replay_teacher_vocab = None
     if replay_records and (replay_w or replay_retention_w):
@@ -7056,6 +7152,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             insight_accept_w=study_insight_accept_w,
             insight_min_delta=study_insight_min_delta,
             study_self_teach_w=study_self_teach_w,
+            self_teach_history_prior=self_teach_history_prior,
             replay_records=replay_records,
             replay_teacher_model=replay_teacher_model,
             replay_teacher_vocab=replay_teacher_vocab,
@@ -7066,6 +7163,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         self_teach_plan, self_teach_base_weights, train_weights = (
             reading_self_teach_weight_maps(
                 before_bundle["score_components"], budget=study_self_teach_w,
+                history_prior=self_teach_history_prior,
                 factorization_w=factorization_w,
                 fer_w=fer_w,
                 discovery_w=discovery_w,
@@ -7381,6 +7479,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                       "updates": {},
                       "applied": False,
                   }),
+              "reading_mastery_history_prior": self_teach_history_prior,
               "replay_w": float(replay_w),
               "replay_batch": int(replay_batch),
               "replay_retention_w": float(replay_retention_w),
