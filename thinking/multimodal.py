@@ -76,6 +76,36 @@ TEXT_KEYS = ("text_tokens", "tokens", "text", "caption")
 TARGET_KEYS = ("target_tokens", "target", "trace_tokens", "trace")
 MULTIMODAL_SCORE_METRICS = (
     "token", "exact", "fer", "bridge", "sequence", "all", "balanced", "mastery")
+MULTIMODAL_SELF_TEACH_SIGNALS = (
+    "token", "mode_floor", "fer", "bridge", "sequence")
+MULTIMODAL_SELF_TEACH_SCORE_KEYS = {
+    "token": "token_score",
+    "mode_floor": "mode_floor_score",
+    "fer": "fer_score",
+    "bridge": "bridge_score",
+    "sequence": "sequence_score",
+}
+MULTIMODAL_SELF_TEACH_SKIP_KEYS = {
+    "token": "token_skipped",
+    "mode_floor": "token_skipped",
+    "fer": "fer_skipped",
+    "bridge": "bridge_skipped",
+    "sequence": "sequence_skipped",
+}
+MULTIMODAL_SELF_TEACH_SIGNAL_OBJECTIVES = {
+    "token": ("decode_w",),
+    "mode_floor": (
+        "agreement_w", "latent_concept_w", "latent_concept_completion_w"),
+    "fer": ("latent_concept_fer_w", "latent_concept_factorization_w"),
+    "bridge": (
+        "latent_concept_bridge_w", "latent_concept_discovery_w",
+        "latent_concept_gap_w", "latent_concept_graph_predict_w"),
+    "sequence": ("latent_concept_sequence_w", "latent_concept_transition_w"),
+}
+MULTIMODAL_SELF_TEACH_WEIGHT_KEYS = tuple(dict.fromkeys(
+    key
+    for keys in MULTIMODAL_SELF_TEACH_SIGNAL_OBJECTIVES.values()
+    for key in keys))
 
 
 @dataclass(frozen=True)
@@ -1923,6 +1953,75 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
             }}
 
 
+def multimodal_self_teach_weight_plan(score_components, budget=0.0):
+    budget = float(budget)
+    if budget < 0.0:
+        raise ValueError("multimodal self-teach budget must be non-negative")
+    extras = {key: 0.0 for key in MULTIMODAL_SELF_TEACH_WEIGHT_KEYS}
+    deficits = {}
+    active = []
+    for signal in MULTIMODAL_SELF_TEACH_SIGNALS:
+        if bool(score_components.get(
+                MULTIMODAL_SELF_TEACH_SKIP_KEYS[signal], False)):
+            continue
+        score = float(score_components.get(
+            MULTIMODAL_SELF_TEACH_SCORE_KEYS[signal], 0.0))
+        quality = min(1.0, max(0.0, score))
+        deficit = max(0.0, 1.0 - quality)
+        deficits[signal] = float(deficit)
+        if deficit > 0.0:
+            active.append((signal, deficit))
+    total_deficit = sum(deficit for _signal, deficit in active)
+    if budget > 0.0 and total_deficit > 0.0:
+        for signal, deficit in active:
+            signal_budget = budget * deficit / total_deficit
+            objectives = MULTIMODAL_SELF_TEACH_SIGNAL_OBJECTIVES[signal]
+            objective_share = signal_budget / float(len(objectives))
+            for key in objectives:
+                extras[key] += objective_share
+    top_signal = None
+    if active:
+        top_signal = max(active, key=lambda item: item[1])[0]
+    return {
+        "enabled": bool(budget > 0.0),
+        "budget": float(budget),
+        "total_deficit": float(total_deficit),
+        "top_signal": top_signal,
+        "signal_deficits": deficits,
+        "active_signals": [signal for signal, _deficit in active],
+        "weight_extras": {key: float(value) for key, value in extras.items()},
+    }
+
+
+def multimodal_self_teach_weight_maps(score_components=None, budget=0.0,
+                                      **base_weights):
+    budget = float(budget)
+    if budget < 0.0:
+        raise ValueError("multimodal self-teach budget must be non-negative")
+    missing = [
+        key for key in MULTIMODAL_SELF_TEACH_WEIGHT_KEYS
+        if key not in base_weights]
+    if missing:
+        raise ValueError(
+            "missing multimodal self-teach base weights: "
+            + ", ".join(sorted(missing)))
+    base = {
+        key: float(base_weights[key])
+        for key in MULTIMODAL_SELF_TEACH_WEIGHT_KEYS}
+    effective = dict(base)
+    if budget == 0.0:
+        return None, base, effective
+    if score_components is None:
+        raise ValueError(
+            "multimodal self-teach needs score components when budget is positive")
+    plan = multimodal_self_teach_weight_plan(score_components, budget=budget)
+    extras = plan["weight_extras"]
+    effective = {
+        key: float(base[key]) + float(extras.get(key, 0.0))
+        for key in MULTIMODAL_SELF_TEACH_WEIGHT_KEYS}
+    return plan, base, effective
+
+
 def multimodal_eval_bundle(model, records, vocab, view_dims, n=200, seed=1,
                            device=DEV, score_metric="mastery",
                            score_margin_w=0.1):
@@ -2573,6 +2672,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           latent_concept_cluster_temperature=0.1,
           latent_concept_cluster_margin=0.0,
           latent_concept_cluster_min_size=2,
+          self_teach_w=0.0,
           select_best=False, selection_rounds=1,
           selection_score_metric="mastery",
           selection_score_margin_w=0.1,
@@ -2604,6 +2704,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_concept_transition_w, latent_concept_cluster_w)
     if float(decode_w) < 0.0:
         raise ValueError("decoder loss weight must be non-negative")
+    self_teach_w = float(self_teach_w)
+    if self_teach_w < 0.0:
+        raise ValueError("multimodal self-teach weight must be non-negative")
     if any(float(w) < 0.0 for w in latent_weights):
         raise ValueError("latent concept loss weights must be non-negative")
     if int(latent_concept_fer_probe_n) < 0:
@@ -2639,7 +2742,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         raise ValueError("latent concept consolidation requires memory_size > 0")
     if (any(float(w) > 0.0 for w in latent_weights)
             or latent_concept_memory_size > 0
-            or hard_study_enabled) and latent_concept_slots <= 0:
+            or hard_study_enabled
+            or self_teach_w > 0.0) and latent_concept_slots <= 0:
         raise ValueError("latent concept losses require latent_concept_slots > 0")
     if float(latent_concept_consolidation_temperature) <= 0.0:
         raise ValueError("latent concept consolidation temperature must be positive")
@@ -2744,6 +2848,68 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     no_improve_rounds = 0
     stopped_early = False
     stop_round = 0
+    self_teach_base_weights = {
+        "decode_w": float(decode_w),
+        "agreement_w": float(agreement_w),
+        "latent_concept_w": float(latent_concept_w),
+        "latent_concept_factorization_w": float(latent_concept_factorization_w),
+        "latent_concept_fer_w": float(latent_concept_fer_w),
+        "latent_concept_discovery_w": float(latent_concept_discovery_w),
+        "latent_concept_gap_w": float(latent_concept_gap_w),
+        "latent_concept_graph_predict_w": float(latent_concept_graph_predict_w),
+        "latent_concept_bridge_w": float(latent_concept_bridge_w),
+        "latent_concept_completion_w": float(latent_concept_completion_w),
+        "latent_concept_sequence_w": float(latent_concept_sequence_w),
+        "latent_concept_transition_w": float(latent_concept_transition_w),
+    }
+    self_teach_effective_weights = dict(self_teach_base_weights)
+    self_teach_plan = None
+    self_teach_reports = []
+
+    def set_objective_weights(weights):
+        nonlocal decode_w, agreement_w, latent_concept_w
+        nonlocal latent_concept_factorization_w, latent_concept_fer_w
+        nonlocal latent_concept_discovery_w, latent_concept_gap_w
+        nonlocal latent_concept_graph_predict_w, latent_concept_bridge_w
+        nonlocal latent_concept_completion_w, latent_concept_sequence_w
+        nonlocal latent_concept_transition_w
+        decode_w = weights["decode_w"]
+        agreement_w = weights["agreement_w"]
+        latent_concept_w = weights["latent_concept_w"]
+        latent_concept_factorization_w = (
+            weights["latent_concept_factorization_w"])
+        latent_concept_fer_w = weights["latent_concept_fer_w"]
+        latent_concept_discovery_w = weights["latent_concept_discovery_w"]
+        latent_concept_gap_w = weights["latent_concept_gap_w"]
+        latent_concept_graph_predict_w = (
+            weights["latent_concept_graph_predict_w"])
+        latent_concept_bridge_w = weights["latent_concept_bridge_w"]
+        latent_concept_completion_w = weights["latent_concept_completion_w"]
+        latent_concept_sequence_w = weights["latent_concept_sequence_w"]
+        latent_concept_transition_w = weights["latent_concept_transition_w"]
+
+    def update_self_teach_weights(score_components=None, round_id=1):
+        nonlocal self_teach_plan, self_teach_effective_weights
+        plan, _base, effective = multimodal_self_teach_weight_maps(
+            score_components, budget=self_teach_w, **self_teach_base_weights)
+        self_teach_plan = plan
+        self_teach_effective_weights = effective
+        set_objective_weights(effective)
+        if plan is not None:
+            self_teach_reports.append(plan | {"round": int(round_id)})
+        return plan
+
+    def current_latent_weights():
+        return (
+            latent_concept_w, latent_concept_factorization_w,
+            latent_concept_memory_w, latent_concept_fer_w,
+            latent_concept_consolidation_w, latent_concept_discovery_w,
+            latent_concept_reanalysis_w, latent_concept_gap_w,
+            latent_concept_association_w, latent_concept_composition_w,
+            latent_concept_graph_predict_w, latent_concept_bridge_w,
+            latent_concept_completion_w, latent_concept_sequence_w,
+            latent_concept_neighborhood_w, latent_concept_transition_w,
+            latent_concept_cluster_w)
 
     def selection_row(round_id, round_steps, bundle):
         score = float(bundle["score_components"]["score"])
@@ -2757,7 +2923,19 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "latent_fer": bundle["latent_fer"],
             "latent_bridge": bundle["latent_bridge"],
             "latent_sequence": bundle["latent_sequence"],
+            "self_teach_plan": self_teach_plan,
+            "self_teach_effective_weights": dict(self_teach_effective_weights),
         }
+
+    before_bundle = None
+    if select_best or self_teach_w > 0.0:
+        before_bundle = multimodal_eval_bundle(
+            model, eval_records, vocab, view_dims, n=selection_eval_n,
+            seed=seed, device=device, score_metric=selection_score_metric,
+            score_margin_w=selection_score_margin_w)
+    if self_teach_w > 0.0:
+        update_self_teach_weights(
+            before_bundle["score_components"], round_id=1)
 
     if select_best:
         schedule = _step_schedule(steps, selection_rounds)
@@ -2767,10 +2945,6 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         for round_id, round_steps in enumerate(schedule, start=1):
             cursor += int(round_steps)
             selection_boundaries[cursor] = (round_id, int(round_steps))
-        before_bundle = multimodal_eval_bundle(
-            model, eval_records, vocab, view_dims, n=selection_eval_n,
-            seed=seed, device=device, score_metric=selection_score_metric,
-            score_margin_w=selection_score_margin_w)
         initial_row = selection_row(0, 0, before_bundle)
         best_state = _model_state_copy(model)
         best_score = float(initial_row["score"])
@@ -2857,7 +3031,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         batch_source = study_pool if study_pool else train_records
         features, txt, ids = _batch_from_records(
             _sample_records(batch_source, batch, rng), vocab, device, view_dims)
-        needs_latent = bool(any(float(w) > 0.0 for w in latent_weights)
+        needs_latent = bool(any(float(w) > 0.0 for w in current_latent_weights())
                             or latent_concept_memory_size > 0
                             or hard_study_enabled)
         bundles_by_mode = {
@@ -3180,6 +3354,11 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "decode_w": float(decode_w),
             "token_loss": float(base_loss.detach()),
             "agreement_loss": float(agreement.detach()),
+            "self_teach_w": float(self_teach_w),
+            "self_teach_plan": self_teach_plan,
+            "self_teach_base_weights": dict(self_teach_base_weights),
+            "self_teach_effective_weights": dict(self_teach_effective_weights),
+            "self_teach_reports": list(self_teach_reports),
             "latent_concept_loss": float(latent_concept.detach()),
             "latent_factorization_loss": float(latent_factorization.detach()),
             "latent_fer_loss": float(latent_fer.detach()),
@@ -3419,6 +3598,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 "insight_score_boost": float(decision["insight_score_boost"]),
                 "insight_effective_delta": float(
                     decision["insight_effective_delta"]),
+                "self_teach_plan": self_teach_plan,
+                "self_teach_effective_weights": dict(
+                    self_teach_effective_weights),
                 "train_metrics": _compact_multimodal_train_metrics(last),
             }
             rounds_report.append(row)
@@ -3437,6 +3619,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                     stopped_early = True
                     stop_round = int(round_id)
                     break
+            if self_teach_w > 0.0 and st < int(steps):
+                update_self_teach_weights(
+                    row["score_components"], round_id=round_id + 1)
     if select_best and best_state is not None:
         model.load_state_dict(best_state, strict=False)
         for row in rounds_report:
@@ -3451,6 +3636,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "score_min_delta": float(selection_score_min_delta),
             "score_patience": int(selection_score_patience),
             "selection_eval_n": int(selection_eval_n),
+            "self_teach_w": float(self_teach_w),
+            "self_teach_reports": list(self_teach_reports),
             "bridge_insight_gate": bool(
                 latent_concept_bridge_w and latent_concept_memory_size > 0),
             "insight_accept_w": float(selection_insight_accept_w),
@@ -3466,8 +3653,13 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "rounds": rounds_report,
         }
         selected_rows = [row for row in rounds_report if row["round"] == best_round]
+        selected_self_teach_plan = self_teach_plan
+        selected_self_teach_effective_weights = dict(self_teach_effective_weights)
         if selected_rows:
             selected_row = selected_rows[0]
+            selected_self_teach_plan = selected_row.get("self_teach_plan")
+            selected_self_teach_effective_weights = selected_row.get(
+                "self_teach_effective_weights", selected_self_teach_effective_weights)
             selection["selected_by_score"] = bool(
                 selected_row.get("selected_by_score", False))
             selection["selected_by_insight"] = bool(
@@ -3478,9 +3670,18 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 selected_row.get("insight_effective_delta", 0.0))
             selection["selected_bridge_insight"] = selected_row.get(
                 "bridge_insight")
+            selection["selected_self_teach_plan"] = selected_self_teach_plan
+            selection["selected_self_teach_effective_weights"] = (
+                selected_self_teach_effective_weights)
         active_study_reports = list(best_study_reports)
         best_metrics = best_metrics | {
             "selection": selection,
+            "self_teach_w": float(self_teach_w),
+            "self_teach_plan": selected_self_teach_plan,
+            "self_teach_base_weights": dict(self_teach_base_weights),
+            "self_teach_effective_weights": dict(
+                selected_self_teach_effective_weights),
+            "self_teach_reports": list(self_teach_reports),
             "latent_fer_study_reports": (
                 active_study_reports if hard_study_strategy == "fer" else []),
             "latent_discovery_study_reports": (
@@ -3505,8 +3706,21 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             }
         last = best_metrics
     else:
-        selection = {"enabled": False}
+        selection = {
+            "enabled": False,
+            "self_teach_w": float(self_teach_w),
+            "self_teach_reports": list(self_teach_reports),
+            "self_teach_plan": self_teach_plan,
+        }
         last = dict(last) | {"selection": selection}
+        if self_teach_plan is not None:
+            last = last | {
+                "self_teach_w": float(self_teach_w),
+                "self_teach_plan": self_teach_plan,
+                "self_teach_base_weights": dict(self_teach_base_weights),
+                "self_teach_effective_weights": dict(self_teach_effective_weights),
+                "self_teach_reports": list(self_teach_reports),
+            }
     model.train_metrics = last
     model.latent_fer_study_reports = (
         last.get("latent_fer_study_reports", []))
@@ -3771,6 +3985,26 @@ def selftest():
         assert bridge_eval["skipped"] is False
         assert bridge_eval["graph_ready"] is True
         assert math.isfinite(bridge_eval["bridge_score"])
+        synthetic_scores = {
+            "token_skipped": False,
+            "fer_skipped": False,
+            "bridge_skipped": False,
+            "sequence_skipped": False,
+            "token_score": 1.0,
+            "mode_floor_score": 0.0,
+            "fer_score": 1.0,
+            "bridge_score": 0.25,
+            "sequence_score": 0.5,
+        }
+        self_teach_plan = multimodal_self_teach_weight_plan(
+            synthetic_scores, budget=0.12)
+        assert self_teach_plan["enabled"] is True
+        assert self_teach_plan["top_signal"] == "mode_floor"
+        assert self_teach_plan["weight_extras"]["latent_concept_completion_w"] > 0.0
+        assert self_teach_plan["weight_extras"]["latent_concept_bridge_w"] > 0.0
+        assert self_teach_plan["weight_extras"]["latent_concept_sequence_w"] > 0.0
+        assert math.isclose(sum(self_teach_plan["weight_extras"].values()),
+                            0.12, rel_tol=1e-6, abs_tol=1e-6)
         positive_insight = multimodal_bridge_selection_insight(
             {"skipped": False, "bridge_score": 0.8, "bridge_connectivity": 0.2},
             {"skipped": False, "bridge_score": 0.4, "bridge_connectivity": 0.5})
@@ -3885,6 +4119,26 @@ def selftest():
         assert math.isfinite(trained_model.train_metrics["latent_sequence_loss"])
         assert (trained_model.train_metrics[
             "latent_sequence_transition_last_batch_updates"] > 0)
+        self_teach_model, *_ = train(
+            manifest, steps=1, batch=2, d=32, layers=1, heads=4, device="cpu",
+            log_every=10, view_tokens=2, txt_tokens=4,
+            concept_tokens=2, latent_concept_slots=3,
+            latent_concept_memory_size=8, self_teach_w=0.05)
+        assert self_teach_model.train_metrics["self_teach_w"] == 0.05
+        assert self_teach_model.train_metrics["self_teach_plan"]["enabled"] is True
+        assert self_teach_model.train_metrics["selection"]["enabled"] is False
+        assert self_teach_model.train_metrics["selection"]["self_teach_reports"]
+        self_teach_extra_sum = sum(
+            self_teach_model.train_metrics["self_teach_plan"][
+                "weight_extras"].values())
+        assert self_teach_extra_sum > 0.0
+        self_teach_delta = sum(
+            self_teach_model.train_metrics["self_teach_effective_weights"][key]
+            - self_teach_model.train_metrics["self_teach_base_weights"][key]
+            for key in MULTIMODAL_SELF_TEACH_WEIGHT_KEYS)
+        assert math.isclose(
+            self_teach_delta, self_teach_extra_sum,
+            rel_tol=1e-6, abs_tol=1e-6)
         no_target_manifest = os.path.join(tmpdir, "mm_no_target.jsonl")
         no_target_rows = []
         for i in range(6):
@@ -3977,6 +4231,7 @@ def selftest():
             latent_concept_bridge_w=0.01,
             latent_concept_sequence_w=0.01,
             latent_concept_sequence_batch=2,
+            self_teach_w=0.05,
             select_best=True, selection_rounds=2, selection_eval_n=4,
             selection_score_min_delta=999.0, selection_score_patience=1)
         selection = selected_model.train_metrics["selection"]
@@ -3991,6 +4246,10 @@ def selftest():
         assert selection["bridge_insight_gate"] is True
         assert selection["selected_by_score"] is False
         assert selection["selected_by_insight"] is False
+        assert selection["self_teach_w"] == 0.05
+        assert selection["self_teach_reports"]
+        assert selection["selected_self_teach_plan"]["enabled"] is True
+        assert selection["rounds"][1]["self_teach_plan"]["enabled"] is True
         assert selected_model.train_metrics["latent_study_reports"] == []
         assert selected_model.train_metrics["latent_discovery_study_reports"] == []
         assert selected_model.train_metrics["latent_study_pool_size"] == 0
@@ -4208,6 +4467,10 @@ def main(argv=None):
                     dest="latent_concept_cluster_margin")
     ap.add_argument("--latent-concept-cluster-min-size", type=int, default=2,
                     dest="latent_concept_cluster_min_size")
+    ap.add_argument("--self-teach-w", type=float, default=0.0,
+                    dest="self_teach_w",
+                    help=("budget for reallocating multimodal objective weight "
+                          "from the model's own eval deficits"))
     ap.add_argument("--view-tokens", type=int, default=4, dest="view_tokens",
                     help="prefix tokens allocated to each named manifest feature view")
     ap.add_argument("--txt-tokens", type=int, default=8, dest="txt_tokens")
@@ -4290,6 +4553,8 @@ def main(argv=None):
     ]
     if any(w < 0.0 for w in latent_weights) or args.agreement_w < 0.0 or args.decode_w < 0.0:
         ap.error("decoder/agreement/latent loss weights must be non-negative")
+    if args.self_teach_w < 0.0:
+        ap.error("--self-teach-w must be non-negative")
     if args.latent_concept_view_dropout < 0.0 or args.latent_concept_view_dropout >= 1.0:
         ap.error("--latent-concept-view-dropout must be in [0, 1)")
     if (args.latent_concept_fer_fragmentation_w < 0.0
@@ -4320,7 +4585,8 @@ def main(argv=None):
         or args.latent_concept_prefix
         or args.latent_concept_fer_hard_max > 0
         or args.latent_concept_discovery_hard_max > 0
-        or args.latent_concept_completion_hard_max > 0)
+        or args.latent_concept_completion_hard_max > 0
+        or args.self_teach_w > 0.0)
     if latent_options_need_slots and args.latent_concept_slots <= 0:
         ap.error("latent concept options require --latent-concept-slots > 0")
     if args.latent_concept_memory_temperature <= 0.0:
@@ -4528,6 +4794,7 @@ def main(argv=None):
         latent_concept_cluster_temperature=args.latent_concept_cluster_temperature,
         latent_concept_cluster_margin=args.latent_concept_cluster_margin,
         latent_concept_cluster_min_size=args.latent_concept_cluster_min_size,
+        self_teach_w=args.self_teach_w,
         select_best=args.select_best,
         selection_rounds=args.selection_rounds,
         selection_score_metric=args.selection_score_metric,
