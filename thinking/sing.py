@@ -202,10 +202,19 @@ def _vowel_classifier(device, steps=500, seed=0):
     return net
 
 
-def train(steps=8000, seed=0, device=DEV, batch=32, lr=3e-4, d=192):
+def train(steps=8000, seed=0, device=DEV, batch=32, lr=3e-4, d=192, vowel_w=0.0,
+          vowel_clf=None):
+    """vowel_w>0 adds VERIFIER-IN-THE-LOOP supervision: a frozen vowel classifier reads the
+    model's OWN per-note output and must recover the right vowel -- 'sing so the lyrics are
+    recognizable', the A-3 listener-in-loop move that forces vowel to stay factored from pitch."""
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     model = SingTTS(d=d).to(device)
+    if vowel_w > 0 and vowel_clf is None:
+        vowel_clf = _vowel_classifier(device, seed=seed)
+    if vowel_clf is not None:
+        for p in vowel_clf.parameters():
+            p.requires_grad_(False)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     for st in range(1, steps + 1):
         model.train()
@@ -216,6 +225,12 @@ def train(steps=8000, seed=0, device=DEV, batch=32, lr=3e-4, d=192):
                            dtype=torch.float32, device=device)
         pred = model(vowels, notes)
         loss = F.l1_loss(pred, tgt)
+        if vowel_w > 0:
+            B = pred.shape[0]
+            blocks = pred.reshape(B, N_BINS, SONG_LEN, NOTE_FRAMES).permute(0, 2, 1, 3)
+            blocks = blocks.reshape(B * SONG_LEN, 1, N_BINS, NOTE_FRAMES)
+            vlogits = vowel_clf(blocks)
+            loss = loss + vowel_w * F.cross_entropy(vlogits, vowels.reshape(-1))
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -266,12 +281,13 @@ def synth(model, songs, out_dir, device=DEV):
             print(f"  {name}: notes {[NOTES[n] for n in notes]} -> {out_dir}/sing_{name}.wav")
 
 
-def run(steps=8000, seed=0, device=DEV):
-    model = train(steps=steps, seed=seed, device=device)
-    ev = evaluate(model, device=device)
+def run(steps=8000, seed=0, device=DEV, vowel_w=0.5):
+    vclf = _vowel_classifier(device, seed=seed) if vowel_w > 0 else None
+    model = train(steps=steps, seed=seed, device=device, vowel_w=vowel_w, vowel_clf=vclf)
+    ev = evaluate(model, device=device, vowel_clf=vclf)
     report = {"experiment": "a6_sing", "steps": steps, "n_notes_scale": len(NOTES),
               "n_vowels": len(VOWELS), "pitch_chance": 1 / len(NOTES),
-              "vowel_chance": 1 / len(VOWELS), **ev,
+              "vowel_chance": 1 / len(VOWELS), "vowel_w": vowel_w, **ev,
               "gate": ev["holdout_pitch_acc"] > 0.6 and ev["holdout_vowel_acc"] > 0.6}
     print(f"\nALL notes : pitch {ev['pitch_acc']:.2f}  vowel {ev['vowel_acc']:.2f}")
     print(f"HELD-OUT (vowel x note) combos: pitch {ev['holdout_pitch_acc']:.2f} "
@@ -308,11 +324,12 @@ def main(argv=None):
     ap.add_argument("--out", default="runs/a6_sing.json")
     ap.add_argument("--checkpoint", default="runs/a6_sing.pt")
     ap.add_argument("--synth-out", default="data/synth", dest="synth_out")
+    ap.add_argument("--vowel-w", type=float, default=0.5, dest="vowel_w")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest()
         return
-    report, model = run(steps=args.steps, seed=args.seed)
+    report, model = run(steps=args.steps, seed=args.seed, vowel_w=args.vowel_w)
     os.makedirs(os.path.dirname(args.checkpoint) or ".", exist_ok=True)
     torch.save({"state_dict": model.state_dict()}, args.checkpoint)
     with open(args.out, "w") as f:

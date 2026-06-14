@@ -4,6 +4,8 @@ This module is intentionally task-agnostic.  A caller supplies fact keys and val
 sets from data, and the head learns where each key should read from a source
 sequence plus a value-embedding space for that key.
 """
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1142,6 +1144,78 @@ def latent_concept_slot_factorization_loss(slots, variance_target=0.05,
     if not losses:
         return slots.sum() * 0.0
     return torch.stack(losses).mean()
+
+
+def latent_concept_fer_metrics(slots, eps=1e-8):
+    """Estimate fractured/entangled latent geometry from schema-free slots.
+
+    The metric is label-free. It treats slots as candidate factors and measures
+    whether representational energy is unnecessarily spread across slots
+    (fragmentation), whether slots point in redundant directions
+    (entanglement), and whether only a few slots carry most of the signal
+    (imbalance).
+    """
+    if slots is None:
+        zero = torch.tensor(0.0)
+        return {"fer_score": zero, "fragmentation": zero,
+                "slot_correlation": zero, "slot_imbalance": zero}
+    if slots.ndim != 3:
+        raise ValueError("latent concept FER metrics expect [batch, slots, dim]")
+    if slots.shape[0] == 0 or slots.shape[1] == 0:
+        zero = slots.sum() * 0.0
+        return {"fer_score": zero, "fragmentation": zero,
+                "slot_correlation": zero, "slot_imbalance": zero}
+    eps_t = float(eps)
+    centered = slots - slots.mean(dim=0, keepdim=True)
+    energy = centered.pow(2).mean(0)
+    if energy.shape[0] <= 1:
+        fragmentation = energy.sum() * 0.0
+        slot_imbalance = energy.sum() * 0.0
+    else:
+        dim_total = energy.sum(0, keepdim=True)
+        active_dims = dim_total.squeeze(0).gt(eps_t)
+        if bool(active_dims.any()):
+            dim_slot = energy[:, active_dims] / dim_total[:, active_dims].clamp_min(eps_t)
+            entropy = -(dim_slot.clamp_min(eps_t).log() * dim_slot).sum(0)
+            fragmentation = (entropy / math.log(float(energy.shape[0]))).mean()
+        else:
+            fragmentation = energy.sum() * 0.0
+        slot_total = energy.sum(-1)
+        if float(slot_total.sum()) > eps_t:
+            usage = slot_total / slot_total.sum().clamp_min(eps_t)
+            uniform = torch.full_like(usage, 1.0 / usage.numel())
+            slot_imbalance = F.kl_div(
+                usage.clamp_min(eps_t).log(), uniform, reduction="sum")
+        else:
+            slot_imbalance = energy.sum() * 0.0
+    if slots.shape[1] <= 1:
+        slot_correlation = slots.sum() * 0.0
+    else:
+        z = F.normalize(slots, dim=-1)
+        corr = z.matmul(z.transpose(1, 2))
+        eye = torch.eye(slots.shape[1], dtype=torch.bool, device=slots.device)
+        slot_correlation = corr.masked_select(~eye[None]).pow(2).mean()
+    fer_score = (fragmentation + slot_correlation + slot_imbalance) / 3.0
+    return {"fer_score": fer_score,
+            "fragmentation": fragmentation,
+            "slot_correlation": slot_correlation,
+            "slot_imbalance": slot_imbalance}
+
+
+def latent_concept_fer_loss(slots, fragmentation_w=1.0, correlation_w=1.0,
+                            balance_w=0.1):
+    """Reduce fractured/entangled latent geometry without labels or schemas."""
+    if slots is None:
+        return torch.tensor(0.0)
+    metrics = latent_concept_fer_metrics(slots)
+    frag_w = float(fragmentation_w)
+    corr_w = float(correlation_w)
+    bal_w = float(balance_w)
+    if frag_w < 0.0 or corr_w < 0.0 or bal_w < 0.0:
+        raise ValueError("latent concept FER weights must be non-negative")
+    return (frag_w * metrics["fragmentation"]
+            + corr_w * metrics["slot_correlation"]
+            + bal_w * metrics["slot_imbalance"])
 
 
 def schema_concept_contrastive_loss(states_by_key, target_ids_by_key, temperature=0.1):

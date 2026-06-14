@@ -49,7 +49,7 @@ copying is architectural, and the dense aux supervision trains exactly that head
 implemented but **off by default** (ablation: shared-block recurrence loses 0.93-vs-2.1 to
 distinct layers on trace corpora at this scale). **Use `d=256` for multi-rule worlds.**
 For multimodal bridge runs, `ScratchpadLM.forward(..., prefix=embeddings)` can prepend continuous
-image/audio embeddings before the token stream on **non-pointer** models; pointer models reject
+feature-view embeddings before the token stream on **non-pointer** models; pointer models reject
 prefixes because the copy distribution is defined over discrete context token ids.
 
 **Engine** (`datalog.py`): least-fixpoint closure with provenance (gold traces = linearized
@@ -267,56 +267,19 @@ strong, but it still fails the gate (**0.625** sampled free decoded F1, SNLI dev
 semantic-head, lexical-overlap HANS **0.595** semantic-head). This is progress toward
 shortcut-resistant language understanding, not mastery.
 
-Grounded transcript language is now a separate text target tied to the existing image/audio
-world rather than another NLI label. The grounded-only run (8k train / 1.6k eval, 600 steps)
-gates: **0.9895** teacher-forced fact accuracy, **0.9968** semantic-head accuracy, **0.996**
-sampled free decoded F1, **0.88** sampled paraphrase consistency, and **0.996** sampled
-counterfactual F1. The unified SNLI+HANS+grounded run (34k train / 5.6k eval, 1.2k steps)
-improves global teacher-forced/semantic accuracy to **0.874 / 0.894** and keeps grounded
-semantic accuracy high (**0.981**), but it still fails the gate: sampled free F1 is **0.742**,
-sampled paraphrase consistency is **0.467**, SNLI dev semantic-head is **0.522**, and HANS
-lexical-overlap semantic-head remains **0.594**. The next text rung should scale shortcut-
-resistant web data and add richer semantic corpora (e.g. MultiNLI/CFQ/GeoQuery and raw-reading
-material) plus stronger paraphrase and counterfactual splits.
+The first MultiNLI integration is wired as infrastructure, not as a mastery run. A sample imports
+from the official NYU zip into `data/text_mnli.jsonl` across ten genres, and the training/eval path
+supports sampled large-set evaluation without adding hard-coded English rules. The useful outcome
+is broader semantic data plumbing that can be mixed with SNLI/HANS and raw-reading records.
 
-Kind-balanced mixed training is a useful curriculum control, not a rulebook. With
-`--balance-by kind`, the mixed SNLI+HANS+grounded run improves global sampled free F1 to
-**0.8125** and lifts HANS lexical-overlap semantic-head accuracy to **0.786**, while keeping
-grounded semantic accuracy high (**0.975**). It still fails the language gate: SNLI dev
-semantic-head accuracy drops to **0.413** and sampled paraphrase consistency is only **0.65**.
-This says the next step is broader language supervision and better paraphrase/counterfactual
-coverage, not hand-coded English rules.
-
-The first MultiNLI integration is now wired and measured as a smoke, not as a mastery run. A
-20k-train / 2k-dev MultiNLI sample imports from the official NYU zip into
-`data/text_mnli.jsonl` across ten genres. A small SNLI+MultiNLI+HANS+grounded smoke
-(120 steps, d=96, sampled eval) completes end to end and writes a checkpoint before evaluation;
-it does **not** gate (**0.324** sampled teacher-forced, **0.591** sampled semantic-head). The
-useful outcome is infrastructure: wider web-backed semantic data, sampled large-set evaluation,
-and no hard-coded English rules.
-
-The first reading-task update path is also wired. `--study-checkpoint` loads an existing text
+The reading-task update path is also wired. `--study-checkpoint` loads an existing text
 checkpoint, expands token embeddings and semantic heads for new reading-task vocabulary/facts,
-evaluates before, fine-tunes on the reading records (plus optional `--study-replay-data`), saves
-to a new checkpoint, and evaluates after. `--decode-w 0` gives a semantic-only study mode for
-understanding updates that do not train the canonical trace decoder on the same step. A 40-step
-full-loss MultiNLI study smoke expanded the balanced SNLI+HANS+grounded checkpoint from
-**11,251** to **34,017** text tokens and improved sampled MultiNLI semantic-head accuracy from
-**0.317** to **0.392**, while teacher-forced accuracy fell. The safer semantic-only replay smoke
-with grounded replay improved sampled MultiNLI semantic-head accuracy from **0.342** to
-**0.375**, nudged teacher-forced from **0.350** to **0.358**, and preserved grounded replay
-semantic accuracy at **0.988**. `--study-strategy errors` adds an explicit self-study loop:
-each round samples train records, mines examples where the semantic head is wrong, and trains on
-those hard examples plus replay. In the current smoke it mined ~60% hard examples, improved
-sampled MultiNLI teacher-forced accuracy from **0.350** to **0.400**, barely moved semantic-head
-accuracy (**0.317** to **0.325**), and preserved grounded replay semantic accuracy at **0.988**.
-`--study-select-best` now evaluates each study round and can restore the best weights using
-semantic, teacher-forced, combined, or bottleneck scoring. The current combined-score smoke
-(`--study-score-metric both --study-retention-w 2.0`) selected round 2 only after both sampled
-MultiNLI teacher-forced accuracy (**0.350** to **0.408**) and semantic-head accuracy
-(**0.333** to **0.383**) improved, with a small grounded replay drop (**0.988** to **0.983** for
-both heads). It still fails the gate; this is the weight-update mechanism for future reading
-curricula, not language mastery.
+evaluates before, fine-tunes on the reading records, saves to a new checkpoint, and evaluates
+after. `--decode-w 0` gives a semantic-only study mode for understanding updates that do not train
+the canonical trace decoder on the same step. `--study-strategy errors` adds an explicit
+self-study loop: each round samples train records, mines examples where the semantic head is wrong,
+and trains on those hard examples plus replay. `--study-select-best` evaluates each study round and
+can restore the best weights using semantic, teacher-forced, combined, or bottleneck scoring.
 
 Raw reading is now the active reading-task path. `--reading-data` accepts JSON, JSONL, or TXT
 chunks and builds schema-free text windows without answer labels or task-specific heads. Training
@@ -334,10 +297,9 @@ refresh produced nonzero mean scores at steps 2-4 (**0.320**, **0.341**, **0.290
 real weight movement and graph self-study, not a claim of language mastery.
 
 The upstream multimodal bridge inherits the same latent concept machinery without a built-in
-oracle world. `thinking.multimodal` now consumes JSONL manifests with data-supplied image/audio
-feature vectors, text tokens, and target token traces. Text-side latent memory, relation graphs,
-and graph-prediction surprise are available upstream to multimodal learning, but the bridge no
-longer ships a transcript fixture or fixed sensory factor schema.
+oracle world. `thinking.multimodal` consumes JSONL manifests with data-supplied named feature
+views, text tokens, and target token traces. Text-side latent memory, relation graphs, and
+graph-prediction surprise are available upstream to multimodal learning.
 
 The architecture now has a generic schema concept head in `thinking.concepts.SchemaConceptHead`.
 Instead of adding another task-specific rule path, text records expose `(slot, predicate) -> value`
@@ -420,21 +382,16 @@ The modern image stack still keeps the efficient latent-flow techniques added ea
 
 ## 3c. Multimodal bridge: manifest features into the same trace language
 
-`thinking.multimodal` is now a generic prefix bridge. It receives data-supplied image feature
-vectors, audio/speech feature vectors, and text tokens from a JSONL manifest, fuses those views
-with learned latent prefix tokens, and trains one non-pointer `ScratchpadLM` decoder on the target
-token trace supplied by the record.
-
-The bridge no longer ships a transcript fixture, no longer imports `thinking.audio`,
-and no longer defines fixed sensory factors. If a dataset wants extraction facts, those facts live
-in the manifest target tokens. If a dataset wants captions, speech units, or another trace format,
-the same decoder path can learn that sequence without changing module code.
+`thinking.multimodal` is now a generic prefix bridge. It receives data-supplied named feature
+views and text tokens from a JSONL manifest, fuses those views with learned latent prefix tokens,
+and trains one non-pointer `ScratchpadLM` decoder on the target token trace supplied by the record.
+If a dataset wants extraction facts, captions, or another trace format, that target sequence lives
+in the manifest rather than in module code.
 
 ```json
 {"split":"train",
  "text":["caption","tokens"],
- "image_features":[0.1,0.2],
- "audio_features":[0.3,0.4],
+ "views":{"sensor_a":[0.1,0.2],"sensor_b":[0.3,0.4]},
  "target":["extract","concept","x","done","."]}
 ```
 

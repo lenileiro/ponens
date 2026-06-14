@@ -786,8 +786,7 @@ def payload(args):
                 f"{args.multimodal_latent_concept_covariance_w} "
                 f"--latent-concept-variance-target "
                 f"{args.multimodal_latent_concept_variance_target} "
-                f"--img-tokens {args.multimodal_img_tokens} "
-                f"--aud-tokens {args.multimodal_aud_tokens} "
+                f"--view-tokens {args.multimodal_view_tokens} "
                 f"--txt-tokens {args.multimodal_txt_tokens} "
                 f"--trunk-arch {args.multimodal_trunk_arch} "
                 f"--trunk-width {args.multimodal_trunk_width} "
@@ -1862,10 +1861,8 @@ def main():
     ap.add_argument("--multimodal-latent-concept-variance-target", type=float, default=1.0,
                     dest="multimodal_latent_concept_variance_target",
                     help="minimum M-0 latent concept per-dimension std target")
-    ap.add_argument("--multimodal-img-tokens", type=int, default=4,
-                    dest="multimodal_img_tokens")
-    ap.add_argument("--multimodal-aud-tokens", type=int, default=8,
-                    dest="multimodal_aud_tokens")
+    ap.add_argument("--multimodal-view-tokens", type=int, default=4,
+                    dest="multimodal_view_tokens")
     ap.add_argument("--multimodal-txt-tokens", type=int, default=8,
                     dest="multimodal_txt_tokens")
     ap.add_argument("--multimodal-trunk-arch", default="mlp", choices=("mlp", "residual"),
@@ -2269,8 +2266,7 @@ def main():
             "--multimodal-heads": args.multimodal_heads,
             "--multimodal-batch": args.multimodal_batch,
             "--multimodal-log-every": args.multimodal_log_every,
-            "--multimodal-img-tokens": args.multimodal_img_tokens,
-            "--multimodal-aud-tokens": args.multimodal_aud_tokens,
+            "--multimodal-view-tokens": args.multimodal_view_tokens,
             "--multimodal-txt-tokens": args.multimodal_txt_tokens,
             "--multimodal-trunk-width": args.multimodal_trunk_width,
             "--multimodal-trunk-depth": args.multimodal_trunk_depth,

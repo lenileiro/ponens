@@ -61,6 +61,8 @@ from .concepts import (
     latent_concept_graph_prediction_scores,
     latent_concept_graph_curiosity_scores,
     latent_concept_cluster_prototype_loss,
+    latent_concept_fer_loss,
+    latent_concept_fer_metrics,
     latent_concept_neighborhood_loss,
     latent_concept_slot_factorization_loss,
     latent_concept_transition_consistency_loss,
@@ -1413,6 +1415,22 @@ def reading_latent_factorization_loss(model, txt, feature_dropout=0.1,
         separation_margin=separation_margin, covariance_weight=covariance_w)
 
 
+def reading_latent_fer_loss(model, txt, feature_dropout=0.1,
+                            fragmentation_w=1.0, correlation_w=1.0,
+                            balance_w=0.1):
+    if getattr(model, "latent_concepts", None) is None:
+        zero = torch.tensor(0.0, device=txt.device)
+        return zero, {"fer_score": zero, "fragmentation": zero,
+                      "slot_correlation": zero, "slot_imbalance": zero}
+    slots = model.latent_concept_states(
+        txt, feature_dropout=feature_dropout, project=True)
+    loss = latent_concept_fer_loss(
+        slots, fragmentation_w=fragmentation_w, correlation_w=correlation_w,
+        balance_w=balance_w)
+    metrics = latent_concept_fer_metrics(slots)
+    return loss, metrics
+
+
 def reading_latent_memory_loss(model, txt, feature_dropout=0.1,
                                temperature=0.1, balance_w=0.0):
     if (getattr(model, "latent_concepts", None) is None
@@ -2668,6 +2686,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          factorization_variance=0.05,
                          factorization_margin=0.2,
                          factorization_covariance_w=0.05,
+                         fer_w=0.0, fer_fragmentation_w=1.0,
+                         fer_correlation_w=1.0, fer_balance_w=0.1,
                          memory_w=0.05, memory_size=64,
                          memory_temperature=0.1, memory_momentum=0.95,
                          memory_balance_w=0.01,
@@ -2723,6 +2743,14 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading factorization margin must be non-negative")
     if float(factorization_covariance_w) < 0.0:
         raise ValueError("reading factorization covariance weight must be non-negative")
+    if float(fer_w) < 0.0:
+        raise ValueError("reading FER loss weight must be non-negative")
+    if float(fer_fragmentation_w) < 0.0:
+        raise ValueError("reading FER fragmentation weight must be non-negative")
+    if float(fer_correlation_w) < 0.0:
+        raise ValueError("reading FER correlation weight must be non-negative")
+    if float(fer_balance_w) < 0.0:
+        raise ValueError("reading FER balance weight must be non-negative")
     if float(memory_w) < 0.0:
         raise ValueError("reading memory loss weight must be non-negative")
     if int(memory_size) < 0:
@@ -2868,6 +2896,11 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_loss = 0.0
     last_view_loss = 0.0
     last_factorization = 0.0
+    last_fer = 0.0
+    last_fer_score = 0.0
+    last_fer_fragmentation = 0.0
+    last_fer_slot_correlation = 0.0
+    last_fer_slot_imbalance = 0.0
     last_memory = 0.0
     last_memory_updates = 0
     last_transition_updates = 0
@@ -3016,6 +3049,19 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 separation_margin=factorization_margin,
                 covariance_w=factorization_covariance_w)
             if factorization_w else view_loss * 0.0)
+        if fer_w:
+            fer_loss, fer_metrics = reading_latent_fer_loss(
+                model, txt, feature_dropout=feature_dropout,
+                fragmentation_w=fer_fragmentation_w,
+                correlation_w=fer_correlation_w,
+                balance_w=fer_balance_w)
+        else:
+            fer_loss = view_loss * 0.0
+            zero_metric = view_loss.detach() * 0.0
+            fer_metrics = {"fer_score": zero_metric,
+                           "fragmentation": zero_metric,
+                           "slot_correlation": zero_metric,
+                           "slot_imbalance": zero_metric}
         memory_loss = (
             reading_latent_memory_loss(
                 model, txt, feature_dropout=feature_dropout,
@@ -3109,6 +3155,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 replay_teacher_vocab, device=device,
                 feature_dropout=feature_dropout)
         loss = (view_loss + float(factorization_w) * factorization_loss
+                + float(fer_w) * fer_loss
                 + float(memory_w) * memory_loss
                 + float(association_w) * association_loss
                 + float(composition_w) * composition_loss
@@ -3136,6 +3183,11 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_loss = float(loss.detach())
         last_view_loss = float(view_loss.detach())
         last_factorization = float(factorization_loss.detach())
+        last_fer = float(fer_loss.detach())
+        last_fer_score = float(fer_metrics["fer_score"].detach())
+        last_fer_fragmentation = float(fer_metrics["fragmentation"].detach())
+        last_fer_slot_correlation = float(fer_metrics["slot_correlation"].detach())
+        last_fer_slot_imbalance = float(fer_metrics["slot_imbalance"].detach())
         last_memory = float(memory_loss.detach())
         last_association = float(association_loss.detach())
         last_composition = float(composition_loss.detach())
@@ -3150,6 +3202,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
             print(f"  reading {st}/{steps} loss {last_loss:.3f} "
                   f"view {last_view_loss:.3f} "
                   f"factor {last_factorization:.3f} "
+                  f"fer {last_fer:.3f} "
                   f"memory {last_memory:.3f} "
                   f"assoc {last_association:.3f} "
                   f"compose {last_composition:.3f} "
@@ -3169,6 +3222,15 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "factorization_variance": float(factorization_variance),
         "factorization_margin": float(factorization_margin),
         "factorization_covariance_w": float(factorization_covariance_w),
+        "fer_loss": last_fer,
+        "fer_w": float(fer_w),
+        "fer_fragmentation_w": float(fer_fragmentation_w),
+        "fer_correlation_w": float(fer_correlation_w),
+        "fer_balance_w": float(fer_balance_w),
+        "fer_score": last_fer_score,
+        "fer_fragmentation": last_fer_fragmentation,
+        "fer_slot_correlation": last_fer_slot_correlation,
+        "fer_slot_imbalance": last_fer_slot_imbalance,
         "memory_loss": last_memory,
         "memory_w": float(memory_w),
         "memory_size": int(getattr(model, "latent_concept_memory_size", 0)),
@@ -3287,6 +3349,8 @@ def fit_reading_concepts_select_best(
         covariance_w=1.0, variance_target=1.0,
         factorization_w=0.05, factorization_variance=0.05,
         factorization_margin=0.2, factorization_covariance_w=0.05,
+        fer_w=0.0, fer_fragmentation_w=1.0,
+        fer_correlation_w=1.0, fer_balance_w=0.1,
         memory_w=0.05, memory_size=64,
         memory_temperature=0.1, memory_momentum=0.95,
         memory_balance_w=0.01,
@@ -3387,6 +3451,10 @@ def fit_reading_concepts_select_best(
             factorization_variance=factorization_variance,
             factorization_margin=factorization_margin,
             factorization_covariance_w=factorization_covariance_w,
+            fer_w=fer_w,
+            fer_fragmentation_w=fer_fragmentation_w,
+            fer_correlation_w=fer_correlation_w,
+            fer_balance_w=fer_balance_w,
             memory_w=memory_w,
             memory_size=memory_size,
             memory_temperature=memory_temperature,
@@ -3517,6 +3585,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            factorization_w=0.05, factorization_variance=0.05,
                            factorization_margin=0.2,
                            factorization_covariance_w=0.05,
+                           fer_w=0.0, fer_fragmentation_w=1.0,
+                           fer_correlation_w=1.0, fer_balance_w=0.1,
                            memory_w=0.05, memory_size=64,
                            memory_temperature=0.1, memory_momentum=0.95,
                            memory_balance_w=0.01,
@@ -3580,6 +3650,10 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         factorization_variance=factorization_variance,
         factorization_margin=factorization_margin,
         factorization_covariance_w=factorization_covariance_w,
+        fer_w=fer_w,
+        fer_fragmentation_w=fer_fragmentation_w,
+        fer_correlation_w=fer_correlation_w,
+        fer_balance_w=fer_balance_w,
         memory_w=memory_w,
         memory_size=memory_size,
         memory_temperature=memory_temperature,
@@ -3647,6 +3721,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          factorization_w=0.05, factorization_variance=0.05,
                          factorization_margin=0.2,
                          factorization_covariance_w=0.05,
+                         fer_w=0.0, fer_fragmentation_w=1.0,
+                         fer_correlation_w=1.0, fer_balance_w=0.1,
                          memory_w=0.05, memory_size=64,
                          memory_temperature=0.1, memory_momentum=0.95,
                          memory_balance_w=0.01,
@@ -3722,6 +3798,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             factorization_variance=factorization_variance,
             factorization_margin=factorization_margin,
             factorization_covariance_w=factorization_covariance_w,
+            fer_w=fer_w,
+            fer_fragmentation_w=fer_fragmentation_w,
+            fer_correlation_w=fer_correlation_w,
+            fer_balance_w=fer_balance_w,
             memory_w=memory_w,
             memory_size=memory_size,
             memory_temperature=memory_temperature,
@@ -3789,6 +3869,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             factorization_variance=factorization_variance,
             factorization_margin=factorization_margin,
             factorization_covariance_w=factorization_covariance_w,
+            fer_w=fer_w,
+            fer_fragmentation_w=fer_fragmentation_w,
+            fer_correlation_w=fer_correlation_w,
+            fer_balance_w=fer_balance_w,
             memory_w=memory_w,
             memory_size=memory_size,
             memory_temperature=memory_temperature,
@@ -3877,6 +3961,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "factorization_variance": float(factorization_variance),
               "factorization_margin": float(factorization_margin),
               "factorization_covariance_w": float(factorization_covariance_w),
+              "fer_w": float(fer_w),
+              "fer_fragmentation_w": float(fer_fragmentation_w),
+              "fer_correlation_w": float(fer_correlation_w),
+              "fer_balance_w": float(fer_balance_w),
               "memory_w": float(memory_w),
               "memory_size": int(memory_size),
               "memory_temperature": float(memory_temperature),
@@ -4054,6 +4142,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              factorization_w=0.05, factorization_variance=0.05,
                              factorization_margin=0.2,
                              factorization_covariance_w=0.05,
+                             fer_w=0.0, fer_fragmentation_w=1.0,
+                             fer_correlation_w=1.0, fer_balance_w=0.1,
                              memory_w=0.05, memory_size=64,
                              memory_temperature=0.1, memory_momentum=0.95,
                              memory_balance_w=0.01,
@@ -4151,6 +4241,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             factorization_variance=factorization_variance,
             factorization_margin=factorization_margin,
             factorization_covariance_w=factorization_covariance_w,
+            fer_w=fer_w,
+            fer_fragmentation_w=fer_fragmentation_w,
+            fer_correlation_w=fer_correlation_w,
+            fer_balance_w=fer_balance_w,
             memory_w=memory_w,
             memory_size=memory_size,
             memory_temperature=memory_temperature,
@@ -4223,6 +4317,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             factorization_variance=factorization_variance,
             factorization_margin=factorization_margin,
             factorization_covariance_w=factorization_covariance_w,
+            fer_w=fer_w,
+            fer_fragmentation_w=fer_fragmentation_w,
+            fer_correlation_w=fer_correlation_w,
+            fer_balance_w=fer_balance_w,
             memory_w=memory_w,
             memory_size=memory_size,
             memory_temperature=memory_temperature,
@@ -4329,6 +4427,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "factorization_variance": float(factorization_variance),
               "factorization_margin": float(factorization_margin),
               "factorization_covariance_w": float(factorization_covariance_w),
+              "fer_w": float(fer_w),
+              "fer_fragmentation_w": float(fer_fragmentation_w),
+              "fer_correlation_w": float(fer_correlation_w),
+              "fer_balance_w": float(fer_balance_w),
               "memory_w": float(memory_w),
               "memory_size": int(memory_size),
               "memory_temperature": float(memory_temperature),

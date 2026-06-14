@@ -51,7 +51,7 @@ MODES = ("full", "sensor_only", "text_only")
 TRUNK_ARCHES = ("mlp", "residual")
 TEXT_TRUNK_ARCHES = ("transformer", "standard", "relational", "abstractor")
 FEATURE_VIEW_KEYS = ("views", "features", "feature_views")
-TEXT_KEYS = ("text_tokens", "tokens", "text", "caption", "transcript")
+TEXT_KEYS = ("text_tokens", "tokens", "text", "caption")
 TARGET_KEYS = ("target_tokens", "target", "trace_tokens", "trace")
 
 
@@ -337,7 +337,7 @@ class ResidualMLPBlock(nn.Module):
 class FeaturePrefixTrunk(nn.Module):
     """Feature vector -> short sequence of decoder-width prefix embeddings."""
 
-    def __init__(self, in_dim, d, n_tokens=4, modality=0, n_modalities=3,
+    def __init__(self, in_dim, d, n_tokens=4, view_index=0, n_views=2,
                  arch="mlp", width=128, depth=1):
         super().__init__()
         arch = str(arch)
@@ -360,24 +360,24 @@ class FeaturePrefixTrunk(nn.Module):
                 layers.extend([nn.Linear(self.width, self.width), nn.GELU()])
         layers.append(nn.Linear(self.width, self.n_tokens * d))
         self.net = nn.Sequential(*layers)
-        self.mod = nn.Embedding(n_modalities, d)
-        self.modality = int(modality)
+        self.view_embed = nn.Embedding(n_views, d)
+        self.view_index = int(view_index)
         self.posn = nn.Parameter(torch.zeros(self.n_tokens, d))
         self.d = int(d)
 
     def forward(self, x):
         h = self.net(x).view(x.shape[0], self.n_tokens, self.d)
-        return h + self.mod.weight[self.modality] + self.posn[None]
+        return h + self.view_embed.weight[self.view_index] + self.posn[None]
 
 
 class TextTrunk(nn.Module):
     """Token encoder -> fixed count of text prefix embeddings."""
 
-    def __init__(self, vocab_size, d, pad=0, n_tokens=8, heads=4, layers=1, modality=2,
-                 n_modalities=3, max_len=64, arch="transformer"):
+    def __init__(self, vocab_size, d, pad=0, n_tokens=8, heads=4, layers=1,
+                 view_index=1, n_views=2, max_len=64, arch="transformer"):
         super().__init__()
         self.pad = int(pad)
-        self.modality = int(modality)
+        self.view_index = int(view_index)
         self.n_tokens = int(n_tokens)
         self.layers = int(layers)
         self.arch = str(arch)
@@ -400,7 +400,7 @@ class TextTrunk(nn.Module):
                             pos_mode="none", causal=False)
                 for _ in range(self.layers)
             ])
-        self.mod = nn.Embedding(n_modalities, d)
+        self.view_embed = nn.Embedding(n_views, d)
         self.ln = nn.LayerNorm(d)
 
     def forward(self, ids):
@@ -413,7 +413,7 @@ class TextTrunk(nn.Module):
         else:
             for block in self.blocks:
                 h = block(h, ids, pad_mask)
-        h = self.ln(h + self.mod.weight[self.modality])
+        h = self.ln(h + self.view_embed.weight[self.view_index])
         h = h.masked_fill(pad_mask.unsqueeze(-1), 0.0)
         if h.shape[1] > self.n_tokens:
             return h[:, :self.n_tokens]
@@ -425,7 +425,7 @@ class TextTrunk(nn.Module):
 
 
 class ConceptFusion(nn.Module):
-    """Shared latent-token mixer for image/audio/text prefixes before decoding."""
+    """Shared latent-token mixer for feature/text prefixes before decoding."""
 
     def __init__(self, d, heads=4, concept_tokens=4, layers=1):
         super().__init__()
@@ -440,25 +440,28 @@ class ConceptFusion(nn.Module):
                                          enable_nested_tensor=False)
         self.ln = nn.LayerNorm(d)
 
-    def forward(self, ip, ap, tp):
-        q = self.queries.unsqueeze(0).expand(ip.shape[0], -1, -1)
-        h = torch.cat([q, ip, ap, tp], dim=1)
+    def forward(self, feature_prefixes, tp):
+        q = self.queries.unsqueeze(0).expand(tp.shape[0], -1, -1)
+        h = torch.cat([q] + list(feature_prefixes) + [tp], dim=1)
         h = self.ln(self.enc(h))
         return h, h[:, :self.concept_tokens]
 
 
 class MultimodalLM(nn.Module):
-    """Generic image/audio/text prefix readers feeding one token decoder."""
+    """Generic manifest feature/text prefix readers feeding one token decoder."""
 
-    def __init__(self, vocab_size, image_dim=1, audio_dim=1, d=96, layers=3, heads=4,
-                 pad=0, max_len=128, img_tokens=4, aud_tokens=4, txt_tokens=8,
+    def __init__(self, vocab_size, view_dims=None, d=96, layers=3, heads=4,
+                 pad=0, max_len=128, view_tokens=4, txt_tokens=8,
                  trunk_arch="mlp", trunk_width=128, trunk_depth=1, text_layers=1,
                  modality_dropout=0.0, text_arch="transformer", concept_tokens=4,
                  fusion_layers=1, latent_concept_slots=0, latent_concept_layers=1,
                  latent_concept_prefix=False, latent_concept_memory_size=0):
         super().__init__()
-        if img_tokens <= 0 or aud_tokens <= 0 or txt_tokens <= 0:
+        view_dims = OrderedDict((str(k), int(v)) for k, v in (view_dims or {}).items())
+        if view_tokens <= 0 or txt_tokens <= 0:
             raise ValueError("multimodal prefix token counts must be positive")
+        if any(dim <= 0 for dim in view_dims.values()):
+            raise ValueError("feature view dimensions must be positive")
         if modality_dropout < 0.0 or modality_dropout > 1.0:
             raise ValueError("modality_dropout must be in [0, 1]")
         if int(latent_concept_slots) < 0:
@@ -473,12 +476,14 @@ class MultimodalLM(nn.Module):
             raise ValueError("latent concept memory requires latent slots")
         trunk_arch = str(trunk_arch)
         text_arch = str(text_arch)
+        view_names = list(view_dims.keys())
+        n_views = len(view_names) + 1
         self.config = {
-            "vocab_size": int(vocab_size), "image_dim": int(image_dim),
-            "audio_dim": int(audio_dim), "d": int(d), "layers": int(layers),
+            "vocab_size": int(vocab_size), "view_dims": dict(view_dims),
+            "view_names": list(view_names), "d": int(d), "layers": int(layers),
             "heads": int(heads), "pad": int(pad), "max_len": int(max_len),
-            "img_tokens": int(img_tokens), "aud_tokens": int(aud_tokens),
-            "txt_tokens": int(txt_tokens), "trunk_arch": trunk_arch,
+            "view_tokens": int(view_tokens), "txt_tokens": int(txt_tokens),
+            "trunk_arch": trunk_arch,
             "trunk_width": int(trunk_width), "trunk_depth": int(trunk_depth),
             "text_layers": int(text_layers), "text_arch": text_arch,
             "modality_dropout": float(modality_dropout),
@@ -494,16 +499,18 @@ class MultimodalLM(nn.Module):
         self.latent_concept_layers = int(latent_concept_layers)
         self.latent_concept_prefix = bool(latent_concept_prefix)
         self.latent_concept_memory_size = int(latent_concept_memory_size)
+        self.view_names = tuple(view_names)
         self.lm = ScratchpadLM(vocab_size, d=d, layers=layers, heads=heads, max_len=max_len,
                                pad=pad, pointer=False, loop=False)
-        self.img = FeaturePrefixTrunk(
-            image_dim, d, n_tokens=img_tokens, modality=0, arch=trunk_arch,
-            width=trunk_width, depth=trunk_depth)
-        self.aud = FeaturePrefixTrunk(
-            audio_dim, d, n_tokens=aud_tokens, modality=1, arch=trunk_arch,
-            width=trunk_width, depth=trunk_depth)
+        self.feature_readers = nn.ModuleList([
+            FeaturePrefixTrunk(
+                dim, d, n_tokens=view_tokens, view_index=i, n_views=n_views,
+                arch=trunk_arch, width=trunk_width, depth=trunk_depth)
+            for i, dim in enumerate(view_dims.values())
+        ])
         self.txt = TextTrunk(vocab_size, d, pad=pad, n_tokens=txt_tokens, heads=heads,
-                             layers=text_layers, modality=2, arch=text_arch,
+                             layers=text_layers, view_index=len(view_names),
+                             n_views=n_views, arch=text_arch,
                              max_len=max_len)
         self.fusion = ConceptFusion(d, heads=heads, concept_tokens=concept_tokens,
                                     layers=fusion_layers)
@@ -515,30 +522,36 @@ class MultimodalLM(nn.Module):
             self.latent_concept_memory_size, d)
             if self.latent_concept_memory_size > 0 else None)
 
-    def _apply_modality_dropout(self, ip, ap, tp):
+    def _apply_modality_dropout(self, prefixes, tp):
         if not self.training or self.modality_dropout <= 0.0:
-            return ip, ap, tp
+            return prefixes, tp
         keep = 1.0 - self.modality_dropout
         if keep <= 0.0:
-            return ip * 0.0, ap * 0.0, tp * 0.0
-        masks = [
-            torch.rand(ip.shape[0], 1, 1, device=ip.device).lt(keep).to(ip.dtype) / keep,
-            torch.rand(ap.shape[0], 1, 1, device=ap.device).lt(keep).to(ap.dtype) / keep,
-            torch.rand(tp.shape[0], 1, 1, device=tp.device).lt(keep).to(tp.dtype) / keep,
-        ]
-        return ip * masks[0], ap * masks[1], tp * masks[2]
+            return [p * 0.0 for p in prefixes], tp * 0.0
+        out = []
+        for prefix in prefixes:
+            mask = (
+                torch.rand(prefix.shape[0], 1, 1, device=prefix.device)
+                .lt(keep).to(prefix.dtype) / keep
+            )
+            out.append(prefix * mask)
+        text_mask = (
+            torch.rand(tp.shape[0], 1, 1, device=tp.device).lt(keep).to(tp.dtype) / keep
+        )
+        return out, tp * text_mask
 
-    def encode_prefix(self, img, aud, txt, mode="full"):
-        ip, ap, tp = self.img(img), self.aud(aud), self.txt(txt)
+    def encode_prefix(self, features, txt, mode="full"):
+        prefixes = [reader(x) for reader, x in zip(self.feature_readers, features)]
+        tp = self.txt(txt)
         if mode == "text_only":
-            ip, ap = ip * 0.0, ap * 0.0
+            prefixes = [p * 0.0 for p in prefixes]
         elif mode == "sensor_only":
             tp = tp * 0.0
         elif mode != "full":
             raise ValueError(f"unknown multimodal mode {mode!r}")
         elif self.modality_dropout > 0.0:
-            ip, ap, tp = self._apply_modality_dropout(ip, ap, tp)
-        return self.fusion(ip, ap, tp)
+            prefixes, tp = self._apply_modality_dropout(prefixes, tp)
+        return self.fusion(prefixes, tp)
 
     def latent_concept_states_from_prefix(self, prefix, view_dropout=0.0, project=False):
         if self.latent_concepts is None:
@@ -547,9 +560,9 @@ class MultimodalLM(nn.Module):
             prefix = F.dropout(prefix, p=float(view_dropout), training=True)
         return self.latent_concepts(prefix, project=project)
 
-    def latent_concept_states(self, img, aud, txt, mode="full", view_dropout=0.0,
+    def latent_concept_states(self, features, txt, mode="full", view_dropout=0.0,
                               project=False):
-        prefix, _concepts = self.encode_prefix(img, aud, txt, mode=mode)
+        prefix, _concepts = self.encode_prefix(features, txt, mode=mode)
         return self.latent_concept_states_from_prefix(
             prefix, view_dropout=view_dropout, project=project)
 
@@ -560,13 +573,13 @@ class MultimodalLM(nn.Module):
             prefix = torch.cat([latent_state_tensor, prefix], dim=1)
         return prefix
 
-    def decoder_prefix(self, img, aud, txt, mode="full"):
-        prefix, _concepts = self.encode_prefix(img, aud, txt, mode=mode)
+    def decoder_prefix(self, features, txt, mode="full"):
+        prefix, _concepts = self.encode_prefix(features, txt, mode=mode)
         return self.decoder_prefix_from_encoded(prefix)
 
-    def mode_bundle(self, img, aud, txt, ids, mode="full", need_latent=False,
+    def mode_bundle(self, features, txt, ids, mode="full", need_latent=False,
                     latent_view_dropout=0.0, latent_project=False):
-        prefix, concepts = self.encode_prefix(img, aud, txt, mode=mode)
+        prefix, concepts = self.encode_prefix(features, txt, mode=mode)
         latent_state_tensor = None
         if (self.latent_concept_prefix or need_latent) and self.latent_concepts is not None:
             latent_state_tensor = self.latent_concept_states_from_prefix(
@@ -579,26 +592,26 @@ class MultimodalLM(nn.Module):
             out["latent_concepts"] = latent_state_tensor
         return out
 
-    def forward(self, img, aud, txt, ids, mode="full"):
-        prefix = self.decoder_prefix(img, aud, txt, mode=mode)
+    def forward(self, features, txt, ids, mode="full"):
+        prefix = self.decoder_prefix(features, txt, mode=mode)
         logits = self.lm(ids, prefix=prefix)
         return logits[:, prefix.shape[1]:]
 
 
-def _zeros(batch, dim):
-    return np.zeros((batch, dim), dtype=np.float32)
-
-
-def _batch_from_records(records, vocab, device, image_dim, audio_dim):
-    images, audios, texts, targets = [], [], [], []
+def _batch_from_records(records, vocab, device, view_dims):
+    feature_rows = {name: [] for name in view_dims}
+    texts, targets = [], []
     for rec in records:
-        images.append(rec.image if rec.image is not None else np.zeros(image_dim, np.float32))
-        audios.append(rec.audio if rec.audio is not None else np.zeros(audio_dim, np.float32))
+        for name, dim in view_dims.items():
+            feature_rows[name].append(
+                rec.views.get(name, np.zeros(int(dim), dtype=np.float32)))
         texts.append(vocab.enc(rec.text))
         targets.append(vocab.enc(rec.target))
     batch = len(records)
-    img = torch.tensor(np.stack(images), dtype=torch.float32, device=device)
-    aud = torch.tensor(np.stack(audios), dtype=torch.float32, device=device)
+    features = [
+        torch.tensor(np.stack(feature_rows[name]), dtype=torch.float32, device=device)
+        for name in view_dims
+    ]
     max_txt = max(len(t) for t in texts)
     txt = torch.full((batch, max_txt), vocab.pad, dtype=torch.long, device=device)
     for i, ids in enumerate(texts):
@@ -607,7 +620,7 @@ def _batch_from_records(records, vocab, device, image_dim, audio_dim):
     target = torch.full((batch, max_target), vocab.pad, dtype=torch.long, device=device)
     for i, ids in enumerate(targets):
         target[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
-    return img, aud, txt, target
+    return features, txt, target
 
 
 def _sample_records(records, n, rng):
@@ -898,7 +911,7 @@ def latent_multimodal_cluster_loss_from_views(views, temperature=0.1,
 
 
 def latent_multimodal_graph_prediction_examples(
-        model, records, vocab, image_dim, audio_dim, n=0, seed=0, device=DEV,
+        model, records, vocab, view_dims, n=0, seed=0, device=DEV,
         temperature=0.1, self_loop_w=0.05, transitive_steps=2,
         transitive_w=0.1, target_power=1.0):
     memory = getattr(model, "latent_concept_memory", None)
@@ -911,14 +924,14 @@ def latent_multimodal_graph_prediction_examples(
     with torch.no_grad():
         for off in range(0, len(sample), 64):
             batch_records = sample[off:off + 64]
-            img, aud, txt, ids = _batch_from_records(
-                batch_records, vocab, device, image_dim, audio_dim)
+            features, txt, ids = _batch_from_records(
+                batch_records, vocab, device, view_dims)
             target = model.latent_concept_states(
-                img, aud, txt, mode="full", project=True)
+                features, txt, mode="full", project=True)
             scores_by_mode = []
             for mode in ("sensor_only", "text_only"):
                 source = model.latent_concept_states(
-                    img, aud, txt, mode=mode, project=True)
+                    features, txt, mode=mode, project=True)
                 scores, _parts = latent_concept_graph_prediction_scores(
                     source, target, memory.active(), memory.active_prediction_relations(),
                     temperature=temperature, self_loop_w=self_loop_w,
@@ -938,7 +951,7 @@ def latent_multimodal_graph_prediction_examples(
     }
 
 
-def evaluate(model, records, vocab, image_dim, audio_dim, n=200, seed=1,
+def evaluate(model, records, vocab, view_dims, n=200, seed=1,
              device=DEV, mode="full"):
     rng = np.random.default_rng(seed)
     count = min(int(n), len(records)) if int(n) > 0 else len(records)
@@ -948,9 +961,9 @@ def evaluate(model, records, vocab, image_dim, audio_dim, n=200, seed=1,
     with torch.no_grad():
         for off in range(0, len(sample), 64):
             batch_records = sample[off:off + 64]
-            img, aud, txt, ids = _batch_from_records(
-                batch_records, vocab, device, image_dim, audio_dim)
-            logits = model(img, aud, txt, ids, mode=mode)
+            features, txt, ids = _batch_from_records(
+                batch_records, vocab, device, view_dims)
+            logits = model(features, txt, ids, mode=mode)
             loss = token_loss(logits, ids, vocab.pad)
             losses.append(float(loss.detach().cpu()))
             if ids.shape[1] >= 2:
@@ -974,7 +987,7 @@ def evaluate(model, records, vocab, image_dim, audio_dim, n=200, seed=1,
 
 def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           device=DEV, log_every=100, layers=3, heads=4, max_len=128,
-          img_tokens=4, aud_tokens=4, txt_tokens=8, trunk_arch="mlp",
+          view_tokens=4, txt_tokens=8, trunk_arch="mlp",
           trunk_width=128, trunk_depth=1, text_layers=1,
           text_arch="transformer", modality_dropout=0.0, agreement_w=0.0,
           text_checkpoint=None, concept_tokens=4, fusion_layers=1,
@@ -1044,14 +1057,14 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         raise ValueError("latent concept losses require latent_concept_slots > 0")
     records = load_manifest(manifest, root=root)
     train_records, eval_records = split_records(records)
-    image_dim, audio_dim = feature_dims(records)
+    view_dims = feature_dims(records)
     vocab = build_vocab(records)
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     model = MultimodalLM(
-        len(vocab), image_dim=image_dim, audio_dim=audio_dim, d=d, layers=layers,
-        heads=heads, pad=vocab.pad, max_len=max_len, img_tokens=img_tokens,
-        aud_tokens=aud_tokens, txt_tokens=txt_tokens, trunk_arch=trunk_arch,
+        len(vocab), view_dims=view_dims, d=d, layers=layers,
+        heads=heads, pad=vocab.pad, max_len=max_len, view_tokens=view_tokens,
+        txt_tokens=txt_tokens, trunk_arch=trunk_arch,
         trunk_width=trunk_width, trunk_depth=trunk_depth, text_layers=text_layers,
         text_arch=text_arch, modality_dropout=modality_dropout,
         concept_tokens=concept_tokens, fusion_layers=fusion_layers,
@@ -1067,13 +1080,13 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     last = {}
     for st in range(1, int(steps) + 1):
         model.train()
-        img, aud, txt, ids = _batch_from_records(
-            _sample_records(train_records, batch, rng), vocab, device, image_dim, audio_dim)
+        features, txt, ids = _batch_from_records(
+            _sample_records(train_records, batch, rng), vocab, device, view_dims)
         needs_latent = bool(any(float(w) > 0.0 for w in latent_weights)
                             or latent_concept_memory_size > 0)
         bundles_by_mode = {
             mode: model.mode_bundle(
-                img, aud, txt, ids, mode=mode, need_latent=needs_latent,
+                features, txt, ids, mode=mode, need_latent=needs_latent,
                 latent_view_dropout=latent_concept_view_dropout,
                 latent_project=True)
             for mode in MODES
@@ -1217,31 +1230,31 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         "records": len(records),
         "train_records": len(train_records),
         "eval_records": len(eval_records),
-        "image_dim": image_dim,
-        "audio_dim": audio_dim,
+        "view_dims": dict(view_dims),
+        "view_names": list(view_dims.keys()),
+        "view_count": len(view_dims),
     }
-    return model, vocab, records, train_records, eval_records, image_dim, audio_dim
+    return model, vocab, records, train_records, eval_records, view_dims
 
 
 def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         checkpoint=None, out=None, **kwargs):
-    model, vocab, records, train_records, eval_records, image_dim, audio_dim = train(
+    model, vocab, records, train_records, eval_records, view_dims = train(
         manifest, root=root, steps=steps, seed=seed, device=device, **kwargs)
     metrics = {
-        mode: evaluate(model, eval_records, vocab, image_dim, audio_dim, n=eval_n,
+        mode: evaluate(model, eval_records, vocab, view_dims, n=eval_n,
                        seed=seed + 17, device=device, mode=mode)
         for mode in MODES
     }
     latent_probe = {}
     if getattr(model, "latent_concept_memory", None) is not None:
         selected, latent_probe = latent_multimodal_graph_prediction_examples(
-            model, train_records, vocab, image_dim, audio_dim,
+            model, train_records, vocab, view_dims,
             n=min(64, len(train_records)), seed=seed + 23, device=device)
         latent_probe["top_ids"] = [r.rec_id for r in selected[:8]]
     architecture = dict(model.config)
     architecture["reader_prefix_tokens"] = (
-        int(model.config["img_tokens"])
-        + int(model.config["aud_tokens"])
+        int(model.config["view_tokens"]) * len(model.config["view_names"])
         + int(model.config["txt_tokens"]))
     architecture["latent_concept_prefix_tokens"] = (
         int(model.latent_concept_slots) if bool(model.latent_concept_prefix) else 0)
@@ -1282,14 +1295,13 @@ def _write_selftest_manifest(path):
         label = labels[i % len(labels)]
         base = np.zeros(4, dtype=np.float32)
         base[i % 4] = 1.0
-        image = (base + 0.01 * rng.normal(size=4)).astype(float).tolist()
-        audio = (base[::-1] + 0.01 * rng.normal(size=4)).astype(float).tolist()
+        sensor_a = (base + 0.01 * rng.normal(size=4)).astype(float).tolist()
+        sensor_b = (base[::-1] + 0.01 * rng.normal(size=4)).astype(float).tolist()
         rows.append({
             "id": f"mm-{i}",
             "split": "eval" if i >= 8 else "train",
             "text": ["sample", str(i), "label", label],
-            "image_features": image,
-            "audio_features": audio,
+            "views": {"sensor_a": sensor_a, "sensor_b": sensor_b},
             "target": ["extract", "sample", str(i), "label", label, "done", "."],
         })
     with open(path, "w") as f:
@@ -1303,23 +1315,23 @@ def selftest():
         _write_selftest_manifest(manifest)
         records = load_manifest(manifest)
         vocab = build_vocab(records)
-        image_dim, audio_dim = feature_dims(records)
+        view_dims = feature_dims(records)
         model = MultimodalLM(
-            len(vocab), image_dim=image_dim, audio_dim=audio_dim, d=32, layers=1,
-            heads=4, pad=vocab.pad, img_tokens=2, aud_tokens=2, txt_tokens=4,
+            len(vocab), view_dims=view_dims, d=32, layers=1,
+            heads=4, pad=vocab.pad, view_tokens=2, txt_tokens=4,
             concept_tokens=2, latent_concept_slots=3,
             latent_concept_memory_size=8).to("cpu")
         batch = records[:2]
-        img, aud, txt, ids = _batch_from_records(
-            batch, vocab, "cpu", image_dim, audio_dim)
-        logits = model(img, aud, txt, ids)
+        features, txt, ids = _batch_from_records(
+            batch, vocab, "cpu", view_dims)
+        logits = model(features, txt, ids)
         assert logits.shape == (2, ids.shape[1], len(vocab)), logits.shape
-        prefix, concepts = model.encode_prefix(img, aud, txt, mode="full")
+        prefix, concepts = model.encode_prefix(features, txt, mode="full")
         assert concepts.shape == (2, 2, 32)
-        latent = model.latent_concept_states(img, aud, txt, mode="full", project=True)
+        latent = model.latent_concept_states(features, txt, mode="full", project=True)
         assert latent.shape == (2, 3, 32)
         views = {
-            mode: model.latent_concept_states(img, aud, txt, mode=mode, project=True)
+            mode: model.latent_concept_states(features, txt, mode=mode, project=True)
             for mode in MODES
         }
         assert torch.isfinite(latent_multimodal_concept_loss_from_views(views))
@@ -1337,7 +1349,7 @@ def selftest():
         assert torch.isfinite(latent_multimodal_cluster_loss_from_views(views))
         trained_model, *_ = train(
             manifest, steps=1, batch=2, d=32, layers=1, heads=4, device="cpu",
-            log_every=1, img_tokens=2, aud_tokens=2, txt_tokens=4,
+            log_every=1, view_tokens=2, txt_tokens=4,
             concept_tokens=2, latent_concept_slots=3,
             latent_concept_memory_size=8, latent_concept_memory_w=0.01,
             latent_concept_association_w=0.01,
@@ -1469,8 +1481,8 @@ def main(argv=None):
                     dest="latent_concept_cluster_margin")
     ap.add_argument("--latent-concept-cluster-min-size", type=int, default=2,
                     dest="latent_concept_cluster_min_size")
-    ap.add_argument("--img-tokens", type=int, default=4, dest="img_tokens")
-    ap.add_argument("--aud-tokens", type=int, default=4, dest="aud_tokens")
+    ap.add_argument("--view-tokens", type=int, default=4, dest="view_tokens",
+                    help="prefix tokens allocated to each named manifest feature view")
     ap.add_argument("--txt-tokens", type=int, default=8, dest="txt_tokens")
     ap.add_argument("--trunk-arch", default="mlp", choices=TRUNK_ARCHES, dest="trunk_arch")
     ap.add_argument("--trunk-width", type=int, default=128, dest="trunk_width")
@@ -1491,8 +1503,8 @@ def main(argv=None):
     positive = {
         "--steps": args.steps, "--batch": args.batch, "--dim": args.d,
         "--layers": args.layers, "--heads": args.heads, "--max-len": args.max_len,
-        "--log-every": args.log_every, "--img-tokens": args.img_tokens,
-        "--aud-tokens": args.aud_tokens, "--txt-tokens": args.txt_tokens,
+        "--log-every": args.log_every, "--view-tokens": args.view_tokens,
+        "--txt-tokens": args.txt_tokens,
         "--trunk-width": args.trunk_width, "--trunk-depth": args.trunk_depth,
         "--text-layers": args.text_layers, "--concept-tokens": args.concept_tokens,
         "--fusion-layers": args.fusion_layers,
@@ -1549,8 +1561,8 @@ def main(argv=None):
         args.manifest, root=args.root, steps=args.steps, seed=args.seed,
         device=args.device, eval_n=args.eval_n, checkpoint=args.checkpoint,
         out=args.out, batch=args.batch, d=args.d, lr=args.lr, layers=args.layers,
-        heads=args.heads, max_len=args.max_len, img_tokens=args.img_tokens,
-        aud_tokens=args.aud_tokens, txt_tokens=args.txt_tokens,
+        heads=args.heads, max_len=args.max_len, view_tokens=args.view_tokens,
+        txt_tokens=args.txt_tokens,
         trunk_arch=args.trunk_arch, trunk_width=args.trunk_width,
         trunk_depth=args.trunk_depth, text_layers=args.text_layers,
         text_arch=args.text_arch, modality_dropout=args.modality_dropout,
