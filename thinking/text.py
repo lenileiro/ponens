@@ -2183,7 +2183,7 @@ def reading_fer_eval(model, vocab, records, device=DEV, n=0, seed=0,
 
 READING_SCORE_METRICS = (
     "view", "context", "neighborhood", "cluster", "fer", "both", "min", "all",
-    "balanced")
+    "balanced", "mastery")
 READING_DISCOVERY_SIGNALS = ("view", "context", "neighborhood", "cluster", "fer")
 READING_STUDY_STRATEGIES = (
     "random", "errors", "curiosity", "graph", "cycle", "discovery", "auto")
@@ -2246,6 +2246,10 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     active_mean_score = sum(active_scores) / float(len(active_scores))
     floor_score = min(active_scores)
     balanced_score = 0.5 * (active_mean_score + floor_score)
+    signal_coverage = sum(
+        0 if skipped[name] else 1 for name in READING_DISCOVERY_SIGNALS
+    ) / float(len(READING_DISCOVERY_SIGNALS))
+    mastery_score = 0.5 * active_mean_score + 0.25 * all_score + 0.25 * signal_coverage
     if metric == "view":
         score = view_score
     elif metric == "context":
@@ -2262,6 +2266,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
         score = all_score
     elif metric == "balanced":
         score = balanced_score
+    elif metric == "mastery":
+        score = mastery_score
     else:
         score = 0.5 * (view_score + context_score)
     return {"metric": metric,
@@ -2271,6 +2277,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "active_mean_score": float(active_mean_score),
             "floor_score": float(floor_score),
             "balanced_score": float(balanced_score),
+            "mastery_score": float(mastery_score),
+            "signal_coverage": float(signal_coverage),
             "view_score": float(view_score),
             "context_score": float(context_score),
             "neighborhood_score": float(neighborhood_score),
@@ -2297,7 +2305,7 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
 
 def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
                         token_drop_p=0.15, token_replace_p=0.05,
-                        context_keep_p=0.5, score_metric="balanced",
+                        context_keep_p=0.5, score_metric="mastery",
                         score_margin_w=0.1):
     view = reading_latent_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 17,
@@ -3663,7 +3671,7 @@ def fit_reading_concepts_select_best(
         replay_records=None, replay_teacher_model=None,
         replay_teacher_vocab=None, replay_w=0.0, replay_batch=0,
         replay_retention_w=0.0,
-        eval_n=64, score_metric="balanced", score_margin_w=0.1,
+        eval_n=64, score_metric="mastery", score_margin_w=0.1,
         rounds=1, before_bundle=None):
     schedule = _step_schedule(steps, rounds)
     if not schedule:
@@ -4046,7 +4054,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          study_strategy="auto", study_probe_n=0,
                          study_hard_max=0, study_refresh_steps=0,
                          study_select_best=False, study_rounds=1,
-                         study_score_metric="balanced", study_score_margin_w=0.1,
+                         study_score_metric="mastery", study_score_margin_w=0.1,
                          text_field="text", max_tokens=128, min_tokens=8,
                          eval_frac=0.10, eval_n=64, out=None, checkpoint=None):
     records = load_reading_records(
@@ -4332,6 +4340,21 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "after_score_components": after_bundle["score_components"],
               "selection": selection,
               "delta": {
+                  "score": (
+                      after_bundle["score_components"].get("score", 0.0)
+                      - before_bundle["score_components"].get("score", 0.0)),
+                  "mastery_score": (
+                      after_bundle["score_components"].get("mastery_score", 0.0)
+                      - before_bundle["score_components"].get("mastery_score", 0.0)),
+                  "active_mean_score": (
+                      after_bundle["score_components"].get("active_mean_score", 0.0)
+                      - before_bundle["score_components"].get("active_mean_score", 0.0)),
+                  "signal_coverage": (
+                      after_bundle["score_components"].get("signal_coverage", 0.0)
+                      - before_bundle["score_components"].get("signal_coverage", 0.0)),
+                  "balanced_score": (
+                      after_bundle["score_components"].get("balanced_score", 0.0)
+                      - before_bundle["score_components"].get("balanced_score", 0.0)),
                   "paired_view_acc": (
                       after["paired_view_acc"] - before["paired_view_acc"]),
                   "margin": after.get("margin", 0.0) - before.get("margin", 0.0),
@@ -4483,7 +4506,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              study_strategy="auto", study_probe_n=0,
                              study_hard_max=0, study_refresh_steps=0,
                              study_select_best=False, study_rounds=1,
-                             study_score_metric="balanced", study_score_margin_w=0.1,
+                             study_score_metric="mastery", study_score_margin_w=0.1,
                              replay_w=0.0, replay_batch=0,
                              replay_retention_w=0.0,
                              text_field="text", max_tokens=128, min_tokens=8,
@@ -4822,6 +4845,21 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "after_replay": after_replay_bundle,
               "selection": selection,
               "delta": {
+                  "score": (
+                      after_bundle["score_components"].get("score", 0.0)
+                      - before_bundle["score_components"].get("score", 0.0)),
+                  "mastery_score": (
+                      after_bundle["score_components"].get("mastery_score", 0.0)
+                      - before_bundle["score_components"].get("mastery_score", 0.0)),
+                  "active_mean_score": (
+                      after_bundle["score_components"].get("active_mean_score", 0.0)
+                      - before_bundle["score_components"].get("active_mean_score", 0.0)),
+                  "signal_coverage": (
+                      after_bundle["score_components"].get("signal_coverage", 0.0)
+                      - before_bundle["score_components"].get("signal_coverage", 0.0)),
+                  "balanced_score": (
+                      after_bundle["score_components"].get("balanced_score", 0.0)
+                      - before_bundle["score_components"].get("balanced_score", 0.0)),
                   "paired_view_acc": (
                       after["paired_view_acc"] - before["paired_view_acc"]),
                   "margin": after.get("margin", 0.0) - before.get("margin", 0.0),
@@ -6345,6 +6383,14 @@ def selftest():
     assert fer_bundle["score_components"]["metric"] == "fer"
     assert fer_bundle["score_components"]["fer_skipped"] is False
     assert math.isfinite(fer_bundle["score_components"]["score"])
+    mastery_bundle = reading_eval_bundle(
+        reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
+        score_metric="mastery")
+    assert mastery_bundle["score_components"]["metric"] == "mastery"
+    assert ("mastery_score" in mastery_bundle["score_components"]
+            and "signal_coverage" in mastery_bundle["score_components"])
+    assert (mastery_bundle["score_components"]["score"]
+            == mastery_bundle["score_components"]["mastery_score"])
     fit_reading_concepts(
         reading_model, reading_vocab, reading_records, steps=3, batch=2, lr=1e-4,
         seed=5, device="cpu", log_every=1, token_drop_p=0.1,
@@ -6468,7 +6514,7 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-study-select-best", action="store_true")
     ap.add_argument("--reading-study-rounds", type=int, default=1)
     ap.add_argument("--reading-study-score-metric", choices=READING_SCORE_METRICS,
-                    default="balanced")
+                    default="mastery")
     ap.add_argument("--reading-study-score-margin-w", type=float, default=0.1)
 
 
