@@ -347,6 +347,62 @@ def latent_concept_neighborhood_loss(anchor_slots, positive_slots,
     return torch.stack(losses).mean()
 
 
+def latent_concept_cluster_prototype_loss(slots, cluster_ids, temperature=0.1,
+                                          margin=0.0, min_cluster_size=2):
+    """Consolidate self-mined latent clusters into reusable prototypes.
+
+    `cluster_ids` are discovered outside this loss, usually from current latent
+    nearest-neighbor structure. The objective is task-agnostic: records with the
+    same discovered id move toward their current detached cluster prototype, and
+    observed prototypes compete as batch negatives when more than one exists.
+    """
+    if slots is None:
+        return torch.tensor(0.0)
+    if not torch.is_tensor(cluster_ids):
+        cluster_ids = torch.tensor(cluster_ids, dtype=torch.long, device=slots.device)
+    else:
+        cluster_ids = cluster_ids.to(device=slots.device, dtype=torch.long)
+    if cluster_ids.shape[0] != slots.shape[0]:
+        raise ValueError("latent cluster ids must match batch rows")
+    valid = cluster_ids.ge(0)
+    if int(valid.sum()) < max(1, int(min_cluster_size)):
+        return slots.sum() * 0.0
+    z = F.normalize(slots.reshape(slots.shape[0], -1), dim=-1)
+    labels = cluster_ids[valid]
+    valid_z = z[valid]
+    centers = []
+    center_labels = []
+    for label in labels.unique(sorted=True):
+        rows = labels.eq(label)
+        if int(rows.sum()) >= int(min_cluster_size):
+            centers.append(F.normalize(valid_z[rows].mean(0), dim=0))
+            center_labels.append(int(label.item()))
+    if not centers:
+        return slots.sum() * 0.0
+    centers = torch.stack(centers, dim=0).detach()
+    label_to_center = {label: i for i, label in enumerate(center_labels)}
+    keep = torch.tensor([int(label.item()) in label_to_center for label in labels],
+                        dtype=torch.bool, device=slots.device)
+    if not bool(keep.any()):
+        return slots.sum() * 0.0
+    state = valid_z[keep]
+    mapped = torch.tensor([label_to_center[int(label.item())] for label in labels[keep]],
+                          dtype=torch.long, device=slots.device)
+    sim = state.matmul(centers.t())
+    target_sim = sim.gather(1, mapped[:, None]).squeeze(1)
+    losses = [(1.0 - target_sim).mean()]
+    if centers.shape[0] > 1:
+        temp = max(float(temperature), 1e-6)
+        losses.append(F.cross_entropy(sim / temp, mapped))
+        margin_t = float(margin)
+        if margin_t:
+            other_sim = sim.masked_fill(
+                F.one_hot(mapped, num_classes=centers.shape[0]).bool(),
+                -float("inf")).max(-1).values
+            losses.append(F.relu(other_sim + margin_t - target_sim).mean())
+    return torch.stack(losses).mean()
+
+
 def schema_concept_contrastive_loss(states_by_key, target_ids_by_key, temperature=0.1):
     """Cluster same-value concept states and separate other values for the same key.
 

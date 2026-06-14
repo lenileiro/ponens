@@ -54,6 +54,7 @@ from .concepts import (
     LatentConceptHead,
     SchemaConceptHead,
     SchemaConceptRefiner,
+    latent_concept_cluster_prototype_loss,
     latent_concept_neighborhood_loss,
     latent_concept_vicreg_loss,
     schema_concept_batch_centroid_loss,
@@ -2078,10 +2079,93 @@ def mine_reading_latent_neighbors(model, vocab, records, device=DEV, n=0, seed=0
                    "skipped": False}
 
 
+def mine_reading_latent_clusters(model, vocab, records, device=DEV, n=0, seed=0,
+                                 split="train", min_cluster_size=2):
+    """Discover reusable reading clusters from current latent nearest-neighbor links."""
+    if getattr(model, "latent_concepts", None) is None:
+        return [], {"n_records": 0, "n_clusters": 0, "n_clustered_records": 0,
+                    "sampled": False, "split": split, "skipped": True}
+    candidates = [r for r in records if r.split == split]
+    sampled = bool(n and n < len(candidates))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=int(n), replace=False)
+        candidates = [candidates[int(i)] for i in idx]
+    if len(candidates) < int(min_cluster_size):
+        return [], {"n_records": len(candidates), "n_clusters": 0,
+                    "n_clustered_records": 0, "sampled": sampled,
+                    "split": split, "skipped": True}
+    emb = _reading_latent_embeddings(model, vocab, candidates, device=device)
+    if emb is None or emb.shape[0] < int(min_cluster_size):
+        return [], {"n_records": len(candidates), "n_clusters": 0,
+                    "n_clustered_records": 0, "sampled": sampled,
+                    "split": split, "skipped": True}
+    sim = emb.matmul(emb.t())
+    eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+    nearest = sim.masked_fill(eye, -float("inf")).argmax(-1).detach().cpu().tolist()
+    parent = list(range(len(candidates)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(int(a)), find(int(b))
+        if ra != rb:
+            parent[rb] = ra
+
+    for i, j in enumerate(nearest):
+        if int(j) != i:
+            union(i, int(j))
+    groups = {}
+    for i, rec in enumerate(candidates):
+        groups.setdefault(find(i), []).append(rec)
+    clusters = [rows for rows in groups.values()
+                if len(rows) >= int(min_cluster_size)]
+    sizes = [len(rows) for rows in clusters]
+    return clusters, {"n_records": len(candidates),
+                      "n_clusters": len(clusters),
+                      "n_clustered_records": int(sum(sizes)),
+                      "sampled": sampled,
+                      "split": split,
+                      "min_cluster_size": int(min_cluster_size),
+                      "mean_cluster_size": float(np.mean(sizes)) if sizes else 0.0,
+                      "max_cluster_size": int(max(sizes)) if sizes else 0,
+                      "skipped": not bool(clusters)}
+
+
 def batch_reading_neighbor_pairs(pairs, rng, batch):
     if not pairs:
         return []
     return [pairs[int(rng.integers(len(pairs)))] for _ in range(int(batch))]
+
+
+def batch_reading_cluster_records(clusters, rng, batch):
+    if not clusters:
+        return [], []
+    batch = int(batch)
+    group_n = min(len(clusters), max(1, batch // 2))
+    group_idx = [int(i) for i in rng.choice(
+        len(clusters), size=group_n, replace=False)]
+    records = []
+    cluster_ids = []
+    for local_id, cluster_i in enumerate(group_idx):
+        cluster = clusters[cluster_i]
+        if len(cluster) >= 2:
+            picks = rng.choice(len(cluster), size=2, replace=False)
+            rows = [cluster[int(picks[0])], cluster[int(picks[1])]]
+        else:
+            rows = [cluster[0], cluster[0]]
+        records.extend(rows)
+        cluster_ids.extend([local_id, local_id])
+    while len(records) < batch:
+        local_id = int(rng.integers(group_n))
+        cluster = clusters[group_idx[local_id]]
+        records.append(cluster[int(rng.integers(len(cluster)))])
+        cluster_ids.append(local_id)
+    return records[:batch], cluster_ids[:batch]
 
 
 def reading_latent_neighborhood_loss(model, pairs, vocab, device=DEV,
@@ -2105,6 +2189,23 @@ def reading_latent_neighborhood_loss(model, pairs, vocab, device=DEV,
         positive_txt, feature_dropout=feature_dropout, project=True)
     return latent_concept_neighborhood_loss(
         anchor_slots, positive_slots, temperature=temperature, margin=margin)
+
+
+def reading_latent_cluster_loss(model, records, cluster_ids, vocab, device=DEV,
+                                token_drop_p=0.15, token_replace_p=0.05,
+                                feature_dropout=0.1, temperature=0.1,
+                                margin=0.0, min_cluster_size=2):
+    if getattr(model, "latent_concepts", None) is None or not records:
+        dev = next(model.parameters()).device
+        return torch.tensor(0.0, device=dev)
+    txt = corrupt_reading_tokens(
+        pack_reading(records, vocab, device), vocab.pad, vocab.unk,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    slots = model.latent_concept_states(
+        txt, feature_dropout=feature_dropout, project=True)
+    return latent_concept_cluster_prototype_loss(
+        slots, cluster_ids, temperature=temperature, margin=margin,
+        min_cluster_size=min_cluster_size)
 
 
 def eval_reading_records(records, n=0, seed=0):
@@ -4639,6 +4740,10 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          neighborhood_probe_n=0, neighborhood_refresh_steps=0,
                          neighborhood_temperature=0.1,
                          neighborhood_margin=0.0,
+                         cluster_w=0.0, cluster_batch=0,
+                         cluster_probe_n=0, cluster_refresh_steps=0,
+                         cluster_temperature=0.1, cluster_margin=0.0,
+                         cluster_min_size=2,
                          study_strategy="errors", study_probe_n=0,
                          study_hard_max=0, study_refresh_steps=0,
                          replay_records=None, replay_teacher_model=None,
@@ -4660,6 +4765,20 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading neighborhood temperature must be positive")
     if float(neighborhood_margin) < 0.0:
         raise ValueError("reading neighborhood margin must be non-negative")
+    if float(cluster_w) < 0.0:
+        raise ValueError("reading cluster loss weight must be non-negative")
+    if int(cluster_batch) < 0:
+        raise ValueError("reading cluster batch must be non-negative")
+    if int(cluster_probe_n) < 0:
+        raise ValueError("reading cluster probe count must be non-negative")
+    if int(cluster_refresh_steps) < 0:
+        raise ValueError("reading cluster refresh steps must be non-negative")
+    if float(cluster_temperature) <= 0.0:
+        raise ValueError("reading cluster temperature must be positive")
+    if float(cluster_margin) < 0.0:
+        raise ValueError("reading cluster margin must be non-negative")
+    if int(cluster_min_size) < 2:
+        raise ValueError("reading cluster min size must be at least two")
     if float(replay_w) < 0.0:
         raise ValueError("reading replay loss weight must be non-negative")
     study_strategy = str(study_strategy)
@@ -4684,14 +4803,18 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading replay batch must be non-negative")
     replay_batch = replay_batch or max(1, batch // 2)
     neighborhood_batch = int(neighborhood_batch) or max(1, batch // 2)
+    cluster_batch = int(cluster_batch) or max(2, batch)
     neighborhood_pairs = []
     neighborhood_reports = []
+    clusters = []
+    cluster_reports = []
     study_pool = []
     study_reports = []
     last_loss = 0.0
     last_view_loss = 0.0
     last_context_target = 0.0
     last_neighborhood = 0.0
+    last_cluster = 0.0
     last_replay = 0.0
 
     def refresh_study_pool(step):
@@ -4727,6 +4850,20 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                            "pool_size": len(neighborhood_pairs)}
         neighborhood_reports.append(report)
 
+    def refresh_clusters(step):
+        nonlocal clusters
+        probe_n = (int(cluster_probe_n) if int(cluster_probe_n) > 0
+                   else max(batch * 8, int(cluster_min_size)))
+        mined, report = mine_reading_latent_clusters(
+            model, vocab, train_records, device=device, n=probe_n,
+            seed=seed + 2609 + int(step), split="train",
+            min_cluster_size=cluster_min_size)
+        if mined:
+            clusters = mined
+        report = report | {"step": int(step), "pool_active": bool(clusters),
+                           "pool_size": len(clusters)}
+        cluster_reports.append(report)
+
     for st in range(1, steps + 1):
         model.train()
         if study_strategy == "errors" and (st == 1 or (
@@ -4737,6 +4874,11 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 neighborhood_refresh_steps
                 and (st - 1) % int(neighborhood_refresh_steps) == 0)):
             refresh_neighborhood_pairs(st)
+            model.train()
+        if cluster_w and (st == 1 or (
+                cluster_refresh_steps
+                and (st - 1) % int(cluster_refresh_steps) == 0)):
+            refresh_clusters(st)
             model.train()
         source = study_pool if study_strategy == "errors" and study_pool else train_records
         rec_batch = batch_records(source, rng, batch)
@@ -4763,6 +4905,18 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 feature_dropout=feature_dropout,
                 temperature=neighborhood_temperature,
                 margin=neighborhood_margin)
+        cluster_loss = view_loss * 0.0
+        if cluster_w and clusters:
+            cluster_records, cluster_ids = batch_reading_cluster_records(
+                clusters, rng, cluster_batch)
+            cluster_loss = reading_latent_cluster_loss(
+                model, cluster_records, cluster_ids, vocab, device=device,
+                token_drop_p=token_drop_p,
+                token_replace_p=token_replace_p,
+                feature_dropout=feature_dropout,
+                temperature=cluster_temperature,
+                margin=cluster_margin,
+                min_cluster_size=cluster_min_size)
         replay_loss = view_loss * 0.0
         if replay_w and replay_sources:
             replay_batch_records = batch_records(replay_sources, rng, replay_batch)
@@ -4772,6 +4926,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 feature_dropout=feature_dropout)
         loss = (view_loss + float(context_target_w) * context_target
                 + float(neighborhood_w) * neighborhood_loss
+                + float(cluster_w) * cluster_loss
                 + float(replay_w) * replay_loss)
         opt.zero_grad()
         loss.backward()
@@ -4780,12 +4935,14 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_view_loss = float(view_loss.detach())
         last_context_target = float(context_target.detach())
         last_neighborhood = float(neighborhood_loss.detach())
+        last_cluster = float(cluster_loss.detach())
         last_replay = float(replay_loss.detach())
         if st % log_every == 0 or st == steps:
             print(f"  reading {st}/{steps} loss {last_loss:.3f} "
                   f"view {last_view_loss:.3f} "
                   f"context-target {last_context_target:.3f} "
                   f"neighborhood {last_neighborhood:.3f} "
+                  f"cluster {last_cluster:.3f} "
                   f"replay {last_replay:.3f}",
                   flush=True)
     model.reading_train_metrics = {
@@ -4793,6 +4950,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "latent_view_loss": last_view_loss,
         "context_target_loss": last_context_target,
         "neighborhood_loss": last_neighborhood,
+        "cluster_loss": last_cluster,
         "neighborhood_w": float(neighborhood_w),
         "neighborhood_batch": int(neighborhood_batch),
         "neighborhood_probe_n": int(neighborhood_probe_n),
@@ -4800,6 +4958,15 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "neighborhood_temperature": float(neighborhood_temperature),
         "neighborhood_margin": float(neighborhood_margin),
         "neighborhood_pairs": len(neighborhood_pairs),
+        "cluster_w": float(cluster_w),
+        "cluster_batch": int(cluster_batch),
+        "cluster_probe_n": int(cluster_probe_n),
+        "cluster_refresh_steps": int(cluster_refresh_steps),
+        "cluster_temperature": float(cluster_temperature),
+        "cluster_margin": float(cluster_margin),
+        "cluster_min_size": int(cluster_min_size),
+        "clusters": len(clusters),
+        "cluster_records": sum(len(rows) for rows in clusters),
         "replay_loss": last_replay,
         "replay_w": float(replay_w),
         "replay_batch": int(replay_batch),
@@ -4810,6 +4977,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     }
     model.reading_study_reports = study_reports
     model.reading_neighborhood_reports = neighborhood_reports
+    model.reading_cluster_reports = cluster_reports
     return model, vocab
 
 
@@ -4839,6 +5007,10 @@ def fit_reading_concepts_select_best(
         neighborhood_w=0.0, neighborhood_batch=0,
         neighborhood_probe_n=0, neighborhood_refresh_steps=0,
         neighborhood_temperature=0.1, neighborhood_margin=0.0,
+        cluster_w=0.0, cluster_batch=0,
+        cluster_probe_n=0, cluster_refresh_steps=0,
+        cluster_temperature=0.1, cluster_margin=0.0,
+        cluster_min_size=2,
         study_strategy="errors", study_probe_n=0,
         study_hard_max=0, study_refresh_steps=0,
         replay_records=None, replay_teacher_model=None,
@@ -4896,6 +5068,7 @@ def fit_reading_concepts_select_best(
     rounds_report = [initial_row]
     all_study_reports = []
     all_neighborhood_reports = []
+    all_cluster_reports = []
     for round_i, round_steps in enumerate(schedule, start=1):
         fit_reading_concepts(
             model, vocab, records, steps=round_steps, batch=batch, lr=lr,
@@ -4912,6 +5085,13 @@ def fit_reading_concepts_select_best(
             neighborhood_refresh_steps=neighborhood_refresh_steps,
             neighborhood_temperature=neighborhood_temperature,
             neighborhood_margin=neighborhood_margin,
+            cluster_w=cluster_w,
+            cluster_batch=cluster_batch,
+            cluster_probe_n=cluster_probe_n,
+            cluster_refresh_steps=cluster_refresh_steps,
+            cluster_temperature=cluster_temperature,
+            cluster_margin=cluster_margin,
+            cluster_min_size=cluster_min_size,
             study_strategy=study_strategy, study_probe_n=study_probe_n,
             study_hard_max=study_hard_max,
             study_refresh_steps=study_refresh_steps,
@@ -4925,6 +5105,9 @@ def fit_reading_concepts_select_best(
         all_neighborhood_reports.extend(
             report | {"round": int(round_i)}
             for report in getattr(model, "reading_neighborhood_reports", []))
+        all_cluster_reports.extend(
+            report | {"round": int(round_i)}
+            for report in getattr(model, "reading_cluster_reports", []))
         bundle = reading_eval_bundle(
             model, vocab, records, device=device, eval_n=eval_n, seed=seed,
             token_drop_p=token_drop_p, token_replace_p=token_replace_p,
@@ -4969,6 +5152,7 @@ def fit_reading_concepts_select_best(
     model.reading_train_metrics = best_metrics
     model.reading_study_reports = all_study_reports
     model.reading_neighborhood_reports = all_neighborhood_reports
+    model.reading_cluster_reports = all_cluster_reports
     model.reading_selection_report = selection
     return model, vocab, selection
 
@@ -4990,6 +5174,10 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            neighborhood_probe_n=0, neighborhood_refresh_steps=0,
                            neighborhood_temperature=0.1,
                            neighborhood_margin=0.0,
+                           cluster_w=0.0, cluster_batch=0,
+                           cluster_probe_n=0, cluster_refresh_steps=0,
+                           cluster_temperature=0.1, cluster_margin=0.0,
+                           cluster_min_size=2,
                            study_strategy="errors", study_probe_n=0,
                            study_hard_max=0, study_refresh_steps=0):
     if int(latent_concept_slots) <= 0:
@@ -5020,6 +5208,13 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         neighborhood_refresh_steps=neighborhood_refresh_steps,
         neighborhood_temperature=neighborhood_temperature,
         neighborhood_margin=neighborhood_margin,
+        cluster_w=cluster_w,
+        cluster_batch=cluster_batch,
+        cluster_probe_n=cluster_probe_n,
+        cluster_refresh_steps=cluster_refresh_steps,
+        cluster_temperature=cluster_temperature,
+        cluster_margin=cluster_margin,
+        cluster_min_size=cluster_min_size,
         study_strategy=study_strategy, study_probe_n=study_probe_n,
         study_hard_max=study_hard_max, study_refresh_steps=study_refresh_steps)
 
@@ -5040,6 +5235,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          neighborhood_probe_n=0, neighborhood_refresh_steps=0,
                          neighborhood_temperature=0.1,
                          neighborhood_margin=0.0,
+                         cluster_w=0.0, cluster_batch=0,
+                         cluster_probe_n=0, cluster_refresh_steps=0,
+                         cluster_temperature=0.1, cluster_margin=0.0,
+                         cluster_min_size=2,
                          study_strategy="errors", study_probe_n=0,
                          study_hard_max=0, study_refresh_steps=0,
                          study_select_best=False, study_rounds=1,
@@ -5082,6 +5281,13 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             neighborhood_refresh_steps=neighborhood_refresh_steps,
             neighborhood_temperature=neighborhood_temperature,
             neighborhood_margin=neighborhood_margin,
+            cluster_w=cluster_w,
+            cluster_batch=cluster_batch,
+            cluster_probe_n=cluster_probe_n,
+            cluster_refresh_steps=cluster_refresh_steps,
+            cluster_temperature=cluster_temperature,
+            cluster_margin=cluster_margin,
+            cluster_min_size=cluster_min_size,
             study_strategy=study_strategy, study_probe_n=study_probe_n,
             study_hard_max=study_hard_max,
             study_refresh_steps=study_refresh_steps, eval_n=eval_n,
@@ -5103,6 +5309,13 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             neighborhood_refresh_steps=neighborhood_refresh_steps,
             neighborhood_temperature=neighborhood_temperature,
             neighborhood_margin=neighborhood_margin,
+            cluster_w=cluster_w,
+            cluster_batch=cluster_batch,
+            cluster_probe_n=cluster_probe_n,
+            cluster_refresh_steps=cluster_refresh_steps,
+            cluster_temperature=cluster_temperature,
+            cluster_margin=cluster_margin,
+            cluster_min_size=cluster_min_size,
             study_strategy=study_strategy, study_probe_n=study_probe_n,
             study_hard_max=study_hard_max,
             study_refresh_steps=study_refresh_steps)
@@ -5144,6 +5357,13 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "neighborhood_refresh_steps": int(neighborhood_refresh_steps),
               "neighborhood_temperature": float(neighborhood_temperature),
               "neighborhood_margin": float(neighborhood_margin),
+              "cluster_w": float(cluster_w),
+              "cluster_batch": int(cluster_batch),
+              "cluster_probe_n": int(cluster_probe_n),
+              "cluster_refresh_steps": int(cluster_refresh_steps),
+              "cluster_temperature": float(cluster_temperature),
+              "cluster_margin": float(cluster_margin),
+              "cluster_min_size": int(cluster_min_size),
               "study_strategy": study_strategy,
               "study_probe_n": int(study_probe_n),
               "study_hard_max": int(study_hard_max),
@@ -5184,7 +5404,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "train_metrics": getattr(model, "reading_train_metrics", {}),
               "study_hard_examples": getattr(model, "reading_study_reports", []),
               "study_neighborhoods": getattr(
-                  model, "reading_neighborhood_reports", [])}
+                  model, "reading_neighborhood_reports", []),
+              "study_clusters": getattr(model, "reading_cluster_reports", [])}
     if checkpoint:
         os.makedirs(os.path.dirname(checkpoint) or ".", exist_ok=True)
         torch.save(checkpoint_payload(model, vocab, d, layers, heads, report),
@@ -5258,6 +5479,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              neighborhood_probe_n=0, neighborhood_refresh_steps=0,
                              neighborhood_temperature=0.1,
                              neighborhood_margin=0.0,
+                             cluster_w=0.0, cluster_batch=0,
+                             cluster_probe_n=0, cluster_refresh_steps=0,
+                             cluster_temperature=0.1, cluster_margin=0.0,
+                             cluster_min_size=2,
                              study_strategy="errors", study_probe_n=0,
                              study_hard_max=0, study_refresh_steps=0,
                              study_select_best=False, study_rounds=1,
@@ -5321,6 +5546,13 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             neighborhood_refresh_steps=neighborhood_refresh_steps,
             neighborhood_temperature=neighborhood_temperature,
             neighborhood_margin=neighborhood_margin,
+            cluster_w=cluster_w,
+            cluster_batch=cluster_batch,
+            cluster_probe_n=cluster_probe_n,
+            cluster_refresh_steps=cluster_refresh_steps,
+            cluster_temperature=cluster_temperature,
+            cluster_margin=cluster_margin,
+            cluster_min_size=cluster_min_size,
             study_strategy=study_strategy, study_probe_n=study_probe_n,
             study_hard_max=study_hard_max,
             study_refresh_steps=study_refresh_steps, eval_n=eval_n,
@@ -5347,6 +5579,13 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             neighborhood_refresh_steps=neighborhood_refresh_steps,
             neighborhood_temperature=neighborhood_temperature,
             neighborhood_margin=neighborhood_margin,
+            cluster_w=cluster_w,
+            cluster_batch=cluster_batch,
+            cluster_probe_n=cluster_probe_n,
+            cluster_refresh_steps=cluster_refresh_steps,
+            cluster_temperature=cluster_temperature,
+            cluster_margin=cluster_margin,
+            cluster_min_size=cluster_min_size,
             study_strategy=study_strategy, study_probe_n=study_probe_n,
             study_hard_max=study_hard_max,
             study_refresh_steps=study_refresh_steps,
@@ -5406,6 +5645,13 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "neighborhood_refresh_steps": int(neighborhood_refresh_steps),
               "neighborhood_temperature": float(neighborhood_temperature),
               "neighborhood_margin": float(neighborhood_margin),
+              "cluster_w": float(cluster_w),
+              "cluster_batch": int(cluster_batch),
+              "cluster_probe_n": int(cluster_probe_n),
+              "cluster_refresh_steps": int(cluster_refresh_steps),
+              "cluster_temperature": float(cluster_temperature),
+              "cluster_margin": float(cluster_margin),
+              "cluster_min_size": int(cluster_min_size),
               "study_strategy": study_strategy,
               "study_probe_n": int(study_probe_n),
               "study_hard_max": int(study_hard_max),
@@ -5460,7 +5706,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "train_metrics": getattr(model, "reading_train_metrics", {}),
               "study_hard_examples": getattr(model, "reading_study_reports", []),
               "study_neighborhoods": getattr(
-                  model, "reading_neighborhood_reports", [])}
+                  model, "reading_neighborhood_reports", []),
+              "study_clusters": getattr(model, "reading_cluster_reports", [])}
     if out_checkpoint:
         os.makedirs(os.path.dirname(out_checkpoint) or ".", exist_ok=True)
         torch.save(checkpoint_payload(model, vocab, d, layers, heads, report),
@@ -8913,6 +9160,16 @@ def selftest():
         reading_model, reading_pairs, reading_vocab, device="cpu",
         token_drop_p=0.1, token_replace_p=0.0, temperature=0.2)
     assert torch.isfinite(reading_neighbor_loss)
+    reading_clusters, reading_cluster_report = mine_reading_latent_clusters(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0)
+    assert reading_cluster_report["n_clusters"] >= 1
+    assert reading_clusters
+    cluster_records, cluster_ids = batch_reading_cluster_records(
+        reading_clusters, np.random.default_rng(0), batch=4)
+    reading_cluster_loss = reading_latent_cluster_loss(
+        reading_model, cluster_records, cluster_ids, reading_vocab, device="cpu",
+        token_drop_p=0.1, token_replace_p=0.0, temperature=0.2)
+    assert torch.isfinite(reading_cluster_loss)
     reading_errors, reading_correct, reading_report = reading_latent_record_outcomes(
         reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0,
         token_drop_p=0.1, token_replace_p=0.0)
@@ -8959,10 +9216,13 @@ def selftest():
         seed=5, device="cpu", log_every=1, token_drop_p=0.1,
         token_replace_p=0.0, study_strategy="errors", study_probe_n=2,
         study_hard_max=2, context_target_w=0.1, context_keep_p=0.5,
-        neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2)
+        neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2,
+        cluster_w=0.1, cluster_batch=4, cluster_probe_n=4)
     assert "context_target_loss" in reading_model.reading_train_metrics
     assert reading_model.reading_train_metrics["neighborhood_w"] == 0.1
     assert reading_model.reading_neighborhood_reports
+    assert reading_model.reading_train_metrics["cluster_w"] == 0.1
+    assert reading_model.reading_cluster_reports
     reading_payload = checkpoint_payload(reading_model, reading_vocab, 32, 1, 4,
                                          {"experiment": "reading-selftest"})
     assert reading_payload["fact_schema"] is None
@@ -8995,9 +9255,11 @@ def selftest():
             context_keep_p=0.5, replay_records=reading_records,
             replay_teacher_model=teacher_model, replay_teacher_vocab=teacher_vocab,
             replay_w=0.1, replay_batch=2,
-            neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2)
+            neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2,
+            cluster_w=0.1, cluster_batch=4, cluster_probe_n=4)
         assert expanded_model.reading_train_metrics["replay_w"] == 0.1
         assert expanded_model.reading_train_metrics["neighborhood_w"] == 0.1
+        assert expanded_model.reading_train_metrics["cluster_w"] == 0.1
     score_a = {"semantic_head": {"fact_value_acc": 0.8},
                "teacher_forced": {"fact_value_acc": 0.7},
                "latent_fact_concept_head": {"fact_value_acc": 0.65,
@@ -9224,6 +9486,22 @@ def main(argv=None):
                     help="contrastive temperature for mined latent neighbors")
     ap.add_argument("--reading-neighborhood-margin", type=float, default=0.0,
                     help="minimum margin over other mined neighbors")
+    ap.add_argument("--reading-cluster-w", type=float, default=0.0,
+                    help=("weight for self-mined latent cluster prototype "
+                          "consolidation on raw reading chunks"))
+    ap.add_argument("--reading-cluster-batch", type=int, default=0,
+                    help="cluster records per step; 0 = main batch")
+    ap.add_argument("--reading-cluster-probe-n", type=int, default=0,
+                    help=("number of train chunks to mine for latent clusters; "
+                          "0 = 8x main batch"))
+    ap.add_argument("--reading-cluster-refresh-steps", type=int, default=0,
+                    help="refresh mined latent clusters every N steps; 0 means once")
+    ap.add_argument("--reading-cluster-temperature", type=float, default=0.1,
+                    help="contrastive temperature for mined latent cluster prototypes")
+    ap.add_argument("--reading-cluster-margin", type=float, default=0.0,
+                    help="minimum margin over other mined cluster prototypes")
+    ap.add_argument("--reading-cluster-min-size", type=int, default=2,
+                    help="minimum records per mined latent cluster")
     ap.add_argument("--reading-study-strategy", choices=("random", "errors"),
                     default="errors",
                     help="train raw reading on random chunks or mined retrieval failures")
@@ -9716,6 +9994,20 @@ def main(argv=None):
         ap.error("--reading-neighborhood-temperature must be positive")
     if args.reading_neighborhood_margin < 0.0:
         ap.error("--reading-neighborhood-margin must be non-negative")
+    if args.reading_cluster_w < 0.0:
+        ap.error("--reading-cluster-w must be non-negative")
+    if args.reading_cluster_batch < 0:
+        ap.error("--reading-cluster-batch must be non-negative")
+    if args.reading_cluster_probe_n < 0:
+        ap.error("--reading-cluster-probe-n must be non-negative")
+    if args.reading_cluster_refresh_steps < 0:
+        ap.error("--reading-cluster-refresh-steps must be non-negative")
+    if args.reading_cluster_temperature <= 0.0:
+        ap.error("--reading-cluster-temperature must be positive")
+    if args.reading_cluster_margin < 0.0:
+        ap.error("--reading-cluster-margin must be non-negative")
+    if args.reading_cluster_min_size < 2:
+        ap.error("--reading-cluster-min-size must be at least two")
     if args.reading_study_probe_n < 0:
         ap.error("--reading-study-probe-n must be non-negative")
     if args.reading_study_hard_max < 0:
@@ -9803,6 +10095,13 @@ def main(argv=None):
                 neighborhood_temperature=(
                     args.reading_neighborhood_temperature),
                 neighborhood_margin=args.reading_neighborhood_margin,
+                cluster_w=args.reading_cluster_w,
+                cluster_batch=args.reading_cluster_batch,
+                cluster_probe_n=args.reading_cluster_probe_n,
+                cluster_refresh_steps=args.reading_cluster_refresh_steps,
+                cluster_temperature=args.reading_cluster_temperature,
+                cluster_margin=args.reading_cluster_margin,
+                cluster_min_size=args.reading_cluster_min_size,
                 study_strategy=args.reading_study_strategy,
                 study_probe_n=args.reading_study_probe_n,
                 study_hard_max=args.reading_study_hard_max,
@@ -9862,6 +10161,13 @@ def main(argv=None):
                 neighborhood_temperature=(
                     args.reading_neighborhood_temperature),
                 neighborhood_margin=args.reading_neighborhood_margin,
+                cluster_w=args.reading_cluster_w,
+                cluster_batch=args.reading_cluster_batch,
+                cluster_probe_n=args.reading_cluster_probe_n,
+                cluster_refresh_steps=args.reading_cluster_refresh_steps,
+                cluster_temperature=args.reading_cluster_temperature,
+                cluster_margin=args.reading_cluster_margin,
+                cluster_min_size=args.reading_cluster_min_size,
                 study_strategy=args.reading_study_strategy,
                 study_probe_n=args.reading_study_probe_n,
                 study_hard_max=args.reading_study_hard_max,
