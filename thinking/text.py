@@ -31,7 +31,6 @@ from .concepts import (
     LatentConceptHead,
     LatentConceptMemory,
     LatentConceptSequencePredictor,
-    SchemaConceptHead,
     SchemaConceptRefiner,
     latent_concept_bridge_loss,
     latent_concept_bridge_scores,
@@ -60,34 +59,15 @@ from .concepts import (
     latent_concept_slot_factorization_loss,
     latent_concept_transition_consistency_loss,
     latent_concept_vicreg_loss,
-    schema_concept_batch_centroid_loss,
-    schema_concept_contrastive_loss,
-    schema_concept_prototype_alignment_loss,
-    schema_concept_prototype_spread_loss,
-    schema_concept_state_spread_loss,
 )
 from .selection import concept_round_selection_decision
 from .trace import Vocab
 
 DEV = get_device()
-KEYWORDS = ("extract", "fact", "done", ".")
 TOKEN_RE = re.compile(r"[a-z0-9_]+|[^\s\w]", re.ASCII)
 READING_DEFAULT_LATENT_CONCEPT_SLOTS = 4
 READING_REPLAY_BANK_VERSION = 1
 READING_REPLAY_BANK_SIZE = 128
-
-
-@dataclass(frozen=True)
-class TextRecord:
-    rec_id: str
-    split: str
-    tokens: tuple[str, ...]
-    facts: tuple[tuple[str, str, str], ...]
-    group: str | None = None
-    kind: str = "plain"
-    base_id: str | None = None
-    changed: tuple[tuple[str, str, str], ...] = field(default_factory=tuple)
-    meta: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -97,17 +77,6 @@ class ReadingRecord:
     tokens: tuple[str, ...]
     kind: str = "raw_text"
     meta: dict = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class FactSchema:
-    keys: tuple[tuple[str, str], ...]
-    values: tuple[tuple[str, ...], ...]
-
-    @property
-    def value_index(self):
-        return {(key, val): i for key, vals in zip(self.keys, self.values)
-                for i, val in enumerate(vals)}
 
 
 def split_words(text):
@@ -239,83 +208,6 @@ def reading_replay_bank_records_from_checkpoint(path, device="cpu"):
     return reading_replay_bank_records_from_payload(ckpt)
 
 
-def normalize_fact(raw, where="record"):
-    if not isinstance(raw, (list, tuple)) or len(raw) != 3:
-        raise ValueError(f"{where}: facts must be [slot, predicate, value] triples")
-    slot, pred, val = raw
-    if not all(isinstance(x, str) and x for x in (slot, pred, val)):
-        raise ValueError(f"{where}: fact fields must be non-empty strings")
-    return (slot, pred, val)
-
-
-def normalize_record(raw, default_split=None, idx=0):
-    if not isinstance(raw, dict):
-        raise ValueError(f"record {idx} must be an object")
-    split = raw.get("split", default_split)
-    if split not in ("train", "eval"):
-        raise ValueError(f"record {idx} has invalid split {split!r}")
-    if "tokens" in raw:
-        tokens = tuple(raw["tokens"])
-    elif "text" in raw:
-        tokens = tuple(split_words(raw["text"]))
-    else:
-        raise ValueError(f"record {idx} must contain text or tokens")
-    if not tokens or not all(isinstance(t, str) and t for t in tokens):
-        raise ValueError(f"record {idx} has empty/non-string tokens")
-    facts = tuple(normalize_fact(f, f"record {idx}") for f in raw.get("facts", []))
-    if not facts:
-        raise ValueError(f"record {idx} must contain at least one fact")
-    changed = tuple(normalize_fact(f, f"record {idx}.changed")
-                    for f in raw.get("changed", []))
-    meta = raw.get("meta") or {}
-    if not isinstance(meta, dict):
-        raise ValueError(f"record {idx}.meta must be an object when provided")
-    return TextRecord(
-        rec_id=str(raw.get("id", f"{split}-{idx}")),
-        split=split,
-        tokens=tokens,
-        facts=facts,
-        group=raw.get("group"),
-        kind=str(raw.get("kind", "plain")),
-        base_id=raw.get("base_id"),
-        changed=changed,
-        meta=meta,
-    )
-
-
-def load_records(path, require_train=True, require_eval=True):
-    if isinstance(path, (list, tuple)):
-        records = []
-        for p in path:
-            records.extend(load_records(p, require_train=False, require_eval=False))
-        if require_train and not any(r.split == "train" for r in records):
-            raise ValueError(f"{path} has no train records")
-        if require_eval and not any(r.split == "eval" for r in records):
-            raise ValueError(f"{path} has no eval records")
-        return records
-    with open(path) as f:
-        txt = f.read()
-    if path.endswith(".jsonl"):
-        records = [normalize_record(json.loads(line), idx=i)
-                   for i, line in enumerate(txt.splitlines()) if line.strip()]
-    else:
-        data = json.loads(txt)
-        records = []
-        if isinstance(data, list):
-            records = [normalize_record(r, idx=i) for i, r in enumerate(data)]
-        elif "records" in data:
-            records = [normalize_record(r, idx=i) for i, r in enumerate(data["records"])]
-        else:
-            for split in ("train", "eval"):
-                records.extend(normalize_record(r, default_split=split, idx=i)
-                               for i, r in enumerate(data.get(split, [])))
-    if require_train and not any(r.split == "train" for r in records):
-        raise ValueError(f"{path} has no train records")
-    if require_eval and not any(r.split == "eval" for r in records):
-        raise ValueError(f"{path} has no eval records")
-    return records
-
-
 def normalize_reading_record(raw, default_split=None, idx=0, text_field="text"):
     if not isinstance(raw, dict):
         raise ValueError(f"reading record {idx} must be an object")
@@ -440,49 +332,6 @@ def _read_text_source(source, timeout=300):
         return f.read()
 
 
-def trace_tokens(facts):
-    toks = ["extract"]
-    for slot, pred, val in facts:
-        toks += ["fact", slot, pred, val, "."]
-    return toks + ["done", "."]
-
-
-def parse_facts(tokens):
-    out = []
-    try:
-        i = tokens.index("extract") + 1
-    except ValueError:
-        i = 0
-    while i < len(tokens):
-        if tokens[i] == "done":
-            break
-        if i + 4 < len(tokens) and tokens[i] == "fact" and tokens[i + 4] == ".":
-            out.append((tokens[i + 1], tokens[i + 2], tokens[i + 3]))
-            i += 5
-        else:
-            i += 1
-    return tuple(out)
-
-
-def build_vocab(records, base_vocab=None):
-    if base_vocab is not None:
-        itos = list(base_vocab.itos)
-        seen = set(itos)
-        new = []
-        for rec in records:
-            for tok in list(rec.tokens) + [x for fact in rec.facts + rec.changed for x in fact]:
-                if tok not in seen:
-                    seen.add(tok)
-                    new.append(tok)
-        return vocab_from_itos(itos + sorted(new))
-    toks = list(KEYWORDS)
-    for rec in records:
-        toks += list(rec.tokens)
-        for fact in rec.facts + rec.changed:
-            toks += list(fact)
-    return Vocab(toks)
-
-
 def build_reading_vocab(records, base_vocab=None):
     if base_vocab is not None:
         itos = list(base_vocab.itos)
@@ -500,19 +349,6 @@ def build_reading_vocab(records, base_vocab=None):
     return Vocab(toks)
 
 
-def build_fact_schema(records, base_schema=None):
-    by_key = {}
-    if base_schema is not None:
-        for key, values in zip(base_schema.keys, base_schema.values):
-            by_key.setdefault(tuple(key), set()).update(values)
-    for rec in records:
-        for slot, pred, val in rec.facts:
-            by_key.setdefault((slot, pred), set()).add(val)
-    keys = tuple(sorted(by_key))
-    values = tuple(tuple(sorted(by_key[k])) for k in keys)
-    return FactSchema(keys=keys, values=values)
-
-
 def vocab_from_itos(itos):
     vocab = object.__new__(Vocab)
     vocab.itos = list(itos)
@@ -520,15 +356,6 @@ def vocab_from_itos(itos):
     vocab.pad = vocab.stoi.get("<pad>", 0)
     vocab.unk = vocab.stoi.get("<unk>", 1)
     return vocab
-
-
-def fact_schema_from_payload(payload):
-    if not payload:
-        return None
-    return FactSchema(
-        keys=tuple(tuple(x) for x in payload["keys"]),
-        values=tuple(tuple(v) for v in payload["values"]),
-    )
 
 
 TEXT_ENCODER_ARCHES = ("transformer", "standard", "relational", "abstractor")
@@ -582,11 +409,7 @@ class TextReadingLM(nn.Module):
     """Raw text reader with latent concept memory and decoder prefix support."""
 
     def __init__(self, vocab_size, d=96, layers=3, heads=4, pad=0, max_len=512,
-                 fact_schema=None, fact_concept_prefix=False,
                  text_encoder_arch="transformer", text_encoder_layers=1,
-                 fact_concept_refine=False, fact_concept_refine_gate_init=-2.0,
-                 fact_concept_mixer_layers=0,
-                 fact_concept_mixer_gate_init=-2.0,
                  latent_concept_slots=0, latent_concept_layers=1,
                  latent_concept_prefix=False,
                  latent_concept_refine=False,
@@ -595,11 +418,6 @@ class TextReadingLM(nn.Module):
         super().__init__()
         self.d = int(d)
         self.heads = int(heads)
-        self.fact_concept_prefix = bool(fact_concept_prefix)
-        self.fact_concept_refine = bool(fact_concept_refine)
-        self.fact_concept_refine_gate_init = float(fact_concept_refine_gate_init)
-        self.fact_concept_mixer_layers = int(fact_concept_mixer_layers)
-        self.fact_concept_mixer_gate_init = float(fact_concept_mixer_gate_init)
         self.latent_concept_slots = int(latent_concept_slots)
         self.latent_concept_layers = int(latent_concept_layers)
         self.latent_concept_prefix = bool(latent_concept_prefix)
@@ -621,9 +439,6 @@ class TextReadingLM(nn.Module):
         self.lm = ScratchpadLM(vocab_size, d=d, layers=layers, heads=heads, max_len=max_len,
                                pad=pad, pointer=False, loop=False)
         self.reading_predictor = LatentConceptSequencePredictor(d)
-        self.fact_schema = fact_schema
-        self.fact_heads = nn.ModuleDict()
-        self.fact_concept_refiner = None
         self.latent_concept_refiner = None
         self.latent_concepts = (LatentConceptHead(
             self.latent_concept_slots, d, heads=heads,
@@ -635,47 +450,6 @@ class TextReadingLM(nn.Module):
         if self.latent_concept_refine and self.latent_concepts is not None:
             self.latent_concept_refiner = SchemaConceptRefiner(
                 d, heads=heads, gate_init=self.latent_concept_refine_gate_init)
-        if fact_schema is not None:
-            self.fact_query = nn.Parameter(torch.randn(len(fact_schema.keys), d) * 0.02)
-            self.fact_concepts = SchemaConceptHead(
-                fact_schema.keys, fact_schema.values, d,
-                mixer_layers=self.fact_concept_mixer_layers,
-                mixer_heads=heads,
-                mixer_gate_init=self.fact_concept_mixer_gate_init)
-            if self.fact_concept_refine:
-                self.fact_concept_refiner = SchemaConceptRefiner(
-                    d, heads=heads, gate_init=self.fact_concept_refine_gate_init)
-            for i, vals in enumerate(fact_schema.values):
-                self.fact_heads[str(i)] = nn.Linear(d, len(vals))
-        else:
-            self.fact_concept_refine = False
-            self.fact_concept_mixer_layers = 0
-            self.fact_query = None
-            self.fact_concepts = None
-
-    def enable_fact_concept_refiner(self, heads=None, gate_init=-2.0):
-        if self.fact_concepts is None:
-            self.fact_concept_refine = False
-            return self
-        if self.fact_concept_refiner is None:
-            self.fact_concept_refiner = SchemaConceptRefiner(
-                self.d, heads=int(heads or self.heads), gate_init=gate_init)
-            self.fact_concept_refiner.to(next(self.parameters()).device)
-            self.fact_concept_refine_gate_init = float(gate_init)
-        self.fact_concept_refine = True
-        return self
-
-    def enable_fact_concept_mixer(self, heads=None, layers=1, gate_init=-2.0):
-        if self.fact_concepts is None:
-            self.fact_concept_mixer_layers = 0
-            return self
-        self.fact_concepts.enable_mixer(
-            heads=int(heads or self.heads), layers=int(layers), gate_init=gate_init)
-        if self.fact_concepts.mixer is not None:
-            self.fact_concepts.mixer.to(next(self.parameters()).device)
-        self.fact_concept_mixer_layers = int(layers)
-        self.fact_concept_mixer_gate_init = float(gate_init)
-        return self
 
     def enable_latent_concepts(self, slots, heads=None, layers=1):
         slots = int(slots)
@@ -848,10 +622,6 @@ class TextReadingLM(nn.Module):
         if self.training and feature_dropout > 0.0:
             prefix = F.dropout(prefix, p=float(feature_dropout), training=True)
             prefix = prefix.masked_fill(mask.unsqueeze(-1), 0.0)
-        if (self.fact_concept_refine and self.fact_concepts is not None
-                and self.fact_concept_refiner is not None):
-            concepts = self.fact_concepts.state_tensor(prefix, mask=mask)
-            prefix = self.fact_concept_refiner(prefix, concepts, mask=mask)
         if (use_latent_refine and self.latent_concept_refine
                 and self.latent_concepts is not None
                 and self.latent_concept_refiner is not None):
@@ -879,83 +649,9 @@ class TextReadingLM(nn.Module):
         mask = txt.eq(self.txt.pad)
         if self.latent_concept_prefix and self.latent_concepts is not None:
             extra.append(self.latent_concepts(prefix, mask=mask))
-        if self.fact_concept_prefix and self.fact_concepts is not None:
-            extra.append(self.fact_concepts.state_tensor(prefix, mask=mask))
         if extra:
             prefix = torch.cat(extra + [prefix], dim=1)
         return prefix
-
-    def semantic_logits(self, txt):
-        if self.fact_schema is None:
-            return {}
-        prefix, _pooled = self.encode_text(txt)
-        mask = txt.eq(self.txt.pad)
-        out = {}
-        scale = prefix.shape[-1] ** -0.5
-        for k, head in self.fact_heads.items():
-            idx = int(k)
-            scores = (prefix * self.fact_query[idx]).sum(-1) * scale
-            scores = scores.masked_fill(mask, float("-inf"))
-            pooled = (scores.softmax(-1).unsqueeze(-1) * prefix).sum(1)
-            out[self.fact_schema.keys[idx]] = head(pooled)
-        return out
-
-    def fact_concept_states(self, txt):
-        if self.fact_concepts is None:
-            return {}
-        prefix, _pooled = self.encode_text(txt)
-        return self.fact_concepts.states(prefix, mask=txt.eq(self.txt.pad))
-
-    def fact_concept_geometry_states(self, txt):
-        if self.fact_concepts is None:
-            return {}
-        prefix, _pooled = self.encode_text(txt)
-        return self.fact_concepts.geometry_states(prefix, mask=txt.eq(self.txt.pad))
-
-    def fact_concept_geometry_logits(self, txt, temperature=0.1):
-        if self.fact_concepts is None:
-            return {}
-        prefix, _pooled = self.encode_text(txt)
-        return self.fact_concepts.geometry_logits(
-            prefix, mask=txt.eq(self.txt.pad), temperature=temperature)
-
-    def fact_concept_logits(self, txt):
-        if self.fact_concepts is None:
-            return {}
-        prefix, _pooled = self.encode_text(txt)
-        return self.fact_concepts(prefix, mask=txt.eq(self.txt.pad))
-
-    def latent_fact_concept_state_tensor(self, txt):
-        if self.fact_concepts is None or self.latent_concepts is None:
-            return None
-        prefix, _pooled = self.encode_text(txt)
-        latent = self.latent_concepts(prefix, mask=txt.eq(self.txt.pad))
-        return self.fact_concepts.state_tensor(latent)
-
-    def latent_fact_concept_states(self, txt):
-        state_tensor = self.latent_fact_concept_state_tensor(txt)
-        if state_tensor is None:
-            return {}
-        return {key: state_tensor[:, i] for i, key in enumerate(self.fact_concepts.keys)}
-
-    def latent_fact_concept_logits(self, txt):
-        state_tensor = self.latent_fact_concept_state_tensor(txt)
-        if state_tensor is None:
-            return {}
-        return self.fact_concepts.logits_from_state_tensor(state_tensor)
-
-def pack(records, vocab, device):
-    text_ids = [vocab.enc(r.tokens) for r in records]
-    trace_ids = [vocab.enc(trace_tokens(r.facts)) for r in records]
-    max_t = max(len(x) for x in text_ids)
-    max_y = max(len(x) for x in trace_ids)
-    txt = torch.full((len(records), max_t), vocab.pad, dtype=torch.long, device=device)
-    y = torch.full((len(records), max_y), vocab.pad, dtype=torch.long, device=device)
-    for i, ids in enumerate(text_ids):
-        txt[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
-    for i, ids in enumerate(trace_ids):
-        y[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
-    return txt, y
 
 
 def pack_reading(records, vocab, device):
@@ -971,41 +667,15 @@ def batch_records(records, rng, batch):
     return [records[int(rng.integers(len(records)))] for _ in range(batch)]
 
 
-def bucket_records(records, key):
-    if key == "none":
-        return {"all": list(records)}
-    if key == "kind":
-        buckets = {}
-        for rec in records:
-            buckets.setdefault(rec.kind, []).append(rec)
-        return buckets
-    raise ValueError(f"unknown balance key {key!r}")
-
-
-def balanced_batch_records(buckets, rng, batch):
-    names = tuple(sorted(k for k, rows in buckets.items() if rows))
-    if not names:
-        raise ValueError("cannot sample from empty buckets")
-    rows = []
-    for i in range(batch):
-        bucket = buckets[names[i % len(names)]]
-        rows.append(bucket[int(rng.integers(len(bucket)))])
-    if len(rows) > 1:
-        order = rng.permutation(len(rows))
-        rows = [rows[int(i)] for i in order]
-    return rows
-
-
 def copy_pretrained_text_weights(src_model, src_vocab, dst_model, dst_vocab):
     """Copy compatible checkpoint weights into an expanded text model.
 
-    New tokens and new fact values keep their random initialization. Existing tokens, transformer
-    blocks, and semantic-head rows are copied by symbolic identity rather than array position.
+    New tokens keep their random initialization. Existing tokens and shape-compatible
+    tensors are copied by symbolic identity rather than array position.
     """
     src_state = src_model.state_dict()
     dst_state = dst_model.state_dict()
-    skip_prefixes = ("txt.emb.", "lm.tok.", "lm.head.", "fact_query",
-                     "fact_heads.", "fact_concepts.")
+    skip_prefixes = ("txt.emb.", "lm.tok.", "lm.head.")
     with torch.no_grad():
         for name, dst_val in dst_state.items():
             if name.startswith(skip_prefixes):
@@ -1020,174 +690,12 @@ def copy_pretrained_text_weights(src_model, src_vocab, dst_model, dst_vocab):
                 continue
             dst_model.txt.emb.weight[dst_idx].copy_(src_model.txt.emb.weight[src_idx])
             dst_model.lm.tok.weight[dst_idx].copy_(src_model.lm.tok.weight[src_idx])
-
-        if src_model.fact_schema is not None and dst_model.fact_schema is not None:
-            dst_keys = {key: i for i, key in enumerate(dst_model.fact_schema.keys)}
-            for src_i, key in enumerate(src_model.fact_schema.keys):
-                dst_i = dst_keys.get(key)
-                if dst_i is None:
-                    continue
-                dst_model.fact_query[dst_i].copy_(src_model.fact_query[src_i])
-                src_head = src_model.fact_heads[str(src_i)]
-                dst_head = dst_model.fact_heads[str(dst_i)]
-                dst_vals = {val: i for i, val in enumerate(dst_model.fact_schema.values[dst_i])}
-                for src_v, val in enumerate(src_model.fact_schema.values[src_i]):
-                    dst_v = dst_vals.get(val)
-                    if dst_v is None:
-                        continue
-                    dst_head.weight[dst_v].copy_(src_head.weight[src_v])
-                    if src_head.bias is not None and dst_head.bias is not None:
-                        dst_head.bias[dst_v].copy_(src_head.bias[src_v])
-            if (getattr(src_model, "has_fact_concept_state", False)
-                    and getattr(src_model, "fact_concepts", None) is not None
-                    and getattr(dst_model, "fact_concepts", None) is not None):
-                for src_i, key in enumerate(src_model.fact_schema.keys):
-                    dst_i = dst_keys.get(key)
-                    if dst_i is None:
-                        continue
-                    dst_model.fact_concepts.key_query[dst_i].copy_(
-                        src_model.fact_concepts.key_query[src_i])
-                    dst_vals = {val: i for i, val in enumerate(
-                        dst_model.fact_schema.values[dst_i])}
-                    for src_v, val in enumerate(src_model.fact_schema.values[src_i]):
-                        dst_v = dst_vals.get(val)
-                        if dst_v is None:
-                            continue
-                        dst_model.fact_concepts.value_embeds[dst_i][dst_v].copy_(
-                            src_model.fact_concepts.value_embeds[src_i][src_v])
-                        dst_model.fact_concepts.value_biases[dst_i][dst_v].copy_(
-                            src_model.fact_concepts.value_biases[src_i][src_v])
-                        src_proto_prefix = (
-                            f"fact_concepts.geometry_prototypes.{src_i}.")
-                        if any(name.startswith(src_proto_prefix) for name in src_state):
-                            dst_model.fact_concepts.geometry_prototypes[dst_i][dst_v].copy_(
-                                src_model.fact_concepts.geometry_prototypes[src_i][src_v])
-                    src_proj_prefix = f"fact_concepts.state_projectors.{src_i}."
-                    if any(name.startswith(src_proj_prefix) for name in src_state):
-                        dst_model.fact_concepts.state_projectors[dst_i].load_state_dict(
-                            src_model.fact_concepts.state_projectors[src_i].state_dict())
-                src_mixer = getattr(src_model.fact_concepts, "mixer", None)
-                dst_mixer = getattr(dst_model.fact_concepts, "mixer", None)
-                if src_mixer is not None and dst_mixer is not None:
-                    src_mixer_state = src_mixer.state_dict()
-                    dst_mixer_state = dst_mixer.state_dict()
-                    for name, dst_val in dst_mixer_state.items():
-                        if name == "key_pos":
-                            continue
-                        src_val = src_mixer_state.get(name)
-                        if src_val is not None and src_val.shape == dst_val.shape:
-                            dst_val.copy_(src_val)
-                    for src_i, key in enumerate(src_model.fact_schema.keys):
-                        dst_i = dst_keys.get(key)
-                        if dst_i is not None:
-                            dst_mixer.key_pos[dst_i].copy_(src_mixer.key_pos[src_i])
     return dst_model
 
 
 def token_loss(logits, ids, pad=0):
     return F.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]),
                            ids[:, 1:].reshape(-1), ignore_index=pad)
-
-
-def semantic_loss(model, txt, records, schema):
-    if schema is None:
-        return torch.tensor(0.0, device=txt.device)
-    logits = model.semantic_logits(txt)
-    value_index = schema.value_index
-    losses = []
-    for key in schema.keys:
-        targets = torch.full((len(records),), -100, dtype=torch.long, device=txt.device)
-        for i, rec in enumerate(records):
-            vals = [val for slot, pred, val in rec.facts if (slot, pred) == key]
-            if vals:
-                targets[i] = value_index[(key, vals[0])]
-        if targets.ne(-100).any() and logits[key].shape[-1] > 1:
-            losses.append(F.cross_entropy(logits[key], targets, ignore_index=-100))
-    if not losses:
-        return torch.tensor(0.0, device=txt.device)
-    return sum(losses) / len(losses)
-
-
-def fact_concept_target_ids(records, schema, device):
-    targets = {key: torch.full((len(records),), -1, dtype=torch.long, device=device)
-               for key in schema.keys}
-    value_index = schema.value_index
-    for i, rec in enumerate(records):
-        seen = set()
-        for slot, pred, val in rec.facts:
-            key = (slot, pred)
-            if key in seen:
-                continue
-            idx = value_index.get((key, val))
-            if idx is not None and key in targets:
-                targets[key][i] = idx
-                seen.add(key)
-    return targets
-
-
-def fact_concept_loss(model, txt, records, schema):
-    if schema is None or getattr(model, "fact_concepts", None) is None:
-        return torch.tensor(0.0, device=txt.device)
-    logits = model.fact_concept_logits(txt)
-    targets_by_key = fact_concept_target_ids(records, schema, txt.device)
-    losses = []
-    for key in schema.keys:
-        row = logits.get(key)
-        targets = targets_by_key[key]
-        if row is not None and targets.ge(0).any() and row.shape[-1] > 1:
-            losses.append(F.cross_entropy(row, targets, ignore_index=-1))
-    if not losses:
-        return torch.tensor(0.0, device=txt.device)
-    return sum(losses) / len(losses)
-
-
-def fact_concept_contrastive_loss(model, txt, records, schema, temperature=0.1):
-    if schema is None or getattr(model, "fact_concepts", None) is None:
-        return torch.tensor(0.0, device=txt.device)
-    states = model.fact_concept_geometry_states(txt)
-    targets = fact_concept_target_ids(records, schema, txt.device)
-    return schema_concept_contrastive_loss(states, targets, temperature=temperature)
-
-
-def fact_concept_batch_centroid_loss(model, txt, records, schema, temperature=0.1,
-                                     margin=0.0):
-    if schema is None or getattr(model, "fact_concepts", None) is None:
-        return torch.tensor(0.0, device=txt.device)
-    states = model.fact_concept_geometry_states(txt)
-    targets = fact_concept_target_ids(records, schema, txt.device)
-    return schema_concept_batch_centroid_loss(
-        states, targets, temperature=temperature, margin=margin)
-
-
-def fact_concept_prototype_loss(model, txt, records, schema, temperature=0.1):
-    if schema is None or getattr(model, "fact_concepts", None) is None:
-        return torch.tensor(0.0, device=txt.device)
-    states = model.fact_concept_geometry_states(txt)
-    targets = fact_concept_target_ids(records, schema, txt.device)
-    prototypes = {key: model.fact_concepts.geometry_prototypes[i]
-                  for i, key in enumerate(model.fact_concepts.keys)}
-    return schema_concept_prototype_alignment_loss(
-        states, targets, prototypes, temperature=temperature)
-
-
-def fact_concept_prototype_spread_loss(model, margin=0.2):
-    head = getattr(model, "fact_concepts", None)
-    if head is None:
-        device = next(model.parameters()).device
-        return torch.tensor(0.0, device=device)
-    prototypes = {key: head.geometry_prototypes[i] for i, key in enumerate(head.keys)}
-    return schema_concept_prototype_spread_loss(prototypes, margin=margin)
-
-
-def fact_concept_state_spread_loss(model, txt, records, schema, variance_target=0.05,
-                                   centroid_margin=0.2, covariance_weight=0.05):
-    if schema is None or getattr(model, "fact_concepts", None) is None:
-        return torch.tensor(0.0, device=txt.device)
-    states = model.fact_concept_geometry_states(txt)
-    targets = fact_concept_target_ids(records, schema, txt.device)
-    return schema_concept_state_spread_loss(
-        states, targets, variance_target=variance_target,
-        centroid_margin=centroid_margin, covariance_weight=covariance_weight)
 
 
 def latent_text_concept_loss(model, txt, view_dropout=0.1,
@@ -1781,6 +1289,17 @@ def _reading_context_target_embeddings(model, txt, pad, seed=0, context_keep_p=0
     return predicted, target
 
 
+def _reading_span_completion_embeddings(model, txt, pad, seed=0, span_frac=0.25):
+    torch.manual_seed(int(seed))
+    masked_txt, _hidden = mask_reading_spans(txt, pad, span_frac=span_frac)
+    partial_slots = model.latent_concept_states(masked_txt, project=False)
+    full_slots = model.latent_concept_states(txt, project=False)
+    predicted = model.reading_predictor(partial_slots)
+    predicted = F.normalize(predicted.reshape(predicted.shape[0], -1), dim=-1)
+    target = F.normalize(full_slots.reshape(full_slots.shape[0], -1), dim=-1)
+    return predicted, target
+
+
 def _reading_latent_embeddings(model, vocab, records, device=DEV, batch=64):
     if getattr(model, "latent_concepts", None) is None or not records:
         return None
@@ -2174,6 +1693,51 @@ def reading_context_target_retrieval_eval(model, vocab, records, device=DEV, n=0
             "skipped": False}
 
 
+def reading_span_completion_retrieval_eval(model, vocab, records, device=DEV, n=0,
+                                           seed=0, span_frac=0.25):
+    if (getattr(model, "latent_concepts", None) is None
+            or not hasattr(model, "reading_predictor")):
+        return {"span_completion_acc": 0.0, "n_records": 0, "sampled": False,
+                "skipped": True}
+    selected = eval_reading_records(records, n=n, seed=seed)
+    if not selected:
+        return {"span_completion_acc": 0.0, "n_records": 0, "sampled": False,
+                "skipped": True}
+    correct = total = 0
+    pos_sum = neg_sum = 0.0
+    neg_count = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(selected), 64):
+            batch = selected[off:off + 64]
+            if len(batch) <= 1:
+                continue
+            txt = pack_reading(batch, vocab, device)
+            predicted, target = _reading_span_completion_embeddings(
+                model, txt, vocab.pad, seed=seed + off * 2,
+                span_frac=span_frac)
+            sim = predicted.matmul(target.t())
+            nearest = sim.argmax(-1)
+            labels = torch.arange(sim.shape[0], device=sim.device)
+            correct += int(nearest.eq(labels).sum())
+            total += int(sim.shape[0])
+            pos_sum += float(sim.diag().sum())
+            eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+            neg_sum += float(sim.masked_select(~eye).sum())
+            neg_count += int((~eye).sum())
+    eval_count = len([r for r in records if r.split == "eval"])
+    if total == 0:
+        return {"span_completion_acc": 0.0, "n_records": 0,
+                "sampled": bool(n > 0 and n < eval_count), "skipped": True}
+    return {"span_completion_acc": correct / max(1, total),
+            "positive_cosine": pos_sum / max(1, total),
+            "negative_cosine": neg_sum / max(1, neg_count),
+            "margin": (pos_sum / max(1, total)) - (neg_sum / max(1, neg_count)),
+            "n_records": total,
+            "sampled": bool(n > 0 and n < eval_count),
+            "skipped": False}
+
+
 def reading_sequence_retrieval_eval(model, vocab, records, device=DEV, n=0,
                                     seed=0, token_drop_p=0.15,
                                     token_replace_p=0.05):
@@ -2423,10 +1987,11 @@ def reading_fer_eval(model, vocab, records, device=DEV, n=0, seed=0,
 
 
 READING_SCORE_METRICS = (
-    "view", "context", "sequence", "neighborhood", "cluster", "fer", "bridge",
-    "both", "min", "all", "balanced", "mastery")
+    "view", "context", "span", "sequence", "neighborhood", "cluster", "fer",
+    "bridge", "both", "min", "all", "balanced", "mastery")
 READING_DISCOVERY_SIGNALS = (
-    "view", "context", "sequence", "neighborhood", "cluster", "fer", "bridge")
+    "view", "context", "span", "sequence", "neighborhood", "cluster", "fer",
+    "bridge")
 READING_STUDY_STRATEGIES = (
     "random", "errors", "fer", "curiosity", "sequence", "graph", "cycle",
     "gap", "discovery", "auto")
@@ -2455,7 +2020,8 @@ def resolve_reading_study_strategy(study_strategy, model):
 def reading_discovery_score_components(view_eval, context_eval, metric="both",
                                        margin_w=0.1, neighborhood_eval=None,
                                        cluster_eval=None, fer_eval=None,
-                                       bridge_eval=None, sequence_eval=None):
+                                       bridge_eval=None, sequence_eval=None,
+                                       span_eval=None):
     metric = str(metric)
     if metric not in READING_SCORE_METRICS:
         raise ValueError(f"unknown reading score metric {metric!r}")
@@ -2464,6 +2030,9 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     view_margin = float(view_eval.get("margin", 0.0))
     context_acc = float(context_eval.get("context_target_acc", 0.0))
     context_margin = float(context_eval.get("margin", 0.0))
+    span_eval = span_eval or {}
+    span_acc = float(span_eval.get("span_completion_acc", 0.0))
+    span_margin = float(span_eval.get("margin", 0.0))
     sequence_eval = sequence_eval or {}
     sequence_acc = float(sequence_eval.get("sequence_acc", 0.0))
     sequence_margin = float(sequence_eval.get("margin", 0.0))
@@ -2486,15 +2055,17 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
                     else 0.5 * (bridge_resolution + bridge_connectivity))
     view_score = view_acc + margin_w * view_margin
     context_score = context_acc + margin_w * context_margin
+    span_score = span_acc + margin_w * span_margin
     sequence_score = sequence_acc + margin_w * sequence_margin
     neighborhood_score = neighborhood_acc + margin_w * neighborhood_margin
     cluster_score = cluster_acc + margin_w * cluster_margin
-    scores = {"view": view_score, "context": context_score,
+    scores = {"view": view_score, "context": context_score, "span": span_score,
               "sequence": sequence_score,
               "neighborhood": neighborhood_score, "cluster": cluster_score,
               "fer": fer_score, "bridge": bridge_score}
     skipped = {"view": bool(view_eval.get("skipped", False)),
                "context": bool(context_eval.get("skipped", False)),
+               "span": bool(span_eval.get("skipped", False)),
                "sequence": bool(sequence_eval.get("skipped", False)),
                "neighborhood": bool(neighborhood_eval.get("skipped", False)),
                "cluster": bool(cluster_eval.get("skipped", False)),
@@ -2516,6 +2087,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
         score = view_score
     elif metric == "context":
         score = context_score
+    elif metric == "span":
+        score = span_score
     elif metric == "sequence":
         score = sequence_score
     elif metric == "neighborhood":
@@ -2547,6 +2120,7 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "signal_coverage": float(signal_coverage),
             "view_score": float(view_score),
             "context_score": float(context_score),
+            "span_score": float(span_score),
             "neighborhood_score": float(neighborhood_score),
             "cluster_score": float(cluster_score),
             "fer_score": float(fer_score),
@@ -2563,6 +2137,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "paired_view_margin": view_margin,
             "context_target_acc": context_acc,
             "context_target_margin": context_margin,
+            "span_completion_acc": span_acc,
+            "span_completion_margin": span_margin,
             "sequence_score": float(sequence_score),
             "sequence_acc": sequence_acc,
             "sequence_margin": sequence_margin,
@@ -2572,6 +2148,7 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "cluster_margin": cluster_margin,
             "view_skipped": skipped["view"],
             "context_skipped": skipped["context"],
+            "span_skipped": skipped["span"],
             "sequence_skipped": skipped["sequence"],
             "neighborhood_skipped": skipped["neighborhood"],
             "cluster_skipped": skipped["cluster"],
@@ -2581,14 +2158,17 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
 
 def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
                         token_drop_p=0.15, token_replace_p=0.05,
-                        context_keep_p=0.5, score_metric="mastery",
-                        score_margin_w=0.1):
+                        context_keep_p=0.5, span_mask_frac=0.25,
+                        score_metric="mastery", score_margin_w=0.1):
     view = reading_latent_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 17,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p)
     context = reading_context_target_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 23,
         context_keep_p=context_keep_p)
+    span = reading_span_completion_retrieval_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 24,
+        span_frac=span_mask_frac)
     sequence = reading_sequence_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 25,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p)
@@ -2606,6 +2186,7 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
         feature_dropout=0.0)
     return {"view": view,
             "context_target": context,
+            "span_completion": span,
             "sequence": sequence,
             "neighborhood": neighborhood,
             "cluster": cluster,
@@ -2614,7 +2195,8 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
             "score_components": reading_discovery_score_components(
                 view, context, metric=score_metric, margin_w=score_margin_w,
                 neighborhood_eval=neighborhood, cluster_eval=cluster,
-                fer_eval=fer, bridge_eval=bridge, sequence_eval=sequence)}
+                fer_eval=fer, bridge_eval=bridge, sequence_eval=sequence,
+                span_eval=span)}
 
 
 def reading_latent_bridge_graph_state(model):
@@ -3484,206 +3066,6 @@ def reading_latent_discovery_records(
                       "n_sequence_pairs": len(sequence_rows),
                       "sequence_mining": sequence_mining,
                       "skipped": False}
-
-
-def latent_fact_concept_loss(model, txt, records, schema):
-    if (schema is None or getattr(model, "fact_concepts", None) is None
-            or getattr(model, "latent_concepts", None) is None):
-        return torch.tensor(0.0, device=txt.device)
-    logits = model.latent_fact_concept_logits(txt)
-    targets_by_key = fact_concept_target_ids(records, schema, txt.device)
-    losses = []
-    for key in schema.keys:
-        row = logits.get(key)
-        targets = targets_by_key[key]
-        if row is not None and targets.ge(0).any() and row.shape[-1] > 1:
-            losses.append(F.cross_entropy(row, targets, ignore_index=-1))
-    if not losses:
-        return torch.tensor(0.0, device=txt.device)
-    return sum(losses) / len(losses)
-
-
-def _normalized_mean(vectors):
-    return F.normalize(torch.stack(vectors).mean(0), dim=0)
-
-
-def fit_model(model, vocab, records, steps=400, batch=32, lr=1e-3, seed=0,
-              device=DEV, log_every=100, semantic_w=0.5, balance_by="none",
-              fact_concept_w=0.0, fact_concept_contrast_w=0.0,
-              fact_concept_contrast_temperature=0.1,
-              fact_concept_centroid_w=0.0,
-              fact_concept_centroid_temperature=0.1,
-              fact_concept_centroid_margin=0.0,
-              fact_concept_prototype_w=0.0,
-              fact_concept_prototype_spread_w=0.0,
-              fact_concept_prototype_spread_margin=0.2,
-              fact_concept_state_spread_w=0.0,
-              fact_concept_state_spread_variance=0.05,
-              fact_concept_state_spread_margin=0.2,
-              fact_concept_state_spread_covariance_w=0.05,
-              latent_concept_w=0.0,
-              latent_concept_view_dropout=0.1,
-              latent_concept_invariance_w=25.0,
-              latent_concept_variance_w=25.0,
-              latent_concept_covariance_w=1.0,
-              latent_concept_variance_target=1.0,
-              latent_concept_fact_w=0.0,
-              prefix="text", decode_w=1.0):
-    if ((latent_concept_w > 0.0 or latent_concept_fact_w > 0.0)
-            and getattr(model, "latent_concepts", None) is None):
-        raise ValueError("latent concept losses require latent concept slots")
-    rng = np.random.default_rng(seed)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    train_records = [r for r in records if r.split == "train"]
-    if not train_records:
-        raise ValueError("cannot train without train records")
-    train_buckets = bucket_records(train_records, balance_by)
-    for st in range(1, steps + 1):
-        model.train()
-        if balance_by == "none":
-            rec_batch = batch_records(train_records, rng, batch)
-        else:
-            rec_batch = balanced_batch_records(train_buckets, rng, batch)
-        txt, ids = pack(rec_batch, vocab, device)
-        dec_loss = token_loss(model(txt, ids), ids, pad=vocab.pad)
-        sem_loss = semantic_loss(model, txt, rec_batch, model.fact_schema)
-        concept_fact_loss = (fact_concept_loss(model, txt, rec_batch, model.fact_schema)
-                             if fact_concept_w else torch.tensor(0.0, device=device))
-        concept_contrast_loss = (
-            fact_concept_contrastive_loss(
-                model, txt, rec_batch, model.fact_schema,
-                temperature=fact_concept_contrast_temperature)
-            if fact_concept_contrast_w else torch.tensor(0.0, device=device))
-        concept_centroid_loss = (
-            fact_concept_batch_centroid_loss(
-                model, txt, rec_batch, model.fact_schema,
-                temperature=fact_concept_centroid_temperature,
-                margin=fact_concept_centroid_margin)
-            if fact_concept_centroid_w else torch.tensor(0.0, device=device))
-        concept_proto_loss = (
-            fact_concept_prototype_loss(
-                model, txt, rec_batch, model.fact_schema,
-                temperature=fact_concept_contrast_temperature)
-            if fact_concept_prototype_w else torch.tensor(0.0, device=device))
-        concept_proto_spread_loss = (
-            fact_concept_prototype_spread_loss(
-                model, margin=fact_concept_prototype_spread_margin)
-            if fact_concept_prototype_spread_w else torch.tensor(0.0, device=device))
-        concept_state_spread_loss = (
-            fact_concept_state_spread_loss(
-                model, txt, rec_batch, model.fact_schema,
-                variance_target=fact_concept_state_spread_variance,
-                centroid_margin=fact_concept_state_spread_margin,
-                covariance_weight=fact_concept_state_spread_covariance_w)
-            if fact_concept_state_spread_w else torch.tensor(0.0, device=device))
-        latent_loss = (
-            latent_text_concept_loss(
-                model, txt, view_dropout=latent_concept_view_dropout,
-                invariance_w=latent_concept_invariance_w,
-                variance_w=latent_concept_variance_w,
-                covariance_w=latent_concept_covariance_w,
-                variance_target=latent_concept_variance_target)
-            if latent_concept_w else torch.tensor(0.0, device=device))
-        latent_fact_loss = (
-            latent_fact_concept_loss(model, txt, rec_batch, model.fact_schema)
-            if latent_concept_fact_w else torch.tensor(0.0, device=device))
-        loss = (decode_w * dec_loss + semantic_w * sem_loss
-                + fact_concept_w * concept_fact_loss
-                + fact_concept_contrast_w * concept_contrast_loss
-                + fact_concept_centroid_w * concept_centroid_loss
-                + fact_concept_prototype_w * concept_proto_loss
-                + fact_concept_prototype_spread_w * concept_proto_spread_loss
-                + fact_concept_state_spread_w * concept_state_spread_loss
-                + latent_concept_w * latent_loss
-                + latent_concept_fact_w * latent_fact_loss)
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-        if st % log_every == 0 or st == steps:
-            print(f"  {prefix} {st}/{steps} loss {loss.item():.3f} "
-                  f"dec {dec_loss.item():.3f} sem {sem_loss.item():.3f} "
-                  f"fact-concept {concept_fact_loss.item():.3f} "
-                  f"fact-contrast {concept_contrast_loss.item():.3f} "
-                  f"fact-centroid {concept_centroid_loss.item():.3f} "
-                  f"fact-proto {concept_proto_loss.item():.3f} "
-                  f"fact-proto-spread {concept_proto_spread_loss.item():.3f} "
-                  f"fact-state-spread {concept_state_spread_loss.item():.3f} "
-                  f"latent {latent_loss.item():.3f} "
-                  f"latent-fact {latent_fact_loss.item():.3f}", flush=True)
-    return model, vocab
-
-
-def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4,
-                text_encoder_arch="transformer", text_encoder_layers=1,
-                fact_concept_refine=False, fact_concept_refine_gate_init=-2.0,
-                fact_concept_mixer_layers=0, fact_concept_mixer_gate_init=-2.0,
-                latent_concept_slots=0, latent_concept_layers=1,
-                latent_concept_prefix=False,
-                latent_concept_refine=False,
-                latent_concept_refine_gate_init=-2.0,
-                lr=1e-3, seed=0, device=DEV, log_every=100,
-                semantic_w=0.5, balance_by="none",
-                fact_concept_w=0.0, fact_concept_contrast_w=0.0,
-                fact_concept_contrast_temperature=0.1,
-                fact_concept_centroid_w=0.0,
-                fact_concept_centroid_temperature=0.1,
-                fact_concept_centroid_margin=0.0,
-                fact_concept_prefix=False,
-                fact_concept_prototype_w=0.0,
-                fact_concept_prototype_spread_w=0.0,
-                fact_concept_prototype_spread_margin=0.2,
-                fact_concept_state_spread_w=0.0,
-                fact_concept_state_spread_variance=0.05,
-                fact_concept_state_spread_margin=0.2,
-                fact_concept_state_spread_covariance_w=0.05,
-                latent_concept_w=0.0,
-                latent_concept_view_dropout=0.1,
-                latent_concept_invariance_w=25.0,
-                latent_concept_variance_w=25.0,
-                latent_concept_covariance_w=1.0,
-                latent_concept_variance_target=1.0,
-                latent_concept_fact_w=0.0,
-                decode_w=1.0):
-    torch.manual_seed(seed)
-    vocab = build_vocab(records)
-    schema = build_fact_schema(records)
-    model = TextReadingLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
-                       fact_schema=schema,
-                       fact_concept_prefix=fact_concept_prefix,
-                       text_encoder_arch=text_encoder_arch,
-                       text_encoder_layers=text_encoder_layers,
-                       fact_concept_refine=fact_concept_refine,
-                       fact_concept_refine_gate_init=fact_concept_refine_gate_init,
-                       fact_concept_mixer_layers=fact_concept_mixer_layers,
-                       fact_concept_mixer_gate_init=fact_concept_mixer_gate_init,
-                       latent_concept_slots=latent_concept_slots,
-                       latent_concept_layers=latent_concept_layers,
-                       latent_concept_prefix=latent_concept_prefix,
-                       latent_concept_refine=latent_concept_refine,
-                       latent_concept_refine_gate_init=latent_concept_refine_gate_init).to(device)
-    return fit_model(model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
-                     device=device, log_every=log_every, semantic_w=semantic_w,
-                     balance_by=balance_by, fact_concept_w=fact_concept_w,
-                     fact_concept_contrast_w=fact_concept_contrast_w,
-                     fact_concept_contrast_temperature=fact_concept_contrast_temperature,
-                     fact_concept_centroid_w=fact_concept_centroid_w,
-                     fact_concept_centroid_temperature=fact_concept_centroid_temperature,
-                     fact_concept_centroid_margin=fact_concept_centroid_margin,
-                     fact_concept_prototype_w=fact_concept_prototype_w,
-                     fact_concept_prototype_spread_w=fact_concept_prototype_spread_w,
-                     fact_concept_prototype_spread_margin=fact_concept_prototype_spread_margin,
-                     fact_concept_state_spread_w=fact_concept_state_spread_w,
-                     fact_concept_state_spread_variance=fact_concept_state_spread_variance,
-                     fact_concept_state_spread_margin=fact_concept_state_spread_margin,
-                     fact_concept_state_spread_covariance_w=fact_concept_state_spread_covariance_w,
-                     latent_concept_w=latent_concept_w,
-                     latent_concept_view_dropout=latent_concept_view_dropout,
-                     latent_concept_invariance_w=latent_concept_invariance_w,
-                     latent_concept_variance_w=latent_concept_variance_w,
-                     latent_concept_covariance_w=latent_concept_covariance_w,
-                     latent_concept_variance_target=latent_concept_variance_target,
-                     latent_concept_fact_w=latent_concept_fact_w,
-                     decode_w=decode_w)
 
 
 def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
@@ -5044,7 +4426,7 @@ def fit_reading_concepts_select_best(
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=score_metric,
-        score_margin_w=score_margin_w)
+        score_margin_w=score_margin_w, span_mask_frac=span_mask_frac)
     bridge_insight_gate = bool(
         bridge_w and initial_study_strategy in READING_POOL_STUDY_STRATEGIES
         and initial_study_strategy not in ("sequence", "fer"))
@@ -5055,7 +4437,8 @@ def fit_reading_concepts_select_best(
             model, vocab, replay_records, device=device, eval_n=eval_n,
             seed=seed + 4093, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, context_keep_p=context_keep_p,
-            score_metric=score_metric, score_margin_w=score_margin_w)
+            score_metric=score_metric, score_margin_w=score_margin_w,
+            span_mask_frac=span_mask_frac)
 
     def selection_row(round_id, round_steps, bundle, replay_bundle=None):
         base_score = float(bundle["score_components"]["score"])
@@ -5229,14 +4612,15 @@ def fit_reading_concepts_select_best(
             model, vocab, records, device=device, eval_n=eval_n, seed=seed,
             token_drop_p=token_drop_p, token_replace_p=token_replace_p,
             context_keep_p=context_keep_p, score_metric=score_metric,
-            score_margin_w=score_margin_w)
+            score_margin_w=score_margin_w, span_mask_frac=span_mask_frac)
         replay_bundle = None
         if before_replay_bundle is not None:
             replay_bundle = reading_eval_bundle(
                 model, vocab, replay_records, device=device, eval_n=eval_n,
                 seed=seed + 4093, token_drop_p=token_drop_p,
                 token_replace_p=token_replace_p, context_keep_p=context_keep_p,
-                score_metric=score_metric, score_margin_w=score_margin_w)
+                score_metric=score_metric, score_margin_w=score_margin_w,
+                span_mask_frac=span_mask_frac)
         row = selection_row(round_i, round_steps, bundle, replay_bundle)
         score = float(row["score"])
         score_delta_from_best = float(score - best_score)
@@ -5423,7 +4807,6 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
     torch.manual_seed(seed)
     vocab = build_reading_vocab(records)
     model = TextReadingLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
-                       fact_schema=None,
                        text_encoder_arch=text_encoder_arch,
                        text_encoder_layers=text_encoder_layers,
                        latent_concept_slots=latent_concept_slots,
@@ -5721,7 +5104,6 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
     torch.manual_seed(seed)
     vocab = build_reading_vocab(records)
     model = TextReadingLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
-                       fact_schema=None,
                        text_encoder_arch=text_encoder_arch,
                        text_encoder_layers=text_encoder_layers,
                        latent_concept_slots=latent_concept_slots,
@@ -5735,7 +5117,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=study_score_metric,
-        score_margin_w=study_score_margin_w)
+        score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac)
     selection = {"enabled": False}
     if study_select_best:
         _model, _vocab, selection = fit_reading_concepts_select_best(
@@ -5941,11 +5323,13 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=study_score_metric,
-        score_margin_w=study_score_margin_w)
+        score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac)
     before = before_bundle["view"]
     after = after_bundle["view"]
     before_context = before_bundle["context_target"]
     after_context = after_bundle["context_target"]
+    before_span = before_bundle["span_completion"]
+    after_span = after_bundle["span_completion"]
     before_sequence = before_bundle["sequence"]
     after_sequence = after_bundle["sequence"]
     before_neighborhood = before_bundle["neighborhood"]
@@ -6072,6 +5456,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "after": after,
               "before_context_target": before_context,
               "after_context_target": after_context,
+              "before_span_completion": before_span,
+              "after_span_completion": after_span,
               "before_sequence": before_sequence,
               "after_sequence": after_sequence,
               "before_neighborhood": before_neighborhood,
@@ -6110,6 +5496,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                   "context_target_margin": (
                       after_context.get("margin", 0.0)
                       - before_context.get("margin", 0.0)),
+                  "span_completion_acc": (
+                      after_span.get("span_completion_acc", 0.0)
+                      - before_span.get("span_completion_acc", 0.0)),
+                  "span_completion_margin": (
+                      after_span.get("margin", 0.0)
+                      - before_span.get("margin", 0.0)),
                   "sequence_acc": (
                       after_sequence.get("sequence_acc", 0.0)
                       - before_sequence.get("sequence_acc", 0.0)),
@@ -6196,16 +5588,8 @@ def expanded_reading_checkpoint_model(checkpoint, reading_records, device=DEV,
         len(vocab), d=int(ckpt.get("d", 96)),
         layers=int(ckpt.get("layers", 3)),
         heads=int(ckpt.get("heads", 4)), pad=vocab.pad,
-        fact_schema=src_model.fact_schema,
-        fact_concept_prefix=bool(ckpt.get("fact_concept_prefix", False)),
         text_encoder_arch=ckpt.get("text_encoder_arch", "transformer"),
         text_encoder_layers=int(ckpt.get("text_encoder_layers", 1)),
-        fact_concept_refine=bool(ckpt.get("fact_concept_refine", False)),
-        fact_concept_refine_gate_init=float(
-            ckpt.get("fact_concept_refine_gate_init", -2.0)),
-        fact_concept_mixer_layers=int(ckpt.get("fact_concept_mixer_layers", 0)),
-        fact_concept_mixer_gate_init=float(
-            ckpt.get("fact_concept_mixer_gate_init", -2.0)),
         latent_concept_slots=slots,
         latent_concept_layers=layers,
         latent_concept_prefix=use_prefix,
@@ -6336,12 +5720,13 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=study_score_metric,
-        score_margin_w=study_score_margin_w)
+        score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac)
     before_replay_bundle = (reading_eval_bundle(
         model, vocab, replay_records, device=device, eval_n=eval_n,
         seed=seed + 4093, token_drop_p=token_drop_p,
         token_replace_p=token_replace_p, context_keep_p=context_keep_p,
-        score_metric=study_score_metric, score_margin_w=study_score_margin_w)
+        score_metric=study_score_metric, score_margin_w=study_score_margin_w,
+        span_mask_frac=span_mask_frac)
         if replay_records else None)
     selection = {"enabled": False}
     if study_select_best:
@@ -6556,17 +5941,20 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=study_score_metric,
-        score_margin_w=study_score_margin_w)
+        score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac)
     after_replay_bundle = (reading_eval_bundle(
         model, vocab, replay_records, device=device, eval_n=eval_n,
         seed=seed + 4093, token_drop_p=token_drop_p,
         token_replace_p=token_replace_p, context_keep_p=context_keep_p,
-        score_metric=study_score_metric, score_margin_w=study_score_margin_w)
+        score_metric=study_score_metric, score_margin_w=study_score_margin_w,
+        span_mask_frac=span_mask_frac)
         if replay_records else None)
     before = before_bundle["view"]
     after = after_bundle["view"]
     before_context = before_bundle["context_target"]
     after_context = after_bundle["context_target"]
+    before_span = before_bundle["span_completion"]
+    after_span = after_bundle["span_completion"]
     before_sequence = before_bundle["sequence"]
     after_sequence = after_bundle["sequence"]
     before_neighborhood = before_bundle["neighborhood"]
@@ -6729,6 +6117,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "after": after,
               "before_context_target": before_context,
               "after_context_target": after_context,
+              "before_span_completion": before_span,
+              "after_span_completion": after_span,
               "before_sequence": before_sequence,
               "after_sequence": after_sequence,
               "before_neighborhood": before_neighborhood,
@@ -6769,6 +6159,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                   "context_target_margin": (
                       after_context.get("margin", 0.0)
                       - before_context.get("margin", 0.0)),
+                  "span_completion_acc": (
+                      after_span.get("span_completion_acc", 0.0)
+                      - before_span.get("span_completion_acc", 0.0)),
+                  "span_completion_margin": (
+                      after_span.get("margin", 0.0)
+                      - before_span.get("margin", 0.0)),
                   "sequence_acc": (
                       after_sequence.get("sequence_acc", 0.0)
                       - before_sequence.get("sequence_acc", 0.0)),
@@ -6828,519 +6224,6 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
     return report
 
 
-def fact_scores(pred, gold):
-    p, g = set(pred), set(gold)
-    tp = len(p & g)
-    precision = tp / max(1, len(p))
-    recall = tp / max(1, len(g))
-    f1 = 2 * precision * recall / max(1e-9, precision + recall)
-    return {"precision": precision, "recall": recall, "f1": f1, "exact": float(p == g)}
-
-
-def teacher_forced_eval(model, vocab, records, device=DEV, n=0, seed=0):
-    selected = eval_records(records, n=n, seed=seed)
-    model.eval()
-    correct = total = 0
-    with torch.no_grad():
-        for off in range(0, len(selected), 64):
-            batch = selected[off:off + 64]
-            txt, ids = pack(batch, vocab, device)
-            logits = model(txt, ids)
-            for r, rec in enumerate(batch):
-                pos = 4
-                for _fact in rec.facts:
-                    pred = int(logits[r, pos - 1].argmax(-1))
-                    gold = int(ids[r, pos])
-                    correct += int(pred == gold)
-                    total += 1
-                    pos += 5
-    eval_count = len([r for r in records if r.split == "eval"])
-    return {"fact_value_acc": correct / max(1, total), "n_facts": total,
-            "n_records": len(selected),
-            "sampled": bool(n > 0 and n < eval_count),
-            "skipped": bool(n < 0)}
-
-
-def semantic_fact_eval(model, vocab, records, device=DEV, n=0, seed=0):
-    if model.fact_schema is None:
-        return {"fact_value_acc": 0.0, "n_facts": 0, "n_records": 0,
-                "sampled": False, "skipped": bool(n < 0)}
-    selected = eval_records(records, n=n, seed=seed)
-    value_index = model.fact_schema.value_index
-    correct = total = 0
-    model.eval()
-    with torch.no_grad():
-        for off in range(0, len(selected), 64):
-            batch = selected[off:off + 64]
-            txt, _ids = pack(batch, vocab, device)
-            logits = model.semantic_logits(txt)
-            for r, rec in enumerate(batch):
-                for slot, pred, val in rec.facts:
-                    key = (slot, pred)
-                    if key not in logits:
-                        continue
-                    if (key, val) not in value_index:
-                        continue
-                    pred_id = int(logits[key][r].argmax(-1))
-                    correct += int(pred_id == value_index[(key, val)])
-                    total += 1
-    eval_count = len([r for r in records if r.split == "eval"])
-    return {"fact_value_acc": correct / max(1, total), "n_facts": total,
-            "n_records": len(selected),
-            "sampled": bool(n > 0 and n < eval_count),
-            "skipped": bool(n < 0)}
-
-
-def fact_concept_eval(model, vocab, records, device=DEV, n=0, seed=0):
-    if model.fact_schema is None or getattr(model, "fact_concepts", None) is None:
-        return {"fact_value_acc": 0.0, "n_facts": 0, "n_records": 0,
-                "sampled": False, "skipped": bool(n < 0)}
-    selected = eval_records(records, n=n, seed=seed)
-    value_index = model.fact_schema.value_index
-    correct = total = 0
-    model.eval()
-    with torch.no_grad():
-        for off in range(0, len(selected), 64):
-            batch = selected[off:off + 64]
-            txt, _ids = pack(batch, vocab, device)
-            logits = model.fact_concept_logits(txt)
-            for r, rec in enumerate(batch):
-                for slot, pred, val in rec.facts:
-                    key = (slot, pred)
-                    if key not in logits or (key, val) not in value_index:
-                        continue
-                    pred_id = int(logits[key][r].argmax(-1))
-                    correct += int(pred_id == value_index[(key, val)])
-                    total += 1
-    eval_count = len([r for r in records if r.split == "eval"])
-    return {"fact_value_acc": correct / max(1, total), "n_facts": total,
-            "n_records": len(selected),
-            "sampled": bool(n > 0 and n < eval_count),
-            "skipped": bool(n < 0)}
-
-
-def latent_fact_concept_eval(model, vocab, records, device=DEV, n=0, seed=0):
-    if (model.fact_schema is None or getattr(model, "fact_concepts", None) is None
-            or getattr(model, "latent_concepts", None) is None):
-        return {"fact_value_acc": 0.0, "n_facts": 0, "n_records": 0,
-                "sampled": False, "skipped": bool(n < 0)}
-    selected = eval_records(records, n=n, seed=seed)
-    value_index = model.fact_schema.value_index
-    correct = total = 0
-    model.eval()
-    with torch.no_grad():
-        for off in range(0, len(selected), 64):
-            batch = selected[off:off + 64]
-            txt, _ids = pack(batch, vocab, device)
-            logits = model.latent_fact_concept_logits(txt)
-            for r, rec in enumerate(batch):
-                for slot, pred, val in rec.facts:
-                    key = (slot, pred)
-                    if key not in logits or (key, val) not in value_index:
-                        continue
-                    pred_id = int(logits[key][r].argmax(-1))
-                    correct += int(pred_id == value_index[(key, val)])
-                    total += 1
-    eval_count = len([r for r in records if r.split == "eval"])
-    return {"fact_value_acc": correct / max(1, total), "n_facts": total,
-            "n_records": len(selected),
-            "sampled": bool(n > 0 and n < eval_count),
-            "skipped": bool(n < 0)}
-
-
-def fact_concept_geometry_eval(model, vocab, records, device=DEV, n=0, seed=0):
-    if model.fact_schema is None or getattr(model, "fact_concepts", None) is None:
-        return {"nearest_same_acc": 0.0, "same_mean": 0.0, "diff_mean": 0.0,
-                "margin": 0.0, "n_records": 0, "n_nearest": 0, "same_pairs": 0,
-                "diff_pairs": 0, "sampled": False, "skipped": bool(n < 0)}
-    selected = eval_records(records, n=n, seed=seed)
-    nearest_correct = nearest_total = 0
-    same_sum = diff_sum = 0.0
-    same_pairs = diff_pairs = 0
-    model.eval()
-    with torch.no_grad():
-        for off in range(0, len(selected), 64):
-            batch = selected[off:off + 64]
-            txt, _ids = pack(batch, vocab, device)
-            states = model.fact_concept_geometry_states(txt)
-            targets_by_key = fact_concept_target_ids(batch, model.fact_schema, device)
-            for key, state in states.items():
-                targets = targets_by_key.get(key)
-                if targets is None:
-                    continue
-                valid = targets.ge(0)
-                if int(valid.sum()) < 2:
-                    continue
-                z = F.normalize(state[valid], dim=-1)
-                labels = targets[valid]
-                sim = z.matmul(z.t())
-                count = labels.shape[0]
-                eye = torch.eye(count, dtype=torch.bool, device=sim.device)
-                same = labels[:, None].eq(labels[None, :]) & ~eye
-                diff = labels[:, None].ne(labels[None, :])
-                if bool(same.any()):
-                    same_sum += float(sim[same].sum())
-                    same_pairs += int(same.sum())
-                if bool(diff.any()):
-                    diff_sum += float(sim[diff].sum())
-                    diff_pairs += int(diff.sum())
-                rows = same.any(-1) & diff.any(-1)
-                if bool(rows.any()):
-                    nearest = sim.masked_fill(eye, -float("inf")).argmax(-1)
-                    nearest_correct += int(labels[nearest][rows].eq(labels[rows]).sum())
-                    nearest_total += int(rows.sum())
-    eval_count = len([r for r in records if r.split == "eval"])
-    same_mean = same_sum / max(1, same_pairs)
-    diff_mean = diff_sum / max(1, diff_pairs)
-    return {"nearest_same_acc": nearest_correct / max(1, nearest_total),
-            "same_mean": same_mean, "diff_mean": diff_mean,
-            "margin": same_mean - diff_mean,
-            "n_records": len(selected), "n_nearest": nearest_total,
-            "same_pairs": same_pairs, "diff_pairs": diff_pairs,
-            "sampled": bool(n > 0 and n < eval_count),
-            "skipped": bool(n < 0)}
-
-
-def semantic_record_errors(model, vocab, records, device=DEV, n=0, seed=0):
-    """Return records whose semantic heads currently miss at least one supplied fact."""
-    if model.fact_schema is None:
-        return [], {"n_records": 0, "n_error_records": 0, "n_facts": 0, "n_errors": 0}
-    candidates = list(records)
-    sampled = bool(n and n < len(candidates))
-    if sampled:
-        rng = np.random.default_rng(seed)
-        idx = rng.choice(len(candidates), size=n, replace=False)
-        candidates = [candidates[int(i)] for i in idx]
-    value_index = model.fact_schema.value_index
-    errors = []
-    n_errors = n_facts = 0
-    model.eval()
-    with torch.no_grad():
-        for off in range(0, len(candidates), 64):
-            batch = candidates[off:off + 64]
-            txt, _ids = pack(batch, vocab, device)
-            logits = model.semantic_logits(txt)
-            for r, rec in enumerate(batch):
-                rec_errors = rec_facts = 0
-                for slot, pred, val in rec.facts:
-                    key = (slot, pred)
-                    if key not in logits or (key, val) not in value_index:
-                        continue
-                    pred_id = int(logits[key][r].argmax(-1))
-                    rec_facts += 1
-                    rec_errors += int(pred_id != value_index[(key, val)])
-                if rec_errors:
-                    errors.append(rec)
-                n_errors += rec_errors
-                n_facts += rec_facts
-    return errors, {"n_records": len(candidates),
-                    "sampled": sampled,
-                    "n_error_records": len(errors),
-                    "n_facts": n_facts,
-                    "n_errors": n_errors,
-                    "fact_error_rate": n_errors / max(1, n_facts)}
-
-
-def latent_fact_record_errors(model, vocab, records, device=DEV, n=0, seed=0):
-    """Return records whose latent concept bridge misses at least one supplied fact."""
-    errors, _correct, report = latent_fact_record_outcomes(
-        model, vocab, records, device=device, n=n, seed=seed)
-    return errors, report
-
-
-def latent_fact_record_outcomes(model, vocab, records, device=DEV, n=0, seed=0):
-    """Return currently wrong and right records under the latent fact bridge."""
-    if (model.fact_schema is None or getattr(model, "fact_concepts", None) is None
-            or getattr(model, "latent_concepts", None) is None):
-        return [], [], {"n_records": 0, "sampled": False, "n_error_records": 0,
-                        "n_correct_records": 0, "n_facts": 0, "n_errors": 0,
-                        "fact_error_rate": 0.0, "by_kind": {}}
-    candidates = list(records)
-    sampled = bool(n and n < len(candidates))
-    if sampled:
-        rng = np.random.default_rng(seed)
-        idx = rng.choice(len(candidates), size=n, replace=False)
-        candidates = [candidates[int(i)] for i in idx]
-    value_index = model.fact_schema.value_index
-    errors = []
-    correct = []
-    by_kind = {}
-    n_errors = n_facts = 0
-    model.eval()
-    with torch.no_grad():
-        for off in range(0, len(candidates), 64):
-            batch = candidates[off:off + 64]
-            txt, _ids = pack(batch, vocab, device)
-            logits = model.latent_fact_concept_logits(txt)
-            for r, rec in enumerate(batch):
-                rec_errors = rec_facts = 0
-                for slot, pred, val in rec.facts:
-                    key = (slot, pred)
-                    if key not in logits or (key, val) not in value_index:
-                        continue
-                    pred_id = int(logits[key][r].argmax(-1))
-                    rec_facts += 1
-                    rec_errors += int(pred_id != value_index[(key, val)])
-                wrong = bool(rec_errors)
-                kind_row = by_kind.setdefault(
-                    rec.kind, {"records": 0, "errors": 0, "correct": 0})
-                kind_row["records"] += 1
-                if wrong:
-                    errors.append(rec)
-                    kind_row["errors"] += 1
-                else:
-                    correct.append(rec)
-                    kind_row["correct"] += 1
-                n_errors += rec_errors
-                n_facts += rec_facts
-    return errors, correct, {"n_records": len(candidates),
-                             "sampled": sampled,
-                             "n_error_records": len(errors),
-                             "n_correct_records": len(correct),
-                             "n_facts": n_facts,
-                             "n_errors": n_errors,
-                             "fact_error_rate": n_errors / max(1, n_facts),
-                             "by_kind": by_kind}
-
-
-def sample_records_per_kind(records, rng, per_kind):
-    if per_kind <= 0:
-        return [], {}
-    buckets = {}
-    for rec in records:
-        buckets.setdefault(rec.kind, []).append(rec)
-    out = []
-    counts = {}
-    for kind, rows in sorted(buckets.items()):
-        n = min(int(per_kind), len(rows))
-        if n <= 0:
-            continue
-        if n < len(rows):
-            idx = rng.choice(len(rows), size=n, replace=False)
-            picked = [rows[int(i)] for i in idx]
-        else:
-            picked = list(rows)
-        out.extend(picked)
-        counts[kind] = len(picked)
-    return out, counts
-
-
-def unique_records_by_id(*record_lists):
-    out = []
-    seen = set()
-    for records in record_lists:
-        for rec in records:
-            if rec.rec_id in seen:
-                continue
-            seen.add(rec.rec_id)
-            out.append(rec)
-    return out
-
-
-def retention_anchor_records(records):
-    out = []
-    for i, rec in enumerate(records):
-        meta = rec.meta | {"retention_anchor": True} if isinstance(rec.meta, dict) else {
-            "retention_anchor": True}
-        out.append(TextRecord(rec_id=f"{rec.rec_id}:retention_anchor:{i}",
-                              split=rec.split,
-                              tokens=rec.tokens,
-                              facts=rec.facts,
-                              group=rec.group,
-                              kind=f"{rec.kind}:retention_anchor",
-                              base_id=rec.base_id,
-                              changed=rec.changed,
-                              meta=meta))
-    return out
-
-
-def semantic_record_outcomes(model, vocab, records, device=DEV, n=0, seed=0):
-    errors, report = semantic_record_errors(model, vocab, records, device=device,
-                                            n=n, seed=seed)
-    error_ids = {r.rec_id for r in errors}
-    candidates = list(records)
-    if n and n < len(candidates):
-        rng = np.random.default_rng(seed)
-        idx = rng.choice(len(candidates), size=n, replace=False)
-        candidates = [candidates[int(i)] for i in idx]
-    correct = [r for r in candidates if r.rec_id not in error_ids]
-    return errors, correct, report | {"n_correct_records": len(correct)}
-
-
-def bucket_fact_eval(model, vocab, records, device=DEV, n=0, seed=0):
-    buckets = {}
-    for rec in records:
-        if rec.split == "eval":
-            buckets.setdefault(rec.kind, []).append(rec)
-    out = {}
-    for i, (name, rows) in enumerate(sorted(buckets.items())):
-        teacher = teacher_forced_eval(model, vocab, rows, device=device, n=n,
-                                      seed=seed + 2003 * i)
-        semantic = semantic_fact_eval(model, vocab, rows, device=device, n=n,
-                                      seed=seed + 3001 * i)
-        fact_concept = fact_concept_eval(model, vocab, rows, device=device, n=n,
-                                         seed=seed + 3001 * i)
-        latent_fact = latent_fact_concept_eval(model, vocab, rows, device=device, n=n,
-                                               seed=seed + 3001 * i)
-        out[name] = {"n": len(rows),
-                     "n_records": teacher["n_records"],
-                     "sampled": teacher["sampled"],
-                     "teacher_forced_fact_value_acc": teacher["fact_value_acc"],
-                     "semantic_fact_value_acc": semantic["fact_value_acc"],
-                     "fact_concept_fact_value_acc": fact_concept["fact_value_acc"],
-                     "latent_fact_concept_fact_value_acc": latent_fact["fact_value_acc"],
-                     "latent_fact_concept_records": latent_fact["n_records"]}
-    return out
-
-
-def bucket_free_eval(model, vocab, records, device=DEV, max_new=80, n=0, seed=0):
-    buckets = {}
-    for rec in records:
-        if rec.split == "eval":
-            buckets.setdefault(rec.kind, []).append(rec)
-    out = {}
-    for i, (name, rows) in enumerate(sorted(buckets.items())):
-        free = free_eval(model, vocab, rows, device=device, max_new=max_new, n=n,
-                         seed=seed + 1009 * i)
-        out[name] = free
-    return out
-
-
-def greedy_facts(model, vocab, rec, device=DEV, max_new=80):
-    model.eval()
-    txt, _ids = pack([rec], vocab, device)
-    ids = torch.tensor([[vocab.stoi["extract"]]], dtype=torch.long, device=device)
-    for _ in range(max_new):
-        logits = model(txt, ids)
-        nxt = int(logits[0, -1].argmax(-1))
-        ids = torch.cat([ids, torch.tensor([[nxt]], dtype=torch.long, device=device)], 1)
-        toks = vocab.dec([int(x) for x in ids[0]])
-        if len(toks) >= 2 and toks[-2:] == ["done", "."]:
-            break
-    return parse_facts(vocab.dec([int(x) for x in ids[0]]))
-
-
-def eval_records(records, n=0, seed=0):
-    out = [r for r in records if r.split == "eval"]
-    if n < 0:
-        return []
-    if n and n < len(out):
-        rng = np.random.default_rng(seed)
-        idx = rng.choice(len(out), size=n, replace=False)
-        out = [out[int(i)] for i in idx]
-    return out
-
-
-def free_eval(model, vocab, records, device=DEV, max_new=80, n=0, seed=0):
-    rows = []
-    selected = eval_records(records, n=n, seed=seed)
-    for rec in selected:
-        pred = greedy_facts(model, vocab, rec, device=device, max_new=max_new)
-        rows.append(fact_scores(pred, rec.facts))
-    keys = ("precision", "recall", "f1", "exact")
-    return {k: float(np.mean([r[k] for r in rows])) if rows else 0.0 for k in keys} | {
-        "n": len(rows),
-        "sampled": bool(n > 0 and n < len([r for r in records if r.split == "eval"])),
-        "skipped": bool(n < 0)}
-
-
-def paraphrase_eval(model, vocab, records, device=DEV, max_new=80, n_groups=0, seed=0):
-    groups = {}
-    for rec in records:
-        if rec.split == "eval" and rec.group:
-            groups.setdefault(rec.group, []).append(rec)
-    usable = [g for g in groups.values() if len(g) >= 2]
-    if n_groups < 0:
-        return {"n_groups": 0, "sampled": False, "skipped": True,
-                "consistent": 0.0, "exact": 0.0}
-    sampled = bool(n_groups and n_groups < len(usable))
-    if sampled:
-        rng = np.random.default_rng(seed)
-        idx = rng.choice(len(usable), size=n_groups, replace=False)
-        usable = [usable[int(i)] for i in idx]
-    consistent = exact = 0
-    for group in usable:
-        preds = [set(greedy_facts(model, vocab, rec, device=device, max_new=max_new))
-                 for rec in group]
-        golds = [set(rec.facts) for rec in group]
-        consistent += int(all(p == preds[0] for p in preds[1:]))
-        exact += int(all(p == g for p, g in zip(preds, golds)))
-    return {"n_groups": len(usable),
-            "sampled": sampled,
-            "skipped": False,
-            "consistent": consistent / max(1, len(usable)),
-            "exact": exact / max(1, len(usable))}
-
-
-def counterfactual_eval(model, vocab, records, device=DEV, max_new=80, n=0, seed=0):
-    cf = [r for r in records if r.split == "eval"
-          and (r.kind == "counterfactual" or r.base_id or r.changed)]
-    if n < 0:
-        return {"n": 0, "sampled": False, "skipped": True, "f1": 0.0, "exact": 0.0}
-    if not cf:
-        return {"n": 0, "sampled": False, "skipped": False, "f1": 0.0, "exact": 0.0}
-    sampled = bool(n and n < len(cf))
-    if sampled:
-        rng = np.random.default_rng(seed)
-        idx = rng.choice(len(cf), size=n, replace=False)
-        cf = [cf[int(i)] for i in idx]
-    rows = []
-    for rec in cf:
-        pred = greedy_facts(model, vocab, rec, device=device, max_new=max_new)
-        rows.append(fact_scores(pred, rec.facts))
-    return {"n": len(cf),
-            "sampled": sampled,
-            "skipped": False,
-            "f1": float(np.mean([r["f1"] for r in rows])),
-            "exact": float(np.mean([r["exact"] for r in rows]))}
-
-
-def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
-                 paraphrase_n=0, counterfactual_n=0, kind_free_n=0,
-                 fact_n=0, kind_fact_n=0, seed=0):
-    teacher = teacher_forced_eval(model, vocab, records, device=device, n=fact_n,
-                                  seed=seed + 11)
-    semantic = semantic_fact_eval(model, vocab, records, device=device, n=fact_n,
-                                  seed=seed + 11)
-    fact_concept = fact_concept_eval(model, vocab, records, device=device, n=fact_n,
-                                     seed=seed + 11)
-    latent_fact_concept = latent_fact_concept_eval(
-        model, vocab, records, device=device, n=fact_n, seed=seed + 11)
-    fact_concept_geometry = fact_concept_geometry_eval(
-        model, vocab, records, device=device, n=fact_n, seed=seed + 12)
-    free = free_eval(model, vocab, records, device=device, max_new=max_new, n=free_n,
-                     seed=seed)
-    para = paraphrase_eval(model, vocab, records, device=device, max_new=max_new,
-                           n_groups=paraphrase_n, seed=seed + 1)
-    cf = counterfactual_eval(model, vocab, records, device=device, max_new=max_new,
-                             n=counterfactual_n, seed=seed + 2)
-    by_kind = bucket_fact_eval(model, vocab, records, device=device, n=kind_fact_n,
-                               seed=seed + 19)
-    by_kind_free = (bucket_free_eval(model, vocab, records, device=device, max_new=max_new,
-                                     n=kind_free_n, seed=seed + 3)
-                    if kind_free_n else {})
-    gate = (teacher["fact_value_acc"] >= 0.80 and semantic["fact_value_acc"] >= 0.80
-            and (free.get("skipped") or free["f1"] >= 0.80)
-            and (para.get("skipped") or para["n_groups"] == 0 or para["consistent"] >= 0.80)
-            and (cf.get("skipped") or cf["n"] == 0 or cf["f1"] >= 0.80))
-    return {"teacher_forced": teacher, "free_decode": free,
-            "semantic_head": semantic,
-            "fact_concept_head": fact_concept,
-            "latent_fact_concept_head": latent_fact_concept,
-            "fact_concept_geometry": fact_concept_geometry,
-            "by_kind": by_kind,
-            "free_decode_by_kind": by_kind_free,
-            "paraphrase_consistency": para, "counterfactual": cf,
-            "gate_thresholds": {"fact_value_acc": 0.80, "free_f1": 0.80,
-                                "semantic_fact_value_acc": 0.80,
-                                "fact_concept_fact_value_acc": 0.80,
-                                "latent_fact_concept_fact_value_acc": 0.80,
-                                "fact_concept_geometry_margin": 0.05,
-                                "paraphrase_consistent": 0.80,
-                                "counterfactual_f1": 0.80},
-            "gate": gate}
-
-
 def _torch_load(path, device):
     try:
         return torch.load(path, map_location=device, weights_only=False)
@@ -7351,98 +6234,34 @@ def _torch_load(path, device):
 def load_checkpoint(path, device=DEV):
     ckpt = _torch_load(path, device)
     vocab = vocab_from_itos(ckpt["vocab"])
-    schema = fact_schema_from_payload(ckpt.get("fact_schema"))
     model = TextReadingLM(len(vocab), d=int(ckpt.get("d", 96)),
-                       layers=int(ckpt.get("layers", 3)),
-                       heads=int(ckpt.get("heads", 4)), pad=vocab.pad,
-                       fact_schema=schema,
-                       fact_concept_prefix=bool(
-                           ckpt.get("fact_concept_prefix", False)),
-                       text_encoder_arch=ckpt.get("text_encoder_arch", "transformer"),
-                       text_encoder_layers=int(
-                           ckpt.get("text_encoder_layers", 1)),
-                       fact_concept_refine=bool(
-                           ckpt.get("fact_concept_refine", False)),
-                       fact_concept_refine_gate_init=float(
-                           ckpt.get("fact_concept_refine_gate_init", -2.0)),
-                       fact_concept_mixer_layers=int(
-                           ckpt.get("fact_concept_mixer_layers", 0)),
-                       fact_concept_mixer_gate_init=float(
-                           ckpt.get("fact_concept_mixer_gate_init", -2.0)),
-                       latent_concept_slots=int(
-                           ckpt.get("latent_concept_slots", 0)),
-                       latent_concept_layers=int(
-                           ckpt.get("latent_concept_layers", 1)),
-                       latent_concept_prefix=bool(
-                           ckpt.get("latent_concept_prefix", False)),
-                       latent_concept_refine=bool(
-                           ckpt.get("latent_concept_refine", False)),
-                       latent_concept_refine_gate_init=float(
-                           ckpt.get("latent_concept_refine_gate_init", -2.0)),
-                       latent_concept_memory_size=int(
-                           ckpt.get("latent_concept_memory_size", 0))).to(device)
+                          layers=int(ckpt.get("layers", 3)),
+                          heads=int(ckpt.get("heads", 4)), pad=vocab.pad,
+                          text_encoder_arch=ckpt.get(
+                              "text_encoder_arch", "transformer"),
+                          text_encoder_layers=int(
+                              ckpt.get("text_encoder_layers", 1)),
+                          latent_concept_slots=int(
+                              ckpt.get("latent_concept_slots", 0)),
+                          latent_concept_layers=int(
+                              ckpt.get("latent_concept_layers", 1)),
+                          latent_concept_prefix=bool(
+                              ckpt.get("latent_concept_prefix", False)),
+                          latent_concept_refine=bool(
+                              ckpt.get("latent_concept_refine", False)),
+                          latent_concept_refine_gate_init=float(
+                              ckpt.get("latent_concept_refine_gate_init", -2.0)),
+                          latent_concept_memory_size=int(
+                              ckpt.get("latent_concept_memory_size", 0))).to(device)
     state = ckpt["state_dict"]
     model.load_state_dict(state, strict=False)
-    model.has_fact_concept_state = any(k.startswith("fact_concepts.") for k in state)
-    model.eval()
-    return model, vocab, ckpt
-
-
-def expanded_checkpoint_model(checkpoint, records, device=DEV):
-    src_model, src_vocab, ckpt = load_checkpoint(checkpoint, device=device)
-    schema = build_fact_schema(records, base_schema=src_model.fact_schema)
-    vocab = build_vocab(records, base_vocab=src_vocab)
-    model = TextReadingLM(len(vocab), d=int(ckpt.get("d", 96)),
-                       layers=int(ckpt.get("layers", 3)),
-                       heads=int(ckpt.get("heads", 4)), pad=vocab.pad,
-                       fact_schema=schema,
-                       fact_concept_prefix=bool(
-                           ckpt.get("fact_concept_prefix", False)),
-                       text_encoder_arch=ckpt.get("text_encoder_arch", "transformer"),
-                       text_encoder_layers=int(
-                           ckpt.get("text_encoder_layers", 1)),
-                       fact_concept_refine=bool(
-                           ckpt.get("fact_concept_refine", False)),
-                       fact_concept_refine_gate_init=float(
-                           ckpt.get("fact_concept_refine_gate_init", -2.0)),
-                       fact_concept_mixer_layers=int(
-                           ckpt.get("fact_concept_mixer_layers", 0)),
-                       fact_concept_mixer_gate_init=float(
-                           ckpt.get("fact_concept_mixer_gate_init", -2.0)),
-                       latent_concept_slots=int(
-                           ckpt.get("latent_concept_slots", 0)),
-                       latent_concept_layers=int(
-                           ckpt.get("latent_concept_layers", 1)),
-                       latent_concept_prefix=bool(
-                           ckpt.get("latent_concept_prefix", False)),
-                       latent_concept_refine=bool(
-                           ckpt.get("latent_concept_refine", False)),
-                       latent_concept_refine_gate_init=float(
-                           ckpt.get("latent_concept_refine_gate_init", -2.0)),
-                       latent_concept_memory_size=int(
-                           ckpt.get("latent_concept_memory_size", 0))).to(device)
-    copy_pretrained_text_weights(src_model, src_vocab, model, vocab)
     model.eval()
     return model, vocab, ckpt
 
 
 def checkpoint_payload(model, vocab, d, layers, heads, report):
-    fact_schema = None
-    if model.fact_schema is not None:
-        fact_schema = {
-            "keys": model.fact_schema.keys,
-            "values": model.fact_schema.values,
-        }
     payload = {
         "state_dict": model.state_dict(), "vocab": vocab.itos,
-        "fact_concept_prefix": bool(getattr(model, "fact_concept_prefix", False)),
-        "fact_concept_refine": bool(getattr(model, "fact_concept_refine", False)),
-        "fact_concept_refine_gate_init": float(
-            getattr(model, "fact_concept_refine_gate_init", -2.0)),
-        "fact_concept_mixer_layers": int(
-            getattr(model, "fact_concept_mixer_layers", 0)),
-        "fact_concept_mixer_gate_init": float(
-            getattr(model, "fact_concept_mixer_gate_init", -2.0)),
         "latent_concept_slots": int(getattr(model, "latent_concept_slots", 0)),
         "latent_concept_layers": int(getattr(model, "latent_concept_layers", 1)),
         "latent_concept_prefix": bool(
@@ -7455,7 +6274,7 @@ def checkpoint_payload(model, vocab, d, layers, heads, report):
             getattr(model, "latent_concept_memory_size", 0)),
         "text_encoder_arch": getattr(model, "text_encoder_arch", "transformer"),
         "text_encoder_layers": int(getattr(model, "text_encoder_layers", 1)),
-        "d": d, "layers": layers, "heads": heads, "fact_schema": fact_schema,
+        "d": d, "layers": layers, "heads": heads,
         "report": report,
     }
     if isinstance(report, dict) and report.get("reading_replay_bank") is not None:
@@ -7463,629 +6282,8 @@ def checkpoint_payload(model, vocab, d, layers, heads, report):
     return payload
 
 
-def clone_model_state(model):
-    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-
-
-def restore_model_state(model, state, device=DEV):
-    model.load_state_dict({k: v.to(device) for k, v in state.items()})
-    model.eval()
-
-
-def _fact_value_scores(eval_report):
-    scores = {
-        "semantic": float(eval_report["semantic_head"]["fact_value_acc"]),
-        "teacher": float(eval_report["teacher_forced"]["fact_value_acc"]),
-    }
-    concept = eval_report.get("fact_concept_head") or {}
-    if concept.get("n_records", 0) and not concept.get("skipped"):
-        scores["concept"] = float(concept["fact_value_acc"])
-    latent = eval_report.get("latent_fact_concept_head") or {}
-    if latent.get("n_records", 0) and not latent.get("skipped"):
-        scores["latent"] = float(latent["fact_value_acc"])
-    return scores
-
-
-def _score_metric(eval_report, metric):
-    scores = _fact_value_scores(eval_report)
-    if metric in scores:
-        return scores[metric]
-    if metric == "both":
-        return 0.5 * (scores["semantic"] + scores["teacher"])
-    if metric == "min":
-        return min(scores["semantic"], scores["teacher"])
-    raise ValueError(f"unknown study score metric {metric!r}")
-
-
-def _kind_score(row, metric):
-    teacher = float(row.get("teacher_forced_fact_value_acc", 0.0))
-    semantic = float(row.get("semantic_fact_value_acc", 0.0))
-    latent = float(row.get("latent_fact_concept_fact_value_acc", 0.0))
-    if metric == "teacher":
-        return teacher
-    if metric == "semantic":
-        return semantic
-    if metric == "latent":
-        return latent if row.get("latent_fact_concept_records", 0) else 0.5 * (teacher + semantic)
-    if metric == "both":
-        return 0.5 * (teacher + semantic)
-    if metric == "min":
-        return min(teacher, semantic)
-    raise ValueError(f"unknown study score metric {metric!r}")
-
-
-def _kind_regressions(eval_report, ref_report, metric="both", tol=1e-9):
-    if ref_report is None:
-        return {}
-    by_kind = eval_report.get("by_kind") or {}
-    ref_by_kind = ref_report.get("by_kind") or {}
-    out = {}
-    for name, row in sorted(by_kind.items()):
-        if name not in ref_by_kind:
-            continue
-        score = _kind_score(row, metric)
-        ref_score = _kind_score(ref_by_kind[name], metric)
-        drop = ref_score - score
-        if drop > tol:
-            out[name] = {"before": ref_score, "after": score, "drop": drop}
-    return out
-
-
-def study_selection_score(study_eval, replay_eval, replay_ref=None, metric="both",
-                          retention_w=1.0, kind_w=1.0, study_ref=None):
-    return study_selection_components(study_eval, replay_eval, replay_ref,
-                                      metric=metric,
-                                      retention_w=retention_w,
-                                      kind_w=kind_w,
-                                      study_ref=study_ref)["score"]
-
-
-def study_selection_allowed(components, require_positive=True, kind_w=1.0):
-    kind_regressed = bool(components.get("kind_regressions")) and kind_w > 0
-    score_allowed = (((not require_positive) or components["score"] > 0.0)
-                     and not kind_regressed)
-    return {"score_allowed": bool(score_allowed),
-            "kind_regression_allowed": not kind_regressed}
-
-
-def study_selection_components(study_eval, replay_eval, replay_ref=None, metric="both",
-                               retention_w=1.0, kind_w=1.0, study_ref=None):
-    study_score = _score_metric(study_eval, metric)
-    replay_score = None
-    replay_ref_score = None
-    retention_penalty = 0.0
-    by_kind = study_eval.get("by_kind") or {}
-    kind_scores = {name: _kind_score(row, metric) for name, row in sorted(by_kind.items())}
-    kind_floor = min(kind_scores.values()) if len(kind_scores) >= 2 else study_score
-    kind_gap_penalty = max(0.0, study_score - kind_floor) if len(kind_scores) >= 2 else 0.0
-    kind_regressions = _kind_regressions(study_eval, study_ref, metric=metric)
-    kind_regression_penalty = sum(row["drop"] for row in kind_regressions.values())
-    kind_penalty = kind_w * (kind_gap_penalty + kind_regression_penalty)
-    if replay_eval is not None and replay_ref is not None:
-        replay_score = _score_metric(replay_eval, metric)
-        replay_ref_score = _score_metric(replay_ref, metric)
-        retention_penalty = retention_w * max(0.0, replay_ref_score - replay_score)
-    scores = _fact_value_scores(study_eval)
-    return {
-        "metric": metric,
-        "study_score": study_score,
-        "study_semantic_fact_value_acc": scores["semantic"],
-        "study_teacher_fact_value_acc": scores["teacher"],
-        "study_latent_fact_value_acc": scores.get("latent"),
-        "replay_score": replay_score,
-        "replay_ref_score": replay_ref_score,
-        "retention_penalty": retention_penalty,
-        "kind_floor": kind_floor,
-        "kind_scores": kind_scores,
-        "kind_gap_penalty": kind_gap_penalty,
-        "kind_regressions": kind_regressions,
-        "kind_regression_penalty": kind_regression_penalty,
-        "kind_penalty": kind_penalty,
-        "score": study_score - retention_penalty - kind_penalty,
-    }
-
-
-def vocab_coverage(records, vocab):
-    total = unk = 0
-    for rec in records:
-        for tok in rec.tokens:
-            total += 1
-            unk += int(tok not in vocab.stoi)
-    return {"text_tokens": total, "unknown_text_tokens": unk,
-            "unknown_text_token_rate": unk / max(1, total)}
-
-
-def eval_checkpoint(checkpoint, data, out=None, device=DEV, max_new=160, free_n=0,
-                    paraphrase_n=0, counterfactual_n=0, kind_free_n=0,
-                    fact_n=0, kind_fact_n=0, seed=0):
-    records = load_records(data, require_train=False, require_eval=True)
-    torch.manual_seed(seed)
-    model, vocab, ckpt = load_checkpoint(checkpoint, device=device)
-    report = {"experiment": "text0_checkpoint_eval", "data": data,
-              "checkpoint": checkpoint,
-              "checkpoint_experiment": ckpt.get("report", {}).get("experiment"),
-              "train_records": sum(r.split == "train" for r in records),
-              "eval_records": sum(r.split == "eval" for r in records),
-              "free_n": int(free_n),
-              "paraphrase_n": int(paraphrase_n),
-              "counterfactual_n": int(counterfactual_n),
-              "kind_free_n": int(kind_free_n),
-              "fact_n": int(fact_n),
-              "kind_fact_n": int(kind_fact_n),
-              "vocab_coverage": vocab_coverage([r for r in records if r.split == "eval"],
-                                                vocab)}
-    report.update(evaluate_all(model, vocab, records, device=device, max_new=max_new,
-                               free_n=free_n, paraphrase_n=paraphrase_n,
-                               counterfactual_n=counterfactual_n,
-                               kind_free_n=kind_free_n, fact_n=fact_n,
-                               kind_fact_n=kind_fact_n, seed=seed + 17))
-    if out:
-        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-        with open(out, "w") as f:
-            json.dump(report, f, indent=1)
-    print(json.dumps(report, indent=1), flush=True)
-    return report
-
-
-
-def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, out=None,
-        checkpoint=None, max_new=160, semantic_w=0.5, free_n=0, paraphrase_n=0,
-        counterfactual_n=0, kind_free_n=0, balance_by="none",
-        text_encoder_arch="transformer", text_encoder_layers=1,
-        fact_concept_refine=False, fact_concept_refine_gate_init=-2.0,
-        fact_concept_mixer_layers=0, fact_concept_mixer_gate_init=-2.0,
-        latent_concept_slots=0, latent_concept_layers=1,
-        latent_concept_prefix=False,
-        latent_concept_refine=False,
-        latent_concept_refine_gate_init=-2.0,
-        latent_concept_w=0.0, latent_concept_view_dropout=0.1,
-        latent_concept_invariance_w=25.0, latent_concept_variance_w=25.0,
-        latent_concept_covariance_w=1.0, latent_concept_variance_target=1.0,
-        latent_concept_fact_w=0.0,
-        fact_n=0, kind_fact_n=0, decode_w=1.0,
-        fact_concept_w=0.0, fact_concept_contrast_w=0.0,
-        fact_concept_contrast_temperature=0.1,
-        fact_concept_centroid_w=0.0, fact_concept_centroid_temperature=0.1,
-        fact_concept_centroid_margin=0.0, fact_concept_prefix=False,
-        fact_concept_prototype_w=0.0, fact_concept_prototype_spread_w=0.0,
-        fact_concept_prototype_spread_margin=0.2,
-        fact_concept_state_spread_w=0.0, fact_concept_state_spread_variance=0.05,
-        fact_concept_state_spread_margin=0.2,
-        fact_concept_state_spread_covariance_w=0.05):
-    records = load_records(data)
-    model, vocab = train_model(records, steps=steps, batch=batch, d=d, layers=layers,
-                               heads=heads,
-                               text_encoder_arch=text_encoder_arch,
-                               text_encoder_layers=text_encoder_layers,
-                               fact_concept_refine=fact_concept_refine,
-                               fact_concept_refine_gate_init=(
-                                   fact_concept_refine_gate_init),
-                               fact_concept_mixer_layers=fact_concept_mixer_layers,
-                               fact_concept_mixer_gate_init=(
-                                   fact_concept_mixer_gate_init),
-                               latent_concept_slots=latent_concept_slots,
-                               latent_concept_layers=latent_concept_layers,
-                               latent_concept_prefix=latent_concept_prefix,
-                               latent_concept_refine=latent_concept_refine,
-                               latent_concept_refine_gate_init=(
-                                   latent_concept_refine_gate_init),
-                               seed=seed, device=device, semantic_w=semantic_w,
-                               balance_by=balance_by, fact_concept_w=fact_concept_w,
-                               fact_concept_contrast_w=fact_concept_contrast_w,
-                               fact_concept_contrast_temperature=(
-                                   fact_concept_contrast_temperature),
-                               fact_concept_centroid_w=fact_concept_centroid_w,
-                               fact_concept_centroid_temperature=(
-                                   fact_concept_centroid_temperature),
-                               fact_concept_centroid_margin=fact_concept_centroid_margin,
-                               fact_concept_prefix=fact_concept_prefix,
-                               fact_concept_prototype_w=fact_concept_prototype_w,
-                               fact_concept_prototype_spread_w=(
-                                   fact_concept_prototype_spread_w),
-                               fact_concept_prototype_spread_margin=(
-                                   fact_concept_prototype_spread_margin),
-                               fact_concept_state_spread_w=fact_concept_state_spread_w,
-                               fact_concept_state_spread_variance=(
-                                   fact_concept_state_spread_variance),
-                               fact_concept_state_spread_margin=(
-                                   fact_concept_state_spread_margin),
-                               fact_concept_state_spread_covariance_w=(
-                                   fact_concept_state_spread_covariance_w),
-                               latent_concept_w=latent_concept_w,
-                               latent_concept_view_dropout=latent_concept_view_dropout,
-                               latent_concept_invariance_w=latent_concept_invariance_w,
-                               latent_concept_variance_w=latent_concept_variance_w,
-                               latent_concept_covariance_w=latent_concept_covariance_w,
-                               latent_concept_variance_target=(
-                                   latent_concept_variance_target),
-                               latent_concept_fact_w=latent_concept_fact_w,
-                               decode_w=decode_w)
-    report = {"experiment": "text0_semantic_extraction", "data": data,
-              "steps": int(steps), "batch": int(batch), "d": int(d),
-              "layers": int(layers), "heads": int(heads),
-              "text_encoder_arch": getattr(model, "text_encoder_arch", text_encoder_arch),
-              "text_encoder_layers": int(getattr(
-                  model, "text_encoder_layers", text_encoder_layers)),
-              "decode_w": float(decode_w), "semantic_w": float(semantic_w),
-              "fact_concept_w": float(fact_concept_w),
-              "fact_concept_contrast_w": float(fact_concept_contrast_w),
-              "fact_concept_contrast_temperature": float(
-                  fact_concept_contrast_temperature),
-              "fact_concept_centroid_w": float(fact_concept_centroid_w),
-              "fact_concept_centroid_temperature": float(
-                  fact_concept_centroid_temperature),
-              "fact_concept_centroid_margin": float(fact_concept_centroid_margin),
-              "fact_concept_prefix": bool(getattr(model, "fact_concept_prefix", False)),
-              "fact_concept_refine": bool(getattr(model, "fact_concept_refine", False)),
-              "fact_concept_refine_gate_init": float(
-                  getattr(model, "fact_concept_refine_gate_init", -2.0)),
-              "fact_concept_mixer_layers": int(
-                  getattr(model, "fact_concept_mixer_layers", 0)),
-              "fact_concept_mixer_gate_init": float(
-                  getattr(model, "fact_concept_mixer_gate_init", -2.0)),
-              "latent_concept_slots": int(getattr(model, "latent_concept_slots", 0)),
-              "latent_concept_layers": int(getattr(model, "latent_concept_layers", 1)),
-              "latent_concept_prefix": bool(
-                  getattr(model, "latent_concept_prefix", False)),
-              "latent_concept_refine": bool(
-                  getattr(model, "latent_concept_refine", False)),
-              "latent_concept_refine_gate_init": float(
-                  getattr(model, "latent_concept_refine_gate_init", -2.0)),
-              "latent_concept_w": float(latent_concept_w),
-              "latent_concept_view_dropout": float(latent_concept_view_dropout),
-              "latent_concept_invariance_w": float(latent_concept_invariance_w),
-              "latent_concept_variance_w": float(latent_concept_variance_w),
-              "latent_concept_covariance_w": float(latent_concept_covariance_w),
-              "latent_concept_variance_target": float(latent_concept_variance_target),
-              "latent_concept_fact_w": float(latent_concept_fact_w),
-              "fact_concept_prototype_w": float(fact_concept_prototype_w),
-              "fact_concept_prototype_spread_w": float(
-                  fact_concept_prototype_spread_w),
-              "fact_concept_prototype_spread_margin": float(
-                  fact_concept_prototype_spread_margin),
-              "fact_concept_state_spread_w": float(fact_concept_state_spread_w),
-              "fact_concept_state_spread_variance": float(
-                  fact_concept_state_spread_variance),
-              "fact_concept_state_spread_margin": float(
-                  fact_concept_state_spread_margin),
-              "fact_concept_state_spread_covariance_w": float(
-                  fact_concept_state_spread_covariance_w),
-              "free_n": int(free_n), "paraphrase_n": int(paraphrase_n),
-              "counterfactual_n": int(counterfactual_n),
-              "kind_free_n": int(kind_free_n), "fact_n": int(fact_n),
-              "kind_fact_n": int(kind_fact_n),
-              "balance_by": balance_by,
-              "train_records": sum(r.split == "train" for r in records),
-              "eval_records": sum(r.split == "eval" for r in records)}
-    if checkpoint:
-        os.makedirs(os.path.dirname(checkpoint) or ".", exist_ok=True)
-        torch.save(checkpoint_payload(model, vocab, d, layers, heads,
-                                      report | {"status": "trained_pending_eval"}),
-                   checkpoint)
-    report.update(evaluate_all(model, vocab, records, device=device, max_new=max_new,
-                               free_n=free_n, paraphrase_n=paraphrase_n,
-                               counterfactual_n=counterfactual_n,
-                               kind_free_n=kind_free_n, fact_n=fact_n,
-                               kind_fact_n=kind_fact_n, seed=seed + 17))
-    if checkpoint:
-        os.makedirs(os.path.dirname(checkpoint) or ".", exist_ok=True)
-        torch.save(checkpoint_payload(model, vocab, d, layers, heads, report), checkpoint)
-        report["checkpoint"] = checkpoint
-    if out:
-        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-        with open(out, "w") as f:
-            json.dump(report, f, indent=1)
-    print(json.dumps(report, indent=1), flush=True)
-    return report
-
-
-def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, out=None,
-                     steps=400, batch=32, lr=5e-4, seed=0, device=DEV,
-                     max_new=160, semantic_w=0.5, free_n=0, paraphrase_n=0,
-                     counterfactual_n=0, kind_free_n=0, balance_by="none",
-                     fact_n=0, kind_fact_n=0, decode_w=1.0,
-                     fact_concept_w=0.0, fact_concept_contrast_w=0.0,
-                     fact_concept_contrast_temperature=0.1,
-                     fact_concept_centroid_w=0.0,
-                     fact_concept_centroid_temperature=0.1,
-                     fact_concept_centroid_margin=0.0,
-                     fact_concept_prototype_w=0.0,
-                     fact_concept_prototype_spread_w=0.0,
-                     fact_concept_prototype_spread_margin=0.2,
-                     fact_concept_state_spread_w=0.0,
-                     fact_concept_state_spread_variance=0.05,
-                     fact_concept_state_spread_margin=0.2,
-                     fact_concept_state_spread_covariance_w=0.05,
-                     latent_concept_w=0.0, latent_concept_view_dropout=0.1,
-                     latent_concept_invariance_w=25.0,
-                     latent_concept_variance_w=25.0,
-                     latent_concept_covariance_w=1.0,
-                     latent_concept_variance_target=1.0,
-                     latent_concept_fact_w=0.0,
-                     study_rounds=1, study_strategy="errors", study_probe_n=0,
-                     study_hard_max=0, study_select_best=False,
-                     study_score_metric="both", study_retention_w=1.0,
-                     study_kind_w=1.0, study_require_positive_score=True,
-                     study_confirm_n=0, study_confirm_seed_stride=10000):
-    if study_strategy not in ("errors", "latent", "all"):
-        raise ValueError(f"unknown study strategy {study_strategy!r}")
-    records = load_records(data)
-    replay_records = (load_records(replay_data, require_train=False, require_eval=True)
-                      if replay_data else [])
-    model, vocab, ckpt = expanded_checkpoint_model(
-        checkpoint, records + replay_records, device=device)
-    d = int(ckpt.get("d", 96))
-    layers = int(ckpt.get("layers", 3))
-    heads = int(ckpt.get("heads", 4))
-    eval_kwargs = dict(device=device, max_new=max_new, free_n=free_n,
-                       paraphrase_n=paraphrase_n,
-                       counterfactual_n=counterfactual_n,
-                       kind_free_n=kind_free_n, fact_n=fact_n,
-                       kind_fact_n=kind_fact_n, seed=seed + 17)
-    before = evaluate_all(model, vocab, records, **eval_kwargs)
-    replay_before = (evaluate_all(model, vocab, replay_records, **eval_kwargs)
-                     if replay_records and any(r.split == "eval" for r in replay_records)
-                     else None)
-    report = {"experiment": "text0_checkpoint_study", "checkpoint": checkpoint,
-              "checkpoint_experiment": ckpt.get("report", {}).get("experiment"),
-              "data": data, "replay_data": replay_data or [],
-              "steps": int(steps), "batch": int(batch), "lr": float(lr),
-              "study_rounds": int(study_rounds), "study_strategy": study_strategy,
-              "study_probe_n": int(study_probe_n),
-              "study_hard_max": int(study_hard_max),
-              "study_select_best": bool(study_select_best),
-              "study_score_metric": study_score_metric,
-              "study_retention_w": float(study_retention_w),
-              "study_kind_w": float(study_kind_w),
-              "decode_w": float(decode_w), "semantic_w": float(semantic_w),
-              "fact_concept_w": float(fact_concept_w),
-              "fact_concept_contrast_w": float(fact_concept_contrast_w),
-              "fact_concept_centroid_w": float(fact_concept_centroid_w),
-              "latent_concept_w": float(latent_concept_w),
-              "latent_concept_fact_w": float(latent_concept_fact_w),
-              "train_records": sum(r.split == "train" for r in records),
-              "eval_records": sum(r.split == "eval" for r in records),
-              "replay_train_records": sum(r.split == "train" for r in replay_records),
-              "replay_eval_records": sum(r.split == "eval" for r in replay_records),
-              "before": before, "replay_before": replay_before}
-    train_records = [r for r in records if r.split == "train"]
-    replay_train = [r for r in replay_records if r.split == "train"]
-    if not train_records:
-        raise ValueError("checkpoint study requires train records")
-    rng = np.random.default_rng(seed)
-    best_state = clone_model_state(model)
-    best_score = -float("inf")
-    best_round = 0
-    best_components = None
-    best_study_eval = before
-    best_replay_eval = replay_before
-    round_reports = []
-    for round_i in range(max(1, int(study_rounds))):
-        round_seed = seed + 1009 * (round_i + 1)
-        probe_n = int(study_probe_n) if int(study_probe_n) > 0 else max(batch * 4, 1)
-        if study_strategy == "all":
-            hard_records = list(train_records)
-            hard_report = {"strategy": "all", "n_records": len(train_records),
-                           "n_error_records": None}
-        elif study_strategy == "latent":
-            hard_records, _correct, hard_report = latent_fact_record_outcomes(
-                model, vocab, train_records, device=device, n=probe_n,
-                seed=round_seed)
-            hard_report = hard_report | {"strategy": "latent"}
-        else:
-            hard_records, _correct, hard_report = semantic_record_outcomes(
-                model, vocab, train_records, device=device, n=probe_n,
-                seed=round_seed)
-            hard_report = hard_report | {"strategy": "errors"}
-        if study_hard_max and len(hard_records) > int(study_hard_max):
-            idx = rng.choice(len(hard_records), size=int(study_hard_max), replace=False)
-            hard_records = [hard_records[int(i)] for i in idx]
-            hard_report = hard_report | {"capped": True}
-        else:
-            hard_report = hard_report | {"capped": False}
-        if not hard_records:
-            hard_records = list(train_records)
-            hard_report = hard_report | {"fallback": "all_train"}
-        round_fit_records = hard_records + replay_train
-        round_reports.append({"round": round_i + 1,
-                              "fit_records": len(round_fit_records),
-                              "study_fit_records": len(hard_records),
-                              "replay_fit_records": len(replay_train),
-                              "hard_examples": hard_report | {
-                                  "n_error_records_used": len(hard_records)}})
-        fit_model(model, vocab, round_fit_records, steps=steps, batch=batch, lr=lr,
-                  seed=round_seed, device=device, semantic_w=semantic_w,
-                  balance_by=balance_by, fact_concept_w=fact_concept_w,
-                  fact_concept_contrast_w=fact_concept_contrast_w,
-                  fact_concept_contrast_temperature=(
-                      fact_concept_contrast_temperature),
-                  fact_concept_centroid_w=fact_concept_centroid_w,
-                  fact_concept_centroid_temperature=(
-                      fact_concept_centroid_temperature),
-                  fact_concept_centroid_margin=fact_concept_centroid_margin,
-                  fact_concept_prototype_w=fact_concept_prototype_w,
-                  fact_concept_prototype_spread_w=fact_concept_prototype_spread_w,
-                  fact_concept_prototype_spread_margin=(
-                      fact_concept_prototype_spread_margin),
-                  fact_concept_state_spread_w=fact_concept_state_spread_w,
-                  fact_concept_state_spread_variance=(
-                      fact_concept_state_spread_variance),
-                  fact_concept_state_spread_margin=fact_concept_state_spread_margin,
-                  fact_concept_state_spread_covariance_w=(
-                      fact_concept_state_spread_covariance_w),
-                  latent_concept_w=latent_concept_w,
-                  latent_concept_view_dropout=latent_concept_view_dropout,
-                  latent_concept_invariance_w=latent_concept_invariance_w,
-                  latent_concept_variance_w=latent_concept_variance_w,
-                  latent_concept_covariance_w=latent_concept_covariance_w,
-                  latent_concept_variance_target=latent_concept_variance_target,
-                  latent_concept_fact_w=latent_concept_fact_w,
-                  prefix=f"study-r{round_i + 1}", decode_w=decode_w)
-        round_study_eval = evaluate_all(model, vocab, records, **eval_kwargs)
-        round_replay_eval = (evaluate_all(model, vocab, replay_records, **eval_kwargs)
-                             if replay_records and any(r.split == "eval"
-                                                       for r in replay_records)
-                             else None)
-        components = study_selection_components(
-            round_study_eval, round_replay_eval, replay_before,
-            metric=study_score_metric, retention_w=study_retention_w,
-            kind_w=study_kind_w, study_ref=before)
-        allowed = study_selection_allowed(
-            components, require_positive=study_require_positive_score,
-            kind_w=study_kind_w)
-        confirmation_checks = []
-        for confirm_i in range(int(study_confirm_n)):
-            confirm_kwargs = eval_kwargs | {
-                "seed": seed + int(study_confirm_seed_stride) * (confirm_i + 1)}
-            confirm_eval = evaluate_all(model, vocab, records, **confirm_kwargs)
-            confirm_replay = (evaluate_all(model, vocab, replay_records, **confirm_kwargs)
-                              if replay_records and any(r.split == "eval"
-                                                        for r in replay_records)
-                              else None)
-            confirm_components = study_selection_components(
-                confirm_eval, confirm_replay, replay_before,
-                metric=study_score_metric, retention_w=study_retention_w,
-                kind_w=study_kind_w, study_ref=before)
-            confirmation_checks.append({
-                "index": confirm_i,
-                "score": confirm_components["score"],
-                "score_components": confirm_components,
-                **study_selection_allowed(confirm_components,
-                                          require_positive=study_require_positive_score,
-                                          kind_w=study_kind_w)})
-        confirmation_allowed = all(row["score_allowed"] for row in confirmation_checks)
-        round_allowed = allowed["score_allowed"] and confirmation_allowed
-        score = float(components["score"])
-        round_reports[-1].update({"score": score, "score_components": components,
-                                  "confirmation": confirmation_checks,
-                                  "confirmation_allowed": bool(confirmation_allowed),
-                                  **allowed, "round_allowed": bool(round_allowed)})
-        if (not study_select_best) or (round_allowed and score >= best_score):
-            best_score = score
-            best_round = round_i + 1
-            best_components = components
-            best_state = clone_model_state(model)
-            best_study_eval = round_study_eval
-            best_replay_eval = round_replay_eval
-    if study_select_best:
-        restore_model_state(model, best_state, device=device)
-    after = best_study_eval
-    replay_after = best_replay_eval
-    report["after"] = after
-    report["replay_after"] = replay_after
-    report["rounds"] = round_reports
-    report["selected_round"] = best_round
-    report["selected_score"] = best_score if best_score != -float("inf") else None
-    report["selected_score_components"] = best_components
-    report["delta"] = {
-        "teacher_forced_fact_value_acc": (
-            after["teacher_forced"]["fact_value_acc"]
-            - before["teacher_forced"]["fact_value_acc"]),
-        "semantic_fact_value_acc": (
-            after["semantic_head"]["fact_value_acc"]
-            - before["semantic_head"]["fact_value_acc"]),
-        "latent_fact_concept_fact_value_acc": (
-            after["latent_fact_concept_head"]["fact_value_acc"]
-            - before["latent_fact_concept_head"]["fact_value_acc"]),
-        "free_f1": after["free_decode"]["f1"] - before["free_decode"]["f1"],
-    }
-    report["replay_delta"] = ({
-        "teacher_forced_fact_value_acc": (
-            replay_after["teacher_forced"]["fact_value_acc"]
-            - replay_before["teacher_forced"]["fact_value_acc"]),
-        "semantic_fact_value_acc": (
-            replay_after["semantic_head"]["fact_value_acc"]
-            - replay_before["semantic_head"]["fact_value_acc"]),
-        "latent_fact_concept_fact_value_acc": (
-            replay_after["latent_fact_concept_head"]["fact_value_acc"]
-            - replay_before["latent_fact_concept_head"]["fact_value_acc"]),
-        "free_f1": replay_after["free_decode"]["f1"] - replay_before["free_decode"]["f1"],
-    } if replay_before is not None and replay_after is not None else None)
-    report["out_checkpoint"] = out_checkpoint
-    if out_checkpoint:
-        os.makedirs(os.path.dirname(out_checkpoint) or ".", exist_ok=True)
-        torch.save(checkpoint_payload(model, vocab, d, layers, heads, report),
-                   out_checkpoint)
-    if out:
-        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-        with open(out, "w") as f:
-            json.dump(report, f, indent=1)
-    print(json.dumps(report, indent=1), flush=True)
-    return report
-
 
 def selftest():
-    raw = [
-        {"split": "train", "id": "t1", "text": "the red square is on card one .",
-         "facts": [["p0", "color", "red"], ["p0", "shape", "square"]]},
-        {"split": "train", "id": "t2", "text": "card two contains a blue circle .",
-         "facts": [["p0", "color", "blue"], ["p0", "shape", "circle"]]},
-        {"split": "eval", "id": "e1", "group": "g1",
-         "text": "a red square appears on the card .",
-         "facts": [["p0", "color", "red"], ["p0", "shape", "square"]]},
-        {"split": "eval", "id": "e2", "group": "g1",
-         "text": "the card shows a square that is red .",
-         "facts": [["p0", "color", "red"], ["p0", "shape", "square"]]},
-        {"split": "eval", "id": "e3", "kind": "counterfactual", "base_id": "e1",
-         "text": "a blue square appears on the card .",
-         "facts": [["p0", "color", "blue"], ["p0", "shape", "square"]],
-         "changed": [["p0", "color", "blue"]]},
-    ]
-    records = [normalize_record(r, idx=i) for i, r in enumerate(raw)]
-    buckets = bucket_records(records, "kind")
-    assert sorted(buckets) == ["counterfactual", "plain"]
-    balanced = balanced_batch_records(buckets, np.random.default_rng(1), 4)
-    assert {r.kind for r in balanced} == {"plain", "counterfactual"}
-    vocab = build_vocab(records)
-    schema = build_fact_schema(records)
-    model = TextReadingLM(len(vocab), d=32, layers=1, heads=4, pad=vocab.pad,
-                       fact_schema=schema, fact_concept_prefix=True,
-                       fact_concept_refine=True, fact_concept_mixer_layers=1,
-                       latent_concept_slots=3, latent_concept_layers=1,
-                       latent_concept_prefix=True,
-                       latent_concept_refine=True).to("cpu")
-    txt, ids = pack(records[:2], vocab, "cpu")
-    logits = model(txt, ids)
-    assert logits.shape[:2] == ids.shape
-    assert torch.isfinite(token_loss(logits, ids, pad=vocab.pad))
-    assert torch.isfinite(semantic_loss(model, txt, records[:2], schema))
-    assert torch.isfinite(fact_concept_loss(model, txt, records[:2], schema))
-    assert torch.isfinite(fact_concept_contrastive_loss(model, txt, records[:2], schema))
-    assert torch.isfinite(fact_concept_batch_centroid_loss(model, txt, records[:2], schema))
-    assert torch.isfinite(fact_concept_prototype_loss(model, txt, records[:2], schema))
-    assert torch.isfinite(fact_concept_prototype_spread_loss(model))
-    assert torch.isfinite(fact_concept_state_spread_loss(model, txt, records[:2], schema))
-    assert torch.isfinite(latent_text_concept_loss(model, txt, view_dropout=0.1))
-    assert torch.isfinite(latent_fact_concept_loss(model, txt, records[:2], schema))
-    rel_model = TextReadingLM(len(vocab), d=32, layers=1, heads=4, pad=vocab.pad,
-                           fact_schema=schema, text_encoder_arch="relational",
-                           text_encoder_layers=1, latent_concept_slots=2).to("cpu")
-    rel_logits = rel_model(txt, ids)
-    assert rel_logits.shape[:2] == ids.shape
-    fit_model(model, vocab, records[:2], steps=1, batch=2, lr=1e-4, seed=3,
-              device="cpu", semantic_w=1.0, decode_w=0.0,
-              fact_concept_w=0.1, latent_concept_w=0.1,
-              latent_concept_fact_w=0.1, prefix="selftest")
-    report = evaluate_all(model, vocab, records, device="cpu", max_new=12,
-                          free_n=-1, paraphrase_n=-1, counterfactual_n=-1)
-    assert set(report) >= {"teacher_forced", "free_decode", "semantic_head",
-                           "fact_concept_head", "latent_fact_concept_head",
-                           "fact_concept_geometry", "by_kind", "gate"}
-    payload = checkpoint_payload(model, vocab, 32, 1, 4, {"experiment": "selftest"})
-    score_a = {"semantic_head": {"fact_value_acc": 0.8},
-               "teacher_forced": {"fact_value_acc": 0.7},
-               "latent_fact_concept_head": {"fact_value_acc": 0.65,
-                                            "n_records": 2}}
-    score_b = {"semantic_head": {"fact_value_acc": 0.6},
-               "teacher_forced": {"fact_value_acc": 0.7},
-               "latent_fact_concept_head": {"fact_value_acc": 0.55,
-                                            "n_records": 2}}
-    assert study_selection_score(score_a, score_b, score_a, retention_w=1.0) < 0.8
-    assert abs(_score_metric(score_a, "both") - 0.75) < 1e-6
-    assert abs(_score_metric(score_a, "min") - 0.7) < 1e-6
-    assert abs(_score_metric(score_a, "latent") - 0.65) < 1e-6
-    assert study_selection_allowed({"score": -0.1}, require_positive=False)[
-        "score_allowed"]
     reading_records = [
         ReadingRecord("read-train-1", "train",
                       tuple(split_words("language concepts connect across repeated views")),
@@ -8109,12 +6307,10 @@ def selftest():
     reading_vocab = build_reading_vocab(reading_records)
     reading_model = TextReadingLM(
         len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
-        fact_schema=None, latent_concept_slots=2,
-        latent_concept_memory_size=8).to("cpu")
+        latent_concept_slots=2, latent_concept_memory_size=8).to("cpu")
     memoryless_reading_model = TextReadingLM(
         len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
-        fact_schema=None, latent_concept_slots=2,
-        latent_concept_memory_size=0).to("cpu")
+        latent_concept_slots=2, latent_concept_memory_size=0).to("cpu")
     assert resolve_reading_study_strategy("auto", reading_model) == "discovery"
     assert (resolve_reading_study_strategy("auto", memoryless_reading_model)
             == "fer")
@@ -8269,14 +6465,23 @@ def selftest():
     assert sequence_bundle["score_components"]["metric"] == "sequence"
     assert sequence_bundle["score_components"]["sequence_skipped"] is False
     assert math.isfinite(sequence_bundle["score_components"]["sequence_score"])
+    span_bundle = reading_eval_bundle(
+        reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
+        score_metric="span")
+    assert span_bundle["score_components"]["metric"] == "span"
+    assert span_bundle["score_components"]["span_skipped"] is False
+    assert math.isfinite(span_bundle["score_components"]["span_score"])
+    assert "span_completion" in span_bundle
     mastery_bundle = reading_eval_bundle(
         reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
         score_metric="mastery")
     assert mastery_bundle["score_components"]["metric"] == "mastery"
     assert ("mastery_score" in mastery_bundle["score_components"]
             and "signal_coverage" in mastery_bundle["score_components"]
+            and "span_score" in mastery_bundle["score_components"]
             and "sequence_score" in mastery_bundle["score_components"]
             and "bridge_score" in mastery_bundle["score_components"])
+    assert mastery_bundle["score_components"]["span_skipped"] is False
     assert mastery_bundle["score_components"]["bridge_skipped"] is False
     assert (mastery_bundle["score_components"]["score"]
             == mastery_bundle["score_components"]["mastery_score"])
@@ -8400,8 +6605,7 @@ def selftest():
     assert no_insight_decision["selected"] is False
     patience_model = TextReadingLM(
         len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
-        fact_schema=None, latent_concept_slots=2,
-        latent_concept_memory_size=8).to("cpu")
+        latent_concept_slots=2, latent_concept_memory_size=8).to("cpu")
     _pm, _pv, patience_selection = fit_reading_concepts_select_best(
         patience_model, reading_vocab, reading_records, steps=2, rounds=2,
         batch=2, lr=1e-4, seed=7, device="cpu", log_every=10,
@@ -8438,7 +6642,6 @@ def selftest():
         reading_model, reading_vocab, 32, 1, 4,
         {"experiment": "reading-selftest",
          "reading_replay_bank": reading_replay_bank})
-    assert reading_payload["fact_schema"] is None
     assert reading_payload["reading_replay_bank"]["record_count"] > 0
     assert reading_replay_bank_records_from_payload(reading_payload)
     assert reading_payload["latent_concept_memory_size"] == 8

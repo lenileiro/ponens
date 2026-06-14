@@ -3471,8 +3471,7 @@ def selftest():
         text_ckpt = os.path.join(tmpdir, "text_reading.pt")
         text_model = TextReadingLM(
             len(vocab), d=32, layers=1, heads=4, pad=vocab.pad,
-            fact_schema=None, latent_concept_slots=3,
-            latent_concept_memory_size=8).to("cpu")
+            latent_concept_slots=3, latent_concept_memory_size=8).to("cpu")
         with torch.no_grad():
             sample_idx = vocab.stoi["sample"]
             text_model.txt.emb.weight[sample_idx].fill_(0.125)
