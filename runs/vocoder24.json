@@ -1,0 +1,9 @@
+{
+ "experiment": "vocoder24",
+ "sr": 24000,
+ "steps": 100000,
+ "gan_dist": 0.07667827066034079,
+ "griffinlim_dist": 0.12411149963736534,
+ "n": 20,
+ "improvement_pct": 38.21823853197901
+}

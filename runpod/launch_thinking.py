@@ -268,6 +268,11 @@ def text_reading_cmd(args, py):
         f"--reading-span-mask-frac {args.reading_span_mask_frac} "
         f"--reading-span-completion-temperature "
         f"{args.reading_span_completion_temperature} "
+        f"--reading-context-closure-w {args.reading_context_closure_w} "
+        f"--reading-context-closure-split-frac "
+        f"{args.reading_context_closure_split_frac} "
+        f"--reading-context-closure-temperature "
+        f"{args.reading_context_closure_temperature} "
         f"--reading-sequence-w {args.reading_sequence_w} "
         f"--reading-sequence-batch {args.reading_sequence_batch} "
         f"--reading-sequence-temperature {args.reading_sequence_temperature} "
@@ -507,6 +512,8 @@ def apply_image_quality_preset(args):
     args.image_dit_attn_impl = "auto"
     args.image_dit_pos_embed = "rope2d"
     args.image_dit_mlp = "swiglu"
+    args.image_dit_register_tokens = max(
+        int(args.image_dit_register_tokens), 1 if hq else 0)
     args.image_flow_time_embed = "fourier"
     args.image_flow_time_embed_dim = max(int(args.image_flow_time_embed_dim), int(args.dim or 0))
     args.image_flow_checkpoint_blocks = True
@@ -523,6 +530,8 @@ def apply_image_quality_preset(args):
     args.image_flow_text_align_w = max(float(args.image_flow_text_align_w), 0.05)
     args.image_feature_align_w = max(float(args.image_feature_align_w), 0.05)
     args.image_flow_feature_align_w = max(float(args.image_flow_feature_align_w), 0.05)
+    if int(args.image_embedding_sequence_max_len) <= 0:
+        args.image_embedding_sequence_max_len = 256 if hq else 128
     args.image_flow_repa_w = max(float(args.image_flow_repa_w), 0.05)
     args.image_flow_repa_structure_w = max(
         float(args.image_flow_repa_structure_w), 0.02 if hq else 0.01)
@@ -626,6 +635,8 @@ def apply_image_quality_preset(args):
         args.image_quality_score_steps = max(int(args.image_quality_score_steps), 1000)
         args.image_preference_w = max(float(args.image_preference_w), 0.5)
         args.image_flow_preference_w = max(float(args.image_flow_preference_w), 0.05)
+        if hq and str(args.image_flow_preference_loss or "margin") == "margin":
+            args.image_flow_preference_loss = "dpo"
         args.image_flow_preference_batch = max(int(args.image_flow_preference_batch), 1)
     args.image_eval_generated = True
     args.image_prompt_embed_backend = args.image_embed_backend
@@ -979,6 +990,7 @@ def payload(args):
                      f"--dit-attn-impl {args.image_dit_attn_impl} "
                      f"--dit-pos-embed {args.image_dit_pos_embed} "
                      f"--dit-mlp {args.image_dit_mlp} "
+                     f"--dit-register-tokens {args.image_dit_register_tokens} "
                      f"--ae-arch {args.image_ae_arch} "
                      f"--ae-hf-model {shlex_quote(args.image_ae_hf_model)} "
                      f"--ae-hf-subfolder {shlex_quote(args.image_ae_hf_subfolder)} "
@@ -998,6 +1010,8 @@ def payload(args):
                      f"--image-feature-align-w {args.image_feature_align_w} "
                      f"--flow-feature-align-w {args.image_flow_feature_align_w} "
                      f"--image-feature-embed-dim {args.image_feature_embed_dim} "
+                     f"--image-embedding-sequence-max-len "
+                     f"{args.image_embedding_sequence_max_len} "
                      f"--flow-repa-w {args.image_flow_repa_w} "
                      f"--flow-repa-steps {args.image_flow_repa_steps} "
                      f"--flow-repa-embed-dim {args.image_flow_repa_embed_dim} "
@@ -1042,6 +1056,8 @@ def payload(args):
                      f"{args.image_preference_max_pairs} "
                      f"--image-preference-w {args.image_preference_w} "
                      f"--flow-preference-w {args.image_flow_preference_w} "
+                     f"--flow-preference-loss {args.image_flow_preference_loss} "
+                     f"--flow-preference-beta {args.image_flow_preference_beta} "
                      f"--flow-preference-margin {args.image_flow_preference_margin} "
                      f"--flow-preference-batch {args.image_flow_preference_batch} "
                      f"--caption-vocab-max {args.image_caption_vocab_max} "
@@ -1508,6 +1524,16 @@ def payload(args):
                 f"{args.multimodal_latent_concept_graph_predict_target_power} "
                 f"--latent-concept-bridge-w "
                 f"{args.multimodal_latent_concept_bridge_w} "
+                f"--latent-concept-completion-w "
+                f"{args.multimodal_latent_concept_completion_w} "
+                f"--latent-concept-completion-temperature "
+                f"{args.multimodal_latent_concept_completion_temperature} "
+                f"--latent-concept-completion-probe-n "
+                f"{args.multimodal_latent_concept_completion_probe_n} "
+                f"--latent-concept-completion-hard-max "
+                f"{args.multimodal_latent_concept_completion_hard_max} "
+                f"--latent-concept-completion-refresh-steps "
+                f"{args.multimodal_latent_concept_completion_refresh_steps} "
                 f"--latent-concept-sequence-w "
                 f"{args.multimodal_latent_concept_sequence_w} "
                 f"--latent-concept-sequence-batch "
@@ -1672,6 +1698,12 @@ def main():
                     dest="reading_span_mask_frac")
     ap.add_argument("--reading-span-completion-temperature", type=float,
                     default=0.1, dest="reading_span_completion_temperature")
+    ap.add_argument("--reading-context-closure-w", type=float, default=0.05,
+                    dest="reading_context_closure_w")
+    ap.add_argument("--reading-context-closure-split-frac", type=float,
+                    default=0.5, dest="reading_context_closure_split_frac")
+    ap.add_argument("--reading-context-closure-temperature", type=float,
+                    default=0.1, dest="reading_context_closure_temperature")
     ap.add_argument("--reading-sequence-w", type=float, default=0.05,
                     dest="reading_sequence_w")
     ap.add_argument("--reading-sequence-batch", type=int, default=0,
@@ -1838,7 +1870,8 @@ def main():
                     dest="reading_cluster_min_size")
     ap.add_argument("--reading-study-strategy", default="auto",
                     choices=("random", "errors", "fer", "curiosity", "sequence",
-                             "graph", "cycle", "gap", "discovery", "auto"),
+                             "closure", "graph", "cycle", "gap", "discovery",
+                             "auto"),
                     dest="reading_study_strategy")
     ap.add_argument("--reading-study-probe-n", type=int, default=0,
                     dest="reading_study_probe_n")
@@ -1852,9 +1885,9 @@ def main():
     ap.add_argument("--reading-study-rounds", type=int, default=1,
                     dest="reading_study_rounds")
     ap.add_argument("--reading-study-score-metric", default="mastery",
-                    choices=("view", "context", "sequence", "neighborhood",
-                             "cluster", "fer", "bridge", "both", "min", "all",
-                             "balanced", "mastery"),
+                    choices=("view", "context", "span", "closure", "sequence",
+                             "neighborhood", "cluster", "fer", "bridge", "both",
+                             "min", "all", "balanced", "mastery"),
                     dest="reading_study_score_metric")
     ap.add_argument("--reading-study-score-margin-w", type=float, default=0.1,
                     dest="reading_study_score_margin_w")
@@ -2277,6 +2310,10 @@ def main():
     ap.add_argument("--image-dit-mlp", default="gelu",
                     choices=("gelu", "swiglu"), dest="image_dit_mlp",
                     help="latent image CrossDiT/MM-DiT feed-forward block")
+    ap.add_argument("--image-dit-register-tokens", type=int, default=0,
+                    dest="image_dit_register_tokens",
+                    help=("learned global image-stream register tokens for latent "
+                          "image DiT/CrossDiT/MM-DiT"))
     ap.add_argument("--image-flow-time-embed", default="scalar",
                     choices=("scalar", "fourier"), dest="image_flow_time_embed",
                     help=("latent image DiT/MM-DiT timestep embedding; scalar keeps "
@@ -2349,6 +2386,10 @@ def main():
     ap.add_argument("--image-feature-embed-dim", type=int, default=128,
                     dest="image_feature_embed_dim",
                     help="shared embedding width for latent/image-feature alignment")
+    ap.add_argument("--image-embedding-sequence-max-len", type=int, default=0,
+                    dest="image_embedding_sequence_max_len",
+                    help=("cap image_embedding_sequence token rows before image REPA "
+                          "cache/training; 0 keeps full sidecar sequences"))
     ap.add_argument("--image-flow-repa-w", type=float, default=0.0,
                     dest="image_flow_repa_w",
                     help="REPA-style hidden-state/image-feature alignment weight")
@@ -2477,6 +2518,13 @@ def main():
                     dest="image_flow_preference_w",
                     help=("direct chosen/rejected preference loss weight on the image "
                           "latent-flow generator"))
+    ap.add_argument("--image-flow-preference-loss", default="margin",
+                    choices=("margin", "dpo"), dest="image_flow_preference_loss",
+                    help=("direct image flow preference objective; dpo compares the "
+                          "policy pair gap against a frozen reference flow"))
+    ap.add_argument("--image-flow-preference-beta", type=float, default=1.0,
+                    dest="image_flow_preference_beta",
+                    help="inverse-temperature for --image-flow-preference-loss dpo")
     ap.add_argument("--image-flow-preference-margin", type=float, default=0.0,
                     dest="image_flow_preference_margin",
                     help="minimum velocity-loss gap for image direct flow preference pairs")
@@ -3125,6 +3173,18 @@ def main():
                     dest="multimodal_latent_concept_graph_predict_target_power")
     ap.add_argument("--multimodal-latent-concept-bridge-w", type=float, default=0.0,
                     dest="multimodal_latent_concept_bridge_w")
+    ap.add_argument("--multimodal-latent-concept-completion-w", type=float,
+                    default=0.0, dest="multimodal_latent_concept_completion_w")
+    ap.add_argument("--multimodal-latent-concept-completion-temperature",
+                    type=float, default=0.1,
+                    dest="multimodal_latent_concept_completion_temperature")
+    ap.add_argument("--multimodal-latent-concept-completion-probe-n", type=int,
+                    default=0, dest="multimodal_latent_concept_completion_probe_n")
+    ap.add_argument("--multimodal-latent-concept-completion-hard-max", type=int,
+                    default=0, dest="multimodal_latent_concept_completion_hard_max")
+    ap.add_argument("--multimodal-latent-concept-completion-refresh-steps",
+                    type=int, default=0,
+                    dest="multimodal_latent_concept_completion_refresh_steps")
     ap.add_argument("--multimodal-latent-concept-sequence-w", type=float, default=0.0,
                     dest="multimodal_latent_concept_sequence_w")
     ap.add_argument("--multimodal-latent-concept-sequence-batch", type=int,
@@ -3258,6 +3318,7 @@ def main():
             "--reading-replay-retention-w": args.reading_replay_retention_w,
             "--reading-context-target-w": args.reading_context_target_w,
             "--reading-span-completion-w": args.reading_span_completion_w,
+            "--reading-context-closure-w": args.reading_context_closure_w,
             "--reading-sequence-w": args.reading_sequence_w,
             "--reading-sequence-batch": args.reading_sequence_batch,
             "--reading-factorization-w": args.reading_factorization_w,
@@ -3356,12 +3417,17 @@ def main():
             "--reading-token-replace": args.reading_token_replace,
             "--reading-context-keep-p": args.reading_context_keep_p,
             "--reading-span-mask-frac": args.reading_span_mask_frac,
+            "--reading-context-closure-split-frac": (
+                args.reading_context_closure_split_frac),
         }
         for name, value in bounded_text.items():
             if value < 0.0 or value > 1.0:
                 sys.exit(f"ERROR: {name} must be in [0, 1]")
         if args.reading_span_mask_frac <= 0.0 or args.reading_span_mask_frac >= 1.0:
             sys.exit("ERROR: --reading-span-mask-frac must be in (0, 1)")
+        if (args.reading_context_closure_split_frac <= 0.0
+                or args.reading_context_closure_split_frac >= 1.0):
+            sys.exit("ERROR: --reading-context-closure-split-frac must be in (0, 1)")
         if args.reading_feature_dropout < 0.0 or args.reading_feature_dropout >= 1.0:
             sys.exit("ERROR: --reading-feature-dropout must be in [0, 1)")
         text_temperatures = {
@@ -3369,6 +3435,8 @@ def main():
                 args.reading_context_target_temperature),
             "--reading-span-completion-temperature": (
                 args.reading_span_completion_temperature),
+            "--reading-context-closure-temperature": (
+                args.reading_context_closure_temperature),
             "--reading-sequence-temperature": args.reading_sequence_temperature,
             "--reading-memory-temperature": args.reading_memory_temperature,
             "--reading-consolidation-temperature": (
@@ -3808,6 +3876,8 @@ def main():
         sys.exit("ERROR: --image-sample-quality-guidance-w must be non-negative")
     if args.image_sample_quality_guidance_w > 0.0 and not args.image_sample_prompts:
         sys.exit("ERROR: --image-sample-quality-guidance-w requires --image-sample-prompts")
+    if args.image_embedding_sequence_max_len < 0:
+        sys.exit("ERROR: --image-embedding-sequence-max-len must be non-negative")
     if args.image_quality_score_w < 0.0 or args.image_flow_quality_score_w < 0.0:
         sys.exit("ERROR: image quality score weights must be non-negative")
     if args.image_quality_score_steps < 0:
@@ -3829,6 +3899,8 @@ def main():
         sys.exit("ERROR: --image-preference-w requires --image-quality-score-steps > 0")
     if args.image_flow_preference_w < 0.0:
         sys.exit("ERROR: --image-flow-preference-w must be non-negative")
+    if args.image_flow_preference_beta <= 0.0:
+        sys.exit("ERROR: --image-flow-preference-beta must be positive")
     if args.image_flow_preference_margin < 0.0:
         sys.exit("ERROR: --image-flow-preference-margin must be non-negative")
     if args.image_flow_preference_batch < 0:
@@ -3859,6 +3931,10 @@ def main():
         sys.exit("ERROR: --image-dit-depth must be positive")
     if args.image_dit_heads <= 0:
         sys.exit("ERROR: --image-dit-heads must be positive")
+    if args.image_dit_register_tokens < 0:
+        sys.exit("ERROR: --image-dit-register-tokens must be non-negative")
+    if args.image_dit_register_tokens > 0 and args.image_latent_arch == "conv":
+        sys.exit("ERROR: --image-dit-register-tokens requires --image-latent-arch dit/crossdit/mmdit")
     if args.image_flow_time_embed_dim < 0:
         sys.exit("ERROR: --image-flow-time-embed-dim must be non-negative")
     if args.image_flow_self_condition and args.image_latent_arch == "conv":
@@ -4046,6 +4122,14 @@ def main():
                 args.multimodal_latent_concept_graph_predict_transitive_w),
             "--multimodal-latent-concept-bridge-w": (
                 args.multimodal_latent_concept_bridge_w),
+            "--multimodal-latent-concept-completion-w": (
+                args.multimodal_latent_concept_completion_w),
+            "--multimodal-latent-concept-completion-probe-n": (
+                args.multimodal_latent_concept_completion_probe_n),
+            "--multimodal-latent-concept-completion-hard-max": (
+                args.multimodal_latent_concept_completion_hard_max),
+            "--multimodal-latent-concept-completion-refresh-steps": (
+                args.multimodal_latent_concept_completion_refresh_steps),
             "--multimodal-latent-concept-sequence-w": (
                 args.multimodal_latent_concept_sequence_w),
             "--multimodal-latent-concept-sequence-batch": (
@@ -4096,6 +4180,7 @@ def main():
             args.multimodal_latent_concept_composition_w,
             args.multimodal_latent_concept_graph_predict_w,
             args.multimodal_latent_concept_bridge_w,
+            args.multimodal_latent_concept_completion_w,
             args.multimodal_latent_concept_sequence_w,
             args.multimodal_latent_concept_neighborhood_w,
             args.multimodal_latent_concept_transition_w,
@@ -4104,7 +4189,8 @@ def main():
         if ((any(w > 0.0 for w in multimodal_latent_weights)
              or args.multimodal_latent_concept_memory_size > 0
              or args.multimodal_latent_concept_fer_hard_max > 0
-             or args.multimodal_latent_concept_discovery_hard_max > 0)
+             or args.multimodal_latent_concept_discovery_hard_max > 0
+             or args.multimodal_latent_concept_completion_hard_max > 0)
                 and args.multimodal_latent_concept_slots <= 0):
             sys.exit(
                 "ERROR: multimodal latent concept options require "
@@ -4136,6 +4222,8 @@ def main():
                 args.multimodal_latent_concept_composition_temperature),
             "--multimodal-latent-concept-graph-predict-temperature": (
                 args.multimodal_latent_concept_graph_predict_temperature),
+            "--multimodal-latent-concept-completion-temperature": (
+                args.multimodal_latent_concept_completion_temperature),
             "--multimodal-latent-concept-sequence-temperature": (
                 args.multimodal_latent_concept_sequence_temperature),
             "--multimodal-latent-concept-neighborhood-temperature": (

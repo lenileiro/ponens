@@ -33,3 +33,5 @@ runpod/launch_learn.py
 runpod/launch_solver.py
 runpod/launch_v6.py
 data/speech24k/
+data/ljspeech/
+data/gsc_spk/

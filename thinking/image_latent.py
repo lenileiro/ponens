@@ -31,6 +31,7 @@ import os
 import tempfile
 from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -59,6 +60,7 @@ FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
 FLOW_NOISE_COUPLINGS = ("random", "sliced_ot")
 FLOW_REPA_MODES = ("pooled", "token", "both", "auto")
 FLOW_BOUNDARY_MODES = ("none", "right-linear", "double-linear", "double-cosine")
+FLOW_PREFERENCE_LOSSES = ("margin", "dpo")
 TIME_SAMPLINGS = ("uniform", "logit-normal", "mode", "adaptive")
 TIME_ADAPTIVE_PRIORS = ("uniform", "logit-normal", "mode")
 DEFAULT_TIME_MODE_SCALE = 1.29
@@ -1233,12 +1235,21 @@ def latent_flow_preference_pair_loss(flow, z_chosen, z_rejected, cond, score_gap
                                      flow_loss_weight_gamma=5.0,
                                      flow_loss_weight_normalize=True,
                                      margin=0.0, prefix="flow_preference",
-                                     adaptive_sampler=None):
+                                     adaptive_sampler=None, loss_mode="margin",
+                                     reference_flow=None, beta=1.0):
     """Direct pairwise preference loss on the generator's rectified-flow objective."""
     if z_chosen.shape != z_rejected.shape:
         raise ValueError(
             f"preference latent shapes differ: {tuple(z_chosen.shape)} vs "
             f"{tuple(z_rejected.shape)}")
+    loss_mode = str(loss_mode or "margin")
+    if loss_mode not in FLOW_PREFERENCE_LOSSES:
+        raise ValueError(f"unknown flow preference loss {loss_mode!r}")
+    beta = float(beta)
+    if beta <= 0.0:
+        raise ValueError("flow preference beta must be positive")
+    if loss_mode == "dpo" and reference_flow is None:
+        raise ValueError("flow preference DPO loss requires a reference flow")
     latent_stats = flow_latent_stats(flow) if latent_stats is None else latent_stats
     zc = normalize_latent(z_chosen, latent_stats)
     zr = normalize_latent(z_rejected, latent_stats)
@@ -1267,17 +1278,36 @@ def latent_flow_preference_pair_loss(flow, z_chosen, z_rejected, cond, score_gap
         gap_weight = torch.ones_like(loss_c)
     else:
         gap_weight = torch.log1p(score_gaps.to(device=loss_c.device).float()).clamp(0.1, 5.0)
-    logits = (loss_r - loss_c - float(margin)) * gap_weight
+    policy_gap = loss_r - loss_c
+    ref_gap = torch.zeros_like(policy_gap)
+    if loss_mode == "dpo":
+        with torch.no_grad():
+            ref_pred_c = flow_velocity(reference_flow, ztc, t, cond_model)
+            ref_pred_r = flow_velocity(reference_flow, ztr, t, cond_model)
+            ref_loss_c = (ref_pred_c - target_c).float().pow(2).flatten(1).mean(dim=1)
+            ref_loss_r = (ref_pred_r - target_r).float().pow(2).flatten(1).mean(dim=1)
+            if flow_loss_weight != "none":
+                ref_loss_c = ref_loss_c * weights
+                ref_loss_r = ref_loss_r * weights
+            ref_gap = ref_loss_r - ref_loss_c
+        logits = float(beta) * (policy_gap - ref_gap - float(margin)) * gap_weight
+    else:
+        logits = (policy_gap - float(margin)) * gap_weight
     loss = F.softplus(-logits).mean()
     return loss, {
         f"{prefix}_loss": loss.detach(),
         f"{prefix}_chosen_velocity_mse": loss_c.mean().detach(),
         f"{prefix}_rejected_velocity_mse": loss_r.mean().detach(),
-        f"{prefix}_loss_gap": (loss_r - loss_c).mean().detach(),
+        f"{prefix}_loss_gap": policy_gap.mean().detach(),
+        f"{prefix}_ref_loss_gap": ref_gap.mean().detach(),
+        f"{prefix}_policy_ref_gap": (policy_gap - ref_gap).mean().detach(),
         f"{prefix}_acc": loss_c.lt(loss_r).float().mean().detach(),
         f"{prefix}_time_stratified": torch.tensor(
             float(bool(time_stratified)), device=zc.device),
         f"{prefix}_margin": torch.tensor(float(margin), device=loss_c.device),
+        f"{prefix}_beta": torch.tensor(float(beta), device=loss_c.device),
+        f"{prefix}_loss_mode_id": torch.tensor(
+            float(FLOW_PREFERENCE_LOSSES.index(loss_mode)), device=loss_c.device),
         f"{prefix}_gap_weight_mean": gap_weight.mean().detach(),
         f"{prefix}_pairs": torch.tensor(float(loss_c.numel()), device=loss_c.device),
     }
@@ -2002,6 +2032,45 @@ def apply_rotary_factors(x, cos, sin):
     return out
 
 
+def make_dit_register_tokens(count, hidden):
+    count = int(count)
+    if count < 0:
+        raise ValueError("dit_register_tokens must be non-negative")
+    if count == 0:
+        return None
+    tokens = nn.Parameter(torch.empty(1, count, int(hidden)))
+    nn.init.normal_(tokens, std=0.02)
+    return tokens
+
+
+def expand_dit_register_tokens(tokens, batch, device, dtype, ctx=None):
+    if tokens is None:
+        return None
+    out = tokens.to(device=device, dtype=dtype).expand(int(batch), -1, -1)
+    if ctx is not None:
+        out = out + ctx.to(device=device, dtype=dtype)
+    return out
+
+
+def apply_image_rope_with_registers(q, k, image_rope):
+    if image_rope is None:
+        return q, k
+    rope_cos, rope_sin = image_rope
+    rope_n = int(rope_cos.shape[-2])
+    if rope_n <= 0:
+        return q, k
+    if rope_n > int(q.shape[2]) or rope_n > int(k.shape[2]):
+        raise ValueError("image RoPE token count exceeds attention image stream length")
+    q_img = apply_rotary_factors(q[:, :, :rope_n], rope_cos, rope_sin)
+    k_img = apply_rotary_factors(k[:, :, :rope_n], rope_cos, rope_sin)
+    if rope_n == int(q.shape[2]):
+        return q_img, k_img
+    return (
+        torch.cat([q_img, q[:, :, rope_n:]], dim=2),
+        torch.cat([k_img, k[:, :, rope_n:]], dim=2),
+    )
+
+
 class AdaDiTBlock(nn.Module):
     """Self-attention DiT block with adaLN-Zero residual gating."""
 
@@ -2048,7 +2117,7 @@ class LatentDiTFlowNet(nn.Module):
                  max_tokens=256, head_width_mult=1, pos_embed="learned",
                  checkpoint_blocks=False, latent_patch_size=1,
                  time_embed="scalar", time_embed_dim=1, mlp="gelu",
-                 self_condition=False):
+                 self_condition=False, register_tokens=0):
         super().__init__()
         latent_patch_size = int(latent_patch_size)
         if latent_patch_size <= 0:
@@ -2076,6 +2145,7 @@ class LatentDiTFlowNet(nn.Module):
         self.head_width_mult = int(head_width_mult)
         self.dit_pos_embed = pos_embed
         self.dit_mlp = mlp
+        self.dit_register_tokens = int(register_tokens)
         self.flow_time_embed = time_embed
         self.flow_time_embed_dim = int(time_embed_dim if time_embed != "scalar" else 1)
         self.uses_adaptive_modulation = True
@@ -2091,6 +2161,8 @@ class LatentDiTFlowNet(nn.Module):
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
             if pos_embed == "learned" else None
         )
+        self.register_tokens = make_dit_register_tokens(
+            self.dit_register_tokens, hidden)
         self.cond = nn.Sequential(
             nn.Linear(cond_dim + self.flow_time_embed_dim, hidden),
             nn.GELU(),
@@ -2129,18 +2201,27 @@ class LatentDiTFlowNet(nn.Module):
         ctx = self.cond(torch.cat([cond, t_feat], dim=1))[:, None, :]
         x = self.in_proj(toks)
         x = x + self.image_pos(th, tw, x.device, x.dtype) + ctx
+        regs = expand_dit_register_tokens(
+            self.register_tokens, b, x.device, x.dtype, ctx=ctx)
+        if regs is not None:
+            x = torch.cat([x, regs], dim=1)
         cond_ctx = ctx[:, 0, :]
         for block in self.blocks:
             if should_checkpoint_blocks(self):
                 x = activation_checkpoint(block, x, cond_ctx)
             else:
                 x = block(x, cond_ctx)
-        features = self.norm(x)
+        all_features = self.norm(x)
+        features = all_features[:, :n]
+        register_features = all_features[:, n:] if regs is not None else None
         v = self.out_proj(features)
         velocity = unpatchify_latents(
             v, c, h, w, patch_size=self.latent_patch_size)
         if return_features:
-            return velocity, {"image_tokens": features}
+            out = {"image_tokens": features}
+            if register_features is not None:
+                out["register_tokens"] = register_features
+            return velocity, out
         return velocity
 
 
@@ -2196,7 +2277,8 @@ class LatentCrossDiTFlowNet(nn.Module):
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256, head_width_mult=1, pos_embed="learned",
                  checkpoint_blocks=False, mlp="gelu", latent_patch_size=1,
-                 time_embed="scalar", time_embed_dim=1, self_condition=False):
+                 time_embed="scalar", time_embed_dim=1, self_condition=False,
+                 register_tokens=0):
         super().__init__()
         latent_patch_size = int(latent_patch_size)
         if latent_patch_size <= 0:
@@ -2224,6 +2306,7 @@ class LatentCrossDiTFlowNet(nn.Module):
         self.head_width_mult = int(head_width_mult)
         self.dit_pos_embed = pos_embed
         self.dit_mlp = mlp
+        self.dit_register_tokens = int(register_tokens)
         self.flow_time_embed = time_embed
         self.flow_time_embed_dim = int(time_embed_dim if time_embed != "scalar" else 1)
         self.uses_zero_residual_gating = True
@@ -2237,6 +2320,8 @@ class LatentCrossDiTFlowNet(nn.Module):
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
             if pos_embed == "learned" else None
         )
+        self.register_tokens = make_dit_register_tokens(
+            self.dit_register_tokens, hidden)
         self.cond = nn.Sequential(
             nn.Linear(cond_dim + self.flow_time_embed_dim, hidden),
             nn.GELU(),
@@ -2286,6 +2371,10 @@ class LatentCrossDiTFlowNet(nn.Module):
         ctx, ctx_mask = self._context(cond)
         x = self.in_proj(toks)
         x = x + self.image_pos(th, tw, x.device, x.dtype) + global_ctx
+        regs = expand_dit_register_tokens(
+            self.register_tokens, b, x.device, x.dtype, ctx=global_ctx)
+        if regs is not None:
+            x = torch.cat([x, regs], dim=1)
         cond_ctx = global_ctx[:, 0, :]
         for block in self.blocks:
             if should_checkpoint_blocks(self):
@@ -2294,12 +2383,17 @@ class LatentCrossDiTFlowNet(nn.Module):
                 x = activation_checkpoint(block_forward, x, ctx, cond_ctx)
             else:
                 x = block(x, ctx, cond_ctx, ctx_mask=ctx_mask)
-        features = self.norm(x)
+        all_features = self.norm(x)
+        features = all_features[:, :n]
+        register_features = all_features[:, n:] if regs is not None else None
         v = self.out_proj(features)
         velocity = unpatchify_latents(
             v, c, h, w, patch_size=self.latent_patch_size)
         if return_features:
-            return velocity, {"image_tokens": features}
+            out = {"image_tokens": features}
+            if register_features is not None:
+                out["register_tokens"] = register_features
+            return velocity, out
         return velocity
 
 
@@ -2439,10 +2533,7 @@ class MMDiTBlock(nn.Module):
         qc, kc, vc = self._qkv(self.ctx_qkv, ctx_attn)
         qi, ki = self.img_q_norm(qi), self.img_k_norm(ki)
         qc, kc = self.ctx_q_norm(qc), self.ctx_k_norm(kc)
-        if image_rope is not None:
-            rope_cos, rope_sin = image_rope
-            qi = apply_rotary_factors(qi, rope_cos, rope_sin)
-            ki = apply_rotary_factors(ki, rope_cos, rope_sin)
+        qi, ki = apply_image_rope_with_registers(qi, ki, image_rope)
         q = torch.cat([qi, qc], dim=2)
         k = torch.cat([ki, kc], dim=2)
         v = torch.cat([vi, vc], dim=2)
@@ -2472,7 +2563,8 @@ class LatentMMDiTFlowNet(nn.Module):
                  max_tokens=256, head_width_mult=1, qk_norm=False,
                  attn_impl="manual", pos_embed="learned", checkpoint_blocks=False,
                  mlp="gelu", latent_patch_size=1,
-                 time_embed="scalar", time_embed_dim=1, self_condition=False):
+                 time_embed="scalar", time_embed_dim=1, self_condition=False,
+                 register_tokens=0):
         super().__init__()
         latent_patch_size = int(latent_patch_size)
         if latent_patch_size <= 0:
@@ -2505,6 +2597,7 @@ class LatentMMDiTFlowNet(nn.Module):
         self.heads = int(heads)
         self.head_dim = self.hidden // self.heads
         self.dit_pos_embed = pos_embed
+        self.dit_register_tokens = int(register_tokens)
         self.flow_time_embed = time_embed
         self.flow_time_embed_dim = int(time_embed_dim if time_embed != "scalar" else 1)
         self.uses_zero_residual_gating = True
@@ -2518,6 +2611,8 @@ class LatentMMDiTFlowNet(nn.Module):
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
             if pos_embed == "learned" else None
         )
+        self.register_tokens = make_dit_register_tokens(
+            self.dit_register_tokens, hidden)
         self.time = nn.Sequential(nn.Linear(cond_dim + self.flow_time_embed_dim, hidden),
                                   nn.GELU(),
                                   nn.Linear(hidden, hidden))
@@ -2578,6 +2673,10 @@ class LatentMMDiTFlowNet(nn.Module):
         if image_pos is not None:
             img = img + image_pos
         img = img + cond_ctx[:, None, :]
+        regs = expand_dit_register_tokens(
+            self.register_tokens, b, img.device, img.dtype, ctx=cond_ctx[:, None, :])
+        if regs is not None:
+            img = torch.cat([img, regs], dim=1)
         ctx, ctx_mask = self._context(cond)
         image_rope = self.image_rope(th, tw, img.device, img.dtype)
         for block in self.blocks:
@@ -2590,12 +2689,17 @@ class LatentMMDiTFlowNet(nn.Module):
             else:
                 img, ctx = block(img, ctx, cond_ctx, ctx_mask=ctx_mask,
                                  image_rope=image_rope)
-        features = self.norm(img)
+        all_features = self.norm(img)
+        features = all_features[:, :n]
+        register_features = all_features[:, n:] if regs is not None else None
         v = self.out_proj(features)
         velocity = unpatchify_latents(
             v, c, h, w, patch_size=self.latent_patch_size)
         if return_features:
-            return velocity, {"image_tokens": features}
+            out = {"image_tokens": features}
+            if register_features is not None:
+                out["register_tokens"] = register_features
+            return velocity, out
         return velocity
 
 
@@ -2604,11 +2708,16 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
               dit_qk_norm=False, dit_attn_impl="auto", dit_pos_embed="learned",
               dit_mlp="gelu", latent_patch_size=1, flow_checkpoint_blocks=False,
               flow_time_embed="scalar", flow_time_embed_dim=0,
-              flow_self_condition=False):
+              flow_self_condition=False, dit_register_tokens=0):
     latent_patch_size = int(latent_patch_size)
     if latent_patch_size <= 0:
         raise ValueError("latent_patch_size must be positive")
+    dit_register_tokens = int(dit_register_tokens or 0)
+    if dit_register_tokens < 0:
+        raise ValueError("dit_register_tokens must be non-negative")
     if flow_arch == "conv":
+        if dit_register_tokens:
+            raise ValueError("dit_register_tokens requires DiT/CrossDiT/MM-DiT flow")
         if latent_patch_size != 1:
             raise ValueError("latent_patch_size is only supported by DiT/CrossDiT/MM-DiT flows")
         if flow_self_condition:
@@ -2649,7 +2758,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                 time_embed=flow_time_embed,
                                 time_embed_dim=flow_time_embed_dim,
                                 mlp=dit_mlp,
-                                self_condition=flow_self_condition)
+                                self_condition=flow_self_condition,
+                                register_tokens=dit_register_tokens)
     if flow_arch == "crossdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
@@ -2664,7 +2774,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                      latent_patch_size=latent_patch_size,
                                      time_embed=flow_time_embed,
                                      time_embed_dim=flow_time_embed_dim,
-                                     self_condition=flow_self_condition)
+                                     self_condition=flow_self_condition,
+                                     register_tokens=dit_register_tokens)
     if flow_arch == "mmdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
@@ -2681,7 +2792,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                   checkpoint_blocks=flow_checkpoint_blocks,
                                   time_embed=flow_time_embed,
                                   time_embed_dim=flow_time_embed_dim,
-                                  self_condition=flow_self_condition)
+                                  self_condition=flow_self_condition,
+                                  register_tokens=dit_register_tokens)
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
@@ -3541,6 +3653,7 @@ def autoencoder_cache_identity(ae):
 def image_latent_cache_fingerprint(ae, rows, size=32, caption_max_len=64,
                                    cond_source="tokens", include_image_embeddings=False,
                                    include_image_embedding_sequences=False,
+                                   image_embedding_sequence_max_len=0,
                                    include_image_geometry=False,
                                    include_quality_targets=False, quality_stats=None,
                                    crop_mode="center", hflip_prob=0.0, seed=0,
@@ -3581,6 +3694,7 @@ def image_latent_cache_fingerprint(ae, rows, size=32, caption_max_len=64,
         "cond_source": str(cond_source),
         "include_image_embeddings": bool(include_image_embeddings),
         "include_image_embedding_sequences": bool(include_image_embedding_sequences),
+        "image_embedding_sequence_max_len": int(image_embedding_sequence_max_len),
         "include_image_geometry": bool(include_image_geometry),
         "image_geometry_feature_dim": int(GEOMETRY_FEATURE_DIM),
         "include_quality_targets": bool(include_quality_targets),
@@ -3656,6 +3770,8 @@ def load_disk_image_latent_cache(cache_dir, expected_fingerprint=None):
             "has_image_embeddings": bool(meta.get("has_image_embeddings", False)),
             "has_image_embedding_sequences": bool(meta.get(
                 "has_image_embedding_sequences", False)),
+            "image_embedding_sequence_max_len": int(
+                meta.get("image_embedding_sequence_max_len", 0) or 0),
             "has_image_geometry": bool(meta.get("has_image_geometry", False)),
             "has_quality_targets": bool(meta.get("has_quality_targets", False)),
             "latent_dtype": str(meta.get("latent_dtype", "")),
@@ -3696,6 +3812,8 @@ def load_disk_image_latent_cache(cache_dir, expected_fingerprint=None):
         "has_image_embeddings": bool(meta.get("has_image_embeddings", False)),
         "has_image_embedding_sequences": bool(meta.get(
             "has_image_embedding_sequences", False)),
+        "image_embedding_sequence_max_len": int(
+            meta.get("image_embedding_sequence_max_len", 0) or 0),
         "has_image_geometry": bool(meta.get("has_image_geometry", False)),
         "has_quality_targets": bool(meta.get("has_quality_targets", False)),
         "latent_dtype": str(meta.get("latent_dtype", "")),
@@ -3717,6 +3835,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                              cond_source="tokens", cache_dir="", shard_size=1024,
                              include_image_embeddings=False, crop_mode="center",
                              include_image_embedding_sequences=False,
+                             image_embedding_sequence_token_cap=0,
                              include_image_geometry=False,
                              include_quality_targets=False, quality_stats=None,
                              hflip_prob=0.0, size_buckets=(), bucket_records=None,
@@ -3726,6 +3845,9 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         raise ValueError("cannot build latent cache from empty records")
     cache_dtype = str(cache_dtype)
     latent_cache_torch_dtype(cache_dtype)
+    image_embedding_sequence_token_cap = int(image_embedding_sequence_token_cap or 0)
+    if image_embedding_sequence_token_cap < 0:
+        raise ValueError("image_embedding_sequence_token_cap must be non-negative")
     rng = np.random.default_rng(seed)
     if max_records and int(max_records) < len(rows):
         probs = normalized_sampling_weights(weights_for_records(rows, record_weights), len(rows))
@@ -3736,6 +3858,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         ae, rows, size=size, caption_max_len=caption_max_len,
         cond_source=cond_source, include_image_embeddings=include_image_embeddings,
         include_image_embedding_sequences=include_image_embedding_sequences,
+        image_embedding_sequence_max_len=image_embedding_sequence_token_cap,
         include_image_geometry=include_image_geometry,
         include_quality_targets=include_quality_targets,
         quality_stats=quality_stats,
@@ -3766,6 +3889,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                 cache_dir=bucket_dir, shard_size=shard_size,
                 include_image_embeddings=include_image_embeddings,
                 include_image_embedding_sequences=include_image_embedding_sequences,
+                image_embedding_sequence_token_cap=image_embedding_sequence_token_cap,
                 include_image_geometry=include_image_geometry,
                 include_quality_targets=include_quality_targets,
                 quality_stats=quality_stats,
@@ -3805,6 +3929,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             "cond_source": cond_source,
             "has_image_embeddings": bool(include_image_embeddings),
             "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+            "image_embedding_sequence_max_len": int(image_embedding_sequence_token_cap),
             "has_image_geometry": bool(include_image_geometry),
             "has_quality_targets": bool(include_quality_targets),
             "latent_dtype": cache_dtype,
@@ -3838,6 +3963,8 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                     "has_image_embeddings": bool(include_image_embeddings),
                     "has_image_embedding_sequences": bool(
                         include_image_embedding_sequences),
+                    "image_embedding_sequence_max_len": int(
+                        image_embedding_sequence_token_cap),
                     "has_image_geometry": bool(include_image_geometry),
                     "has_quality_targets": bool(include_quality_targets),
                     "latent_dtype": cache_dtype,
@@ -3863,6 +3990,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             cond_source=cond_source, cache_dir=cache_dir, shard_size=shard_size,
             include_image_embeddings=include_image_embeddings,
             include_image_embedding_sequences=include_image_embedding_sequences,
+            image_embedding_sequence_token_cap=image_embedding_sequence_token_cap,
             include_image_geometry=include_image_geometry,
             include_quality_targets=include_quality_targets,
             quality_stats=cache_quality_stats,
@@ -3872,7 +4000,8 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
     latents, captions, embeddings, pooled_embeddings, pooled_masks = [], [], [], [], []
     image_embeddings, image_embedding_sequences, image_geometry_features = [], [], []
     quality_targets, quality_masks = [], []
-    sequence_max_len = image_embedding_sequence_max_len(rows)
+    sequence_max_len = image_embedding_sequence_max_len(
+        rows, cap=image_embedding_sequence_token_cap)
     weights = weights_for_records(rows, record_weights)
     ae.eval()
     crop_rng = np.random.default_rng(seed + 17)
@@ -3905,7 +4034,8 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             image_embeddings.append(record_image_embedding_tensor(chunk, device="cpu"))
         if include_image_embedding_sequences:
             image_embedding_sequences.append(record_image_embedding_sequence_tensor(
-                chunk, device="cpu", max_len=sequence_max_len))
+                chunk, device="cpu", max_len=sequence_max_len,
+                token_cap=image_embedding_sequence_token_cap))
         if include_image_geometry:
             image_geometry_features.append(image_geometry_feature_tensor(
                 chunk, target_size=size, device="cpu",
@@ -3951,6 +4081,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         "cond_source": cond_source,
         "has_image_embeddings": bool(image_embeddings),
         "has_image_embedding_sequences": bool(image_embedding_sequences),
+        "image_embedding_sequence_max_len": int(image_embedding_sequence_token_cap),
         "has_image_geometry": bool(image_geometry_features),
         "has_quality_targets": bool(quality_targets),
         "latent_dtype": cache_dtype,
@@ -4019,6 +4150,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
                                   cond_source="tokens", cache_dir="", shard_size=1024,
                                   include_image_embeddings=False, seed=0,
                                   include_image_embedding_sequences=False,
+                                  image_embedding_sequence_token_cap=0,
                                   include_image_geometry=False,
                                   include_quality_targets=False, quality_stats=None,
                                   crop_mode="center", hflip_prob=0.0,
@@ -4028,6 +4160,9 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         raise ValueError("cache_dir is required for disk latent cache")
     cache_dtype = str(cache_dtype)
     latent_cache_torch_dtype(cache_dtype)
+    image_embedding_sequence_token_cap = int(image_embedding_sequence_token_cap or 0)
+    if image_embedding_sequence_token_cap < 0:
+        raise ValueError("image_embedding_sequence_token_cap must be non-negative")
     shard_size = int(shard_size)
     if shard_size <= 0:
         raise ValueError("flow cache shard size must be positive")
@@ -4040,7 +4175,8 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
     total_bytes = 0
     total_weight = 0.0
     latent_shape = None
-    sequence_max_len = image_embedding_sequence_max_len(rows)
+    sequence_max_len = image_embedding_sequence_max_len(
+        rows, cap=image_embedding_sequence_token_cap)
     cache_quality_stats = quality_stats or quality_score_stats(rows)
     ae.eval()
     crop_rng = np.random.default_rng(seed + 17)
@@ -4104,7 +4240,8 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
             ),
             "image_embedding_sequences": (
                 record_image_embedding_sequence_tensor(
-                    chunk_rows, device="cpu", max_len=sequence_max_len)
+                    chunk_rows, device="cpu", max_len=sequence_max_len,
+                    token_cap=image_embedding_sequence_token_cap)
                 if include_image_embedding_sequences else None
             ),
             "image_geometry_features": (
@@ -4118,6 +4255,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
             "cond_source": cond_source,
             "has_image_embeddings": bool(include_image_embeddings),
             "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+            "image_embedding_sequence_max_len": int(image_embedding_sequence_token_cap),
             "has_image_geometry": bool(include_image_geometry),
             "has_quality_targets": bool(include_quality_targets),
             "latent_dtype": cache_dtype,
@@ -4171,6 +4309,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         "cond_source": cond_source,
         "has_image_embeddings": bool(include_image_embeddings),
         "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+        "image_embedding_sequence_max_len": int(image_embedding_sequence_token_cap),
         "has_image_geometry": bool(include_image_geometry),
         "has_quality_targets": bool(include_quality_targets),
         "latent_dtype": cache_dtype,
@@ -4210,6 +4349,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         "cond_source": cond_source,
         "has_image_embeddings": bool(include_image_embeddings),
         "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+        "image_embedding_sequence_max_len": int(image_embedding_sequence_token_cap),
         "has_image_geometry": bool(include_image_geometry),
         "has_quality_targets": bool(include_quality_targets),
         "latent_dtype": cache_dtype,
@@ -5252,12 +5392,43 @@ def flow_hidden_feature_token_alignment_loss(aligner, hidden_tokens, feature_tok
     }
 
 
+def _square_token_side(n):
+    n = int(n)
+    if n <= 0:
+        return 0
+    side = math.isqrt(n)
+    return side if side * side == n else 0
+
+
+def image_embedding_sequence_target_len(length, cap=0):
+    length = int(length)
+    cap = int(cap or 0)
+    if length <= 0:
+        return 0
+    if cap <= 0 or length <= cap:
+        return length
+    source_side = _square_token_side(length)
+    if source_side:
+        target_side = max(1, math.isqrt(cap))
+        return min(length, target_side * target_side)
+    return cap
+
+
 def _resize_token_sequence(tokens, target_len):
     target_len = int(target_len)
     if int(tokens.shape[0]) == target_len:
         return tokens
     if target_len <= 0:
         raise ValueError("target token length must be positive")
+    source_side = _square_token_side(tokens.shape[0])
+    target_side = _square_token_side(target_len)
+    if source_side and target_side:
+        grid = tokens.reshape(source_side, source_side, tokens.shape[-1])
+        grid = grid.permute(2, 0, 1).unsqueeze(0)
+        resized = F.interpolate(
+            grid, size=(target_side, target_side), mode="bilinear",
+            align_corners=False)
+        return resized.squeeze(0).permute(1, 2, 0).reshape(target_len, tokens.shape[-1])
     return F.interpolate(
         tokens.t()[None], size=target_len, mode="linear", align_corners=False
     )[0].t()
@@ -6538,9 +6709,9 @@ def records_have_image_embedding_sequences(records):
     return any(rec.image_embedding_sequence is not None for rec in records)
 
 
-def image_embedding_sequence_max_len(records):
+def image_embedding_sequence_max_len(records, cap=0):
     return max(
-        (len(rec.image_embedding_sequence)
+        (image_embedding_sequence_target_len(len(rec.image_embedding_sequence), cap)
          for rec in records if rec.image_embedding_sequence is not None),
         default=0)
 
@@ -6627,24 +6798,30 @@ def record_image_embedding_tensor(records, device=DEV):
     return torch.tensor(rows, dtype=torch.float32, device=device)
 
 
-def record_image_embedding_sequence_tensor(records, device=DEV, max_len=0):
+def record_image_embedding_sequence_tensor(records, device=DEV, max_len=0, token_cap=0):
     dim = infer_image_embedding_dim(records)
     if dim <= 0:
         raise ValueError("records do not have image embeddings")
     rows = []
     max_len = int(max_len or 0)
+    token_cap = int(token_cap or 0)
+    if token_cap < 0:
+        raise ValueError("image embedding sequence token cap must be non-negative")
     for rec in records:
         if rec.image_embedding_sequence is not None:
-            row = [list(x) for x in rec.image_embedding_sequence]
+            row = torch.tensor(rec.image_embedding_sequence, dtype=torch.float32, device=device)
+            target_len = image_embedding_sequence_target_len(int(row.shape[0]), token_cap)
+            if target_len > 0 and int(row.shape[0]) != target_len:
+                row = _resize_token_sequence(row, target_len)
         elif rec.image_embedding is not None:
-            row = [list(rec.image_embedding)]
+            row = torch.tensor([rec.image_embedding], dtype=torch.float32, device=device)
         else:
             raise ValueError("record is missing image embedding")
         rows.append(row)
-        max_len = max(max_len, len(row))
+        max_len = max(max_len, int(row.shape[0]))
     out = torch.zeros((len(rows), max(1, max_len), dim), dtype=torch.float32, device=device)
     for i, row in enumerate(rows):
-        out[i, :len(row)] = torch.tensor(row, dtype=torch.float32, device=device)
+        out[i, :int(row.shape[0])] = row.to(device=device, dtype=torch.float32)
     return out
 
 
@@ -7478,6 +7655,96 @@ def sample_health_metrics(samples, prefix="sample", eps=1.0e-8):
         f"{prefix}_health_score": float(
             components["health_score"].mean().detach().cpu()),
     }
+
+
+def _sample_gate_metric_value(report, key):
+    raw = report.get(key)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def sample_quality_gate_report(
+        report, prefix="sample_grid", min_finite_frac=None,
+        max_nonfinite_frac=None, max_collapsed_frac=None, min_health_score=None,
+        min_detail_energy=None, min_dynamic_range=None, min_luminance_std=None):
+    """Return pass/fail metadata for generated-sample quality thresholds."""
+    thresholds = {
+        "min_finite_frac": min_finite_frac,
+        "max_nonfinite_frac": max_nonfinite_frac,
+        "max_collapsed_frac": max_collapsed_frac,
+        "min_health_score": min_health_score,
+        "min_detail_energy": min_detail_energy,
+        "min_dynamic_range": min_dynamic_range,
+        "min_luminance_std": min_luminance_std,
+    }
+    thresholds = {
+        key: (None if value is None else float(value))
+        for key, value in thresholds.items()
+    }
+    enabled = any(value is not None for value in thresholds.values())
+    failures = []
+
+    def check_min(metric, gate_name):
+        threshold = thresholds[gate_name]
+        if threshold is None:
+            return
+        key = f"{prefix}_{metric}"
+        value = _sample_gate_metric_value(report, key)
+        if value is None:
+            failures.append(f"{key} is missing for {gate_name}={threshold:g}")
+        elif value < threshold:
+            failures.append(f"{key} {value:g} < {gate_name} {threshold:g}")
+
+    def check_max(metric, gate_name):
+        threshold = thresholds[gate_name]
+        if threshold is None:
+            return
+        key = f"{prefix}_{metric}"
+        value = _sample_gate_metric_value(report, key)
+        if value is None:
+            failures.append(f"{key} is missing for {gate_name}={threshold:g}")
+        elif value > threshold:
+            failures.append(f"{key} {value:g} > {gate_name} {threshold:g}")
+
+    check_min("finite_frac", "min_finite_frac")
+    check_max("nonfinite_frac", "max_nonfinite_frac")
+    check_max("collapsed_frac", "max_collapsed_frac")
+    check_min("health_score", "min_health_score")
+    check_min("detail_energy", "min_detail_energy")
+    check_min("dynamic_range", "min_dynamic_range")
+    check_min("luminance_std", "min_luminance_std")
+
+    meta = {
+        f"{prefix}_quality_gate_enabled": bool(enabled),
+        f"{prefix}_quality_gate_passed": bool(not failures),
+        f"{prefix}_quality_gate_failures": failures,
+    }
+    for name, value in thresholds.items():
+        meta[f"{prefix}_quality_gate_{name}"] = value
+    return meta
+
+
+def cli_sample_quality_gate_report(report, args, prefix="sample_grid"):
+    return sample_quality_gate_report(
+        report, prefix=prefix,
+        min_finite_frac=args.sample_min_finite_frac,
+        max_nonfinite_frac=args.sample_max_nonfinite_frac,
+        max_collapsed_frac=args.sample_max_collapsed_frac,
+        min_health_score=args.sample_min_health_score,
+        min_detail_energy=args.sample_min_detail_energy,
+        min_dynamic_range=args.sample_min_dynamic_range,
+        min_luminance_std=args.sample_min_luminance_std)
+
+
+def sample_quality_gate_failure_message(report, prefix="sample_grid"):
+    failures = report.get(f"{prefix}_quality_gate_failures", [])
+    if not failures:
+        return ""
+    return "sample quality gate failed: " + "; ".join(str(x) for x in failures)
 
 
 def sample_candidate_health_scores(samples, eps=1.0e-8):
@@ -8807,6 +9074,10 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     dit_mlp = str(ckpt.get("dit_mlp", report.get("dit_mlp", "gelu")) or "gelu")
     if dit_mlp not in DIT_MLPS:
         raise ValueError(f"unknown DiT MLP {dit_mlp!r}")
+    dit_register_tokens = int(ckpt.get(
+        "dit_register_tokens", report.get("dit_register_tokens", 0)) or 0)
+    if dit_register_tokens < 0:
+        raise ValueError("checkpoint dit_register_tokens must be non-negative")
     flow_time_embed = str(ckpt.get(
         "flow_time_embed", report.get("flow_time_embed", "scalar")) or "scalar")
     if flow_time_embed not in FLOW_TIME_EMBEDS:
@@ -8928,7 +9199,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                      flow_checkpoint_blocks=flow_checkpoint_blocks,
                      flow_time_embed=flow_time_embed,
                      flow_time_embed_dim=flow_time_embed_dim,
-                     flow_self_condition=flow_self_condition).to(device)
+                     flow_self_condition=flow_self_condition,
+                     dit_register_tokens=dit_register_tokens).to(device)
     attach_image_geometry_mode(flow, bool(ckpt.get(
         "image_geometry_cond", report.get("image_geometry_cond", False))))
     flow_repa_aligner = None
@@ -9005,6 +9277,9 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
         "dit_pos_embed": dit_pos_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
         "dit_mlp": dit_mlp if flow_arch in ("dit", "crossdit", "mmdit") else "",
+        "dit_register_tokens": (
+            int(dit_register_tokens) if flow_arch in ("dit", "crossdit", "mmdit") else 0
+        ),
         "flow_time_embed": flow_time_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
         "flow_time_embed_dim": (
             int(flow_time_embed_dim) if flow_arch in ("dit", "crossdit", "mmdit") else 1
@@ -9932,6 +10207,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       dit_head_width_mult=1, latent_max_tokens=256,
                       dit_pos_embed="learned",
                       dit_mlp="gelu",
+                      dit_register_tokens=0,
                       flow_time_embed="scalar", flow_time_embed_dim=0,
                       flow_self_condition=False, flow_self_condition_p=0.5,
                       latent_patch_size=1,
@@ -9943,6 +10219,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       image_text_align_w=0.0, flow_text_align_w=0.0, text_embed_dim=128,
                       image_feature_align_w=0.0, flow_feature_align_w=0.0,
                       image_feature_embed_dim=128,
+                      image_embedding_sequence_max_len=0,
                       flow_repa_w=0.0, flow_repa_steps=0, flow_repa_embed_dim=128,
                       flow_repa_mode="pooled", flow_repa_structure_w=0.0,
                       flow_repa_frac=0.0,
@@ -9980,7 +10257,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       image_preference_manifest="", image_preference_root="",
                       image_preference_max_pairs=0, image_preference_w=0.0,
                       flow_preference_w=0.0, flow_preference_margin=0.0,
-                      flow_preference_batch=0,
+                      flow_preference_batch=0, flow_preference_loss="margin",
+                      flow_preference_beta=1.0,
                       image_geometry_cond=False,
                       caption_vocab_max=8192, caption_max_len=64,
                       caption_cond_source="tokens",
@@ -10163,6 +10441,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_preference_w = float(flow_preference_w)
     if flow_preference_w < 0.0:
         raise ValueError("flow_preference_w must be non-negative")
+    flow_preference_loss = str(flow_preference_loss or "margin")
+    if flow_preference_loss not in FLOW_PREFERENCE_LOSSES:
+        raise ValueError(f"unknown flow preference loss {flow_preference_loss!r}")
+    flow_preference_beta = float(flow_preference_beta)
+    if flow_preference_beta <= 0.0:
+        raise ValueError("flow_preference_beta must be positive")
     flow_preference_margin = float(flow_preference_margin)
     if flow_preference_margin < 0.0:
         raise ValueError("flow_preference_margin must be non-negative")
@@ -10191,6 +10475,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("image/text alignment weights must be non-negative")
     if image_feature_align_w < 0.0 or flow_feature_align_w < 0.0:
         raise ValueError("image feature alignment weights must be non-negative")
+    image_embedding_sequence_max_len = int(image_embedding_sequence_max_len or 0)
+    if image_embedding_sequence_max_len < 0:
+        raise ValueError("image_embedding_sequence_max_len must be non-negative")
     if flow_repa_w < 0.0:
         raise ValueError("flow_repa_w must be non-negative")
     flow_repa_structure_w = float(flow_repa_structure_w)
@@ -10322,6 +10609,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     dit_mlp = str(dit_mlp)
     if dit_mlp not in DIT_MLPS:
         raise ValueError(f"unknown DiT MLP {dit_mlp!r}")
+    dit_register_tokens = int(dit_register_tokens or 0)
+    if dit_register_tokens < 0:
+        raise ValueError("dit_register_tokens must be non-negative")
+    if dit_register_tokens and flow_arch == "conv":
+        raise ValueError("dit_register_tokens requires DiT/CrossDiT/MM-DiT flow")
     flow_time_embed = str(flow_time_embed or "scalar")
     if flow_time_embed not in FLOW_TIME_EMBEDS:
         raise ValueError(f"unknown flow time embedding {flow_time_embed!r}")
@@ -10490,7 +10782,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                      flow_checkpoint_blocks=flow_checkpoint_blocks,
                      flow_time_embed=flow_time_embed,
                      flow_time_embed_dim=flow_time_embed_dim,
-                     flow_self_condition=flow_self_condition).to(device)
+                     flow_self_condition=flow_self_condition,
+                     dit_register_tokens=dit_register_tokens).to(device)
     attach_image_geometry_mode(flow, image_geometry_cond)
     flow_repa_aligner = None
     if flow_repa_w > 0.0 or flow_repa_structure_w > 0.0:
@@ -10540,6 +10833,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 flow_repa_aligner=flow_repa_aligner,
                 flow_self_repa_aligner=flow_self_repa_aligner,
                 device=device))
+    flow_preference_reference = None
+    if (flow_preference_w > 0.0 and flow_preference_loss == "dpo"
+            and image_preference_pairs):
+        flow_preference_reference = copy.deepcopy(flow).to(device)
+        flow_preference_reference.eval()
+        for p in flow_preference_reference.parameters():
+            p.requires_grad_(False)
     ae_params = [p for p in ae.parameters() if p.requires_grad]
     if text_aligner is not None and image_text_align_w > 0.0:
         ae_params += list(conditioner.parameters()) + list(text_aligner.parameters())
@@ -10660,6 +10960,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 flow_feature_align_w > 0.0 or flow_repa_w > 0.0
                 or flow_repa_structure_w > 0.0),
             include_image_embedding_sequences=flow_repa_cache_sequences,
+            image_embedding_sequence_token_cap=image_embedding_sequence_max_len,
             include_image_geometry=image_geometry_cond,
             include_quality_targets=(
                 flow_quality_score_w > 0.0 or flow_quality_rank_w > 0.0
@@ -11027,7 +11328,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                         or active_flow_repa_structure_w > 0.0) else None
                 )
                 image_feature_tokens = (
-                    record_image_embedding_sequence_tensor(chosen_records, device=device)
+                    record_image_embedding_sequence_tensor(
+                        chosen_records, device=device,
+                        token_cap=image_embedding_sequence_max_len)
                     if (
                         active_flow_repa_structure_w > 0.0
                         or (
@@ -11140,7 +11443,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                         flow_loss_weight_gamma=flow_loss_weight_gamma,
                         flow_loss_weight_normalize=flow_loss_weight_normalize,
                         margin=flow_preference_margin,
-                        adaptive_sampler=adaptive_time_sampler)
+                        adaptive_sampler=adaptive_time_sampler,
+                        loss_mode=flow_preference_loss,
+                        reference_flow=flow_preference_reference,
+                        beta=flow_preference_beta)
                     loss = loss + float(flow_preference_w) * pref_loss
                     parts.update(pref_parts)
                     parts["flow_preference_w"] = torch.tensor(
@@ -11199,6 +11505,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             dit_qk_norm=dit_qk_norm, dit_attn_impl=dit_attn_impl,
             dit_pos_embed=dit_pos_embed,
             dit_mlp=dit_mlp,
+            dit_register_tokens=dit_register_tokens,
             latent_patch_size=latent_patch_size,
             flow_checkpoint_blocks=flow_checkpoint_blocks,
             flow_time_embed=flow_time_embed,
@@ -11377,6 +11684,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_cache_has_image_geometry": bool(
             flow_cache.get("has_image_geometry", False) if flow_cache is not None else False
         ),
+        "flow_cache_image_embedding_sequence_max_len": int(
+            flow_cache.get("image_embedding_sequence_max_len", 0)
+            if flow_cache is not None else 0
+        ),
         **latent_cache_runtime_report(flow_cache),
         **latent_cache_text_embedding_report(flow_cache),
         **latent_cache_text_pooled_embedding_report(flow_cache),
@@ -11439,6 +11750,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
         "dit_pos_embed": dit_pos_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
         "dit_mlp": dit_mlp if flow_arch in ("dit", "crossdit", "mmdit") else "",
+        "dit_register_tokens": (
+            int(dit_register_tokens) if flow_arch in ("dit", "crossdit", "mmdit") else 0
+        ),
         "flow_time_embed": (
             flow_time_embed if flow_arch in ("dit", "crossdit", "mmdit") else ""
         ),
@@ -11470,6 +11784,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_feature_align_w": float(flow_feature_align_w),
         "image_feature_embed_dim": int(image_feature_embed_dim),
         "image_feature_aligner": image_feature_aligner is not None,
+        "image_embedding_sequence_max_len": int(image_embedding_sequence_max_len),
         "flow_repa_w": float(flow_repa_w),
         "flow_repa_structure_w": float(flow_repa_structure_w),
         "flow_repa_frac": float(flow_repa_frac),
@@ -11514,6 +11829,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_sra_time_gap": float(flow_sra_time_gap),
         "flow_sra_mode": str(flow_sra_mode),
         "flow_preference_w": float(flow_preference_w),
+        "flow_preference_loss": str(flow_preference_loss),
+        "flow_preference_beta": float(flow_preference_beta),
+        "flow_preference_reference": bool(flow_preference_reference is not None),
         "flow_preference_margin": float(flow_preference_margin),
         "flow_preference_batch": int(flow_preference_batch),
         "flow_preference_steps_run": int(flow_preference_steps_run),
@@ -11834,6 +12152,24 @@ def selftest():
         assert abs(float(geom_features[0, 8]) - 0.2) < 1.0e-6
         assert abs(float(geom_features[0, 9]) - 0.2) < 1.0e-6
         assert float(geom_features[0, -1]) == 1.0
+        capped_image_tokens = record_image_embedding_sequence_tensor(
+            manifest_records[:2], device="cpu", token_cap=2)
+        assert tuple(capped_image_tokens.shape) == (2, 2, 3)
+        assert image_embedding_sequence_max_len(manifest_records, cap=2) == 2
+        assert image_embedding_sequence_target_len(3, cap=2) == 2
+        assert image_embedding_sequence_target_len(16, cap=10) == 9
+        grid_tokens = torch.arange(16 * 2, dtype=torch.float32).reshape(16, 2)
+        grid_tokens_down = _resize_token_sequence(grid_tokens, 9)
+        assert tuple(grid_tokens_down.shape) == (9, 2)
+        grid_records = [replace(
+            manifest_records[0],
+            image_embedding=[0.0, 1.0],
+            image_embedding_sequence=grid_tokens.tolist(),
+        )]
+        capped_grid_tokens = record_image_embedding_sequence_tensor(
+            grid_records, device="cpu", token_cap=10)
+        assert tuple(capped_grid_tokens.shape) == (1, 9, 2)
+        assert image_embedding_sequence_max_len(grid_records, cap=10) == 9
         candidate_settings = prompt_candidate_sampler_settings(
             3, seed=11, cfg_scale=1.0, cfg_rescale=0.0,
             cfg_scales=(1.0, 2.0), cfg_rescales=(0.0, 0.5),
@@ -11875,6 +12211,16 @@ def selftest():
             torch.cat([flat_sample, textured_sample], dim=0), prefix="unit")
         assert "unit_detail_energy" in health_meta
         assert "unit_pixel_clip_frac" in health_meta
+        gate_pass = sample_quality_gate_report(
+            health_meta, prefix="unit", min_finite_frac=1.0,
+            max_nonfinite_frac=0.0, max_collapsed_frac=0.5,
+            min_detail_energy=0.001)
+        assert gate_pass["unit_quality_gate_enabled"] is True
+        assert gate_pass["unit_quality_gate_passed"] is True
+        gate_fail = sample_quality_gate_report(
+            health_meta, prefix="unit", min_detail_energy=1.0)
+        assert gate_fail["unit_quality_gate_passed"] is False
+        assert gate_fail["unit_quality_gate_failures"]
         structure_aligner = FlowFeatureAligner(
             hidden_dim=6, feature_dim=3, hidden=8, embed_dim=4)
         structure_loss, structure_parts = flow_hidden_feature_structure_loss(
@@ -11904,19 +12250,23 @@ def selftest():
             flow_arch="dit", dit_depth=1, dit_heads=2, seed=5, device="cpu",
             cond_mode="text", text_cond_dim=8, image_manifest=manifest,
             image_root=td, image_split="train", caption_max_len=8,
-            image_max_records=3, sample_steps=1, flow_distill_steps=1,
+            image_max_records=3, image_preference_manifest=pref_manifest,
+            flow_preference_w=0.01, flow_preference_loss="dpo",
+            flow_preference_beta=0.5, flow_preference_batch=1,
+            sample_steps=1, flow_distill_steps=1,
             flow_guidance_distill_w=0.01, flow_ema_decay=0.9,
             flow_frequency_w=0.01, flow_straightness_w=0.01,
             flow_endpoint_stats_w=0.01,
             flow_repa_w=0.01, flow_repa_structure_w=0.01,
             flow_repa_frac=1.0,
             flow_repa_mode="auto",
+            image_embedding_sequence_max_len=2,
             flow_factorization_w=0.01,
             flow_multiscale_w=0.01, flow_multiscale_scales=(2,),
             flow_boundary_mode="double-cosine",
             flow_time_embed="fourier", flow_time_embed_dim=8,
             flow_self_condition=True, flow_self_condition_p=1.0,
-            dit_mlp="swiglu",
+            dit_mlp="swiglu", dit_register_tokens=1,
             time_sampling="adaptive", time_adaptive_bins=4,
             time_stratified=True,
             time_adaptive_uniform_mix=0.1,
@@ -11942,6 +12292,7 @@ def selftest():
         assert report["flow_repa_steps"] == 1
         assert "flow_repa_structure_loss" in report["last_flow"]
         assert report["flow_repa_token_sequences"] is True
+        assert report["image_embedding_sequence_max_len"] == 2
         assert math.isclose(report["flow_straightness_w"], 0.01)
         assert "flow_straightness_velocity_mse" in report["last_flow"]
         assert math.isclose(report["flow_factorization_w"], 0.01)
@@ -11960,6 +12311,12 @@ def selftest():
         assert report["flow_self_condition"] is True
         assert math.isclose(report["flow_self_condition_p"], 1.0)
         assert report["dit_mlp"] == "swiglu"
+        assert report["dit_register_tokens"] == 1
+        assert report["flow_preference_loss"] == "dpo"
+        assert math.isclose(report["flow_preference_beta"], 0.5)
+        assert report["flow_preference_reference"] is True
+        assert report["flow_preference_steps_run"] >= 1
+        assert "flow_preference_policy_ref_gap" in report["last_flow"]
         assert report["uses_swiglu_mlp"] is True
         assert report["adaptive_modulation"] is True
         assert report["residual_gating"] is True
@@ -12022,6 +12379,7 @@ def selftest():
             "dit_head_width_mult": report["dit_head_width_mult"],
             "dit_pos_embed": report["dit_pos_embed"],
             "dit_mlp": report["dit_mlp"],
+            "dit_register_tokens": report["dit_register_tokens"],
             "flow_time_embed": report["flow_time_embed"],
             "flow_time_embed_dim": report["flow_time_embed_dim"],
             "flow_self_condition": report["flow_self_condition"],
@@ -12041,6 +12399,22 @@ def selftest():
             "data_mode": "image_manifest",
             "report": report,
         }, resume_path)
+        loaded_ae, loaded_flow, loaded_cond, loaded_vocab, _templates, loaded_meta = (
+            load_checkpoint(resume_path, device="cpu", prefer_ema=False)
+        )
+        assert loaded_meta["flow_arch"] == "dit"
+        assert loaded_meta["dit_register_tokens"] == 1
+        assert loaded_meta["flow_load"]["missing"] == []
+        assert loaded_meta["flow_load"]["unexpected"] == []
+        reload_sample_path = os.path.join(td, "reload_samples.ppm")
+        reload_meta = save_text_prompt_sample_grid(
+            loaded_ae, loaded_flow, ("manifest texture sample 1",),
+            reload_sample_path, size=16, device="cpu", conditioner=loaded_cond,
+            prompt_vocab=loaded_vocab, caption_max_len=8, cfg_scale=1.0,
+            sample_steps=1, sample_method="euler")
+        assert reload_meta["sample_grid_cond_mode"] == "prompt"
+        assert reload_meta["sample_grid_prompt_count"] == 1
+        assert os.path.exists(reload_sample_path)
         _ae2, _flow2, _cond2, _vocab2, resumed = train_latent_flow(
             ae_steps=0, flow_steps=1, batch=2, latent_ch=4, hidden=16,
             flow_arch="dit", dit_depth=1, dit_heads=2, seed=6, device="cpu",
@@ -12051,38 +12425,43 @@ def selftest():
             flow_repa_frac=1.0, flow_repa_mode="auto",
             flow_time_embed="fourier", flow_time_embed_dim=8,
             flow_self_condition=True, flow_self_condition_p=1.0,
-            dit_mlp="swiglu", resume_checkpoint=resume_path,
+            dit_mlp="swiglu", dit_register_tokens=1, resume_checkpoint=resume_path,
             return_conditioner=True)
         assert resumed["resume_checkpoint_loaded"] is True
         assert resumed["resume_ae_state"] == "loaded"
         assert resumed["resume_module_state"]["flow_repa_aligner"] == "loaded"
     crossdit = make_flow(
         flow_arch="crossdit", latent_ch=4, hidden=16, dit_depth=1, dit_heads=2,
-        cond_dim=8, dit_mlp="swiglu", latent_max_tokens=16,
+        cond_dim=8, dit_mlp="swiglu", latent_max_tokens=16, dit_register_tokens=1,
         flow_time_embed="fourier", flow_time_embed_dim=8)
     crossdit_cond = {
         "vec": torch.randn(2, 8),
         "tokens": torch.randn(2, 3, 8),
         "mask": torch.zeros(2, 3, dtype=torch.bool),
     }
-    crossdit_out = crossdit(
-        torch.randn(2, 4, 4, 4), torch.rand(2, 1, 1, 1), crossdit_cond)
+    crossdit_out, crossdit_features = crossdit(
+        torch.randn(2, 4, 4, 4), torch.rand(2, 1, 1, 1), crossdit_cond,
+        return_features=True)
     assert tuple(crossdit_out.shape) == (2, 4, 4, 4)
+    assert tuple(crossdit_features["register_tokens"].shape) == (2, 1, 16)
     assert getattr(crossdit, "uses_adaptive_modulation", False) is True
     assert getattr(crossdit, "uses_zero_residual_gating", False) is True
     assert getattr(crossdit, "uses_swiglu_mlp", False) is True
     mmdit = make_flow(
         flow_arch="mmdit", latent_ch=4, hidden=16, dit_depth=1, dit_heads=2,
         cond_dim=8, dit_qk_norm=True, dit_attn_impl="auto", dit_pos_embed="rope2d",
-        dit_mlp="swiglu", latent_max_tokens=16,
+        dit_mlp="swiglu", latent_max_tokens=16, dit_register_tokens=2,
         flow_time_embed="fourier", flow_time_embed_dim=8)
     mmdit_cond = {
         "vec": torch.randn(2, 8),
         "tokens": torch.randn(2, 3, 8),
         "mask": torch.zeros(2, 3, dtype=torch.bool),
     }
-    mmdit_out = mmdit(torch.randn(2, 4, 4, 4), torch.rand(2, 1, 1, 1), mmdit_cond)
+    mmdit_out, mmdit_features = mmdit(
+        torch.randn(2, 4, 4, 4), torch.rand(2, 1, 1, 1), mmdit_cond,
+        return_features=True)
     assert tuple(mmdit_out.shape) == (2, 4, 4, 4)
+    assert tuple(mmdit_features["register_tokens"].shape) == (2, 2, 16)
     assert getattr(mmdit, "attn_impl", "") == "auto"
     assert getattr(mmdit, "flow_time_embed", "") == "fourier"
     assert getattr(mmdit, "flow_time_embed_dim", 0) == 8
@@ -12211,6 +12590,10 @@ def main(argv=None):
     ap.add_argument("--image-feature-embed-dim", type=int, default=128,
                     dest="image_feature_embed_dim",
                     help="shared embedding width for latent/image-feature alignment")
+    ap.add_argument("--image-embedding-sequence-max-len", type=int, default=0,
+                    dest="image_embedding_sequence_max_len",
+                    help=("cap image_embedding_sequence rows by linear downsampling before "
+                          "REPA cache/training; 0 keeps full sidecar sequences"))
     ap.add_argument("--flow-repa-w", type=float, default=0.0, dest="flow_repa_w",
                     help="REPA-style hidden-state/image-feature alignment weight")
     ap.add_argument("--flow-repa-steps", type=int, default=0, dest="flow_repa_steps",
@@ -12286,6 +12669,10 @@ def main(argv=None):
                           "rope2d is MM-DiT-only"))
     ap.add_argument("--dit-mlp", default="gelu", choices=DIT_MLPS, dest="dit_mlp",
                     help="feed-forward block for CrossDiT/MM-DiT image-token transformers")
+    ap.add_argument("--dit-register-tokens", type=int, default=0,
+                    dest="dit_register_tokens",
+                    help=("learned global image-stream register tokens for "
+                          "DiT/CrossDiT/MM-DiT flows"))
     ap.add_argument("--flow-time-embed", default="scalar", choices=FLOW_TIME_EMBEDS,
                     dest="flow_time_embed",
                     help=("timestep embedding for DiT/CrossDiT/MM-DiT flows; "
@@ -12583,6 +12970,14 @@ def main(argv=None):
                     dest="flow_preference_w",
                     help=("direct chosen/rejected preference loss weight on the "
                           "latent rectified-flow generator"))
+    ap.add_argument("--flow-preference-loss", default="margin",
+                    choices=FLOW_PREFERENCE_LOSSES, dest="flow_preference_loss",
+                    help=("direct flow preference objective: margin compares "
+                          "chosen/rejected velocity loss; dpo anchors that gap "
+                          "to a frozen reference flow"))
+    ap.add_argument("--flow-preference-beta", type=float, default=1.0,
+                    dest="flow_preference_beta",
+                    help="inverse-temperature for --flow-preference-loss dpo")
     ap.add_argument("--flow-preference-margin", type=float, default=0.0,
                     dest="flow_preference_margin",
                     help="minimum per-pair velocity-loss gap for direct flow preference")
@@ -12665,6 +13060,34 @@ def main(argv=None):
                     dest="sample_quality_guidance_interval",
                     help=("quality guidance active interval over flow time, "
                           "formatted start,end"))
+    ap.add_argument("--sample-min-finite-frac", type=float, default=None,
+                    dest="sample_min_finite_frac",
+                    help=("fail after --sample-grid-out if generated finite pixel "
+                          "fraction is below this threshold"))
+    ap.add_argument("--sample-max-nonfinite-frac", type=float, default=None,
+                    dest="sample_max_nonfinite_frac",
+                    help=("fail after --sample-grid-out if generated non-finite "
+                          "pixel fraction is above this threshold"))
+    ap.add_argument("--sample-max-collapsed-frac", type=float, default=None,
+                    dest="sample_max_collapsed_frac",
+                    help=("fail after --sample-grid-out if collapsed generated "
+                          "sample fraction is above this threshold"))
+    ap.add_argument("--sample-min-health-score", type=float, default=None,
+                    dest="sample_min_health_score",
+                    help=("fail after --sample-grid-out if generated sample health "
+                          "score is below this threshold"))
+    ap.add_argument("--sample-min-detail-energy", type=float, default=None,
+                    dest="sample_min_detail_energy",
+                    help=("fail after --sample-grid-out if generated sample detail "
+                          "energy is below this threshold"))
+    ap.add_argument("--sample-min-dynamic-range", type=float, default=None,
+                    dest="sample_min_dynamic_range",
+                    help=("fail after --sample-grid-out if generated luminance "
+                          "dynamic range is below this threshold"))
+    ap.add_argument("--sample-min-luminance-std", type=float, default=None,
+                    dest="sample_min_luminance_std",
+                    help=("fail after --sample-grid-out if generated luminance "
+                          "standard deviation is below this threshold"))
     ap.add_argument("--prompt-embed-backend", default="stats",
                     choices=("stats", "hf"), dest="prompt_embed_backend",
                     help="text embedding backend used by --sample-prompts with embedding conditioning")
@@ -12788,6 +13211,10 @@ def main(argv=None):
         ap.error("--flow-time-embed-dim must be non-negative")
     if args.flow_self_condition and args.flow_arch == "conv":
         ap.error("--flow-self-condition requires --flow-arch dit/crossdit/mmdit")
+    if args.dit_register_tokens < 0:
+        ap.error("--dit-register-tokens must be non-negative")
+    if args.dit_register_tokens > 0 and args.flow_arch == "conv":
+        ap.error("--dit-register-tokens requires --flow-arch dit/crossdit/mmdit")
     if args.flow_self_condition_p < 0.0 or args.flow_self_condition_p > 1.0:
         ap.error("--flow-self-condition-p must be in [0, 1]")
     if args.flow_endpoint_w < 0.0:
@@ -12807,6 +13234,8 @@ def main(argv=None):
             args.flow_multiscale_scales)
     except ValueError as exc:
         ap.error(str(exc))
+    if args.image_embedding_sequence_max_len < 0:
+        ap.error("--image-embedding-sequence-max-len must be non-negative")
     if args.flow_repa_w < 0.0:
         ap.error("--flow-repa-w must be non-negative")
     if args.flow_repa_structure_w < 0.0:
@@ -12875,6 +13304,8 @@ def main(argv=None):
         ap.error("--image-preference-w requires --quality-score-steps > 0")
     if args.flow_preference_w < 0.0:
         ap.error("--flow-preference-w must be non-negative")
+    if args.flow_preference_beta <= 0.0:
+        ap.error("--flow-preference-beta must be positive")
     if args.flow_preference_margin < 0.0:
         ap.error("--flow-preference-margin must be non-negative")
     if args.flow_preference_batch < 0:
@@ -12901,6 +13332,18 @@ def main(argv=None):
         ap.error("--sample-quality-guidance-w must be non-negative")
     if args.sample_quality_guidance_w > 0.0 and not sample_prompts:
         ap.error("--sample-quality-guidance-w requires --sample-prompts")
+    for gate_name in (
+            "sample_min_finite_frac", "sample_max_nonfinite_frac",
+            "sample_max_collapsed_frac"):
+        gate_value = getattr(args, gate_name)
+        if gate_value is not None and (gate_value < 0.0 or gate_value > 1.0):
+            ap.error(f"--{gate_name.replace('_', '-')} must be in [0, 1]")
+    for gate_name in (
+            "sample_min_health_score", "sample_min_detail_energy",
+            "sample_min_dynamic_range", "sample_min_luminance_std"):
+        gate_value = getattr(args, gate_name)
+        if gate_value is not None and gate_value < 0.0:
+            ap.error(f"--{gate_name.replace('_', '-')} must be non-negative")
     if args.prompt_embed_text_sequence_max_length < 0:
         ap.error("--prompt-embed-text-sequence-max-length must be non-negative")
     if args.prompt_embed_text_sequence_model and args.prompt_embed_backend != "hf":
@@ -13098,6 +13541,7 @@ def main(argv=None):
             grid_meta["sample_grid_checkpoint_weight_mode"] = (
                 "ema" if meta["ema_loaded"] else "raw")
             report.update(grid_meta)
+            report.update(cli_sample_quality_gate_report(report, args))
         if args.eval_out:
             os.makedirs(os.path.dirname(args.eval_out) or ".", exist_ok=True)
             with open(args.eval_out, "w") as f:
@@ -13106,6 +13550,9 @@ def main(argv=None):
             print(f"saved -> {args.eval_out}")
         else:
             print(json.dumps(report, indent=1))
+        gate_message = sample_quality_gate_failure_message(report)
+        if gate_message:
+            raise SystemExit(gate_message)
         return
     if not args.train:
         ap.error("use --selftest, --train, or --eval-checkpoint")
@@ -13124,6 +13571,7 @@ def main(argv=None):
         dit_attn_impl=args.dit_attn_impl,
         dit_pos_embed=args.dit_pos_embed,
         dit_mlp=args.dit_mlp,
+        dit_register_tokens=args.dit_register_tokens,
         flow_time_embed=args.flow_time_embed,
         flow_time_embed_dim=args.flow_time_embed_dim,
         flow_checkpoint_blocks=args.flow_checkpoint_blocks,
@@ -13145,6 +13593,7 @@ def main(argv=None):
         image_feature_align_w=args.image_feature_align_w,
         flow_feature_align_w=args.flow_feature_align_w,
         image_feature_embed_dim=args.image_feature_embed_dim,
+        image_embedding_sequence_max_len=args.image_embedding_sequence_max_len,
         flow_repa_w=args.flow_repa_w,
         flow_repa_steps=args.flow_repa_steps,
         flow_repa_embed_dim=args.flow_repa_embed_dim,
@@ -13204,6 +13653,8 @@ def main(argv=None):
         image_preference_max_pairs=args.image_preference_max_pairs,
         image_preference_w=args.image_preference_w,
         flow_preference_w=args.flow_preference_w,
+        flow_preference_loss=args.flow_preference_loss,
+        flow_preference_beta=args.flow_preference_beta,
         flow_preference_margin=args.flow_preference_margin,
         flow_preference_batch=args.flow_preference_batch,
         image_geometry_cond=args.image_geometry_cond,
@@ -13372,6 +13823,7 @@ def main(argv=None):
             ap.error("--sample-grid-out requires --sample-prompts or --image-manifest")
         grid_meta["sample_grid_checkpoint_weight_mode"] = grid_weight_mode
         report.update(grid_meta)
+        report.update(cli_sample_quality_gate_report(report, args))
         load_flow_state(flow, raw_flow)
         if conditioner is not None and raw_conditioner is not None:
             conditioner.load_state_dict(raw_conditioner)
@@ -13414,6 +13866,7 @@ def main(argv=None):
         "image_feature_align_w": args.image_feature_align_w,
         "flow_feature_align_w": args.flow_feature_align_w,
         "image_feature_embed_dim": args.image_feature_embed_dim,
+        "image_embedding_sequence_max_len": args.image_embedding_sequence_max_len,
         "flow_repa_w": args.flow_repa_w,
         "flow_repa_structure_w": args.flow_repa_structure_w,
         "flow_repa_frac": report.get("flow_repa_frac", args.flow_repa_frac),
@@ -13475,6 +13928,8 @@ def main(argv=None):
         "dit_attn_impl": report.get("dit_attn_impl", "manual"),
         "dit_pos_embed": report.get("dit_pos_embed", "") or args.dit_pos_embed,
         "dit_mlp": report.get("dit_mlp", "") or args.dit_mlp,
+        "dit_register_tokens": report.get(
+            "dit_register_tokens", args.dit_register_tokens),
         "flow_time_embed": report.get("flow_time_embed", args.flow_time_embed),
         "flow_time_embed_dim": report.get("flow_time_embed_dim", args.flow_time_embed_dim),
         "flow_checkpoint_blocks": report.get("flow_checkpoint_blocks", False),
@@ -13535,6 +13990,11 @@ def main(argv=None):
         "image_preference_rejected_cfg_schedules": report.get(
             "image_preference_rejected_cfg_schedules", {}),
         "flow_preference_w": args.flow_preference_w,
+        "flow_preference_loss": report.get(
+            "flow_preference_loss", args.flow_preference_loss),
+        "flow_preference_beta": report.get(
+            "flow_preference_beta", args.flow_preference_beta),
+        "flow_preference_reference": report.get("flow_preference_reference", False),
         "flow_preference_margin": args.flow_preference_margin,
         "flow_preference_batch": args.flow_preference_batch,
         "flow_preference_steps_run": report.get("flow_preference_steps_run", 0),
@@ -13683,6 +14143,9 @@ def main(argv=None):
     }, args.out)
     print(json.dumps(report, indent=1))
     print(f"saved -> {args.out}")
+    gate_message = sample_quality_gate_failure_message(report)
+    if gate_message:
+        raise SystemExit(gate_message)
 
 
 if __name__ == "__main__":

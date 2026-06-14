@@ -105,11 +105,12 @@ installs those when this path is active.
     --caption-cond-source auto \
     --size 64 --ae-arch residual --latent-downsample 8 --latent-max-tokens 128 \
     --dit-pos-embed rope2d --dit-attn-impl auto --dit-mlp swiglu \
+    --dit-register-tokens 1 \
     --latent-patch-size 2 \
     --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 --ae-fft-w 0.05 \
     --image-text-align-w 0.1 --flow-text-align-w 0.05 --text-embed-dim 128 \
     --image-feature-align-w 0.1 --flow-feature-align-w 0.05 \
-    --image-feature-embed-dim 128 \
+    --image-feature-embed-dim 128 --image-embedding-sequence-max-len 256 \
     --flow-repa-w 0.05 --flow-repa-mode auto \
     --flow-self-repa-w 0.05 --flow-self-repa-mode auto \
     --flow-sra-w 0.05 --flow-sra-mode both --flow-sra-time-gap 0.25 \
@@ -146,6 +147,9 @@ installs those when this path is active.
     --report-out runs/image_eval_report.json
 # Preference-loop artifact: score multiple generated candidates per prompt, then emit
 # chosen/rejected pairs for direct flow preference tuning and quality-scorer training.
+# The latent-flow trainer accepts `--flow-preference-loss dpo` to anchor those
+# pairwise updates against a frozen reference flow instead of only optimizing a
+# raw chosen/rejected margin.
 .venv/bin/python -m thinking.image_score --manifest data/images/generated_captioned.jsonl \
     --root data/images --backend ensemble --technical-w 0.3 \
     --external-sidecar data/images/generated_reward_scores.jsonl \
@@ -168,13 +172,15 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
 # 512/768 data path; `web-hf-vae-hq` switches to a mixed 1024+512 source manifest with
 # high-res source upweighting, PickScore + technical-health quality scoring,
 # stricter cleaning, longer text sequence conditioning, 1024/multi-aspect buckets, latent patching
-# that keeps MM-DiT token count bounded, a 12-block/12-head 768-wide MM-DiT, more sampling steps,
+# that keeps MM-DiT token count bounded, a 12-block/12-head 768-wide MM-DiT
+# with a REG-style image-stream register token, more sampling steps,
 # Karras-style timestep placement, sampler-diverse candidate reranking, and a
 # generated-candidate feedback artifact:
 # `*_candidates.jsonl` -> PickScore-scored candidates -> `*_preferences.jsonl` chosen/rejected
 # pairs, including sampler/CFG provenance, for the next quality-scorer and direct-flow preference pass. If that portable preference
 # artifact and its candidate images exist locally, the next `web-hf-vae-hq` launch auto-uploads
-# and consumes it. Prompt candidates now cycle through the configured CFG/sampler/seed
+# and consumes it with reference-anchored DPO flow preference tuning. Prompt candidates
+# now cycle through the configured CFG/sampler/seed
 # sweep lists and record per-candidate provenance for preference mining; add
 # `--image-no-auto-preferences` to force a first-run/no-feedback profile. Both use SigLIP So400m
 # pooled prompts plus T5-large token-sequence conditioning, crop/flip/pad-aware

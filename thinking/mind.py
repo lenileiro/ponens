@@ -32,7 +32,8 @@ import torch.nn.functional as F
 from scratchpad_model import ScratchpadLM
 from device import get_device
 from .concepts import (LatentConceptHead, latent_concept_vicreg_loss,
-                       latent_concept_slot_factorization_loss, latent_concept_fer_scores)
+                       latent_concept_slot_factorization_loss, latent_concept_fer_loss,
+                       latent_concept_fer_scores)
 
 DEV = get_device()
 
@@ -180,7 +181,8 @@ def _masked_view(seqs, vocab, rng, mask_p, device, want_labels):
 
 
 def train(model, vocab, windows, steps=12000, batch=32, lr=1e-3, read_frac=0.4,
-          concept_frac=0.2, concept_w=0.05, mask_p=0.15, seed=0, device=DEV, log_every=0):
+          concept_frac=0.2, concept_w=0.05, fer_w=1.0, mask_p=0.15, seed=0, device=DEV,
+          log_every=0):
     max_len = model.max_len
     enc = [vocab.enc(w)[:max_len - 2] for w in windows]
     enc = [e for e in enc if len(e) >= 2]
@@ -207,8 +209,11 @@ def train(model, vocab, windows, steps=12000, batch=32, lr=1e-3, read_frac=0.4,
             # down-weighted: VICReg starts ~50x the LM losses; left unscaled it dominates the
             # shared trunk and wrecks read/write (verified: read 0.475 -> 0.40). concept_w keeps
             # concept gradients comparable to the LM objectives so concepts shape, not disrupt.
+            # VICReg = invariance across views (concepts) ; factorization + FER = sharpen the
+            # slots (reduce fragmentation/entanglement so concepts specialize, not stay uniform).
             loss = concept_w * (latent_concept_vicreg_loss(sa, sb)
-                                + 0.1 * latent_concept_slot_factorization_loss(sa))
+                                + 0.1 * latent_concept_slot_factorization_loss(sa)
+                                + fer_w * latent_concept_fer_loss(sa))
             key = "concept"
         else:                                                  # WRITE: causal next-token LM
             ids = _pad_batch([[vocab.bos] + e + [vocab.eos] for e in pick], vocab.pad, device)
@@ -375,6 +380,7 @@ def main(argv=None):
     ap.add_argument("--read-frac", type=float, default=0.4)
     ap.add_argument("--concept-frac", type=float, default=0.2)
     ap.add_argument("--concept-w", type=float, default=0.05)
+    ap.add_argument("--fer-w", type=float, default=1.0)
     ap.add_argument("--mask-p", type=float, default=0.15)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--d", type=int, default=256)
@@ -411,7 +417,7 @@ def main(argv=None):
                       device=DEV)
     tr = train(model, vocab, train_w, steps=args.steps, batch=args.batch, lr=args.lr,
                read_frac=args.read_frac, concept_frac=args.concept_frac,
-               concept_w=args.concept_w, mask_p=args.mask_p,
+               concept_w=args.concept_w, fer_w=args.fer_w, mask_p=args.mask_p,
                seed=args.seed, device=DEV, log_every=args.log_every)
     report = {"book": args.read, "train_windows": len(train_w), "vocab_size": len(vocab),
               "params": sum(p.numel() for p in model.parameters()), "train": tr,
