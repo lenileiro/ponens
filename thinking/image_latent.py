@@ -5389,6 +5389,54 @@ def flow_hidden_factorization_loss(hidden_tokens, variance_target=0.05,
     return loss, parts
 
 
+def endpoint_statistics_axes(x):
+    if x.ndim <= 1:
+        return tuple(range(x.ndim))
+    if x.ndim == 2:
+        return (0,)
+    return (0,) + tuple(range(2, x.ndim))
+
+
+def flow_endpoint_statistics_loss(endpoint_pred, clean_target, mean_w=1.0, std_w=1.0,
+                                  prefix="flow_endpoint_stats", eps=1.0e-6):
+    if endpoint_pred.shape != clean_target.shape:
+        raise ValueError(
+            f"endpoint statistics shapes differ: pred={tuple(endpoint_pred.shape)} "
+            f"target={tuple(clean_target.shape)}")
+    pred = endpoint_pred.float()
+    target = clean_target.float().detach()
+    zero = pred.sum() * 0.0
+    mean_w = float(mean_w)
+    std_w = float(std_w)
+    if mean_w < 0.0 or std_w < 0.0:
+        raise ValueError("endpoint statistics component weights must be non-negative")
+    axes = endpoint_statistics_axes(pred)
+    if not axes:
+        pred_mean = pred
+        target_mean = target
+        pred_std = torch.zeros_like(pred_mean)
+        target_std = torch.zeros_like(target_mean)
+    else:
+        pred_mean = pred.mean(dim=axes)
+        target_mean = target.mean(dim=axes)
+        pred_std = pred.std(dim=axes, unbiased=False)
+        target_std = target.std(dim=axes, unbiased=False)
+    mean_loss = F.mse_loss(pred_mean, target_mean) if mean_w > 0.0 else zero
+    std_loss = F.mse_loss(pred_std, target_std) if std_w > 0.0 else zero
+    loss = mean_w * mean_loss + std_w * std_loss
+    return loss, {
+        f"{prefix}_loss": loss.detach(),
+        f"{prefix}_mean_loss": mean_loss.detach(),
+        f"{prefix}_std_loss": std_loss.detach(),
+        f"{prefix}_pred_mean_abs": pred_mean.detach().abs().mean(),
+        f"{prefix}_target_mean_abs": target_mean.detach().abs().mean(),
+        f"{prefix}_pred_std_mean": pred_std.detach().mean(),
+        f"{prefix}_target_std_mean": target_std.detach().mean(),
+        f"{prefix}_axes": torch.tensor(float(len(axes)), device=endpoint_pred.device),
+        f"{prefix}_eps": torch.tensor(float(eps), device=endpoint_pred.device),
+    }
+
+
 def condition_batch(cond):
     return int(condition_vector(cond).shape[0])
 
@@ -5675,6 +5723,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        time_stratified=False,
                        latent_stats=None, consistency_w=0.0,
                        endpoint_w=0.0, frequency_w=0.0,
+                       endpoint_stats_w=0.0,
+                       endpoint_stats_mean_w=1.0, endpoint_stats_std_w=1.0,
                        straightness_w=0.0,
                        multiscale_w=0.0, multiscale_scales=(2, 4),
                        self_condition_p=0.0,
@@ -5702,6 +5752,13 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     frequency_w = float(frequency_w)
     if frequency_w < 0.0:
         raise ValueError("frequency_w must be non-negative")
+    endpoint_stats_w = float(endpoint_stats_w)
+    endpoint_stats_mean_w = float(endpoint_stats_mean_w)
+    endpoint_stats_std_w = float(endpoint_stats_std_w)
+    if endpoint_stats_w < 0.0:
+        raise ValueError("endpoint_stats_w must be non-negative")
+    if endpoint_stats_mean_w < 0.0 or endpoint_stats_std_w < 0.0:
+        raise ValueError("endpoint statistics component weights must be non-negative")
     straightness_w = float(straightness_w)
     if straightness_w < 0.0:
         raise ValueError("straightness_w must be non-negative")
@@ -5782,6 +5839,11 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         "flow_endpoint_target_mse_unweighted": endpoint_unweighted.detach(),
         "flow_endpoint_w": torch.tensor(float(endpoint_w), device=z1.device),
         "flow_frequency_w": torch.tensor(float(frequency_w), device=z1.device),
+        "flow_endpoint_stats_w": torch.tensor(float(endpoint_stats_w), device=z1.device),
+        "flow_endpoint_stats_mean_w": torch.tensor(
+            float(endpoint_stats_mean_w), device=z1.device),
+        "flow_endpoint_stats_std_w": torch.tensor(
+            float(endpoint_stats_std_w), device=z1.device),
         "flow_straightness_w": torch.tensor(float(straightness_w), device=z1.device),
         "flow_multiscale_w": torch.tensor(float(multiscale_w), device=z1.device),
         "flow_multiscale_scale_count": torch.tensor(
@@ -5820,6 +5882,13 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         frequency = frequency_recon_loss(endpoint_pred, z1_model)
         total = total + float(frequency_w) * frequency
         parts["flow_endpoint_frequency_l1"] = frequency.detach()
+    if endpoint_stats_w > 0.0:
+        endpoint_stats, endpoint_stats_parts = flow_endpoint_statistics_loss(
+            endpoint_pred, z1_model,
+            mean_w=endpoint_stats_mean_w,
+            std_w=endpoint_stats_std_w)
+        total = total + float(endpoint_stats_w) * endpoint_stats
+        parts.update(endpoint_stats_parts)
     if consistency_w > 0.0 or straightness_w > 0.0:
         t2 = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                                logit_mean=time_logit_mean, logit_std=time_logit_std,
@@ -8733,6 +8802,14 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
             "flow_endpoint_w", report.get("flow_endpoint_w", 0.0)) or 0.0),
         "flow_frequency_w": float(ckpt.get(
             "flow_frequency_w", report.get("flow_frequency_w", 0.0)) or 0.0),
+        "flow_endpoint_stats_w": float(ckpt.get(
+            "flow_endpoint_stats_w", report.get("flow_endpoint_stats_w", 0.0)) or 0.0),
+        "flow_endpoint_stats_mean_w": float(ckpt.get(
+            "flow_endpoint_stats_mean_w",
+            report.get("flow_endpoint_stats_mean_w", 1.0)) or 1.0),
+        "flow_endpoint_stats_std_w": float(ckpt.get(
+            "flow_endpoint_stats_std_w",
+            report.get("flow_endpoint_stats_std_w", 1.0)) or 1.0),
         "flow_straightness_w": float(ckpt.get(
             "flow_straightness_w", report.get("flow_straightness_w", 0.0)) or 0.0),
         "flow_multiscale_w": float(ckpt.get(
@@ -9605,6 +9682,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       sample_steps=4,
                       flow_consistency_w=0.0, flow_endpoint_w=0.0,
                       flow_frequency_w=0.0,
+                      flow_endpoint_stats_w=0.0,
+                      flow_endpoint_stats_mean_w=1.0,
+                      flow_endpoint_stats_std_w=1.0,
                       flow_straightness_w=0.0,
                       flow_distill_steps=0, flow_distill_w=1.0,
                       flow_distill_time_gap=0.25, flow_distill_teacher="auto",
@@ -9877,6 +9957,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_frequency_w = float(flow_frequency_w)
     if flow_frequency_w < 0.0:
         raise ValueError("flow_frequency_w must be non-negative")
+    flow_endpoint_stats_w = float(flow_endpoint_stats_w)
+    flow_endpoint_stats_mean_w = float(flow_endpoint_stats_mean_w)
+    flow_endpoint_stats_std_w = float(flow_endpoint_stats_std_w)
+    if flow_endpoint_stats_w < 0.0:
+        raise ValueError("flow_endpoint_stats_w must be non-negative")
+    if flow_endpoint_stats_mean_w < 0.0 or flow_endpoint_stats_std_w < 0.0:
+        raise ValueError("flow endpoint statistics component weights must be non-negative")
     flow_straightness_w = float(flow_straightness_w)
     if flow_straightness_w < 0.0:
         raise ValueError("flow_straightness_w must be non-negative")
@@ -10663,6 +10750,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     consistency_w=flow_consistency_w,
                     endpoint_w=flow_endpoint_w,
                     frequency_w=flow_frequency_w,
+                    endpoint_stats_w=flow_endpoint_stats_w,
+                    endpoint_stats_mean_w=flow_endpoint_stats_mean_w,
+                    endpoint_stats_std_w=flow_endpoint_stats_std_w,
                     straightness_w=flow_straightness_w,
                     multiscale_w=flow_multiscale_w,
                     multiscale_scales=flow_multiscale_scales,
@@ -11089,6 +11179,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_consistency_w": float(flow_consistency_w),
         "flow_endpoint_w": float(flow_endpoint_w),
         "flow_frequency_w": float(flow_frequency_w),
+        "flow_endpoint_stats_w": float(flow_endpoint_stats_w),
+        "flow_endpoint_stats_mean_w": float(flow_endpoint_stats_mean_w),
+        "flow_endpoint_stats_std_w": float(flow_endpoint_stats_std_w),
         "flow_straightness_w": float(flow_straightness_w),
         "flow_multiscale_w": float(flow_multiscale_w),
         "flow_multiscale_scales": list(flow_multiscale_scales),
@@ -11269,6 +11362,12 @@ def selftest():
     assert tuple(stratified_times.shape) == (8, 1, 1, 1)
     assert float(stratified_times.min()) >= 0.0
     assert float(stratified_times.max()) <= 1.0
+    stats_pred = torch.randn(3, 4, 2, 2)
+    stats_target = torch.randn(3, 4, 2, 2)
+    stats_loss, stats_parts = flow_endpoint_statistics_loss(stats_pred, stats_target)
+    assert stats_loss.ndim == 0
+    assert "flow_endpoint_stats_mean_loss" in stats_parts
+    assert "flow_endpoint_stats_std_loss" in stats_parts
     prior_probs = timestep_prior_bin_probs(8, prior="mode", mode_scale=1.29)
     assert tuple(prior_probs.shape) == (8,)
     assert torch.allclose(prior_probs.sum(), torch.ones((), dtype=torch.float64))
@@ -11428,6 +11527,7 @@ def selftest():
             image_max_records=3, sample_steps=1, flow_distill_steps=1,
             flow_guidance_distill_w=0.01, flow_ema_decay=0.9,
             flow_frequency_w=0.01, flow_straightness_w=0.01,
+            flow_endpoint_stats_w=0.01,
             flow_factorization_w=0.01,
             flow_multiscale_w=0.01, flow_multiscale_scales=(2,),
             flow_boundary_mode="double-cosine",
@@ -11452,6 +11552,8 @@ def selftest():
         assert math.isclose(report["time_mode_scale"], DEFAULT_TIME_MODE_SCALE)
         assert report["time_adaptive_enabled"] is True
         assert math.isclose(report["flow_frequency_w"], 0.01)
+        assert math.isclose(report["flow_endpoint_stats_w"], 0.01)
+        assert "flow_endpoint_stats_loss" in report["last_flow"]
         assert math.isclose(report["flow_straightness_w"], 0.01)
         assert "flow_straightness_velocity_mse" in report["last_flow"]
         assert math.isclose(report["flow_factorization_w"], 0.01)
@@ -11828,6 +11930,15 @@ def main(argv=None):
     ap.add_argument("--flow-frequency-w", type=float, default=0.0,
                     dest="flow_frequency_w",
                     help="frequency-domain clean-endpoint latent loss weight for latent flow")
+    ap.add_argument("--flow-endpoint-stats-w", type=float, default=0.0,
+                    dest="flow_endpoint_stats_w",
+                    help="batch latent endpoint mean/std matching loss weight")
+    ap.add_argument("--flow-endpoint-stats-mean-w", type=float, default=1.0,
+                    dest="flow_endpoint_stats_mean_w",
+                    help="mean component weight inside --flow-endpoint-stats-w")
+    ap.add_argument("--flow-endpoint-stats-std-w", type=float, default=1.0,
+                    dest="flow_endpoint_stats_std_w",
+                    help="std component weight inside --flow-endpoint-stats-w")
     ap.add_argument("--flow-straightness-w", type=float, default=0.0,
                     dest="flow_straightness_w",
                     help="same-chord velocity straightness loss weight for latent flow")
@@ -12213,6 +12324,10 @@ def main(argv=None):
         ap.error("--flow-endpoint-w must be non-negative")
     if args.flow_frequency_w < 0.0:
         ap.error("--flow-frequency-w must be non-negative")
+    if args.flow_endpoint_stats_w < 0.0:
+        ap.error("--flow-endpoint-stats-w must be non-negative")
+    if args.flow_endpoint_stats_mean_w < 0.0 or args.flow_endpoint_stats_std_w < 0.0:
+        ap.error("flow endpoint statistics component weights must be non-negative")
     if args.flow_straightness_w < 0.0:
         ap.error("--flow-straightness-w must be non-negative")
     if args.flow_multiscale_w < 0.0:
@@ -12576,6 +12691,9 @@ def main(argv=None):
         flow_consistency_w=args.flow_consistency_w,
         flow_endpoint_w=args.flow_endpoint_w,
         flow_frequency_w=args.flow_frequency_w,
+        flow_endpoint_stats_w=args.flow_endpoint_stats_w,
+        flow_endpoint_stats_mean_w=args.flow_endpoint_stats_mean_w,
+        flow_endpoint_stats_std_w=args.flow_endpoint_stats_std_w,
         flow_straightness_w=args.flow_straightness_w,
         flow_multiscale_w=args.flow_multiscale_w,
         flow_multiscale_scales=flow_multiscale_scales,
@@ -12966,6 +13084,14 @@ def main(argv=None):
             args.sample_pixel_dynamic_threshold_percentile),
         "sample_pixel_dynamic_threshold_max": args.sample_pixel_dynamic_threshold_max,
         "flow_consistency_w": args.flow_consistency_w,
+        "flow_endpoint_w": args.flow_endpoint_w,
+        "flow_frequency_w": args.flow_frequency_w,
+        "flow_endpoint_stats_w": args.flow_endpoint_stats_w,
+        "flow_endpoint_stats_mean_w": args.flow_endpoint_stats_mean_w,
+        "flow_endpoint_stats_std_w": args.flow_endpoint_stats_std_w,
+        "flow_straightness_w": args.flow_straightness_w,
+        "flow_multiscale_w": args.flow_multiscale_w,
+        "flow_multiscale_scales": report.get("flow_multiscale_scales", []),
         "flow_distill_steps": report.get("flow_distill_steps", args.flow_distill_steps),
         "flow_distill_steps_run": report.get("flow_distill_steps_run", 0),
         "flow_distill_w": report.get("flow_distill_w", args.flow_distill_w),

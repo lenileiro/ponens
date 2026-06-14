@@ -533,6 +533,8 @@ def apply_image_quality_preset(args):
     args.image_flow_consistency_w = max(float(args.image_flow_consistency_w), 0.05)
     args.image_flow_endpoint_w = max(float(args.image_flow_endpoint_w), 0.1)
     args.image_flow_frequency_w = max(float(args.image_flow_frequency_w), 0.02 if hq else 0.01)
+    args.image_flow_endpoint_stats_w = max(
+        float(args.image_flow_endpoint_stats_w), 0.02 if hq else 0.01)
     args.image_flow_straightness_w = max(
         float(args.image_flow_straightness_w), 0.02 if hq else 0.01)
     args.image_flow_multiscale_w = max(float(args.image_flow_multiscale_w), 0.03 if hq else 0.01)
@@ -1051,6 +1053,11 @@ def payload(args):
                      f"--flow-consistency-w {args.image_flow_consistency_w} "
                      f"--flow-endpoint-w {args.image_flow_endpoint_w} "
                      f"--flow-frequency-w {args.image_flow_frequency_w} "
+                     f"--flow-endpoint-stats-w {args.image_flow_endpoint_stats_w} "
+                     f"--flow-endpoint-stats-mean-w "
+                     f"{args.image_flow_endpoint_stats_mean_w} "
+                     f"--flow-endpoint-stats-std-w "
+                     f"{args.image_flow_endpoint_stats_std_w} "
                      f"--flow-straightness-w {args.image_flow_straightness_w} "
                      f"--flow-multiscale-w {args.image_flow_multiscale_w} "
                      f"--flow-multiscale-scales {shlex_quote(args.image_flow_multiscale_scales)} "
@@ -2708,6 +2715,15 @@ def main():
     ap.add_argument("--image-flow-frequency-w", type=float, default=0.0,
                     dest="image_flow_frequency_w",
                     help="frequency-domain clean-endpoint latent loss weight for image flow")
+    ap.add_argument("--image-flow-endpoint-stats-w", type=float, default=0.0,
+                    dest="image_flow_endpoint_stats_w",
+                    help="batch latent endpoint mean/std matching loss weight for image flow")
+    ap.add_argument("--image-flow-endpoint-stats-mean-w", type=float, default=1.0,
+                    dest="image_flow_endpoint_stats_mean_w",
+                    help="mean component weight inside --image-flow-endpoint-stats-w")
+    ap.add_argument("--image-flow-endpoint-stats-std-w", type=float, default=1.0,
+                    dest="image_flow_endpoint_stats_std_w",
+                    help="std component weight inside --image-flow-endpoint-stats-w")
     ap.add_argument("--image-flow-straightness-w", type=float, default=0.0,
                     dest="image_flow_straightness_w",
                     help="same-chord velocity straightness loss weight for image flow")
@@ -3517,6 +3533,11 @@ def main():
         sys.exit("ERROR: --image-flow-endpoint-w must be non-negative")
     if args.image_flow_frequency_w < 0.0:
         sys.exit("ERROR: --image-flow-frequency-w must be non-negative")
+    if args.image_flow_endpoint_stats_w < 0.0:
+        sys.exit("ERROR: --image-flow-endpoint-stats-w must be non-negative")
+    if (args.image_flow_endpoint_stats_mean_w < 0.0
+            or args.image_flow_endpoint_stats_std_w < 0.0):
+        sys.exit("ERROR: image flow endpoint statistics component weights must be non-negative")
     if args.image_flow_straightness_w < 0.0:
         sys.exit("ERROR: --image-flow-straightness-w must be non-negative")
     if args.image_flow_multiscale_w < 0.0:
