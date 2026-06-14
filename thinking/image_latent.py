@@ -6420,6 +6420,8 @@ def init_sample_trace(steps, sample_finite_guard=False, sample_velocity_clip=0.0
         "sample_trace_solver_error_max": 0.0,
         "sample_trace_solver_error_mean": 0.0,
         "sample_trace_solver_error_count": 0,
+        "sample_trace_self_condition_updates": 0,
+        "sample_trace_self_condition_rollbacks": 0,
         "sample_trace_cfg_scale_min": 1.0,
         "sample_trace_cfg_scale_max": 1.0,
         "sample_trace_cfg_scale_mean": 1.0,
@@ -6469,7 +6471,9 @@ def merge_sample_traces(left, right):
             out[key] = max(float(out.get(key, 0.0)), float(value))
         elif key.endswith("_nonfinite_steps") or key.endswith("_events"):
             out[key] = int(out.get(key, 0)) + int(value)
-        elif key.endswith("_solver_steps") or key.endswith("_solver_rejects"):
+        elif (key.endswith("_solver_steps") or key.endswith("_solver_rejects")
+              or key.endswith("_self_condition_updates")
+              or key.endswith("_self_condition_rollbacks")):
             out[key] = int(out.get(key, 0)) + int(value)
         elif key.endswith("_solver_velocity_evals") or key.endswith("_solver_error_count"):
             out[key] = int(out.get(key, 0)) + int(value)
@@ -6720,6 +6724,7 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
     trace["sample_trace_requested_cfg_scale"] = float(cfg_scale)
     trace["sample_trace_self_condition"] = bool(flow_uses_self_condition(flow))
     trace["sample_trace_self_condition_updates"] = 0
+    trace["sample_trace_self_condition_rollbacks"] = 0
     update_sample_trace(trace, "latent", z)
 
     def stabilize_latent(z_in):
@@ -6776,6 +6781,15 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
             trace["sample_trace_cfg_guided_evals"] = (
                 int(trace.get("sample_trace_cfg_guided_evals", 0)) + 1
             )
+
+    def rollback_self_condition(state):
+        nonlocal self_cond_state
+        if self_cond_state is None:
+            return
+        self_cond_state = state
+        trace["sample_trace_self_condition_rollbacks"] = (
+            int(trace.get("sample_trace_self_condition_rollbacks", 0)) + 1
+        )
 
     for i in range(steps):
         t_scalar = float(schedule[i].detach().cpu())
@@ -6864,6 +6878,7 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                 remaining = target - t_cur
                 if direction * h > direction * remaining:
                     h = remaining
+                self_cond_before_attempt = self_cond_state
                 v_start = velocity_at(z, t_cur)
                 z_euler = z + h * v_start
                 v_end = velocity_at(z_euler, t_cur + h)
@@ -6890,6 +6905,7 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                     if abs(h) <= 0.0:
                         break
                 else:
+                    rollback_self_condition(self_cond_before_attempt)
                     rejects_for_interval += 1
                     trace["sample_trace_solver_rejects"] += 1
                     shrink = max(0.25, min(0.5, 0.9 * err_ratio ** -0.5))
@@ -8822,6 +8838,8 @@ SWEEP_METRICS = (
     "sample_trace_solver_error_max",
     "sample_trace_solver_error_mean",
     "sample_trace_solver_error_count",
+    "sample_trace_self_condition_updates",
+    "sample_trace_self_condition_rollbacks",
     "sample_trace_cfg_scale_min",
     "sample_trace_cfg_scale_max",
     "sample_trace_cfg_scale_mean",
@@ -9001,6 +9019,8 @@ def eval_report_summary(report):
         "sample_trace_solver_error_max",
         "sample_trace_solver_error_mean",
         "sample_trace_solver_error_count",
+        "sample_trace_self_condition_updates",
+        "sample_trace_self_condition_rollbacks",
         "sample_trace_cfg_schedule",
         "sample_trace_requested_cfg_scale",
         "sample_trace_cfg_scale_min",
@@ -11240,6 +11260,7 @@ def selftest():
         assert meta["sample_grid_trace_cfg_guided_evals"] >= 1
         assert meta["sample_grid_trace_self_condition"] is True
         assert meta["sample_grid_trace_self_condition_updates"] >= 1
+        assert meta["sample_grid_trace_self_condition_rollbacks"] >= 0
         assert os.path.exists(sample_path)
     crossdit = make_flow(
         flow_arch="crossdit", latent_ch=4, hidden=16, dit_depth=1, dit_heads=2,
