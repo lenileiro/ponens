@@ -1277,6 +1277,38 @@ def latent_multimodal_graph_prediction_loss_from_views(
     return torch.stack(losses).mean() if losses else target.sum() * 0.0
 
 
+def latent_multimodal_completion_loss_from_views(model, views, temperature=0.1):
+    """Predict the full fused concept state from partial modality views.
+
+    This is a self-supervised completion objective: the target is the model's own
+    full-view latent concept state, and each partial view must learn to recover
+    that state without task labels, answer choices, or modality-specific rules.
+    """
+    views = {mode: slots for mode, slots in views.items() if slots is not None}
+    zero = (next(iter(views.values())).sum() * 0.0
+            if views else torch.tensor(0.0))
+    metrics = {"completion_loss": zero, "view_count": 0, "skipped": True}
+    predictor = getattr(model, "concept_sequence_predictor", None)
+    target = views.get("full")
+    if predictor is None or target is None:
+        return zero, metrics
+    losses = []
+    by_mode = {}
+    for mode, source in views.items():
+        if mode == "full":
+            continue
+        loss = latent_concept_sequence_prediction_loss(
+            predictor, source, target.detach(), temperature=temperature)
+        losses.append(loss)
+        by_mode[mode] = loss.detach()
+    if not losses:
+        return zero, metrics
+    loss = torch.stack(losses).mean()
+    metrics = {"completion_loss": loss, "view_count": len(losses),
+               "skipped": False, "modes": by_mode}
+    return loss, metrics
+
+
 def latent_multimodal_sequence_prediction_loss(
         model, pair_batch, vocab, view_dims, device=DEV, temperature=0.1,
         view_dropout=0.0):
@@ -2408,6 +2440,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           latent_concept_graph_predict_transitive_w=0.1,
           latent_concept_graph_predict_target_power=1.0,
           latent_concept_bridge_w=0.0,
+          latent_concept_completion_w=0.0,
+          latent_concept_completion_temperature=0.1,
           latent_concept_sequence_w=0.0,
           latent_concept_sequence_batch=0,
           latent_concept_sequence_temperature=0.1,
@@ -2446,6 +2480,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_concept_gap_w,
         latent_concept_association_w, latent_concept_composition_w,
         latent_concept_graph_predict_w, latent_concept_bridge_w,
+        latent_concept_completion_w,
         latent_concept_sequence_w,
         latent_concept_neighborhood_w,
         latent_concept_transition_w, latent_concept_cluster_w)
@@ -2521,6 +2556,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         raise ValueError("latent concept gap target power must be positive")
     if int(latent_concept_sequence_batch) < 0 or int(latent_concept_sequence_batch) == 1:
         raise ValueError("latent concept sequence batch must be 0 or at least 2")
+    if float(latent_concept_completion_temperature) <= 0.0:
+        raise ValueError("latent concept completion temperature must be positive")
     if float(latent_concept_sequence_temperature) <= 0.0:
         raise ValueError("latent concept sequence temperature must be positive")
     if selection_score_metric not in MULTIMODAL_SCORE_METRICS:
@@ -2910,6 +2947,20 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_bridge = (
             latent_multimodal_bridge_loss_from_views(model, latent_views)
             if latent_concept_bridge_w else base_loss * 0.0)
+        if latent_concept_completion_w:
+            latent_completion, completion_metrics = (
+                latent_multimodal_completion_loss_from_views(
+                    model, latent_views,
+                    temperature=latent_concept_completion_temperature))
+        else:
+            latent_completion = base_loss * 0.0
+            completion_zero = base_loss.detach() * 0.0
+            completion_metrics = {
+                "completion_loss": completion_zero,
+                "view_count": 0,
+                "skipped": True,
+                "modes": {},
+            }
         latent_sequence = base_loss * 0.0
         if latent_concept_sequence_w and sequence_pairs:
             sequence_pair_batch = _sample_pairs(sequence_pairs, sequence_batch, rng)
@@ -2946,6 +2997,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 + float(latent_concept_composition_w) * latent_composition
                 + float(latent_concept_graph_predict_w) * latent_graph_predict
                 + float(latent_concept_bridge_w) * latent_bridge
+                + float(latent_concept_completion_w) * latent_completion
                 + float(latent_concept_sequence_w) * latent_sequence
                 + float(latent_concept_neighborhood_w) * latent_neighborhood
                 + float(latent_concept_transition_w) * latent_transition
@@ -2960,6 +3012,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                             if (latent_concept_association_w
                                 or latent_concept_composition_w
                                 or latent_concept_graph_predict_w
+                                or latent_concept_completion_w
                                 or latent_concept_discovery_w
                                 or latent_concept_reanalysis_w
                                 or latent_concept_gap_w
@@ -3125,6 +3178,12 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "latent_graph_predict_loss": float(latent_graph_predict.detach()),
             "latent_bridge_loss": float(latent_bridge.detach()),
             "latent_bridge_w": float(latent_concept_bridge_w),
+            "latent_completion_loss": float(latent_completion.detach()),
+            "latent_completion_w": float(latent_concept_completion_w),
+            "latent_completion_temperature": float(
+                latent_concept_completion_temperature),
+            "latent_completion_view_count": int(completion_metrics["view_count"]),
+            "latent_completion_skipped": bool(completion_metrics["skipped"]),
             "latent_sequence_loss": float(latent_sequence.detach()),
             "latent_sequence_w": float(latent_concept_sequence_w),
             "latent_sequence_batch": int(sequence_batch),
@@ -3172,6 +3231,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                   f"discover {last['latent_discovery_loss']:.3f} "
                   f"reanalyze {last['latent_reanalysis_loss']:.3f} "
                   f"gap {last['latent_gap_loss']:.3f} "
+                  f"complete {last['latent_completion_loss']:.3f} "
                   f"sequence {last['latent_sequence_loss']:.3f}",
                   flush=True)
         if select_best and st in selection_boundaries:
@@ -3525,6 +3585,11 @@ def selftest():
         assert torch.isfinite(latent_multimodal_composition_loss_from_views(model, views))
         assert torch.isfinite(latent_multimodal_graph_prediction_loss_from_views(model, views))
         assert torch.isfinite(latent_multimodal_bridge_loss_from_views(model, views))
+        completion_loss, completion_metrics = (
+            latent_multimodal_completion_loss_from_views(model, views))
+        assert torch.isfinite(completion_loss)
+        assert completion_metrics["skipped"] is False
+        assert completion_metrics["view_count"] >= 1
         gap_loss, gap_metrics = latent_multimodal_gap_loss_from_views(model, views)
         assert torch.isfinite(gap_loss)
         assert gap_metrics["skipped"] is False
@@ -3607,6 +3672,7 @@ def selftest():
             latent_concept_composition_w=0.01,
             latent_concept_graph_predict_w=0.01,
             latent_concept_bridge_w=0.01,
+            latent_concept_completion_w=0.01,
             latent_concept_sequence_w=0.01,
             latent_concept_sequence_batch=2,
             latent_concept_neighborhood_w=0.01,
@@ -3640,6 +3706,10 @@ def selftest():
         assert trained_model.train_metrics["latent_bridge_graph_ready"] is True
         assert trained_model.train_metrics["latent_bridge_skipped"] is False
         assert math.isfinite(trained_model.train_metrics["latent_bridge_score"])
+        assert trained_model.train_metrics["latent_completion_w"] == 0.01
+        assert trained_model.train_metrics["latent_completion_skipped"] is False
+        assert trained_model.train_metrics["latent_completion_view_count"] >= 1
+        assert math.isfinite(trained_model.train_metrics["latent_completion_loss"])
         assert trained_model.train_metrics["latent_sequence_w"] == 0.01
         assert trained_model.train_metrics["latent_sequence_pairs"] == 7
         assert math.isfinite(trained_model.train_metrics["latent_sequence_loss"])
@@ -3911,6 +3981,12 @@ def main(argv=None):
     ap.add_argument("--latent-concept-bridge-w", type=float, default=0.0,
                     dest="latent_concept_bridge_w",
                     help="weight for label-free weak-connection bridge closure")
+    ap.add_argument("--latent-concept-completion-w", type=float, default=0.0,
+                    dest="latent_concept_completion_w",
+                    help=("weight for partial modality views predicting the full "
+                          "shared latent concept state"))
+    ap.add_argument("--latent-concept-completion-temperature", type=float,
+                    default=0.1, dest="latent_concept_completion_temperature")
     ap.add_argument("--latent-concept-sequence-w", type=float, default=0.0,
                     dest="latent_concept_sequence_w",
                     help="weight for adjacent-record latent concept prediction")
@@ -4013,6 +4089,7 @@ def main(argv=None):
         args.latent_concept_association_w,
         args.latent_concept_composition_w, args.latent_concept_graph_predict_w,
         args.latent_concept_bridge_w,
+        args.latent_concept_completion_w,
         args.latent_concept_sequence_w,
         args.latent_concept_neighborhood_w, args.latent_concept_transition_w,
         args.latent_concept_cluster_w,
@@ -4094,6 +4171,8 @@ def main(argv=None):
         ap.error("--latent-concept-composition-temperature must be positive")
     if args.latent_concept_graph_predict_temperature <= 0.0:
         ap.error("--latent-concept-graph-predict-temperature must be positive")
+    if args.latent_concept_completion_temperature <= 0.0:
+        ap.error("--latent-concept-completion-temperature must be positive")
     if args.latent_concept_sequence_batch < 0 or args.latent_concept_sequence_batch == 1:
         ap.error("--latent-concept-sequence-batch must be 0 or at least 2")
     if args.latent_concept_sequence_temperature <= 0.0:
@@ -4225,6 +4304,9 @@ def main(argv=None):
         latent_concept_graph_predict_target_power=(
             args.latent_concept_graph_predict_target_power),
         latent_concept_bridge_w=args.latent_concept_bridge_w,
+        latent_concept_completion_w=args.latent_concept_completion_w,
+        latent_concept_completion_temperature=(
+            args.latent_concept_completion_temperature),
         latent_concept_sequence_w=args.latent_concept_sequence_w,
         latent_concept_sequence_batch=args.latent_concept_sequence_batch,
         latent_concept_sequence_temperature=(
