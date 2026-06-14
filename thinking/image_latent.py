@@ -1983,6 +1983,40 @@ def apply_rotary_factors(x, cos, sin):
     return out
 
 
+class AdaDiTBlock(nn.Module):
+    """Self-attention DiT block with adaLN-Zero residual gating."""
+
+    def __init__(self, hidden=96, heads=4, mlp="gelu"):
+        super().__init__()
+        mlp = str(mlp)
+        if mlp not in DIT_MLPS:
+            raise ValueError(f"unknown DiT MLP {mlp!r}")
+        self.dit_mlp = mlp
+        self.uses_zero_residual_gating = True
+        self.attn_norm = nn.LayerNorm(hidden)
+        self.attn = nn.MultiheadAttention(hidden, heads, batch_first=True, dropout=0.0)
+        self.ff_norm = nn.LayerNorm(hidden)
+        self.ff = make_dit_feed_forward(hidden, mlp=mlp)
+        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(hidden, hidden * 4))
+        self.gate = nn.Sequential(nn.SiLU(), nn.Linear(hidden, hidden * 2))
+        nn.init.zeros_(self.ada[-1].weight)
+        nn.init.zeros_(self.ada[-1].bias)
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.zeros_(self.gate[-1].bias)
+
+    @staticmethod
+    def _modulate(x, shift, scale):
+        return x * (1.0 + scale[:, None, :]) + shift[:, None, :]
+
+    def forward(self, x, cond_ctx):
+        attn_shift, attn_scale, ff_shift, ff_scale = self.ada(cond_ctx).chunk(4, dim=-1)
+        attn_gate, ff_gate = self.gate(cond_ctx).chunk(2, dim=-1)
+        q = self._modulate(self.attn_norm(x), attn_shift, attn_scale)
+        x = x + attn_gate[:, None, :] * self.attn(q, q, q, need_weights=False)[0]
+        ff = self._modulate(self.ff_norm(x), ff_shift, ff_scale)
+        return x + ff_gate[:, None, :] * self.ff(ff)
+
+
 class LatentDiTFlowNet(nn.Module):
     """Patch-token transformer velocity field over semantic image latents.
 
@@ -1994,11 +2028,14 @@ class LatentDiTFlowNet(nn.Module):
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256, head_width_mult=1, pos_embed="learned",
                  checkpoint_blocks=False, latent_patch_size=1,
-                 time_embed="scalar", time_embed_dim=1):
+                 time_embed="scalar", time_embed_dim=1, mlp="gelu"):
         super().__init__()
         latent_patch_size = int(latent_patch_size)
         if latent_patch_size <= 0:
             raise ValueError("latent_patch_size must be positive")
+        mlp = str(mlp)
+        if mlp not in DIT_MLPS:
+            raise ValueError(f"unknown DiT MLP {mlp!r}")
         pos_embed = str(pos_embed)
         if pos_embed not in DIT_POS_EMBEDS:
             raise ValueError(f"unknown DiT positional embedding {pos_embed!r}")
@@ -2016,10 +2053,15 @@ class LatentDiTFlowNet(nn.Module):
         self.max_tokens = int(max_tokens)
         self.head_width_mult = int(head_width_mult)
         self.dit_pos_embed = pos_embed
+        self.dit_mlp = mlp
         self.flow_time_embed = time_embed
         self.flow_time_embed_dim = int(time_embed_dim if time_embed != "scalar" else 1)
+        self.uses_adaptive_modulation = True
+        self.uses_residual_gating = True
+        self.uses_zero_residual_gating = True
         self.uses_2d_pos_embed = pos_embed == "sincos2d"
         self.uses_rope2d_pos_embed = False
+        self.uses_swiglu_mlp = mlp == "swiglu"
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.uses_activation_checkpointing = self.checkpoint_blocks
         self.in_proj = nn.Linear(self.token_dim, hidden)
@@ -2032,16 +2074,9 @@ class LatentDiTFlowNet(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, hidden),
         )
-        layer = nn.TransformerEncoderLayer(
-            d_model=hidden,
-            nhead=heads,
-            dim_feedforward=hidden * 4,
-            dropout=0.0,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.blocks = nn.TransformerEncoder(layer, num_layers=depth, enable_nested_tensor=False)
+        self.blocks = nn.ModuleList([
+            AdaDiTBlock(hidden, heads, mlp=mlp) for _ in range(depth)
+        ])
         self.norm = nn.LayerNorm(hidden)
         self.out_proj = make_velocity_head(hidden, self.token_dim, self.head_width_mult)
 
@@ -2068,13 +2103,12 @@ class LatentDiTFlowNet(nn.Module):
         ctx = self.cond(torch.cat([cond, t_feat], dim=1))[:, None, :]
         x = self.in_proj(toks)
         x = x + self.image_pos(th, tw, x.device, x.dtype) + ctx
-        if should_checkpoint_blocks(self):
-            for layer in self.blocks.layers:
-                x = activation_checkpoint(layer, x)
-            if self.blocks.norm is not None:
-                x = self.blocks.norm(x)
-        else:
-            x = self.blocks(x)
+        cond_ctx = ctx[:, 0, :]
+        for block in self.blocks:
+            if should_checkpoint_blocks(self):
+                x = activation_checkpoint(block, x, cond_ctx)
+            else:
+                x = block(x, cond_ctx)
         features = self.norm(x)
         v = self.out_proj(features)
         velocity = unpatchify_latents(
@@ -2085,7 +2119,7 @@ class LatentDiTFlowNet(nn.Module):
 
 
 class CrossDiTBlock(nn.Module):
-    """Tiny image-token block with prompt-token cross-attention."""
+    """Image-token block with prompt cross-attention and adaLN-Zero gating."""
 
     def __init__(self, hidden=96, heads=4, mlp="gelu"):
         super().__init__()
@@ -2100,19 +2134,38 @@ class CrossDiTBlock(nn.Module):
         self.cross_attn = nn.MultiheadAttention(hidden, heads, batch_first=True, dropout=0.0)
         self.ff_norm = nn.LayerNorm(hidden)
         self.ff = make_dit_feed_forward(hidden, mlp=mlp)
+        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(hidden, hidden * 6))
+        self.gate = nn.Sequential(nn.SiLU(), nn.Linear(hidden, hidden * 3))
+        self.uses_zero_residual_gating = True
+        nn.init.zeros_(self.ada[-1].weight)
+        nn.init.zeros_(self.ada[-1].bias)
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.zeros_(self.gate[-1].bias)
 
-    def forward(self, x, ctx, ctx_mask=None):
-        q = self.self_norm(x)
-        x = x + self.self_attn(q, q, q, need_weights=False)[0]
-        x = x + self.cross_attn(self.cross_norm(x), self.ctx_norm(ctx), self.ctx_norm(ctx),
-                                key_padding_mask=ctx_mask, need_weights=False)[0]
-        return x + self.ff(self.ff_norm(x))
+    @staticmethod
+    def _modulate(x, shift, scale):
+        return x * (1.0 + scale[:, None, :]) + shift[:, None, :]
+
+    def forward(self, x, ctx, cond_ctx, ctx_mask=None):
+        (self_shift, self_scale, cross_shift, cross_scale,
+         ff_shift, ff_scale) = self.ada(cond_ctx).chunk(6, dim=-1)
+        self_gate, cross_gate, ff_gate = self.gate(cond_ctx).chunk(3, dim=-1)
+        q = self._modulate(self.self_norm(x), self_shift, self_scale)
+        x = x + self_gate[:, None, :] * self.self_attn(q, q, q, need_weights=False)[0]
+        cross_q = self._modulate(self.cross_norm(x), cross_shift, cross_scale)
+        ctx_norm = self.ctx_norm(ctx)
+        x = x + cross_gate[:, None, :] * self.cross_attn(
+            cross_q, ctx_norm, ctx_norm, key_padding_mask=ctx_mask, need_weights=False)[0]
+        ff = self._modulate(self.ff_norm(x), ff_shift, ff_scale)
+        return x + ff_gate[:, None, :] * self.ff(ff)
 
 
 class LatentCrossDiTFlowNet(nn.Module):
     """Latent DiT that lets image tokens attend to prompt/fact condition tokens."""
 
     uses_cond_tokens = True
+    uses_adaptive_modulation = True
+    uses_residual_gating = True
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256, head_width_mult=1, pos_embed="learned",
@@ -2145,6 +2198,7 @@ class LatentCrossDiTFlowNet(nn.Module):
         self.dit_mlp = mlp
         self.flow_time_embed = time_embed
         self.flow_time_embed_dim = int(time_embed_dim if time_embed != "scalar" else 1)
+        self.uses_zero_residual_gating = True
         self.uses_2d_pos_embed = pos_embed == "sincos2d"
         self.uses_rope2d_pos_embed = False
         self.uses_swiglu_mlp = mlp == "swiglu"
@@ -2200,13 +2254,14 @@ class LatentCrossDiTFlowNet(nn.Module):
         ctx, ctx_mask = self._context(cond)
         x = self.in_proj(toks)
         x = x + self.image_pos(th, tw, x.device, x.dtype) + global_ctx
+        cond_ctx = global_ctx[:, 0, :]
         for block in self.blocks:
             if should_checkpoint_blocks(self):
-                def block_forward(x_arg, ctx_arg, block=block):
-                    return block(x_arg, ctx_arg, ctx_mask=ctx_mask)
-                x = activation_checkpoint(block_forward, x, ctx)
+                def block_forward(x_arg, ctx_arg, cond_arg, block=block):
+                    return block(x_arg, ctx_arg, cond_arg, ctx_mask=ctx_mask)
+                x = activation_checkpoint(block_forward, x, ctx, cond_ctx)
             else:
-                x = block(x, ctx, ctx_mask=ctx_mask)
+                x = block(x, ctx, cond_ctx, ctx_mask=ctx_mask)
         features = self.norm(x)
         v = self.out_proj(features)
         velocity = unpatchify_latents(
@@ -2536,8 +2591,6 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
         raise ValueError(f"unknown DiT positional embedding {dit_pos_embed!r}")
     if dit_pos_embed == "rope2d" and flow_arch != "mmdit":
         raise ValueError("rope2d positional embedding is only supported by MM-DiT")
-    if dit_mlp != "gelu" and flow_arch == "dit":
-        raise ValueError("custom DiT MLPs are supported by CrossDiT/MM-DiT flows")
     dit_head_width_mult = int(dit_head_width_mult)
     if dit_head_width_mult <= 0:
         raise ValueError("dit_head_width_mult must be positive")
@@ -2553,7 +2606,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                 checkpoint_blocks=flow_checkpoint_blocks,
                                 latent_patch_size=latent_patch_size,
                                 time_embed=flow_time_embed,
-                                time_embed_dim=flow_time_embed_dim)
+                                time_embed_dim=flow_time_embed_dim,
+                                mlp=dit_mlp)
     if flow_arch == "crossdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
@@ -9372,8 +9426,6 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_time_embed_dim = int(flow_time_embed_dim or 0)
     if flow_time_embed_dim < 0:
         raise ValueError("flow_time_embed_dim must be non-negative")
-    if dit_mlp != "gelu" and flow_arch == "dit":
-        raise ValueError("custom DiT MLPs are supported by CrossDiT/MM-DiT flows")
     flow_checkpoint_blocks = bool(flow_checkpoint_blocks)
     if latent_max_tokens <= 0:
         raise ValueError("latent_max_tokens must be positive")
@@ -10784,6 +10836,7 @@ def selftest():
             flow_guidance_distill_w=0.01, flow_ema_decay=0.9,
             flow_boundary_mode="double-cosine",
             flow_time_embed="fourier", flow_time_embed_dim=8,
+            dit_mlp="swiglu",
             time_sampling="adaptive", time_adaptive_bins=4,
             time_adaptive_uniform_mix=0.1,
             image_geometry_cond=True,
@@ -10801,6 +10854,11 @@ def selftest():
         assert report["image_geometry_cond"] is True
         assert report["flow_time_embed"] == "fourier"
         assert report["flow_time_embed_dim"] == 8
+        assert report["dit_mlp"] == "swiglu"
+        assert report["uses_swiglu_mlp"] is True
+        assert report["adaptive_modulation"] is True
+        assert report["residual_gating"] is True
+        assert report["zero_residual_gating"] is True
         assert report["flow_boundary_mode"] == "double-cosine"
         assert report["flow_distill_steps_run"] == 1
         assert report["flow_distill_teacher_used"] == "ema"
@@ -10820,6 +10878,21 @@ def selftest():
         assert meta["sample_grid_trace_cfg_scale_max"] > 1.0
         assert meta["sample_grid_trace_cfg_guided_evals"] >= 1
         assert os.path.exists(sample_path)
+    crossdit = make_flow(
+        flow_arch="crossdit", latent_ch=4, hidden=16, dit_depth=1, dit_heads=2,
+        cond_dim=8, dit_mlp="swiglu", latent_max_tokens=16,
+        flow_time_embed="fourier", flow_time_embed_dim=8)
+    crossdit_cond = {
+        "vec": torch.randn(2, 8),
+        "tokens": torch.randn(2, 3, 8),
+        "mask": torch.zeros(2, 3, dtype=torch.bool),
+    }
+    crossdit_out = crossdit(
+        torch.randn(2, 4, 4, 4), torch.rand(2, 1, 1, 1), crossdit_cond)
+    assert tuple(crossdit_out.shape) == (2, 4, 4, 4)
+    assert getattr(crossdit, "uses_adaptive_modulation", False) is True
+    assert getattr(crossdit, "uses_zero_residual_gating", False) is True
+    assert getattr(crossdit, "uses_swiglu_mlp", False) is True
     mmdit = make_flow(
         flow_arch="mmdit", latent_ch=4, hidden=16, dit_depth=1, dit_heads=2,
         cond_dim=8, dit_qk_norm=True, dit_attn_impl="auto", dit_pos_embed="rope2d",
