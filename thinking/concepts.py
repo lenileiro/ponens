@@ -151,6 +151,14 @@ class LatentConceptMemory(nn.Module):
             self_loop_w=self_loop_w, transitive_steps=transitive_steps,
             transitive_w=transitive_w)
 
+    def composition_loss(self, slots, temperature=0.1, self_loop_w=0.0,
+                         transitive_steps=2, transitive_w=0.1, margin=0.0):
+        return latent_concept_composition_loss(
+            slots, self.active(), self.active_relations(),
+            temperature=temperature, self_loop_w=self_loop_w,
+            transitive_steps=transitive_steps, transitive_w=transitive_w,
+            margin=margin)
+
     @torch.no_grad()
     def update(self, slots, momentum=0.95, relation_decay=None):
         if slots is None:
@@ -393,6 +401,67 @@ def latent_concept_graph_curiosity_scores(slots, memory, relations=None,
                 reduction="none").sum(-1)
     score = float(novelty_w) * novelty + float(association_w) * association
     return score, {"novelty": novelty, "association": association}
+
+
+def latent_concept_composition_loss(slots, memory, relations, temperature=0.1,
+                                    self_loop_w=0.0, transitive_steps=2,
+                                    transitive_w=0.1, margin=0.0):
+    """Use the self-mined graph as a reusable concept transformation space.
+
+    For each current latent slot, find its nearest persistent concept A. The
+    graph predicts a related concept distribution B. The loss teaches the slot
+    that applying the learned A->B relation delta should land near B. This is
+    label-free: only the model's own prototypes and co-activation graph define
+    the relation.
+    """
+    if slots is None:
+        return torch.tensor(0.0)
+    if memory is None or memory.numel() == 0:
+        return slots.sum() * 0.0
+    if relations is None or relations.numel() == 0:
+        return slots.sum() * 0.0
+    if slots.ndim != 3:
+        raise ValueError("latent concept composition expects [batch, slots, dim]")
+    if slots.shape[-1] != memory.shape[-1]:
+        raise ValueError("latent concept composition dimension mismatch")
+    mem = F.normalize(memory.to(device=slots.device, dtype=slots.dtype), dim=-1)
+    rel = _latent_relation_targets(
+        relations, mem.shape[0], slots.device, slots.dtype,
+        self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+        transitive_w=transitive_w)
+    if rel is None:
+        return slots.sum() * 0.0
+    rows = F.normalize(slots.reshape(-1, slots.shape[-1]), dim=-1)
+    nearest = rows.matmul(mem.t()).detach().argmax(-1)
+    target = rel[nearest].detach()
+    active = target.sum(-1).gt(0.0)
+    if not bool(active.any()):
+        return slots.sum() * 0.0
+    rows = rows[active]
+    nearest = nearest[active]
+    target = target[active]
+    target = target / target.sum(-1, keepdim=True).clamp_min(1e-8)
+    source = mem[nearest].detach()
+    target_center = F.normalize(target.matmul(mem).detach(), dim=-1)
+    composed = F.normalize(rows + (target_center - source), dim=-1)
+    temp = max(float(temperature), 1e-6)
+    logits = composed.matmul(mem.t()) / temp
+    losses = [
+        F.kl_div(F.log_softmax(logits, dim=-1), target, reduction="batchmean"),
+        (1.0 - (composed * target_center).sum(-1)).mean(),
+    ]
+    margin_t = float(margin)
+    if margin_t and mem.shape[0] > 1:
+        target_sim = (composed * target_center).sum(-1)
+        negative_mask = target.le(0.0)
+        if bool(negative_mask.any(-1).all()):
+            negative_sim = composed.matmul(mem.t()).masked_fill(
+                ~negative_mask, -float("inf")).max(-1).values
+            finite = torch.isfinite(negative_sim)
+            if bool(finite.any()):
+                losses.append(
+                    F.relu(negative_sim[finite] + margin_t - target_sim[finite]).mean())
+    return torch.stack(losses).mean()
 
 
 class SchemaConceptHead(nn.Module):

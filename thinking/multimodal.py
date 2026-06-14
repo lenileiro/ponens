@@ -37,6 +37,7 @@ from .concepts import (
     LatentConceptMemory,
     SchemaConceptHead,
     SchemaConceptRefiner,
+    latent_concept_composition_loss,
     latent_concept_graph_curiosity_scores,
     latent_concept_cluster_prototype_loss,
     latent_concept_neighborhood_loss,
@@ -675,6 +676,18 @@ class MultimodalLM(nn.Module):
             slots, temperature=temperature, target_power=target_power,
             self_loop_w=self_loop_w, transitive_steps=transitive_steps,
             transitive_w=transitive_w)
+
+    def latent_concept_composition_loss(self, slots, temperature=0.1,
+                                        self_loop_w=0.0, transitive_steps=2,
+                                        transitive_w=0.1, margin=0.0):
+        if self.latent_concept_memory is None:
+            if slots is not None:
+                return slots.sum() * 0.0
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        return self.latent_concept_memory.composition_loss(
+            slots, temperature=temperature, self_loop_w=self_loop_w,
+            transitive_steps=transitive_steps, transitive_w=transitive_w,
+            margin=margin)
 
     @torch.no_grad()
     def update_latent_concept_memory(self, slots, momentum=0.95,
@@ -1576,6 +1589,31 @@ def latent_multimodal_association_loss_from_views(
     return torch.stack(losses).mean() if losses else next(iter(views.values())).sum() * 0.0
 
 
+def latent_multimodal_composition_loss_from_views(
+        model, views, temperature=0.1, self_loop_w=0.0, transitive_steps=2,
+        transitive_w=0.1, margin=0.0):
+    views = {mode: slots for mode, slots in views.items() if slots is not None}
+    if not views:
+        return torch.tensor(0.0)
+    if getattr(model, "latent_concept_memory", None) is None:
+        return next(iter(views.values())).sum() * 0.0
+    losses = []
+    for slots in views.values():
+        if hasattr(model, "latent_concept_composition_loss"):
+            losses.append(model.latent_concept_composition_loss(
+                slots, temperature=temperature, self_loop_w=self_loop_w,
+                transitive_steps=transitive_steps, transitive_w=transitive_w,
+                margin=margin))
+        else:
+            losses.append(latent_concept_composition_loss(
+                slots, model.latent_concept_memory.active(),
+                model.latent_concept_memory.active_relations(),
+                temperature=temperature, self_loop_w=self_loop_w,
+                transitive_steps=transitive_steps, transitive_w=transitive_w,
+                margin=margin))
+    return torch.stack(losses).mean() if losses else next(iter(views.values())).sum() * 0.0
+
+
 @torch.no_grad()
 def update_multimodal_latent_memory(model, slots, momentum=0.95,
                                     relation_decay=None):
@@ -1868,6 +1906,12 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           latent_concept_association_self_loop_w=0.05,
           latent_concept_association_transitive_steps=2,
           latent_concept_association_transitive_w=0.1,
+          latent_concept_composition_w=0.0,
+          latent_concept_composition_temperature=0.1,
+          latent_concept_composition_self_loop_w=0.0,
+          latent_concept_composition_transitive_steps=2,
+          latent_concept_composition_transitive_w=0.1,
+          latent_concept_composition_margin=0.0,
           latent_concept_neighborhood_w=0.0,
           latent_concept_neighborhood_temperature=0.1,
           latent_concept_neighborhood_margin=0.0,
@@ -1908,6 +1952,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
             or latent_concept_factorization_w < 0.0
             or latent_concept_memory_w < 0.0
             or latent_concept_association_w < 0.0
+            or latent_concept_composition_w < 0.0
             or latent_concept_neighborhood_w < 0.0
             or latent_concept_transition_w < 0.0
             or latent_concept_cluster_w < 0.0):
@@ -1916,6 +1961,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
          or latent_concept_factorization_w > 0.0
          or latent_concept_memory_w > 0.0
          or latent_concept_association_w > 0.0
+         or latent_concept_composition_w > 0.0
          or latent_concept_memory_size > 0
          or latent_concept_neighborhood_w > 0.0
          or latent_concept_transition_w > 0.0
@@ -1954,6 +2000,21 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     if latent_concept_association_transitive_w < 0.0:
         raise ValueError(
             "latent concept association transitive weight must be non-negative")
+    if latent_concept_composition_w > 0.0 and latent_concept_memory_size <= 0:
+        raise ValueError("latent concept composition requires latent concept memory")
+    if latent_concept_composition_temperature <= 0.0:
+        raise ValueError("latent concept composition temperature must be positive")
+    if latent_concept_composition_self_loop_w < 0.0:
+        raise ValueError(
+            "latent concept composition self-loop weight must be non-negative")
+    if int(latent_concept_composition_transitive_steps) < 1:
+        raise ValueError(
+            "latent concept composition transitive steps must be positive")
+    if latent_concept_composition_transitive_w < 0.0:
+        raise ValueError(
+            "latent concept composition transitive weight must be non-negative")
+    if latent_concept_composition_margin < 0.0:
+        raise ValueError("latent concept composition margin must be non-negative")
     if latent_concept_neighborhood_temperature <= 0.0:
         raise ValueError("latent concept neighborhood temperature must be positive")
     if latent_concept_neighborhood_margin < 0.0:
@@ -2058,6 +2119,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     last_latent_memory = 0.0
     last_latent_memory_updates = 0
     last_latent_association = 0.0
+    last_latent_composition = 0.0
     last_latent_neighborhood = 0.0
     last_latent_transition = 0.0
     last_latent_cluster = 0.0
@@ -2086,6 +2148,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
             latent_concept_w or latent_concept_factorization_w
             or latent_concept_memory_w
             or latent_concept_association_w
+            or latent_concept_composition_w
             or latent_concept_neighborhood_w
             or latent_concept_transition_w
             or latent_concept_cluster_w)
@@ -2205,6 +2268,17 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                 transitive_steps=latent_concept_association_transitive_steps,
                 transitive_w=latent_concept_association_transitive_w)
             if latent_concept_association_w else base_loss * 0.0)
+        latent_composition = (
+            latent_multimodal_composition_loss_from_views(
+                model,
+                {mode: bundle["latent_concepts"]
+                 for mode, bundle in bundles_by_mode.items()},
+                temperature=latent_concept_composition_temperature,
+                self_loop_w=latent_concept_composition_self_loop_w,
+                transitive_steps=latent_concept_composition_transitive_steps,
+                transitive_w=latent_concept_composition_transitive_w,
+                margin=latent_concept_composition_margin)
+            if latent_concept_composition_w else base_loss * 0.0)
         latent_neighborhood = (
             latent_multimodal_neighborhood_loss_from_views(
                 {mode: bundle["latent_concepts"]
@@ -2252,6 +2326,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                 + float(latent_concept_factorization_w) * latent_factorization
                 + float(latent_concept_memory_w) * latent_memory
                 + float(latent_concept_association_w) * latent_association
+                + float(latent_concept_composition_w) * latent_composition
                 + float(latent_concept_neighborhood_w) * latent_neighborhood
                 + float(latent_concept_transition_w) * latent_transition
                 + float(latent_concept_cluster_w) * latent_cluster
@@ -2265,7 +2340,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         last_latent_memory_updates = int(update_multimodal_latent_memory(
             model, full_latent_for_memory, momentum=latent_concept_memory_momentum,
             relation_decay=(latent_concept_association_decay
-                            if latent_concept_association_w else None)))
+                            if (latent_concept_association_w
+                                or latent_concept_composition_w) else None)))
         last_base = float(base_loss.detach())
         last_agreement = float(agreement.detach())
         last_concept = float(concept_loss.detach())
@@ -2282,6 +2358,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         last_latent_factorization = float(latent_factorization.detach())
         last_latent_memory = float(latent_memory.detach())
         last_latent_association = float(latent_association.detach())
+        last_latent_composition = float(latent_composition.detach())
         last_latent_neighborhood = float(latent_neighborhood.detach())
         last_latent_transition = float(latent_transition.detach())
         last_latent_cluster = float(latent_cluster.detach())
@@ -2303,6 +2380,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                   f"latent-factorize {last_latent_factorization:.3f} "
                   f"latent-memory {last_latent_memory:.3f} "
                   f"latent-assoc {last_latent_association:.3f} "
+                  f"latent-compose {last_latent_composition:.3f} "
                   f"latent-neighborhood {last_latent_neighborhood:.3f} "
                   f"latent-transition {last_latent_transition:.3f} "
                   f"latent-cluster {last_latent_cluster:.3f} "
@@ -2345,6 +2423,19 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                            "latent_association_active_edges": int(
                                getattr(getattr(model, "latent_concept_memory", None),
                                        "relations", torch.zeros(0)).gt(0).sum().item()),
+                           "latent_composition_loss": last_latent_composition,
+                           "latent_composition_w": float(
+                               latent_concept_composition_w),
+                           "latent_composition_temperature": float(
+                               latent_concept_composition_temperature),
+                           "latent_composition_self_loop_w": float(
+                               latent_concept_composition_self_loop_w),
+                           "latent_composition_transitive_steps": int(
+                               latent_concept_composition_transitive_steps),
+                           "latent_composition_transitive_w": float(
+                               latent_concept_composition_transitive_w),
+                           "latent_composition_margin": float(
+                               latent_concept_composition_margin),
                            "latent_memory_size": int(
                                getattr(model, "latent_concept_memory_size", 0)),
                            "latent_memory_active": int(
@@ -2409,6 +2500,12 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         latent_concept_association_self_loop_w=0.05,
         latent_concept_association_transitive_steps=2,
         latent_concept_association_transitive_w=0.1,
+        latent_concept_composition_w=0.0,
+        latent_concept_composition_temperature=0.1,
+        latent_concept_composition_self_loop_w=0.0,
+        latent_concept_composition_transitive_steps=2,
+        latent_concept_composition_transitive_w=0.1,
+        latent_concept_composition_margin=0.0,
         latent_concept_neighborhood_w=0.0,
         latent_concept_neighborhood_temperature=0.1,
         latent_concept_neighborhood_margin=0.0,
@@ -2498,6 +2595,18 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                        latent_concept_association_transitive_steps),
                                    latent_concept_association_transitive_w=(
                                        latent_concept_association_transitive_w),
+                                   latent_concept_composition_w=(
+                                       latent_concept_composition_w),
+                                   latent_concept_composition_temperature=(
+                                       latent_concept_composition_temperature),
+                                   latent_concept_composition_self_loop_w=(
+                                       latent_concept_composition_self_loop_w),
+                                   latent_concept_composition_transitive_steps=(
+                                       latent_concept_composition_transitive_steps),
+                                   latent_concept_composition_transitive_w=(
+                                       latent_concept_composition_transitive_w),
+                                   latent_concept_composition_margin=(
+                                       latent_concept_composition_margin),
                                    latent_concept_neighborhood_w=(
                                        latent_concept_neighborhood_w),
                                    latent_concept_neighborhood_temperature=(
@@ -2648,6 +2757,17 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                   latent_concept_association_transitive_steps),
               "latent_concept_association_transitive_w": float(
                   latent_concept_association_transitive_w),
+              "latent_concept_composition_w": float(latent_concept_composition_w),
+              "latent_concept_composition_temperature": float(
+                  latent_concept_composition_temperature),
+              "latent_concept_composition_self_loop_w": float(
+                  latent_concept_composition_self_loop_w),
+              "latent_concept_composition_transitive_steps": int(
+                  latent_concept_composition_transitive_steps),
+              "latent_concept_composition_transitive_w": float(
+                  latent_concept_composition_transitive_w),
+              "latent_concept_composition_margin": float(
+                  latent_concept_composition_margin),
               "latent_concept_neighborhood_w": float(latent_concept_neighborhood_w),
               "latent_concept_neighborhood_temperature": float(
                   latent_concept_neighborhood_temperature),
@@ -2852,6 +2972,9 @@ def selftest():
     assert torch.isfinite(latent_multimodal_association_loss_from_views(
         latent_model, latent_views, temperature=0.2,
         transitive_steps=2, transitive_w=0.1))
+    assert torch.isfinite(latent_multimodal_composition_loss_from_views(
+        latent_model, latent_views, temperature=0.2,
+        transitive_steps=2, transitive_w=0.1))
     curious_examples, curious_report = multimodal_latent_curiosity_examples(
         latent_model, vocab, surfaces, n=4, seed=5, device="cpu",
         transitive_steps=2, transitive_w=0.1)
@@ -2946,6 +3069,7 @@ def selftest():
             latent_concept_factorization_w=0.1,
             latent_concept_memory_w=0.1,
             latent_concept_association_w=0.1,
+            latent_concept_composition_w=0.1,
             latent_concept_neighborhood_w=0.1,
             latent_concept_transition_w=0.1,
             latent_concept_cluster_w=0.1,
@@ -2960,6 +3084,8 @@ def selftest():
         assert auto_model.train_metrics["latent_association_transitive_steps"] == 2
         assert auto_model.train_metrics["latent_association_transitive_w"] == 0.1
         assert auto_model.train_metrics["latent_association_relation_updates"] > 0
+        assert auto_model.train_metrics["latent_composition_w"] == 0.1
+        assert auto_model.train_metrics["latent_composition_loss"] >= 0.0
         assert auto_model.study_reports[-1]["strategy"] == "curiosity"
         assert auto_model.train_metrics["latent_neighborhood_loss"] >= 0.0
         assert auto_model.train_metrics["latent_transition_loss"] >= 0.0
@@ -3164,6 +3290,25 @@ def main(argv=None):
     ap.add_argument("--latent-concept-association-transitive-w", type=float,
                     default=0.1, dest="latent_concept_association_transitive_w",
                     help="weight for multi-hop inferred latent concept associations")
+    ap.add_argument("--latent-concept-composition-w", type=float, default=0.0,
+                    dest="latent_concept_composition_w",
+                    help=("weight for graph-composition loss over self-mined "
+                          "latent concept relations"))
+    ap.add_argument("--latent-concept-composition-temperature", type=float,
+                    default=0.1, dest="latent_concept_composition_temperature",
+                    help="contrastive temperature for latent graph composition")
+    ap.add_argument("--latent-concept-composition-self-loop-w", type=float,
+                    default=0.0, dest="latent_concept_composition_self_loop_w",
+                    help="self-loop weight in latent graph composition targets")
+    ap.add_argument("--latent-concept-composition-transitive-steps", type=int,
+                    default=2, dest="latent_concept_composition_transitive_steps",
+                    help="graph walk depth for latent concept composition")
+    ap.add_argument("--latent-concept-composition-transitive-w", type=float,
+                    default=0.1, dest="latent_concept_composition_transitive_w",
+                    help="weight for multi-hop inferred concept composition")
+    ap.add_argument("--latent-concept-composition-margin", type=float, default=0.0,
+                    dest="latent_concept_composition_margin",
+                    help="minimum margin over non-target concept compositions")
     ap.add_argument("--latent-concept-neighborhood-w", type=float, default=0.0,
                     dest="latent_concept_neighborhood_w",
                     help=("weight for self-mined latent neighborhood alignment "
@@ -3388,9 +3533,11 @@ def main(argv=None):
         ap.error("--latent-concept-memory-size must be non-negative")
     if ((args.latent_concept_memory_w > 0.0
          or args.latent_concept_association_w > 0.0
+         or args.latent_concept_composition_w > 0.0
          or args.latent_concept_memory_size > 0)
             and effective_latent_slots <= 0):
-        ap.error("--latent-concept-memory/association requires --latent-concept-slots > 0")
+        ap.error("--latent-concept-memory/association/composition requires "
+                 "--latent-concept-slots > 0")
     if args.latent_concept_memory_temperature <= 0.0:
         ap.error("--latent-concept-memory-temperature must be positive")
     if (args.latent_concept_memory_momentum < 0.0
@@ -3413,6 +3560,18 @@ def main(argv=None):
         ap.error("--latent-concept-association-transitive-steps must be positive")
     if args.latent_concept_association_transitive_w < 0.0:
         ap.error("--latent-concept-association-transitive-w must be non-negative")
+    if args.latent_concept_composition_w < 0.0:
+        ap.error("--latent-concept-composition-w must be non-negative")
+    if args.latent_concept_composition_temperature <= 0.0:
+        ap.error("--latent-concept-composition-temperature must be positive")
+    if args.latent_concept_composition_self_loop_w < 0.0:
+        ap.error("--latent-concept-composition-self-loop-w must be non-negative")
+    if args.latent_concept_composition_transitive_steps < 1:
+        ap.error("--latent-concept-composition-transitive-steps must be positive")
+    if args.latent_concept_composition_transitive_w < 0.0:
+        ap.error("--latent-concept-composition-transitive-w must be non-negative")
+    if args.latent_concept_composition_margin < 0.0:
+        ap.error("--latent-concept-composition-margin must be non-negative")
     if args.latent_concept_neighborhood_w < 0.0:
         ap.error("--latent-concept-neighborhood-w must be non-negative")
     if args.latent_concept_neighborhood_w > 0.0 and effective_latent_slots <= 0:
@@ -3532,6 +3691,18 @@ def main(argv=None):
                      args.latent_concept_association_transitive_steps),
                  latent_concept_association_transitive_w=(
                      args.latent_concept_association_transitive_w),
+                 latent_concept_composition_w=(
+                     args.latent_concept_composition_w),
+                 latent_concept_composition_temperature=(
+                     args.latent_concept_composition_temperature),
+                 latent_concept_composition_self_loop_w=(
+                     args.latent_concept_composition_self_loop_w),
+                 latent_concept_composition_transitive_steps=(
+                     args.latent_concept_composition_transitive_steps),
+                 latent_concept_composition_transitive_w=(
+                     args.latent_concept_composition_transitive_w),
+                 latent_concept_composition_margin=(
+                     args.latent_concept_composition_margin),
                  latent_concept_neighborhood_w=args.latent_concept_neighborhood_w,
                  latent_concept_neighborhood_temperature=(
                      args.latent_concept_neighborhood_temperature),
