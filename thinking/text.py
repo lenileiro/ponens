@@ -88,6 +88,15 @@ class TextRecord:
 
 
 @dataclass(frozen=True)
+class ReadingRecord:
+    rec_id: str
+    split: str
+    tokens: tuple[str, ...]
+    kind: str = "raw_text"
+    meta: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class FactSchema:
     keys: tuple[tuple[str, str], ...]
     values: tuple[tuple[str, ...], ...]
@@ -181,6 +190,121 @@ def load_records(path, require_train=True, require_eval=True):
         raise ValueError(f"{path} has no train records")
     if require_eval and not any(r.split == "eval" for r in records):
         raise ValueError(f"{path} has no eval records")
+    return records
+
+
+def normalize_reading_record(raw, default_split=None, idx=0, text_field="text"):
+    if not isinstance(raw, dict):
+        raise ValueError(f"reading record {idx} must be an object")
+    split = raw.get("split", default_split or "train")
+    if split not in ("train", "eval"):
+        raise ValueError(f"reading record {idx} has invalid split {split!r}")
+    if "tokens" in raw:
+        tokens = tuple(raw["tokens"])
+    elif text_field in raw:
+        tokens = tuple(split_words(raw[text_field]))
+    elif "text" in raw:
+        tokens = tuple(split_words(raw["text"]))
+    else:
+        raise ValueError(f"reading record {idx} must contain text or tokens")
+    if not tokens or not all(isinstance(t, str) and t for t in tokens):
+        raise ValueError(f"reading record {idx} has empty/non-string tokens")
+    meta = raw.get("meta") or {}
+    if not isinstance(meta, dict):
+        raise ValueError(f"reading record {idx}.meta must be an object when provided")
+    return ReadingRecord(
+        rec_id=str(raw.get("id", f"reading-{split}-{idx}")),
+        split=split,
+        tokens=tokens,
+        kind=str(raw.get("kind", "raw_text")),
+        meta=meta,
+    )
+
+
+def _chunk_reading_tokens(tokens, max_tokens=128, min_tokens=8):
+    max_tokens = max(1, int(max_tokens))
+    min_tokens = max(1, int(min_tokens))
+    chunks = []
+    for off in range(0, len(tokens), max_tokens):
+        chunk = tuple(tokens[off:off + max_tokens])
+        if len(chunk) >= min_tokens:
+            chunks.append(chunk)
+    if not chunks and tokens:
+        chunks.append(tuple(tokens[:max_tokens]))
+    return chunks
+
+
+def reading_records_from_text(text, source, max_tokens=128, min_tokens=8,
+                              eval_frac=0.10, seed=0):
+    tokens = split_words(text)
+    chunks = _chunk_reading_tokens(tokens, max_tokens=max_tokens, min_tokens=min_tokens)
+    if not chunks:
+        raise ValueError(f"{source} produced no reading chunks")
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(chunks))
+    eval_n = max(1, int(round(len(chunks) * eval_frac))) if len(chunks) > 1 else 0
+    eval_ids = set(int(i) for i in order[:eval_n])
+    return [
+        ReadingRecord(
+            rec_id=f"{os.path.basename(str(source)) or 'reading'}-{i}",
+            split="eval" if i in eval_ids else "train",
+            tokens=chunk,
+            kind="raw_text",
+            meta={"source": str(source), "chunk_index": i},
+        )
+        for i, chunk in enumerate(chunks)
+    ]
+
+
+def _json_reading_records(data, source, text_field="text"):
+    records = []
+    if isinstance(data, list):
+        records = [normalize_reading_record(r, idx=i, text_field=text_field)
+                   for i, r in enumerate(data)]
+    elif isinstance(data, dict):
+        if "records" in data:
+            records = [normalize_reading_record(r, idx=i, text_field=text_field)
+                       for i, r in enumerate(data["records"])]
+        else:
+            for split in ("train", "eval"):
+                records.extend(normalize_reading_record(
+                    r, default_split=split, idx=i, text_field=text_field)
+                    for i, r in enumerate(data.get(split, [])))
+    if not records:
+        raise ValueError(f"{source} produced no reading records")
+    return records
+
+
+def load_reading_records(path, require_train=True, require_eval=True,
+                         text_field="text", max_tokens=128, min_tokens=8,
+                         eval_frac=0.10, seed=0):
+    if isinstance(path, (list, tuple)):
+        records = []
+        for i, p in enumerate(path):
+            records.extend(load_reading_records(
+                p, require_train=False, require_eval=False,
+                text_field=text_field, max_tokens=max_tokens,
+                min_tokens=min_tokens, eval_frac=eval_frac, seed=seed + i))
+        if require_train and not any(r.split == "train" for r in records):
+            raise ValueError(f"{path} has no train reading records")
+        if require_eval and not any(r.split == "eval" for r in records):
+            raise ValueError(f"{path} has no eval reading records")
+        return records
+    txt = _read_text_source(path)
+    if str(path).endswith(".jsonl"):
+        records = [normalize_reading_record(json.loads(line), idx=i,
+                                            text_field=text_field)
+                   for i, line in enumerate(txt.splitlines()) if line.strip()]
+    elif str(path).endswith(".json"):
+        records = _json_reading_records(json.loads(txt), path, text_field=text_field)
+    else:
+        records = reading_records_from_text(
+            txt, path, max_tokens=max_tokens, min_tokens=min_tokens,
+            eval_frac=eval_frac, seed=seed)
+    if require_train and not any(r.split == "train" for r in records):
+        raise ValueError(f"{path} has no train reading records")
+    if require_eval and not any(r.split == "eval" for r in records):
+        raise ValueError(f"{path} has no eval reading records")
     return records
 
 
@@ -1006,6 +1130,23 @@ def build_vocab(records, base_vocab=None):
     return Vocab(toks)
 
 
+def build_reading_vocab(records, base_vocab=None):
+    if base_vocab is not None:
+        itos = list(base_vocab.itos)
+        seen = set(itos)
+        new = []
+        for rec in records:
+            for tok in rec.tokens:
+                if tok not in seen:
+                    seen.add(tok)
+                    new.append(tok)
+        return vocab_from_itos(itos + sorted(new))
+    toks = []
+    for rec in records:
+        toks += list(rec.tokens)
+    return Vocab(toks)
+
+
 def build_fact_schema(records, base_schema=None):
     by_key = {}
     if base_schema is not None:
@@ -1486,6 +1627,15 @@ def pack(records, vocab, device):
     return txt, y
 
 
+def pack_reading(records, vocab, device):
+    text_ids = [vocab.enc(r.tokens) for r in records]
+    max_t = max(len(x) for x in text_ids)
+    txt = torch.full((len(records), max_t), vocab.pad, dtype=torch.long, device=device)
+    for i, ids in enumerate(text_ids):
+        txt[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+    return txt
+
+
 def batch_records(records, rng, batch):
     return [records[int(rng.integers(len(records)))] for _ in range(batch)]
 
@@ -1719,6 +1869,153 @@ def latent_text_concept_loss(model, txt, view_dropout=0.1,
     return latent_concept_vicreg_loss(
         a, b, invariance_weight=invariance_w, variance_weight=variance_w,
         covariance_weight=covariance_w, variance_target=variance_target)
+
+
+def corrupt_reading_tokens(txt, pad, unk, token_drop_p=0.15, token_replace_p=0.05):
+    out = txt.clone()
+    valid = out.ne(pad)
+    dropped = torch.zeros_like(valid)
+    if token_drop_p > 0.0:
+        dropped = torch.rand(out.shape, device=out.device).lt(float(token_drop_p)) & valid
+        out = out.masked_fill(dropped, pad)
+    if token_replace_p > 0.0:
+        replaced = (torch.rand(out.shape, device=out.device).lt(float(token_replace_p))
+                    & valid & ~dropped)
+        out = out.masked_fill(replaced, int(unk))
+    empty = out.ne(pad).sum(1).eq(0)
+    if bool(empty.any()):
+        has_token = valid.any(1)
+        rows = torch.where(empty & has_token)[0]
+        if int(rows.numel()):
+            first = valid.to(torch.long).argmax(1)
+            out[rows, first[rows]] = txt[rows, first[rows]]
+    return out
+
+
+def reading_latent_view_loss(model, txt, pad, unk, token_drop_p=0.15,
+                             token_replace_p=0.05, feature_dropout=0.1,
+                             invariance_w=25.0, variance_w=25.0,
+                             covariance_w=1.0, variance_target=1.0):
+    if getattr(model, "latent_concepts", None) is None:
+        return torch.tensor(0.0, device=txt.device)
+    view_a = corrupt_reading_tokens(
+        txt, pad, unk, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p)
+    view_b = corrupt_reading_tokens(
+        txt, pad, unk, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p)
+    a = model.latent_concept_states(view_a, feature_dropout=feature_dropout, project=True)
+    b = model.latent_concept_states(view_b, feature_dropout=feature_dropout, project=True)
+    return latent_concept_vicreg_loss(
+        a, b, invariance_weight=invariance_w, variance_weight=variance_w,
+        covariance_weight=covariance_w, variance_target=variance_target)
+
+
+def _reading_latent_pair_embeddings(model, txt, vocab, seed=0, token_drop_p=0.15,
+                                    token_replace_p=0.05):
+    torch.manual_seed(int(seed))
+    view_a = corrupt_reading_tokens(
+        txt, vocab.pad, vocab.unk, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p)
+    torch.manual_seed(int(seed) + 1)
+    view_b = corrupt_reading_tokens(
+        txt, vocab.pad, vocab.unk, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p)
+    a = model.latent_concept_states(view_a, project=True)
+    b = model.latent_concept_states(view_b, project=True)
+    a = F.normalize(a.reshape(a.shape[0], -1), dim=-1)
+    b = F.normalize(b.reshape(b.shape[0], -1), dim=-1)
+    return a, b
+
+
+def eval_reading_records(records, n=0, seed=0):
+    rows = [r for r in records if r.split == "eval"]
+    if n < 0:
+        return []
+    if n and n < len(rows):
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(rows), size=n, replace=False)
+        rows = [rows[int(i)] for i in idx]
+    return rows
+
+
+def reading_latent_retrieval_eval(model, vocab, records, device=DEV, n=0, seed=0,
+                                  token_drop_p=0.15, token_replace_p=0.05):
+    if getattr(model, "latent_concepts", None) is None:
+        return {"paired_view_acc": 0.0, "n_records": 0, "sampled": False,
+                "skipped": True}
+    selected = eval_reading_records(records, n=n, seed=seed)
+    if not selected:
+        return {"paired_view_acc": 0.0, "n_records": 0, "sampled": False,
+                "skipped": True}
+    correct = total = 0
+    pos_sum = neg_sum = 0.0
+    neg_count = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(selected), 64):
+            batch = selected[off:off + 64]
+            txt = pack_reading(batch, vocab, device)
+            a, b = _reading_latent_pair_embeddings(
+                model, txt, vocab, seed=seed + off * 2,
+                token_drop_p=token_drop_p,
+                token_replace_p=token_replace_p)
+            sim = a.matmul(b.t())
+            nearest = sim.argmax(-1)
+            target = torch.arange(sim.shape[0], device=sim.device)
+            correct += int(nearest.eq(target).sum())
+            total += int(sim.shape[0])
+            pos_sum += float(sim.diag().sum())
+            if sim.shape[0] > 1:
+                eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+                neg_sum += float(sim.masked_select(~eye).sum())
+                neg_count += int((~eye).sum())
+    eval_count = len([r for r in records if r.split == "eval"])
+    return {"paired_view_acc": correct / max(1, total),
+            "positive_cosine": pos_sum / max(1, total),
+            "negative_cosine": neg_sum / max(1, neg_count),
+            "margin": (pos_sum / max(1, total)) - (neg_sum / max(1, neg_count)),
+            "n_records": total,
+            "sampled": bool(n > 0 and n < eval_count),
+            "skipped": False}
+
+
+def reading_latent_record_outcomes(model, vocab, records, device=DEV, n=0, seed=0,
+                                   token_drop_p=0.15, token_replace_p=0.05):
+    if getattr(model, "latent_concepts", None) is None:
+        return [], [], {"n_records": 0, "sampled": False, "n_error_records": 0,
+                        "n_correct_records": 0, "paired_view_acc": 0.0,
+                        "skipped": True}
+    candidates = [r for r in records if r.split == "train"]
+    sampled = bool(n and n < len(candidates))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=n, replace=False)
+        candidates = [candidates[int(i)] for i in idx]
+    errors = []
+    correct = []
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(candidates), 64):
+            batch = candidates[off:off + 64]
+            txt = pack_reading(batch, vocab, device)
+            a, b = _reading_latent_pair_embeddings(
+                model, txt, vocab, seed=seed + off * 2,
+                token_drop_p=token_drop_p,
+                token_replace_p=token_replace_p)
+            nearest = a.matmul(b.t()).argmax(-1)
+            for i, rec in enumerate(batch):
+                if int(nearest[i]) == i:
+                    correct.append(rec)
+                else:
+                    errors.append(rec)
+    total = len(candidates)
+    return errors, correct, {"n_records": total,
+                             "sampled": sampled,
+                             "n_error_records": len(errors),
+                             "n_correct_records": len(correct),
+                             "paired_view_acc": len(correct) / max(1, total),
+                             "skipped": False}
 
 
 def latent_fact_concept_loss(model, txt, records, schema):
@@ -3980,6 +4277,200 @@ def train_model(records, steps=400, batch=32, d=96, layers=3, heads=4,
                      choice_control_margin=choice_control_margin)
 
 
+def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
+                         seed=0, device=DEV, log_every=100,
+                         token_drop_p=0.15, token_replace_p=0.05,
+                         feature_dropout=0.1,
+                         invariance_w=25.0, variance_w=25.0,
+                         covariance_w=1.0, variance_target=1.0,
+                         study_strategy="errors", study_probe_n=0,
+                         study_hard_max=0, study_refresh_steps=0):
+    if getattr(model, "latent_concepts", None) is None:
+        raise ValueError("raw reading concept training requires latent concept slots")
+    study_strategy = str(study_strategy)
+    if study_strategy not in ("random", "errors"):
+        raise ValueError(f"unknown reading study strategy {study_strategy!r}")
+    rng = np.random.default_rng(seed)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    train_records = [r for r in records if r.split == "train"]
+    if not train_records:
+        raise ValueError("cannot train reading concepts without train records")
+    study_pool = []
+    study_reports = []
+    last_loss = 0.0
+
+    def refresh_study_pool(step):
+        nonlocal study_pool
+        probe_n = int(study_probe_n) if int(study_probe_n) > 0 else max(batch * 4, 1)
+        hard, _correct, report = reading_latent_record_outcomes(
+            model, vocab, records, device=device, n=probe_n, seed=seed + 1301 + int(step),
+            token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+        selected = list(hard)
+        if study_hard_max and len(selected) > int(study_hard_max):
+            cap_rng = np.random.default_rng(seed + 1759 + int(step))
+            idx = cap_rng.choice(len(selected), size=int(study_hard_max), replace=False)
+            selected = [selected[int(i)] for i in idx]
+            report = report | {"capped": True, "n_error_records_used": len(selected)}
+        else:
+            report = report | {"capped": False, "n_error_records_used": len(selected)}
+        if selected:
+            study_pool = selected
+        report = report | {"step": int(step), "pool_active": bool(study_pool),
+                           "pool_size": len(study_pool)}
+        study_reports.append(report)
+
+    for st in range(1, steps + 1):
+        model.train()
+        if study_strategy == "errors" and (st == 1 or (
+                study_refresh_steps and (st - 1) % int(study_refresh_steps) == 0)):
+            refresh_study_pool(st)
+            model.train()
+        source = study_pool if study_strategy == "errors" and study_pool else train_records
+        rec_batch = batch_records(source, rng, batch)
+        txt = pack_reading(rec_batch, vocab, device)
+        loss = reading_latent_view_loss(
+            model, txt, vocab.pad, vocab.unk, token_drop_p=token_drop_p,
+            token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+            invariance_w=invariance_w, variance_w=variance_w,
+            covariance_w=covariance_w, variance_target=variance_target)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        last_loss = float(loss.detach())
+        if st % log_every == 0 or st == steps:
+            print(f"  reading {st}/{steps} loss {last_loss:.3f}", flush=True)
+    model.reading_train_metrics = {"latent_view_loss": last_loss}
+    model.reading_study_reports = study_reports
+    return model, vocab
+
+
+def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4,
+                           text_encoder_arch="transformer", text_encoder_layers=1,
+                           latent_concept_slots=4, latent_concept_layers=1,
+                           latent_concept_prefix=False,
+                           latent_concept_refine=False,
+                           latent_concept_refine_gate_init=-2.0,
+                           lr=1e-3, seed=0, device=DEV, log_every=100,
+                           token_drop_p=0.15, token_replace_p=0.05,
+                           feature_dropout=0.1,
+                           invariance_w=25.0, variance_w=25.0,
+                           covariance_w=1.0, variance_target=1.0,
+                           study_strategy="errors", study_probe_n=0,
+                           study_hard_max=0, study_refresh_steps=0):
+    if int(latent_concept_slots) <= 0:
+        raise ValueError("raw reading concept training requires latent_concept_slots > 0")
+    torch.manual_seed(seed)
+    vocab = build_reading_vocab(records)
+    model = TextFactLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
+                       fact_schema=None,
+                       text_encoder_arch=text_encoder_arch,
+                       text_encoder_layers=text_encoder_layers,
+                       latent_concept_slots=latent_concept_slots,
+                       latent_concept_layers=latent_concept_layers,
+                       latent_concept_prefix=latent_concept_prefix,
+                       latent_concept_refine=latent_concept_refine,
+                       latent_concept_refine_gate_init=(
+                           latent_concept_refine_gate_init)).to(device)
+    return fit_reading_concepts(
+        model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
+        device=device, log_every=log_every, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+        invariance_w=invariance_w, variance_w=variance_w,
+        covariance_w=covariance_w, variance_target=variance_target,
+        study_strategy=study_strategy, study_probe_n=study_probe_n,
+        study_hard_max=study_hard_max, study_refresh_steps=study_refresh_steps)
+
+
+def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
+                         text_encoder_arch="transformer", text_encoder_layers=1,
+                         latent_concept_slots=4, latent_concept_layers=1,
+                         latent_concept_prefix=False, latent_concept_refine=False,
+                         latent_concept_refine_gate_init=-2.0,
+                         lr=1e-3, seed=0, device=DEV, log_every=100,
+                         token_drop_p=0.15, token_replace_p=0.05,
+                         feature_dropout=0.1,
+                         invariance_w=25.0, variance_w=25.0,
+                         covariance_w=1.0, variance_target=1.0,
+                         study_strategy="errors", study_probe_n=0,
+                         study_hard_max=0, study_refresh_steps=0,
+                         text_field="text", max_tokens=128, min_tokens=8,
+                         eval_frac=0.10, eval_n=64, out=None, checkpoint=None):
+    records = load_reading_records(
+        data, text_field=text_field, max_tokens=max_tokens, min_tokens=min_tokens,
+        eval_frac=eval_frac, seed=seed)
+    torch.manual_seed(seed)
+    vocab = build_reading_vocab(records)
+    model = TextFactLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
+                       fact_schema=None,
+                       text_encoder_arch=text_encoder_arch,
+                       text_encoder_layers=text_encoder_layers,
+                       latent_concept_slots=latent_concept_slots,
+                       latent_concept_layers=latent_concept_layers,
+                       latent_concept_prefix=latent_concept_prefix,
+                       latent_concept_refine=latent_concept_refine,
+                       latent_concept_refine_gate_init=(
+                           latent_concept_refine_gate_init)).to(device)
+    before = reading_latent_retrieval_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 17,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    fit_reading_concepts(
+        model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
+        device=device, log_every=log_every, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+        invariance_w=invariance_w, variance_w=variance_w,
+        covariance_w=covariance_w, variance_target=variance_target,
+        study_strategy=study_strategy, study_probe_n=study_probe_n,
+        study_hard_max=study_hard_max, study_refresh_steps=study_refresh_steps)
+    after = reading_latent_retrieval_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 17,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    report = {"experiment": "text_raw_reading_concept_pretrain",
+              "data": data,
+              "steps": int(steps), "batch": int(batch), "lr": float(lr),
+              "text_encoder_arch": text_encoder_arch,
+              "text_encoder_layers": int(text_encoder_layers),
+              "latent_concept_slots": int(latent_concept_slots),
+              "latent_concept_layers": int(latent_concept_layers),
+              "latent_concept_prefix": bool(latent_concept_prefix),
+              "latent_concept_refine": bool(latent_concept_refine),
+              "latent_concept_refine_gate_init": float(
+                  latent_concept_refine_gate_init),
+              "token_drop_p": float(token_drop_p),
+              "token_replace_p": float(token_replace_p),
+              "feature_dropout": float(feature_dropout),
+              "invariance_w": float(invariance_w),
+              "variance_w": float(variance_w),
+              "covariance_w": float(covariance_w),
+              "variance_target": float(variance_target),
+              "study_strategy": study_strategy,
+              "study_probe_n": int(study_probe_n),
+              "study_hard_max": int(study_hard_max),
+              "study_refresh_steps": int(study_refresh_steps),
+              "train_records": sum(r.split == "train" for r in records),
+              "eval_records": sum(r.split == "eval" for r in records),
+              "vocab_size": len(vocab),
+              "before": before,
+              "after": after,
+              "delta": {
+                  "paired_view_acc": (
+                      after["paired_view_acc"] - before["paired_view_acc"]),
+                  "margin": after.get("margin", 0.0) - before.get("margin", 0.0),
+              },
+              "train_metrics": getattr(model, "reading_train_metrics", {}),
+              "study_hard_examples": getattr(model, "reading_study_reports", [])}
+    if checkpoint:
+        os.makedirs(os.path.dirname(checkpoint) or ".", exist_ok=True)
+        torch.save(checkpoint_payload(model, vocab, d, layers, heads, report),
+                   checkpoint)
+        report["checkpoint"] = checkpoint
+    if out:
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        with open(out, "w") as f:
+            json.dump(report, f, indent=1)
+    print(json.dumps(report, indent=1), flush=True)
+    return report
+
+
 def fact_scores(pred, gold):
     p, g = set(pred), set(gold)
     tp = len(p & g)
@@ -5386,6 +5877,12 @@ def expanded_checkpoint_model(checkpoint, records, device=DEV):
 
 
 def checkpoint_payload(model, vocab, d, layers, heads, report):
+    fact_schema = None
+    if model.fact_schema is not None:
+        fact_schema = {
+            "keys": model.fact_schema.keys,
+            "values": model.fact_schema.values,
+        }
     return {"state_dict": model.state_dict(), "vocab": vocab.itos,
             "fact_concept_prefix": bool(getattr(model, "fact_concept_prefix", False)),
             "fact_concept_refine": bool(getattr(model, "fact_concept_refine", False)),
@@ -5405,10 +5902,8 @@ def checkpoint_payload(model, vocab, d, layers, heads, report):
                 getattr(model, "latent_concept_refine_gate_init", -2.0)),
             "text_encoder_arch": getattr(model, "text_encoder_arch", "transformer"),
             "text_encoder_layers": int(getattr(model, "text_encoder_layers", 1)),
-            "d": d, "layers": layers, "heads": heads, "fact_schema": {
-                "keys": model.fact_schema.keys,
-                "values": model.fact_schema.values,
-            }, "report": report}
+            "d": d, "layers": layers, "heads": heads, "fact_schema": fact_schema,
+            "report": report}
 
 
 def clone_model_state(model):
@@ -7366,6 +7861,42 @@ def selftest():
     latent_errors_only, latent_error_report = latent_fact_record_errors(
         latent_mining_model, vocab, records[:2], device="cpu", n=0, seed=0)
     assert latent_error_report["n_error_records"] == len(latent_errors_only)
+    reading_records = [
+        ReadingRecord("read-train-1", "train",
+                      tuple(split_words("language concepts connect across repeated views"))),
+        ReadingRecord("read-train-2", "train",
+                      tuple(split_words("models can revise concepts from reading"))),
+        ReadingRecord("read-eval-1", "eval",
+                      tuple(split_words("reading updates should preserve concept identity"))),
+        ReadingRecord("read-eval-2", "eval",
+                      tuple(split_words("self teaching compares two views of text"))),
+    ]
+    reading_vocab = build_reading_vocab(reading_records)
+    reading_model = TextFactLM(
+        len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
+        fact_schema=None, latent_concept_slots=2).to("cpu")
+    reading_txt = pack_reading(reading_records[:2], reading_vocab, "cpu")
+    reading_loss = reading_latent_view_loss(
+        reading_model, reading_txt, reading_vocab.pad, reading_vocab.unk,
+        token_drop_p=0.1, token_replace_p=0.0)
+    assert torch.isfinite(reading_loss)
+    reading_errors, reading_correct, reading_report = reading_latent_record_outcomes(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0,
+        token_drop_p=0.1, token_replace_p=0.0)
+    assert reading_report["n_error_records"] + reading_report["n_correct_records"] == 2
+    assert len(reading_errors) + len(reading_correct) == 2
+    reading_eval = reading_latent_retrieval_eval(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0,
+        token_drop_p=0.1, token_replace_p=0.0)
+    assert reading_eval["n_records"] == 2
+    fit_reading_concepts(
+        reading_model, reading_vocab, reading_records, steps=1, batch=2, lr=1e-4,
+        seed=5, device="cpu", log_every=1, token_drop_p=0.1,
+        token_replace_p=0.0, study_strategy="errors", study_probe_n=2,
+        study_hard_max=2)
+    reading_payload = checkpoint_payload(reading_model, reading_vocab, 32, 1, 4,
+                                         {"experiment": "reading-selftest"})
+    assert reading_payload["fact_schema"] is None
     score_a = {"semantic_head": {"fact_value_acc": 0.8},
                "teacher_forced": {"fact_value_acc": 0.7},
                "latent_fact_concept_head": {"fact_value_acc": 0.65,
@@ -7535,6 +8066,36 @@ def main(argv=None):
     ap.add_argument("--grounded-counterfactual", type=int, default=300)
     ap.add_argument("--data", action="append",
                     help="JSON/JSONL semantic text records; repeat to mix datasets")
+    ap.add_argument("--reading-data", action="append",
+                    help=("raw reading JSON/JSONL/TXT corpus; trains schema-free latent "
+                          "concepts without fact labels"))
+    ap.add_argument("--reading-text-field", default="text",
+                    help="JSON object field to read for --reading-data records")
+    ap.add_argument("--reading-max-tokens", type=int, default=128,
+                    help="maximum tokens per raw reading chunk")
+    ap.add_argument("--reading-min-tokens", type=int, default=8,
+                    help="minimum tokens per raw reading chunk")
+    ap.add_argument("--reading-eval-frac", type=float, default=0.10,
+                    help="fraction of plain-text chunks held out for reading eval")
+    ap.add_argument("--reading-eval-n", type=int, default=64,
+                    help="sample this many eval chunks for paired-view retrieval")
+    ap.add_argument("--reading-lr", type=float, default=1e-3,
+                    help="learning rate for raw reading concept pretraining")
+    ap.add_argument("--reading-token-drop", type=float, default=0.15,
+                    help="token dropout probability for raw reading views")
+    ap.add_argument("--reading-token-replace", type=float, default=0.05,
+                    help="UNK replacement probability for raw reading views")
+    ap.add_argument("--reading-feature-dropout", type=float, default=0.1,
+                    help="encoder feature dropout for raw reading latent views")
+    ap.add_argument("--reading-study-strategy", choices=("random", "errors"),
+                    default="errors",
+                    help="train raw reading on random chunks or mined retrieval failures")
+    ap.add_argument("--reading-study-probe-n", type=int, default=0,
+                    help="number of train chunks to probe for raw reading hard examples")
+    ap.add_argument("--reading-study-hard-max", type=int, default=0,
+                    help="cap raw reading hard-example pool size")
+    ap.add_argument("--reading-study-refresh-steps", type=int, default=0,
+                    help="refresh raw reading hard examples every N steps; 0 means once")
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--d", type=int, default=96)
@@ -7950,16 +8511,17 @@ def main(argv=None):
         ap.error("--latent-concept-slots must be non-negative")
     if args.latent_concept_layers <= 0:
         ap.error("--latent-concept-layers must be positive")
+    effective_latent_slots = args.latent_concept_slots or (4 if args.reading_data else 0)
     if args.latent_concept_w < 0.0:
         ap.error("--latent-concept-w must be non-negative")
-    if args.latent_concept_w > 0.0 and args.latent_concept_slots <= 0:
+    if args.latent_concept_w > 0.0 and effective_latent_slots <= 0:
         ap.error("--latent-concept-w requires --latent-concept-slots > 0")
     if args.latent_concept_fact_w < 0.0:
         ap.error("--latent-concept-fact-w must be non-negative")
-    if args.latent_concept_fact_w > 0.0 and args.latent_concept_slots <= 0:
+    if args.latent_concept_fact_w > 0.0 and effective_latent_slots <= 0:
         ap.error("--latent-concept-fact-w requires --latent-concept-slots > 0")
     if ((args.latent_concept_prefix or args.latent_concept_refine)
-            and args.latent_concept_slots <= 0):
+            and effective_latent_slots <= 0):
         ap.error("latent concept prefix/refine require --latent-concept-slots > 0")
     if not math.isfinite(args.latent_concept_refine_gate_init):
         ap.error("--latent-concept-refine-gate-init must be finite")
@@ -7971,6 +8533,30 @@ def main(argv=None):
         ap.error("latent concept loss weights must be non-negative")
     if args.latent_concept_variance_target < 0.0:
         ap.error("--latent-concept-variance-target must be non-negative")
+    if args.reading_max_tokens <= 0:
+        ap.error("--reading-max-tokens must be positive")
+    if args.reading_min_tokens <= 0:
+        ap.error("--reading-min-tokens must be positive")
+    if args.reading_min_tokens > args.reading_max_tokens:
+        ap.error("--reading-min-tokens must be <= --reading-max-tokens")
+    if args.reading_eval_frac < 0.0 or args.reading_eval_frac >= 1.0:
+        ap.error("--reading-eval-frac must be in [0, 1)")
+    if args.reading_eval_n < 0:
+        ap.error("--reading-eval-n must be non-negative")
+    if args.reading_lr <= 0.0:
+        ap.error("--reading-lr must be positive")
+    if args.reading_token_drop < 0.0 or args.reading_token_drop >= 1.0:
+        ap.error("--reading-token-drop must be in [0, 1)")
+    if args.reading_token_replace < 0.0 or args.reading_token_replace >= 1.0:
+        ap.error("--reading-token-replace must be in [0, 1)")
+    if args.reading_feature_dropout < 0.0 or args.reading_feature_dropout >= 1.0:
+        ap.error("--reading-feature-dropout must be in [0, 1)")
+    if args.reading_study_probe_n < 0:
+        ap.error("--reading-study-probe-n must be non-negative")
+    if args.reading_study_hard_max < 0:
+        ap.error("--reading-study-hard-max must be non-negative")
+    if args.reading_study_refresh_steps < 0:
+        ap.error("--reading-study-refresh-steps must be non-negative")
     if args.import_scan:
         import_scan(args.out, url=args.scan_url, max_records=args.scan_max,
                     eval_frac=args.scan_eval_frac, seed=args.seed)
@@ -8008,6 +8594,38 @@ def main(argv=None):
         import_grounded(args.out, surfaces_path=args.grounded_surfaces,
                         max_train=args.grounded_train, max_eval=args.grounded_eval,
                         counterfactual_n=args.grounded_counterfactual, seed=args.seed)
+        return
+    if args.reading_data:
+        run_reading_concepts(
+            args.reading_data, steps=args.steps, batch=args.batch, d=args.d,
+            layers=args.layers, heads=args.heads,
+            text_encoder_arch=args.text_encoder_arch,
+            text_encoder_layers=args.text_encoder_layers,
+            latent_concept_slots=args.latent_concept_slots or 4,
+            latent_concept_layers=args.latent_concept_layers,
+            latent_concept_prefix=args.latent_concept_prefix,
+            latent_concept_refine=args.latent_concept_refine,
+            latent_concept_refine_gate_init=args.latent_concept_refine_gate_init,
+            lr=args.reading_lr, seed=args.seed, device=DEV,
+            log_every=max(1, args.steps if args.steps < args.batch else args.batch),
+            token_drop_p=args.reading_token_drop,
+            token_replace_p=args.reading_token_replace,
+            feature_dropout=args.reading_feature_dropout,
+            invariance_w=args.latent_concept_invariance_w,
+            variance_w=args.latent_concept_variance_w,
+            covariance_w=args.latent_concept_covariance_w,
+            variance_target=args.latent_concept_variance_target,
+            study_strategy=args.reading_study_strategy,
+            study_probe_n=args.reading_study_probe_n,
+            study_hard_max=args.reading_study_hard_max,
+            study_refresh_steps=args.reading_study_refresh_steps,
+            text_field=args.reading_text_field,
+            max_tokens=args.reading_max_tokens,
+            min_tokens=args.reading_min_tokens,
+            eval_frac=args.reading_eval_frac,
+            eval_n=args.reading_eval_n,
+            out=args.out,
+            checkpoint=args.checkpoint)
         return
     if not args.data:
         raise SystemExit("--data is required unless --selftest is set")
