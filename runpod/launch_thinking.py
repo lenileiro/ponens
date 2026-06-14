@@ -1524,6 +1524,16 @@ def payload(args):
                 f"{args.multimodal_latent_concept_graph_predict_target_power} "
                 f"--latent-concept-bridge-w "
                 f"{args.multimodal_latent_concept_bridge_w} "
+                f"--latent-concept-completion-w "
+                f"{args.multimodal_latent_concept_completion_w} "
+                f"--latent-concept-completion-temperature "
+                f"{args.multimodal_latent_concept_completion_temperature} "
+                f"--latent-concept-completion-probe-n "
+                f"{args.multimodal_latent_concept_completion_probe_n} "
+                f"--latent-concept-completion-hard-max "
+                f"{args.multimodal_latent_concept_completion_hard_max} "
+                f"--latent-concept-completion-refresh-steps "
+                f"{args.multimodal_latent_concept_completion_refresh_steps} "
                 f"--latent-concept-sequence-w "
                 f"{args.multimodal_latent_concept_sequence_w} "
                 f"--latent-concept-sequence-batch "
@@ -3163,6 +3173,18 @@ def main():
                     dest="multimodal_latent_concept_graph_predict_target_power")
     ap.add_argument("--multimodal-latent-concept-bridge-w", type=float, default=0.0,
                     dest="multimodal_latent_concept_bridge_w")
+    ap.add_argument("--multimodal-latent-concept-completion-w", type=float,
+                    default=0.0, dest="multimodal_latent_concept_completion_w")
+    ap.add_argument("--multimodal-latent-concept-completion-temperature",
+                    type=float, default=0.1,
+                    dest="multimodal_latent_concept_completion_temperature")
+    ap.add_argument("--multimodal-latent-concept-completion-probe-n", type=int,
+                    default=0, dest="multimodal_latent_concept_completion_probe_n")
+    ap.add_argument("--multimodal-latent-concept-completion-hard-max", type=int,
+                    default=0, dest="multimodal_latent_concept_completion_hard_max")
+    ap.add_argument("--multimodal-latent-concept-completion-refresh-steps",
+                    type=int, default=0,
+                    dest="multimodal_latent_concept_completion_refresh_steps")
     ap.add_argument("--multimodal-latent-concept-sequence-w", type=float, default=0.0,
                     dest="multimodal_latent_concept_sequence_w")
     ap.add_argument("--multimodal-latent-concept-sequence-batch", type=int,
@@ -4100,6 +4122,14 @@ def main():
                 args.multimodal_latent_concept_graph_predict_transitive_w),
             "--multimodal-latent-concept-bridge-w": (
                 args.multimodal_latent_concept_bridge_w),
+            "--multimodal-latent-concept-completion-w": (
+                args.multimodal_latent_concept_completion_w),
+            "--multimodal-latent-concept-completion-probe-n": (
+                args.multimodal_latent_concept_completion_probe_n),
+            "--multimodal-latent-concept-completion-hard-max": (
+                args.multimodal_latent_concept_completion_hard_max),
+            "--multimodal-latent-concept-completion-refresh-steps": (
+                args.multimodal_latent_concept_completion_refresh_steps),
             "--multimodal-latent-concept-sequence-w": (
                 args.multimodal_latent_concept_sequence_w),
             "--multimodal-latent-concept-sequence-batch": (
@@ -4150,6 +4180,7 @@ def main():
             args.multimodal_latent_concept_composition_w,
             args.multimodal_latent_concept_graph_predict_w,
             args.multimodal_latent_concept_bridge_w,
+            args.multimodal_latent_concept_completion_w,
             args.multimodal_latent_concept_sequence_w,
             args.multimodal_latent_concept_neighborhood_w,
             args.multimodal_latent_concept_transition_w,
@@ -4158,7 +4189,8 @@ def main():
         if ((any(w > 0.0 for w in multimodal_latent_weights)
              or args.multimodal_latent_concept_memory_size > 0
              or args.multimodal_latent_concept_fer_hard_max > 0
-             or args.multimodal_latent_concept_discovery_hard_max > 0)
+             or args.multimodal_latent_concept_discovery_hard_max > 0
+             or args.multimodal_latent_concept_completion_hard_max > 0)
                 and args.multimodal_latent_concept_slots <= 0):
             sys.exit(
                 "ERROR: multimodal latent concept options require "
@@ -4190,6 +4222,8 @@ def main():
                 args.multimodal_latent_concept_composition_temperature),
             "--multimodal-latent-concept-graph-predict-temperature": (
                 args.multimodal_latent_concept_graph_predict_temperature),
+            "--multimodal-latent-concept-completion-temperature": (
+                args.multimodal_latent_concept_completion_temperature),
             "--multimodal-latent-concept-sequence-temperature": (
                 args.multimodal_latent_concept_sequence_temperature),
             "--multimodal-latent-concept-neighborhood-temperature": (

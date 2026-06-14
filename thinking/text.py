@@ -35,6 +35,7 @@ from .concepts import (
     latent_concept_bridge_loss,
     latent_concept_bridge_scores,
     latent_concept_completion_loss,
+    latent_concept_completion_scores,
     latent_concept_composition_loss,
     latent_concept_graph_cycle_loss,
     latent_concept_graph_cycle_scores,
@@ -2711,59 +2712,25 @@ def reading_context_closure_surprise_records(
                 suffix_txt, feature_dropout=feature_dropout, project=False)
             full_slots = model.latent_concept_states(
                 txt, feature_dropout=0.0, project=False)
-            prefix_pred = model.reading_predictor(prefix_slots)
-            suffix_pred = model.reading_predictor(suffix_slots)
-            prefix_pred = F.normalize(
-                prefix_pred.reshape(prefix_pred.shape[0], -1), dim=-1)
-            suffix_pred = F.normalize(
-                suffix_pred.reshape(suffix_pred.shape[0], -1), dim=-1)
-            target = F.normalize(
-                full_slots.detach().reshape(full_slots.shape[0], -1), dim=-1)
-            prefix_sim = prefix_pred.matmul(target.t())
-            suffix_sim = suffix_pred.matmul(target.t())
-            labels = torch.arange(prefix_sim.shape[0], device=prefix_sim.device)
-            if prefix_sim.shape[0] > 1:
-                prefix_ce = F.cross_entropy(
-                    prefix_sim / temp, labels, reduction="none")
-                suffix_ce = F.cross_entropy(
-                    suffix_sim / temp, labels, reduction="none")
-                eye = torch.eye(
-                    prefix_sim.shape[0], dtype=torch.bool,
-                    device=prefix_sim.device)
-                prefix_pos = prefix_sim.diag()
-                suffix_pos = suffix_sim.diag()
-                prefix_hard = prefix_sim.masked_fill(eye, -float("inf")).max(-1).values
-                suffix_hard = suffix_sim.masked_fill(eye, -float("inf")).max(-1).values
-                prefix_hard = torch.where(
-                    torch.isfinite(prefix_hard), prefix_hard,
-                    torch.zeros_like(prefix_pos))
-                suffix_hard = torch.where(
-                    torch.isfinite(suffix_hard), suffix_hard,
-                    torch.zeros_like(suffix_pos))
-                prefix_rank = (
-                    prefix_sim.ge(prefix_pos[:, None]).sum(-1).to(prefix_sim.dtype)
-                    - 1.0)
-                suffix_rank = (
-                    suffix_sim.ge(suffix_pos[:, None]).sum(-1).to(suffix_sim.dtype)
-                    - 1.0)
-                prefix_surprise = prefix_ce + F.relu(prefix_hard - prefix_pos)
-                suffix_surprise = suffix_ce + F.relu(suffix_hard - suffix_pos)
-            else:
-                prefix_pos = (prefix_pred * target).sum(-1)
-                suffix_pos = (suffix_pred * target).sum(-1)
-                zero = prefix_pos * 0.0
-                prefix_ce = zero
-                suffix_ce = zero
-                prefix_hard = zero
-                suffix_hard = zero
-                prefix_rank = zero
-                suffix_rank = zero
-                prefix_surprise = zero
-                suffix_surprise = zero
-            mean_cosine = 0.5 * (prefix_pos + suffix_pos)
-            closure_surprise = (
-                0.5 * (prefix_surprise + suffix_surprise)
-                + F.relu(1.0 - mean_cosine))
+            closure_surprise, closure_parts = latent_concept_completion_scores(
+                model.reading_predictor,
+                {"prefix": prefix_slots, "suffix": suffix_slots},
+                full_slots, temperature=temp)
+            mode_parts = closure_parts.get("modes", {})
+            prefix_parts = mode_parts.get("prefix", {})
+            suffix_parts = mode_parts.get("suffix", {})
+            zero = closure_surprise.new_zeros(closure_surprise.shape)
+            prefix_surprise = prefix_parts.get("surprise", zero)
+            suffix_surprise = suffix_parts.get("surprise", zero)
+            prefix_ce = prefix_parts.get("cross_entropy", zero)
+            suffix_ce = suffix_parts.get("cross_entropy", zero)
+            mean_cosine = closure_parts.get("positive_cosine", zero)
+            prefix_pos = prefix_parts.get("positive_cosine", zero)
+            suffix_pos = suffix_parts.get("positive_cosine", zero)
+            prefix_hard = prefix_parts.get("hard_negative_cosine", zero)
+            suffix_hard = suffix_parts.get("hard_negative_cosine", zero)
+            prefix_rank = prefix_parts.get("rank", zero)
+            suffix_rank = suffix_parts.get("rank", zero)
             valid_count = txt.ne(vocab.pad).sum(1).clamp_min(1)
             prefix_rate = (
                 prefix_txt.ne(vocab.pad).sum(1).to(dtype=torch.float32)
