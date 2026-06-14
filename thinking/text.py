@@ -2377,6 +2377,87 @@ def reading_latent_graph_prediction_records(
                       "skipped": False}
 
 
+def reading_latent_graph_cycle_records(
+        model, vocab, records, device=DEV, n=0, seed=0, context_keep_p=0.5,
+        feature_dropout=0.0, temperature=0.1, self_loop_w=0.05,
+        transitive_steps=2, transitive_w=0.1, target_power=1.0,
+        cycle_w=0.5):
+    memory = getattr(model, "latent_concept_memory", None)
+    if getattr(model, "latent_concepts", None) is None or memory is None:
+        return [], {"n_records": 0, "sampled": False, "n_selected": 0,
+                    "mean_score": 0.0, "max_score": 0.0,
+                    "mean_forward_kl": 0.0, "mean_reverse_kl": 0.0,
+                    "mean_source_cycle_kl": 0.0, "mean_target_cycle_kl": 0.0,
+                    "skipped": True}
+    candidates = [r for r in records if r.split == "train"]
+    sampled = bool(n and n < len(candidates))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=n, replace=False)
+        candidates = [candidates[int(i)] for i in idx]
+    scored = []
+    score_values = []
+    forward_values = []
+    reverse_values = []
+    source_cycle_values = []
+    target_cycle_values = []
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(candidates), 64):
+            batch = candidates[off:off + 64]
+            txt = pack_reading(batch, vocab, device)
+            context_txt, heldout_txt = split_reading_context_target(
+                txt, vocab.pad, context_keep_p=context_keep_p)
+            source_slots = model.latent_concept_states(
+                context_txt, feature_dropout=feature_dropout, project=True)
+            heldout_slots = model.latent_concept_states(
+                heldout_txt, feature_dropout=0.0, project=True)
+            if hasattr(model, "latent_concept_graph_cycle_scores"):
+                scores, parts = model.latent_concept_graph_cycle_scores(
+                    source_slots, heldout_slots, temperature=temperature,
+                    self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+                    transitive_w=transitive_w, target_power=target_power,
+                    cycle_w=cycle_w)
+            else:
+                scores, parts = latent_concept_graph_cycle_scores(
+                    source_slots, heldout_slots, memory.active(),
+                    memory.active_prediction_relations(), temperature=temperature,
+                    self_loop_w=self_loop_w,
+                    transitive_steps=transitive_steps,
+                    transitive_w=transitive_w, target_power=target_power,
+                    cycle_w=cycle_w)
+            forward = parts.get("forward_kl", scores.new_zeros(scores.shape))
+            reverse = parts.get("reverse_kl", scores.new_zeros(scores.shape))
+            source_cycle = parts.get("source_cycle_kl", scores.new_zeros(scores.shape))
+            target_cycle = parts.get("target_cycle_kl", scores.new_zeros(scores.shape))
+            for i, rec in enumerate(batch):
+                score = float(scores[i].detach().cpu())
+                scored.append((score, rec))
+                score_values.append(score)
+                forward_values.append(float(forward[i].detach().cpu()))
+                reverse_values.append(float(reverse[i].detach().cpu()))
+                source_cycle_values.append(float(source_cycle[i].detach().cpu()))
+                target_cycle_values.append(float(target_cycle[i].detach().cpu()))
+    scored.sort(key=lambda row: row[0], reverse=True)
+    selected = [rec for _score, rec in scored]
+    return selected, {"n_records": len(candidates),
+                      "sampled": sampled,
+                      "n_selected": len(selected),
+                      "mean_score": float(np.mean(score_values)) if score_values else 0.0,
+                      "max_score": float(max(score_values)) if score_values else 0.0,
+                      "mean_forward_kl": (
+                          float(np.mean(forward_values)) if forward_values else 0.0),
+                      "mean_reverse_kl": (
+                          float(np.mean(reverse_values)) if reverse_values else 0.0),
+                      "mean_source_cycle_kl": (
+                          float(np.mean(source_cycle_values))
+                          if source_cycle_values else 0.0),
+                      "mean_target_cycle_kl": (
+                          float(np.mean(target_cycle_values))
+                          if target_cycle_values else 0.0),
+                      "skipped": False}
+
+
 def latent_fact_concept_loss(model, txt, records, schema):
     if (schema is None or getattr(model, "fact_concepts", None) is None
             or getattr(model, "latent_concepts", None) is None):
@@ -2741,7 +2822,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     if float(replay_w) < 0.0:
         raise ValueError("reading replay loss weight must be non-negative")
     study_strategy = str(study_strategy)
-    if study_strategy not in ("random", "errors", "curiosity", "graph"):
+    if study_strategy not in ("random", "errors", "curiosity", "graph", "cycle"):
         raise ValueError(f"unknown reading study strategy {study_strategy!r}")
     rng = np.random.default_rng(seed)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
@@ -2802,7 +2883,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
 
     def graph_study_ready():
         memory = getattr(model, "latent_concept_memory", None)
-        if study_strategy != "graph":
+        if study_strategy not in ("graph", "cycle"):
             return True
         if memory is None:
             return False
@@ -2837,6 +2918,19 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 transitive_w=graph_predict_transitive_w,
                 target_power=graph_predict_target_power)
             report = report | {"strategy": "graph"}
+        elif study_strategy == "cycle":
+            selected, report = reading_latent_graph_cycle_records(
+                model, vocab, records, device=device, n=probe_n,
+                seed=seed + 1301 + int(step),
+                context_keep_p=context_keep_p,
+                feature_dropout=0.0,
+                temperature=graph_cycle_temperature,
+                self_loop_w=graph_cycle_self_loop_w,
+                transitive_steps=graph_cycle_transitive_steps,
+                transitive_w=graph_cycle_transitive_w,
+                target_power=graph_cycle_target_power,
+                cycle_w=graph_cycle_consistency_w)
+            report = report | {"strategy": "cycle"}
         else:
             hard, _correct, report = reading_latent_record_outcomes(
                 model, vocab, records, device=device, n=probe_n,
@@ -2846,7 +2940,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
             selected = list(hard)
             report = report | {"strategy": "errors"}
         if study_hard_max and len(selected) > int(study_hard_max):
-            if study_strategy in ("curiosity", "graph"):
+            if study_strategy in ("curiosity", "graph", "cycle"):
                 selected = selected[:int(study_hard_max)]
             else:
                 cap_rng = np.random.default_rng(seed + 1759 + int(step))
@@ -2892,8 +2986,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         model.train()
         refresh_due = (not study_pool or st == 1 or (
             study_refresh_steps and (st - 1) % int(study_refresh_steps) == 0))
-        if study_strategy in ("errors", "curiosity", "graph") and refresh_due:
-            if study_strategy != "graph" or graph_study_ready():
+        if study_strategy in ("errors", "curiosity", "graph", "cycle") and refresh_due:
+            if study_strategy not in ("graph", "cycle") or graph_study_ready():
                 refresh_study_pool(st)
                 model.train()
         if (neighborhood_w or transition_w) and (st == 1 or (
@@ -2906,7 +3000,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 and (st - 1) % int(cluster_refresh_steps) == 0)):
             refresh_clusters(st)
             model.train()
-        source = (study_pool if study_strategy in ("errors", "curiosity", "graph")
+        source = (study_pool if study_strategy in ("errors", "curiosity", "graph", "cycle")
                   and study_pool else train_records)
         rec_batch = batch_records(source, rng, batch)
         txt = pack_reading(rec_batch, vocab, device)
@@ -5804,7 +5898,7 @@ def selftest():
     fit_reading_concepts(
         reading_model, reading_vocab, reading_records, steps=3, batch=2, lr=1e-4,
         seed=5, device="cpu", log_every=1, token_drop_p=0.1,
-        token_replace_p=0.0, study_strategy="graph", study_probe_n=4,
+        token_replace_p=0.0, study_strategy="cycle", study_probe_n=4,
         study_hard_max=2, study_refresh_steps=1, context_target_w=0.1,
         context_keep_p=0.5, memory_size=8, composition_w=0.1, graph_predict_w=0.1,
         graph_cycle_w=0.1,
@@ -5816,10 +5910,12 @@ def selftest():
     assert reading_model.reading_train_metrics["graph_cycle_w"] == 0.1
     assert math.isfinite(reading_model.reading_train_metrics["graph_cycle_loss"])
     assert reading_model.reading_train_metrics["graph_transition_updates"] > 0
-    assert any(r.get("strategy") == "graph" for r in reading_model.reading_study_reports)
+    assert any(r.get("strategy") == "cycle" for r in reading_model.reading_study_reports)
     scored = [r.get("mean_score", 0.0) for r in reading_model.reading_study_reports
-              if r.get("strategy") == "graph" and not r.get("skipped")]
+              if r.get("strategy") == "cycle" and not r.get("skipped")]
     assert scored and max(scored) > 0.0
+    assert any("mean_reverse_kl" in r for r in reading_model.reading_study_reports
+               if r.get("strategy") == "cycle")
     reading_payload = checkpoint_payload(reading_model, reading_vocab, 32, 1, 4,
                                          {"experiment": "reading-selftest"})
     assert reading_payload["fact_schema"] is None
@@ -5905,7 +6001,7 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-cluster-margin", type=float, default=0.0)
     ap.add_argument("--reading-cluster-min-size", type=int, default=2)
     ap.add_argument("--reading-study-strategy",
-                    choices=("random", "errors", "curiosity", "graph"),
+                    choices=("random", "errors", "curiosity", "graph", "cycle"),
                     default="errors")
     ap.add_argument("--reading-study-probe-n", type=int, default=0)
     ap.add_argument("--reading-study-hard-max", type=int, default=0)
