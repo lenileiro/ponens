@@ -16,27 +16,34 @@ new work on the current entry points:
 
 ## Text
 
-`thinking.text` accepts either structured semantic records or raw reading corpora. The raw-reading
-path is the language-mastery path: text chunks are read directly, latent slots are trained with
+`thinking.text` accepts raw reading corpora through `--reading-data`. This is the language-mastery
+path: text chunks are read directly, latent slots are trained with
 sequence, factorization, association, graph, neighborhood, transition, cluster, discovery,
 reanalysis, memory-gap, and graph-closure insight objectives. No English rules or prompt
-templates are embedded in the module.
+templates are embedded in the module, and the old structured fact/QA/import command-line surfaces
+are no longer supported.
 
 ```bash
 python -m thinking.text --selftest
 
 python -m thinking.text --reading-data data/reading.jsonl \
     --steps 40000 --batch 16 --d 256 --layers 4 --heads 8 \
-    --latent-concept-slots 4 --latent-concept-memory-size 256 \
+    --latent-concept-slots 4 --reading-memory-size 256 \
     --reading-study-strategy gap --reading-study-probe-n 256 \
     --reading-discovery-w 0.05 --reading-reanalysis-w 0.05 \
     --reading-gap-w 0.05 \
     --out runs/text_raw_reading.json \
     --checkpoint runs/text_raw_reading.pt
-```
 
-Structured semantic records are still accepted for supervised probes and artifact controls, but
-they are not the default direction for language mastery.
+python -m thinking.text --reading-data data/new_reading.jsonl \
+    --reading-checkpoint runs/text_raw_reading.pt \
+    --reading-out-checkpoint runs/text_raw_reading_studied.pt \
+    --steps 4000 --batch 16 \
+    --reading-study-strategy gap --reading-study-probe-n 256 \
+    --reading-discovery-w 0.05 --reading-reanalysis-w 0.05 \
+    --reading-gap-w 0.05 \
+    --out runs/text_raw_reading_study.json
+```
 
 ## Multimodal
 
@@ -134,6 +141,7 @@ The old synthetic-language modules were removed from the active package:
 - `thinking.induce`
 - `thinking.verbalize`
 - `thinking.hybrid_vocab`
+- standalone exam/write/mind/meaning prototypes
 - `datalog.py`
 
 Do not add replacements for these as hard-coded QA/rule/template layers. New data handling should

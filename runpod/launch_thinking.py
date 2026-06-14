@@ -1810,7 +1810,7 @@ def main():
                     dest="reading_cluster_min_size")
     ap.add_argument("--reading-study-strategy", default="auto",
                     choices=("random", "errors", "fer", "curiosity", "sequence",
-                             "graph", "cycle", "discovery", "auto"),
+                             "graph", "cycle", "gap", "discovery", "auto"),
                     dest="reading_study_strategy")
     ap.add_argument("--reading-study-probe-n", type=int, default=0,
                     dest="reading_study_probe_n")

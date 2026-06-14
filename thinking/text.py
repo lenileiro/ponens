@@ -1,32 +1,13 @@
-"""Text-0: data-driven language understanding -> canonical facts.
+"""Schema-free text reading and latent concept discovery.
 
-This module is the text-only rung that M-0 was missing.  It does not contain English
-interpretation rules.  It learns from records that pair natural language with canonical facts,
-then evaluates the model by decoded facts, paraphrase consistency, and explicit counterfactual
-records supplied by the dataset.
+The supported public surface is raw reading via ``--reading-data``.  Text is read as
+corpus chunks and trained with latent slots, concept memory, self-study, reanalysis,
+memory-gap learning, and graph-closure insight.  There are no English rulebooks,
+answer-choice handlers, QA imports, or structured fact-training CLIs in the active
+entrypoint.
 
-Record formats accepted by --data:
-
-  JSONL:
-    {"split":"train","id":"r1","text":"...","facts":[["p0","color","red"]]}
-
-  JSON:
-    {"train":[...], "eval":[...]}
-    {"records":[...]}
-
-Fields:
-  text or tokens        natural-language input
-  facts                 list of [slot, predicate, value] triples
-  group                 optional paraphrase group id; records in a group should share facts
-  kind/base_id/changed  optional metadata for dataset-supplied counterfactual evals
-
-The model receives the text as a continuous prefix and must emit:
-  extract fact p0 color red . fact ... done .
-
-Example:
-  python -m thinking.text --selftest
-  python -m thinking.text --data data/text_semantics.jsonl --steps 2000 \
-      --out runs/text0.json --checkpoint runs/text0.pt
+Older structured-fact helpers remain in the module for checkpoint compatibility and
+selftest coverage, but they are not exposed as supported command-line surfaces.
 """
 import argparse
 import copy
@@ -6291,6 +6272,18 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              consolidation_balance_w=0.01,
                              consolidation_anchor_w=1.0,
                              consolidation_fer_w=0.0,
+                             discovery_w=0.0, discovery_curiosity_w=1.0,
+                             discovery_graph_w=1.0, discovery_cycle_w=1.0,
+                             discovery_bridge_w=1.0, discovery_fer_w=0.0,
+                             reanalysis_w=0.0, reanalysis_graph_w=1.0,
+                             reanalysis_cycle_w=0.5,
+                             reanalysis_bridge_w=0.5,
+                             reanalysis_fer_w=0.0,
+                             gap_w=0.0, gap_temperature=0.1,
+                             gap_self_loop_w=0.0,
+                             gap_transitive_steps=2,
+                             gap_transitive_w=0.1,
+                             gap_target_power=1.0,
                              association_w=0.05, association_temperature=0.1,
                              association_decay=0.99, association_target_power=1.0,
                              association_self_loop_w=0.05,
@@ -6405,6 +6398,23 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             consolidation_balance_w=consolidation_balance_w,
             consolidation_anchor_w=consolidation_anchor_w,
             consolidation_fer_w=consolidation_fer_w,
+            discovery_w=discovery_w,
+            discovery_curiosity_w=discovery_curiosity_w,
+            discovery_graph_w=discovery_graph_w,
+            discovery_cycle_w=discovery_cycle_w,
+            discovery_bridge_w=discovery_bridge_w,
+            discovery_fer_w=discovery_fer_w,
+            reanalysis_w=reanalysis_w,
+            reanalysis_graph_w=reanalysis_graph_w,
+            reanalysis_cycle_w=reanalysis_cycle_w,
+            reanalysis_bridge_w=reanalysis_bridge_w,
+            reanalysis_fer_w=reanalysis_fer_w,
+            gap_w=gap_w,
+            gap_temperature=gap_temperature,
+            gap_self_loop_w=gap_self_loop_w,
+            gap_transitive_steps=gap_transitive_steps,
+            gap_transitive_w=gap_transitive_w,
+            gap_target_power=gap_target_power,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -6493,6 +6503,23 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             consolidation_balance_w=consolidation_balance_w,
             consolidation_anchor_w=consolidation_anchor_w,
             consolidation_fer_w=consolidation_fer_w,
+            discovery_w=discovery_w,
+            discovery_curiosity_w=discovery_curiosity_w,
+            discovery_graph_w=discovery_graph_w,
+            discovery_cycle_w=discovery_cycle_w,
+            discovery_bridge_w=discovery_bridge_w,
+            discovery_fer_w=discovery_fer_w,
+            reanalysis_w=reanalysis_w,
+            reanalysis_graph_w=reanalysis_graph_w,
+            reanalysis_cycle_w=reanalysis_cycle_w,
+            reanalysis_bridge_w=reanalysis_bridge_w,
+            reanalysis_fer_w=reanalysis_fer_w,
+            gap_w=gap_w,
+            gap_temperature=gap_temperature,
+            gap_self_loop_w=gap_self_loop_w,
+            gap_transitive_steps=gap_transitive_steps,
+            gap_transitive_w=gap_transitive_w,
+            gap_target_power=gap_target_power,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -6621,6 +6648,23 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "consolidation_balance_w": float(consolidation_balance_w),
               "consolidation_anchor_w": float(consolidation_anchor_w),
               "consolidation_fer_w": float(consolidation_fer_w),
+              "discovery_w": float(discovery_w),
+              "discovery_curiosity_w": float(discovery_curiosity_w),
+              "discovery_graph_w": float(discovery_graph_w),
+              "discovery_cycle_w": float(discovery_cycle_w),
+              "discovery_bridge_w": float(discovery_bridge_w),
+              "discovery_fer_w": float(discovery_fer_w),
+              "reanalysis_w": float(reanalysis_w),
+              "reanalysis_graph_w": float(reanalysis_graph_w),
+              "reanalysis_cycle_w": float(reanalysis_cycle_w),
+              "reanalysis_bridge_w": float(reanalysis_bridge_w),
+              "reanalysis_fer_w": float(reanalysis_fer_w),
+              "gap_w": float(gap_w),
+              "gap_temperature": float(gap_temperature),
+              "gap_self_loop_w": float(gap_self_loop_w),
+              "gap_transitive_steps": int(gap_transitive_steps),
+              "gap_transitive_w": float(gap_transitive_w),
+              "gap_target_power": float(gap_target_power),
               "association_w": float(association_w),
               "association_temperature": float(association_temperature),
               "association_decay": float(association_decay),
@@ -8762,29 +8806,6 @@ def _new_reading_latent_slots(args):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--import-scan", action="store_true")
-    ap.add_argument("--import-snli", action="store_true")
-    ap.add_argument("--import-mnli", action="store_true")
-    ap.add_argument("--import-hans", action="store_true")
-    ap.add_argument("--scan-url", default=SCAN_URL)
-    ap.add_argument("--scan-max", type=int, default=2000)
-    ap.add_argument("--scan-eval-frac", type=float, default=0.10)
-    ap.add_argument("--snli-url", default=SNLI_URL)
-    ap.add_argument("--snli-zip", default=None)
-    ap.add_argument("--snli-train", type=int, default=5000)
-    ap.add_argument("--snli-eval", type=int, default=1000)
-    ap.add_argument("--mnli-url", default=MNLI_URL)
-    ap.add_argument("--mnli-zip", default=None)
-    ap.add_argument("--mnli-train", type=int, default=10000)
-    ap.add_argument("--mnli-eval", type=int, default=2000)
-    ap.add_argument("--hans-train-url", default=HANS_TRAIN_URL)
-    ap.add_argument("--hans-eval-url", default=HANS_EVAL_URL)
-    ap.add_argument("--hans-train-file", default=None)
-    ap.add_argument("--hans-eval-file", default=None)
-    ap.add_argument("--hans-train", type=int, default=5000)
-    ap.add_argument("--hans-eval", type=int, default=3000)
-    ap.add_argument("--hans-label-mode", choices=("snli", "binary"), default="snli")
-    ap.add_argument("--data", action="append")
     _add_reading_args(ap)
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--batch", type=int, default=32)
@@ -8795,227 +8816,50 @@ def main(argv=None):
                     default="transformer")
     ap.add_argument("--text-encoder-layers", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--max-new", type=int, default=160, dest="max_new")
-    ap.add_argument("--free-n", type=int, default=0, dest="free_n")
-    ap.add_argument("--paraphrase-n", type=int, default=0, dest="paraphrase_n")
-    ap.add_argument("--counterfactual-n", type=int, default=0, dest="counterfactual_n")
-    ap.add_argument("--kind-free-n", type=int, default=0, dest="kind_free_n")
-    ap.add_argument("--fact-n", type=int, default=0, dest="fact_n")
-    ap.add_argument("--kind-fact-n", type=int, default=0, dest="kind_fact_n")
-    ap.add_argument("--artifact-n", type=int, default=0, dest="artifact_n")
-    ap.add_argument("--balance-by", choices=("none", "kind"), default="none")
-    ap.add_argument("--semantic-w", type=float, default=0.5, dest="semantic_w")
-    ap.add_argument("--fact-concept-w", type=float, default=0.0,
-                    dest="fact_concept_w")
-    ap.add_argument("--fact-concept-contrast-w", type=float, default=0.0,
-                    dest="fact_concept_contrast_w")
-    ap.add_argument("--fact-concept-contrast-temperature", type=float, default=0.1,
-                    dest="fact_concept_contrast_temperature")
-    ap.add_argument("--fact-concept-centroid-w", type=float, default=0.0,
-                    dest="fact_concept_centroid_w")
-    ap.add_argument("--fact-concept-centroid-temperature", type=float, default=0.1,
-                    dest="fact_concept_centroid_temperature")
-    ap.add_argument("--fact-concept-centroid-margin", type=float, default=0.0,
-                    dest="fact_concept_centroid_margin")
-    ap.add_argument("--fact-concept-prefix", action="store_true",
-                    dest="fact_concept_prefix")
-    ap.add_argument("--fact-concept-refine", action="store_true",
-                    dest="fact_concept_refine")
-    ap.add_argument("--fact-concept-refine-gate-init", type=float, default=-2.0,
-                    dest="fact_concept_refine_gate_init")
-    ap.add_argument("--fact-concept-mixer-layers", type=int, default=0,
-                    dest="fact_concept_mixer_layers")
-    ap.add_argument("--fact-concept-mixer-gate-init", type=float, default=-2.0,
-                    dest="fact_concept_mixer_gate_init")
-    ap.add_argument("--fact-concept-prototype-w", type=float, default=0.0,
-                    dest="fact_concept_prototype_w")
-    ap.add_argument("--fact-concept-prototype-spread-w", type=float, default=0.0,
-                    dest="fact_concept_prototype_spread_w")
-    ap.add_argument("--fact-concept-prototype-spread-margin", type=float, default=0.2,
-                    dest="fact_concept_prototype_spread_margin")
-    ap.add_argument("--fact-concept-state-spread-w", type=float, default=0.0,
-                    dest="fact_concept_state_spread_w")
-    ap.add_argument("--fact-concept-state-spread-variance", type=float, default=0.05,
-                    dest="fact_concept_state_spread_variance")
-    ap.add_argument("--fact-concept-state-spread-margin", type=float, default=0.2,
-                    dest="fact_concept_state_spread_margin")
-    ap.add_argument("--fact-concept-state-spread-covariance-w", type=float, default=0.05,
-                    dest="fact_concept_state_spread_covariance_w")
     ap.add_argument("--latent-concept-slots", type=int, default=0)
     ap.add_argument("--latent-concept-layers", type=int, default=1)
     ap.add_argument("--latent-concept-prefix", action="store_true")
     ap.add_argument("--latent-concept-refine", action="store_true")
     ap.add_argument("--latent-concept-refine-gate-init", type=float, default=-2.0)
-    ap.add_argument("--latent-concept-w", type=float, default=0.0)
-    ap.add_argument("--latent-concept-view-dropout", type=float, default=0.1)
-    ap.add_argument("--latent-concept-invariance-w", type=float, default=25.0)
-    ap.add_argument("--latent-concept-variance-w", type=float, default=25.0)
-    ap.add_argument("--latent-concept-covariance-w", type=float, default=1.0)
-    ap.add_argument("--latent-concept-variance-target", type=float, default=1.0)
-    ap.add_argument("--latent-concept-fact-w", type=float, default=0.0)
-    ap.add_argument("--decode-w", type=float, default=1.0, dest="decode_w")
     ap.add_argument("--out", default=None)
     ap.add_argument("--checkpoint", default=None)
-    ap.add_argument("--eval-checkpoint", default=None)
-    ap.add_argument("--study-checkpoint", default=None)
-    ap.add_argument("--study-out-checkpoint", default=None)
-    ap.add_argument("--study-replay-data", action="append")
-    ap.add_argument("--study-lr", type=float, default=5e-4)
-    ap.add_argument("--study-rounds", type=int, default=1)
-    ap.add_argument("--study-strategy", choices=("errors", "latent", "all"),
-                    default="errors")
-    ap.add_argument("--study-probe-n", type=int, default=0)
-    ap.add_argument("--study-hard-max", type=int, default=0)
-    ap.add_argument("--study-select-best", action="store_true")
-    ap.add_argument("--study-score-metric",
-                    choices=("semantic", "teacher", "concept", "latent", "both", "min"),
-                    default="both")
-    ap.add_argument("--study-retention-w", type=float, default=1.0)
-    ap.add_argument("--study-control-w", type=float, default=1.0)
-    ap.add_argument("--study-kind-w", type=float, default=1.0)
-    ap.add_argument("--study-allow-negative-score", action="store_true")
-    ap.add_argument("--study-confirm-n", type=int, default=0)
-    ap.add_argument("--study-confirm-seed-stride", type=int, default=10000)
     args = ap.parse_args(argv)
     if args.selftest:
         selftest()
         return
-    if ((args.import_scan or args.import_snli or args.import_mnli or args.import_hans)
-            and not args.out):
-        ap.error("--out is required for import commands")
-    if args.import_scan:
-        import_scan(args.out, url=args.scan_url, max_records=args.scan_max,
-                    eval_frac=args.scan_eval_frac, seed=args.seed)
+    if not args.reading_data:
+        raise SystemExit("--reading-data is required unless --selftest is set")
+    reading_common = _reading_kwargs(args)
+    if args.reading_checkpoint:
+        study_reading_checkpoint(
+            args.reading_checkpoint, args.reading_data,
+            out_checkpoint=args.reading_out_checkpoint or args.checkpoint,
+            replay_data=args.reading_replay_data, out=args.out,
+            steps=args.steps, batch=args.batch, seed=args.seed, device=DEV,
+            replay_w=args.reading_replay_w,
+            replay_batch=args.reading_replay_batch,
+            replay_retention_w=args.reading_replay_retention_w,
+            latent_concept_slots=args.latent_concept_slots,
+            latent_concept_layers=args.latent_concept_layers,
+            latent_concept_prefix=args.latent_concept_prefix,
+            latent_concept_refine=args.latent_concept_refine,
+            latent_concept_refine_gate_init=(
+                args.latent_concept_refine_gate_init),
+            **reading_common)
         return
-    if args.import_snli:
-        import_snli(args.out, zip_path=args.snli_zip, url=args.snli_url,
-                    max_train=args.snli_train, max_eval=args.snli_eval,
-                    seed=args.seed)
-        return
-    if args.import_mnli:
-        import_mnli(args.out, zip_path=args.mnli_zip, url=args.mnli_url,
-                    max_train=args.mnli_train, max_eval=args.mnli_eval,
-                    seed=args.seed)
-        return
-    if args.import_hans:
-        import_hans(args.out,
-                    train_source=args.hans_train_file or args.hans_train_url,
-                    eval_source=args.hans_eval_file or args.hans_eval_url,
-                    max_train=args.hans_train, max_eval=args.hans_eval,
-                    seed=args.seed, label_mode=args.hans_label_mode)
-        return
-    if args.reading_data:
-        reading_common = _reading_kwargs(args)
-        if args.reading_checkpoint:
-            study_reading_checkpoint(
-                args.reading_checkpoint, args.reading_data,
-                out_checkpoint=args.reading_out_checkpoint or args.checkpoint,
-                replay_data=args.reading_replay_data, out=args.out,
-                steps=args.steps, batch=args.batch, seed=args.seed, device=DEV,
-                replay_w=args.reading_replay_w,
-                replay_batch=args.reading_replay_batch,
-                replay_retention_w=args.reading_replay_retention_w,
-                latent_concept_slots=args.latent_concept_slots,
-                latent_concept_layers=args.latent_concept_layers,
-                latent_concept_prefix=args.latent_concept_prefix,
-                latent_concept_refine=args.latent_concept_refine,
-                latent_concept_refine_gate_init=(
-                    args.latent_concept_refine_gate_init),
-                **reading_common)
-        else:
-            run_reading_concepts(
-                args.reading_data, steps=args.steps, batch=args.batch, d=args.d,
-                layers=args.layers, heads=args.heads,
-                text_encoder_arch=args.text_encoder_arch,
-                text_encoder_layers=args.text_encoder_layers,
-                latent_concept_slots=_new_reading_latent_slots(args),
-                latent_concept_layers=args.latent_concept_layers,
-                latent_concept_prefix=args.latent_concept_prefix,
-                latent_concept_refine=args.latent_concept_refine,
-                latent_concept_refine_gate_init=(
-                    args.latent_concept_refine_gate_init),
-                seed=args.seed, device=DEV, out=args.out,
-                checkpoint=args.checkpoint, **reading_common)
-        return
-    if not args.data:
-        raise SystemExit("--data is required unless --selftest or --reading-data is set")
-    eval_common = dict(max_new=args.max_new, free_n=args.free_n,
-                       paraphrase_n=args.paraphrase_n,
-                       counterfactual_n=args.counterfactual_n,
-                       kind_free_n=args.kind_free_n, fact_n=args.fact_n,
-                       kind_fact_n=args.kind_fact_n, artifact_n=args.artifact_n,
-                       seed=args.seed)
-    if args.eval_checkpoint:
-        eval_checkpoint(args.eval_checkpoint, args.data, out=args.out, device=DEV,
-                        **eval_common)
-        return
-    train_common = dict(semantic_w=args.semantic_w, balance_by=args.balance_by,
-                        fact_concept_w=args.fact_concept_w,
-                        fact_concept_contrast_w=args.fact_concept_contrast_w,
-                        fact_concept_contrast_temperature=(
-                            args.fact_concept_contrast_temperature),
-                        fact_concept_centroid_w=args.fact_concept_centroid_w,
-                        fact_concept_centroid_temperature=(
-                            args.fact_concept_centroid_temperature),
-                        fact_concept_centroid_margin=args.fact_concept_centroid_margin,
-                        fact_concept_prototype_w=args.fact_concept_prototype_w,
-                        fact_concept_prototype_spread_w=(
-                            args.fact_concept_prototype_spread_w),
-                        fact_concept_prototype_spread_margin=(
-                            args.fact_concept_prototype_spread_margin),
-                        fact_concept_state_spread_w=args.fact_concept_state_spread_w,
-                        fact_concept_state_spread_variance=(
-                            args.fact_concept_state_spread_variance),
-                        fact_concept_state_spread_margin=(
-                            args.fact_concept_state_spread_margin),
-                        fact_concept_state_spread_covariance_w=(
-                            args.fact_concept_state_spread_covariance_w),
-                        latent_concept_w=args.latent_concept_w,
-                        latent_concept_view_dropout=args.latent_concept_view_dropout,
-                        latent_concept_invariance_w=(
-                            args.latent_concept_invariance_w),
-                        latent_concept_variance_w=args.latent_concept_variance_w,
-                        latent_concept_covariance_w=args.latent_concept_covariance_w,
-                        latent_concept_variance_target=(
-                            args.latent_concept_variance_target),
-                        latent_concept_fact_w=args.latent_concept_fact_w,
-                        decode_w=args.decode_w)
-    if args.study_checkpoint:
-        study_checkpoint(
-            args.study_checkpoint, args.data,
-            out_checkpoint=args.study_out_checkpoint or args.checkpoint,
-            replay_data=args.study_replay_data, out=args.out,
-            steps=args.steps, batch=args.batch, lr=args.study_lr,
-            seed=args.seed, device=DEV, **eval_common, **train_common,
-            study_rounds=args.study_rounds, study_strategy=args.study_strategy,
-            study_probe_n=args.study_probe_n, study_hard_max=args.study_hard_max,
-            study_select_best=args.study_select_best,
-            study_score_metric=args.study_score_metric,
-            study_retention_w=args.study_retention_w,
-            study_control_w=args.study_control_w,
-            study_kind_w=args.study_kind_w,
-            study_require_positive_score=not args.study_allow_negative_score,
-            study_confirm_n=args.study_confirm_n,
-            study_confirm_seed_stride=args.study_confirm_seed_stride)
-        return
-    run(args.data, steps=args.steps, batch=args.batch, d=args.d, layers=args.layers,
-        heads=args.heads, text_encoder_arch=args.text_encoder_arch,
+    run_reading_concepts(
+        args.reading_data, steps=args.steps, batch=args.batch, d=args.d,
+        layers=args.layers, heads=args.heads,
+        text_encoder_arch=args.text_encoder_arch,
         text_encoder_layers=args.text_encoder_layers,
-        seed=args.seed, out=args.out, checkpoint=args.checkpoint,
-        fact_concept_prefix=args.fact_concept_prefix,
-        fact_concept_refine=args.fact_concept_refine,
-        fact_concept_refine_gate_init=args.fact_concept_refine_gate_init,
-        fact_concept_mixer_layers=args.fact_concept_mixer_layers,
-        fact_concept_mixer_gate_init=args.fact_concept_mixer_gate_init,
-        latent_concept_slots=args.latent_concept_slots,
+        latent_concept_slots=_new_reading_latent_slots(args),
         latent_concept_layers=args.latent_concept_layers,
         latent_concept_prefix=args.latent_concept_prefix,
         latent_concept_refine=args.latent_concept_refine,
-        latent_concept_refine_gate_init=args.latent_concept_refine_gate_init,
-        free_n=args.free_n, paraphrase_n=args.paraphrase_n,
-        counterfactual_n=args.counterfactual_n, kind_free_n=args.kind_free_n,
-        fact_n=args.fact_n, kind_fact_n=args.kind_fact_n,
-        artifact_n=args.artifact_n, max_new=args.max_new, **train_common)
+        latent_concept_refine_gate_init=(
+            args.latent_concept_refine_gate_init),
+        seed=args.seed, device=DEV, out=args.out,
+        checkpoint=args.checkpoint, **reading_common)
 
 
 if __name__ == "__main__":

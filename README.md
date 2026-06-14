@@ -193,74 +193,6 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
 .venv/bin/python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.5 --sample-steps-list 4,8 --eval-seeds 1,2,3 \
     --eval-out runs/image_latent_dit_sweep.json
-.venv/bin/python -m thinking.text --import-snli --snli-zip /private/tmp/snli_1.0.zip \
-    --snli-train 20000 --snli-eval 1000 --seed 11 --out data/text_snli.jsonl
-.venv/bin/python -m thinking.text --import-mnli --mnli-zip /private/tmp/multinli_1.0.zip \
-    --mnli-train 20000 --mnli-eval 2000 --seed 19 --out data/text_mnli.jsonl
-.venv/bin/python -m thinking.text --data data/text_snli.jsonl --steps 1500 \
-    --batch 64 --d 192 --layers 4 --heads 6 --semantic-w 0.75 \
-    --free-n 200 --max-new 20 \
-    --out runs/text_snli.json --checkpoint runs/text_snli.pt
-.venv/bin/python -m thinking.text --import-hans --hans-train 6000 --hans-eval 3000 \
-    --seed 13 --out data/text_hans.jsonl
-.venv/bin/python -m thinking.text --data data/text_hans.jsonl \
-    --eval-checkpoint runs/text_snli.pt --free-n 200 --max-new 20 \
-    --out runs/text_snli_on_hans.json
-.venv/bin/python -m thinking.text --data data/text_snli.jsonl --data data/text_hans.jsonl \
-    --steps 1500 --batch 64 --d 192 --layers 4 --heads 6 --semantic-w 0.75 \
-    --free-n 200 --max-new 20 \
-    --out runs/text_snli_hans.json --checkpoint runs/text_snli_hans.pt
-.venv/bin/python -m thinking.text --data data/text_snli.jsonl --data data/text_hans.jsonl \
-    --steps 1200 --batch 64 --d 192 \
-    --layers 4 --heads 6 --semantic-w 0.75 \
-    --free-n 100 --paraphrase-n 30 --counterfactual-n 30 --max-new 32 \
-    --out runs/text_snli_hans_extended.json --checkpoint runs/text_snli_hans_extended.pt
-.venv/bin/python -m thinking.text --data data/text_snli.jsonl --data data/text_hans.jsonl \
-    --steps 1200 --batch 64 --d 192 \
-    --layers 4 --heads 6 --semantic-w 0.75 --balance-by kind \
-    --free-n 80 --kind-free-n 5 --paraphrase-n 20 --counterfactual-n 20 --max-new 32 \
-    --out runs/text_snli_hans_balanced.json \
-    --checkpoint runs/text_snli_hans_balanced.pt
-.venv/bin/python -m thinking.text --data data/text_snli.jsonl --data data/text_mnli.jsonl \
-    --data data/text_hans.jsonl \
-    --steps 120 --batch 48 --d 96 --layers 3 --heads 4 --semantic-w 0.75 \
-    --balance-by kind --fact-n 240 --kind-fact-n 40 --artifact-n 240 \
-    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_snli_mnli_hans_smoke.json \
-    --checkpoint runs/text_snli_mnli_hans_smoke.pt
-.venv/bin/python -m thinking.text --data data/text_mnli.jsonl \
-    --study-checkpoint runs/text_snli_hans_balanced.pt \
-    --study-out-checkpoint runs/text_study_mnli_smoke.pt \
-    --steps 40 --batch 32 --study-lr 0.0005 --semantic-w 0.75 \
-    --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
-    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_mnli_smoke.json
-.venv/bin/python -m thinking.text --data data/text_mnli.jsonl \
-    --study-checkpoint runs/text_snli_hans_balanced.pt \
-    --study-out-checkpoint runs/text_study_mnli_semantic_replay_smoke.pt \
-    --steps 80 --batch 32 --study-lr 0.0005 --decode-w 0 --semantic-w 1.0 \
-    --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
-    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_mnli_semantic_replay_smoke.json
-.venv/bin/python -m thinking.text --data data/text_mnli.jsonl \
-    --study-checkpoint runs/text_snli_hans_balanced.pt \
-    --study-out-checkpoint runs/text_study_mnli_error_replay_smoke.pt \
-    --steps 40 --study-rounds 2 --study-strategy errors \
-    --study-probe-n 512 --study-hard-max 256 \
-    --batch 32 --study-lr 0.0005 --decode-w 0 --semantic-w 1.0 \
-    --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
-    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_mnli_error_replay_smoke.json
-.venv/bin/python -m thinking.text --data data/text_mnli.jsonl \
-    --study-checkpoint runs/text_snli_hans_balanced.pt \
-    --study-out-checkpoint runs/text_study_mnli_select_both_replay_smoke.pt \
-    --steps 40 --study-rounds 2 --study-strategy errors \
-    --study-probe-n 512 --study-hard-max 256 --study-select-best \
-    --study-score-metric both --study-retention-w 2.0 \
-    --batch 32 --study-lr 0.0005 --decode-w 0 --semantic-w 1.0 \
-    --balance-by kind --fact-n 120 --kind-fact-n 20 --artifact-n 120 \
-    --free-n -1 --paraphrase-n -1 --counterfactual-n -1 --max-new 24 \
-    --out runs/text_study_mnli_select_both_replay_smoke.json
 .venv/bin/python -m thinking.text --reading-data NEWER-TECHNIQUES.md \
     --steps 4 --batch 16 --d 96 --layers 2 --heads 4 \
     --latent-concept-slots 6 --latent-concept-layers 1 \
@@ -284,6 +216,13 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --reading-cluster-probe-n 32 \
     --out runs/text_raw_reading_gap_study_smoke.json \
     --checkpoint runs/text_raw_reading_gap_study_smoke.pt
+.venv/bin/python -m thinking.text --reading-data README.md \
+    --reading-checkpoint runs/text_raw_reading_gap_study_smoke.pt \
+    --reading-out-checkpoint runs/text_raw_reading_gap_study_continued.pt \
+    --steps 4 --batch 16 --reading-study-strategy gap \
+    --reading-memory-size 64 --reading-memory-w 0.05 \
+    --reading-association-w 0.05 --reading-gap-w 0.05 \
+    --out runs/text_raw_reading_gap_study_continued.json
 .venv/bin/python -m thinking.multimodal --manifest data/multimodal_manifest.jsonl \
     --steps 3 --batch 4 --dim 96 --layers 1 --heads 4 --eval-n 20 \
     --latent-concept-slots 6 \
