@@ -10288,6 +10288,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                         flow, teacher_flow, z1, cond, teacher_cond=teacher_cond,
                         time_sampling=distill_time_sampling,
                         time_logit_mean=time_logit_mean, time_logit_std=time_logit_std,
+                        time_mode_scale=time_mode_scale,
                         time_shift=effective_time_shift, latent_stats=latent_stats,
                         time_gap=flow_distill_time_gap,
                         guidance_w=flow_guidance_distill_w,
@@ -10597,6 +10598,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         ),
         "time_logit_mean": float(time_logit_mean),
         "time_logit_std": float(time_logit_std),
+        "time_mode_scale": float(time_mode_scale),
         "time_adaptive_requested": time_sampling == "adaptive",
         "time_adaptive_bins": int(time_adaptive_bins),
         "time_adaptive_momentum": float(time_adaptive_momentum),
@@ -10723,6 +10725,16 @@ def selftest():
     assert torch.allclose(karras_schedule[-1:], torch.ones(1))
     assert bool(torch.all(karras_schedule[1:] > karras_schedule[:-1]))
     assert not torch.allclose(karras_schedule, linear_schedule)
+    mode_grid = mode_flow_time_base(torch.linspace(0.0, 1.0, 9), mode_scale=1.29)
+    assert torch.allclose(mode_grid[:1], torch.zeros(1))
+    assert torch.allclose(mode_grid[-1:], torch.ones(1))
+    assert bool(torch.all(mode_grid[1:] > mode_grid[:-1]))
+    assert torch.allclose(
+        mode_flow_time_base(torch.linspace(0.0, 1.0, 5), mode_scale=0.0),
+        torch.linspace(0.0, 1.0, 5))
+    mode_times = sample_flow_times(8, device="cpu", mode="mode", mode_scale=1.29)
+    assert tuple(mode_times.shape) == (8, 1, 1, 1)
+    assert float(mode_times.min()) >= 0.0 and float(mode_times.max()) <= 1.0
     curriculum_buckets = normalize_image_size_buckets("16x16,32x16,32x32")
     assert [image_size_key(b) for b in size_curriculum_bucket_order(
         curriculum_buckets)] == ["16x16", "32x16", "32x32"]
@@ -10886,6 +10898,7 @@ def selftest():
         assert report["time_shift_mode"] == "auto"
         assert report["time_shift_effective_mode"] == "manual"
         assert report["time_sampling"] == "adaptive"
+        assert math.isclose(report["time_mode_scale"], DEFAULT_TIME_MODE_SCALE)
         assert report["time_adaptive_enabled"] is True
         assert report["time_adaptive_updates"] >= 1
         assert report["time_adaptive_observed_bins"] >= 1
@@ -11258,6 +11271,10 @@ def main(argv=None):
                     help="mean for --time-sampling logit-normal")
     ap.add_argument("--time-logit-std", type=float, default=1.0, dest="time_logit_std",
                     help="stddev for --time-sampling logit-normal")
+    ap.add_argument("--time-mode-scale", type=float, default=DEFAULT_TIME_MODE_SCALE,
+                    dest="time_mode_scale",
+                    help=("curvature for --time-sampling mode; 0 is uniform, "
+                          f"must be < {MAX_TIME_MODE_SCALE:g}"))
     ap.add_argument("--time-curriculum-frac", type=float, default=0.0,
                     dest="time_curriculum_frac",
                     help=("fraction of flow training that uses --time-sampling before "
@@ -11598,6 +11615,8 @@ def main(argv=None):
         ap.error("--time-adaptive-min-prob must be in [0, 1)")
     if args.time_adaptive_loss_power <= 0.0:
         ap.error("--time-adaptive-loss-power must be positive")
+    if args.time_mode_scale < 0.0 or args.time_mode_scale >= MAX_TIME_MODE_SCALE:
+        ap.error(f"--time-mode-scale must be in [0, {MAX_TIME_MODE_SCALE:g})")
     if args.flow_guidance_distill_w < 0.0:
         ap.error("--flow-guidance-distill-w must be non-negative")
     if args.flow_guidance_distill_cfg_scale < 1.0:
@@ -11943,6 +11962,7 @@ def main(argv=None):
         image_crop_mode=args.image_crop_mode, image_hflip_prob=args.image_hflip_prob,
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
         time_logit_std=args.time_logit_std,
+        time_mode_scale=args.time_mode_scale,
         time_curriculum_frac=args.time_curriculum_frac,
         time_adaptive_bins=args.time_adaptive_bins,
         time_adaptive_momentum=args.time_adaptive_momentum,
@@ -12304,6 +12324,7 @@ def main(argv=None):
             "time_curriculum_final_sampling", args.time_sampling),
         "time_logit_mean": args.time_logit_mean,
         "time_logit_std": args.time_logit_std,
+        "time_mode_scale": args.time_mode_scale,
         "time_adaptive_requested": report.get(
             "time_adaptive_requested", args.time_sampling == "adaptive"),
         "time_adaptive_enabled": report.get("time_adaptive_enabled", False),

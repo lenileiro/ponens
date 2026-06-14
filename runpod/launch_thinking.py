@@ -23,6 +23,9 @@ IMAGE = "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
 REMOTE = "/workspace/fer_relational"
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IMAGE_SAMPLE_SCHEDULES = ("linear", "quadratic", "sqrt", "cosine", "karras")
+IMAGE_TIME_SAMPLINGS = ("uniform", "logit-normal", "mode", "adaptive")
+IMAGE_DEFAULT_TIME_MODE_SCALE = 1.29
+IMAGE_MAX_TIME_MODE_SCALE = 1.75
 
 
 def api(method, path, key, body=None):
@@ -1051,6 +1054,7 @@ def payload(args):
                      f"--time-sampling {args.image_time_sampling} "
                      f"--time-logit-mean {args.image_time_logit_mean} "
                      f"--time-logit-std {args.image_time_logit_std} "
+                     f"--time-mode-scale {args.image_time_mode_scale} "
                      f"--time-curriculum-frac {args.image_time_curriculum_frac} "
                      f"--time-adaptive-bins {args.image_time_adaptive_bins} "
                      f"--time-adaptive-momentum {args.image_time_adaptive_momentum} "
@@ -2806,7 +2810,7 @@ def main():
                     dest="image_no_ema_warmup",
                     help="use exact image EMA decay from the first update")
     ap.add_argument("--image-time-sampling", default="uniform",
-                    choices=("uniform", "logit-normal", "adaptive"),
+                    choices=IMAGE_TIME_SAMPLINGS,
                     dest="image_time_sampling",
                     help="latent image flow timestep distribution")
     ap.add_argument("--image-time-logit-mean", type=float, default=0.0,
@@ -2815,6 +2819,11 @@ def main():
     ap.add_argument("--image-time-logit-std", type=float, default=1.0,
                     dest="image_time_logit_std",
                     help="stddev for --image-time-sampling logit-normal")
+    ap.add_argument("--image-time-mode-scale", type=float,
+                    default=IMAGE_DEFAULT_TIME_MODE_SCALE,
+                    dest="image_time_mode_scale",
+                    help=("curvature for --image-time-sampling mode; 0 is uniform, "
+                          f"must be < {IMAGE_MAX_TIME_MODE_SCALE:g}"))
     ap.add_argument("--image-time-curriculum-frac", type=float, default=0.0,
                     dest="image_time_curriculum_frac",
                     help=("fraction of image flow training using --image-time-sampling before "
@@ -3487,6 +3496,10 @@ def main():
         )
     if args.image_time_shift <= 0.0:
         sys.exit("ERROR: --image-time-shift must be positive")
+    if (args.image_time_mode_scale < 0.0
+            or args.image_time_mode_scale >= IMAGE_MAX_TIME_MODE_SCALE):
+        sys.exit(
+            f"ERROR: --image-time-mode-scale must be in [0, {IMAGE_MAX_TIME_MODE_SCALE:g})")
     if args.image_size_curriculum_frac < 0.0 or args.image_size_curriculum_frac > 1.0:
         sys.exit("ERROR: --image-size-curriculum-frac must be in [0, 1]")
     if args.image_time_curriculum_frac < 0.0 or args.image_time_curriculum_frac > 1.0:
