@@ -637,7 +637,7 @@ def apply_image_quality_preset(args):
         args.image_preference_w = max(float(args.image_preference_w), 0.5)
         args.image_flow_preference_w = max(float(args.image_flow_preference_w), 0.05)
         if hq and str(args.image_flow_preference_loss or "margin") == "margin":
-            args.image_flow_preference_loss = "dpo"
+            args.image_flow_preference_loss = "gap"
         args.image_flow_preference_batch = max(int(args.image_flow_preference_batch), 1)
     args.image_eval_generated = True
     args.image_quality_loop_generated = True
@@ -2650,12 +2650,13 @@ def main():
                     help=("direct chosen/rejected preference loss weight on the image "
                           "latent-flow generator"))
     ap.add_argument("--image-flow-preference-loss", default="margin",
-                    choices=("margin", "dpo"), dest="image_flow_preference_loss",
-                    help=("direct image flow preference objective; dpo compares the "
-                          "policy pair gap against a frozen reference flow"))
+                    choices=("margin", "dpo", "gap"), dest="image_flow_preference_loss",
+                    help=("direct image flow preference objective; gap uses score_gap "
+                          "as a pair-specific margin, dpo compares the policy pair "
+                          "gap against a frozen reference flow"))
     ap.add_argument("--image-flow-preference-beta", type=float, default=1.0,
                     dest="image_flow_preference_beta",
-                    help="inverse-temperature for --image-flow-preference-loss dpo")
+                    help="inverse-temperature for --image-flow-preference-loss dpo/gap")
     ap.add_argument("--image-flow-preference-margin", type=float, default=0.0,
                     dest="image_flow_preference_margin",
                     help="minimum velocity-loss gap for image direct flow preference pairs")

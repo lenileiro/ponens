@@ -60,7 +60,7 @@ FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
 FLOW_NOISE_COUPLINGS = ("random", "sliced_ot")
 FLOW_REPA_MODES = ("pooled", "token", "both", "auto")
 FLOW_BOUNDARY_MODES = ("none", "right-linear", "double-linear", "double-cosine")
-FLOW_PREFERENCE_LOSSES = ("margin", "dpo")
+FLOW_PREFERENCE_LOSSES = ("margin", "dpo", "gap")
 TIME_SAMPLINGS = ("uniform", "logit-normal", "mode", "adaptive")
 TIME_ADAPTIVE_PRIORS = ("uniform", "logit-normal", "mode")
 DEFAULT_TIME_MODE_SCALE = 1.29
@@ -1276,10 +1276,14 @@ def latent_flow_preference_pair_loss(flow, z_chosen, z_rejected, cond, score_gap
         loss_r = loss_r * weights
     if score_gaps is None:
         gap_weight = torch.ones_like(loss_c)
+        score_gap_target = torch.zeros_like(loss_c)
     else:
-        gap_weight = torch.log1p(score_gaps.to(device=loss_c.device).float()).clamp(0.1, 5.0)
+        score_gap_values = score_gaps.to(device=loss_c.device).float().clamp_min(0.0)
+        gap_weight = torch.log1p(score_gap_values).clamp(0.1, 5.0)
+        score_gap_target = torch.log1p(score_gap_values).clamp(0.0, 5.0)
     policy_gap = loss_r - loss_c
     ref_gap = torch.zeros_like(policy_gap)
+    target_margin = torch.full_like(policy_gap, float(margin))
     if loss_mode == "dpo":
         with torch.no_grad():
             ref_pred_c = flow_velocity(reference_flow, ztc, t, cond_model)
@@ -1291,6 +1295,9 @@ def latent_flow_preference_pair_loss(flow, z_chosen, z_rejected, cond, score_gap
                 ref_loss_r = ref_loss_r * weights
             ref_gap = ref_loss_r - ref_loss_c
         logits = float(beta) * (policy_gap - ref_gap - float(margin)) * gap_weight
+    elif loss_mode == "gap":
+        target_margin = target_margin + score_gap_target
+        logits = float(beta) * (policy_gap - target_margin) * gap_weight
     else:
         logits = (policy_gap - float(margin)) * gap_weight
     loss = F.softplus(-logits).mean()
@@ -1302,6 +1309,10 @@ def latent_flow_preference_pair_loss(flow, z_chosen, z_rejected, cond, score_gap
         f"{prefix}_ref_loss_gap": ref_gap.mean().detach(),
         f"{prefix}_policy_ref_gap": (policy_gap - ref_gap).mean().detach(),
         f"{prefix}_acc": loss_c.lt(loss_r).float().mean().detach(),
+        f"{prefix}_target_margin": target_margin.mean().detach(),
+        f"{prefix}_target_margin_error": (
+            target_margin - policy_gap).mean().detach(),
+        f"{prefix}_score_gap_target": score_gap_target.mean().detach(),
         f"{prefix}_time_stratified": torch.tensor(
             float(bool(time_stratified)), device=zc.device),
         f"{prefix}_margin": torch.tensor(float(margin), device=loss_c.device),
@@ -12317,6 +12328,25 @@ def selftest():
         assert report["flow_preference_reference"] is True
         assert report["flow_preference_steps_run"] >= 1
         assert "flow_preference_policy_ref_gap" in report["last_flow"]
+        x_gap_chosen, x_gap_rejected, gap_scores, gap_pairs = (
+            sample_image_preference_pair_batch(
+                pref_pairs, np.random.default_rng(7), batch=1, size=16,
+                device="cpu", return_pairs=True))
+        with torch.no_grad():
+            z_gap_chosen = ae.encode(x_gap_chosen)
+            z_gap_rejected = ae.encode(x_gap_rejected)
+        gap_cond = image_preference_pair_condition(
+            gap_pairs, conditioner, vocab, source="tokens",
+            caption_max_len=8, device="cpu",
+            return_tokens=flow_uses_cond_tokens(flow))
+        gap_loss, gap_parts = latent_flow_preference_pair_loss(
+            flow, z_gap_chosen, z_gap_rejected, gap_cond,
+            score_gaps=gap_scores, loss_mode="gap", beta=0.5,
+            prefix="gap_unit")
+        assert torch.isfinite(gap_loss)
+        assert gap_parts["gap_unit_score_gap_target"].item() > 0.0
+        assert gap_parts["gap_unit_target_margin"].item() > 0.0
+        assert "gap_unit_policy_ref_gap" in gap_parts
         assert report["uses_swiglu_mlp"] is True
         assert report["adaptive_modulation"] is True
         assert report["residual_gating"] is True
@@ -12974,10 +13004,11 @@ def main(argv=None):
                     choices=FLOW_PREFERENCE_LOSSES, dest="flow_preference_loss",
                     help=("direct flow preference objective: margin compares "
                           "chosen/rejected velocity loss; dpo anchors that gap "
-                          "to a frozen reference flow"))
+                          "to a frozen reference flow; gap uses score_gap as "
+                          "a pair-specific target margin without a reference flow"))
     ap.add_argument("--flow-preference-beta", type=float, default=1.0,
                     dest="flow_preference_beta",
-                    help="inverse-temperature for --flow-preference-loss dpo")
+                    help="inverse-temperature for --flow-preference-loss dpo/gap")
     ap.add_argument("--flow-preference-margin", type=float, default=0.0,
                     dest="flow_preference_margin",
                     help="minimum per-pair velocity-loss gap for direct flow preference")
