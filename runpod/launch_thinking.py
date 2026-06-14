@@ -537,6 +537,8 @@ def apply_image_quality_preset(args):
     args.image_flow_text_align_w = max(float(args.image_flow_text_align_w), 0.05)
     args.image_ae_structure_w = max(
         float(args.image_ae_structure_w), 0.1 if hq else 0.05)
+    args.image_ae_texture_w = max(
+        float(args.image_ae_texture_w), 0.1 if hq else 0.05)
     args.image_feature_align_w = max(float(args.image_feature_align_w), 0.05)
     args.image_flow_feature_align_w = max(float(args.image_flow_feature_align_w), 0.05)
     if int(args.image_embedding_sequence_max_len) <= 0:
@@ -584,6 +586,8 @@ def apply_image_quality_preset(args):
         float(args.image_flow_decoded_endpoint_fft_w), 0.1 if hq else 0.05)
     args.image_flow_decoded_endpoint_structure_w = max(
         float(args.image_flow_decoded_endpoint_structure_w), 0.25 if hq else 0.1)
+    args.image_flow_decoded_endpoint_texture_w = max(
+        float(args.image_flow_decoded_endpoint_texture_w), 0.25 if hq else 0.1)
     args.image_flow_equivariance_w = max(
         float(args.image_flow_equivariance_w), 0.02 if hq else 0.01)
     image_flow_equivariance_p = (
@@ -1069,6 +1073,8 @@ def payload(args):
                          args.image_sample_reference_max_structure_frequency_l1),
                         ("sample-reference-max-structure-ssim-loss",
                          args.image_sample_reference_max_structure_ssim_loss),
+                        ("sample-reference-max-texture-stats-l1",
+                         args.image_sample_reference_max_texture_stats_l1),
                         ("sample-reference-max-selected-score",
                          args.image_sample_reference_max_selected_score)):
                     if value is not None:
@@ -1115,6 +1121,7 @@ def payload(args):
                      f"--ae-ms-w {args.image_ae_ms_w} "
                      f"--ae-fft-w {args.image_ae_fft_w} "
                      f"--ae-structure-w {args.image_ae_structure_w} "
+                     f"--ae-texture-w {args.image_ae_texture_w} "
                      f"--ae-latent-reg-w {args.image_ae_latent_reg_w} "
                      f"--image-text-align-w {args.image_text_align_w} "
                      f"--flow-text-align-w {args.image_flow_text_align_w} "
@@ -1227,6 +1234,8 @@ def payload(args):
                      f"{args.image_flow_decoded_endpoint_fft_w} "
                      f"--flow-decoded-endpoint-structure-w "
                      f"{args.image_flow_decoded_endpoint_structure_w} "
+                     f"--flow-decoded-endpoint-texture-w "
+                     f"{args.image_flow_decoded_endpoint_texture_w} "
                      f"--flow-equivariance-w {args.image_flow_equivariance_w} "
                      f"--flow-equivariance-p {args.image_flow_equivariance_p} "
                      f"--flow-equivariance-transforms "
@@ -2650,6 +2659,9 @@ def main():
     ap.add_argument("--image-ae-structure-w", type=float, default=0.0,
                     dest="image_ae_structure_w",
                     help="SSIM-style local structure reconstruction loss weight")
+    ap.add_argument("--image-ae-texture-w", type=float, default=0.0,
+                    dest="image_ae_texture_w",
+                    help="multi-scale local texture statistics reconstruction loss weight")
     ap.add_argument("--image-ae-latent-reg-w", type=float, default=0.0,
                     dest="image_ae_latent_reg_w",
                     help="latent L2 regularization weight during AE training")
@@ -2978,6 +2990,11 @@ def main():
                     dest="image_sample_reference_max_structure_ssim_loss",
                     help=("fail image reference reproduction if SSIM-style structure "
                           "loss exceeds this"))
+    ap.add_argument("--image-sample-reference-max-texture-stats-l1", type=float,
+                    default=None,
+                    dest="image_sample_reference_max_texture_stats_l1",
+                    help=("fail image reference reproduction if texture-statistics "
+                          "L1 exceeds this"))
     ap.add_argument("--image-sample-reference-max-selected-score", type=float,
                     default=None,
                     dest="image_sample_reference_max_selected_score",
@@ -3247,6 +3264,9 @@ def main():
     ap.add_argument("--image-flow-decoded-endpoint-structure-w", type=float, default=0.0,
                     dest="image_flow_decoded_endpoint_structure_w",
                     help="SSIM-style local structure weight inside decoded endpoint loss")
+    ap.add_argument("--image-flow-decoded-endpoint-texture-w", type=float, default=0.0,
+                    dest="image_flow_decoded_endpoint_texture_w",
+                    help="local texture statistics weight inside decoded endpoint loss")
     ap.add_argument("--image-flow-equivariance-w", type=float, default=0.0,
                     dest="image_flow_equivariance_w",
                     help=("spatial equivariance loss weight for image flow "
@@ -4081,6 +4101,7 @@ def main():
         sys.exit("ERROR: --image-time-shift must be positive")
     if (args.image_ae_grad_w < 0.0 or args.image_ae_ms_w < 0.0
             or args.image_ae_fft_w < 0.0 or args.image_ae_structure_w < 0.0
+            or args.image_ae_texture_w < 0.0
             or args.image_ae_latent_reg_w < 0.0):
         sys.exit("ERROR: image AE reconstruction weights must be non-negative")
     if (args.image_time_mode_scale < 0.0
@@ -4135,7 +4156,8 @@ def main():
     if (args.image_flow_decoded_endpoint_grad_w < 0.0
             or args.image_flow_decoded_endpoint_ms_w < 0.0
             or args.image_flow_decoded_endpoint_fft_w < 0.0
-            or args.image_flow_decoded_endpoint_structure_w < 0.0):
+            or args.image_flow_decoded_endpoint_structure_w < 0.0
+            or args.image_flow_decoded_endpoint_texture_w < 0.0):
         sys.exit("ERROR: image decoded endpoint component weights must be non-negative")
     if args.image_flow_equivariance_w < 0.0:
         sys.exit("ERROR: --image-flow-equivariance-w must be non-negative")
@@ -4307,6 +4329,7 @@ def main():
         "image_sample_reference_max_structure_multiscale_l1",
         "image_sample_reference_max_structure_frequency_l1",
         "image_sample_reference_max_structure_ssim_loss",
+        "image_sample_reference_max_texture_stats_l1",
         "image_sample_reference_max_selected_score",
     )
     image_reference_gate_enabled = any(

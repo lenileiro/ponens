@@ -5064,6 +5064,54 @@ def local_structure_loss(pred, target, window=7, data_range=2.0, eps=1.0e-6):
     return (1.0 - ssim).mul(0.5).mean()
 
 
+def texture_statistics_loss(pred, target, levels=3, eps=1.0e-6):
+    """Match multi-scale high-frequency residual statistics and channel covariance."""
+    if pred.shape != target.shape:
+        raise ValueError(
+            f"texture loss shapes must match, got "
+            f"{tuple(pred.shape)} and {tuple(target.shape)}")
+    cur_pred = torch.nan_to_num(
+        pred.float(), nan=0.0, posinf=1.0, neginf=-1.0)
+    cur_target = torch.nan_to_num(
+        target.float(), nan=0.0, posinf=1.0, neginf=-1.0)
+    losses = []
+    for _ in range(max(1, int(levels))):
+        if min(cur_pred.shape[-2:]) < 3:
+            break
+        pred_mean = F.avg_pool2d(
+            cur_pred, kernel_size=3, stride=1, padding=1,
+            count_include_pad=False)
+        target_mean = F.avg_pool2d(
+            cur_target, kernel_size=3, stride=1, padding=1,
+            count_include_pad=False)
+        pred_detail = cur_pred - pred_mean
+        target_detail = cur_target - target_mean
+        pred_flat = pred_detail.flatten(2)
+        target_flat = target_detail.flatten(2)
+        pred_energy = pred_flat.pow(2).mean(dim=2).add(float(eps)).sqrt()
+        target_energy = target_flat.pow(2).mean(dim=2).add(float(eps)).sqrt()
+        pred_abs = pred_flat.abs().mean(dim=2)
+        target_abs = target_flat.abs().mean(dim=2)
+        pred_centered = pred_flat - pred_flat.mean(dim=2, keepdim=True)
+        target_centered = target_flat - target_flat.mean(dim=2, keepdim=True)
+        norm = max(1, int(pred_centered.shape[-1]))
+        pred_cov = pred_centered.bmm(pred_centered.transpose(1, 2)) / float(norm)
+        target_cov = target_centered.bmm(target_centered.transpose(1, 2)) / float(norm)
+        scale_loss = (
+            F.l1_loss(pred_energy, target_energy)
+            + F.l1_loss(pred_abs, target_abs)
+            + F.l1_loss(pred_cov, target_cov)
+        )
+        losses.append(scale_loss)
+        if min(cur_pred.shape[-2:]) < 6:
+            break
+        cur_pred = F.avg_pool2d(cur_pred, kernel_size=2, stride=2)
+        cur_target = F.avg_pool2d(cur_target, kernel_size=2, stride=2)
+    if not losses:
+        return F.l1_loss(cur_pred, cur_target) * 0.0
+    return torch.stack(losses).mean()
+
+
 def multiscale_recon_loss(pred, target, levels=3):
     losses = []
     cur_pred, cur_target = pred, target
@@ -5217,8 +5265,8 @@ def multiscale_flow_velocity_loss(pred, target, scales=(2, 4), weights=None):
 
 
 def reconstruction_loss_parts(pred, target, mode="mse", grad_w=0.0, ms_w=0.0,
-                              fft_w=0.0, structure_w=0.0, latent=None,
-                              latent_reg_w=0.0):
+                              fft_w=0.0, structure_w=0.0, texture_w=0.0,
+                              latent=None, latent_reg_w=0.0):
     if mode not in AE_RECON_LOSSES:
         raise ValueError(f"unknown AE reconstruction loss {mode!r}")
     mse = F.mse_loss(pred, target)
@@ -5251,6 +5299,10 @@ def reconstruction_loss_parts(pred, target, mode="mse", grad_w=0.0, ms_w=0.0,
         structure = local_structure_loss(pred, target)
         loss = loss + float(structure_w) * structure
         parts["recon_structure_ssim"] = structure.detach()
+    if texture_w > 0.0:
+        texture = texture_statistics_loss(pred, target)
+        loss = loss + float(texture_w) * texture
+        parts["recon_texture_stats_l1"] = texture.detach()
     if latent is not None and latent_reg_w > 0.0:
         lat = latent.float().pow(2).mean()
         loss = loss + float(latent_reg_w) * lat
@@ -6223,6 +6275,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        decoded_endpoint_ms_w=0.0,
                        decoded_endpoint_fft_w=0.0,
                        decoded_endpoint_structure_w=0.0,
+                       decoded_endpoint_texture_w=0.0,
                        equivariance_w=0.0, equivariance_p=1.0,
                        equivariance_transforms=DEFAULT_FLOW_EQUIVARIANCE_TRANSFORMS,
                        equivariance_shift_frac=0.125,
@@ -6271,13 +6324,15 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     decoded_endpoint_ms_w = float(decoded_endpoint_ms_w)
     decoded_endpoint_fft_w = float(decoded_endpoint_fft_w)
     decoded_endpoint_structure_w = float(decoded_endpoint_structure_w)
+    decoded_endpoint_texture_w = float(decoded_endpoint_texture_w)
     if decoded_endpoint_w < 0.0:
         raise ValueError("decoded_endpoint_w must be non-negative")
     if decoded_endpoint_p < 0.0 or decoded_endpoint_p > 1.0:
         raise ValueError("decoded_endpoint_p must be in [0, 1]")
     if (decoded_endpoint_grad_w < 0.0 or decoded_endpoint_ms_w < 0.0
             or decoded_endpoint_fft_w < 0.0
-            or decoded_endpoint_structure_w < 0.0):
+            or decoded_endpoint_structure_w < 0.0
+            or decoded_endpoint_texture_w < 0.0):
         raise ValueError("decoded endpoint structure weights must be non-negative")
     if decoded_endpoint_w > 0.0 and ae is None:
         raise ValueError("decoded_endpoint_w requires an autoencoder")
@@ -6403,6 +6458,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
             float(decoded_endpoint_fft_w), device=z1.device),
         "flow_decoded_endpoint_structure_w": torch.tensor(
             float(decoded_endpoint_structure_w), device=z1.device),
+        "flow_decoded_endpoint_texture_w": torch.tensor(
+            float(decoded_endpoint_texture_w), device=z1.device),
         "flow_decoded_endpoint_active": torch.tensor(0.0, device=z1.device),
         "flow_equivariance_w": torch.tensor(float(equivariance_w), device=z1.device),
         "flow_equivariance_p": torch.tensor(float(equivariance_p), device=z1.device),
@@ -6502,7 +6559,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
             grad_w=decoded_endpoint_grad_w,
             ms_w=decoded_endpoint_ms_w,
             fft_w=decoded_endpoint_fft_w,
-            structure_w=decoded_endpoint_structure_w)
+            structure_w=decoded_endpoint_structure_w,
+            texture_w=decoded_endpoint_texture_w)
         total = total + float(decoded_endpoint_w) * decoded_loss
         parts["flow_decoded_endpoint_loss"] = decoded_loss.detach()
         parts["flow_decoded_endpoint_active"] = torch.tensor(1.0, device=z1.device)
@@ -8206,7 +8264,7 @@ def reference_reproduction_gate_report(
         report, prefix="reference_flow", max_pixel_mse=None, max_pixel_mae=None,
         max_structure_edge_l1=None, max_structure_multiscale_l1=None,
         max_structure_frequency_l1=None, max_structure_ssim_loss=None,
-        max_selected_score=None):
+        max_texture_stats_l1=None, max_selected_score=None):
     """Return pass/fail metadata for shown-image reproduction thresholds."""
     thresholds = {
         "max_pixel_mse": max_pixel_mse,
@@ -8215,6 +8273,7 @@ def reference_reproduction_gate_report(
         "max_structure_multiscale_l1": max_structure_multiscale_l1,
         "max_structure_frequency_l1": max_structure_frequency_l1,
         "max_structure_ssim_loss": max_structure_ssim_loss,
+        "max_texture_stats_l1": max_texture_stats_l1,
         "max_selected_score": max_selected_score,
     }
     thresholds = {
@@ -8242,6 +8301,7 @@ def reference_reproduction_gate_report(
     check_max("structure_multiscale_l1", "max_structure_multiscale_l1")
     check_max("structure_frequency_l1", "max_structure_frequency_l1")
     check_max("structure_ssim_loss", "max_structure_ssim_loss")
+    check_max("texture_stats_l1", "max_texture_stats_l1")
     check_max(
         "selected_score", "max_selected_score",
         key="sample_grid_reference_selected_denoise_score")
@@ -8268,6 +8328,7 @@ def cli_reference_reproduction_gate_report(report, args, prefix="reference_flow"
         max_structure_frequency_l1=(
             args.sample_reference_max_structure_frequency_l1),
         max_structure_ssim_loss=args.sample_reference_max_structure_ssim_loss,
+        max_texture_stats_l1=args.sample_reference_max_texture_stats_l1,
         max_selected_score=args.sample_reference_max_selected_score)
 
 
@@ -8308,6 +8369,8 @@ def image_reproduction_metrics(reference, candidate, prefix="reference"):
             frequency_recon_loss(cand, ref).detach().cpu()),
         f"{prefix}_structure_ssim_loss": float(
             local_structure_loss(cand, ref).detach().cpu()),
+        f"{prefix}_texture_stats_l1": float(
+            texture_statistics_loss(cand, ref).detach().cpu()),
     }
 
 
@@ -8854,6 +8917,7 @@ def save_reference_reproduction_grid(ae, flow, records, path, size=32, device=DE
             + metrics_i["reference_flow_structure_multiscale_l1"]
             + metrics_i["reference_flow_structure_frequency_l1"]
             + metrics_i["reference_flow_structure_ssim_loss"]
+            + metrics_i["reference_flow_texture_stats_l1"]
         )
         row_i = {
             "index": int(sweep_idx),
@@ -11099,7 +11163,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       ae_arch="semantic", latent_downsample=4, ae_res_blocks=1,
                       ae_hf_model="", ae_hf_subfolder="", ae_hf_scaling_factor=0.0,
                       ae_recon_loss="mse", ae_grad_w=0.0, ae_ms_w=0.0, ae_fft_w=0.0,
-                      ae_structure_w=0.0, ae_latent_reg_w=0.0,
+                      ae_structure_w=0.0, ae_texture_w=0.0,
+                      ae_latent_reg_w=0.0,
                       image_text_align_w=0.0, flow_text_align_w=0.0, text_embed_dim=128,
                       image_feature_align_w=0.0, flow_feature_align_w=0.0,
                       image_feature_embed_dim=128,
@@ -11128,6 +11193,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       flow_decoded_endpoint_ms_w=0.0,
                       flow_decoded_endpoint_fft_w=0.0,
                       flow_decoded_endpoint_structure_w=0.0,
+                      flow_decoded_endpoint_texture_w=0.0,
                       flow_equivariance_w=0.0, flow_equivariance_p=1.0,
                       flow_equivariance_transforms=DEFAULT_FLOW_EQUIVARIANCE_TRANSFORMS,
                       flow_equivariance_shift_frac=0.125,
@@ -11373,8 +11439,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     if ae_recon_loss not in AE_RECON_LOSSES:
         raise ValueError(f"unknown AE reconstruction loss {ae_recon_loss!r}")
     ae_structure_w = float(ae_structure_w)
+    ae_texture_w = float(ae_texture_w)
     if (ae_grad_w < 0.0 or ae_ms_w < 0.0 or ae_fft_w < 0.0
-            or ae_structure_w < 0.0 or ae_latent_reg_w < 0.0):
+            or ae_structure_w < 0.0 or ae_texture_w < 0.0
+            or ae_latent_reg_w < 0.0):
         raise ValueError("AE reconstruction weights must be non-negative")
     if image_text_align_w < 0.0 or flow_text_align_w < 0.0:
         raise ValueError("image/text alignment weights must be non-negative")
@@ -11457,13 +11525,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_decoded_endpoint_ms_w = float(flow_decoded_endpoint_ms_w)
     flow_decoded_endpoint_fft_w = float(flow_decoded_endpoint_fft_w)
     flow_decoded_endpoint_structure_w = float(flow_decoded_endpoint_structure_w)
+    flow_decoded_endpoint_texture_w = float(flow_decoded_endpoint_texture_w)
     if flow_decoded_endpoint_w < 0.0:
         raise ValueError("flow_decoded_endpoint_w must be non-negative")
     if flow_decoded_endpoint_p < 0.0 or flow_decoded_endpoint_p > 1.0:
         raise ValueError("flow_decoded_endpoint_p must be in [0, 1]")
     if (flow_decoded_endpoint_grad_w < 0.0 or flow_decoded_endpoint_ms_w < 0.0
             or flow_decoded_endpoint_fft_w < 0.0
-            or flow_decoded_endpoint_structure_w < 0.0):
+            or flow_decoded_endpoint_structure_w < 0.0
+            or flow_decoded_endpoint_texture_w < 0.0):
         raise ValueError("flow decoded endpoint component weights must be non-negative")
     flow_equivariance_w = float(flow_equivariance_w)
     flow_equivariance_p = float(flow_equivariance_p)
@@ -11824,7 +11894,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 loss, parts = reconstruction_loss_parts(
                     out["recon"], x, mode=ae_recon_loss, grad_w=ae_grad_w,
                     ms_w=ae_ms_w, fft_w=ae_fft_w, structure_w=ae_structure_w,
-                    latent=out.get("latent"),
+                    texture_w=ae_texture_w, latent=out.get("latent"),
                     latent_reg_w=ae_latent_reg_w)
                 if text_aligner is not None and image_text_align_w > 0.0:
                     cond_vec = caption_record_condition(
@@ -12372,6 +12442,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     decoded_endpoint_fft_w=flow_decoded_endpoint_fft_w,
                     decoded_endpoint_structure_w=(
                         flow_decoded_endpoint_structure_w),
+                    decoded_endpoint_texture_w=(
+                        flow_decoded_endpoint_texture_w),
                     equivariance_w=flow_equivariance_w,
                     equivariance_p=flow_equivariance_p,
                     equivariance_transforms=flow_equivariance_transforms,
@@ -12763,6 +12835,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "ae_ms_w": float(ae_ms_w),
         "ae_fft_w": float(ae_fft_w),
         "ae_structure_w": float(ae_structure_w),
+        "ae_texture_w": float(ae_texture_w),
         "ae_latent_reg_w": float(ae_latent_reg_w),
         "image_text_align_w": float(image_text_align_w),
         "flow_text_align_w": float(flow_text_align_w),
@@ -12847,6 +12920,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_decoded_endpoint_fft_w": float(flow_decoded_endpoint_fft_w),
         "flow_decoded_endpoint_structure_w": float(
             flow_decoded_endpoint_structure_w),
+        "flow_decoded_endpoint_texture_w": float(
+            flow_decoded_endpoint_texture_w),
         "flow_equivariance_w": float(flow_equivariance_w),
         "flow_equivariance_p": float(flow_equivariance_p),
         "flow_equivariance_transforms": list(flow_equivariance_transforms),
@@ -13232,6 +13307,10 @@ def selftest():
             textured_sample, torch.roll(textured_sample, shifts=3, dims=-1))
         assert float(same_structure) < 1.0e-3
         assert float(shifted_structure) > float(same_structure)
+        same_texture = texture_statistics_loss(textured_sample, textured_sample)
+        flat_texture = texture_statistics_loss(textured_sample, flat_sample)
+        assert float(same_texture) < 1.0e-6
+        assert float(flat_texture) > float(same_texture)
         health_scores = sample_candidate_health_scores(torch.cat([
             flat_sample, clipped_sample, textured_sample], dim=0))
         assert torch.isfinite(health_scores).all()
@@ -13258,11 +13337,13 @@ def selftest():
             "reference_flow_structure_multiscale_l1": 0.10,
             "reference_flow_structure_frequency_l1": 0.15,
             "reference_flow_structure_ssim_loss": 0.20,
+            "reference_flow_texture_stats_l1": 0.05,
             "sample_grid_reference_selected_denoise_score": 0.60,
         }
         ref_gate_pass = reference_reproduction_gate_report(
             ref_gate_report, max_pixel_mse=0.20,
-            max_structure_ssim_loss=0.30, max_selected_score=1.0)
+            max_structure_ssim_loss=0.30,
+            max_texture_stats_l1=0.10, max_selected_score=1.0)
         assert ref_gate_pass["sample_reference_quality_gate_enabled"] is True
         assert ref_gate_pass["sample_reference_quality_gate_passed"] is True
         ref_gate_fail = reference_reproduction_gate_report(
@@ -13360,7 +13441,7 @@ def selftest():
             flow_guidance_distill_w=0.01, flow_ema_decay=0.9,
             flow_frequency_w=0.01, flow_straightness_w=0.01,
             flow_endpoint_stats_w=0.01,
-            ae_structure_w=0.1,
+            ae_structure_w=0.1, ae_texture_w=0.1,
             image_feature_align_w=0.01, flow_feature_align_w=0.01,
             flow_repa_w=0.01, flow_repa_structure_w=0.01,
             flow_repa_frac=1.0,
@@ -13378,6 +13459,7 @@ def selftest():
             flow_decoded_endpoint_ms_w=0.1,
             flow_decoded_endpoint_fft_w=0.1,
             flow_decoded_endpoint_structure_w=0.1,
+            flow_decoded_endpoint_texture_w=0.1,
             flow_equivariance_w=0.01,
             flow_equivariance_p=1.0,
             flow_equivariance_transforms=("roll",),
@@ -13401,7 +13483,9 @@ def selftest():
         assert math.isclose(report["time_mode_scale"], DEFAULT_TIME_MODE_SCALE)
         assert report["time_adaptive_enabled"] is True
         assert math.isclose(report["ae_structure_w"], 0.1)
+        assert math.isclose(report["ae_texture_w"], 0.1)
         assert "recon_structure_ssim" in report["last_ae"]
+        assert "recon_texture_stats_l1" in report["last_ae"]
         assert math.isclose(report["flow_frequency_w"], 0.01)
         assert math.isclose(report["flow_endpoint_stats_w"], 0.01)
         assert "flow_endpoint_stats_loss" in report["last_flow"]
@@ -13434,6 +13518,8 @@ def selftest():
         assert "flow_decoded_endpoint_recon_fft_l1" in report["last_flow"]
         assert "flow_decoded_endpoint_recon_structure_ssim" in report["last_flow"]
         assert math.isclose(report["flow_decoded_endpoint_structure_w"], 0.1)
+        assert "flow_decoded_endpoint_recon_texture_stats_l1" in report["last_flow"]
+        assert math.isclose(report["flow_decoded_endpoint_texture_w"], 0.1)
         assert math.isclose(report["flow_equivariance_w"], 0.01)
         assert report["last_flow"]["flow_equivariance_active"] == 1.0
         assert "flow_equivariance_velocity_mse" in report["last_flow"]
@@ -13530,7 +13616,9 @@ def selftest():
         assert reference_meta["reference_flow_sample_trace_self_condition_updates"] == 0
         assert "reference_flow_structure_edge_l1" in reference_meta
         assert "reference_flow_structure_ssim_loss" in reference_meta
+        assert "reference_flow_texture_stats_l1" in reference_meta
         assert "reference_recon_structure_ssim_loss" in reference_meta
+        assert "reference_recon_texture_stats_l1" in reference_meta
         assert os.path.exists(reference_sample_path)
         resume_path = os.path.join(td, "resume.pt")
         torch.save({
@@ -13783,6 +13871,9 @@ def main(argv=None):
     ap.add_argument("--ae-structure-w", type=float, default=0.0,
                     dest="ae_structure_w",
                     help="SSIM-style local structure reconstruction loss weight")
+    ap.add_argument("--ae-texture-w", type=float, default=0.0,
+                    dest="ae_texture_w",
+                    help="multi-scale local texture statistics reconstruction loss weight")
     ap.add_argument("--ae-latent-reg-w", type=float, default=0.0, dest="ae_latent_reg_w",
                     help="latent L2 regularization weight during AE training")
     ap.add_argument("--image-text-align-w", type=float, default=0.0,
@@ -14033,6 +14124,9 @@ def main(argv=None):
     ap.add_argument("--flow-decoded-endpoint-structure-w", type=float, default=0.0,
                     dest="flow_decoded_endpoint_structure_w",
                     help="SSIM-style local structure weight inside decoded endpoint loss")
+    ap.add_argument("--flow-decoded-endpoint-texture-w", type=float, default=0.0,
+                    dest="flow_decoded_endpoint_texture_w",
+                    help="local texture statistics weight inside decoded endpoint loss")
     ap.add_argument("--flow-equivariance-w", type=float, default=0.0,
                     dest="flow_equivariance_w",
                     help=("spatial equivariance loss weight for latent flow "
@@ -14315,6 +14409,10 @@ def main(argv=None):
                     default=None, dest="sample_reference_max_structure_ssim_loss",
                     help=("fail after --sample-reference-grid-out if reference "
                           "SSIM-style structure loss is above this threshold"))
+    ap.add_argument("--sample-reference-max-texture-stats-l1", type=float,
+                    default=None, dest="sample_reference_max_texture_stats_l1",
+                    help=("fail after --sample-reference-grid-out if reference "
+                          "texture-statistics L1 is above this threshold"))
     ap.add_argument("--sample-reference-max-selected-score", type=float, default=None,
                     dest="sample_reference_max_selected_score",
                     help=("fail after --sample-reference-grid-out if the selected "
@@ -14536,6 +14634,7 @@ def main(argv=None):
         ap.error("--sample-pixel-dynamic-threshold-max must be positive")
     if (args.ae_grad_w < 0.0 or args.ae_ms_w < 0.0
             or args.ae_fft_w < 0.0 or args.ae_structure_w < 0.0
+            or args.ae_texture_w < 0.0
             or args.ae_latent_reg_w < 0.0):
         ap.error("AE reconstruction weights must be non-negative")
     if args.flow_time_embed_dim < 0:
@@ -14564,6 +14663,7 @@ def main(argv=None):
         "sample_reference_max_structure_multiscale_l1",
         "sample_reference_max_structure_frequency_l1",
         "sample_reference_max_structure_ssim_loss",
+        "sample_reference_max_texture_stats_l1",
         "sample_reference_max_selected_score",
     )
     reference_gate_enabled = any(
@@ -14597,7 +14697,8 @@ def main(argv=None):
     if (args.flow_decoded_endpoint_grad_w < 0.0
             or args.flow_decoded_endpoint_ms_w < 0.0
             or args.flow_decoded_endpoint_fft_w < 0.0
-            or args.flow_decoded_endpoint_structure_w < 0.0):
+            or args.flow_decoded_endpoint_structure_w < 0.0
+            or args.flow_decoded_endpoint_texture_w < 0.0):
         ap.error("flow decoded endpoint component weights must be non-negative")
     if args.flow_equivariance_w < 0.0:
         ap.error("--flow-equivariance-w must be non-negative")
@@ -15066,6 +15167,7 @@ def main(argv=None):
         ae_recon_loss=args.ae_recon_loss, ae_grad_w=args.ae_grad_w,
         ae_ms_w=args.ae_ms_w, ae_fft_w=args.ae_fft_w,
         ae_structure_w=args.ae_structure_w,
+        ae_texture_w=args.ae_texture_w,
         ae_latent_reg_w=args.ae_latent_reg_w,
         image_text_align_w=args.image_text_align_w,
         flow_text_align_w=args.flow_text_align_w,
@@ -15109,6 +15211,8 @@ def main(argv=None):
         flow_decoded_endpoint_fft_w=args.flow_decoded_endpoint_fft_w,
         flow_decoded_endpoint_structure_w=(
             args.flow_decoded_endpoint_structure_w),
+        flow_decoded_endpoint_texture_w=(
+            args.flow_decoded_endpoint_texture_w),
         flow_equivariance_w=args.flow_equivariance_w,
         flow_equivariance_p=args.flow_equivariance_p,
         flow_equivariance_transforms=flow_equivariance_transforms,
@@ -15430,6 +15534,7 @@ def main(argv=None):
         "ae_ms_w": args.ae_ms_w,
         "ae_fft_w": args.ae_fft_w,
         "ae_structure_w": args.ae_structure_w,
+        "ae_texture_w": args.ae_texture_w,
         "ae_latent_reg_w": args.ae_latent_reg_w,
         "image_text_align_w": args.image_text_align_w,
         "flow_text_align_w": args.flow_text_align_w,
@@ -15628,6 +15733,9 @@ def main(argv=None):
         "flow_decoded_endpoint_structure_w": report.get(
             "flow_decoded_endpoint_structure_w",
             args.flow_decoded_endpoint_structure_w),
+        "flow_decoded_endpoint_texture_w": report.get(
+            "flow_decoded_endpoint_texture_w",
+            args.flow_decoded_endpoint_texture_w),
         "flow_equivariance_w": report.get(
             "flow_equivariance_w", args.flow_equivariance_w),
         "flow_equivariance_p": report.get(
