@@ -490,6 +490,8 @@ def apply_image_quality_preset(args):
     args.image_flow_time_embed = "fourier"
     args.image_flow_time_embed_dim = max(int(args.image_flow_time_embed_dim), int(args.dim or 0))
     args.image_flow_checkpoint_blocks = True
+    args.image_flow_self_condition = True
+    args.image_flow_self_condition_p = max(float(args.image_flow_self_condition_p), 0.5)
     args.image_train_precision = "bf16"
     args.image_grad_clip = max(float(args.image_grad_clip), 1.0)
     args.image_flow_cache_latents = True
@@ -1069,6 +1071,7 @@ def payload(args):
                      f"--ema-eval-mode {args.image_ema_eval_mode} "
                      f"--flow-time-embed {args.image_flow_time_embed} "
                      f"--flow-time-embed-dim {args.image_flow_time_embed_dim} "
+                     f"--flow-self-condition-p {args.image_flow_self_condition_p} "
                      f"--time-sampling {args.image_time_sampling} "
                      f"--time-logit-mean {args.image_time_logit_mean} "
                      f"--time-logit-std {args.image_time_logit_std} "
@@ -1103,6 +1106,8 @@ def payload(args):
                 train += " --dit-qk-norm"
             if args.image_flow_checkpoint_blocks:
                 train += " --flow-checkpoint-blocks"
+            if args.image_flow_self_condition:
+                train += " --flow-self-condition"
             if args.image_geometry_cond:
                 train += " --image-geometry-cond"
             if args.image_flow_cache_latents:
@@ -2396,6 +2401,12 @@ def main():
     ap.add_argument("--image-flow-checkpoint-blocks", action="store_true",
                     dest="image_flow_checkpoint_blocks",
                     help="checkpoint latent image transformer blocks during flow training")
+    ap.add_argument("--image-flow-self-condition", action="store_true",
+                    dest="image_flow_self_condition",
+                    help="feed previous clean endpoint estimates into latent transformer flows")
+    ap.add_argument("--image-flow-self-condition-p", type=float, default=0.5,
+                    dest="image_flow_self_condition_p",
+                    help="probability of endpoint self-conditioning during image flow training")
     ap.add_argument("--image-ae-arch", default="semantic",
                     choices=("semantic", "residual", "hf-vae"),
                     dest="image_ae_arch",
@@ -3897,6 +3908,10 @@ def main():
         sys.exit("ERROR: --image-dit-heads must be positive")
     if args.image_flow_time_embed_dim < 0:
         sys.exit("ERROR: --image-flow-time-embed-dim must be non-negative")
+    if args.image_flow_self_condition and args.image_latent_arch == "conv":
+        sys.exit("ERROR: --image-flow-self-condition requires --image-latent-arch dit/crossdit/mmdit")
+    if args.image_flow_self_condition_p < 0.0 or args.image_flow_self_condition_p > 1.0:
+        sys.exit("ERROR: --image-flow-self-condition-p must be in [0, 1]")
     if args.image_latent_arch in ("dit", "crossdit", "mmdit"):
         hidden = int(args.dim or 64)
         actual_heads = max(1, min(int(args.image_dit_heads), hidden // 16))

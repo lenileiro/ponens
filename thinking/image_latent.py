@@ -2033,7 +2033,8 @@ class LatentDiTFlowNet(nn.Module):
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256, head_width_mult=1, pos_embed="learned",
                  checkpoint_blocks=False, latent_patch_size=1,
-                 time_embed="scalar", time_embed_dim=1, mlp="gelu"):
+                 time_embed="scalar", time_embed_dim=1, mlp="gelu",
+                 self_condition=False):
         super().__init__()
         latent_patch_size = int(latent_patch_size)
         if latent_patch_size <= 0:
@@ -2053,6 +2054,8 @@ class LatentDiTFlowNet(nn.Module):
         self.latent_ch = int(latent_ch)
         self.latent_patch_size = latent_patch_size
         self.token_dim = self.latent_ch * self.latent_patch_size * self.latent_patch_size
+        self.uses_self_condition = bool(self_condition)
+        self.input_token_dim = self.token_dim * (2 if self.uses_self_condition else 1)
         self.hidden = int(hidden)
         self.hidden_feature_dim = int(hidden)
         self.max_tokens = int(max_tokens)
@@ -2069,7 +2072,7 @@ class LatentDiTFlowNet(nn.Module):
         self.uses_swiglu_mlp = mlp == "swiglu"
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.uses_activation_checkpointing = self.checkpoint_blocks
-        self.in_proj = nn.Linear(self.token_dim, hidden)
+        self.in_proj = nn.Linear(self.input_token_dim, hidden)
         self.pos = (
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
             if pos_embed == "learned" else None
@@ -2102,6 +2105,10 @@ class LatentDiTFlowNet(nn.Module):
         if n > self.max_tokens:
             raise ValueError(f"latent token count {n} exceeds max_tokens={self.max_tokens}")
         toks, th, tw = patchify_latents(z, patch_size=self.latent_patch_size)
+        if self.uses_self_condition:
+            self_cond_toks, _sc_th, _sc_tw = patchify_latents(
+                condition_self_condition(cond, z), patch_size=self.latent_patch_size)
+            toks = torch.cat([toks, self_cond_toks.to(dtype=toks.dtype)], dim=-1)
         t_feat = flow_time_features(
             t, mode=self.flow_time_embed, dim=self.flow_time_embed_dim,
             dtype=cond.dtype)
@@ -2175,7 +2182,7 @@ class LatentCrossDiTFlowNet(nn.Module):
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256, head_width_mult=1, pos_embed="learned",
                  checkpoint_blocks=False, mlp="gelu", latent_patch_size=1,
-                 time_embed="scalar", time_embed_dim=1):
+                 time_embed="scalar", time_embed_dim=1, self_condition=False):
         super().__init__()
         latent_patch_size = int(latent_patch_size)
         if latent_patch_size <= 0:
@@ -2195,6 +2202,8 @@ class LatentCrossDiTFlowNet(nn.Module):
         self.latent_ch = int(latent_ch)
         self.latent_patch_size = latent_patch_size
         self.token_dim = self.latent_ch * self.latent_patch_size * self.latent_patch_size
+        self.uses_self_condition = bool(self_condition)
+        self.input_token_dim = self.token_dim * (2 if self.uses_self_condition else 1)
         self.hidden = int(hidden)
         self.hidden_feature_dim = int(hidden)
         self.max_tokens = int(max_tokens)
@@ -2209,7 +2218,7 @@ class LatentCrossDiTFlowNet(nn.Module):
         self.uses_swiglu_mlp = mlp == "swiglu"
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.uses_activation_checkpointing = self.checkpoint_blocks
-        self.in_proj = nn.Linear(self.token_dim, hidden)
+        self.in_proj = nn.Linear(self.input_token_dim, hidden)
         self.pos = (
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
             if pos_embed == "learned" else None
@@ -2252,6 +2261,10 @@ class LatentCrossDiTFlowNet(nn.Module):
         if n > self.max_tokens:
             raise ValueError(f"latent token count {n} exceeds max_tokens={self.max_tokens}")
         toks, th, tw = patchify_latents(z, patch_size=self.latent_patch_size)
+        if self.uses_self_condition:
+            self_cond_toks, _sc_th, _sc_tw = patchify_latents(
+                condition_self_condition(cond, z), patch_size=self.latent_patch_size)
+            toks = torch.cat([toks, self_cond_toks.to(dtype=toks.dtype)], dim=-1)
         t_feat = flow_time_features(
             t, mode=self.flow_time_embed, dim=self.flow_time_embed_dim,
             dtype=cond_vec.dtype)
@@ -2445,7 +2458,7 @@ class LatentMMDiTFlowNet(nn.Module):
                  max_tokens=256, head_width_mult=1, qk_norm=False,
                  attn_impl="manual", pos_embed="learned", checkpoint_blocks=False,
                  mlp="gelu", latent_patch_size=1,
-                 time_embed="scalar", time_embed_dim=1):
+                 time_embed="scalar", time_embed_dim=1, self_condition=False):
         super().__init__()
         latent_patch_size = int(latent_patch_size)
         if latent_patch_size <= 0:
@@ -2466,6 +2479,8 @@ class LatentMMDiTFlowNet(nn.Module):
         self.latent_ch = int(latent_ch)
         self.latent_patch_size = latent_patch_size
         self.token_dim = self.latent_ch * self.latent_patch_size * self.latent_patch_size
+        self.uses_self_condition = bool(self_condition)
+        self.input_token_dim = self.token_dim * (2 if self.uses_self_condition else 1)
         self.hidden = int(hidden)
         self.hidden_feature_dim = int(hidden)
         self.max_tokens = int(max_tokens)
@@ -2484,7 +2499,7 @@ class LatentMMDiTFlowNet(nn.Module):
         self.uses_swiglu_mlp = mlp == "swiglu"
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.uses_activation_checkpointing = self.checkpoint_blocks
-        self.in_proj = nn.Linear(self.token_dim, hidden)
+        self.in_proj = nn.Linear(self.input_token_dim, hidden)
         self.pos = (
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
             if pos_embed == "learned" else None
@@ -2540,6 +2555,10 @@ class LatentMMDiTFlowNet(nn.Module):
             dtype=cond_vec.dtype)
         cond_ctx = self.time(torch.cat([cond_vec, t_feat], dim=1))
         toks, th, tw = patchify_latents(z, patch_size=self.latent_patch_size)
+        if self.uses_self_condition:
+            self_cond_toks, _sc_th, _sc_tw = patchify_latents(
+                condition_self_condition(cond, z), patch_size=self.latent_patch_size)
+            toks = torch.cat([toks, self_cond_toks.to(dtype=toks.dtype)], dim=-1)
         img = self.in_proj(toks)
         image_pos = self.image_pos(th, tw, img.device, img.dtype)
         if image_pos is not None:
@@ -2570,13 +2589,16 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
               cond_dim=None, dit_head_width_mult=1, latent_max_tokens=256,
               dit_qk_norm=False, dit_attn_impl="auto", dit_pos_embed="learned",
               dit_mlp="gelu", latent_patch_size=1, flow_checkpoint_blocks=False,
-              flow_time_embed="scalar", flow_time_embed_dim=0):
+              flow_time_embed="scalar", flow_time_embed_dim=0,
+              flow_self_condition=False):
     latent_patch_size = int(latent_patch_size)
     if latent_patch_size <= 0:
         raise ValueError("latent_patch_size must be positive")
     if flow_arch == "conv":
         if latent_patch_size != 1:
             raise ValueError("latent_patch_size is only supported by DiT/CrossDiT/MM-DiT flows")
+        if flow_self_condition:
+            raise ValueError("flow_self_condition requires DiT/CrossDiT/MM-DiT flow")
         return LatentFlowNet(latent_ch=latent_ch, hidden=hidden, cond_dim=cond_dim)
     flow_time_embed = str(flow_time_embed or "scalar")
     if flow_time_embed not in FLOW_TIME_EMBEDS:
@@ -2612,7 +2634,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                 latent_patch_size=latent_patch_size,
                                 time_embed=flow_time_embed,
                                 time_embed_dim=flow_time_embed_dim,
-                                mlp=dit_mlp)
+                                mlp=dit_mlp,
+                                self_condition=flow_self_condition)
     if flow_arch == "crossdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
@@ -2626,7 +2649,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                      mlp=dit_mlp,
                                      latent_patch_size=latent_patch_size,
                                      time_embed=flow_time_embed,
-                                     time_embed_dim=flow_time_embed_dim)
+                                     time_embed_dim=flow_time_embed_dim,
+                                     self_condition=flow_self_condition)
     if flow_arch == "mmdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
@@ -2642,7 +2666,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                   latent_patch_size=latent_patch_size,
                                   checkpoint_blocks=flow_checkpoint_blocks,
                                   time_embed=flow_time_embed,
-                                  time_embed_dim=flow_time_embed_dim)
+                                  time_embed_dim=flow_time_embed_dim,
+                                  self_condition=flow_self_condition)
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
@@ -2743,6 +2768,32 @@ def flow_velocity(flow, z, t, cond, return_features=False):
             features,
         )
     return apply_flow_boundary_velocity(out, z, t, mode=get_flow_boundary_mode(flow))
+
+
+def flow_uses_self_condition(flow):
+    return bool(getattr(flow, "uses_self_condition", False))
+
+
+def condition_self_condition(cond, z):
+    if isinstance(cond, dict) and torch.is_tensor(cond.get("self_cond")):
+        self_cond = cond["self_cond"].to(device=z.device, dtype=z.dtype)
+        if tuple(self_cond.shape) != tuple(z.shape):
+            raise ValueError(
+                f"self_condition shape {tuple(self_cond.shape)} does not match "
+                f"latent shape {tuple(z.shape)}")
+        return self_cond.detach()
+    return torch.zeros_like(z)
+
+
+def attach_flow_self_condition(cond, self_cond):
+    if self_cond is None:
+        return cond
+    if isinstance(cond, dict):
+        out = dict(cond)
+    else:
+        out = {"vec": cond, "tokens": cond[:, None, :]}
+    out["self_cond"] = self_cond.detach()
+    return out
 
 
 def _parse_number_list(s, cast=float):
@@ -5467,6 +5518,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        time_mode_scale=DEFAULT_TIME_MODE_SCALE, time_shift=1.0,
                        latent_stats=None, consistency_w=0.0,
                        endpoint_w=0.0, frequency_w=0.0,
+                       self_condition_p=0.0,
                        flow_noise_coupling="random", flow_noise_coupling_projections=1,
                        flow_loss_weight="none", flow_loss_weight_gamma=5.0,
                        flow_loss_weight_normalize=True,
@@ -5488,6 +5540,9 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     frequency_w = float(frequency_w)
     if frequency_w < 0.0:
         raise ValueError("frequency_w must be non-negative")
+    self_condition_p = float(self_condition_p)
+    if self_condition_p < 0.0 or self_condition_p > 1.0:
+        raise ValueError("self_condition_p must be in [0, 1]")
     z1_model = normalize_latent(z1, latent_stats)
     x0 = torch.randn_like(z1_model)
     x0, coupling_parts = couple_flow_noise_to_data(
@@ -5500,6 +5555,18 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     zt = (1.0 - t) * x0 + t * z1_model
     target = z1_model - x0
     cond_model = condition_dropout(cond, cond_drop)
+    self_condition_active = False
+    if flow_uses_self_condition(flow):
+        if self_condition_p > 0.0 and bool(torch.rand((), device=z1.device) < self_condition_p):
+            with torch.no_grad():
+                zero_self_cond = attach_flow_self_condition(
+                    cond_model, torch.zeros_like(z1_model))
+                self_pred = flow_velocity(flow, zt, t, zero_self_cond)
+                self_endpoint = zt + (1.0 - t) * self_pred
+            cond_model = attach_flow_self_condition(cond_model, self_endpoint.detach())
+            self_condition_active = True
+        else:
+            cond_model = attach_flow_self_condition(cond_model, torch.zeros_like(z1_model))
     flow_features = None
     need_flow_features = (
         (repa_aligner is not None and repa_w > 0.0)
@@ -5534,6 +5601,11 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         "flow_endpoint_target_mse_unweighted": endpoint_unweighted.detach(),
         "flow_endpoint_w": torch.tensor(float(endpoint_w), device=z1.device),
         "flow_frequency_w": torch.tensor(float(frequency_w), device=z1.device),
+        "flow_self_condition": torch.tensor(
+            float(flow_uses_self_condition(flow)), device=z1.device),
+        "flow_self_condition_p": torch.tensor(float(self_condition_p), device=z1.device),
+        "flow_self_condition_active": torch.tensor(
+            float(self_condition_active), device=z1.device),
         "velocity_weight_mean": velocity_weights.detach().mean(),
         "velocity_weight_min": velocity_weights.detach().min(),
         "velocity_weight_max": velocity_weights.detach().max(),
@@ -6505,6 +6577,7 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         raise ValueError("text_guidance_cond batch must match cond batch")
     latent_stats = flow_latent_stats(flow)
     z = _seeded_randn((batch,) + tuple(latent_shape), device=device, seed=seed)
+    self_cond_state = torch.zeros_like(z) if flow_uses_self_condition(flow) else None
     flow.eval()
     if ae is not None:
         ae.eval()
@@ -6571,6 +6644,8 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         sample_latent_clip=sample_latent_clip)
     trace["sample_trace_cfg_schedule"] = cfg_schedule
     trace["sample_trace_requested_cfg_scale"] = float(cfg_scale)
+    trace["sample_trace_self_condition"] = bool(flow_uses_self_condition(flow))
+    trace["sample_trace_self_condition_updates"] = 0
     update_sample_trace(trace, "latent", z)
 
     def stabilize_latent(z_in):
@@ -6642,19 +6717,38 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                 z = stabilize_latent(z)
 
         def velocity_at(z_in, raw_t):
+            nonlocal self_cond_state
             t = torch.full((batch, 1, 1, 1), float(raw_t), device=device)
             step_cfg, cfg_strength = effective_cfg_scale_at(
                 float(raw_t), cfg_scale=cfg_scale, cfg_interval=cfg_interval,
                 cfg_schedule=cfg_schedule)
             step_cfg_mode = cfg_mode if cfg_strength > 1.0e-8 else "standard"
             record_cfg_scale(step_cfg, cfg_strength)
-            v = guided_velocity(flow, z_in, t, cond, cfg_scale=step_cfg,
-                                cfg_rescale=cfg_rescale, cfg_uncond=cfg_uncond,
+            if self_cond_state is not None:
+                step_cond = attach_flow_self_condition(cond, self_cond_state)
+                step_uncond = (
+                    attach_flow_self_condition(cfg_uncond, self_cond_state)
+                    if cfg_uncond is not None else None
+                )
+            else:
+                step_cond = cond
+                step_uncond = cfg_uncond
+            v = guided_velocity(flow, z_in, t, step_cond, cfg_scale=step_cfg,
+                                cfg_rescale=cfg_rescale, cfg_uncond=step_uncond,
                                 cfg_mode=step_cfg_mode)
+            v = stabilize_velocity(v)
+            if self_cond_state is not None:
+                tt = t
+                while tt.ndim < z_in.ndim:
+                    tt = tt.unsqueeze(-1)
+                self_cond_state = (z_in + (1.0 - tt) * v).detach()
+                trace["sample_trace_self_condition_updates"] = (
+                    int(trace.get("sample_trace_self_condition_updates", 0)) + 1
+                )
             trace["sample_trace_solver_velocity_evals"] = (
                 int(trace.get("sample_trace_solver_velocity_evals", 0)) + 1
             )
-            return stabilize_velocity(v)
+            return v
 
         if sample_method == "euler":
             v0 = velocity_at(z, t_scalar)
@@ -8126,6 +8220,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "flow_time_embed_dim", report.get("flow_time_embed_dim", 1)) or 1)
     flow_checkpoint_blocks = bool(ckpt.get(
         "flow_checkpoint_blocks", report.get("flow_checkpoint_blocks", False)))
+    flow_self_condition = bool(ckpt.get(
+        "flow_self_condition", report.get("flow_self_condition", False)))
     checkpoint_flow_boundary_mode = str(ckpt.get(
         "flow_boundary_mode", report.get("flow_boundary_mode", "none")) or "none")
     if checkpoint_flow_boundary_mode not in FLOW_BOUNDARY_MODES:
@@ -8236,7 +8332,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                      latent_patch_size=latent_patch_size,
                      flow_checkpoint_blocks=flow_checkpoint_blocks,
                      flow_time_embed=flow_time_embed,
-                     flow_time_embed_dim=flow_time_embed_dim).to(device)
+                     flow_time_embed_dim=flow_time_embed_dim,
+                     flow_self_condition=flow_self_condition).to(device)
     attach_image_geometry_mode(flow, bool(ckpt.get(
         "image_geometry_cond", report.get("image_geometry_cond", False))))
     flow_repa_aligner = None
@@ -8319,6 +8416,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         ),
         "uses_swiglu_mlp": bool(getattr(flow, "uses_swiglu_mlp", False)),
         "flow_checkpoint_blocks": bool(getattr(flow, "checkpoint_blocks", False)),
+        "flow_self_condition": bool(getattr(flow, "uses_self_condition", False)),
         "flow_boundary_mode": get_flow_boundary_mode(flow),
         "activation_checkpointing": bool(getattr(flow, "uses_activation_checkpointing", False)),
         "uses_2d_pos_embed": bool(getattr(flow, "uses_2d_pos_embed", False)),
@@ -9205,6 +9303,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       dit_pos_embed="learned",
                       dit_mlp="gelu",
                       flow_time_embed="scalar", flow_time_embed_dim=0,
+                      flow_self_condition=False, flow_self_condition_p=0.5,
                       latent_patch_size=1,
                       flow_checkpoint_blocks=False,
                       ae_arch="semantic", latent_downsample=4, ae_res_blocks=1,
@@ -9545,6 +9644,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     if flow_time_embed_dim < 0:
         raise ValueError("flow_time_embed_dim must be non-negative")
     flow_checkpoint_blocks = bool(flow_checkpoint_blocks)
+    flow_self_condition = bool(flow_self_condition)
+    if flow_self_condition and flow_arch == "conv":
+        raise ValueError("flow_self_condition requires DiT/CrossDiT/MM-DiT flow")
+    flow_self_condition_p = float(flow_self_condition_p)
+    if flow_self_condition_p < 0.0 or flow_self_condition_p > 1.0:
+        raise ValueError("flow_self_condition_p must be in [0, 1]")
     if latent_max_tokens <= 0:
         raise ValueError("latent_max_tokens must be positive")
     latent_patch_size = int(latent_patch_size)
@@ -9699,7 +9804,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                      latent_patch_size=latent_patch_size,
                      flow_checkpoint_blocks=flow_checkpoint_blocks,
                      flow_time_embed=flow_time_embed,
-                     flow_time_embed_dim=flow_time_embed_dim).to(device)
+                     flow_time_embed_dim=flow_time_embed_dim,
+                     flow_self_condition=flow_self_condition).to(device)
     attach_image_geometry_mode(flow, image_geometry_cond)
     flow_repa_aligner = None
     if flow_repa_w > 0.0:
@@ -10250,6 +10356,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     consistency_w=flow_consistency_w,
                     endpoint_w=flow_endpoint_w,
                     frequency_w=flow_frequency_w,
+                    self_condition_p=flow_self_condition_p,
                     text_aligner=text_aligner, text_align_w=flow_text_align_w,
                     feature_aligner=image_feature_aligner, image_features=image_features,
                     feature_align_w=flow_feature_align_w,
@@ -10347,7 +10454,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             latent_patch_size=latent_patch_size,
             flow_checkpoint_blocks=flow_checkpoint_blocks,
             flow_time_embed=flow_time_embed,
-            flow_time_embed_dim=flow_time_embed_dim).to(device)
+            flow_time_embed_dim=flow_time_embed_dim,
+            flow_self_condition=flow_self_condition).to(device)
         load_flow_state(teacher_flow, teacher_state)
         attach_latent_stats(teacher_flow, latent_stats)
         teacher_flow.eval()
@@ -10589,6 +10697,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             if flow_arch in ("dit", "crossdit", "mmdit") else 1
         ),
         "flow_checkpoint_blocks": bool(getattr(flow, "checkpoint_blocks", False)),
+        "flow_self_condition": bool(getattr(flow, "uses_self_condition", False)),
+        "flow_self_condition_p": float(flow_self_condition_p),
         "flow_boundary_mode": get_flow_boundary_mode(flow),
         "activation_checkpointing": bool(getattr(flow, "uses_activation_checkpointing", False)),
         "uses_2d_pos_embed": bool(getattr(flow, "uses_2d_pos_embed", False)),
@@ -10987,6 +11097,7 @@ def selftest():
             flow_frequency_w=0.01,
             flow_boundary_mode="double-cosine",
             flow_time_embed="fourier", flow_time_embed_dim=8,
+            flow_self_condition=True, flow_self_condition_p=1.0,
             dit_mlp="swiglu",
             time_sampling="adaptive", time_adaptive_bins=4,
             time_adaptive_uniform_mix=0.1,
@@ -11011,6 +11122,8 @@ def selftest():
         assert report["image_geometry_cond"] is True
         assert report["flow_time_embed"] == "fourier"
         assert report["flow_time_embed_dim"] == 8
+        assert report["flow_self_condition"] is True
+        assert math.isclose(report["flow_self_condition_p"], 1.0)
         assert report["dit_mlp"] == "swiglu"
         assert report["uses_swiglu_mlp"] is True
         assert report["adaptive_modulation"] is True
@@ -11034,6 +11147,8 @@ def selftest():
         assert meta["sample_grid_trace_solver_velocity_evals"] >= 2
         assert meta["sample_grid_trace_cfg_scale_max"] > 1.0
         assert meta["sample_grid_trace_cfg_guided_evals"] >= 1
+        assert meta["sample_grid_trace_self_condition"] is True
+        assert meta["sample_grid_trace_self_condition_updates"] >= 1
         assert os.path.exists(sample_path)
     crossdit = make_flow(
         flow_arch="crossdit", latent_ch=4, hidden=16, dit_depth=1, dit_heads=2,
@@ -11065,6 +11180,15 @@ def selftest():
     assert getattr(mmdit, "attn_impl", "") == "auto"
     assert getattr(mmdit, "flow_time_embed", "") == "fourier"
     assert getattr(mmdit, "flow_time_embed_dim", 0) == 8
+    selfcond = make_flow(
+        flow_arch="mmdit", latent_ch=4, hidden=16, dit_depth=1, dit_heads=2,
+        cond_dim=8, dit_qk_norm=True, dit_attn_impl="auto", dit_pos_embed="rope2d",
+        dit_mlp="swiglu", latent_max_tokens=16, flow_self_condition=True)
+    z_sc = torch.randn(2, 4, 4, 4)
+    cond_sc = attach_flow_self_condition(mmdit_cond, torch.zeros_like(z_sc))
+    out_sc = selfcond(z_sc, torch.zeros(2, 1, 1, 1), cond_sc)
+    assert tuple(out_sc.shape) == tuple(z_sc.shape)
+    assert getattr(selfcond, "uses_self_condition", False) is True
     print("image_latent selftest OK")
 
 
@@ -11246,6 +11370,13 @@ def main(argv=None):
                     dest="flow_checkpoint_blocks",
                     help=("checkpoint DiT/CrossDiT/MM-DiT transformer blocks during "
                           "flow training to reduce activation memory"))
+    ap.add_argument("--flow-self-condition", action="store_true",
+                    dest="flow_self_condition",
+                    help="feed previous clean endpoint estimates into transformer flow blocks")
+    ap.add_argument("--flow-self-condition-p", type=float, default=0.5,
+                    dest="flow_self_condition_p",
+                    help=("probability of no-grad endpoint self-conditioning during "
+                          "flow training"))
     ap.add_argument("--cond-drop", type=float, default=0.0, dest="cond_drop")
     ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
     ap.add_argument("--cfg-rescale", type=float, default=0.0, dest="cfg_rescale",
@@ -11705,6 +11836,10 @@ def main(argv=None):
         ap.error("--sample-pixel-dynamic-threshold-max must be positive")
     if args.flow_time_embed_dim < 0:
         ap.error("--flow-time-embed-dim must be non-negative")
+    if args.flow_self_condition and args.flow_arch == "conv":
+        ap.error("--flow-self-condition requires --flow-arch dit/crossdit/mmdit")
+    if args.flow_self_condition_p < 0.0 or args.flow_self_condition_p > 1.0:
+        ap.error("--flow-self-condition-p must be in [0, 1]")
     if args.flow_endpoint_w < 0.0:
         ap.error("--flow-endpoint-w must be non-negative")
     if args.flow_frequency_w < 0.0:
@@ -12014,6 +12149,8 @@ def main(argv=None):
         flow_time_embed=args.flow_time_embed,
         flow_time_embed_dim=args.flow_time_embed_dim,
         flow_checkpoint_blocks=args.flow_checkpoint_blocks,
+        flow_self_condition=args.flow_self_condition,
+        flow_self_condition_p=args.flow_self_condition_p,
         latent_max_tokens=args.latent_max_tokens,
         latent_patch_size=args.latent_patch_size,
         ae_arch=args.ae_arch,
@@ -12332,6 +12469,10 @@ def main(argv=None):
         "flow_time_embed": report.get("flow_time_embed", args.flow_time_embed),
         "flow_time_embed_dim": report.get("flow_time_embed_dim", args.flow_time_embed_dim),
         "flow_checkpoint_blocks": report.get("flow_checkpoint_blocks", False),
+        "flow_self_condition": report.get(
+            "flow_self_condition", args.flow_self_condition),
+        "flow_self_condition_p": report.get(
+            "flow_self_condition_p", args.flow_self_condition_p),
         "flow_boundary_mode": report.get("flow_boundary_mode", args.flow_boundary_mode),
         "activation_checkpointing": report.get("activation_checkpointing", False),
         "zero_residual_gating": report.get("zero_residual_gating", False),

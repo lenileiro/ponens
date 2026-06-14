@@ -160,6 +160,7 @@ installs those when this path is active.
     --flow-repa-w 0.05 --flow-repa-mode auto \
     --flow-self-repa-w 0.05 --flow-self-repa-mode auto \
     --flow-sra-w 0.05 --flow-sra-mode both --flow-sra-time-gap 0.25 \
+    --flow-self-condition --flow-self-condition-p 0.5 \
     --ae-accum-steps 2 --flow-accum-steps 2 --grad-clip 1.0 \
     --flow-cache-latents --flow-cache-dir runs/image_manifest_cache \
     --flow-cache-shard-size 2048 --flow-cache-batch 32 --flow-cache-dtype bf16 \
@@ -226,7 +227,8 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
 # pooled prompts plus T5-large token-sequence conditioning, crop/flip/pad-aware
 # geometry conditioning for multi-aspect targets, Fourier flow-time conditioning, decoded-pixel
 # dynamic thresholding for high-CFG samples, progressive bucket curriculum, CFG dropout,
-# boundary-enforced double-cosine rectified-flow velocity, frequency-domain endpoint
+# boundary-enforced double-cosine rectified-flow velocity, endpoint self-conditioning,
+# frequency-domain endpoint
 # detail loss, logit-normal flow times with soft Min-SNR velocity weighting,
 # SD3-style mode-biased timestep priors inside adaptive loss-tracked timestep sampling,
 # EMA-teacher guided self-distillation, triangular middle-window CFG scheduling,
