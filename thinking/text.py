@@ -1271,6 +1271,12 @@ class TextFactLM(nn.Module):
         self.choice_context_mass_scale = nn.Parameter(torch.tensor(-3.0))
         self.choice_answerability_threshold = nn.Parameter(torch.zeros(()))
         self.choice_answerability_scale = nn.Parameter(torch.tensor(-3.0))
+        self.reading_predictor = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, d),
+            nn.GELU(),
+            nn.Linear(d, d, bias=False),
+        )
         self.fact_schema = fact_schema
         self.fact_heads = nn.ModuleDict()
         self.fact_concept_refiner = None
@@ -1912,6 +1918,57 @@ def reading_latent_view_loss(model, txt, pad, unk, token_drop_p=0.15,
         covariance_weight=covariance_w, variance_target=variance_target)
 
 
+def split_reading_context_target(txt, pad, context_keep_p=0.5):
+    keep_p = float(context_keep_p)
+    if keep_p <= 0.0 or keep_p >= 1.0:
+        raise ValueError("reading context keep probability must be in (0, 1)")
+    valid = txt.ne(pad)
+    context = torch.rand(txt.shape, device=txt.device).lt(keep_p) & valid
+    target = valid & ~context
+    lengths = valid.sum(1)
+    positions = torch.arange(txt.shape[1], device=txt.device).unsqueeze(0)
+    first = valid.to(torch.long).argmax(1)
+    last_pos = positions.masked_fill(~valid, -1).max(1).values.clamp_min(0)
+    no_context = valid.any(1) & ~context.any(1)
+    if bool(no_context.any()):
+        rows = torch.where(no_context)[0]
+        context[rows, first[rows]] = True
+        target[rows, first[rows]] = False
+    no_target = valid.any(1) & ~target.any(1)
+    movable = no_target & lengths.gt(1)
+    if bool(movable.any()):
+        rows = torch.where(movable)[0]
+        target[rows, last_pos[rows]] = True
+        context[rows, last_pos[rows]] = False
+    single = no_target & lengths.eq(1)
+    if bool(single.any()):
+        rows = torch.where(single)[0]
+        target[rows, first[rows]] = True
+    context_txt = txt.masked_fill(~context, pad)
+    target_txt = txt.masked_fill(~target, pad)
+    return context_txt, target_txt
+
+
+def reading_context_target_loss(model, txt, pad, context_keep_p=0.5,
+                                feature_dropout=0.1, temperature=0.1):
+    if getattr(model, "latent_concepts", None) is None:
+        return torch.tensor(0.0, device=txt.device)
+    if txt.shape[0] <= 1:
+        return txt.float().sum() * 0.0
+    context_txt, target_txt = split_reading_context_target(
+        txt, pad, context_keep_p=context_keep_p)
+    context_slots = model.latent_concept_states(
+        context_txt, feature_dropout=feature_dropout, project=False)
+    target_slots = model.latent_concept_states(
+        target_txt, feature_dropout=0.0, project=False).detach()
+    predicted = model.reading_predictor(context_slots)
+    predicted = F.normalize(predicted.reshape(predicted.shape[0], -1), dim=-1)
+    target = F.normalize(target_slots.reshape(target_slots.shape[0], -1), dim=-1)
+    logits = predicted.matmul(target.t()) / max(float(temperature), 1e-6)
+    labels = torch.arange(logits.shape[0], device=logits.device)
+    return F.cross_entropy(logits, labels)
+
+
 def _reading_latent_pair_embeddings(model, txt, vocab, seed=0, token_drop_p=0.15,
                                     token_replace_p=0.05):
     torch.manual_seed(int(seed))
@@ -1927,6 +1984,18 @@ def _reading_latent_pair_embeddings(model, txt, vocab, seed=0, token_drop_p=0.15
     a = F.normalize(a.reshape(a.shape[0], -1), dim=-1)
     b = F.normalize(b.reshape(b.shape[0], -1), dim=-1)
     return a, b
+
+
+def _reading_context_target_embeddings(model, txt, pad, seed=0, context_keep_p=0.5):
+    torch.manual_seed(int(seed))
+    context_txt, target_txt = split_reading_context_target(
+        txt, pad, context_keep_p=context_keep_p)
+    context_slots = model.latent_concept_states(context_txt, project=False)
+    target_slots = model.latent_concept_states(target_txt, project=False)
+    predicted = model.reading_predictor(context_slots)
+    predicted = F.normalize(predicted.reshape(predicted.shape[0], -1), dim=-1)
+    target = F.normalize(target_slots.reshape(target_slots.shape[0], -1), dim=-1)
+    return predicted, target
 
 
 def eval_reading_records(records, n=0, seed=0):
@@ -1973,6 +2042,51 @@ def reading_latent_retrieval_eval(model, vocab, records, device=DEV, n=0, seed=0
                 neg_count += int((~eye).sum())
     eval_count = len([r for r in records if r.split == "eval"])
     return {"paired_view_acc": correct / max(1, total),
+            "positive_cosine": pos_sum / max(1, total),
+            "negative_cosine": neg_sum / max(1, neg_count),
+            "margin": (pos_sum / max(1, total)) - (neg_sum / max(1, neg_count)),
+            "n_records": total,
+            "sampled": bool(n > 0 and n < eval_count),
+            "skipped": False}
+
+
+def reading_context_target_retrieval_eval(model, vocab, records, device=DEV, n=0,
+                                          seed=0, context_keep_p=0.5):
+    if (getattr(model, "latent_concepts", None) is None
+            or not hasattr(model, "reading_predictor")):
+        return {"context_target_acc": 0.0, "n_records": 0, "sampled": False,
+                "skipped": True}
+    selected = eval_reading_records(records, n=n, seed=seed)
+    if not selected:
+        return {"context_target_acc": 0.0, "n_records": 0, "sampled": False,
+                "skipped": True}
+    correct = total = 0
+    pos_sum = neg_sum = 0.0
+    neg_count = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(selected), 64):
+            batch = selected[off:off + 64]
+            if len(batch) <= 1:
+                continue
+            txt = pack_reading(batch, vocab, device)
+            predicted, target = _reading_context_target_embeddings(
+                model, txt, vocab.pad, seed=seed + off * 2,
+                context_keep_p=context_keep_p)
+            sim = predicted.matmul(target.t())
+            nearest = sim.argmax(-1)
+            labels = torch.arange(sim.shape[0], device=sim.device)
+            correct += int(nearest.eq(labels).sum())
+            total += int(sim.shape[0])
+            pos_sum += float(sim.diag().sum())
+            eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+            neg_sum += float(sim.masked_select(~eye).sum())
+            neg_count += int((~eye).sum())
+    eval_count = len([r for r in records if r.split == "eval"])
+    if total == 0:
+        return {"context_target_acc": 0.0, "n_records": 0,
+                "sampled": bool(n > 0 and n < eval_count), "skipped": True}
+    return {"context_target_acc": correct / max(1, total),
             "positive_cosine": pos_sum / max(1, total),
             "negative_cosine": neg_sum / max(1, neg_count),
             "margin": (pos_sum / max(1, total)) - (neg_sum / max(1, neg_count)),
@@ -4284,10 +4398,14 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          feature_dropout=0.1,
                          invariance_w=25.0, variance_w=25.0,
                          covariance_w=1.0, variance_target=1.0,
+                         context_target_w=0.1, context_keep_p=0.5,
+                         context_target_temperature=0.1,
                          study_strategy="errors", study_probe_n=0,
                          study_hard_max=0, study_refresh_steps=0):
     if getattr(model, "latent_concepts", None) is None:
         raise ValueError("raw reading concept training requires latent concept slots")
+    if float(context_target_w) < 0.0:
+        raise ValueError("reading context-target loss weight must be non-negative")
     study_strategy = str(study_strategy)
     if study_strategy not in ("random", "errors"):
         raise ValueError(f"unknown reading study strategy {study_strategy!r}")
@@ -4299,6 +4417,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     study_pool = []
     study_reports = []
     last_loss = 0.0
+    last_view_loss = 0.0
+    last_context_target = 0.0
 
     def refresh_study_pool(step):
         nonlocal study_pool
@@ -4329,18 +4449,37 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         source = study_pool if study_strategy == "errors" and study_pool else train_records
         rec_batch = batch_records(source, rng, batch)
         txt = pack_reading(rec_batch, vocab, device)
-        loss = reading_latent_view_loss(
+        view_loss = reading_latent_view_loss(
             model, txt, vocab.pad, vocab.unk, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target)
+        context_target = (
+            reading_context_target_loss(
+                model, txt, vocab.pad, context_keep_p=context_keep_p,
+                feature_dropout=feature_dropout,
+                temperature=context_target_temperature)
+            if context_target_w else view_loss * 0.0)
+        loss = view_loss + float(context_target_w) * context_target
         opt.zero_grad()
         loss.backward()
         opt.step()
         last_loss = float(loss.detach())
+        last_view_loss = float(view_loss.detach())
+        last_context_target = float(context_target.detach())
         if st % log_every == 0 or st == steps:
-            print(f"  reading {st}/{steps} loss {last_loss:.3f}", flush=True)
-    model.reading_train_metrics = {"latent_view_loss": last_loss}
+            print(f"  reading {st}/{steps} loss {last_loss:.3f} "
+                  f"view {last_view_loss:.3f} "
+                  f"context-target {last_context_target:.3f}",
+                  flush=True)
+    model.reading_train_metrics = {
+        "loss": last_loss,
+        "latent_view_loss": last_view_loss,
+        "context_target_loss": last_context_target,
+        "context_target_w": float(context_target_w),
+        "context_keep_p": float(context_keep_p),
+        "context_target_temperature": float(context_target_temperature),
+    }
     model.reading_study_reports = study_reports
     return model, vocab
 
@@ -4356,6 +4495,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            feature_dropout=0.1,
                            invariance_w=25.0, variance_w=25.0,
                            covariance_w=1.0, variance_target=1.0,
+                           context_target_w=0.1, context_keep_p=0.5,
+                           context_target_temperature=0.1,
                            study_strategy="errors", study_probe_n=0,
                            study_hard_max=0, study_refresh_steps=0):
     if int(latent_concept_slots) <= 0:
@@ -4378,6 +4519,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         token_replace_p=token_replace_p, feature_dropout=feature_dropout,
         invariance_w=invariance_w, variance_w=variance_w,
         covariance_w=covariance_w, variance_target=variance_target,
+        context_target_w=context_target_w, context_keep_p=context_keep_p,
+        context_target_temperature=context_target_temperature,
         study_strategy=study_strategy, study_probe_n=study_probe_n,
         study_hard_max=study_hard_max, study_refresh_steps=study_refresh_steps)
 
@@ -4392,6 +4535,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          feature_dropout=0.1,
                          invariance_w=25.0, variance_w=25.0,
                          covariance_w=1.0, variance_target=1.0,
+                         context_target_w=0.1, context_keep_p=0.5,
+                         context_target_temperature=0.1,
                          study_strategy="errors", study_probe_n=0,
                          study_hard_max=0, study_refresh_steps=0,
                          text_field="text", max_tokens=128, min_tokens=8,
@@ -4414,17 +4559,25 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
     before = reading_latent_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 17,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    before_context = reading_context_target_retrieval_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 23,
+        context_keep_p=context_keep_p)
     fit_reading_concepts(
         model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
         device=device, log_every=log_every, token_drop_p=token_drop_p,
         token_replace_p=token_replace_p, feature_dropout=feature_dropout,
         invariance_w=invariance_w, variance_w=variance_w,
         covariance_w=covariance_w, variance_target=variance_target,
+        context_target_w=context_target_w, context_keep_p=context_keep_p,
+        context_target_temperature=context_target_temperature,
         study_strategy=study_strategy, study_probe_n=study_probe_n,
         study_hard_max=study_hard_max, study_refresh_steps=study_refresh_steps)
     after = reading_latent_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 17,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    after_context = reading_context_target_retrieval_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 23,
+        context_keep_p=context_keep_p)
     report = {"experiment": "text_raw_reading_concept_pretrain",
               "data": data,
               "steps": int(steps), "batch": int(batch), "lr": float(lr),
@@ -4443,6 +4596,9 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "variance_w": float(variance_w),
               "covariance_w": float(covariance_w),
               "variance_target": float(variance_target),
+              "context_target_w": float(context_target_w),
+              "context_keep_p": float(context_keep_p),
+              "context_target_temperature": float(context_target_temperature),
               "study_strategy": study_strategy,
               "study_probe_n": int(study_probe_n),
               "study_hard_max": int(study_hard_max),
@@ -4452,10 +4608,18 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "vocab_size": len(vocab),
               "before": before,
               "after": after,
+              "before_context_target": before_context,
+              "after_context_target": after_context,
               "delta": {
                   "paired_view_acc": (
                       after["paired_view_acc"] - before["paired_view_acc"]),
                   "margin": after.get("margin", 0.0) - before.get("margin", 0.0),
+                  "context_target_acc": (
+                      after_context.get("context_target_acc", 0.0)
+                      - before_context.get("context_target_acc", 0.0)),
+                  "context_target_margin": (
+                      after_context.get("margin", 0.0)
+                      - before_context.get("margin", 0.0)),
               },
               "train_metrics": getattr(model, "reading_train_metrics", {}),
               "study_hard_examples": getattr(model, "reading_study_reports", [])}
@@ -4525,6 +4689,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              token_replace_p=0.05, feature_dropout=0.1,
                              invariance_w=25.0, variance_w=25.0,
                              covariance_w=1.0, variance_target=1.0,
+                             context_target_w=0.1, context_keep_p=0.5,
+                             context_target_temperature=0.1,
                              study_strategy="errors", study_probe_n=0,
                              study_hard_max=0, study_refresh_steps=0,
                              text_field="text", max_tokens=128, min_tokens=8,
@@ -4548,17 +4714,25 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
     before = reading_latent_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 17,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    before_context = reading_context_target_retrieval_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 23,
+        context_keep_p=context_keep_p)
     fit_reading_concepts(
         model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
         device=device, log_every=log_every, token_drop_p=token_drop_p,
         token_replace_p=token_replace_p, feature_dropout=feature_dropout,
         invariance_w=invariance_w, variance_w=variance_w,
         covariance_w=covariance_w, variance_target=variance_target,
+        context_target_w=context_target_w, context_keep_p=context_keep_p,
+        context_target_temperature=context_target_temperature,
         study_strategy=study_strategy, study_probe_n=study_probe_n,
         study_hard_max=study_hard_max, study_refresh_steps=study_refresh_steps)
     after = reading_latent_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 17,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    after_context = reading_context_target_retrieval_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 23,
+        context_keep_p=context_keep_p)
     d = int(ckpt.get("d", 96))
     layers = int(ckpt.get("layers", 3))
     heads = int(ckpt.get("heads", 4))
@@ -4584,6 +4758,9 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "variance_w": float(variance_w),
               "covariance_w": float(covariance_w),
               "variance_target": float(variance_target),
+              "context_target_w": float(context_target_w),
+              "context_keep_p": float(context_keep_p),
+              "context_target_temperature": float(context_target_temperature),
               "study_strategy": study_strategy,
               "study_probe_n": int(study_probe_n),
               "study_hard_max": int(study_hard_max),
@@ -4595,10 +4772,18 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "new_tokens": max(0, len(vocab) - old_vocab_size),
               "before": before,
               "after": after,
+              "before_context_target": before_context,
+              "after_context_target": after_context,
               "delta": {
                   "paired_view_acc": (
                       after["paired_view_acc"] - before["paired_view_acc"]),
                   "margin": after.get("margin", 0.0) - before.get("margin", 0.0),
+                  "context_target_acc": (
+                      after_context.get("context_target_acc", 0.0)
+                      - before_context.get("context_target_acc", 0.0)),
+                  "context_target_margin": (
+                      after_context.get("margin", 0.0)
+                      - before_context.get("margin", 0.0)),
               },
               "train_metrics": getattr(model, "reading_train_metrics", {}),
               "study_hard_examples": getattr(model, "reading_study_reports", [])}
@@ -7801,6 +7986,20 @@ def selftest():
         choice_fragile_correct_records_per_kind(
             choice_model, choice_vocab, choice_eval, np.random.default_rng(27),
             per_kind=2, device="cpu", pool_per_kind=0))
+    if not fragile_rows:
+        opt = torch.optim.AdamW(choice_model.parameters(), lr=1e-3)
+        for _ in range(20):
+            loss = choice_loss(choice_model, choice_txt, choice_eval)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            fragile_rows, fragile_counts, fragile_selection = (
+                choice_fragile_correct_records_per_kind(
+                    choice_model, choice_vocab, choice_eval,
+                    np.random.default_rng(27), per_kind=2, device="cpu",
+                    pool_per_kind=0))
+            if fragile_rows:
+                break
     assert fragile_rows and fragile_counts
     assert fragile_selection["reason"] == "lowest_correct_choice_margin"
     neighbor_proto_rows, neighbor_proto_items = (
@@ -8024,6 +8223,14 @@ def selftest():
         reading_model, reading_txt, reading_vocab.pad, reading_vocab.unk,
         token_drop_p=0.1, token_replace_p=0.0)
     assert torch.isfinite(reading_loss)
+    context_txt, target_txt = split_reading_context_target(
+        reading_txt, reading_vocab.pad, context_keep_p=0.5)
+    assert context_txt.ne(reading_vocab.pad).any(1).all()
+    assert target_txt.ne(reading_vocab.pad).any(1).all()
+    reading_context_loss = reading_context_target_loss(
+        reading_model, reading_txt, reading_vocab.pad, context_keep_p=0.5,
+        temperature=0.2)
+    assert torch.isfinite(reading_context_loss)
     reading_errors, reading_correct, reading_report = reading_latent_record_outcomes(
         reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0,
         token_drop_p=0.1, token_replace_p=0.0)
@@ -8033,11 +8240,16 @@ def selftest():
         reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0,
         token_drop_p=0.1, token_replace_p=0.0)
     assert reading_eval["n_records"] == 2
+    reading_context_eval = reading_context_target_retrieval_eval(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0,
+        context_keep_p=0.5)
+    assert reading_context_eval["n_records"] == 2
     fit_reading_concepts(
         reading_model, reading_vocab, reading_records, steps=1, batch=2, lr=1e-4,
         seed=5, device="cpu", log_every=1, token_drop_p=0.1,
         token_replace_p=0.0, study_strategy="errors", study_probe_n=2,
-        study_hard_max=2)
+        study_hard_max=2, context_target_w=0.1, context_keep_p=0.5)
+    assert "context_target_loss" in reading_model.reading_train_metrics
     reading_payload = checkpoint_payload(reading_model, reading_vocab, 32, 1, 4,
                                          {"experiment": "reading-selftest"})
     assert reading_payload["fact_schema"] is None
@@ -8060,7 +8272,8 @@ def selftest():
             expanded_model, expanded_vocab, expanded_records, steps=1, batch=2,
             lr=1e-4, seed=7, device="cpu", log_every=1,
             token_drop_p=0.1, token_replace_p=0.0, study_strategy="errors",
-            study_probe_n=2, study_hard_max=2)
+            study_probe_n=2, study_hard_max=2, context_target_w=0.1,
+            context_keep_p=0.5)
     score_a = {"semantic_head": {"fact_value_acc": 0.8},
                "teacher_forced": {"fact_value_acc": 0.7},
                "latent_fact_concept_head": {"fact_value_acc": 0.65,
@@ -8257,6 +8470,13 @@ def main(argv=None):
                     help="UNK replacement probability for raw reading views")
     ap.add_argument("--reading-feature-dropout", type=float, default=0.1,
                     help="encoder feature dropout for raw reading latent views")
+    ap.add_argument("--reading-context-target-w", type=float, default=0.1,
+                    help=("weight for predicting held-out reading fragment latent "
+                          "state from kept context fragment"))
+    ap.add_argument("--reading-context-keep-p", type=float, default=0.5,
+                    help="probability that a token stays in the context fragment")
+    ap.add_argument("--reading-context-target-temperature", type=float, default=0.1,
+                    help="contrastive temperature for context-to-target reading retrieval")
     ap.add_argument("--reading-study-strategy", choices=("random", "errors"),
                     default="errors",
                     help="train raw reading on random chunks or mined retrieval failures")
@@ -8721,6 +8941,12 @@ def main(argv=None):
         ap.error("--reading-token-replace must be in [0, 1)")
     if args.reading_feature_dropout < 0.0 or args.reading_feature_dropout >= 1.0:
         ap.error("--reading-feature-dropout must be in [0, 1)")
+    if args.reading_context_target_w < 0.0:
+        ap.error("--reading-context-target-w must be non-negative")
+    if args.reading_context_keep_p <= 0.0 or args.reading_context_keep_p >= 1.0:
+        ap.error("--reading-context-keep-p must be in (0, 1)")
+    if args.reading_context_target_temperature <= 0.0:
+        ap.error("--reading-context-target-temperature must be positive")
     if args.reading_study_probe_n < 0:
         ap.error("--reading-study-probe-n must be non-negative")
     if args.reading_study_hard_max < 0:
@@ -8781,6 +9007,10 @@ def main(argv=None):
                 variance_w=args.latent_concept_variance_w,
                 covariance_w=args.latent_concept_covariance_w,
                 variance_target=args.latent_concept_variance_target,
+                context_target_w=args.reading_context_target_w,
+                context_keep_p=args.reading_context_keep_p,
+                context_target_temperature=(
+                    args.reading_context_target_temperature),
                 study_strategy=args.reading_study_strategy,
                 study_probe_n=args.reading_study_probe_n,
                 study_hard_max=args.reading_study_hard_max,
@@ -8821,6 +9051,10 @@ def main(argv=None):
                 variance_w=args.latent_concept_variance_w,
                 covariance_w=args.latent_concept_covariance_w,
                 variance_target=args.latent_concept_variance_target,
+                context_target_w=args.reading_context_target_w,
+                context_keep_p=args.reading_context_keep_p,
+                context_target_temperature=(
+                    args.reading_context_target_temperature),
                 study_strategy=args.reading_study_strategy,
                 study_probe_n=args.reading_study_probe_n,
                 study_hard_max=args.reading_study_hard_max,
