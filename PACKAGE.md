@@ -1,7 +1,7 @@
 # Ponens Package Reference
 
 The supported `thinking` package is manifest-driven. It no longer ships the legacy synthetic
-English bank, kinship QA worlds, proof-checking CLI, rule-induction harness, or verbalizer. Keep
+English bank, proof-checking CLI, rule-induction harness, or verbalizer. Keep
 new work on the current entry points:
 
 - `thinking.text`: raw reading and semantic text learning with latent concept discovery,
@@ -20,8 +20,9 @@ new work on the current entry points:
 path: text chunks are read directly, latent slots are trained with
 sequence, factorization, association, graph, neighborhood, transition, cluster, discovery,
 reanalysis, memory-gap, and graph-closure insight objectives. No English rules or prompt
-templates are embedded in the module, and the old structured fact/QA/import command-line surfaces
-are no longer supported.
+templates are embedded in the module, and legacy dataset importers are not supported APIs.
+Checkpoints carry a bounded raw-reading replay bank selected from the model's own study records,
+so continuation can retain earlier concepts without a separate task-specific harness.
 
 ```bash
 python -m thinking.text --selftest
@@ -41,7 +42,7 @@ python -m thinking.text --reading-data data/new_reading.jsonl \
     --steps 4000 --batch 16 \
     --reading-study-strategy gap --reading-study-probe-n 256 \
     --reading-discovery-w 0.05 --reading-reanalysis-w 0.05 \
-    --reading-gap-w 0.05 \
+    --reading-gap-w 0.05 --reading-replay-w 0.05 \
     --out runs/text_raw_reading_study.json
 ```
 
@@ -144,7 +145,7 @@ The old synthetic-language modules were removed from the active package:
 - standalone exam/write/mind/meaning prototypes
 - `datalog.py`
 
-Do not add replacements for these as hard-coded QA/rule/template layers. New data handling should
+Do not add replacements for these as hard-coded task, rule, or template layers. New data handling should
 be expressed through manifests, corpora, feature views, targets, and learned objectives. For text
 self-study, prefer `--reading-study-strategy gap` when latent memory is enabled; it ranks raw
 chunks by the model's own graph-predicted missing-concept score. Use `--reading-discovery-w` to

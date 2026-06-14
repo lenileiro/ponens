@@ -1,25 +1,22 @@
 """Schema-free text reading and latent concept discovery.
 
-The supported public surface is raw reading via ``--reading-data``.  Text is read as
+The supported text entrypoint is raw reading via ``--reading-data``.  Text is read as
 corpus chunks and trained with latent slots, concept memory, self-study, reanalysis,
 memory-gap learning, and graph-closure insight.  There are no English rulebooks,
-answer-choice handlers, QA imports, or structured fact-training CLIs in the active
-entrypoint.
+dataset-specific import handlers, answer-choice handlers, or structured fact-training
+CLIs in the active entrypoint.
 
-Older structured-fact helpers remain in the module for checkpoint compatibility and
-selftest coverage, but they are not exposed as supported command-line surfaces.
+Checkpoint compatibility code remains internal, but old dataset-specific importers have
+been removed.
 """
 import argparse
 import copy
-import csv
-import io
 import json
 import math
 import os
 import re
 import tempfile
 import urllib.request
-import zipfile
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -73,13 +70,10 @@ from .trace import Vocab
 
 DEV = get_device()
 KEYWORDS = ("extract", "fact", "done", ".")
-SCAN_URL = "https://raw.githubusercontent.com/brendenlake/SCAN/master/tasks.txt"
-SNLI_URL = "https://nlp.stanford.edu/projects/snli/snli_1.0.zip"
-MNLI_URL = "https://cims.nyu.edu/~sbowman/multinli/multinli_1.0.zip"
-HANS_TRAIN_URL = "https://raw.githubusercontent.com/tommccoy1/hans/master/heuristics_train_set.txt"
-HANS_EVAL_URL = "https://raw.githubusercontent.com/tommccoy1/hans/master/heuristics_evaluation_set.txt"
 TOKEN_RE = re.compile(r"[a-z0-9_]+|[^\s\w]", re.ASCII)
 READING_DEFAULT_LATENT_CONCEPT_SLOTS = 4
+READING_REPLAY_BANK_VERSION = 1
+READING_REPLAY_BANK_SIZE = 128
 
 
 @dataclass(frozen=True)
@@ -122,6 +116,126 @@ def split_words(text):
 def split_words_with_spans(text):
     text = str(text).lower()
     return [(m.group(0), m.start(), m.end()) for m in TOKEN_RE.finditer(text)]
+
+
+def _jsonable_meta(meta):
+    if not isinstance(meta, dict):
+        return {}
+    return json.loads(json.dumps(meta, default=str))
+
+
+def reading_record_to_bank_row(rec):
+    return {
+        "id": str(rec.rec_id),
+        "split": str(rec.split),
+        "tokens": list(rec.tokens),
+        "kind": str(rec.kind),
+        "meta": _jsonable_meta(rec.meta),
+    }
+
+
+def reading_record_from_bank_row(row, idx=0):
+    if not isinstance(row, dict):
+        raise ValueError(f"reading replay bank row {idx} must be an object")
+    split = str(row.get("split", "train"))
+    if split not in ("train", "eval"):
+        split = "train"
+    tokens = tuple(str(tok) for tok in row.get("tokens", ()) if str(tok))
+    if not tokens:
+        raise ValueError(f"reading replay bank row {idx} has no tokens")
+    meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+    meta = meta | {"replay_bank": True}
+    return ReadingRecord(
+        rec_id=str(row.get("id", f"reading-replay-{idx}")),
+        split=split,
+        tokens=tokens,
+        kind=str(row.get("kind", "raw_text")),
+        meta=meta,
+    )
+
+
+def unique_reading_records_by_id(*record_lists):
+    out = []
+    seen = set()
+    for records in record_lists:
+        for rec in records or ():
+            if rec.rec_id in seen:
+                continue
+            seen.add(rec.rec_id)
+            out.append(rec)
+    return out
+
+
+def reading_hard_record_ids(study_reports):
+    ids = []
+    seen = set()
+    for report in study_reports or ():
+        if not isinstance(report, dict):
+            continue
+        for raw_id in report.get("hard_record_ids", ()):
+            rec_id = str(raw_id)
+            if rec_id and rec_id not in seen:
+                seen.add(rec_id)
+                ids.append(rec_id)
+    return ids
+
+
+def build_reading_replay_bank(records, study_reports=None,
+                              max_records=READING_REPLAY_BANK_SIZE, seed=0):
+    max_records = int(max_records)
+    if max_records <= 0:
+        return {"version": READING_REPLAY_BANK_VERSION, "max_records": max_records,
+                "records": [], "record_count": 0, "hard_record_count": 0}
+    records = unique_reading_records_by_id(records)
+    by_id = {rec.rec_id: rec for rec in records}
+    hard_ids = reading_hard_record_ids(study_reports)
+    hard_id_set = set(hard_ids)
+    hard = [by_id[rec_id] for rec_id in hard_ids if rec_id in by_id]
+    evals = [rec for rec in records if rec.split == "eval"
+             and rec.rec_id not in {r.rec_id for r in hard}]
+    train = [rec for rec in records if rec.split == "train"
+             and rec.rec_id not in {r.rec_id for r in hard}]
+    ordered = unique_reading_records_by_id(hard, evals, train)
+    if len(ordered) > max_records:
+        keep = ordered[:max_records]
+        if hard:
+            keep_ids = {rec.rec_id for rec in keep}
+            remaining = [rec for rec in ordered[max_records:]
+                         if rec.rec_id not in keep_ids]
+            if remaining and not any(rec.split == "eval" for rec in keep):
+                eval_remaining = next((rec for rec in remaining
+                                       if rec.split == "eval"), None)
+                if eval_remaining is not None:
+                    keep[-1] = eval_remaining
+        ordered = keep
+    return {
+        "version": READING_REPLAY_BANK_VERSION,
+        "max_records": max_records,
+        "record_count": len(ordered),
+        "hard_record_count": sum(1 for rec in ordered if rec.rec_id in hard_id_set),
+        "records": [reading_record_to_bank_row(rec) for rec in ordered],
+    }
+
+
+def reading_replay_bank_records_from_payload(payload):
+    if not isinstance(payload, dict):
+        return []
+    bank = payload.get("reading_replay_bank")
+    if bank is None:
+        bank = (payload.get("report") or {}).get("reading_replay_bank")
+    rows = bank.get("records", ()) if isinstance(bank, dict) else bank
+    out = []
+    for idx, row in enumerate(rows or ()):
+        try:
+            out.append(reading_record_from_bank_row(row, idx=idx))
+        except ValueError:
+            continue
+    return unique_reading_records_by_id(out)
+
+
+def reading_replay_bank_records_from_checkpoint(path, device="cpu"):
+    ckpt = _torch_load(path, device)
+    return reading_replay_bank_records_from_payload(ckpt)
 
 
 def normalize_fact(raw, where="record"):
@@ -316,204 +430,6 @@ def load_reading_records(path, require_train=True, require_eval=True,
     return records
 
 
-def parse_scan_line(line):
-    line = line.strip()
-    if not line or not line.startswith("IN: ") or " OUT: " not in line:
-        return None
-    left, right = line.split(" OUT: ", 1)
-    command = left[len("IN: "):].strip()
-    actions = right.strip().split()
-    if not command or not actions:
-        return None
-    facts = [[f"s{i:03d}", "action", action] for i, action in enumerate(actions)]
-    return command, facts
-
-
-def scan_records(text, max_records=2000, eval_frac=0.10, seed=0):
-    pairs = [p for p in (parse_scan_line(line) for line in text.splitlines()) if p is not None]
-    if max_records:
-        pairs = pairs[:max_records]
-    if not pairs:
-        raise ValueError("SCAN import found no command/action pairs")
-    rng = np.random.default_rng(seed)
-    order = rng.permutation(len(pairs))
-    eval_n = max(1, int(round(len(pairs) * eval_frac)))
-    eval_ids = set(int(i) for i in order[:eval_n])
-    records = []
-    for i, (command, facts) in enumerate(pairs):
-        split = "eval" if i in eval_ids else "train"
-        records.append({"split": split, "id": f"scan-{i}", "text": command, "facts": facts,
-                        "kind": "scan_command"})
-    return records
-
-
-def write_jsonl(records, path):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
-        for rec in records:
-            f.write(json.dumps(rec, sort_keys=True) + "\n")
-
-
-def import_scan(out, url=SCAN_URL, max_records=2000, eval_frac=0.10, seed=0):
-    req = urllib.request.Request(url, headers={"User-Agent": "ponens-text"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        text = r.read().decode("utf-8")
-    records = scan_records(text, max_records=max_records, eval_frac=eval_frac, seed=seed)
-    write_jsonl(records, out)
-    report = {"source": url, "out": out, "records": len(records),
-              "train_records": sum(r["split"] == "train" for r in records),
-              "eval_records": sum(r["split"] == "eval" for r in records),
-              "representation": "SCAN OUT actions -> ordered canonical action facts"}
-    print(json.dumps(report, indent=1), flush=True)
-    return report
-
-
-def _snli_records_from_member(zf, member, split, limit, rng):
-    records = []
-    seen = 0
-    with zf.open(member) as f:
-        for line in f:
-            row = json.loads(line.decode("utf-8"))
-            label = row.get("gold_label")
-            if label not in ("entailment", "contradiction", "neutral"):
-                continue
-            premise = split_words(row.get("sentence1", ""))
-            hypothesis = split_words(row.get("sentence2", ""))
-            if not premise or not hypothesis:
-                continue
-            rec_id = row.get("pairID") or f"snli-{split}-{len(records)}"
-            text = ["premise", ":"] + premise + ["hypothesis", ":"] + hypothesis
-            rec = {"split": split, "id": rec_id, "tokens": text,
-                   "facts": [["pair0", "nli", label]],
-                   "kind": "natural_language_inference"}
-            seen += 1
-            if not limit or len(records) < limit:
-                records.append(rec)
-            else:
-                j = int(rng.integers(seen))
-                if j < limit:
-                    records[j] = rec
-    return records
-
-
-def import_snli(out, zip_path=None, url=SNLI_URL, max_train=5000, max_eval=1000, seed=0):
-    """Import SNLI as natural-English semantic labels.
-
-    The target is not the next token in either sentence; it is the human-labeled inference
-    relation between the premise and hypothesis.
-    """
-    if zip_path is None:
-        cache = os.path.join(os.path.dirname(out) or ".", "snli_1.0.zip")
-        if not os.path.exists(cache):
-            req = urllib.request.Request(url, headers={"User-Agent": "ponens-text"})
-            with urllib.request.urlopen(req, timeout=300) as r, open(cache, "wb") as f:
-                f.write(r.read())
-        zip_path = cache
-    with zipfile.ZipFile(zip_path) as zf:
-        rng = np.random.default_rng(seed)
-        train = _snli_records_from_member(
-            zf, "snli_1.0/snli_1.0_train.jsonl", "train", max_train, rng)
-        evals = _snli_records_from_member(
-            zf, "snli_1.0/snli_1.0_dev.jsonl", "eval", max_eval, rng)
-    records = train + evals
-    write_jsonl(records, out)
-    report = {"source": url if zip_path is None else zip_path, "out": out,
-              "records": len(records), "train_records": len(train),
-              "eval_records": len(evals),
-              "seed": int(seed),
-              "representation": "SNLI premise+hypothesis -> canonical nli relation fact",
-              "labels": ["entailment", "contradiction", "neutral"]}
-    print(json.dumps(report, indent=1), flush=True)
-    return report
-
-
-def _nli_record(row, split, rec_id, kind, source, label=None):
-    label = label or row.get("gold_label")
-    if label not in ("entailment", "contradiction", "neutral"):
-        return None
-    premise = split_words(row.get("sentence1", ""))
-    hypothesis = split_words(row.get("sentence2", ""))
-    if not premise or not hypothesis:
-        return None
-    meta = {"source": source}
-    for key in ("genre", "promptID", "pairID"):
-        if row.get(key):
-            meta[key] = row[key]
-    return {"split": split, "id": rec_id,
-            "tokens": ["premise", ":"] + premise + ["hypothesis", ":"] + hypothesis,
-            "facts": [["pair0", "nli", label]],
-            "kind": kind, "meta": meta}
-
-
-def _mnli_records_from_member(zf, member, split, limit, rng, eval_name=None):
-    records = []
-    seen = 0
-    source = eval_name or "train"
-    with zf.open(member) as f:
-        for line in f:
-            row = json.loads(line.decode("utf-8"))
-            genre = row.get("genre") or "unknown"
-            pair_id = row.get("pairID") or f"{source}-{seen}"
-            rec = _nli_record(row, split, f"mnli-{source}-{pair_id}",
-                              f"multinli:{genre}", source)
-            if rec is None:
-                continue
-            seen += 1
-            if not limit or len(records) < limit:
-                records.append(rec)
-            else:
-                j = int(rng.integers(seen))
-                if j < limit:
-                    records[j] = rec
-    return records, seen
-
-
-def import_mnli(out, zip_path=None, url=MNLI_URL, max_train=10000, max_eval=2000, seed=0):
-    """Import MultiNLI as broader-genre natural-language inference records.
-
-    This is data supervision, not a rule set: premise+hypothesis text is mapped to the human
-    NLI label as a canonical `pair0 nli <label>` fact.
-    """
-    if zip_path is None:
-        cache = os.path.join(os.path.dirname(out) or ".", "multinli_1.0.zip")
-        if not os.path.exists(cache):
-            req = urllib.request.Request(url, headers={"User-Agent": "ponens-text"})
-            with urllib.request.urlopen(req, timeout=600) as r, open(cache, "wb") as f:
-                f.write(r.read())
-        zip_path = cache
-    rng = np.random.default_rng(seed)
-    matched_n = max_eval // 2 if max_eval else 0
-    mismatched_n = max_eval - matched_n if max_eval else 0
-    with zipfile.ZipFile(zip_path) as zf:
-        train, train_seen = _mnli_records_from_member(
-            zf, "multinli_1.0/multinli_1.0_train.jsonl", "train", max_train, rng)
-        matched, matched_seen = _mnli_records_from_member(
-            zf, "multinli_1.0/multinli_1.0_dev_matched.jsonl", "eval", matched_n,
-            rng, eval_name="dev_matched")
-        mismatched, mismatched_seen = _mnli_records_from_member(
-            zf, "multinli_1.0/multinli_1.0_dev_mismatched.jsonl", "eval", mismatched_n,
-            rng, eval_name="dev_mismatched")
-    records = train + matched + mismatched
-    if not train:
-        raise ValueError("MultiNLI import produced no train records")
-    if not matched and not mismatched:
-        raise ValueError("MultiNLI import produced no eval records")
-    write_jsonl(records, out)
-    report = {"source": url if zip_path is None else zip_path, "out": out,
-              "records": len(records), "train_records": len(train),
-              "eval_records": len(matched) + len(mismatched),
-              "matched_eval_records": len(matched),
-              "mismatched_eval_records": len(mismatched),
-              "train_seen": train_seen,
-              "matched_seen": matched_seen,
-              "mismatched_seen": mismatched_seen,
-              "seed": int(seed),
-              "representation": "MultiNLI premise+hypothesis -> canonical nli relation fact",
-              "genres": sorted({r["meta"].get("genre", "unknown") for r in records})}
-    print(json.dumps(report, indent=1), flush=True)
-    return report
-
-
 def _read_text_source(source, timeout=300):
     if source.startswith(("http://", "https://")):
         req = urllib.request.Request(source, headers={"User-Agent": "ponens-text"})
@@ -521,75 +437,6 @@ def _read_text_source(source, timeout=300):
             return r.read().decode("utf-8")
     with open(source, encoding="utf-8") as f:
         return f.read()
-
-
-def _hans_label(label, mode):
-    if label == "entailment":
-        return "entailment"
-    if label == "non-entailment":
-        return "neutral" if mode == "snli" else "non_entailment"
-    raise ValueError(f"unknown HANS label {label!r}")
-
-
-def _hans_records_from_text(text, split, limit, rng, label_mode):
-    records = []
-    seen = 0
-    reader = csv.DictReader(text.splitlines(), delimiter="\t")
-    required = {"gold_label", "sentence1", "sentence2", "pairID", "heuristic",
-                "subcase", "template"}
-    if not reader.fieldnames or not required.issubset(reader.fieldnames):
-        raise ValueError("HANS file is missing required TSV fields")
-    for row in reader:
-        premise = split_words(row["sentence1"])
-        hypothesis = split_words(row["sentence2"])
-        if not premise or not hypothesis:
-            continue
-        heuristic = row["heuristic"]
-        label = _hans_label(row["gold_label"], label_mode)
-        rec = {"split": split, "id": f"hans-{split}-{row['pairID']}",
-               "tokens": ["premise", ":"] + premise + ["hypothesis", ":"] + hypothesis,
-               "facts": [["pair0", "nli", label]],
-               "kind": f"hans:{heuristic}",
-               "meta": {"heuristic": heuristic, "subcase": row["subcase"],
-                        "template": row["template"], "original_label": row["gold_label"]}}
-        seen += 1
-        if not limit or len(records) < limit:
-            records.append(rec)
-        else:
-            j = int(rng.integers(seen))
-            if j < limit:
-                records[j] = rec
-    return records, seen
-
-
-def import_hans(out, train_source=HANS_TRAIN_URL, eval_source=HANS_EVAL_URL,
-                max_train=5000, max_eval=3000, seed=0, label_mode="snli"):
-    """Import HANS as adversarial NLI records.
-
-    HANS is not used as a rulebook.  It supplies controlled premise/hypothesis examples that
-    break shallow lexical-overlap, subsequence, and constituent heuristics.
-    """
-    rng = np.random.default_rng(seed)
-    train_text = _read_text_source(train_source)
-    eval_text = _read_text_source(eval_source)
-    train, train_seen = _hans_records_from_text(train_text, "train", max_train, rng,
-                                                label_mode)
-    evals, eval_seen = _hans_records_from_text(eval_text, "eval", max_eval, rng,
-                                               label_mode)
-    records = train + evals
-    if not train:
-        raise ValueError("HANS import produced no train records")
-    if not evals:
-        raise ValueError("HANS import produced no eval records")
-    write_jsonl(records, out)
-    report = {"source": {"train": train_source, "eval": eval_source}, "out": out,
-              "records": len(records), "train_records": len(train),
-              "eval_records": len(evals), "train_seen": train_seen, "eval_seen": eval_seen,
-              "seed": int(seed), "label_mode": label_mode,
-              "representation": "HANS premise+hypothesis -> canonical nli relation fact",
-              "heuristics": sorted({r["meta"]["heuristic"] for r in records})}
-    print(json.dumps(report, indent=1), flush=True)
-    return report
 
 
 def trace_tokens(facts):
@@ -6002,6 +5849,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
     resolved_study_strategy = train_metrics.get("study_strategy", study_strategy)
     requested_study_strategy = train_metrics.get(
         "study_strategy_requested", study_strategy)
+    reading_replay_bank = build_reading_replay_bank(
+        records, study_reports=getattr(model, "reading_study_reports", []))
     report = {"experiment": "text_raw_reading_concept_pretrain",
               "data": data,
               "steps": int(steps), "batch": int(batch), "lr": float(lr),
@@ -6101,6 +5950,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "study_score_patience": int(study_score_patience),
               "study_insight_accept_w": float(study_insight_accept_w),
               "study_insight_min_delta": float(study_insight_min_delta),
+              "reading_replay_bank": reading_replay_bank,
               "train_records": sum(r.split == "train" for r in records),
               "eval_records": sum(r.split == "eval" for r in records),
               "vocab_size": len(vocab),
@@ -6340,10 +6190,14 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
     records = load_reading_records(
         data, text_field=text_field, max_tokens=max_tokens, min_tokens=min_tokens,
         eval_frac=eval_frac, seed=seed)
-    replay_records = (load_reading_records(
+    external_replay_records = (load_reading_records(
         replay_data, require_train=False, require_eval=False, text_field=text_field,
         max_tokens=max_tokens, min_tokens=min_tokens, eval_frac=eval_frac,
         seed=seed + 313) if replay_data else [])
+    checkpoint_replay_records = reading_replay_bank_records_from_checkpoint(
+        checkpoint, device="cpu")
+    replay_records = unique_reading_records_by_id(
+        external_replay_records, checkpoint_replay_records)
     torch.manual_seed(seed)
     model, vocab, ckpt = expanded_reading_checkpoint_model(
         checkpoint, records + replay_records, device=device,
@@ -6608,11 +6462,17 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
     resolved_study_strategy = train_metrics.get("study_strategy", study_strategy)
     requested_study_strategy = train_metrics.get(
         "study_strategy_requested", study_strategy)
+    reading_replay_bank = build_reading_replay_bank(
+        unique_reading_records_by_id(records, replay_records),
+        study_reports=getattr(model, "reading_study_reports", []))
     report = {"experiment": "text_raw_reading_checkpoint_study",
               "checkpoint": checkpoint,
               "checkpoint_experiment": ckpt.get("report", {}).get("experiment"),
               "data": data,
               "replay_data": replay_data or [],
+              "replay_external_records": len(external_replay_records),
+              "replay_bank_records": len(checkpoint_replay_records),
+              "replay_bank_used": bool(checkpoint_replay_records),
               "steps": int(steps), "batch": int(batch), "lr": float(lr),
               "text_encoder_arch": ckpt.get("text_encoder_arch", "transformer"),
               "text_encoder_layers": int(ckpt.get("text_encoder_layers", 1)),
@@ -6732,6 +6592,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "replay_w": float(replay_w),
               "replay_batch": int(replay_batch),
               "replay_retention_w": float(replay_retention_w),
+              "reading_replay_bank": reading_replay_bank,
               "train_records": sum(r.split == "train" for r in records),
               "eval_records": sum(r.split == "eval" for r in records),
               "replay_train_records": sum(r.split == "train" for r in replay_records),
@@ -7519,29 +7380,34 @@ def checkpoint_payload(model, vocab, d, layers, heads, report):
             "keys": model.fact_schema.keys,
             "values": model.fact_schema.values,
         }
-    return {"state_dict": model.state_dict(), "vocab": vocab.itos,
-            "fact_concept_prefix": bool(getattr(model, "fact_concept_prefix", False)),
-            "fact_concept_refine": bool(getattr(model, "fact_concept_refine", False)),
-            "fact_concept_refine_gate_init": float(
-                getattr(model, "fact_concept_refine_gate_init", -2.0)),
-            "fact_concept_mixer_layers": int(
-                getattr(model, "fact_concept_mixer_layers", 0)),
-            "fact_concept_mixer_gate_init": float(
-                getattr(model, "fact_concept_mixer_gate_init", -2.0)),
-            "latent_concept_slots": int(getattr(model, "latent_concept_slots", 0)),
-            "latent_concept_layers": int(getattr(model, "latent_concept_layers", 1)),
-            "latent_concept_prefix": bool(
-                getattr(model, "latent_concept_prefix", False)),
-            "latent_concept_refine": bool(
-                getattr(model, "latent_concept_refine", False)),
-            "latent_concept_refine_gate_init": float(
-                getattr(model, "latent_concept_refine_gate_init", -2.0)),
-            "latent_concept_memory_size": int(
-                getattr(model, "latent_concept_memory_size", 0)),
-            "text_encoder_arch": getattr(model, "text_encoder_arch", "transformer"),
-            "text_encoder_layers": int(getattr(model, "text_encoder_layers", 1)),
-            "d": d, "layers": layers, "heads": heads, "fact_schema": fact_schema,
-            "report": report}
+    payload = {
+        "state_dict": model.state_dict(), "vocab": vocab.itos,
+        "fact_concept_prefix": bool(getattr(model, "fact_concept_prefix", False)),
+        "fact_concept_refine": bool(getattr(model, "fact_concept_refine", False)),
+        "fact_concept_refine_gate_init": float(
+            getattr(model, "fact_concept_refine_gate_init", -2.0)),
+        "fact_concept_mixer_layers": int(
+            getattr(model, "fact_concept_mixer_layers", 0)),
+        "fact_concept_mixer_gate_init": float(
+            getattr(model, "fact_concept_mixer_gate_init", -2.0)),
+        "latent_concept_slots": int(getattr(model, "latent_concept_slots", 0)),
+        "latent_concept_layers": int(getattr(model, "latent_concept_layers", 1)),
+        "latent_concept_prefix": bool(
+            getattr(model, "latent_concept_prefix", False)),
+        "latent_concept_refine": bool(
+            getattr(model, "latent_concept_refine", False)),
+        "latent_concept_refine_gate_init": float(
+            getattr(model, "latent_concept_refine_gate_init", -2.0)),
+        "latent_concept_memory_size": int(
+            getattr(model, "latent_concept_memory_size", 0)),
+        "text_encoder_arch": getattr(model, "text_encoder_arch", "transformer"),
+        "text_encoder_layers": int(getattr(model, "text_encoder_layers", 1)),
+        "d": d, "layers": layers, "heads": heads, "fact_schema": fact_schema,
+        "report": report,
+    }
+    if isinstance(report, dict) and report.get("reading_replay_bank") is not None:
+        payload["reading_replay_bank"] = report["reading_replay_bank"]
+    return payload
 
 
 def clone_model_state(model):
@@ -8164,17 +8030,6 @@ def selftest():
     assert sorted(buckets) == ["counterfactual", "plain"]
     balanced = balanced_batch_records(buckets, np.random.default_rng(1), 4)
     assert {r.kind for r in balanced} == {"plain", "counterfactual"}
-    scan = scan_records("IN: jump twice OUT: I_JUMP I_JUMP\n"
-                        "IN: walk left OUT: I_TURN_LEFT I_WALK\n",
-                        max_records=2, eval_frac=0.5, seed=0)
-    assert scan[0]["facts"][0] == ["s000", "action", "I_JUMP"]
-    hans_text = ("gold_label\tsentence1\tsentence2\tpairID\theuristic\tsubcase\ttemplate\n"
-                 "non-entailment\tThe doctor advised the president .\t"
-                 "The president advised the doctor .\tex0\tlexical_overlap\t"
-                 "ln_subject/object_swap\ttemp1\n")
-    hans, seen = _hans_records_from_text(hans_text, "eval", 0, np.random.default_rng(0),
-                                         "snli")
-    assert seen == 1 and hans[0]["facts"] == [["pair0", "nli", "neutral"]]
     vocab = build_vocab(records)
     schema = build_fact_schema(records)
     model = TextFactLM(len(vocab), d=32, layers=1, heads=4, pad=vocab.pad,
@@ -8557,9 +8412,16 @@ def selftest():
     assert helper_selection["accepted_update"] is False
     assert helper_selection["selected_round"] == 0
     assert helper_model.reading_study_reports == []
-    reading_payload = checkpoint_payload(reading_model, reading_vocab, 32, 1, 4,
-                                         {"experiment": "reading-selftest"})
+    reading_replay_bank = build_reading_replay_bank(
+        reading_records, study_reports=getattr(reading_model, "reading_study_reports", []),
+        max_records=4)
+    reading_payload = checkpoint_payload(
+        reading_model, reading_vocab, 32, 1, 4,
+        {"experiment": "reading-selftest",
+         "reading_replay_bank": reading_replay_bank})
     assert reading_payload["fact_schema"] is None
+    assert reading_payload["reading_replay_bank"]["record_count"] > 0
+    assert reading_replay_bank_records_from_payload(reading_payload)
     assert reading_payload["latent_concept_memory_size"] == 8
     with tempfile.TemporaryDirectory() as td:
         base_ckpt = os.path.join(td, "reading_base.pt")
@@ -8587,7 +8449,8 @@ def selftest():
             gap_w=0.05, study_strategy="gap", study_probe_n=2,
             study_hard_max=1, study_refresh_steps=1,
             study_select_best=False, context_target_w=0.0,
-            sequence_w=0.0, transition_w=0.0, print_report=False)
+            sequence_w=0.0, transition_w=0.0, replay_w=0.05,
+            print_report=False)
         assert study_report["experiment"] == "text_raw_reading_checkpoint_study"
         assert study_report["checkpoint_experiment"] == "reading-selftest"
         assert os.path.exists(studied_ckpt)
@@ -8597,17 +8460,24 @@ def selftest():
         assert study_report["discovery_w"] == 0.05
         assert study_report["reanalysis_w"] == 0.05
         assert study_report["gap_w"] == 0.05
+        assert study_report["replay_bank_used"] is True
+        assert study_report["replay_bank_records"] > 0
+        assert study_report["replay_train_records"] > 0
+        assert study_report["before_replay"] is not None
         assert study_report["train_metrics"]["study_strategy"] == "gap"
         assert study_report["train_metrics"]["memory_active"] > 0
         assert study_report["train_metrics"]["discovery_w"] == 0.05
         assert study_report["train_metrics"]["reanalysis_w"] == 0.05
         assert study_report["train_metrics"]["gap_w"] == 0.05
+        assert study_report["train_metrics"]["replay_w"] == 0.05
+        assert study_report["train_metrics"]["replay_records"] > 0
         assert math.isfinite(study_report["train_metrics"]["gap_loss"])
         _studied_model, studied_vocab, studied_payload = load_checkpoint(
             studied_ckpt, device="cpu")
         assert "crystallize" in studied_vocab.stoi
         assert (studied_payload["report"]["experiment"]
                 == "text_raw_reading_checkpoint_study")
+        assert studied_payload["reading_replay_bank"]["record_count"] > 0
     print("text selftest OK")
 
 

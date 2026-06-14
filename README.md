@@ -9,7 +9,7 @@ multimodal bridge.
 
 The current bet is that language mastery should come from reading, latent structure, replay,
 reanalysis, self-generated memory gaps, graph-closure insight, and cross-modal concept pressure,
-not from hand-authored QA harnesses or templated phrasing rules. The code keeps model inputs manifest-driven: datasets
+not from hand-authored task harnesses or templated phrasing rules. The code keeps model inputs manifest-driven: datasets
 provide text, feature views, image records, and optional target tokens; model code learns the
 representations.
 
