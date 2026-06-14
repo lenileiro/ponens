@@ -26,10 +26,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from device import get_device
-from .vocoder import load_bank, _split, N_BINS, N_FFT, HOP, SR, write_wav, griffin_lim, stft_logmag
+from .vocoder import load_bank, N_BINS, N_FFT, HOP, SR, write_wav, griffin_lim, stft_logmag
 
 DEV = get_device()
 _WIN = torch.hann_window(N_FFT)
+
+
+def _split(clips, holdout_frac=0.15, seed=0):
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(len(clips))
+    k = max(1, int(len(clips) * holdout_frac))
+    hold = set(idx[:k].tolist())
+    return [c for i, c in enumerate(clips) if i not in hold], [c for i, c in enumerate(clips) if i in hold]
 
 
 def _stft(wav):
