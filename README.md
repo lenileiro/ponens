@@ -105,6 +105,7 @@ installs those when this path is active.
     --caption-cond-source auto \
     --size 64 --ae-arch residual --latent-downsample 8 --latent-max-tokens 128 \
     --dit-pos-embed rope2d --dit-attn-impl auto --dit-mlp swiglu \
+    --dit-register-tokens 1 \
     --latent-patch-size 2 \
     --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 --ae-fft-w 0.05 \
     --image-text-align-w 0.1 --flow-text-align-w 0.05 --text-embed-dim 128 \
@@ -168,7 +169,8 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
 # 512/768 data path; `web-hf-vae-hq` switches to a mixed 1024+512 source manifest with
 # high-res source upweighting, PickScore + technical-health quality scoring,
 # stricter cleaning, longer text sequence conditioning, 1024/multi-aspect buckets, latent patching
-# that keeps MM-DiT token count bounded, a 12-block/12-head 768-wide MM-DiT, more sampling steps,
+# that keeps MM-DiT token count bounded, a 12-block/12-head 768-wide MM-DiT
+# with a REG-style image-stream register token, more sampling steps,
 # Karras-style timestep placement, sampler-diverse candidate reranking, and a
 # generated-candidate feedback artifact:
 # `*_candidates.jsonl` -> PickScore-scored candidates -> `*_preferences.jsonl` chosen/rejected
