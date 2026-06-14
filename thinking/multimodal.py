@@ -36,6 +36,8 @@ from .concepts import (
     latent_concept_association_loss,
     latent_concept_cluster_prototype_loss,
     latent_concept_composition_loss,
+    latent_concept_fer_loss,
+    latent_concept_fer_metrics,
     latent_concept_graph_prediction_loss,
     latent_concept_graph_prediction_scores,
     latent_concept_memory_loss,
@@ -700,6 +702,41 @@ def latent_multimodal_factorization_loss_from_views(
     return torch.stack(losses).mean() if losses else next(iter(views.values())).sum() * 0.0
 
 
+def latent_multimodal_fer_loss_from_views(
+        views, fragmentation_w=1.0, correlation_w=1.0, balance_w=0.1):
+    views = {mode: slots for mode, slots in views.items() if slots is not None}
+    if not views:
+        return torch.tensor(0.0)
+    losses = [
+        latent_concept_fer_loss(
+            slots, fragmentation_w=fragmentation_w,
+            correlation_w=correlation_w, balance_w=balance_w)
+        for slots in views.values()
+    ]
+    return torch.stack(losses).mean() if losses else next(iter(views.values())).sum() * 0.0
+
+
+def latent_multimodal_fer_metrics_from_views(views):
+    views = {mode: slots for mode, slots in views.items() if slots is not None}
+    if not views:
+        return {"fer_score": 0.0, "fragmentation": 0.0,
+                "slot_correlation": 0.0, "slot_imbalance": 0.0,
+                "mode_count": 0, "modes": {}}
+    keys = ("fer_score", "fragmentation", "slot_correlation", "slot_imbalance")
+    totals = {key: 0.0 for key in keys}
+    modes = {}
+    for mode, slots in views.items():
+        metrics = latent_concept_fer_metrics(slots)
+        report = {key: float(metrics[key].detach()) for key in keys}
+        modes[mode] = report
+        for key in keys:
+            totals[key] += report[key]
+    count = float(max(1, len(modes)))
+    return {**{key: totals[key] / count for key in keys},
+            "mode_count": len(modes),
+            "modes": modes}
+
+
 def latent_multimodal_memory_loss_from_views(model, views, temperature=0.1,
                                              balance_w=0.0):
     views = {mode: slots for mode, slots in views.items() if slots is not None}
@@ -985,6 +1022,59 @@ def evaluate(model, records, vocab, view_dims, n=200, seed=1,
     }
 
 
+def latent_multimodal_fer_eval(model, records, vocab, view_dims, n=200,
+                               seed=1, device=DEV):
+    if getattr(model, "latent_concepts", None) is None:
+        return {"fer_score": 0.0, "fragmentation": 0.0,
+                "slot_correlation": 0.0, "slot_imbalance": 0.0,
+                "n_records": 0, "sampled": False, "skipped": True}
+    rng = np.random.default_rng(seed)
+    count = min(int(n), len(records)) if int(n) > 0 else len(records)
+    sample = _sample_records(records, count, rng) if count else []
+    if not sample:
+        return {"fer_score": 0.0, "fragmentation": 0.0,
+                "slot_correlation": 0.0, "slot_imbalance": 0.0,
+                "n_records": 0, "sampled": False, "skipped": True}
+    keys = ("fer_score", "fragmentation", "slot_correlation", "slot_imbalance")
+    totals = {key: 0.0 for key in keys}
+    mode_totals = {mode: {key: 0.0 for key in keys} for mode in MODES}
+    total = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(sample), 64):
+            batch_records = sample[off:off + 64]
+            features, txt, _ids = _batch_from_records(
+                batch_records, vocab, device, view_dims)
+            views = {
+                mode: model.latent_concept_states(
+                    features, txt, mode=mode, project=True)
+                for mode in MODES
+            }
+            metrics = latent_multimodal_fer_metrics_from_views(views)
+            weight = len(batch_records)
+            total += weight
+            for key in keys:
+                totals[key] += float(metrics[key]) * weight
+            for mode, mode_metrics in metrics.get("modes", {}).items():
+                for key in keys:
+                    mode_totals[mode][key] += float(mode_metrics[key]) * weight
+    if total == 0:
+        return {"fer_score": 0.0, "fragmentation": 0.0,
+                "slot_correlation": 0.0, "slot_imbalance": 0.0,
+                "n_records": 0, "sampled": False, "skipped": True}
+    report = {key: totals[key] / float(total) for key in keys}
+    report.update({
+        "n_records": total,
+        "sampled": bool(int(n) > 0 and int(n) < len(records)),
+        "skipped": False,
+        "modes": {
+            mode: {key: vals[key] / float(total) for key in keys}
+            for mode, vals in mode_totals.items()
+        },
+    })
+    return report
+
+
 def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           device=DEV, log_every=100, layers=3, heads=4, max_len=128,
           view_tokens=4, txt_tokens=8, trunk_arch="mlp",
@@ -1002,6 +1092,10 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           latent_concept_factorization_variance=0.05,
           latent_concept_factorization_margin=0.2,
           latent_concept_factorization_covariance_w=0.05,
+          latent_concept_fer_w=0.0,
+          latent_concept_fer_fragmentation_w=1.0,
+          latent_concept_fer_correlation_w=1.0,
+          latent_concept_fer_balance_w=0.1,
           latent_concept_memory_w=0.0,
           latent_concept_memory_size=0,
           latent_concept_memory_temperature=0.1,
@@ -1047,7 +1141,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_concept_memory_size = ckpt_latents["latent_concept_memory_size"]
     latent_weights = (
         latent_concept_w, latent_concept_factorization_w, latent_concept_memory_w,
-        latent_concept_association_w, latent_concept_composition_w,
+        latent_concept_fer_w, latent_concept_association_w, latent_concept_composition_w,
         latent_concept_graph_predict_w, latent_concept_neighborhood_w,
         latent_concept_transition_w, latent_concept_cluster_w)
     if any(float(w) < 0.0 for w in latent_weights):
@@ -1114,6 +1208,13 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 separation_margin=latent_concept_factorization_margin,
                 covariance_w=latent_concept_factorization_covariance_w)
             if latent_concept_factorization_w else base_loss * 0.0)
+        latent_fer = (
+            latent_multimodal_fer_loss_from_views(
+                latent_views,
+                fragmentation_w=latent_concept_fer_fragmentation_w,
+                correlation_w=latent_concept_fer_correlation_w,
+                balance_w=latent_concept_fer_balance_w)
+            if latent_concept_fer_w else base_loss * 0.0)
         latent_memory = (
             latent_multimodal_memory_loss_from_views(
                 model, latent_views, temperature=latent_concept_memory_temperature,
@@ -1165,6 +1266,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         loss = (base_loss + float(agreement_w) * agreement
                 + float(latent_concept_w) * latent_concept
                 + float(latent_concept_factorization_w) * latent_factorization
+                + float(latent_concept_fer_w) * latent_fer
                 + float(latent_concept_memory_w) * latent_memory
                 + float(latent_concept_association_w) * latent_association
                 + float(latent_concept_composition_w) * latent_composition
@@ -1186,12 +1288,22 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         if latent_concept_graph_predict_w:
             transition_updates = int(update_multimodal_latent_transitions(
                 model, latent_views, decay=latent_concept_association_decay))
+        fer_metrics = latent_multimodal_fer_metrics_from_views(latent_views)
         last = {
             "loss": float(loss.detach()),
             "token_loss": float(base_loss.detach()),
             "agreement_loss": float(agreement.detach()),
             "latent_concept_loss": float(latent_concept.detach()),
             "latent_factorization_loss": float(latent_factorization.detach()),
+            "latent_fer_loss": float(latent_fer.detach()),
+            "latent_fer_w": float(latent_concept_fer_w),
+            "latent_fer_fragmentation_w": float(latent_concept_fer_fragmentation_w),
+            "latent_fer_correlation_w": float(latent_concept_fer_correlation_w),
+            "latent_fer_balance_w": float(latent_concept_fer_balance_w),
+            "latent_fer_score": float(fer_metrics["fer_score"]),
+            "latent_fer_fragmentation": float(fer_metrics["fragmentation"]),
+            "latent_fer_slot_correlation": float(fer_metrics["slot_correlation"]),
+            "latent_fer_slot_imbalance": float(fer_metrics["slot_imbalance"]),
             "latent_memory_loss": float(latent_memory.detach()),
             "latent_association_loss": float(latent_association.detach()),
             "latent_composition_loss": float(latent_composition.detach()),
@@ -1221,6 +1333,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             print(f"  multimodal {st}/{steps} loss {last['loss']:.3f} "
                   f"token {last['token_loss']:.3f} agree {last['agreement_loss']:.3f} "
                   f"latent {last['latent_concept_loss']:.3f} "
+                  f"fer {last['latent_fer_loss']:.3f} "
                   f"memory {last['latent_memory_loss']:.3f}",
                   flush=True)
     model.train_metrics = last
@@ -1252,6 +1365,9 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
             model, train_records, vocab, view_dims,
             n=min(64, len(train_records)), seed=seed + 23, device=device)
         latent_probe["top_ids"] = [r.rec_id for r in selected[:8]]
+    latent_fer_probe = latent_multimodal_fer_eval(
+        model, eval_records, vocab, view_dims, n=eval_n, seed=seed + 29,
+        device=device)
     architecture = dict(model.config)
     architecture["reader_prefix_tokens"] = (
         int(model.config["view_tokens"]) * len(model.config["view_names"])
@@ -1270,6 +1386,7 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         "train_metrics": getattr(model, "train_metrics", {}),
         "teacher_forced": metrics,
         "latent_graph_probe": latent_probe,
+        "latent_fer_probe": latent_fer_probe,
         "text_checkpoint_transfer": getattr(model, "text_checkpoint_transfer", {}),
         "gate": metrics["full"]["token_acc"] >= 0.50,
     }
@@ -1336,6 +1453,13 @@ def selftest():
         }
         assert torch.isfinite(latent_multimodal_concept_loss_from_views(views))
         assert torch.isfinite(latent_multimodal_factorization_loss_from_views(views))
+        assert torch.isfinite(latent_multimodal_fer_loss_from_views(views))
+        fer_metrics = latent_multimodal_fer_metrics_from_views(views)
+        assert math.isfinite(fer_metrics["fer_score"])
+        fer_eval = latent_multimodal_fer_eval(
+            model, records, vocab, view_dims, n=4, device="cpu")
+        assert fer_eval["skipped"] is False
+        assert math.isfinite(fer_eval["fer_score"])
         assert update_multimodal_latent_memory(
             model, views["full"], relation_decay=0.5) > 0
         assert update_multimodal_latent_transitions(model, views, decay=0.5) > 0
@@ -1352,6 +1476,7 @@ def selftest():
             log_every=1, view_tokens=2, txt_tokens=4,
             concept_tokens=2, latent_concept_slots=3,
             latent_concept_memory_size=8, latent_concept_memory_w=0.01,
+            latent_concept_fer_w=0.01,
             latent_concept_association_w=0.01,
             latent_concept_composition_w=0.01,
             latent_concept_graph_predict_w=0.01,
@@ -1359,6 +1484,8 @@ def selftest():
             latent_concept_transition_w=0.01,
             latent_concept_cluster_w=0.01)
         assert trained_model.train_metrics["latent_graph_transition_updates"] > 0
+        assert trained_model.train_metrics["latent_fer_w"] == 0.01
+        assert math.isfinite(trained_model.train_metrics["latent_fer_score"])
     print("multimodal selftest OK")
 
 
@@ -1413,6 +1540,14 @@ def main(argv=None):
                     default=0.2, dest="latent_concept_factorization_margin")
     ap.add_argument("--latent-concept-factorization-covariance-w", type=float,
                     default=0.05, dest="latent_concept_factorization_covariance_w")
+    ap.add_argument("--latent-concept-fer-w", type=float, default=0.0,
+                    dest="latent_concept_fer_w")
+    ap.add_argument("--latent-concept-fer-fragmentation-w", type=float, default=1.0,
+                    dest="latent_concept_fer_fragmentation_w")
+    ap.add_argument("--latent-concept-fer-correlation-w", type=float, default=1.0,
+                    dest="latent_concept_fer_correlation_w")
+    ap.add_argument("--latent-concept-fer-balance-w", type=float, default=0.1,
+                    dest="latent_concept_fer_balance_w")
     ap.add_argument("--latent-concept-memory-w", type=float, default=0.0,
                     dest="latent_concept_memory_w")
     ap.add_argument("--latent-concept-memory-size", type=int, default=0,
@@ -1528,7 +1663,8 @@ def main(argv=None):
         ap.error("--latent-concept-layers must be positive")
     latent_weights = [
         args.latent_concept_w, args.latent_concept_factorization_w,
-        args.latent_concept_memory_w, args.latent_concept_association_w,
+        args.latent_concept_fer_w, args.latent_concept_memory_w,
+        args.latent_concept_association_w,
         args.latent_concept_composition_w, args.latent_concept_graph_predict_w,
         args.latent_concept_neighborhood_w, args.latent_concept_transition_w,
         args.latent_concept_cluster_w,
@@ -1537,6 +1673,10 @@ def main(argv=None):
         ap.error("agreement/latent loss weights must be non-negative")
     if args.latent_concept_view_dropout < 0.0 or args.latent_concept_view_dropout >= 1.0:
         ap.error("--latent-concept-view-dropout must be in [0, 1)")
+    if (args.latent_concept_fer_fragmentation_w < 0.0
+            or args.latent_concept_fer_correlation_w < 0.0
+            or args.latent_concept_fer_balance_w < 0.0):
+        ap.error("latent FER component weights must be non-negative")
     if (any(w > 0.0 for w in latent_weights)
             or args.latent_concept_memory_size > 0
             or args.latent_concept_prefix) and args.latent_concept_slots <= 0:
@@ -1584,6 +1724,11 @@ def main(argv=None):
             args.latent_concept_factorization_margin),
         latent_concept_factorization_covariance_w=(
             args.latent_concept_factorization_covariance_w),
+        latent_concept_fer_w=args.latent_concept_fer_w,
+        latent_concept_fer_fragmentation_w=(
+            args.latent_concept_fer_fragmentation_w),
+        latent_concept_fer_correlation_w=args.latent_concept_fer_correlation_w,
+        latent_concept_fer_balance_w=args.latent_concept_fer_balance_w,
         latent_concept_memory_w=args.latent_concept_memory_w,
         latent_concept_memory_size=args.latent_concept_memory_size,
         latent_concept_memory_temperature=args.latent_concept_memory_temperature,
