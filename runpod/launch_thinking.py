@@ -339,6 +339,10 @@ def text_reading_cmd(args, PY):
         f"--reading-study-score-margin-w {args.reading_study_score_margin_w} "
         f"--reading-study-score-min-delta {args.reading_study_score_min_delta} "
         f"--reading-study-score-patience {args.reading_study_score_patience} "
+        f"--reading-study-insight-accept-w "
+        f"{args.reading_study_insight_accept_w} "
+        f"--reading-study-insight-min-delta "
+        f"{args.reading_study_insight_min_delta} "
         f"--out {shlex_quote(report)}"
     )
     for source in args.reading_data or []:
@@ -1830,6 +1834,11 @@ def main():
                     dest="reading_study_score_min_delta")
     ap.add_argument("--reading-study-score-patience", type=int, default=0,
                     dest="reading_study_score_patience")
+    ap.add_argument("--reading-study-insight-accept-w", "--reading-study-insight-w",
+                    type=float, default=0.25,
+                    dest="reading_study_insight_accept_w")
+    ap.add_argument("--reading-study-insight-min-delta", type=float, default=0.0,
+                    dest="reading_study_insight_min_delta")
     ap.add_argument("--ref", default="HEAD",
                     help="deploy this git ref (pinned commit); '' = live tree")
     ap.add_argument("--vision-understanding", action="store_true",
@@ -3151,6 +3160,10 @@ def main():
             "--reading-study-score-margin-w": args.reading_study_score_margin_w,
             "--reading-study-score-min-delta": args.reading_study_score_min_delta,
             "--reading-study-score-patience": args.reading_study_score_patience,
+            "--reading-study-insight-accept-w": (
+                args.reading_study_insight_accept_w),
+            "--reading-study-insight-min-delta": (
+                args.reading_study_insight_min_delta),
         }
         bad_text_nonnegative = [
             name for name, value in text_nonnegative.items() if value < 0

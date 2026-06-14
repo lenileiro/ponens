@@ -4265,6 +4265,35 @@ def _step_schedule(steps, rounds):
             if base + (1 if i < rem else 0) > 0]
 
 
+def reading_round_selection_decision(
+        score_delta_from_best, score_min_delta, insight_delta=0.0,
+        insight_allowed=True, bridge_insight_gate=False,
+        insight_accept_w=0.25, insight_min_delta=0.0):
+    score_delta_from_best = float(score_delta_from_best)
+    score_min_delta = float(score_min_delta)
+    insight_delta = float(insight_delta)
+    insight_accept_w = float(insight_accept_w)
+    insight_min_delta = float(insight_min_delta)
+    selected_by_score = (
+        bool(insight_allowed) and score_delta_from_best > score_min_delta)
+    insight_boost = 0.0
+    if (bool(insight_allowed) and bool(bridge_insight_gate)
+            and insight_accept_w > 0.0 and insight_delta > insight_min_delta):
+        insight_boost = insight_accept_w * max(0.0, insight_delta)
+    effective_delta = score_delta_from_best + insight_boost
+    selected_by_insight = (
+        bool(insight_allowed) and insight_boost > 0.0
+        and effective_delta > score_min_delta)
+    return {
+        "selected": bool(selected_by_score or selected_by_insight),
+        "selected_by_score": bool(selected_by_score),
+        "selected_by_insight": bool(
+            selected_by_insight and not selected_by_score),
+        "insight_score_boost": float(insight_boost),
+        "insight_effective_delta": float(effective_delta),
+    }
+
+
 def fit_reading_concepts_select_best(
         model, vocab, records, steps=400, batch=32, lr=1e-3,
         seed=0, device=DEV, log_every=100,
@@ -4313,6 +4342,7 @@ def fit_reading_concepts_select_best(
         replay_retention_w=0.0,
         eval_n=64, score_metric="mastery", score_margin_w=0.1,
         score_min_delta=0.0, score_patience=0,
+        insight_accept_w=0.25, insight_min_delta=0.0,
         rounds=1, before_bundle=None):
     schedule = _step_schedule(steps, rounds)
     if not schedule:
@@ -4323,6 +4353,12 @@ def fit_reading_concepts_select_best(
     score_patience = int(score_patience)
     if score_patience < 0:
         raise ValueError("reading study score patience must be non-negative")
+    insight_accept_w = float(insight_accept_w)
+    if insight_accept_w < 0.0:
+        raise ValueError("reading study insight accept weight must be non-negative")
+    insight_min_delta = float(insight_min_delta)
+    if insight_min_delta < 0.0:
+        raise ValueError("reading study insight min delta must be non-negative")
     if int(memory_size) > 0:
         model.enable_latent_concept_memory(int(memory_size))
     initial_study_strategy = resolve_reading_study_strategy(
@@ -4504,12 +4540,23 @@ def fit_reading_concepts_select_best(
         score_delta_from_best = float(score - best_score)
         insight = round_train_metrics.get("study_pool_insight")
         insight_delta, insight_allowed = bridge_insight_delta(insight)
-        selected = insight_allowed and score_delta_from_best > score_min_delta
+        decision = reading_round_selection_decision(
+            score_delta_from_best, score_min_delta,
+            insight_delta=insight_delta, insight_allowed=insight_allowed,
+            bridge_insight_gate=bridge_insight_gate,
+            insight_accept_w=insight_accept_w,
+            insight_min_delta=insight_min_delta)
+        selected = decision["selected"]
         rounds_report.append(row | {
             "selected": bool(selected),
             "score_delta_from_best": score_delta_from_best,
             "bridge_insight_delta": float(insight_delta),
             "bridge_insight_allowed": bool(insight_allowed),
+            "selected_by_score": bool(decision["selected_by_score"]),
+            "selected_by_insight": bool(decision["selected_by_insight"]),
+            "insight_score_boost": float(decision["insight_score_boost"]),
+            "insight_effective_delta": float(
+                decision["insight_effective_delta"]),
             "study_pool_insight": insight,
             "study_pool_bridge_before": round_train_metrics.get(
                 "study_pool_bridge_before"),
@@ -4544,6 +4591,8 @@ def fit_reading_concepts_select_best(
         "score_min_delta": float(score_min_delta),
         "score_patience": int(score_patience),
         "bridge_insight_gate": bool(bridge_insight_gate),
+        "insight_accept_w": float(insight_accept_w),
+        "insight_min_delta": float(insight_min_delta),
         "stopped_early": bool(stopped_early),
         "stop_round": int(stop_round),
         "no_improve_rounds": int(no_improve_rounds),
@@ -4561,7 +4610,16 @@ def fit_reading_concepts_select_best(
     }
     selected_rows = [row for row in rounds_report if row["round"] == best_round]
     if selected_rows:
-        selection["selected_insight"] = selected_rows[0].get("study_pool_insight")
+        selected_row = selected_rows[0]
+        selection["selected_by_score"] = bool(
+            selected_row.get("selected_by_score", False))
+        selection["selected_by_insight"] = bool(
+            selected_row.get("selected_by_insight", False))
+        selection["selected_insight_score_boost"] = float(
+            selected_row.get("insight_score_boost", 0.0))
+        selection["selected_insight_effective_delta"] = float(
+            selected_row.get("insight_effective_delta", 0.0))
+        selection["selected_insight"] = selected_row.get("study_pool_insight")
     best_metrics = best_metrics | {"selection": selection}
     model.reading_train_metrics = best_metrics
     model.reading_study_reports = best_study_reports
@@ -4637,6 +4695,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            study_score_margin_w=0.1,
                            study_score_min_delta=0.0,
                            study_score_patience=0,
+                           study_insight_accept_w=0.25,
+                           study_insight_min_delta=0.0,
                            eval_n=64):
     if int(latent_concept_slots) <= 0:
         raise ValueError("raw reading concept training requires latent_concept_slots > 0")
@@ -4728,6 +4788,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             score_margin_w=study_score_margin_w,
             score_min_delta=study_score_min_delta,
             score_patience=study_score_patience,
+            insight_accept_w=study_insight_accept_w,
+            insight_min_delta=study_insight_min_delta,
             rounds=study_rounds)
         return model, vocab
     return fit_reading_concepts(
@@ -4861,6 +4923,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          study_select_best=True, study_rounds=1,
                          study_score_metric="mastery", study_score_margin_w=0.1,
                          study_score_min_delta=0.0, study_score_patience=0,
+                         study_insight_accept_w=0.25,
+                         study_insight_min_delta=0.0,
                          text_field="text", max_tokens=128, min_tokens=8,
                          eval_frac=0.10, eval_n=64, out=None, checkpoint=None):
     records = load_reading_records(
@@ -4960,6 +5024,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             score_margin_w=study_score_margin_w,
             score_min_delta=study_score_min_delta,
             score_patience=study_score_patience,
+            insight_accept_w=study_insight_accept_w,
+            insight_min_delta=study_insight_min_delta,
             rounds=study_rounds,
             before_bundle=before_bundle)
     else:
@@ -5148,6 +5214,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "study_score_margin_w": float(study_score_margin_w),
               "study_score_min_delta": float(study_score_min_delta),
               "study_score_patience": int(study_score_patience),
+              "study_insight_accept_w": float(study_insight_accept_w),
+              "study_insight_min_delta": float(study_insight_min_delta),
               "train_records": sum(r.split == "train" for r in records),
               "eval_records": sum(r.split == "eval" for r in records),
               "vocab_size": len(vocab),
@@ -5357,6 +5425,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              study_select_best=True, study_rounds=1,
                              study_score_metric="mastery", study_score_margin_w=0.1,
                              study_score_min_delta=0.0, study_score_patience=0,
+                             study_insight_accept_w=0.25,
+                             study_insight_min_delta=0.0,
                              replay_w=0.0, replay_batch=0,
                              replay_retention_w=0.0,
                              text_field="text", max_tokens=128, min_tokens=8,
@@ -5477,6 +5547,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             score_margin_w=study_score_margin_w,
             score_min_delta=study_score_min_delta,
             score_patience=study_score_patience,
+            insight_accept_w=study_insight_accept_w,
+            insight_min_delta=study_insight_min_delta,
             replay_records=replay_records,
             replay_teacher_model=replay_teacher_model,
             replay_teacher_vocab=replay_teacher_vocab,
@@ -5687,6 +5759,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "study_score_margin_w": float(study_score_margin_w),
               "study_score_min_delta": float(study_score_min_delta),
               "study_score_patience": int(study_score_patience),
+              "study_insight_accept_w": float(study_insight_accept_w),
+              "study_insight_min_delta": float(study_insight_min_delta),
               "replay_w": float(replay_w),
               "replay_batch": int(replay_batch),
               "replay_retention_w": float(replay_retention_w),
@@ -7387,6 +7461,25 @@ def selftest():
     assert (reading_model.reading_train_metrics[
         "study_pool_bridge_before"].get("graph_source") == "snapshot")
     assert "study_pool_bridge_after_current" in reading_model.reading_train_metrics
+    score_decision = reading_round_selection_decision(
+        0.2, 0.0, insight_delta=-1.0, insight_allowed=False,
+        bridge_insight_gate=True, insight_accept_w=1.0)
+    assert score_decision["selected"] is False
+    score_decision = reading_round_selection_decision(
+        0.2, 0.0, insight_delta=-1.0, insight_allowed=True,
+        bridge_insight_gate=True, insight_accept_w=1.0)
+    assert score_decision["selected_by_score"] is True
+    insight_decision = reading_round_selection_decision(
+        -0.01, 0.0, insight_delta=0.2, insight_allowed=True,
+        bridge_insight_gate=True, insight_accept_w=1.0)
+    assert insight_decision["selected"] is True
+    assert insight_decision["selected_by_insight"] is True
+    assert insight_decision["insight_effective_delta"] > 0.0
+    no_insight_decision = reading_round_selection_decision(
+        -0.01, 0.0, insight_delta=0.2, insight_allowed=True,
+        bridge_insight_gate=True, insight_accept_w=1.0,
+        insight_min_delta=0.3)
+    assert no_insight_decision["selected"] is False
     patience_model = TextFactLM(
         len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
         fact_schema=None, latent_concept_slots=2,
@@ -7525,6 +7618,9 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-study-score-margin-w", type=float, default=0.1)
     ap.add_argument("--reading-study-score-min-delta", type=float, default=0.0)
     ap.add_argument("--reading-study-score-patience", type=int, default=0)
+    ap.add_argument("--reading-study-insight-accept-w", "--reading-study-insight-w",
+                    type=float, default=0.25, dest="reading_study_insight_accept_w")
+    ap.add_argument("--reading-study-insight-min-delta", type=float, default=0.0)
 
 
 def _reading_kwargs(args):
@@ -7605,6 +7701,8 @@ def _reading_kwargs(args):
                 study_score_margin_w=args.reading_study_score_margin_w,
                 study_score_min_delta=args.reading_study_score_min_delta,
                 study_score_patience=args.reading_study_score_patience,
+                study_insight_accept_w=args.reading_study_insight_accept_w,
+                study_insight_min_delta=args.reading_study_insight_min_delta,
                 text_field=args.reading_text_field,
                 max_tokens=args.reading_max_tokens,
                 min_tokens=args.reading_min_tokens,
