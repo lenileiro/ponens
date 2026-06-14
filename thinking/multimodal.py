@@ -41,6 +41,7 @@ from .concepts import (
     latent_concept_composition_loss,
     latent_concept_fer_loss,
     latent_concept_fer_metrics,
+    latent_concept_fer_scores,
     latent_concept_graph_prediction_loss,
     latent_concept_graph_prediction_scores,
     latent_concept_graph_ready,
@@ -648,6 +649,16 @@ def _sample_records(records, n, rng):
     return [records[int(i)] for i in idx]
 
 
+def _sample_unique_records(records, n, rng):
+    if not records:
+        return []
+    n = int(n)
+    if n <= 0 or n >= len(records):
+        return list(records)
+    idx = rng.choice(len(records), size=n, replace=False)
+    return [records[int(i)] for i in idx]
+
+
 def _sequence_order(rec, fallback):
     meta = rec.meta if isinstance(rec.meta, dict) else {}
     raw_order = meta.get(
@@ -797,6 +808,31 @@ def latent_multimodal_fer_metrics_from_views(views):
     return {**{key: totals[key] / count for key in keys},
             "mode_count": len(modes),
             "modes": modes}
+
+
+def latent_multimodal_fer_scores_from_views(views):
+    views = {mode: slots for mode, slots in views.items() if slots is not None}
+    if not views:
+        zero = torch.zeros(0)
+        return zero, {"fragmentation": zero, "slot_correlation": zero,
+                      "slot_imbalance": zero}
+    keys = ("fragmentation", "slot_correlation", "slot_imbalance")
+    score_rows = []
+    part_rows = {key: [] for key in keys}
+    batch_size = None
+    for slots in views.values():
+        scores, parts = latent_concept_fer_scores(slots)
+        if batch_size is None:
+            batch_size = int(scores.shape[0])
+        elif int(scores.shape[0]) != batch_size:
+            raise ValueError("multimodal FER score views must share batch size")
+        score_rows.append(scores)
+        for key in keys:
+            part_rows[key].append(parts[key])
+    scores = torch.stack(score_rows).mean(0)
+    parts = {key: torch.stack(values).mean(0)
+             for key, values in part_rows.items()}
+    return scores, parts
 
 
 def latent_multimodal_bridge_loss_from_views(model, views):
@@ -1181,6 +1217,65 @@ def latent_multimodal_graph_prediction_examples(
     }
 
 
+def latent_multimodal_fer_examples(
+        model, records, vocab, view_dims, n=0, seed=0, device=DEV):
+    if getattr(model, "latent_concepts", None) is None:
+        return [], {"n_records": 0, "n_selected": 0,
+                    "mean_fer_score": 0.0, "max_fer_score": 0.0,
+                    "mean_fer_fragmentation": 0.0,
+                    "mean_fer_slot_correlation": 0.0,
+                    "mean_fer_slot_imbalance": 0.0,
+                    "skipped": True}
+    rng = np.random.default_rng(seed)
+    sample = _sample_unique_records(
+        records, int(n) if int(n) > 0 else len(records), rng)
+    scored = []
+    score_values = []
+    fragmentation_values = []
+    correlation_values = []
+    imbalance_values = []
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(sample), 64):
+            batch_records = sample[off:off + 64]
+            features, txt, _ids = _batch_from_records(
+                batch_records, vocab, device, view_dims)
+            views = {
+                mode: model.latent_concept_states(
+                    features, txt, mode=mode, project=True)
+                for mode in MODES
+            }
+            scores, parts = latent_multimodal_fer_scores_from_views(views)
+            fragmentation = parts["fragmentation"]
+            correlation = parts["slot_correlation"]
+            imbalance = parts["slot_imbalance"]
+            for i, rec in enumerate(batch_records):
+                score = float(scores[i].detach().cpu())
+                scored.append((score, rec))
+                score_values.append(score)
+                fragmentation_values.append(float(fragmentation[i].detach().cpu()))
+                correlation_values.append(float(correlation[i].detach().cpu()))
+                imbalance_values.append(float(imbalance[i].detach().cpu()))
+    scored.sort(key=lambda row: row[0], reverse=True)
+    selected = [rec for _score, rec in scored]
+    return selected, {"n_records": len(sample),
+                      "n_selected": len(selected),
+                      "mean_fer_score": (
+                          float(np.mean(score_values)) if score_values else 0.0),
+                      "max_fer_score": (
+                          float(max(score_values)) if score_values else 0.0),
+                      "mean_fer_fragmentation": (
+                          float(np.mean(fragmentation_values))
+                          if fragmentation_values else 0.0),
+                      "mean_fer_slot_correlation": (
+                          float(np.mean(correlation_values))
+                          if correlation_values else 0.0),
+                      "mean_fer_slot_imbalance": (
+                          float(np.mean(imbalance_values))
+                          if imbalance_values else 0.0),
+                      "skipped": False}
+
+
 def evaluate(model, records, vocab, view_dims, n=200, seed=1,
              device=DEV, mode="full"):
     rng = np.random.default_rng(seed)
@@ -1426,6 +1521,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           latent_concept_fer_fragmentation_w=1.0,
           latent_concept_fer_correlation_w=1.0,
           latent_concept_fer_balance_w=0.1,
+          latent_concept_fer_probe_n=0,
+          latent_concept_fer_hard_max=0,
+          latent_concept_fer_refresh_steps=0,
           latent_concept_memory_w=0.0,
           latent_concept_memory_size=0,
           latent_concept_memory_temperature=0.1,
@@ -1482,8 +1580,16 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_concept_transition_w, latent_concept_cluster_w)
     if any(float(w) < 0.0 for w in latent_weights):
         raise ValueError("latent concept loss weights must be non-negative")
+    if int(latent_concept_fer_probe_n) < 0:
+        raise ValueError("latent concept FER probe count must be non-negative")
+    if int(latent_concept_fer_hard_max) < 0:
+        raise ValueError("latent concept FER hard max must be non-negative")
+    if int(latent_concept_fer_refresh_steps) < 0:
+        raise ValueError("latent concept FER refresh steps must be non-negative")
+    fer_hard_enabled = int(latent_concept_fer_hard_max) > 0
     if (any(float(w) > 0.0 for w in latent_weights)
-            or latent_concept_memory_size > 0) and latent_concept_slots <= 0:
+            or latent_concept_memory_size > 0
+            or fer_hard_enabled) and latent_concept_slots <= 0:
         raise ValueError("latent concept losses require latent_concept_slots > 0")
     if int(latent_concept_sequence_batch) < 0 or int(latent_concept_sequence_batch) == 1:
         raise ValueError("latent concept sequence batch must be 0 or at least 2")
@@ -1514,13 +1620,52 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     else:
         model.text_checkpoint_transfer = {}
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    fer_study_pool = []
+    fer_study_reports = []
     last = {}
+
+    def selected_id_sample(selected, limit=16):
+        return [rec.rec_id for rec in selected[:int(limit)]]
+
+    def refresh_fer_pool(step):
+        nonlocal fer_study_pool
+        probe_n = (int(latent_concept_fer_probe_n)
+                   if int(latent_concept_fer_probe_n) > 0
+                   else max(batch * 4, 1))
+        selected, report = latent_multimodal_fer_examples(
+            model, train_records, vocab, view_dims, n=probe_n,
+            seed=seed + 1301 + int(step), device=device)
+        selected = selected[:int(latent_concept_fer_hard_max)]
+        if selected:
+            fer_study_pool = selected
+        report = report | {
+            "step": int(step),
+            "strategy": "fer",
+            "capped": True,
+            "n_error_records_used": len(selected),
+            "pool_active": bool(fer_study_pool),
+            "pool_size": len(fer_study_pool),
+            "hard_record_ids": selected_id_sample(selected),
+            "hard_record_count": len(selected),
+        }
+        fer_study_reports.append(report)
+
     for st in range(1, int(steps) + 1):
         model.train()
+        refresh_due = (
+            fer_hard_enabled
+            and (not fer_study_pool or st == 1 or (
+                latent_concept_fer_refresh_steps
+                and (st - 1) % int(latent_concept_fer_refresh_steps) == 0)))
+        if refresh_due:
+            refresh_fer_pool(st)
+            model.train()
+        batch_source = fer_study_pool if fer_study_pool else train_records
         features, txt, ids = _batch_from_records(
-            _sample_records(train_records, batch, rng), vocab, device, view_dims)
+            _sample_records(batch_source, batch, rng), vocab, device, view_dims)
         needs_latent = bool(any(float(w) > 0.0 for w in latent_weights)
-                            or latent_concept_memory_size > 0)
+                            or latent_concept_memory_size > 0
+                            or fer_hard_enabled)
         bundles_by_mode = {
             mode: model.mode_bundle(
                 features, txt, ids, mode=mode, need_latent=needs_latent,
@@ -1670,6 +1815,12 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "latent_fer_fragmentation": float(fer_metrics["fragmentation"]),
             "latent_fer_slot_correlation": float(fer_metrics["slot_correlation"]),
             "latent_fer_slot_imbalance": float(fer_metrics["slot_imbalance"]),
+            "latent_fer_probe_n": int(latent_concept_fer_probe_n),
+            "latent_fer_hard_max": int(latent_concept_fer_hard_max),
+            "latent_fer_refresh_steps": int(latent_concept_fer_refresh_steps),
+            "latent_fer_study_pool_size": len(fer_study_pool),
+            "latent_fer_hard_record_ids": selected_id_sample(fer_study_pool),
+            "latent_fer_study_reports": fer_study_reports,
             "latent_memory_loss": float(latent_memory.detach()),
             "latent_association_loss": float(latent_association.detach()),
             "latent_composition_loss": float(latent_composition.detach()),
@@ -1722,6 +1873,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                   f"sequence {last['latent_sequence_loss']:.3f}",
                   flush=True)
     model.train_metrics = last
+    model.latent_fer_study_reports = fer_study_reports
     model.manifest_info = {
         "path": manifest,
         "root": root,
@@ -1753,6 +1905,11 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
     latent_fer_probe = latent_multimodal_fer_eval(
         model, eval_records, vocab, view_dims, n=eval_n, seed=seed + 29,
         device=device)
+    latent_fer_hard_selected, latent_fer_hard_probe = latent_multimodal_fer_examples(
+        model, train_records, vocab, view_dims,
+        n=min(64, len(train_records)), seed=seed + 30, device=device)
+    latent_fer_hard_probe["top_ids"] = [
+        r.rec_id for r in latent_fer_hard_selected[:8]]
     latent_bridge_probe = latent_multimodal_bridge_eval(
         model, eval_records, vocab, view_dims, n=eval_n, seed=seed + 31,
         device=device)
@@ -1778,6 +1935,7 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         "teacher_forced": metrics,
         "latent_graph_probe": latent_probe,
         "latent_fer_probe": latent_fer_probe,
+        "latent_fer_hard_probe": latent_fer_hard_probe,
         "latent_bridge_probe": latent_bridge_probe,
         "latent_sequence_probe": latent_sequence_probe,
         "text_checkpoint_transfer": getattr(model, "text_checkpoint_transfer", {}),
@@ -1853,10 +2011,17 @@ def selftest():
         assert torch.isfinite(latent_multimodal_fer_loss_from_views(views))
         fer_metrics = latent_multimodal_fer_metrics_from_views(views)
         assert math.isfinite(fer_metrics["fer_score"])
+        fer_scores, fer_parts = latent_multimodal_fer_scores_from_views(views)
+        assert fer_scores.shape == (2,)
+        assert fer_parts["fragmentation"].shape == (2,)
         fer_eval = latent_multimodal_fer_eval(
             model, records, vocab, view_dims, n=4, device="cpu")
         assert fer_eval["skipped"] is False
         assert math.isfinite(fer_eval["fer_score"])
+        fer_selected, fer_report = latent_multimodal_fer_examples(
+            model, records, vocab, view_dims, n=4, device="cpu")
+        assert fer_selected and fer_report["skipped"] is False
+        assert math.isfinite(fer_report["mean_fer_score"])
         cold_bridge_eval = latent_multimodal_bridge_eval(
             model, records, vocab, view_dims, n=4, device="cpu")
         assert cold_bridge_eval["skipped"] is True
@@ -1896,6 +2061,9 @@ def selftest():
             concept_tokens=2, latent_concept_slots=3,
             latent_concept_memory_size=8, latent_concept_memory_w=0.01,
             latent_concept_fer_w=0.01,
+            latent_concept_fer_probe_n=4,
+            latent_concept_fer_hard_max=2,
+            latent_concept_fer_refresh_steps=1,
             latent_concept_association_w=0.01,
             latent_concept_composition_w=0.01,
             latent_concept_graph_predict_w=0.01,
@@ -1908,6 +2076,9 @@ def selftest():
         assert trained_model.train_metrics["latent_graph_transition_updates"] > 0
         assert trained_model.train_metrics["latent_fer_w"] == 0.01
         assert math.isfinite(trained_model.train_metrics["latent_fer_score"])
+        assert trained_model.train_metrics["latent_fer_study_pool_size"] == 2
+        assert trained_model.train_metrics["latent_fer_study_reports"]
+        assert len(set(trained_model.train_metrics["latent_fer_hard_record_ids"])) == 2
         assert trained_model.train_metrics["latent_bridge_w"] == 0.01
         assert trained_model.train_metrics["latent_bridge_graph_ready"] is True
         assert trained_model.train_metrics["latent_bridge_skipped"] is False
@@ -1979,6 +2150,12 @@ def main(argv=None):
                     dest="latent_concept_fer_correlation_w")
     ap.add_argument("--latent-concept-fer-balance-w", type=float, default=0.1,
                     dest="latent_concept_fer_balance_w")
+    ap.add_argument("--latent-concept-fer-probe-n", type=int, default=0,
+                    dest="latent_concept_fer_probe_n")
+    ap.add_argument("--latent-concept-fer-hard-max", type=int, default=0,
+                    dest="latent_concept_fer_hard_max")
+    ap.add_argument("--latent-concept-fer-refresh-steps", type=int, default=0,
+                    dest="latent_concept_fer_refresh_steps")
     ap.add_argument("--latent-concept-memory-w", type=float, default=0.0,
                     dest="latent_concept_memory_w")
     ap.add_argument("--latent-concept-memory-size", type=int, default=0,
@@ -2120,9 +2297,16 @@ def main(argv=None):
             or args.latent_concept_fer_correlation_w < 0.0
             or args.latent_concept_fer_balance_w < 0.0):
         ap.error("latent FER component weights must be non-negative")
+    if args.latent_concept_fer_probe_n < 0:
+        ap.error("--latent-concept-fer-probe-n must be non-negative")
+    if args.latent_concept_fer_hard_max < 0:
+        ap.error("--latent-concept-fer-hard-max must be non-negative")
+    if args.latent_concept_fer_refresh_steps < 0:
+        ap.error("--latent-concept-fer-refresh-steps must be non-negative")
     if (any(w > 0.0 for w in latent_weights)
             or args.latent_concept_memory_size > 0
-            or args.latent_concept_prefix) and args.latent_concept_slots <= 0:
+            or args.latent_concept_prefix
+            or args.latent_concept_fer_hard_max > 0) and args.latent_concept_slots <= 0:
         ap.error("latent concept options require --latent-concept-slots > 0")
     if args.latent_concept_memory_temperature <= 0.0:
         ap.error("--latent-concept-memory-temperature must be positive")
@@ -2176,6 +2360,9 @@ def main(argv=None):
             args.latent_concept_fer_fragmentation_w),
         latent_concept_fer_correlation_w=args.latent_concept_fer_correlation_w,
         latent_concept_fer_balance_w=args.latent_concept_fer_balance_w,
+        latent_concept_fer_probe_n=args.latent_concept_fer_probe_n,
+        latent_concept_fer_hard_max=args.latent_concept_fer_hard_max,
+        latent_concept_fer_refresh_steps=args.latent_concept_fer_refresh_steps,
         latent_concept_memory_w=args.latent_concept_memory_w,
         latent_concept_memory_size=args.latent_concept_memory_size,
         latent_concept_memory_temperature=args.latent_concept_memory_temperature,

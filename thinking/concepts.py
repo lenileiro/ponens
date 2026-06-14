@@ -1407,6 +1407,37 @@ def latent_concept_fer_metrics(slots, eps=1e-8):
             "slot_imbalance": slot_imbalance}
 
 
+def latent_concept_fer_scores(slots, eps=1e-8):
+    """Score each example for fractured/entangled latent concept slots."""
+    if slots is None:
+        zero = torch.zeros(0)
+        return zero, {"fragmentation": zero, "slot_correlation": zero,
+                      "slot_imbalance": zero}
+    if slots.ndim != 3:
+        raise ValueError("latent concept FER scores expect [batch, slots, dim]")
+    zero = slots.reshape(slots.shape[0], -1).sum(-1) * 0.0
+    if slots.shape[0] == 0 or slots.shape[1] <= 1:
+        return zero, {"fragmentation": zero, "slot_correlation": zero,
+                      "slot_imbalance": zero}
+    eps_t = float(eps)
+    energy = slots.pow(2).mean(-1)
+    usage = energy / energy.sum(-1, keepdim=True).clamp_min(eps_t)
+    fragmentation = -(usage.clamp_min(eps_t).log() * usage).sum(-1)
+    fragmentation = fragmentation / math.log(float(slots.shape[1]))
+    uniform = torch.full_like(usage, 1.0 / usage.shape[-1])
+    slot_imbalance = F.kl_div(
+        usage.clamp_min(eps_t).log(), uniform, reduction="none").sum(-1)
+    z = F.normalize(slots, dim=-1)
+    corr = z.matmul(z.transpose(1, 2))
+    eye = torch.eye(slots.shape[1], dtype=torch.bool, device=slots.device)
+    slot_correlation = corr.masked_select(~eye[None]).view(
+        slots.shape[0], slots.shape[1], slots.shape[1] - 1).pow(2).mean((1, 2))
+    fer_score = (fragmentation + slot_correlation + slot_imbalance) / 3.0
+    return fer_score, {"fragmentation": fragmentation,
+                       "slot_correlation": slot_correlation,
+                       "slot_imbalance": slot_imbalance}
+
+
 def latent_concept_fer_loss(slots, fragmentation_w=1.0, correlation_w=1.0,
                             balance_w=0.1):
     """Reduce fractured/entangled latent geometry without labels or schemas."""

@@ -66,6 +66,7 @@ from .concepts import (
     latent_concept_cluster_prototype_loss,
     latent_concept_fer_loss,
     latent_concept_fer_metrics,
+    latent_concept_fer_scores,
     latent_concept_graph_ready,
     latent_concept_graph_snapshot,
     latent_concept_neighborhood_loss,
@@ -2702,36 +2703,11 @@ def reading_latent_curiosity_records(
 
 
 def _latent_slot_fer_parts(slots, eps=1e-8):
-    if slots is None or slots.ndim != 3:
-        zero = torch.zeros(0)
-        return {"fer_score": zero, "fragmentation": zero,
-                "slot_correlation": zero, "slot_imbalance": zero}
-    if slots.shape[0] == 0:
-        zero = slots.reshape(slots.shape[0], -1).sum(-1) * 0.0
-        return {"fer_score": zero, "fragmentation": zero,
-                "slot_correlation": zero, "slot_imbalance": zero}
-    if slots.shape[1] <= 1:
-        zero = slots.reshape(slots.shape[0], -1).sum(-1) * 0.0
-        return {"fer_score": zero, "fragmentation": zero,
-                "slot_correlation": zero, "slot_imbalance": zero}
-    eps_t = float(eps)
-    energy = slots.pow(2).mean(-1)
-    usage = energy / energy.sum(-1, keepdim=True).clamp_min(eps_t)
-    fragmentation = -(usage.clamp_min(eps_t).log() * usage).sum(-1)
-    fragmentation = fragmentation / math.log(float(slots.shape[1]))
-    uniform = torch.full_like(usage, 1.0 / usage.shape[-1])
-    imbalance = F.kl_div(
-        usage.clamp_min(eps_t).log(), uniform, reduction="none").sum(-1)
-    z = F.normalize(slots, dim=-1)
-    corr = z.matmul(z.transpose(1, 2))
-    eye = torch.eye(slots.shape[1], dtype=torch.bool, device=slots.device)
-    correlation = corr.masked_select(~eye[None]).view(
-        slots.shape[0], slots.shape[1], slots.shape[1] - 1).pow(2).mean((1, 2))
-    fer_score = (fragmentation + correlation + imbalance) / 3.0
+    fer_score, parts = latent_concept_fer_scores(slots, eps=eps)
     return {"fer_score": fer_score,
-            "fragmentation": fragmentation,
-            "slot_correlation": correlation,
-            "slot_imbalance": imbalance}
+            "fragmentation": parts["fragmentation"],
+            "slot_correlation": parts["slot_correlation"],
+            "slot_imbalance": parts["slot_imbalance"]}
 
 
 def reading_latent_fer_records(
