@@ -4223,6 +4223,68 @@ def semantic_record_errors(model, vocab, records, device=DEV, n=0, seed=0):
                     "fact_error_rate": n_errors / max(1, n_facts)}
 
 
+def latent_fact_record_errors(model, vocab, records, device=DEV, n=0, seed=0):
+    """Return records whose latent concept bridge misses at least one supplied fact."""
+    errors, _correct, report = latent_fact_record_outcomes(
+        model, vocab, records, device=device, n=n, seed=seed)
+    return errors, report
+
+
+def latent_fact_record_outcomes(model, vocab, records, device=DEV, n=0, seed=0):
+    """Return currently wrong and right records under the latent fact bridge."""
+    if (model.fact_schema is None or getattr(model, "fact_concepts", None) is None
+            or getattr(model, "latent_concepts", None) is None):
+        return [], [], {"n_records": 0, "sampled": False, "n_error_records": 0,
+                        "n_correct_records": 0, "n_facts": 0, "n_errors": 0,
+                        "fact_error_rate": 0.0, "by_kind": {}}
+    candidates = list(records)
+    sampled = bool(n and n < len(candidates))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=n, replace=False)
+        candidates = [candidates[int(i)] for i in idx]
+    value_index = model.fact_schema.value_index
+    errors = []
+    correct = []
+    by_kind = {}
+    n_errors = n_facts = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(candidates), 64):
+            batch = candidates[off:off + 64]
+            txt, _ids = pack(batch, vocab, device)
+            logits = model.latent_fact_concept_logits(txt)
+            for r, rec in enumerate(batch):
+                rec_errors = rec_facts = 0
+                for slot, pred, val in rec.facts:
+                    key = (slot, pred)
+                    if key not in logits or (key, val) not in value_index:
+                        continue
+                    pred_id = int(logits[key][r].argmax(-1))
+                    rec_facts += 1
+                    rec_errors += int(pred_id != value_index[(key, val)])
+                wrong = bool(rec_errors)
+                kind_row = by_kind.setdefault(
+                    rec.kind, {"records": 0, "errors": 0, "correct": 0})
+                kind_row["records"] += 1
+                if wrong:
+                    errors.append(rec)
+                    kind_row["errors"] += 1
+                else:
+                    correct.append(rec)
+                    kind_row["correct"] += 1
+                n_errors += rec_errors
+                n_facts += rec_facts
+    return errors, correct, {"n_records": len(candidates),
+                             "sampled": sampled,
+                             "n_error_records": len(errors),
+                             "n_correct_records": len(correct),
+                             "n_facts": n_facts,
+                             "n_errors": n_errors,
+                             "fact_error_rate": n_errors / max(1, n_facts),
+                             "by_kind": by_kind}
+
+
 def choice_record_errors(model, vocab, records, device=DEV, n=0, seed=0):
     """Return choice-QA records whose candidate head currently predicts the wrong target."""
     errors, _correct, report = choice_record_outcomes(
@@ -6077,6 +6139,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
     if latent_concept_refine:
         model.enable_latent_concept_refiner(
             heads=heads, gate_init=latent_concept_refine_gate_init)
+    if study_score_metric == "latent" and getattr(model, "latent_concepts", None) is None:
+        raise ValueError("latent study score requires latent concept slots")
     old_schema = fact_schema_from_payload(ckpt.get("fact_schema"))
     old_fact_values = (sum(len(v) for v in old_schema.values) if old_schema is not None else 0)
     new_fact_values = sum(len(v) for v in model.fact_schema.values)
@@ -6348,6 +6412,31 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                         n=study_probe_n, seed=round_seed)
                     correct_records = []
                 hard_report = hard_report | {"error_metric": "choice"}
+            elif study_score_metric == "latent":
+                if need_metric_correct:
+                    hard_records, correct_records, hard_report = (
+                        latent_fact_record_outcomes(
+                            model, vocab, train_study_records, device=device,
+                            n=study_probe_n, seed=round_seed))
+                else:
+                    hard_records, hard_report = latent_fact_record_errors(
+                        model, vocab, train_study_records, device=device,
+                        n=study_probe_n, seed=round_seed)
+                    correct_records = []
+                hard_report = hard_report | {"error_metric": "latent"}
+                if study_distill_correct_per_kind or study_discovery_correct_per_kind:
+                    _choice_hard, choice_correct_records, choice_correct_report = (
+                        choice_record_outcomes(model, vocab, train_study_records,
+                                               device=device, n=study_probe_n,
+                                               seed=round_seed))
+                    hard_report = hard_report | {
+                        "choice_correct_for_self_teach": {
+                            "n_records": choice_correct_report["n_records"],
+                            "n_correct_records": choice_correct_report[
+                                "n_correct_records"],
+                            "choice_error_rate": choice_correct_report[
+                                "choice_error_rate"],
+                        }}
             else:
                 if study_anchor_correct_per_kind:
                     hard_records, correct_records, hard_report = semantic_record_outcomes(
@@ -7266,6 +7355,17 @@ def selftest():
     assert hard_report["n_records"] == 1
     assert "fact_error_rate" in hard_report
     assert isinstance(hard, list)
+    latent_mining_model = TextFactLM(
+        len(vocab), d=32, layers=1, heads=4, pad=vocab.pad,
+        fact_schema=build_fact_schema(records), latent_concept_slots=2).to("cpu")
+    latent_errors, latent_correct, latent_report = latent_fact_record_outcomes(
+        latent_mining_model, vocab, records[:2], device="cpu", n=0, seed=0)
+    assert latent_report["n_records"] == 2
+    assert latent_report["n_error_records"] + latent_report["n_correct_records"] == 2
+    assert len(latent_errors) + len(latent_correct) == 2
+    latent_errors_only, latent_error_report = latent_fact_record_errors(
+        latent_mining_model, vocab, records[:2], device="cpu", n=0, seed=0)
+    assert latent_error_report["n_error_records"] == len(latent_errors_only)
     score_a = {"semantic_head": {"fact_value_acc": 0.8},
                "teacher_forced": {"fact_value_acc": 0.7},
                "latent_fact_concept_head": {"fact_value_acc": 0.65,
