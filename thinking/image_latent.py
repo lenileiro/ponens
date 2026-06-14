@@ -2003,6 +2003,45 @@ def apply_rotary_factors(x, cos, sin):
     return out
 
 
+def make_dit_register_tokens(count, hidden):
+    count = int(count)
+    if count < 0:
+        raise ValueError("dit_register_tokens must be non-negative")
+    if count == 0:
+        return None
+    tokens = nn.Parameter(torch.empty(1, count, int(hidden)))
+    nn.init.normal_(tokens, std=0.02)
+    return tokens
+
+
+def expand_dit_register_tokens(tokens, batch, device, dtype, ctx=None):
+    if tokens is None:
+        return None
+    out = tokens.to(device=device, dtype=dtype).expand(int(batch), -1, -1)
+    if ctx is not None:
+        out = out + ctx.to(device=device, dtype=dtype)
+    return out
+
+
+def apply_image_rope_with_registers(q, k, image_rope):
+    if image_rope is None:
+        return q, k
+    rope_cos, rope_sin = image_rope
+    rope_n = int(rope_cos.shape[-2])
+    if rope_n <= 0:
+        return q, k
+    if rope_n > int(q.shape[2]) or rope_n > int(k.shape[2]):
+        raise ValueError("image RoPE token count exceeds attention image stream length")
+    q_img = apply_rotary_factors(q[:, :, :rope_n], rope_cos, rope_sin)
+    k_img = apply_rotary_factors(k[:, :, :rope_n], rope_cos, rope_sin)
+    if rope_n == int(q.shape[2]):
+        return q_img, k_img
+    return (
+        torch.cat([q_img, q[:, :, rope_n:]], dim=2),
+        torch.cat([k_img, k[:, :, rope_n:]], dim=2),
+    )
+
+
 class AdaDiTBlock(nn.Module):
     """Self-attention DiT block with adaLN-Zero residual gating."""
 
@@ -2049,7 +2088,7 @@ class LatentDiTFlowNet(nn.Module):
                  max_tokens=256, head_width_mult=1, pos_embed="learned",
                  checkpoint_blocks=False, latent_patch_size=1,
                  time_embed="scalar", time_embed_dim=1, mlp="gelu",
-                 self_condition=False):
+                 self_condition=False, register_tokens=0):
         super().__init__()
         latent_patch_size = int(latent_patch_size)
         if latent_patch_size <= 0:
@@ -2077,6 +2116,7 @@ class LatentDiTFlowNet(nn.Module):
         self.head_width_mult = int(head_width_mult)
         self.dit_pos_embed = pos_embed
         self.dit_mlp = mlp
+        self.dit_register_tokens = int(register_tokens)
         self.flow_time_embed = time_embed
         self.flow_time_embed_dim = int(time_embed_dim if time_embed != "scalar" else 1)
         self.uses_adaptive_modulation = True
@@ -2092,6 +2132,8 @@ class LatentDiTFlowNet(nn.Module):
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
             if pos_embed == "learned" else None
         )
+        self.register_tokens = make_dit_register_tokens(
+            self.dit_register_tokens, hidden)
         self.cond = nn.Sequential(
             nn.Linear(cond_dim + self.flow_time_embed_dim, hidden),
             nn.GELU(),
@@ -2130,18 +2172,27 @@ class LatentDiTFlowNet(nn.Module):
         ctx = self.cond(torch.cat([cond, t_feat], dim=1))[:, None, :]
         x = self.in_proj(toks)
         x = x + self.image_pos(th, tw, x.device, x.dtype) + ctx
+        regs = expand_dit_register_tokens(
+            self.register_tokens, b, x.device, x.dtype, ctx=ctx)
+        if regs is not None:
+            x = torch.cat([x, regs], dim=1)
         cond_ctx = ctx[:, 0, :]
         for block in self.blocks:
             if should_checkpoint_blocks(self):
                 x = activation_checkpoint(block, x, cond_ctx)
             else:
                 x = block(x, cond_ctx)
-        features = self.norm(x)
+        all_features = self.norm(x)
+        features = all_features[:, :n]
+        register_features = all_features[:, n:] if regs is not None else None
         v = self.out_proj(features)
         velocity = unpatchify_latents(
             v, c, h, w, patch_size=self.latent_patch_size)
         if return_features:
-            return velocity, {"image_tokens": features}
+            out = {"image_tokens": features}
+            if register_features is not None:
+                out["register_tokens"] = register_features
+            return velocity, out
         return velocity
 
 
@@ -2197,7 +2248,8 @@ class LatentCrossDiTFlowNet(nn.Module):
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256, head_width_mult=1, pos_embed="learned",
                  checkpoint_blocks=False, mlp="gelu", latent_patch_size=1,
-                 time_embed="scalar", time_embed_dim=1, self_condition=False):
+                 time_embed="scalar", time_embed_dim=1, self_condition=False,
+                 register_tokens=0):
         super().__init__()
         latent_patch_size = int(latent_patch_size)
         if latent_patch_size <= 0:
@@ -2225,6 +2277,7 @@ class LatentCrossDiTFlowNet(nn.Module):
         self.head_width_mult = int(head_width_mult)
         self.dit_pos_embed = pos_embed
         self.dit_mlp = mlp
+        self.dit_register_tokens = int(register_tokens)
         self.flow_time_embed = time_embed
         self.flow_time_embed_dim = int(time_embed_dim if time_embed != "scalar" else 1)
         self.uses_zero_residual_gating = True
@@ -2238,6 +2291,8 @@ class LatentCrossDiTFlowNet(nn.Module):
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
             if pos_embed == "learned" else None
         )
+        self.register_tokens = make_dit_register_tokens(
+            self.dit_register_tokens, hidden)
         self.cond = nn.Sequential(
             nn.Linear(cond_dim + self.flow_time_embed_dim, hidden),
             nn.GELU(),
@@ -2287,6 +2342,10 @@ class LatentCrossDiTFlowNet(nn.Module):
         ctx, ctx_mask = self._context(cond)
         x = self.in_proj(toks)
         x = x + self.image_pos(th, tw, x.device, x.dtype) + global_ctx
+        regs = expand_dit_register_tokens(
+            self.register_tokens, b, x.device, x.dtype, ctx=global_ctx)
+        if regs is not None:
+            x = torch.cat([x, regs], dim=1)
         cond_ctx = global_ctx[:, 0, :]
         for block in self.blocks:
             if should_checkpoint_blocks(self):
@@ -2295,12 +2354,17 @@ class LatentCrossDiTFlowNet(nn.Module):
                 x = activation_checkpoint(block_forward, x, ctx, cond_ctx)
             else:
                 x = block(x, ctx, cond_ctx, ctx_mask=ctx_mask)
-        features = self.norm(x)
+        all_features = self.norm(x)
+        features = all_features[:, :n]
+        register_features = all_features[:, n:] if regs is not None else None
         v = self.out_proj(features)
         velocity = unpatchify_latents(
             v, c, h, w, patch_size=self.latent_patch_size)
         if return_features:
-            return velocity, {"image_tokens": features}
+            out = {"image_tokens": features}
+            if register_features is not None:
+                out["register_tokens"] = register_features
+            return velocity, out
         return velocity
 
 
@@ -2440,10 +2504,7 @@ class MMDiTBlock(nn.Module):
         qc, kc, vc = self._qkv(self.ctx_qkv, ctx_attn)
         qi, ki = self.img_q_norm(qi), self.img_k_norm(ki)
         qc, kc = self.ctx_q_norm(qc), self.ctx_k_norm(kc)
-        if image_rope is not None:
-            rope_cos, rope_sin = image_rope
-            qi = apply_rotary_factors(qi, rope_cos, rope_sin)
-            ki = apply_rotary_factors(ki, rope_cos, rope_sin)
+        qi, ki = apply_image_rope_with_registers(qi, ki, image_rope)
         q = torch.cat([qi, qc], dim=2)
         k = torch.cat([ki, kc], dim=2)
         v = torch.cat([vi, vc], dim=2)
@@ -2473,7 +2534,8 @@ class LatentMMDiTFlowNet(nn.Module):
                  max_tokens=256, head_width_mult=1, qk_norm=False,
                  attn_impl="manual", pos_embed="learned", checkpoint_blocks=False,
                  mlp="gelu", latent_patch_size=1,
-                 time_embed="scalar", time_embed_dim=1, self_condition=False):
+                 time_embed="scalar", time_embed_dim=1, self_condition=False,
+                 register_tokens=0):
         super().__init__()
         latent_patch_size = int(latent_patch_size)
         if latent_patch_size <= 0:
@@ -2506,6 +2568,7 @@ class LatentMMDiTFlowNet(nn.Module):
         self.heads = int(heads)
         self.head_dim = self.hidden // self.heads
         self.dit_pos_embed = pos_embed
+        self.dit_register_tokens = int(register_tokens)
         self.flow_time_embed = time_embed
         self.flow_time_embed_dim = int(time_embed_dim if time_embed != "scalar" else 1)
         self.uses_zero_residual_gating = True
@@ -2519,6 +2582,8 @@ class LatentMMDiTFlowNet(nn.Module):
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
             if pos_embed == "learned" else None
         )
+        self.register_tokens = make_dit_register_tokens(
+            self.dit_register_tokens, hidden)
         self.time = nn.Sequential(nn.Linear(cond_dim + self.flow_time_embed_dim, hidden),
                                   nn.GELU(),
                                   nn.Linear(hidden, hidden))
@@ -2579,6 +2644,10 @@ class LatentMMDiTFlowNet(nn.Module):
         if image_pos is not None:
             img = img + image_pos
         img = img + cond_ctx[:, None, :]
+        regs = expand_dit_register_tokens(
+            self.register_tokens, b, img.device, img.dtype, ctx=cond_ctx[:, None, :])
+        if regs is not None:
+            img = torch.cat([img, regs], dim=1)
         ctx, ctx_mask = self._context(cond)
         image_rope = self.image_rope(th, tw, img.device, img.dtype)
         for block in self.blocks:
@@ -2591,12 +2660,17 @@ class LatentMMDiTFlowNet(nn.Module):
             else:
                 img, ctx = block(img, ctx, cond_ctx, ctx_mask=ctx_mask,
                                  image_rope=image_rope)
-        features = self.norm(img)
+        all_features = self.norm(img)
+        features = all_features[:, :n]
+        register_features = all_features[:, n:] if regs is not None else None
         v = self.out_proj(features)
         velocity = unpatchify_latents(
             v, c, h, w, patch_size=self.latent_patch_size)
         if return_features:
-            return velocity, {"image_tokens": features}
+            out = {"image_tokens": features}
+            if register_features is not None:
+                out["register_tokens"] = register_features
+            return velocity, out
         return velocity
 
 
@@ -2605,11 +2679,16 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
               dit_qk_norm=False, dit_attn_impl="auto", dit_pos_embed="learned",
               dit_mlp="gelu", latent_patch_size=1, flow_checkpoint_blocks=False,
               flow_time_embed="scalar", flow_time_embed_dim=0,
-              flow_self_condition=False):
+              flow_self_condition=False, dit_register_tokens=0):
     latent_patch_size = int(latent_patch_size)
     if latent_patch_size <= 0:
         raise ValueError("latent_patch_size must be positive")
+    dit_register_tokens = int(dit_register_tokens or 0)
+    if dit_register_tokens < 0:
+        raise ValueError("dit_register_tokens must be non-negative")
     if flow_arch == "conv":
+        if dit_register_tokens:
+            raise ValueError("dit_register_tokens requires DiT/CrossDiT/MM-DiT flow")
         if latent_patch_size != 1:
             raise ValueError("latent_patch_size is only supported by DiT/CrossDiT/MM-DiT flows")
         if flow_self_condition:
@@ -2650,7 +2729,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                 time_embed=flow_time_embed,
                                 time_embed_dim=flow_time_embed_dim,
                                 mlp=dit_mlp,
-                                self_condition=flow_self_condition)
+                                self_condition=flow_self_condition,
+                                register_tokens=dit_register_tokens)
     if flow_arch == "crossdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
@@ -2665,7 +2745,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                      latent_patch_size=latent_patch_size,
                                      time_embed=flow_time_embed,
                                      time_embed_dim=flow_time_embed_dim,
-                                     self_condition=flow_self_condition)
+                                     self_condition=flow_self_condition,
+                                     register_tokens=dit_register_tokens)
     if flow_arch == "mmdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
@@ -2682,7 +2763,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                   checkpoint_blocks=flow_checkpoint_blocks,
                                   time_embed=flow_time_embed,
                                   time_embed_dim=flow_time_embed_dim,
-                                  self_condition=flow_self_condition)
+                                  self_condition=flow_self_condition,
+                                  register_tokens=dit_register_tokens)
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
@@ -8873,6 +8955,10 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     dit_mlp = str(ckpt.get("dit_mlp", report.get("dit_mlp", "gelu")) or "gelu")
     if dit_mlp not in DIT_MLPS:
         raise ValueError(f"unknown DiT MLP {dit_mlp!r}")
+    dit_register_tokens = int(ckpt.get(
+        "dit_register_tokens", report.get("dit_register_tokens", 0)) or 0)
+    if dit_register_tokens < 0:
+        raise ValueError("checkpoint dit_register_tokens must be non-negative")
     flow_time_embed = str(ckpt.get(
         "flow_time_embed", report.get("flow_time_embed", "scalar")) or "scalar")
     if flow_time_embed not in FLOW_TIME_EMBEDS:
@@ -8994,7 +9080,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                      flow_checkpoint_blocks=flow_checkpoint_blocks,
                      flow_time_embed=flow_time_embed,
                      flow_time_embed_dim=flow_time_embed_dim,
-                     flow_self_condition=flow_self_condition).to(device)
+                     flow_self_condition=flow_self_condition,
+                     dit_register_tokens=dit_register_tokens).to(device)
     attach_image_geometry_mode(flow, bool(ckpt.get(
         "image_geometry_cond", report.get("image_geometry_cond", False))))
     flow_repa_aligner = None
@@ -9071,6 +9158,9 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
         "dit_pos_embed": dit_pos_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
         "dit_mlp": dit_mlp if flow_arch in ("dit", "crossdit", "mmdit") else "",
+        "dit_register_tokens": (
+            int(dit_register_tokens) if flow_arch in ("dit", "crossdit", "mmdit") else 0
+        ),
         "flow_time_embed": flow_time_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
         "flow_time_embed_dim": (
             int(flow_time_embed_dim) if flow_arch in ("dit", "crossdit", "mmdit") else 1
@@ -9998,6 +10088,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       dit_head_width_mult=1, latent_max_tokens=256,
                       dit_pos_embed="learned",
                       dit_mlp="gelu",
+                      dit_register_tokens=0,
                       flow_time_embed="scalar", flow_time_embed_dim=0,
                       flow_self_condition=False, flow_self_condition_p=0.5,
                       latent_patch_size=1,
@@ -10392,6 +10483,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     dit_mlp = str(dit_mlp)
     if dit_mlp not in DIT_MLPS:
         raise ValueError(f"unknown DiT MLP {dit_mlp!r}")
+    dit_register_tokens = int(dit_register_tokens or 0)
+    if dit_register_tokens < 0:
+        raise ValueError("dit_register_tokens must be non-negative")
+    if dit_register_tokens and flow_arch == "conv":
+        raise ValueError("dit_register_tokens requires DiT/CrossDiT/MM-DiT flow")
     flow_time_embed = str(flow_time_embed or "scalar")
     if flow_time_embed not in FLOW_TIME_EMBEDS:
         raise ValueError(f"unknown flow time embedding {flow_time_embed!r}")
@@ -10560,7 +10656,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                      flow_checkpoint_blocks=flow_checkpoint_blocks,
                      flow_time_embed=flow_time_embed,
                      flow_time_embed_dim=flow_time_embed_dim,
-                     flow_self_condition=flow_self_condition).to(device)
+                     flow_self_condition=flow_self_condition,
+                     dit_register_tokens=dit_register_tokens).to(device)
     attach_image_geometry_mode(flow, image_geometry_cond)
     flow_repa_aligner = None
     if flow_repa_w > 0.0 or flow_repa_structure_w > 0.0:
@@ -11272,6 +11369,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             dit_qk_norm=dit_qk_norm, dit_attn_impl=dit_attn_impl,
             dit_pos_embed=dit_pos_embed,
             dit_mlp=dit_mlp,
+            dit_register_tokens=dit_register_tokens,
             latent_patch_size=latent_patch_size,
             flow_checkpoint_blocks=flow_checkpoint_blocks,
             flow_time_embed=flow_time_embed,
@@ -11516,6 +11614,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
         "dit_pos_embed": dit_pos_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
         "dit_mlp": dit_mlp if flow_arch in ("dit", "crossdit", "mmdit") else "",
+        "dit_register_tokens": (
+            int(dit_register_tokens) if flow_arch in ("dit", "crossdit", "mmdit") else 0
+        ),
         "flow_time_embed": (
             flow_time_embed if flow_arch in ("dit", "crossdit", "mmdit") else ""
         ),
@@ -12388,6 +12489,10 @@ def main(argv=None):
                           "rope2d is MM-DiT-only"))
     ap.add_argument("--dit-mlp", default="gelu", choices=DIT_MLPS, dest="dit_mlp",
                     help="feed-forward block for CrossDiT/MM-DiT image-token transformers")
+    ap.add_argument("--dit-register-tokens", type=int, default=0,
+                    dest="dit_register_tokens",
+                    help=("learned global image-stream register tokens for "
+                          "DiT/CrossDiT/MM-DiT flows"))
     ap.add_argument("--flow-time-embed", default="scalar", choices=FLOW_TIME_EMBEDS,
                     dest="flow_time_embed",
                     help=("timestep embedding for DiT/CrossDiT/MM-DiT flows; "
@@ -12890,6 +12995,10 @@ def main(argv=None):
         ap.error("--flow-time-embed-dim must be non-negative")
     if args.flow_self_condition and args.flow_arch == "conv":
         ap.error("--flow-self-condition requires --flow-arch dit/crossdit/mmdit")
+    if args.dit_register_tokens < 0:
+        ap.error("--dit-register-tokens must be non-negative")
+    if args.dit_register_tokens > 0 and args.flow_arch == "conv":
+        ap.error("--dit-register-tokens requires --flow-arch dit/crossdit/mmdit")
     if args.flow_self_condition_p < 0.0 or args.flow_self_condition_p > 1.0:
         ap.error("--flow-self-condition-p must be in [0, 1]")
     if args.flow_endpoint_w < 0.0:
@@ -13228,6 +13337,7 @@ def main(argv=None):
         dit_attn_impl=args.dit_attn_impl,
         dit_pos_embed=args.dit_pos_embed,
         dit_mlp=args.dit_mlp,
+        dit_register_tokens=args.dit_register_tokens,
         flow_time_embed=args.flow_time_embed,
         flow_time_embed_dim=args.flow_time_embed_dim,
         flow_checkpoint_blocks=args.flow_checkpoint_blocks,
@@ -13581,6 +13691,8 @@ def main(argv=None):
         "dit_attn_impl": report.get("dit_attn_impl", "manual"),
         "dit_pos_embed": report.get("dit_pos_embed", "") or args.dit_pos_embed,
         "dit_mlp": report.get("dit_mlp", "") or args.dit_mlp,
+        "dit_register_tokens": report.get(
+            "dit_register_tokens", args.dit_register_tokens),
         "flow_time_embed": report.get("flow_time_embed", args.flow_time_embed),
         "flow_time_embed_dim": report.get("flow_time_embed_dim", args.flow_time_embed_dim),
         "flow_checkpoint_blocks": report.get("flow_checkpoint_blocks", False),
