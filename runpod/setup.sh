@@ -31,6 +31,12 @@ BASE_DEPS=(numpy pandas scikit-learn tokenizers nltk pillow)
 if [ "${INSTALL_IMAGE_EMBED_DEPS:-0}" = "1" ]; then
   BASE_DEPS+=(transformers accelerate)
 fi
+if [ "${INSTALL_IMAGE_TEXT_SEQUENCE_DEPS:-0}" = "1" ]; then
+  BASE_DEPS+=(transformers accelerate sentencepiece)
+fi
+if [ "${INSTALL_IMAGE_CAPTION_DEPS:-0}" = "1" ]; then
+  BASE_DEPS+=(transformers accelerate sentencepiece)
+fi
 if [ "${INSTALL_IMAGE_HF_AE_DEPS:-0}" = "1" ]; then
   BASE_DEPS+=(diffusers transformers accelerate safetensors)
 fi

@@ -143,7 +143,7 @@ def render_example(problem, steps, sup="steps"):
 def _pick(variants, rng):
     if isinstance(variants[0], (list, tuple)) and not isinstance(variants[0], str):
         return variants[int(rng.integers(len(variants))) if rng is not None else 0]
-    return variants                                        # single template (back-compat)
+    return variants                                        # single template
 
 
 def render_prompt(problem, templates, question, rng=None):

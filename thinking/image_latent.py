@@ -1,33 +1,35 @@
-"""Latent fact-conditioned rectified flow for the synthetic image rung.
+"""Manifest-conditioned latent rectified flow for real image generation.
 
-This is Image-3: move generation from pixels into a compact visual latent.
+This module trains a compact image autoencoder plus a latent-space rectified flow.
+Production training is manifest-driven: captions, image/text embedding sidecars,
+quality scores, and preference pairs come from data rather than hard-coded visual
+factors.
 
 The design follows the current scalable image-generation pattern at toy scale:
 
   image -> semantic autoencoder latent -> rectified flow in latent space -> decoder -> image
 
-The autoencoder is not reconstruction-only.  It also predicts canonical color/shape facts from
-the latent, which keeps the compression aligned with the FER/UFR requirement: factors should stay
-linearly usable after compression instead of becoming another entangled bottleneck.
-
   python -m thinking.image_latent --selftest
-  python -m thinking.image_latent --train --flow-arch dit --ae-steps 400 --flow-steps 400 \
-      --cond-drop 0.1 --cfg-scale 1.5 --cfg-rescale 0.7 \
-      --sample-steps 8 --flow-semantic-w 0.25 \
+  python -m thinking.image_latent --train --cond-mode text --image-manifest data/images/train.jsonl \
+      --image-root data/images --flow-arch dit --ae-steps 400 --flow-steps 400 \
+      --cond-drop 0.1 --cfg-scale 1.5 --cfg-rescale 0.7 --sample-steps 8 \
       --out runs/image_latent_dit.pt
   python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
       --cfg-scales 1.0,1.25,1.5,2.0 --cfg-rescales 0.0,0.7 \
       --sample-steps-list 4,8,16 \
       --eval-seeds 1,2,3 --roundtrip-samples 2 --eval-out runs/image_latent_dit_sweep.json
   python -m thinking.image_latent --train --cond-mode text --flow-arch dit \
-      --ae-steps 400 --flow-steps 400 --flow-semantic-w 0.25
+      --image-manifest data/images/train.jsonl --image-root data/images \
+      --ae-steps 400 --flow-steps 400
 """
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
 import tempfile
+from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
 
 import numpy as np
@@ -39,7 +41,7 @@ from torch.utils.checkpoint import checkpoint as torch_activation_checkpoint
 from .image_data import (ImageTextRecord, build_caption_vocab, caption_ids,
                          load_image_tensor, normalized_sampling_weights,
                          read_image_manifest, sample_image_text_batch,
-                         summarize_records)
+                         summarize_records, vocab_unknown_id)
 from .image_flow import FACT_VOCAB, fact_condition
 from .vision import COLORS, SHAPES, DEV, ObjectSpec, object_facts, render_object, sample_object
 
@@ -56,9 +58,13 @@ FACT_GROUPS = {
 }
 SAMPLE_METHODS = ("euler", "heun", "midpoint", "rk4")
 SAMPLE_SCHEDULES = ("linear", "quadratic", "sqrt", "cosine")
-MMDIT_ATTN_IMPLS = ("manual", "sdpa", "auto")
+CFG_MODES = ("standard", "cfgpp")
+MMDIT_ATTN_IMPLS = ("manual", "sdpa", "linear", "auto")
 DIT_POS_EMBEDS = ("learned", "sincos2d", "rope2d")
+DIT_MLPS = ("gelu", "swiglu")
 FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
+FLOW_NOISE_COUPLINGS = ("random", "sliced_ot")
+FLOW_REPA_MODES = ("pooled", "token", "both", "auto")
 TIME_SAMPLINGS = ("uniform", "logit-normal")
 TIME_SHIFT_MODES = ("manual", "dim")
 AE_ARCHES = ("semantic", "residual", "hf-vae")
@@ -112,7 +118,7 @@ def render_prompt(spec, rng=None, templates=DEFAULT_PROMPT_TEMPLATES, index=None
 
 
 def build_prompt_vocab(templates=DEFAULT_PROMPT_TEMPLATES):
-    toks = ["<pad>"]
+    toks = ["<pad>", "<unk>"]
     for color in COLORS:
         for shape in SHAPES:
             spec = ObjectSpec("p0", color, shape)
@@ -125,7 +131,7 @@ def prompt_ids(specs, vocab, rng=None, templates=DEFAULT_PROMPT_TEMPLATES, devic
     rows = [render_prompt(spec, rng=rng, templates=templates) for spec in specs]
     max_len = max(len(r) for r in rows)
     ids = torch.zeros((len(rows), max_len), dtype=torch.long, device=device)
-    unk = 0
+    unk = vocab_unknown_id(vocab)
     for i, row in enumerate(rows):
         ids[i, :len(row)] = torch.tensor([vocab.get(tok, unk) for tok in row],
                                          dtype=torch.long, device=device)
@@ -768,6 +774,16 @@ def image_quality_score_loss(scorer, z, records, stats, prefix="quality_score"):
         zero = z.sum() * 0.0
         return zero, {}
     target, mask = quality_target_tensor(records, stats, device=z.device)
+    return image_quality_score_target_loss(
+        scorer, z, target, mask, prefix=prefix)
+
+
+def image_quality_score_target_loss(scorer, z, target, mask, prefix="quality_score"):
+    if scorer is None:
+        zero = z.sum() * 0.0
+        return zero, {}
+    target = target.to(device=z.device, dtype=torch.float32).flatten()
+    mask = mask.to(device=z.device, dtype=torch.bool).flatten()
     n = int(mask.sum().detach().cpu())
     if n <= 0:
         zero = z.sum() * 0.0
@@ -782,6 +798,157 @@ def image_quality_score_loss(scorer, z, records, stats, prefix="quality_score"):
         f"{prefix}_pred_mean": pred[mask].detach().mean(),
         f"{prefix}_target_mean": target[mask].detach().mean(),
         f"{prefix}_n": torch.tensor(float(n), device=z.device),
+    }
+
+
+def image_quality_rank_target_loss(scorer, z, target, mask, prefix="quality_rank",
+                                   margin=0.0):
+    """Pairwise quality preference loss from normalized manifest score targets."""
+    if scorer is None:
+        zero = z.sum() * 0.0
+        return zero, {}
+    target = target.to(device=z.device, dtype=torch.float32).flatten()
+    mask = mask.to(device=z.device, dtype=torch.bool).flatten()
+    valid_pairs = mask[:, None] & mask[None, :]
+    target_gap = target[:, None] - target[None, :]
+    prefer = valid_pairs & target_gap.gt(1.0e-6)
+    n_pairs = int(prefer.sum().detach().cpu())
+    if n_pairs <= 0:
+        zero = z.sum() * 0.0
+        return zero, {
+            f"{prefix}_loss": zero.detach(),
+            f"{prefix}_pairs": torch.tensor(0.0, device=z.device),
+        }
+    logits = scorer.logits(z)
+    pred_gap = logits[:, None] - logits[None, :]
+    pair_weights = target_gap[prefer].detach().clamp_min(1.0e-6)
+    pair_loss = F.softplus(float(margin) - pred_gap[prefer])
+    loss = (pair_loss * pair_weights).sum() / pair_weights.sum().clamp_min(1.0e-6)
+    pair_acc = pred_gap[prefer].gt(0.0).to(torch.float32).mean()
+    return loss, {
+        f"{prefix}_loss": loss.detach(),
+        f"{prefix}_pairs": torch.tensor(float(n_pairs), device=z.device),
+        f"{prefix}_acc": pair_acc.detach(),
+        f"{prefix}_target_gap_mean": target_gap[prefer].detach().mean(),
+        f"{prefix}_pred_gap_mean": pred_gap[prefer].detach().mean(),
+    }
+
+
+def image_quality_rank_loss(scorer, z, records, stats, prefix="quality_rank", margin=0.0):
+    if scorer is None:
+        zero = z.sum() * 0.0
+        return zero, {}
+    target, mask = quality_target_tensor(records, stats, device=z.device)
+    return image_quality_rank_target_loss(
+        scorer, z, target, mask, prefix=prefix, margin=margin)
+
+
+def _read_jsonl_rows(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def _resolve_relative_path(path, base=""):
+    path = str(path)
+    if not base or os.path.isabs(path):
+        return os.path.normpath(path)
+    return os.path.normpath(os.path.join(base, path))
+
+
+def read_image_preference_pairs(path, root="", max_pairs=0):
+    """Read generic chosen/rejected image pairs for quality-scorer pretraining."""
+    if not path:
+        return []
+    manifest_dir = os.path.dirname(os.path.abspath(path))
+    base = root or manifest_dir
+    pairs = []
+    skipped = 0
+    for row in _read_jsonl_rows(path):
+        chosen = (
+            row.get("chosen_image") or row.get("chosen") or row.get("winner_image")
+            or row.get("preferred_image")
+        )
+        rejected = (
+            row.get("rejected_image") or row.get("rejected") or row.get("loser_image")
+            or row.get("nonpreferred_image")
+        )
+        if not chosen or not rejected:
+            skipped += 1
+            continue
+        try:
+            gap = float(row.get("score_gap", row.get("preference_gap", 1.0)) or 1.0)
+        except (TypeError, ValueError):
+            gap = 1.0
+        if not math.isfinite(gap) or gap <= 0.0:
+            gap = 1.0
+        pairs.append({
+            "prompt": str(row.get("prompt") or row.get("caption") or ""),
+            "chosen_path": _resolve_relative_path(chosen, base=base),
+            "rejected_path": _resolve_relative_path(rejected, base=base),
+            "score_gap": float(gap),
+            "source": str(row.get("preference_source") or row.get("source") or ""),
+        })
+        if max_pairs and len(pairs) >= int(max_pairs):
+            break
+    if not pairs:
+        raise ValueError(
+            f"image preference manifest {path!r} yielded no chosen/rejected pairs "
+            f"(skipped {skipped})")
+    return pairs
+
+
+def sample_image_preference_pair_batch(pairs, rng, batch=32, size=32, device=DEV,
+                                       crop_mode="center", hflip_prob=0.0):
+    rows = list(pairs)
+    if not rows:
+        raise ValueError("no image preference pairs available")
+    idx = rng.integers(0, len(rows), size=max(1, int(batch)))
+    chosen = []
+    rejected = []
+    gaps = []
+    for i in idx:
+        pair = rows[int(i)]
+        flip = bool(float(hflip_prob) > 0.0 and rng.random() < float(hflip_prob))
+        chosen.append(load_image_tensor(
+            pair["chosen_path"], size=size, device=device, center_crop=(crop_mode == "center"),
+            crop_mode=crop_mode, hflip=flip, rng=rng))
+        rejected.append(load_image_tensor(
+            pair["rejected_path"], size=size, device=device, center_crop=(crop_mode == "center"),
+            crop_mode=crop_mode, hflip=flip, rng=rng))
+        gaps.append(float(pair.get("score_gap", 1.0)))
+    return (
+        torch.stack(chosen, dim=0),
+        torch.stack(rejected, dim=0),
+        torch.tensor(gaps, dtype=torch.float32, device=device),
+    )
+
+
+def image_quality_preference_pair_loss(scorer, z_chosen, z_rejected, score_gaps=None,
+                                       prefix="quality_preference", margin=0.0):
+    """Pairwise preference loss from chosen/rejected image latents."""
+    if scorer is None:
+        zero = z_chosen.sum() * 0.0
+        return zero, {}
+    chosen_logits = scorer.logits(z_chosen)
+    rejected_logits = scorer.logits(z_rejected)
+    pred_gap = chosen_logits - rejected_logits
+    if score_gaps is None:
+        weights = torch.ones_like(pred_gap)
+    else:
+        weights = score_gaps.to(device=pred_gap.device, dtype=torch.float32).flatten()
+        if weights.numel() != pred_gap.numel():
+            weights = torch.ones_like(pred_gap)
+        weights = weights.clamp_min(1.0e-6)
+        weights = weights / weights.mean().clamp_min(1.0e-6)
+    pair_loss = F.softplus(float(margin) - pred_gap)
+    loss = (pair_loss * weights).mean()
+    acc = pred_gap.gt(0.0).to(torch.float32).mean()
+    return loss, {
+        f"{prefix}_loss": loss.detach(),
+        f"{prefix}_pairs": torch.tensor(float(pred_gap.numel()), device=pred_gap.device),
+        f"{prefix}_acc": acc.detach(),
+        f"{prefix}_pred_gap_mean": pred_gap.detach().mean(),
+        f"{prefix}_score_gap_mean": weights.detach().mean(),
     }
 
 
@@ -857,8 +1024,11 @@ class PromptConditioner(nn.Module):
         super().__init__()
         self.cond_dim = int(cond_dim)
         self.pad = int(pad)
+        self.max_len = int(max_len)
         self.emb = nn.Embedding(vocab_size, hidden, padding_idx=pad)
         self.pos = nn.Embedding(max_len, hidden)
+        self.null_vec = nn.Parameter(torch.zeros(cond_dim))
+        self.null_tokens = nn.Parameter(torch.zeros(max_len, cond_dim))
         heads = max(1, min(heads, hidden))
         while hidden % heads:
             heads -= 1
@@ -874,6 +1044,16 @@ class PromptConditioner(nn.Module):
         self.enc = nn.TransformerEncoder(layer, num_layers=1, enable_nested_tensor=False)
         self.out = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, cond_dim))
 
+    def null_token_rows(self, length, device=None, dtype=None):
+        length = int(length)
+        rows = self.null_tokens
+        if length <= rows.shape[0]:
+            out = rows[:length]
+        else:
+            tail = rows[-1:].expand(length - rows.shape[0], -1)
+            out = torch.cat([rows, tail], dim=0)
+        return out.to(device=device, dtype=dtype)
+
     def forward(self, ids, return_tokens=False):
         b, l = ids.shape
         pos = torch.arange(l, device=ids.device).clamp_max(self.pos.num_embeddings - 1)
@@ -884,7 +1064,19 @@ class PromptConditioner(nn.Module):
         pooled = (h * keep).sum(dim=1) / keep.sum(dim=1).clamp_min(1.0)
         vec = self.out(pooled)
         if return_tokens:
-            return {"vec": vec, "tokens": self.out(h), "mask": mask}
+            tokens = self.out(h)
+            null_vec = self.null_vec.to(device=ids.device, dtype=vec.dtype)[None].expand(b, -1)
+            null_tokens = self.null_token_rows(
+                l, device=ids.device, dtype=tokens.dtype)[None].expand(b, -1, -1)
+            null_mask = torch.zeros((b, l), dtype=torch.bool, device=ids.device)
+            return {
+                "vec": vec,
+                "tokens": tokens,
+                "mask": mask,
+                "null_vec": null_vec,
+                "null_tokens": null_tokens,
+                "null_mask": null_mask,
+            }
         return vec
 
 
@@ -895,6 +1087,8 @@ class PrecomputedTextConditioner(nn.Module):
         super().__init__()
         self.input_dim = int(input_dim)
         self.cond_dim = int(cond_dim)
+        self.null_vec = nn.Parameter(torch.zeros(cond_dim))
+        self.null_token = nn.Parameter(torch.zeros(cond_dim))
         self.net = nn.Sequential(
             nn.LayerNorm(self.input_dim),
             nn.Linear(self.input_dim, int(hidden)),
@@ -905,18 +1099,33 @@ class PrecomputedTextConditioner(nn.Module):
     def forward(self, embeddings, return_tokens=False):
         embeddings = embeddings.float()
         if embeddings.ndim == 3:
+            b, l = int(embeddings.shape[0]), int(embeddings.shape[1])
             tokens = self.net(embeddings)
             mask = embeddings.abs().sum(dim=-1).eq(0)
             keep = (~mask).to(tokens.dtype).unsqueeze(-1)
             pooled = (tokens * keep).sum(dim=1) / keep.sum(dim=1).clamp_min(1.0)
             if return_tokens:
+                null_vec = self.null_vec.to(
+                    device=embeddings.device, dtype=pooled.dtype)[None].expand(b, -1)
+                null_tokens = self.null_token.to(
+                    device=embeddings.device, dtype=tokens.dtype)[None, None, :].expand(
+                        b, l, -1)
+                null_mask = torch.zeros((b, l), dtype=torch.bool, device=embeddings.device)
                 return {"vec": pooled, "tokens": tokens.masked_fill(mask[:, :, None], 0.0),
-                        "mask": mask}
+                        "mask": mask, "null_vec": null_vec,
+                        "null_tokens": null_tokens, "null_mask": null_mask}
             return pooled
         vec = self.net(embeddings)
         if return_tokens:
+            b = int(vec.shape[0])
             mask = torch.zeros((vec.shape[0], 1), dtype=torch.bool, device=vec.device)
-            return {"vec": vec, "tokens": vec[:, None, :], "mask": mask}
+            null_vec = self.null_vec.to(device=vec.device, dtype=vec.dtype)[None].expand(b, -1)
+            null_tokens = self.null_token.to(
+                device=vec.device, dtype=vec.dtype)[None, None, :].expand(b, 1, -1)
+            null_mask = torch.zeros((b, 1), dtype=torch.bool, device=vec.device)
+            return {"vec": vec, "tokens": vec[:, None, :], "mask": mask,
+                    "null_vec": null_vec, "null_tokens": null_tokens,
+                    "null_mask": null_mask}
         return vec
 
 
@@ -1059,11 +1268,94 @@ class FlowFeatureAligner(nn.Module):
             raise ValueError(f"expected hidden tokens as B,N,H or B,H, got {tuple(tokens.shape)}")
         return F.normalize(self.hidden(pooled), dim=-1)
 
+    def encode_hidden_tokens(self, tokens):
+        if tokens.ndim == 2:
+            tokens = tokens[:, None, :]
+        if tokens.ndim != 3:
+            raise ValueError(f"expected hidden tokens as B,N,H or B,H, got {tuple(tokens.shape)}")
+        return F.normalize(self.hidden(tokens.float()), dim=-1)
+
     def encode_feature(self, features):
+        if features.ndim == 3:
+            features = pool_embedding_sequence(features)
+        return F.normalize(self.feature(features.float()), dim=-1)
+
+    def encode_feature_tokens(self, features):
+        if features.ndim == 2:
+            features = features[:, None, :]
+        if features.ndim != 3:
+            raise ValueError(f"expected feature tokens as B,M,D or B,D, got {tuple(features.shape)}")
         return F.normalize(self.feature(features.float()), dim=-1)
 
     def forward(self, tokens, features):
         return self.encode_hidden(tokens), self.encode_feature(features)
+
+    def scale(self):
+        return self.logit_scale.exp().clamp(max=100.0)
+
+
+class FlowLatentAligner(nn.Module):
+    """Align denoiser hidden states to clean latent patches from the same image.
+
+    This is a no-extra-data REPA-style signal. External REPA needs manifest image
+    embeddings; this path only needs the frozen AE latent endpoint, so it works for
+    synthetic factors, caption manifests, and cached real-image latents.
+    """
+
+    def __init__(self, hidden_dim=96, latent_ch=16, patch_size=1, hidden=96,
+                 embed_dim=128, temperature=0.07):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.latent_ch = int(latent_ch)
+        self.patch_size = int(patch_size)
+        if self.patch_size <= 0:
+            raise ValueError("latent alignment patch_size must be positive")
+        self.latent_token_dim = self.latent_ch * self.patch_size * self.patch_size
+        self.embed_dim = int(embed_dim)
+        self.hidden = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, int(hidden)),
+            nn.GELU(),
+            nn.Linear(int(hidden), self.embed_dim),
+        )
+        self.latent = nn.Sequential(
+            nn.LayerNorm(self.latent_token_dim),
+            nn.Linear(self.latent_token_dim, int(hidden)),
+            nn.GELU(),
+            nn.Linear(int(hidden), self.embed_dim),
+        )
+        temp = max(float(temperature), 1.0e-4)
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / temp)))
+
+    def encode_hidden(self, tokens):
+        if tokens.ndim == 3:
+            pooled = tokens.float().mean(dim=1)
+        elif tokens.ndim == 2:
+            pooled = tokens.float()
+        else:
+            raise ValueError(f"expected hidden tokens as B,N,H or B,H, got {tuple(tokens.shape)}")
+        return F.normalize(self.hidden(pooled), dim=-1)
+
+    def encode_hidden_tokens(self, tokens):
+        if tokens.ndim == 2:
+            tokens = tokens[:, None, :]
+        if tokens.ndim != 3:
+            raise ValueError(f"expected hidden tokens as B,N,H or B,H, got {tuple(tokens.shape)}")
+        return F.normalize(self.hidden(tokens.float()), dim=-1)
+
+    def latent_tokens(self, z):
+        tokens, _th, _tw = patchify_latents(z.float(), patch_size=self.patch_size)
+        return tokens
+
+    def encode_latent(self, z):
+        pooled = self.latent_tokens(z).mean(dim=1)
+        return F.normalize(self.latent(pooled), dim=-1)
+
+    def encode_latent_tokens(self, z):
+        return F.normalize(self.latent(self.latent_tokens(z)), dim=-1)
+
+    def forward(self, tokens, z):
+        return self.encode_hidden(tokens), self.encode_latent(z)
 
     def scale(self):
         return self.logit_scale.exp().clamp(max=100.0)
@@ -1114,6 +1406,77 @@ def make_velocity_head(hidden, latent_ch, width_mult=1):
         nn.Linear(width, width),
         nn.GELU(),
         nn.Linear(width, latent_ch),
+    )
+
+
+class SwiGLUFeedForward(nn.Module):
+    def __init__(self, hidden, expansion=4):
+        super().__init__()
+        inner = max(1, int(int(hidden) * int(expansion) * 2 / 3))
+        self.proj = nn.Linear(hidden, inner * 2)
+        self.out = nn.Linear(inner, hidden)
+
+    def forward(self, x):
+        value, gate = self.proj(x).chunk(2, dim=-1)
+        return self.out(value * F.silu(gate))
+
+
+def make_dit_feed_forward(hidden, mlp="gelu"):
+    mlp = str(mlp)
+    if mlp == "gelu":
+        return nn.Sequential(
+            nn.Linear(hidden, hidden * 4),
+            nn.GELU(),
+            nn.Linear(hidden * 4, hidden),
+        )
+    if mlp == "swiglu":
+        return SwiGLUFeedForward(hidden)
+    raise ValueError(f"unknown DiT MLP {mlp!r}")
+
+
+def latent_patch_grid(height, width, patch_size=1):
+    patch_size = int(patch_size)
+    if patch_size <= 0:
+        raise ValueError("latent_patch_size must be positive")
+    height = int(height)
+    width = int(width)
+    if height % patch_size or width % patch_size:
+        raise ValueError(
+            f"latent grid {height}x{width} is not divisible by latent_patch_size={patch_size}")
+    return height // patch_size, width // patch_size
+
+
+def latent_token_count(latent_shape, patch_size=1):
+    _c, h, w = latent_shape
+    th, tw = latent_patch_grid(h, w, patch_size=patch_size)
+    return int(th) * int(tw)
+
+
+def patchify_latents(z, patch_size=1):
+    patch_size = int(patch_size)
+    b, c, h, w = z.shape
+    th, tw = latent_patch_grid(h, w, patch_size=patch_size)
+    if patch_size == 1:
+        return z.flatten(2).transpose(1, 2), th, tw
+    return (
+        z.reshape(b, c, th, patch_size, tw, patch_size)
+        .permute(0, 2, 4, 1, 3, 5)
+        .reshape(b, th * tw, c * patch_size * patch_size),
+        th,
+        tw,
+    )
+
+
+def unpatchify_latents(tokens, latent_ch, height, width, patch_size=1):
+    patch_size = int(patch_size)
+    b = tokens.shape[0]
+    th, tw = latent_patch_grid(height, width, patch_size=patch_size)
+    if patch_size == 1:
+        return tokens.transpose(1, 2).reshape(b, latent_ch, height, width)
+    return (
+        tokens.reshape(b, th, tw, latent_ch, patch_size, patch_size)
+        .permute(0, 3, 1, 4, 2, 5)
+        .reshape(b, latent_ch, height, width)
     )
 
 
@@ -1204,8 +1567,11 @@ class LatentDiTFlowNet(nn.Module):
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256, head_width_mult=1, pos_embed="learned",
-                 checkpoint_blocks=False):
+                 checkpoint_blocks=False, latent_patch_size=1):
         super().__init__()
+        latent_patch_size = int(latent_patch_size)
+        if latent_patch_size <= 0:
+            raise ValueError("latent_patch_size must be positive")
         pos_embed = str(pos_embed)
         if pos_embed not in DIT_POS_EMBEDS:
             raise ValueError(f"unknown DiT positional embedding {pos_embed!r}")
@@ -1213,6 +1579,8 @@ class LatentDiTFlowNet(nn.Module):
             raise ValueError("rope2d positional embedding is only supported by MM-DiT")
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
+        self.latent_patch_size = latent_patch_size
+        self.token_dim = self.latent_ch * self.latent_patch_size * self.latent_patch_size
         self.hidden = int(hidden)
         self.hidden_feature_dim = int(hidden)
         self.max_tokens = int(max_tokens)
@@ -1222,7 +1590,7 @@ class LatentDiTFlowNet(nn.Module):
         self.uses_rope2d_pos_embed = False
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.uses_activation_checkpointing = self.checkpoint_blocks
-        self.in_proj = nn.Linear(latent_ch, hidden)
+        self.in_proj = nn.Linear(self.token_dim, hidden)
         self.pos = (
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
             if pos_embed == "learned" else None
@@ -1243,7 +1611,7 @@ class LatentDiTFlowNet(nn.Module):
         )
         self.blocks = nn.TransformerEncoder(layer, num_layers=depth, enable_nested_tensor=False)
         self.norm = nn.LayerNorm(hidden)
-        self.out_proj = make_velocity_head(hidden, latent_ch, self.head_width_mult)
+        self.out_proj = make_velocity_head(hidden, self.token_dim, self.head_width_mult)
 
     def image_pos(self, h, w, device, dtype):
         if self.dit_pos_embed == "learned":
@@ -1257,13 +1625,14 @@ class LatentDiTFlowNet(nn.Module):
         elif t.ndim == 1:
             t = t[:, None]
         b, c, h, w = z.shape
-        n = h * w
+        th, tw = latent_patch_grid(h, w, patch_size=self.latent_patch_size)
+        n = th * tw
         if n > self.max_tokens:
             raise ValueError(f"latent token count {n} exceeds max_tokens={self.max_tokens}")
-        toks = z.flatten(2).transpose(1, 2)                  # B,N,C
+        toks, th, tw = patchify_latents(z, patch_size=self.latent_patch_size)
         ctx = self.cond(torch.cat([cond, t.to(cond.dtype)], dim=1))[:, None, :]
         x = self.in_proj(toks)
-        x = x + self.image_pos(h, w, x.device, x.dtype) + ctx
+        x = x + self.image_pos(th, tw, x.device, x.dtype) + ctx
         if should_checkpoint_blocks(self):
             for layer in self.blocks.layers:
                 x = activation_checkpoint(layer, x)
@@ -1273,7 +1642,8 @@ class LatentDiTFlowNet(nn.Module):
             x = self.blocks(x)
         features = self.norm(x)
         v = self.out_proj(features)
-        velocity = v.transpose(1, 2).reshape(b, c, h, w)
+        velocity = unpatchify_latents(
+            v, c, h, w, patch_size=self.latent_patch_size)
         if return_features:
             return velocity, {"image_tokens": features}
         return velocity
@@ -1282,19 +1652,19 @@ class LatentDiTFlowNet(nn.Module):
 class CrossDiTBlock(nn.Module):
     """Tiny image-token block with prompt-token cross-attention."""
 
-    def __init__(self, hidden=96, heads=4):
+    def __init__(self, hidden=96, heads=4, mlp="gelu"):
         super().__init__()
+        mlp = str(mlp)
+        if mlp not in DIT_MLPS:
+            raise ValueError(f"unknown DiT MLP {mlp!r}")
+        self.dit_mlp = mlp
         self.self_norm = nn.LayerNorm(hidden)
         self.self_attn = nn.MultiheadAttention(hidden, heads, batch_first=True, dropout=0.0)
         self.cross_norm = nn.LayerNorm(hidden)
         self.ctx_norm = nn.LayerNorm(hidden)
         self.cross_attn = nn.MultiheadAttention(hidden, heads, batch_first=True, dropout=0.0)
         self.ff_norm = nn.LayerNorm(hidden)
-        self.ff = nn.Sequential(
-            nn.Linear(hidden, hidden * 4),
-            nn.GELU(),
-            nn.Linear(hidden * 4, hidden),
-        )
+        self.ff = make_dit_feed_forward(hidden, mlp=mlp)
 
     def forward(self, x, ctx, ctx_mask=None):
         q = self.self_norm(x)
@@ -1311,8 +1681,14 @@ class LatentCrossDiTFlowNet(nn.Module):
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256, head_width_mult=1, pos_embed="learned",
-                 checkpoint_blocks=False):
+                 checkpoint_blocks=False, mlp="gelu", latent_patch_size=1):
         super().__init__()
+        latent_patch_size = int(latent_patch_size)
+        if latent_patch_size <= 0:
+            raise ValueError("latent_patch_size must be positive")
+        mlp = str(mlp)
+        if mlp not in DIT_MLPS:
+            raise ValueError(f"unknown DiT MLP {mlp!r}")
         pos_embed = str(pos_embed)
         if pos_embed not in DIT_POS_EMBEDS:
             raise ValueError(f"unknown DiT positional embedding {pos_embed!r}")
@@ -1320,16 +1696,20 @@ class LatentCrossDiTFlowNet(nn.Module):
             raise ValueError("rope2d positional embedding is only supported by MM-DiT")
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
+        self.latent_patch_size = latent_patch_size
+        self.token_dim = self.latent_ch * self.latent_patch_size * self.latent_patch_size
         self.hidden = int(hidden)
         self.hidden_feature_dim = int(hidden)
         self.max_tokens = int(max_tokens)
         self.head_width_mult = int(head_width_mult)
         self.dit_pos_embed = pos_embed
+        self.dit_mlp = mlp
         self.uses_2d_pos_embed = pos_embed == "sincos2d"
         self.uses_rope2d_pos_embed = False
+        self.uses_swiglu_mlp = mlp == "swiglu"
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.uses_activation_checkpointing = self.checkpoint_blocks
-        self.in_proj = nn.Linear(latent_ch, hidden)
+        self.in_proj = nn.Linear(self.token_dim, hidden)
         self.pos = (
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
             if pos_embed == "learned" else None
@@ -1340,9 +1720,11 @@ class LatentCrossDiTFlowNet(nn.Module):
             nn.Linear(hidden, hidden),
         )
         self.ctx_proj = nn.Linear(cond_dim, hidden)
-        self.blocks = nn.ModuleList([CrossDiTBlock(hidden, heads) for _ in range(depth)])
+        self.blocks = nn.ModuleList([
+            CrossDiTBlock(hidden, heads, mlp=mlp) for _ in range(depth)
+        ])
         self.norm = nn.LayerNorm(hidden)
-        self.out_proj = make_velocity_head(hidden, latent_ch, self.head_width_mult)
+        self.out_proj = make_velocity_head(hidden, self.token_dim, self.head_width_mult)
 
     def image_pos(self, h, w, device, dtype):
         if self.dit_pos_embed == "learned":
@@ -1365,14 +1747,15 @@ class LatentCrossDiTFlowNet(nn.Module):
         elif t.ndim == 1:
             t = t[:, None]
         b, c, h, w = z.shape
-        n = h * w
+        th, tw = latent_patch_grid(h, w, patch_size=self.latent_patch_size)
+        n = th * tw
         if n > self.max_tokens:
             raise ValueError(f"latent token count {n} exceeds max_tokens={self.max_tokens}")
-        toks = z.flatten(2).transpose(1, 2)
+        toks, th, tw = patchify_latents(z, patch_size=self.latent_patch_size)
         global_ctx = self.cond(torch.cat([cond_vec, t.to(cond_vec.dtype)], dim=1))[:, None, :]
         ctx, ctx_mask = self._context(cond)
         x = self.in_proj(toks)
-        x = x + self.image_pos(h, w, x.device, x.dtype) + global_ctx
+        x = x + self.image_pos(th, tw, x.device, x.dtype) + global_ctx
         for block in self.blocks:
             if should_checkpoint_blocks(self):
                 def block_forward(x_arg, ctx_arg, block=block):
@@ -1382,7 +1765,8 @@ class LatentCrossDiTFlowNet(nn.Module):
                 x = block(x, ctx, ctx_mask=ctx_mask)
         features = self.norm(x)
         v = self.out_proj(features)
-        velocity = v.transpose(1, 2).reshape(b, c, h, w)
+        velocity = unpatchify_latents(
+            v, c, h, w, patch_size=self.latent_patch_size)
         if return_features:
             return velocity, {"image_tokens": features}
         return velocity
@@ -1407,8 +1791,11 @@ class MMDiTBlock(nn.Module):
     """Tiny dual-stream block with separate image/text projections and joint attention."""
 
     def __init__(self, hidden=96, heads=4, qk_norm=False, attn_impl="manual",
-                 image_rope=False):
+                 image_rope=False, mlp="gelu"):
         super().__init__()
+        mlp = str(mlp)
+        if mlp not in DIT_MLPS:
+            raise ValueError(f"unknown DiT MLP {mlp!r}")
         if hidden % heads:
             raise ValueError(f"hidden={hidden} must be divisible by heads={heads}")
         attn_impl = str(attn_impl)
@@ -1420,7 +1807,9 @@ class MMDiTBlock(nn.Module):
             raise ValueError("rope2d requires an even MM-DiT head dimension")
         self.uses_qk_norm = bool(qk_norm)
         self.attn_impl = attn_impl
+        self.dit_mlp = mlp
         self.uses_image_rope2d = bool(image_rope)
+        self.uses_swiglu_mlp = mlp == "swiglu"
         self.uses_zero_residual_gating = True
         self.scale = self.head_dim ** -0.5
         self.img_norm = nn.LayerNorm(hidden)
@@ -1435,10 +1824,8 @@ class MMDiTBlock(nn.Module):
         self.ctx_out = nn.Linear(hidden, hidden)
         self.img_ff_norm = nn.LayerNorm(hidden)
         self.ctx_ff_norm = nn.LayerNorm(hidden)
-        self.img_ff = nn.Sequential(nn.Linear(hidden, hidden * 4), nn.GELU(),
-                                    nn.Linear(hidden * 4, hidden))
-        self.ctx_ff = nn.Sequential(nn.Linear(hidden, hidden * 4), nn.GELU(),
-                                    nn.Linear(hidden * 4, hidden))
+        self.img_ff = make_dit_feed_forward(hidden, mlp=mlp)
+        self.ctx_ff = make_dit_feed_forward(hidden, mlp=mlp)
         self.ada = nn.Sequential(nn.SiLU(), nn.Linear(hidden, hidden * 8))
         self.gate = nn.Sequential(nn.SiLU(), nn.Linear(hidden, hidden * 4))
         nn.init.zeros_(self.ada[-1].weight)
@@ -1482,9 +1869,25 @@ class MMDiTBlock(nn.Module):
         return F.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
 
+    def _linear_attention(self, q, k, v, key_mask=None, eps=1.0e-6):
+        q_feat = F.elu(q.float()) + 1.0
+        k_feat = F.elu(k.float()) + 1.0
+        v_float = v.float()
+        if key_mask is not None:
+            keep = (~key_mask).to(dtype=k_feat.dtype, device=k_feat.device)[:, None, :, None]
+            k_feat = k_feat * keep
+            v_float = v_float * keep
+        k_sum = k_feat.sum(dim=2)
+        kv = torch.einsum("bhnd,bhne->bhde", k_feat, v_float)
+        denom = torch.einsum("bhnd,bhd->bhn", q_feat, k_sum).clamp_min(float(eps))
+        out = torch.einsum("bhnd,bhde,bhn->bhne", q_feat, kv, denom.reciprocal())
+        return out.to(dtype=v.dtype)
+
     def _joint_attention(self, q, k, v, key_mask=None):
         if self.attn_impl == "manual":
             return self._manual_attention(q, k, v, key_mask=key_mask)
+        if self.attn_impl == "linear":
+            return self._linear_attention(q, k, v, key_mask=key_mask)
         if self._sdpa_available():
             return self._sdpa_attention(q, k, v, key_mask=key_mask)
         if self.attn_impl == "sdpa":
@@ -1536,8 +1939,15 @@ class LatentMMDiTFlowNet(nn.Module):
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256, head_width_mult=1, qk_norm=False,
-                 attn_impl="manual", pos_embed="learned", checkpoint_blocks=False):
+                 attn_impl="manual", pos_embed="learned", checkpoint_blocks=False,
+                 mlp="gelu", latent_patch_size=1):
         super().__init__()
+        latent_patch_size = int(latent_patch_size)
+        if latent_patch_size <= 0:
+            raise ValueError("latent_patch_size must be positive")
+        mlp = str(mlp)
+        if mlp not in DIT_MLPS:
+            raise ValueError(f"unknown DiT MLP {mlp!r}")
         attn_impl = str(attn_impl)
         if attn_impl not in MMDIT_ATTN_IMPLS:
             raise ValueError(f"unknown MM-DiT attention implementation {attn_impl!r}")
@@ -1546,21 +1956,25 @@ class LatentMMDiTFlowNet(nn.Module):
             raise ValueError(f"unknown DiT positional embedding {pos_embed!r}")
         cond_dim = cond_dim or len(FACT_VOCAB)
         self.latent_ch = int(latent_ch)
+        self.latent_patch_size = latent_patch_size
+        self.token_dim = self.latent_ch * self.latent_patch_size * self.latent_patch_size
         self.hidden = int(hidden)
         self.hidden_feature_dim = int(hidden)
         self.max_tokens = int(max_tokens)
         self.head_width_mult = int(head_width_mult)
         self.uses_qk_norm = bool(qk_norm)
         self.attn_impl = attn_impl
+        self.dit_mlp = mlp
         self.heads = int(heads)
         self.head_dim = self.hidden // self.heads
         self.dit_pos_embed = pos_embed
         self.uses_zero_residual_gating = True
         self.uses_2d_pos_embed = pos_embed in ("sincos2d", "rope2d")
         self.uses_rope2d_pos_embed = pos_embed == "rope2d"
+        self.uses_swiglu_mlp = mlp == "swiglu"
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.uses_activation_checkpointing = self.checkpoint_blocks
-        self.in_proj = nn.Linear(latent_ch, hidden)
+        self.in_proj = nn.Linear(self.token_dim, hidden)
         self.pos = (
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
             if pos_embed == "learned" else None
@@ -1571,12 +1985,12 @@ class LatentMMDiTFlowNet(nn.Module):
         self.blocks = nn.ModuleList([
             MMDiTBlock(
                 hidden, heads, qk_norm=self.uses_qk_norm, attn_impl=self.attn_impl,
-                image_rope=self.uses_rope2d_pos_embed
+                image_rope=self.uses_rope2d_pos_embed, mlp=mlp
             )
             for _ in range(depth)
         ])
         self.norm = nn.LayerNorm(hidden)
-        self.out_proj = make_velocity_head(hidden, latent_ch, self.head_width_mult)
+        self.out_proj = make_velocity_head(hidden, self.token_dim, self.head_width_mult)
 
     def image_pos(self, h, w, device, dtype):
         if self.dit_pos_embed == "learned":
@@ -1606,17 +2020,19 @@ class LatentMMDiTFlowNet(nn.Module):
         elif t.ndim == 1:
             t = t[:, None]
         b, c, h, w = z.shape
-        n = h * w
+        th, tw = latent_patch_grid(h, w, patch_size=self.latent_patch_size)
+        n = th * tw
         if n > self.max_tokens:
             raise ValueError(f"latent token count {n} exceeds max_tokens={self.max_tokens}")
         cond_ctx = self.time(torch.cat([cond_vec, t.to(cond_vec.dtype)], dim=1))
-        img = self.in_proj(z.flatten(2).transpose(1, 2))
-        image_pos = self.image_pos(h, w, img.device, img.dtype)
+        toks, th, tw = patchify_latents(z, patch_size=self.latent_patch_size)
+        img = self.in_proj(toks)
+        image_pos = self.image_pos(th, tw, img.device, img.dtype)
         if image_pos is not None:
             img = img + image_pos
         img = img + cond_ctx[:, None, :]
         ctx, ctx_mask = self._context(cond)
-        image_rope = self.image_rope(h, w, img.device, img.dtype)
+        image_rope = self.image_rope(th, tw, img.device, img.dtype)
         for block in self.blocks:
             if should_checkpoint_blocks(self):
                 def block_forward(img_arg, ctx_arg, cond_arg, block=block):
@@ -1629,7 +2045,8 @@ class LatentMMDiTFlowNet(nn.Module):
                                  image_rope=image_rope)
         features = self.norm(img)
         v = self.out_proj(features)
-        velocity = v.transpose(1, 2).reshape(b, c, h, w)
+        velocity = unpatchify_latents(
+            v, c, h, w, patch_size=self.latent_patch_size)
         if return_features:
             return velocity, {"image_tokens": features}
         return velocity
@@ -1638,14 +2055,24 @@ class LatentMMDiTFlowNet(nn.Module):
 def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4,
               cond_dim=None, dit_head_width_mult=1, latent_max_tokens=256,
               dit_qk_norm=False, dit_attn_impl="manual", dit_pos_embed="learned",
-              flow_checkpoint_blocks=False):
+              dit_mlp="gelu", latent_patch_size=1, flow_checkpoint_blocks=False):
+    latent_patch_size = int(latent_patch_size)
+    if latent_patch_size <= 0:
+        raise ValueError("latent_patch_size must be positive")
     if flow_arch == "conv":
+        if latent_patch_size != 1:
+            raise ValueError("latent_patch_size is only supported by DiT/CrossDiT/MM-DiT flows")
         return LatentFlowNet(latent_ch=latent_ch, hidden=hidden, cond_dim=cond_dim)
+    dit_mlp = str(dit_mlp)
+    if dit_mlp not in DIT_MLPS:
+        raise ValueError(f"unknown DiT MLP {dit_mlp!r}")
     dit_pos_embed = str(dit_pos_embed)
     if dit_pos_embed not in DIT_POS_EMBEDS:
         raise ValueError(f"unknown DiT positional embedding {dit_pos_embed!r}")
     if dit_pos_embed == "rope2d" and flow_arch != "mmdit":
         raise ValueError("rope2d positional embedding is only supported by MM-DiT")
+    if dit_mlp != "gelu" and flow_arch == "dit":
+        raise ValueError("custom DiT MLPs are supported by CrossDiT/MM-DiT flows")
     dit_head_width_mult = int(dit_head_width_mult)
     if dit_head_width_mult <= 0:
         raise ValueError("dit_head_width_mult must be positive")
@@ -1658,7 +2085,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                 head_width_mult=dit_head_width_mult,
                                 max_tokens=latent_max_tokens,
                                 pos_embed=dit_pos_embed,
-                                checkpoint_blocks=flow_checkpoint_blocks)
+                                checkpoint_blocks=flow_checkpoint_blocks,
+                                latent_patch_size=latent_patch_size)
     if flow_arch == "crossdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
@@ -1668,7 +2096,9 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                      head_width_mult=dit_head_width_mult,
                                      max_tokens=latent_max_tokens,
                                      pos_embed=dit_pos_embed,
-                                     checkpoint_blocks=flow_checkpoint_blocks)
+                                     checkpoint_blocks=flow_checkpoint_blocks,
+                                     mlp=dit_mlp,
+                                     latent_patch_size=latent_patch_size)
     if flow_arch == "mmdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
@@ -1680,6 +2110,8 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                   qk_norm=dit_qk_norm,
                                   attn_impl=dit_attn_impl,
                                   pos_embed=dit_pos_embed,
+                                  mlp=dit_mlp,
+                                  latent_patch_size=latent_patch_size,
                                   checkpoint_blocks=flow_checkpoint_blocks)
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
@@ -1713,6 +2145,14 @@ def attach_flow_repa_aligner(flow, flow_repa_aligner):
     if hasattr(flow, "_modules"):
         flow._modules.pop("flow_repa_aligner", None)
     flow.__dict__["flow_repa_aligner"] = flow_repa_aligner
+    return flow
+
+
+def attach_flow_self_repa_aligner(flow, flow_self_repa_aligner):
+    # Keep the auxiliary self-REPA head out of flow.state_dict(); checkpoint it explicitly.
+    if hasattr(flow, "_modules"):
+        flow._modules.pop("flow_self_repa_aligner", None)
+    flow.__dict__["flow_self_repa_aligner"] = flow_self_repa_aligner
     return flow
 
 
@@ -2153,22 +2593,237 @@ def estimate_latent_stats_tensor(latents, n=512, seed=123, mode="none", eps=1.0e
     }
 
 
+def maybe_embedding_sha256(values):
+    if values is None:
+        return ""
+    arr = np.asarray(values, dtype=np.float32)
+    return hashlib.sha256(arr.tobytes()).hexdigest()
+
+
+def autoencoder_cache_identity(ae):
+    if isinstance(ae, HFAutoencoderKL):
+        return {
+            "arch": "hf-vae",
+            "model_id": ae.model_id,
+            "subfolder": ae.subfolder,
+            "scaling_factor": float(ae.scaling_factor),
+            "downsample": int(ae.downsample),
+            "latent_ch": int(ae.latent_ch),
+        }
+    h = hashlib.sha256()
+    for name, tensor in sorted(ae.state_dict().items()):
+        h.update(str(name).encode("utf-8"))
+        h.update(str(tuple(int(x) for x in tensor.shape)).encode("utf-8"))
+        h.update(str(tensor.dtype).encode("utf-8"))
+        h.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+    return {
+        "arch": ae.__class__.__name__,
+        "state_sha256": h.hexdigest(),
+        "downsample": int(getattr(ae, "downsample", 0) or 0),
+        "latent_ch": int(getattr(ae, "latent_ch", 0) or 0),
+    }
+
+
+def image_latent_cache_fingerprint(ae, rows, size=32, caption_max_len=64,
+                                   cond_source="tokens", include_image_embeddings=False,
+                                   include_image_embedding_sequences=False,
+                                   include_quality_targets=False, quality_stats=None,
+                                   crop_mode="center", hflip_prob=0.0, seed=0,
+                                   cache_dtype="fp32", shard_size=1024,
+                                   size_buckets=(), weighted=False, precision="fp32"):
+    record_rows = []
+    for rec in rows:
+        try:
+            stat = os.stat(rec.path)
+            file_size = int(stat.st_size)
+            file_mtime_ns = int(stat.st_mtime_ns)
+        except OSError:
+            file_size = -1
+            file_mtime_ns = -1
+        record_rows.append({
+            "path": os.path.abspath(rec.path),
+            "caption": str(rec.caption),
+            "split": str(rec.split),
+            "source": str(rec.source),
+            "aesthetic": None if rec.aesthetic is None else float(rec.aesthetic),
+            "width": int(rec.width),
+            "height": int(rec.height),
+            "file_size": file_size,
+            "file_mtime_ns": file_mtime_ns,
+            "text_embedding_sha256": maybe_embedding_sha256(rec.text_embedding),
+            "text_embedding_sequence_sha256": maybe_embedding_sha256(
+                rec.text_embedding_sequence),
+            "image_embedding_sha256": maybe_embedding_sha256(rec.image_embedding),
+            "image_embedding_sequence_sha256": maybe_embedding_sha256(
+                rec.image_embedding_sequence),
+        })
+    payload = {
+        "version": 1,
+        "ae": autoencoder_cache_identity(ae),
+        "size": image_size_pair_value(size),
+        "size_buckets": [image_size_pair_value(bucket) for bucket in size_buckets],
+        "caption_max_len": int(caption_max_len),
+        "cond_source": str(cond_source),
+        "include_image_embeddings": bool(include_image_embeddings),
+        "include_image_embedding_sequences": bool(include_image_embedding_sequences),
+        "include_quality_targets": bool(include_quality_targets),
+        "quality_stats": (
+            {
+                "n": int(quality_stats.get("n", 0)),
+                "missing": int(quality_stats.get("missing", 0)),
+                "min": float(quality_stats.get("min", 0.0)),
+                "mean": float(quality_stats.get("mean", 0.0)),
+                "max": float(quality_stats.get("max", 0.0)),
+                "has_range": bool(quality_stats.get("has_range", False)),
+            }
+            if quality_stats is not None else None
+        ),
+        "crop_mode": str(crop_mode),
+        "hflip_prob": float(hflip_prob),
+        "seed": int(seed),
+        "cache_dtype": str(cache_dtype),
+        "shard_size": int(shard_size),
+        "weighted": bool(weighted),
+        "precision": str(precision),
+        "records": record_rows,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _latent_cache_meta_path(cache_dir):
+    return os.path.join(os.path.abspath(cache_dir), "meta.json")
+
+
+def load_disk_image_latent_cache(cache_dir, expected_fingerprint=None):
+    cache_dir = os.path.abspath(cache_dir)
+    meta_path = _latent_cache_meta_path(cache_dir)
+    if not os.path.exists(meta_path):
+        return None
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    if expected_fingerprint and meta.get("fingerprint") != expected_fingerprint:
+        return None
+    fmt = str(meta.get("format", ""))
+    if fmt == "image_latent_cache_bucketed_v1":
+        buckets = []
+        total_bytes = int(os.path.getsize(meta_path))
+        total_shards = 0
+        for bucket_meta in meta.get("buckets", []):
+            key = str(bucket_meta["key"])
+            subcache = load_disk_image_latent_cache(os.path.join(cache_dir, key))
+            if subcache is None:
+                return None
+            total_bytes += int(subcache.get("bytes", 0))
+            total_shards += int(subcache.get("shard_count", len(subcache.get("shards", []))))
+            buckets.append({
+                "key": key,
+                "size": list(bucket_meta.get("size", [])),
+                "cache": subcache,
+                "records": int(subcache.get("records", bucket_meta.get("records", 0))),
+                "weight_sum": float(subcache.get(
+                    "weight_sum", bucket_meta.get("weight_sum", 0.0))),
+            })
+        cache = {
+            "backend": str(meta.get("backend", "bucketed_disk")),
+            "cache_dir": cache_dir,
+            "meta_path": meta_path,
+            "buckets": buckets,
+            "bucket_sampling_mode": str(meta.get("bucket_sampling_mode", "uniform")),
+            "bucket_sampling_probs": dict(meta.get("bucket_sampling_probs", {})),
+            "records": int(meta.get("records", sum(b["records"] for b in buckets))),
+            "bucket_count": int(meta.get("bucket_count", len(buckets))),
+            "shard_count": int(meta.get("shard_count", total_shards)),
+            "bytes": int(meta.get("bytes", total_bytes)) + int(os.path.getsize(meta_path)),
+            "cond_source": str(meta.get("cond_source", "")),
+            "has_image_embeddings": bool(meta.get("has_image_embeddings", False)),
+            "has_image_embedding_sequences": bool(meta.get(
+                "has_image_embedding_sequences", False)),
+            "has_quality_targets": bool(meta.get("has_quality_targets", False)),
+            "latent_dtype": str(meta.get("latent_dtype", "")),
+            "weighted": bool(meta.get("weighted", False)),
+            "weight_sum": float(meta.get("weight_sum", 0.0)),
+            "fingerprint": meta.get("fingerprint", ""),
+            "cache_reused": True,
+        }
+        return cache
+    if fmt != "image_latent_cache_v1":
+        return None
+    shards = []
+    for shard_meta in meta.get("shards", []):
+        filename = str(shard_meta["file"])
+        path = os.path.join(cache_dir, filename)
+        if not os.path.exists(path):
+            return None
+        shards.append({
+            "path": path,
+            "file": filename,
+            "count": int(shard_meta.get("count", 0)),
+            "bytes": int(shard_meta.get("bytes", os.path.getsize(path))),
+            "weight_sum": float(shard_meta.get("weight_sum", shard_meta.get("count", 0))),
+            "latent_dtype": str(shard_meta.get("latent_dtype", meta.get("latent_dtype", ""))),
+            "text_embedding_shape": list(shard_meta.get("text_embedding_shape", [])),
+            "image_embedding_sequence_shape": list(shard_meta.get(
+                "image_embedding_sequence_shape", [])),
+        })
+    return {
+        "backend": "disk",
+        "cache_dir": cache_dir,
+        "meta_path": meta_path,
+        "records": int(meta.get("records", sum(s["count"] for s in shards))),
+        "latent_shape": tuple(int(x) for x in meta.get("latent_shape", [])),
+        "cond_source": str(meta.get("cond_source", "")),
+        "has_image_embeddings": bool(meta.get("has_image_embeddings", False)),
+        "has_image_embedding_sequences": bool(meta.get(
+            "has_image_embedding_sequences", False)),
+        "has_quality_targets": bool(meta.get("has_quality_targets", False)),
+        "latent_dtype": str(meta.get("latent_dtype", "")),
+        "shard_size": int(meta.get("shard_size", 0)),
+        "shards": shards,
+        "shard_count": int(len(shards)),
+        "bytes": int(meta.get("bytes", sum(s["bytes"] for s in shards))) + int(
+            os.path.getsize(meta_path)),
+        "weighted": bool(meta.get("weighted", False)),
+        "weight_sum": float(meta.get("weight_sum", 0.0)),
+        "fingerprint": meta.get("fingerprint", ""),
+        "cache_reused": True,
+    }
+
+
 @torch.no_grad()
 def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_records=0,
                              batch=64, seed=0, size=32, device=DEV, precision="fp32",
                              cond_source="tokens", cache_dir="", shard_size=1024,
                              include_image_embeddings=False, crop_mode="center",
+                             include_image_embedding_sequences=False,
+                             include_quality_targets=False, quality_stats=None,
                              hflip_prob=0.0, size_buckets=(), bucket_records=None,
-                             record_weights=None):
+                             record_weights=None, cache_dtype="fp32"):
     rows = list(records)
     if not rows:
         raise ValueError("cannot build latent cache from empty records")
+    cache_dtype = str(cache_dtype)
+    latent_cache_torch_dtype(cache_dtype)
     rng = np.random.default_rng(seed)
     if max_records and int(max_records) < len(rows):
         probs = normalized_sampling_weights(weights_for_records(rows, record_weights), len(rows))
         chosen_idx = rng.choice(len(rows), size=int(max_records), replace=False, p=probs)
         rows = [rows[int(i)] for i in chosen_idx]
     buckets = normalize_image_size_buckets(size_buckets)
+    cache_fingerprint = image_latent_cache_fingerprint(
+        ae, rows, size=size, caption_max_len=caption_max_len,
+        cond_source=cond_source, include_image_embeddings=include_image_embeddings,
+        include_image_embedding_sequences=include_image_embedding_sequences,
+        include_quality_targets=include_quality_targets,
+        quality_stats=quality_stats,
+        crop_mode=crop_mode, hflip_prob=hflip_prob, seed=seed,
+        cache_dtype=cache_dtype, shard_size=shard_size, size_buckets=buckets,
+        weighted=record_weights is not None, precision=precision)
+    if cache_dir:
+        existing = load_disk_image_latent_cache(
+            cache_dir, expected_fingerprint=cache_fingerprint)
+        if existing is not None:
+            return existing
     if len(buckets) > 1:
         limited_bucket_records, _missing_dims = bucket_records_by_aspect(rows, buckets)
         subcaches = []
@@ -2187,8 +2842,11 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                 size=bucket, device=device, precision=precision, cond_source=cond_source,
                 cache_dir=bucket_dir, shard_size=shard_size,
                 include_image_embeddings=include_image_embeddings,
+                include_image_embedding_sequences=include_image_embedding_sequences,
+                include_quality_targets=include_quality_targets,
+                quality_stats=quality_stats,
                 crop_mode=crop_mode, hflip_prob=hflip_prob,
-                record_weights=record_weights)
+                record_weights=record_weights, cache_dtype=cache_dtype)
             total_bytes += int(subcache.get("bytes", 0))
             total_records += int(subcache.get("records", 0))
             total_shards += int(subcache.get("shard_count", len(subcache.get("shards", []))))
@@ -2222,8 +2880,13 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             "bytes": int(total_bytes),
             "cond_source": cond_source,
             "has_image_embeddings": bool(include_image_embeddings),
+            "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+            "has_quality_targets": bool(include_quality_targets),
+            "latent_dtype": cache_dtype,
             "weighted": bool(weighted),
             "weight_sum": float(total_weight),
+            "fingerprint": cache_fingerprint,
+            "cache_reused": False,
         }
         if cache_dir:
             os.makedirs(cache["cache_dir"], exist_ok=True)
@@ -2248,8 +2911,13 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                     "bytes": int(total_bytes),
                     "cond_source": cond_source,
                     "has_image_embeddings": bool(include_image_embeddings),
+                    "has_image_embedding_sequences": bool(
+                        include_image_embedding_sequences),
+                    "has_quality_targets": bool(include_quality_targets),
+                    "latent_dtype": cache_dtype,
                     "weighted": bool(weighted),
                     "weight_sum": float(total_weight),
+                    "fingerprint": cache_fingerprint,
                 }, f, indent=1, sort_keys=True)
             os.replace(meta_path + ".tmp", meta_path)
             cache["meta_path"] = meta_path
@@ -2259,14 +2927,24 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         infer_text_embedding_dim(rows)
     if include_image_embeddings:
         infer_image_embedding_dim(rows)
+    if include_image_embedding_sequences and not records_have_image_embedding_sequences(rows):
+        raise ValueError("image embedding sequence cache requested but no records have sequences")
+    cache_quality_stats = quality_stats or quality_score_stats(rows)
     if cache_dir:
         return build_disk_image_latent_cache(
             ae, rows, prompt_vocab, caption_max_len=caption_max_len,
             batch=batch, size=size, device=device, precision=precision,
             cond_source=cond_source, cache_dir=cache_dir, shard_size=shard_size,
-            include_image_embeddings=include_image_embeddings, seed=seed,
-            crop_mode=crop_mode, hflip_prob=hflip_prob, record_weights=record_weights)
-    latents, captions, embeddings, image_embeddings = [], [], [], []
+            include_image_embeddings=include_image_embeddings,
+            include_image_embedding_sequences=include_image_embedding_sequences,
+            include_quality_targets=include_quality_targets,
+            quality_stats=cache_quality_stats,
+            seed=seed,
+            crop_mode=crop_mode, hflip_prob=hflip_prob, record_weights=record_weights,
+            cache_dtype=cache_dtype, cache_fingerprint=cache_fingerprint)
+    latents, captions, embeddings, image_embeddings, image_embedding_sequences = [], [], [], [], []
+    quality_targets, quality_masks = [], []
+    sequence_max_len = image_embedding_sequence_max_len(rows)
     weights = weights_for_records(rows, record_weights)
     ae.eval()
     crop_rng = np.random.default_rng(seed + 17)
@@ -2281,12 +2959,20 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         ], dim=0)
         with amp_autocast(device, precision):
             z = ae.encode(x)
-        latents.append(z.detach().float().cpu())
+        latents.append(cache_latent_tensor(z, cache_dtype))
         captions.extend(rec.caption for rec in chunk)
         if cond_source == "embedding":
             embeddings.append(record_text_embedding_tensor(chunk, device="cpu"))
         if include_image_embeddings:
             image_embeddings.append(record_image_embedding_tensor(chunk, device="cpu"))
+        if include_image_embedding_sequences:
+            image_embedding_sequences.append(record_image_embedding_sequence_tensor(
+                chunk, device="cpu", max_len=sequence_max_len))
+        if include_quality_targets:
+            q_target, q_mask = quality_target_tensor(
+                chunk, cache_quality_stats, device="cpu")
+            quality_targets.append(q_target.cpu())
+            quality_masks.append(q_mask.cpu())
     cache = {
         "backend": "memory",
         "latents": torch.cat(latents, dim=0).contiguous(),
@@ -2299,8 +2985,21 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         "image_embeddings": (
             torch.cat(image_embeddings, dim=0).contiguous() if image_embeddings else None
         ),
+        "image_embedding_sequences": (
+            torch.cat(image_embedding_sequences, dim=0).contiguous()
+            if image_embedding_sequences else None
+        ),
+        "quality_targets": (
+            torch.cat(quality_targets, dim=0).contiguous() if quality_targets else None
+        ),
+        "quality_masks": (
+            torch.cat(quality_masks, dim=0).contiguous() if quality_masks else None
+        ),
         "cond_source": cond_source,
         "has_image_embeddings": bool(image_embeddings),
+        "has_image_embedding_sequences": bool(image_embedding_sequences),
+        "has_quality_targets": bool(quality_targets),
+        "latent_dtype": cache_dtype,
         "records": len(rows),
         "latent_shape": tuple(int(x) for x in latents[0].shape[1:]),
         "bytes": int(sum(z.numel() * z.element_size() for z in latents)),
@@ -2309,6 +3008,8 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         ),
         "weighted": bool(weights is not None),
         "weight_sum": float(np.sum(weights)) if weights is not None else float(len(rows)),
+        "fingerprint": cache_fingerprint,
+        "cache_reused": False,
     }
     if cache["text_embeddings"] is not None:
         cache["text_embedding_shape"] = [
@@ -2324,6 +3025,19 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         cache["bytes"] += int(
             cache["image_embeddings"].numel() * cache["image_embeddings"].element_size()
         )
+    if cache["image_embedding_sequences"] is not None:
+        cache["bytes"] += int(
+            cache["image_embedding_sequences"].numel()
+            * cache["image_embedding_sequences"].element_size()
+        )
+    if cache["quality_targets"] is not None:
+        cache["bytes"] += int(
+            cache["quality_targets"].numel() * cache["quality_targets"].element_size()
+        )
+    if cache["quality_masks"] is not None:
+        cache["bytes"] += int(
+            cache["quality_masks"].numel() * cache["quality_masks"].element_size()
+        )
     return cache
 
 
@@ -2332,10 +3046,15 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
                                   size=32, device=DEV, precision="fp32",
                                   cond_source="tokens", cache_dir="", shard_size=1024,
                                   include_image_embeddings=False, seed=0,
+                                  include_image_embedding_sequences=False,
+                                  include_quality_targets=False, quality_stats=None,
                                   crop_mode="center", hflip_prob=0.0,
-                                  record_weights=None):
+                                  record_weights=None, cache_dtype="fp32",
+                                  cache_fingerprint=""):
     if not cache_dir:
         raise ValueError("cache_dir is required for disk latent cache")
+    cache_dtype = str(cache_dtype)
+    latent_cache_torch_dtype(cache_dtype)
     shard_size = int(shard_size)
     if shard_size <= 0:
         raise ValueError("flow cache shard size must be positive")
@@ -2348,6 +3067,8 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
     total_bytes = 0
     total_weight = 0.0
     latent_shape = None
+    sequence_max_len = image_embedding_sequence_max_len(rows)
+    cache_quality_stats = quality_stats or quality_score_stats(rows)
     ae.eval()
     crop_rng = np.random.default_rng(seed + 17)
     for shard_i, start in enumerate(range(0, len(rows), shard_size)):
@@ -2367,7 +3088,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
             ], dim=0)
             with amp_autocast(device, precision):
                 z = ae.encode(x)
-            latents.append(z.detach().float().cpu())
+            latents.append(cache_latent_tensor(z, cache_dtype))
         captions = [rec.caption for rec in chunk_rows]
         chunk_weights = weights_for_records(chunk_rows, record_weights)
         chunk_weight_tensor = (
@@ -2377,6 +3098,11 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         chunk_weight_sum = (
             float(np.sum(chunk_weights)) if chunk_weights is not None
             else float(len(chunk_rows))
+        )
+        q_target, q_mask = (
+            quality_target_tensor(
+                chunk_rows, cache_quality_stats, device="cpu")
+            if include_quality_targets else (None, None)
         )
         total_weight += chunk_weight_sum
         shard = {
@@ -2394,8 +3120,18 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
                 record_image_embedding_tensor(chunk_rows, device="cpu")
                 if include_image_embeddings else None
             ),
+            "image_embedding_sequences": (
+                record_image_embedding_sequence_tensor(
+                    chunk_rows, device="cpu", max_len=sequence_max_len)
+                if include_image_embedding_sequences else None
+            ),
+            "quality_targets": q_target.cpu().contiguous() if q_target is not None else None,
+            "quality_masks": q_mask.cpu().contiguous() if q_mask is not None else None,
             "cond_source": cond_source,
             "has_image_embeddings": bool(include_image_embeddings),
+            "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+            "has_quality_targets": bool(include_quality_targets),
+            "latent_dtype": cache_dtype,
             "weights": chunk_weight_tensor,
             "weighted": bool(chunk_weight_tensor is not None),
             "weight_sum": float(chunk_weight_sum),
@@ -2405,6 +3141,10 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         if shard["text_embeddings"] is not None:
             shard["text_embedding_shape"] = [
                 int(x) for x in shard["text_embeddings"].shape
+            ]
+        if shard["image_embedding_sequences"] is not None:
+            shard["image_embedding_sequence_shape"] = [
+                int(x) for x in shard["image_embedding_sequences"].shape
             ]
         if latent_shape is None:
             latent_shape = tuple(int(x) for x in shard["latents"].shape[1:])
@@ -2417,7 +3157,10 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         total_bytes += file_bytes
         shards.append({"path": path, "file": name, "count": int(len(chunk_rows)),
                        "bytes": file_bytes, "weight_sum": float(chunk_weight_sum),
-                       "text_embedding_shape": shard.get("text_embedding_shape", [])})
+                       "latent_dtype": cache_dtype,
+                       "text_embedding_shape": shard.get("text_embedding_shape", []),
+                       "image_embedding_sequence_shape": shard.get(
+                           "image_embedding_sequence_shape", [])})
     meta = {
         "format": "image_latent_cache_v1",
         "backend": "disk",
@@ -2426,6 +3169,9 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         "latent_shape": list(latent_shape or ()),
         "cond_source": cond_source,
         "has_image_embeddings": bool(include_image_embeddings),
+        "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+        "has_quality_targets": bool(include_quality_targets),
+        "latent_dtype": cache_dtype,
         "shard_size": int(shard_size),
         "shards": [
             {
@@ -2433,13 +3179,17 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
                 "count": int(s["count"]),
                 "bytes": int(s["bytes"]),
                 "weight_sum": float(s["weight_sum"]),
+                "latent_dtype": str(s.get("latent_dtype", cache_dtype)),
                 "text_embedding_shape": list(s.get("text_embedding_shape", [])),
+                "image_embedding_sequence_shape": list(s.get(
+                    "image_embedding_sequence_shape", [])),
             }
             for s in shards
         ],
         "bytes": int(total_bytes),
         "weighted": bool(record_weights is not None),
         "weight_sum": float(total_weight),
+        "fingerprint": str(cache_fingerprint or ""),
     }
     meta_path = os.path.join(cache_dir, "meta.json")
     tmp_meta = meta_path + ".tmp"
@@ -2455,16 +3205,52 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         "latent_shape": tuple(int(x) for x in latent_shape),
         "cond_source": cond_source,
         "has_image_embeddings": bool(include_image_embeddings),
+        "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+        "has_quality_targets": bool(include_quality_targets),
+        "latent_dtype": cache_dtype,
         "shard_size": int(shard_size),
         "shards": shards,
         "bytes": int(total_bytes),
         "weighted": bool(record_weights is not None),
         "weight_sum": float(total_weight),
+        "fingerprint": str(cache_fingerprint or ""),
+        "cache_reused": False,
     }
 
 
 def latent_cache_backend(cache):
     return str((cache or {}).get("backend", "memory" if cache is not None else ""))
+
+
+def latent_cache_dtype_name(cache):
+    if cache is None:
+        return ""
+    dtype = str(cache.get("latent_dtype", "") or "")
+    if dtype:
+        return dtype
+    backend = latent_cache_backend(cache)
+    if backend in ("bucketed_memory", "bucketed_disk"):
+        buckets = list(cache.get("buckets", []))
+        dtypes = {
+            latent_cache_dtype_name(bucket.get("cache"))
+            for bucket in buckets
+            if latent_cache_dtype_name(bucket.get("cache"))
+        }
+        if len(dtypes) == 1:
+            return next(iter(dtypes))
+        if dtypes:
+            return "mixed"
+    if backend == "disk":
+        dtypes = {str(s.get("latent_dtype", "") or "") for s in cache.get("shards", [])}
+        dtypes.discard("")
+        if len(dtypes) == 1:
+            return next(iter(dtypes))
+        if dtypes:
+            return "mixed"
+    tensor = cache.get("latents") if isinstance(cache, dict) else None
+    if torch.is_tensor(tensor):
+        return str(tensor.dtype).replace("torch.", "")
+    return ""
 
 
 def latent_cache_text_embedding_shapes(cache):
@@ -2511,6 +3297,47 @@ def latent_cache_text_embedding_report(cache):
     }
 
 
+def latent_cache_image_embedding_sequence_shapes(cache):
+    if cache is None:
+        return []
+    backend = latent_cache_backend(cache)
+    if backend in ("bucketed_memory", "bucketed_disk"):
+        shapes = []
+        for bucket in cache.get("buckets", []):
+            shapes.extend(latent_cache_image_embedding_sequence_shapes(bucket.get("cache")))
+        return shapes
+    if backend == "disk":
+        return [
+            [int(x) for x in shard.get("image_embedding_sequence_shape", [])]
+            for shard in cache.get("shards", [])
+            if shard.get("image_embedding_sequence_shape")
+        ]
+    tensor = cache.get("image_embedding_sequences")
+    if torch.is_tensor(tensor):
+        return [[int(x) for x in tensor.shape]]
+    return []
+
+
+def latent_cache_image_embedding_sequence_report(cache):
+    shapes = latent_cache_image_embedding_sequence_shapes(cache)
+    if not shapes:
+        return {
+            "flow_cache_image_embedding_sequence_ndim": 0,
+            "flow_cache_image_embedding_sequence_dim": 0,
+            "flow_cache_image_embedding_sequence_len": 0,
+            "flow_cache_image_embedding_sequence_shapes": [],
+        }
+    ndim = max(len(shape) for shape in shapes)
+    dim = max(int(shape[-1]) for shape in shapes if shape)
+    seq_len = max(int(shape[1]) if len(shape) == 3 else 1 for shape in shapes)
+    return {
+        "flow_cache_image_embedding_sequence_ndim": int(ndim),
+        "flow_cache_image_embedding_sequence_dim": int(dim),
+        "flow_cache_image_embedding_sequence_len": int(seq_len),
+        "flow_cache_image_embedding_sequence_shapes": shapes,
+    }
+
+
 def _latent_cache_shard_offsets(cache):
     offsets, pos = [], 0
     for shard in cache.get("shards", []):
@@ -2519,16 +3346,92 @@ def _latent_cache_shard_offsets(cache):
     return offsets
 
 
-def _load_latent_cache_shard(shard):
-    return torch.load(shard["path"], map_location="cpu")
+def configure_latent_cache_runtime(cache, max_loaded_shards=0):
+    if cache is None:
+        return cache
+    max_loaded_shards = int(max_loaded_shards)
+    if max_loaded_shards < 0:
+        raise ValueError("max_loaded_shards must be non-negative")
+    backend = latent_cache_backend(cache)
+    cache["max_loaded_shards"] = max_loaded_shards
+    cache["_shard_cache_hits"] = 0
+    cache["_shard_cache_misses"] = 0
+    cache["_shard_cache_loads"] = 0
+    if backend == "disk" and max_loaded_shards > 0:
+        cache["_loaded_shards"] = OrderedDict()
+    elif "_loaded_shards" in cache:
+        cache.pop("_loaded_shards", None)
+    if backend in ("bucketed_memory", "bucketed_disk"):
+        for bucket in cache.get("buckets", []):
+            configure_latent_cache_runtime(bucket.get("cache"), max_loaded_shards)
+    return cache
 
 
-def _latent_cache_payload(source, ids=None, embeddings=None, image_embeddings=None):
+def latent_cache_runtime_report(cache):
+    if cache is None:
+        return {
+            "flow_cache_max_loaded_shards": 0,
+            "flow_cache_loaded_shards": 0,
+            "flow_cache_shard_loads": 0,
+            "flow_cache_shard_cache_hits": 0,
+            "flow_cache_shard_cache_misses": 0,
+        }
+    backend = latent_cache_backend(cache)
+    if backend in ("bucketed_memory", "bucketed_disk"):
+        rows = [latent_cache_runtime_report(bucket.get("cache"))
+                for bucket in cache.get("buckets", [])]
+        return {
+            "flow_cache_max_loaded_shards": int(cache.get("max_loaded_shards", 0)),
+            "flow_cache_loaded_shards": int(sum(r["flow_cache_loaded_shards"] for r in rows)),
+            "flow_cache_shard_loads": int(sum(r["flow_cache_shard_loads"] for r in rows)),
+            "flow_cache_shard_cache_hits": int(sum(
+                r["flow_cache_shard_cache_hits"] for r in rows)),
+            "flow_cache_shard_cache_misses": int(sum(
+                r["flow_cache_shard_cache_misses"] for r in rows)),
+        }
+    return {
+        "flow_cache_max_loaded_shards": int(cache.get("max_loaded_shards", 0)),
+        "flow_cache_loaded_shards": int(len(cache.get("_loaded_shards", {}))),
+        "flow_cache_shard_loads": int(cache.get("_shard_cache_loads", 0)),
+        "flow_cache_shard_cache_hits": int(cache.get("_shard_cache_hits", 0)),
+        "flow_cache_shard_cache_misses": int(cache.get("_shard_cache_misses", 0)),
+    }
+
+
+def _load_latent_cache_shard(shard, cache=None):
+    if cache is None:
+        return torch.load(shard["path"], map_location="cpu")
+    max_loaded = int(cache.get("max_loaded_shards", 0) or 0)
+    path = shard["path"]
+    if max_loaded <= 0:
+        cache["_shard_cache_misses"] = int(cache.get("_shard_cache_misses", 0)) + 1
+        cache["_shard_cache_loads"] = int(cache.get("_shard_cache_loads", 0)) + 1
+        return torch.load(path, map_location="cpu")
+    loaded = cache.setdefault("_loaded_shards", OrderedDict())
+    if path in loaded:
+        shard_payload = loaded.pop(path)
+        loaded[path] = shard_payload
+        cache["_shard_cache_hits"] = int(cache.get("_shard_cache_hits", 0)) + 1
+        return shard_payload
+    cache["_shard_cache_misses"] = int(cache.get("_shard_cache_misses", 0)) + 1
+    cache["_shard_cache_loads"] = int(cache.get("_shard_cache_loads", 0)) + 1
+    shard_payload = torch.load(path, map_location="cpu")
+    loaded[path] = shard_payload
+    while len(loaded) > max_loaded:
+        loaded.popitem(last=False)
+    return shard_payload
+
+def _latent_cache_payload(source, ids=None, embeddings=None, image_embeddings=None,
+                          image_embedding_sequences=None, quality_targets=None,
+                          quality_masks=None):
     return {
         "cond_source": source,
         "caption_ids": ids,
         "text_embeddings": embeddings,
         "image_embeddings": image_embeddings,
+        "image_embedding_sequences": image_embedding_sequences,
+        "quality_targets": quality_targets,
+        "quality_masks": quality_masks,
     }
 
 
@@ -2560,7 +3463,7 @@ def sample_latent_cache(cache, rng, batch, device=DEV):
         ], dtype=np.float64)
         probs = normalized_sampling_weights(shard_weights, len(shards))
         shard_i = int(rng.choice(len(shards), p=probs))
-        shard = _load_latent_cache_shard(shards[shard_i])
+        shard = _load_latent_cache_shard(shards[shard_i], cache=cache)
         n = int(shard["latents"].shape[0])
         shard_probs = normalized_sampling_weights(
             shard.get("weights"), n) if shard.get("weights") is not None else None
@@ -2569,17 +3472,30 @@ def sample_latent_cache(cache, rng, batch, device=DEV):
         else:
             idx_np = rng.choice(n, size=int(batch), replace=True, p=shard_probs)
         idx = torch.tensor(idx_np, dtype=torch.long)
-        z1 = shard["latents"][idx].to(device=device)
+        z1 = shard["latents"][idx].to(device=device, dtype=torch.float32)
         image_embs = (
             shard["image_embeddings"][idx] if shard.get("image_embeddings") is not None else None
+        )
+        image_seq = (
+            shard["image_embedding_sequences"][idx]
+            if shard.get("image_embedding_sequences") is not None else None
+        )
+        quality_targets = (
+            shard["quality_targets"][idx] if shard.get("quality_targets") is not None else None
+        )
+        quality_masks = (
+            shard["quality_masks"][idx] if shard.get("quality_masks") is not None else None
         )
         if cache["cond_source"] == "embedding":
             payload = _latent_cache_payload(
                 "embedding", embeddings=shard["text_embeddings"][idx],
-                image_embeddings=image_embs)
+                image_embeddings=image_embs, image_embedding_sequences=image_seq,
+                quality_targets=quality_targets, quality_masks=quality_masks)
         else:
             payload = _latent_cache_payload(
-                "tokens", ids=shard["caption_ids"][idx], image_embeddings=image_embs)
+                "tokens", ids=shard["caption_ids"][idx], image_embeddings=image_embs,
+                image_embedding_sequences=image_seq,
+                quality_targets=quality_targets, quality_masks=quality_masks)
         return z1, payload
     cache_probs = normalized_sampling_weights(
         cache.get("weights"), int(cache["records"])) if cache.get("weights") is not None else None
@@ -2588,17 +3504,30 @@ def sample_latent_cache(cache, rng, batch, device=DEV):
     else:
         idx_np = rng.choice(int(cache["records"]), size=int(batch), replace=True, p=cache_probs)
     idx = torch.tensor(idx_np, dtype=torch.long)
-    z1 = cache["latents"][idx].to(device=device)
+    z1 = cache["latents"][idx].to(device=device, dtype=torch.float32)
     image_embs = (
         cache["image_embeddings"][idx] if cache.get("image_embeddings") is not None else None
+    )
+    image_seq = (
+        cache["image_embedding_sequences"][idx]
+        if cache.get("image_embedding_sequences") is not None else None
+    )
+    quality_targets = (
+        cache["quality_targets"][idx] if cache.get("quality_targets") is not None else None
+    )
+    quality_masks = (
+        cache["quality_masks"][idx] if cache.get("quality_masks") is not None else None
     )
     if cache["cond_source"] == "embedding":
         payload = _latent_cache_payload(
             "embedding", embeddings=cache["text_embeddings"][idx],
-            image_embeddings=image_embs)
+            image_embeddings=image_embs, image_embedding_sequences=image_seq,
+            quality_targets=quality_targets, quality_masks=quality_masks)
     else:
         payload = _latent_cache_payload(
-            "tokens", ids=cache["caption_ids"][idx], image_embeddings=image_embs)
+            "tokens", ids=cache["caption_ids"][idx], image_embeddings=image_embs,
+            image_embedding_sequences=image_seq,
+            quality_targets=quality_targets, quality_masks=quality_masks)
     return z1, payload
 
 
@@ -2716,6 +3645,7 @@ def resolve_latent_normalize(mode, image_records=None, ae_arch="semantic"):
 
 AE_RECON_LOSSES = ("mse", "l1", "hybrid")
 TRAIN_PRECISIONS = ("fp32", "bf16", "fp16")
+LATENT_CACHE_DTYPES = ("fp32", "bf16", "fp16")
 
 
 def _device_type(device):
@@ -2750,6 +3680,21 @@ def amp_grad_scaler(device, precision):
     return torch.amp.GradScaler("cuda", enabled=bool(cfg["enabled"] and precision == "fp16"))
 
 
+def latent_cache_torch_dtype(dtype):
+    dtype = str(dtype)
+    if dtype not in LATENT_CACHE_DTYPES:
+        raise ValueError(f"unknown latent cache dtype {dtype!r}")
+    return {
+        "fp32": torch.float32,
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+    }[dtype]
+
+
+def cache_latent_tensor(z, dtype="fp32"):
+    return z.detach().to(dtype=latent_cache_torch_dtype(dtype), device="cpu")
+
+
 def image_gradient_loss(pred, target):
     dx_pred = pred[..., :, 1:] - pred[..., :, :-1]
     dx_target = target[..., :, 1:] - target[..., :, :-1]
@@ -2770,8 +3715,23 @@ def multiscale_recon_loss(pred, target, levels=3):
     return torch.stack(losses).mean()
 
 
+def frequency_recon_loss(pred, target, eps=1.0e-8):
+    pred_f = pred.float()
+    target_f = target.float()
+    pred_fft = torch.fft.rfft2(pred_f, dim=(-2, -1), norm="ortho")
+    target_fft = torch.fft.rfft2(target_f, dim=(-2, -1), norm="ortho")
+    pred_mag = torch.log1p(pred_fft.abs().clamp_min(float(eps)))
+    target_mag = torch.log1p(target_fft.abs().clamp_min(float(eps)))
+    h, w = pred_f.shape[-2:]
+    fy = torch.fft.fftfreq(int(h), device=pred_f.device, dtype=pred_f.dtype).abs()
+    fx = torch.fft.rfftfreq(int(w), device=pred_f.device, dtype=pred_f.dtype).abs()
+    radius = torch.sqrt(fy[:, None].pow(2) + fx[None, :].pow(2))
+    weight = 1.0 + radius / radius.max().clamp_min(float(eps))
+    return (pred_mag - target_mag).abs().mul(weight[None, None]).mean()
+
+
 def reconstruction_loss_parts(pred, target, mode="mse", grad_w=0.0, ms_w=0.0,
-                              latent=None, latent_reg_w=0.0):
+                              fft_w=0.0, latent=None, latent_reg_w=0.0):
     if mode not in AE_RECON_LOSSES:
         raise ValueError(f"unknown AE reconstruction loss {mode!r}")
     mse = F.mse_loss(pred, target)
@@ -2796,6 +3756,10 @@ def reconstruction_loss_parts(pred, target, mode="mse", grad_w=0.0, ms_w=0.0,
         ms = multiscale_recon_loss(pred, target)
         loss = loss + float(ms_w) * ms
         parts["recon_multiscale_l1"] = ms.detach()
+    if fft_w > 0.0:
+        fft = frequency_recon_loss(pred, target)
+        loss = loss + float(fft_w) * fft
+        parts["recon_fft_l1"] = fft.detach()
     if latent is not None and latent_reg_w > 0.0:
         lat = latent.float().pow(2).mean()
         loss = loss + float(latent_reg_w) * lat
@@ -2804,10 +3768,10 @@ def reconstruction_loss_parts(pred, target, mode="mse", grad_w=0.0, ms_w=0.0,
 
 
 def autoencoder_loss(out, x, yc, ys, fact_w=0.25, recon_loss="mse", grad_w=0.0,
-                     ms_w=0.0, latent_reg_w=0.0):
+                     ms_w=0.0, fft_w=0.0, latent_reg_w=0.0):
     recon, parts = reconstruction_loss_parts(
         out["recon"], x, mode=recon_loss, grad_w=grad_w, ms_w=ms_w,
-        latent=out.get("latent"), latent_reg_w=latent_reg_w)
+        fft_w=fft_w, latent=out.get("latent"), latent_reg_w=latent_reg_w)
     facts = F.cross_entropy(out["color"], yc) + F.cross_entropy(out["shape"], ys)
     parts["fact_ce"] = facts.detach()
     return recon + fact_w * facts, parts
@@ -2823,6 +3787,14 @@ def flow_hidden_feature_dim(flow):
 
 def condition_vector(cond):
     return cond["vec"] if isinstance(cond, dict) else cond
+
+
+def conditioner_has_learned_null(conditioner):
+    return bool(conditioner is not None and hasattr(conditioner, "null_vec"))
+
+
+def text_condition_return_tokens(conditioner, return_tokens=False):
+    return bool(return_tokens or conditioner_has_learned_null(conditioner))
 
 
 def image_text_alignment_loss(aligner, z, cond, prefix="caption_align", mask=None):
@@ -3112,6 +4084,135 @@ def flow_hidden_feature_alignment_loss(aligner, hidden_tokens, features, prefix=
     }
 
 
+def flow_hidden_feature_token_alignment_loss(aligner, hidden_tokens, feature_tokens,
+                                             prefix="flow_repa_token"):
+    if aligner is None:
+        zero = hidden_tokens.sum() * 0.0
+        return zero, {}
+    feature_tokens = feature_tokens.to(device=hidden_tokens.device)
+    hidden_emb = aligner.encode_hidden_tokens(hidden_tokens)
+    feat_emb = aligner.encode_feature_tokens(feature_tokens)
+    valid = feature_tokens.float().abs().sum(dim=-1).gt(0)
+    bsz, hidden_n, _dim = hidden_emb.shape
+    feat_n = int(feat_emb.shape[1])
+    if int(valid.sum()) <= 0 or hidden_n <= 0 or feat_n <= 0:
+        zero = hidden_tokens.sum() * 0.0 + feature_tokens.sum() * 0.0
+        return zero, {
+            f"{prefix}_loss": zero.detach(),
+            f"{prefix}_h2f_cos": zero.detach(),
+            f"{prefix}_f2h_cos": zero.detach(),
+            f"{prefix}_n": torch.tensor(0.0, device=hidden_tokens.device),
+        }
+    sim = torch.bmm(hidden_emb, feat_emb.transpose(1, 2))
+    masked_sim = sim.masked_fill(~valid[:, None, :], -float("inf"))
+    h2f = masked_sim.max(dim=2).values
+    f2h = sim.max(dim=1).values
+    f2h = f2h.masked_fill(~valid, 0.0)
+    valid_count = valid.sum().clamp_min(1).to(f2h.dtype)
+    h2f_mean = h2f[torch.isfinite(h2f)].mean()
+    f2h_mean = f2h.sum() / valid_count
+    match_loss = 0.5 * ((1.0 - h2f_mean) + (1.0 - f2h_mean))
+    return match_loss, {
+        f"{prefix}_loss": match_loss.detach(),
+        f"{prefix}_h2f_cos": h2f_mean.detach(),
+        f"{prefix}_f2h_cos": f2h_mean.detach(),
+        f"{prefix}_n": torch.tensor(float(bsz), device=hidden_tokens.device),
+        f"{prefix}_hidden_tokens": torch.tensor(float(hidden_n), device=hidden_tokens.device),
+        f"{prefix}_feature_tokens": valid.float().sum(dim=1).mean().detach(),
+    }
+
+
+def flow_hidden_latent_alignment_loss(aligner, hidden_tokens, clean_latent,
+                                      prefix="flow_self_repa", mask=None):
+    if aligner is None:
+        zero = hidden_tokens.sum() * 0.0
+        return zero, {}
+    clean_latent = clean_latent.to(device=hidden_tokens.device)
+    hidden_emb, latent_emb = aligner(hidden_tokens, clean_latent)
+    if mask is not None:
+        mask = mask.to(device=hidden_emb.device, dtype=torch.bool).flatten()
+        hidden_emb = hidden_emb[mask]
+        latent_emb = latent_emb[mask]
+    n = int(hidden_emb.shape[0])
+    if n <= 0:
+        zero = hidden_tokens.sum() * 0.0 + clean_latent.sum() * 0.0
+        return zero, {
+            f"{prefix}_loss": zero.detach(),
+            f"{prefix}_h2z_cos": zero.detach(),
+            f"{prefix}_n": torch.tensor(0.0, device=hidden_tokens.device),
+        }
+    cos = (hidden_emb * latent_emb.detach()).sum(dim=-1)
+    loss = (1.0 - cos).mean()
+    return loss, {
+        f"{prefix}_loss": loss.detach(),
+        f"{prefix}_h2z_cos": cos.mean().detach(),
+        f"{prefix}_n": torch.tensor(float(n), device=hidden_tokens.device),
+    }
+
+
+def flow_hidden_latent_token_alignment_loss(aligner, hidden_tokens, clean_latent,
+                                            prefix="flow_self_repa_token"):
+    if aligner is None:
+        zero = hidden_tokens.sum() * 0.0
+        return zero, {}
+    clean_latent = clean_latent.to(device=hidden_tokens.device)
+    hidden_emb = aligner.encode_hidden_tokens(hidden_tokens)
+    latent_emb = aligner.encode_latent_tokens(clean_latent).detach()
+    if hidden_emb.shape[:2] != latent_emb.shape[:2]:
+        raise ValueError(
+            f"self-REPA token counts differ: hidden={tuple(hidden_emb.shape)} "
+            f"latent={tuple(latent_emb.shape)}"
+        )
+    if int(hidden_emb.shape[1]) <= 0:
+        zero = hidden_tokens.sum() * 0.0 + clean_latent.sum() * 0.0
+        return zero, {
+            f"{prefix}_loss": zero.detach(),
+            f"{prefix}_h2z_cos": zero.detach(),
+            f"{prefix}_n": torch.tensor(0.0, device=hidden_tokens.device),
+        }
+    cos = (hidden_emb * latent_emb).sum(dim=-1)
+    loss = (1.0 - cos).mean()
+    return loss, {
+        f"{prefix}_loss": loss.detach(),
+        f"{prefix}_h2z_cos": cos.mean().detach(),
+        f"{prefix}_n": torch.tensor(float(cos.numel()), device=hidden_tokens.device),
+        f"{prefix}_tokens": torch.tensor(float(hidden_emb.shape[1]),
+                                         device=hidden_tokens.device),
+    }
+
+
+def flow_hidden_self_representation_alignment_loss(hidden_tokens, target_tokens,
+                                                   prefix="flow_sra",
+                                                   pooled=False):
+    if hidden_tokens.ndim != 3 or target_tokens.ndim != 3:
+        raise ValueError(
+            f"expected self-representation tokens as B,N,H, got "
+            f"{tuple(hidden_tokens.shape)} and {tuple(target_tokens.shape)}")
+    if hidden_tokens.shape != target_tokens.shape:
+        raise ValueError(
+            f"self-representation token shapes differ: hidden={tuple(hidden_tokens.shape)} "
+            f"target={tuple(target_tokens.shape)}")
+    if pooled:
+        hidden_emb = hidden_tokens.float().mean(dim=1)
+        target_emb = target_tokens.float().mean(dim=1)
+    else:
+        hidden_emb = hidden_tokens.float()
+        target_emb = target_tokens.float()
+    hidden_emb = F.normalize(hidden_emb, dim=-1)
+    target_emb = F.normalize(target_emb.detach(), dim=-1)
+    cos = (hidden_emb * target_emb).sum(dim=-1)
+    loss = (1.0 - cos).mean()
+    parts = {
+        f"{prefix}_loss": loss.detach(),
+        f"{prefix}_h2t_cos": cos.mean().detach(),
+        f"{prefix}_n": torch.tensor(float(cos.numel()), device=hidden_tokens.device),
+    }
+    if not pooled:
+        parts[f"{prefix}_tokens"] = torch.tensor(
+            float(hidden_tokens.shape[1]), device=hidden_tokens.device)
+    return loss, parts
+
+
 def condition_batch(cond):
     return int(condition_vector(cond).shape[0])
 
@@ -3132,6 +4233,81 @@ def zero_condition(cond):
     return out
 
 
+def null_condition(cond):
+    """Return a trained unconditional condition when present, otherwise zeros."""
+    if not isinstance(cond, dict) or "null_vec" not in cond:
+        return zero_condition(cond)
+    out = dict(cond)
+    out["vec"] = cond["null_vec"].to(device=cond["vec"].device, dtype=cond["vec"].dtype)
+    if "tokens" in cond:
+        if "null_tokens" in cond:
+            out["tokens"] = cond["null_tokens"].to(
+                device=cond["tokens"].device, dtype=cond["tokens"].dtype)
+        else:
+            out["tokens"] = torch.zeros_like(cond["tokens"])
+    if "mask" in cond:
+        if "null_mask" in cond:
+            out["mask"] = cond["null_mask"].to(device=cond["mask"].device, dtype=torch.bool)
+        else:
+            out["mask"] = torch.zeros_like(cond["mask"], dtype=torch.bool)
+    return out
+
+
+def condition_has_null(cond):
+    return isinstance(cond, dict) and "null_vec" in cond
+
+
+def _pad_condition_values_for_concat(key, values):
+    if not values:
+        return values
+    if key in ("tokens", "null_tokens") and values[0].ndim == 3:
+        max_len = max(int(val.shape[1]) for val in values)
+        out = []
+        for val in values:
+            pad = max_len - int(val.shape[1])
+            if pad > 0:
+                val = F.pad(val, (0, 0, 0, pad), value=0.0)
+            out.append(val)
+        return out
+    if key in ("mask", "null_mask") and values[0].ndim == 2:
+        max_len = max(int(val.shape[1]) for val in values)
+        out = []
+        for val in values:
+            pad = max_len - int(val.shape[1])
+            if pad > 0:
+                val = F.pad(val, (0, pad), value=True)
+            out.append(val)
+        return out
+    return values
+
+
+def concat_conditions(*conds):
+    if not conds:
+        raise ValueError("concat_conditions requires at least one condition")
+    if not isinstance(conds[0], dict):
+        if any(isinstance(cond, dict) for cond in conds):
+            raise ValueError("cannot concatenate mixed tensor/dict conditions")
+        return torch.cat(conds, dim=0)
+    if any(not isinstance(cond, dict) for cond in conds):
+        raise ValueError("cannot concatenate mixed tensor/dict conditions")
+    first_batch = condition_batch(conds[0])
+    out = dict(conds[0])
+    for key, first in conds[0].items():
+        if not torch.is_tensor(first) or int(first.shape[0]) != first_batch:
+            continue
+        values = []
+        for cond in conds:
+            if key not in cond:
+                raise ValueError(f"condition is missing batched field {key!r}")
+            val = cond[key]
+            if not torch.is_tensor(val):
+                raise ValueError(f"condition field {key!r} is not a tensor")
+            values.append(val)
+        values = _pad_condition_values_for_concat(key, values)
+        out[key] = torch.cat(values, dim=0)
+    return out
+
+
 def repeat_condition_rows(cond, repeats):
     repeats = int(repeats)
     if cond is None:
@@ -3149,19 +4325,37 @@ def repeat_condition_rows(cond, repeats):
 
 
 def condition_dropout(cond, p=0.0):
-    """Classifier-free condition dropout: zero whole condition rows during training."""
+    """Classifier-free condition dropout over whole condition rows during training."""
     if p <= 0.0:
         return cond
     vec = condition_vector(cond)
     if p >= 1.0:
-        return zero_condition(cond)
-    keep = (torch.rand(vec.shape[0], 1, device=vec.device) >= p).to(vec.dtype)
+        out = null_condition(cond)
+        if isinstance(out, dict):
+            out["drop_mask"] = torch.ones(
+                vec.shape[0], dtype=torch.bool, device=vec.device)
+        return out
+    drop = torch.rand(vec.shape[0], device=vec.device) < float(p)
+    keep = (~drop).to(vec.dtype)[:, None]
     if not isinstance(cond, dict):
         return cond * keep
+    null = null_condition(cond)
     out = dict(cond)
-    out["vec"] = cond["vec"] * keep
-    out["tokens"] = cond["tokens"] * keep[:, None, :]
+    out["vec"] = torch.where(drop[:, None], null["vec"], cond["vec"])
+    out["tokens"] = torch.where(drop[:, None, None], null["tokens"], cond["tokens"])
+    if "mask" in cond:
+        out["mask"] = torch.where(drop[:, None], null.get("mask", cond["mask"]), cond["mask"])
+    out["drop_mask"] = drop
     return out
+
+
+def condition_active_mask(cond, keepdim=False):
+    vec = condition_vector(cond)
+    if isinstance(cond, dict) and "drop_mask" in cond:
+        active = ~cond["drop_mask"].to(device=vec.device, dtype=torch.bool).flatten()
+    else:
+        active = vec.detach().abs().sum(dim=1).gt(0)
+    return active[:, None] if keepdim else active
 
 
 def semantic_guidance_step(ae, z, fact_cond, weight=0.0, step_size=1.0, mode="decoded",
@@ -3516,20 +4710,117 @@ def latent_factor_orthogonality_loss(z, cond, eps=1.0e-6):
     }
 
 
+def couple_flow_noise_to_data(x0, z1, mode="random", projections=1, eps=1.0e-8):
+    mode = str(mode)
+    if mode not in FLOW_NOISE_COUPLINGS:
+        raise ValueError(f"unknown flow noise coupling {mode!r}")
+    projections = int(projections)
+    if projections <= 0:
+        raise ValueError("flow noise coupling projections must be positive")
+    before = (x0.float() - z1.float()).pow(2).flatten(1).mean(dim=1).mean()
+    if mode == "random" or int(x0.shape[0]) <= 1:
+        return x0, {
+            "flow_noise_pair_mse_before": before.detach(),
+            "flow_noise_pair_mse_after": before.detach(),
+            "flow_noise_pair_mse_delta": torch.zeros((), device=x0.device),
+            "flow_noise_coupling_active": torch.tensor(0.0, device=x0.device),
+            "flow_noise_coupling_accepted": torch.tensor(0.0, device=x0.device),
+            "flow_noise_coupling_projections": torch.tensor(0.0, device=x0.device),
+            "flow_noise_coupling_selected_projection": torch.tensor(-1.0, device=x0.device),
+        }
+    flat_noise = x0.float().flatten(1)
+    flat_data = z1.float().flatten(1)
+    best_matched = None
+    best_after = None
+    best_i = 0
+    for proj_i in range(projections):
+        direction = torch.randn(flat_noise.shape[1], device=x0.device, dtype=torch.float32)
+        direction = direction / direction.norm().clamp_min(float(eps))
+        noise_order = torch.argsort(flat_noise.matmul(direction), dim=0)
+        data_order = torch.argsort(flat_data.matmul(direction), dim=0)
+        matched = torch.empty_like(x0)
+        matched[data_order] = x0[noise_order]
+        after_i = (matched.float() - z1.float()).pow(2).flatten(1).mean(dim=1).mean()
+        if best_after is None or bool(after_i < best_after):
+            best_matched = matched
+            best_after = after_i
+            best_i = int(proj_i)
+    if bool(best_after >= before):
+        return x0, {
+            "flow_noise_pair_mse_before": before.detach(),
+            "flow_noise_pair_mse_after": before.detach(),
+            "flow_noise_pair_mse_delta": torch.zeros((), device=x0.device),
+            "flow_noise_coupling_active": torch.tensor(1.0, device=x0.device),
+            "flow_noise_coupling_accepted": torch.tensor(0.0, device=x0.device),
+            "flow_noise_coupling_projections": torch.tensor(float(projections), device=x0.device),
+            "flow_noise_coupling_selected_projection": torch.tensor(float(best_i), device=x0.device),
+        }
+    after = best_after
+    return best_matched, {
+        "flow_noise_pair_mse_before": before.detach(),
+        "flow_noise_pair_mse_after": after.detach(),
+        "flow_noise_pair_mse_delta": (before - after).detach(),
+        "flow_noise_coupling_active": torch.tensor(1.0, device=x0.device),
+        "flow_noise_coupling_accepted": torch.tensor(1.0, device=x0.device),
+        "flow_noise_coupling_projections": torch.tensor(float(projections), device=x0.device),
+        "flow_noise_coupling_selected_projection": torch.tensor(float(best_i), device=x0.device),
+    }
+
+
+def effective_flow_repa_mode(mode, image_feature_tokens=None):
+    mode = str(mode or "pooled")
+    if mode not in FLOW_REPA_MODES:
+        raise ValueError(f"unknown flow_repa_mode {mode!r}")
+    if mode == "auto":
+        return "both" if image_feature_tokens is not None else "pooled"
+    return mode
+
+
+def effective_flow_self_repa_mode(mode):
+    mode = str(mode or "pooled")
+    if mode not in FLOW_REPA_MODES:
+        raise ValueError(f"unknown flow_self_repa_mode {mode!r}")
+    return "both" if mode == "auto" else mode
+
+
+def effective_flow_sra_mode(mode):
+    mode = str(mode or "token")
+    if mode not in FLOW_REPA_MODES:
+        raise ValueError(f"unknown flow_sra_mode {mode!r}")
+    return "both" if mode == "auto" else mode
+
+
+def flow_repa_mode_id(mode):
+    return float(FLOW_REPA_MODES.index(str(mode)) if str(mode) in FLOW_REPA_MODES else -1)
+
+
 def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
                        semantic_cond=None, time_sampling="uniform", time_logit_mean=0.0,
                        time_logit_std=1.0, time_shift=1.0,
                        latent_stats=None, consistency_w=0.0,
+                       endpoint_w=0.0,
+                       flow_noise_coupling="random", flow_noise_coupling_projections=1,
                        flow_loss_weight="none", flow_loss_weight_gamma=5.0,
                        flow_loss_weight_normalize=True,
                        text_aligner=None, text_align_w=0.0,
                        feature_aligner=None, image_features=None, feature_align_w=0.0,
-                       repa_aligner=None, repa_w=0.0,
+                       repa_aligner=None, repa_w=0.0, image_feature_tokens=None,
+                       repa_mode="pooled",
+                       self_repa_aligner=None, self_repa_w=0.0,
+                       self_repa_mode="pooled",
+                       sra_w=0.0, sra_time_gap=0.25, sra_mode="token",
                        quality_scorer=None, quality_records=None, quality_stats=None,
-                       quality_w=0.0):
+                       quality_targets=None, quality_masks=None,
+                       quality_w=0.0, quality_rank_w=0.0, quality_rank_margin=0.0):
     latent_stats = flow_latent_stats(flow) if latent_stats is None else latent_stats
+    endpoint_w = float(endpoint_w)
+    if endpoint_w < 0.0:
+        raise ValueError("endpoint_w must be non-negative")
     z1_model = normalize_latent(z1, latent_stats)
     x0 = torch.randn_like(z1_model)
+    x0, coupling_parts = couple_flow_noise_to_data(
+        x0, z1_model, mode=flow_noise_coupling,
+        projections=flow_noise_coupling_projections)
     t = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                           logit_mean=time_logit_mean, logit_std=time_logit_std,
                           time_shift=time_shift)
@@ -3537,25 +4828,36 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
     target = z1_model - x0
     cond_model = condition_dropout(cond, cond_drop)
     flow_features = None
-    if repa_aligner is not None and repa_w > 0.0:
+    need_flow_features = (
+        (repa_aligner is not None and repa_w > 0.0)
+        or (self_repa_aligner is not None and self_repa_w > 0.0)
+        or sra_w > 0.0
+    )
+    if need_flow_features:
         pred, flow_features = flow(zt, t, cond_model, return_features=True)
     else:
         pred = flow(zt, t, cond_model)
+    per_sample_velocity = (pred - target).float().pow(2).flatten(1).mean(dim=1)
     if flow_loss_weight == "none":
-        velocity = F.mse_loss(pred, target)
-        velocity_unweighted = velocity
         velocity_weights = torch.ones(z1.shape[0], device=z1.device)
     else:
-        per_sample_velocity = (pred - target).float().pow(2).flatten(1).mean(dim=1)
         velocity_weights = flow_loss_time_weights(
             t, mode=flow_loss_weight, gamma=flow_loss_weight_gamma,
             normalize=flow_loss_weight_normalize)
-        velocity_unweighted = per_sample_velocity.mean()
-        velocity = (per_sample_velocity * velocity_weights.to(per_sample_velocity.dtype)).mean()
+    velocity_unweighted = per_sample_velocity.mean()
+    velocity = (per_sample_velocity * velocity_weights.to(per_sample_velocity.dtype)).mean()
+    endpoint_pred = zt + (1.0 - t) * pred
+    per_sample_endpoint = (endpoint_pred - z1_model).float().pow(2).flatten(1).mean(dim=1)
+    endpoint_unweighted = per_sample_endpoint.mean()
+    endpoint_weighted = (
+        per_sample_endpoint * velocity_weights.to(per_sample_endpoint.dtype)).mean()
     total = velocity
     parts = {
         "velocity_mse": velocity.detach(),
         "velocity_mse_unweighted": velocity_unweighted.detach(),
+        "flow_endpoint_target_mse": endpoint_weighted.detach(),
+        "flow_endpoint_target_mse_unweighted": endpoint_unweighted.detach(),
+        "flow_endpoint_w": torch.tensor(float(endpoint_w), device=z1.device),
         "velocity_weight_mean": velocity_weights.detach().mean(),
         "velocity_weight_min": velocity_weights.detach().min(),
         "velocity_weight_max": velocity_weights.detach().max(),
@@ -3564,13 +4866,16 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
         "time_std": t.detach().std(unbiased=False),
         "time_shift": torch.tensor(float(time_shift), device=z1.device),
     }
+    parts.update(coupling_parts)
+    if endpoint_w > 0.0:
+        total = total + float(endpoint_w) * endpoint_weighted
     if consistency_w > 0.0:
         t2 = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                                logit_mean=time_logit_mean, logit_std=time_logit_std,
                                time_shift=time_shift)
         zt2 = (1.0 - t2) * x0 + t2 * z1_model
         pred2 = flow(zt2, t2, cond_model)
-        endpoint1 = zt + (1.0 - t) * pred
+        endpoint1 = endpoint_pred
         endpoint2 = zt2 + (1.0 - t2) * pred2
         consistency = 0.5 * (
             F.mse_loss(endpoint1, endpoint2.detach())
@@ -3580,59 +4885,167 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None, semantic_w=0.0,
         parts["endpoint_consistency_mse"] = consistency.detach()
     z_clean = None
     if ae is not None and semantic_w > 0.0:
-        z_clean = denormalize_latent(zt + (1.0 - t) * pred, latent_stats)
+        z_clean = denormalize_latent(endpoint_pred, latent_stats)
         sem_cond = cond if semantic_cond is None else semantic_cond
-        cond_vec = condition_vector(cond_model)
-        keep = cond_vec.detach().abs().sum(dim=1, keepdim=True).gt(0).to(sem_cond.dtype)
+        keep = condition_active_mask(cond_model, keepdim=True).to(sem_cond.dtype)
         semantic, sem_parts = semantic_endpoint_loss(ae, z_clean, sem_cond * keep)
         total = total + semantic_w * semantic
         parts["semantic_endpoint_ce"] = semantic.detach()
         parts.update(sem_parts)
     if text_aligner is not None and text_align_w > 0.0:
         if z_clean is None:
-            z_clean = denormalize_latent(zt + (1.0 - t) * pred, latent_stats)
-        cond_vec = condition_vector(cond_model)
-        keep = cond_vec.detach().abs().sum(dim=1).gt(0)
+            z_clean = denormalize_latent(endpoint_pred, latent_stats)
+        keep = condition_active_mask(cond_model)
         text_align, text_parts = image_text_alignment_loss(
             text_aligner, z_clean, cond_model, prefix="flow_caption_align", mask=keep)
         total = total + float(text_align_w) * text_align
         parts.update(text_parts)
-    if quality_scorer is not None and quality_w > 0.0:
-        if quality_records is None or quality_stats is None:
-            raise ValueError("flow quality loss requires quality records and stats")
+    if quality_scorer is not None and (quality_w > 0.0 or quality_rank_w > 0.0):
         if z_clean is None:
-            z_clean = denormalize_latent(zt + (1.0 - t) * pred, latent_stats)
-        quality_loss, quality_parts = image_quality_score_loss(
-            quality_scorer, z_clean, quality_records, quality_stats,
-            prefix="flow_quality_score")
-        total = total + float(quality_w) * quality_loss
-        parts.update(quality_parts)
+            z_clean = denormalize_latent(endpoint_pred, latent_stats)
+        if quality_targets is None or quality_masks is None:
+            if quality_records is None or quality_stats is None:
+                raise ValueError("flow quality loss requires quality records/stats or cached targets")
+            quality_targets, quality_masks = quality_target_tensor(
+                quality_records, quality_stats, device=z_clean.device)
+        if quality_w > 0.0:
+            quality_loss, quality_parts = image_quality_score_target_loss(
+                quality_scorer, z_clean, quality_targets, quality_masks,
+                prefix="flow_quality_score")
+            total = total + float(quality_w) * quality_loss
+            parts.update(quality_parts)
+        if quality_rank_w > 0.0:
+            quality_rank, quality_rank_parts = image_quality_rank_target_loss(
+                quality_scorer, z_clean, quality_targets, quality_masks,
+                prefix="flow_quality_rank", margin=quality_rank_margin)
+            total = total + float(quality_rank_w) * quality_rank
+            parts.update(quality_rank_parts)
     if feature_aligner is not None and feature_align_w > 0.0:
         if image_features is None:
             raise ValueError("flow feature alignment requires image_features")
         if z_clean is None:
-            z_clean = denormalize_latent(zt + (1.0 - t) * pred, latent_stats)
+            z_clean = denormalize_latent(endpoint_pred, latent_stats)
         feature_align, feature_parts = image_feature_alignment_loss(
             feature_aligner, z_clean, image_features, prefix="flow_image_feature_align")
         total = total + float(feature_align_w) * feature_align
         parts.update(feature_parts)
     if repa_aligner is not None and repa_w > 0.0:
-        if image_features is None:
-            raise ValueError("flow REPA alignment requires image_features")
         if flow_features is None or "image_tokens" not in flow_features:
             raise ValueError("flow REPA alignment requires transformer image-token features")
-        repa_align, repa_parts = flow_hidden_feature_alignment_loss(
-            repa_aligner, flow_features["image_tokens"], image_features, prefix="flow_repa")
+        active_repa_mode = effective_flow_repa_mode(
+            repa_mode, image_feature_tokens=image_feature_tokens)
+        repa_losses = []
+        repa_parts = {}
+        if active_repa_mode in ("pooled", "both"):
+            pooled_features = image_features
+            if pooled_features is None and image_feature_tokens is not None:
+                pooled_features = pool_embedding_sequence(image_feature_tokens)
+            if pooled_features is None:
+                raise ValueError("pooled flow REPA alignment requires image_features")
+            pooled_repa, pooled_parts = flow_hidden_feature_alignment_loss(
+                repa_aligner, flow_features["image_tokens"], pooled_features,
+                prefix="flow_repa")
+            repa_losses.append(pooled_repa)
+            repa_parts.update(pooled_parts)
+        if active_repa_mode in ("token", "both"):
+            if image_feature_tokens is None:
+                raise ValueError("token flow REPA alignment requires image_embedding_sequence rows")
+            token_repa, token_parts = flow_hidden_feature_token_alignment_loss(
+                repa_aligner, flow_features["image_tokens"], image_feature_tokens,
+                prefix="flow_repa_token")
+            repa_losses.append(token_repa)
+            repa_parts.update(token_parts)
+        if not repa_losses:
+            raise ValueError(f"flow REPA mode {active_repa_mode!r} did not select any losses")
+        repa_align = torch.stack(repa_losses).mean()
         total = total + float(repa_w) * repa_align
         parts.update(repa_parts)
+        parts["flow_repa_loss"] = repa_align.detach()
         parts["flow_repa_w"] = torch.tensor(float(repa_w), device=z1.device)
+        parts["flow_repa_mode_id"] = torch.tensor(
+            flow_repa_mode_id(active_repa_mode), device=z1.device)
+        parts["flow_repa_components"] = torch.tensor(float(len(repa_losses)), device=z1.device)
+    if self_repa_aligner is not None and self_repa_w > 0.0:
+        if flow_features is None or "image_tokens" not in flow_features:
+            raise ValueError("flow self-REPA alignment requires transformer image-token features")
+        active_self_repa_mode = effective_flow_self_repa_mode(self_repa_mode)
+        self_repa_losses = []
+        self_repa_parts = {}
+        clean_target = z1_model.detach()
+        if active_self_repa_mode in ("pooled", "both"):
+            pooled_self_repa, pooled_self_parts = flow_hidden_latent_alignment_loss(
+                self_repa_aligner, flow_features["image_tokens"], clean_target,
+                prefix="flow_self_repa")
+            self_repa_losses.append(pooled_self_repa)
+            self_repa_parts.update(pooled_self_parts)
+        if active_self_repa_mode in ("token", "both"):
+            token_self_repa, token_self_parts = flow_hidden_latent_token_alignment_loss(
+                self_repa_aligner, flow_features["image_tokens"], clean_target,
+                prefix="flow_self_repa_token")
+            self_repa_losses.append(token_self_repa)
+            self_repa_parts.update(token_self_parts)
+        if not self_repa_losses:
+            raise ValueError(
+                f"flow self-REPA mode {active_self_repa_mode!r} did not select any losses")
+        self_repa_align = torch.stack(self_repa_losses).mean()
+        total = total + float(self_repa_w) * self_repa_align
+        parts.update(self_repa_parts)
+        parts["flow_self_repa_loss"] = self_repa_align.detach()
+        parts["flow_self_repa_w"] = torch.tensor(float(self_repa_w), device=z1.device)
+        parts["flow_self_repa_mode_id"] = torch.tensor(
+            flow_repa_mode_id(active_self_repa_mode), device=z1.device)
+        parts["flow_self_repa_components"] = torch.tensor(
+            float(len(self_repa_losses)), device=z1.device)
+    if sra_w > 0.0:
+        if flow_features is None or "image_tokens" not in flow_features:
+            raise ValueError("flow SRA alignment requires transformer image-token features")
+        gap = float(sra_time_gap)
+        if gap <= 0.0 or gap > 1.0:
+            raise ValueError("flow_sra_time_gap must be in (0, 1]")
+        active_sra_mode = effective_flow_sra_mode(sra_mode)
+        t_teacher = t + gap * (1.0 - t)
+        zt_teacher = (1.0 - t_teacher) * x0 + t_teacher * z1_model
+        with torch.no_grad():
+            _teacher_pred, teacher_features = flow(
+                zt_teacher, t_teacher, cond_model, return_features=True)
+        if teacher_features is None or "image_tokens" not in teacher_features:
+            raise ValueError("flow SRA teacher pass requires transformer image-token features")
+        teacher_tokens = teacher_features["image_tokens"].detach()
+        sra_losses = []
+        sra_parts = {}
+        if active_sra_mode in ("pooled", "both"):
+            pooled_sra, pooled_parts = flow_hidden_self_representation_alignment_loss(
+                flow_features["image_tokens"], teacher_tokens,
+                prefix="flow_sra", pooled=True)
+            sra_losses.append(pooled_sra)
+            sra_parts.update(pooled_parts)
+        if active_sra_mode in ("token", "both"):
+            token_sra, token_parts = flow_hidden_self_representation_alignment_loss(
+                flow_features["image_tokens"], teacher_tokens,
+                prefix="flow_sra_token", pooled=False)
+            sra_losses.append(token_sra)
+            sra_parts.update(token_parts)
+        if not sra_losses:
+            raise ValueError(f"flow SRA mode {active_sra_mode!r} did not select any losses")
+        sra_align = torch.stack(sra_losses).mean()
+        total = total + float(sra_w) * sra_align
+        parts.update(sra_parts)
+        parts["flow_sra_loss"] = sra_align.detach()
+        parts["flow_sra_w"] = torch.tensor(float(sra_w), device=z1.device)
+        parts["flow_sra_mode_id"] = torch.tensor(
+            flow_repa_mode_id(active_sra_mode), device=z1.device)
+        parts["flow_sra_components"] = torch.tensor(float(len(sra_losses)), device=z1.device)
+        parts["flow_sra_time_gap"] = torch.tensor(gap, device=z1.device)
+        parts["flow_sra_teacher_time_mean"] = t_teacher.detach().mean()
     return total, parts
 
 
 def latent_flow_self_distill_losses(flow, teacher_flow, z1, cond, teacher_cond=None,
                                     time_sampling="uniform", time_logit_mean=0.0,
                                     time_logit_std=1.0, time_shift=1.0,
-                                    latent_stats=None, time_gap=0.25):
+                                    latent_stats=None, time_gap=0.25,
+                                    guidance_w=0.0, guidance_cfg_scale=1.0,
+                                    guidance_cfg_rescale=0.0):
     """Distill a frozen same-model teacher into cleaner endpoint predictions.
 
     The student starts from a noisier point on the same rectified-flow path and matches the
@@ -3654,22 +5067,54 @@ def latent_flow_self_distill_losses(flow, teacher_flow, z1, cond, teacher_cond=N
     pred = flow(zt, t, cond)
     endpoint = zt + (1.0 - t) * pred
     with torch.no_grad():
-        teacher_pred = teacher_flow(
-            zt_teacher, t_teacher, cond if teacher_cond is None else teacher_cond)
+        teacher_input = cond if teacher_cond is None else teacher_cond
+        teacher_pred = teacher_flow(zt_teacher, t_teacher, teacher_input)
         teacher_endpoint = zt_teacher + (1.0 - t_teacher) * teacher_pred
     endpoint_loss = F.mse_loss(endpoint, teacher_endpoint.detach())
+    guidance_w = float(guidance_w)
+    if guidance_w < 0.0:
+        raise ValueError("guidance_w must be non-negative")
+    guidance_loss = endpoint_loss * 0.0
+    guidance_teacher_endpoint_mse = endpoint_loss * 0.0
+    if guidance_w > 0.0:
+        with torch.no_grad():
+            teacher_uncond = null_condition(teacher_input)
+            teacher_batch = int(z1.shape[0])
+            t_pair = expand_time_batch(t_teacher, teacher_batch)
+            guided_pair = teacher_flow(
+                torch.cat([zt_teacher, zt_teacher], dim=0),
+                torch.cat([t_pair, t_pair], dim=0),
+                concat_conditions(teacher_uncond, teacher_input),
+            )
+            teacher_uncond_pred, teacher_cond_pred = guided_pair.chunk(2, dim=0)
+            teacher_guided_pred = teacher_uncond_pred + float(guidance_cfg_scale) * (
+                teacher_cond_pred - teacher_uncond_pred)
+            teacher_guided_pred = rescale_guided_velocity(
+                teacher_guided_pred, teacher_cond_pred, cfg_rescale=guidance_cfg_rescale)
+            teacher_guided_endpoint = zt_teacher + (1.0 - t_teacher) * teacher_guided_pred
+        guidance_loss = F.mse_loss(endpoint, teacher_guided_endpoint.detach())
+        guidance_teacher_endpoint_mse = F.mse_loss(
+            teacher_guided_endpoint.detach(), z1_model).detach()
+    total = endpoint_loss + guidance_w * guidance_loss
     parts = {
-        "distill_endpoint_mse": endpoint_loss.detach(),
+        "distill_endpoint_mse": total.detach(),
+        "distill_base_endpoint_mse": endpoint_loss.detach(),
+        "distill_guidance_endpoint_mse": guidance_loss.detach(),
+        "distill_guidance_w": torch.tensor(guidance_w, device=z1.device),
+        "distill_guidance_cfg_scale": torch.tensor(float(guidance_cfg_scale), device=z1.device),
+        "distill_guidance_cfg_rescale": torch.tensor(
+            float(guidance_cfg_rescale), device=z1.device),
         "distill_student_endpoint_mse": F.mse_loss(endpoint.detach(), z1_model).detach(),
         "distill_teacher_endpoint_mse": F.mse_loss(
             teacher_endpoint.detach(), z1_model).detach(),
+        "distill_guidance_teacher_endpoint_mse": guidance_teacher_endpoint_mse,
         "distill_time_mean": t.detach().mean(),
         "distill_teacher_time_mean": t_teacher.detach().mean(),
         "distill_time_gap": (t_teacher - t).detach().mean(),
         "distill_requested_time_gap": torch.tensor(gap, device=z1.device),
         "time_shift": torch.tensor(float(time_shift), device=z1.device),
     }
-    return endpoint_loss, parts
+    return total, parts
 
 
 @torch.no_grad()
@@ -3730,7 +5175,8 @@ def model_condition(specs, fact_cond, cond_mode="facts", conditioner=None, promp
         if conditioner is None or prompt_vocab is None:
             raise ValueError("text conditioning requires conditioner and prompt_vocab")
         ids = prompt_ids(specs, prompt_vocab, rng=rng, templates=prompt_templates, device=device)
-        return conditioner(ids, return_tokens=return_tokens)
+        return conditioner(ids, return_tokens=text_condition_return_tokens(
+            conditioner, return_tokens=return_tokens))
     raise ValueError(f"unknown condition mode {cond_mode!r}")
 
 
@@ -3738,13 +5184,15 @@ def caption_condition(captions, conditioner, vocab, max_len=64, device=DEV, retu
     if conditioner is None or vocab is None:
         raise ValueError("caption conditioning requires conditioner and caption vocab")
     ids = caption_ids(captions, vocab, max_len=max_len, device=device)
-    return conditioner(ids, return_tokens=return_tokens)
+    return conditioner(ids, return_tokens=text_condition_return_tokens(
+        conditioner, return_tokens=return_tokens))
 
 
 def caption_condition_ids(ids, conditioner, device=DEV, return_tokens=False):
     if conditioner is None:
         raise ValueError("caption id conditioning requires conditioner")
-    return conditioner(ids.to(device=device), return_tokens=return_tokens)
+    return conditioner(ids.to(device=device), return_tokens=text_condition_return_tokens(
+        conditioner, return_tokens=return_tokens))
 
 
 def parse_sample_prompts(raw):
@@ -3782,7 +5230,8 @@ def expand_negative_prompts(raw, n):
 def prompt_embedding_condition(prompts, conditioner, embed_backend="stats", embed_model="",
                                embed_device=None, embed_dtype="auto", embed_normalize=True,
                                embed_stats_dim=0, trust_remote_code=False, device=DEV,
-                               return_tokens=False, return_embedding=False):
+                               return_tokens=False, return_embedding=False,
+                               text_sequence_model="", text_sequence_max_length=0):
     if conditioner is None:
         raise ValueError("prompt embedding conditioning requires a loaded conditioner")
     input_dim = int(getattr(conditioner, "input_dim", 0) or 0)
@@ -3790,21 +5239,58 @@ def prompt_embedding_condition(prompts, conditioner, embed_backend="stats", embe
         raise ValueError("prompt embedding conditioning requires a PrecomputedTextConditioner")
     stats_dim = int(embed_stats_dim or input_dim)
     from .image_embed import make_embedder
+    text_mode = "both" if return_tokens else "pooled"
     embedder = make_embedder(
         backend=embed_backend, model=embed_model, device=embed_device or device,
         dtype=embed_dtype, normalize=embed_normalize, stats_dim=stats_dim,
-        trust_remote_code=trust_remote_code)
+        text_mode=text_mode, trust_remote_code=trust_remote_code,
+        text_sequence_model=text_sequence_model,
+        text_sequence_max_length=text_sequence_max_length)
     records = [ImageTextRecord(path="", caption=str(prompt), split="sample")
                for prompt in prompts]
-    embeddings = embedder.encode_texts(records).to(device=device)
-    if int(embeddings.shape[-1]) != input_dim:
+    encoded = embedder.encode_texts(records)
+    if isinstance(encoded, dict):
+        feature_embeddings = encoded.get("pooled")
+        cond_embeddings = (
+            encoded.get("tokens") if return_tokens and encoded.get("tokens") is not None
+            else feature_embeddings
+        )
+    else:
+        feature_embeddings = encoded if torch.is_tensor(encoded) else None
+        cond_embeddings = encoded
+    if isinstance(cond_embeddings, list):
+        max_len = max((int(row.shape[0]) for row in cond_embeddings), default=1)
+        cond_tensor = torch.zeros(
+            (len(cond_embeddings), max(1, max_len), input_dim), dtype=torch.float32)
+        for i, row in enumerate(cond_embeddings):
+            row = row.detach().float()
+            if int(row.shape[-1]) != input_dim:
+                raise ValueError(
+                    f"prompt embedding dim {int(row.shape[-1])} does not match "
+                    f"checkpoint text_embedding_in_dim {input_dim}"
+                )
+            cond_tensor[i, :int(row.shape[0])] = row.cpu()
+        cond_embeddings = cond_tensor
+    cond_embeddings = cond_embeddings.to(device=device)
+    if int(cond_embeddings.shape[-1]) != input_dim:
         raise ValueError(
-            f"prompt embedding dim {int(embeddings.shape[-1])} does not match "
+            f"prompt embedding dim {int(cond_embeddings.shape[-1])} does not match "
             f"checkpoint text_embedding_in_dim {input_dim}"
         )
-    cond = conditioner(embeddings, return_tokens=return_tokens)
+    cond = conditioner(cond_embeddings, return_tokens=text_condition_return_tokens(
+        conditioner, return_tokens=return_tokens))
     if return_embedding:
-        return cond, embeddings
+        if torch.is_tensor(feature_embeddings):
+            feature_embeddings = feature_embeddings.to(device=device)
+        elif isinstance(feature_embeddings, list):
+            pooled = []
+            for row in feature_embeddings:
+                row = row.detach().float()
+                pooled.append(row.mean(dim=0))
+            feature_embeddings = torch.stack(pooled, dim=0).to(device=device)
+        else:
+            feature_embeddings = condition_vector(cond)
+        return cond, feature_embeddings
     return cond
 
 
@@ -3813,7 +5299,8 @@ def text_prompt_condition(prompts, conditioner, prompt_vocab=None, caption_max_l
                           source="tokens", device=DEV, return_tokens=False,
                           embed_backend="stats", embed_model="", embed_device=None,
                           embed_dtype="auto", embed_normalize=True, embed_stats_dim=0,
-                          trust_remote_code=False, return_embedding=False):
+                          trust_remote_code=False, return_embedding=False,
+                          text_sequence_model="", text_sequence_max_length=0):
     source = str(source or "tokens")
     if source == "embedding":
         return prompt_embedding_condition(
@@ -3821,7 +5308,8 @@ def text_prompt_condition(prompts, conditioner, prompt_vocab=None, caption_max_l
             embed_device=embed_device, embed_dtype=embed_dtype,
             embed_normalize=embed_normalize, embed_stats_dim=embed_stats_dim,
             trust_remote_code=trust_remote_code, device=device, return_tokens=return_tokens,
-            return_embedding=return_embedding)
+            return_embedding=return_embedding, text_sequence_model=text_sequence_model,
+            text_sequence_max_length=text_sequence_max_length)
     cond = caption_condition(
         prompts, conditioner, prompt_vocab, max_len=caption_max_len, device=device,
         return_tokens=return_tokens)
@@ -3831,12 +5319,32 @@ def text_prompt_condition(prompts, conditioner, prompt_vocab=None, caption_max_l
 
 
 def infer_text_embedding_dim(records):
-    dims = {len(rec.text_embedding) for rec in records if rec.text_embedding is not None}
-    dims.update({
+    seq_dims = {
         len(rec.text_embedding_sequence[0])
         for rec in records
         if rec.text_embedding_sequence is not None and len(rec.text_embedding_sequence) > 0
-    })
+    }
+    if seq_dims:
+        if len(seq_dims) != 1:
+            raise ValueError(
+                f"manifest text embedding sequences have mixed dimensions: {sorted(seq_dims)}")
+        dim = next(iter(seq_dims))
+        missing = sum(
+            1 for rec in records
+            if rec.text_embedding_sequence is None and rec.text_embedding is None)
+        fallback_bad = sum(
+            1 for rec in records
+            if rec.text_embedding_sequence is None
+            and rec.text_embedding is not None
+            and len(rec.text_embedding) != dim)
+        if missing:
+            raise ValueError(f"{missing} manifest records are missing text embeddings")
+        if fallback_bad:
+            raise ValueError(
+                f"{fallback_bad} manifest records have pooled text fallback dims "
+                f"that do not match sequence dim {dim}")
+        return int(dim)
+    dims = {len(rec.text_embedding) for rec in records if rec.text_embedding is not None}
     if not dims:
         return 0
     if len(dims) != 1:
@@ -3852,15 +5360,33 @@ def infer_text_embedding_dim(records):
 
 def infer_image_embedding_dim(records):
     dims = {len(rec.image_embedding) for rec in records if rec.image_embedding is not None}
+    dims.update({
+        len(rec.image_embedding_sequence[0])
+        for rec in records
+        if rec.image_embedding_sequence is not None and len(rec.image_embedding_sequence) > 0
+    })
     if not dims:
         return 0
     if len(dims) != 1:
         raise ValueError(f"manifest image embeddings have mixed dimensions: {sorted(dims)}")
     dim = next(iter(dims))
-    missing = sum(1 for rec in records if rec.image_embedding is None)
+    missing = sum(
+        1 for rec in records
+        if rec.image_embedding is None and rec.image_embedding_sequence is None)
     if missing:
         raise ValueError(f"{missing} manifest records are missing image embeddings")
     return int(dim)
+
+
+def records_have_image_embedding_sequences(records):
+    return any(rec.image_embedding_sequence is not None for rec in records)
+
+
+def image_embedding_sequence_max_len(records):
+    return max(
+        (len(rec.image_embedding_sequence)
+         for rec in records if rec.image_embedding_sequence is not None),
+        default=0)
 
 
 def resolve_caption_cond_source(source, records):
@@ -3909,15 +5435,45 @@ def record_image_embedding_tensor(records, device=DEV):
     dim = infer_image_embedding_dim(records)
     if dim <= 0:
         raise ValueError("records do not have image embeddings")
-    return torch.tensor([rec.image_embedding for rec in records], dtype=torch.float32,
-                        device=device)
+    rows = []
+    for rec in records:
+        if rec.image_embedding is not None:
+            rows.append(list(rec.image_embedding))
+        elif rec.image_embedding_sequence is not None:
+            seq = torch.tensor(rec.image_embedding_sequence, dtype=torch.float32)
+            rows.append(seq.mean(dim=0).tolist())
+        else:
+            raise ValueError("record is missing image embedding")
+    return torch.tensor(rows, dtype=torch.float32, device=device)
+
+
+def record_image_embedding_sequence_tensor(records, device=DEV, max_len=0):
+    dim = infer_image_embedding_dim(records)
+    if dim <= 0:
+        raise ValueError("records do not have image embeddings")
+    rows = []
+    max_len = int(max_len or 0)
+    for rec in records:
+        if rec.image_embedding_sequence is not None:
+            row = [list(x) for x in rec.image_embedding_sequence]
+        elif rec.image_embedding is not None:
+            row = [list(rec.image_embedding)]
+        else:
+            raise ValueError("record is missing image embedding")
+        rows.append(row)
+        max_len = max(max_len, len(row))
+    out = torch.zeros((len(rows), max(1, max_len), dim), dtype=torch.float32, device=device)
+    for i, row in enumerate(rows):
+        out[i, :len(row)] = torch.tensor(row, dtype=torch.float32, device=device)
+    return out
 
 
 def caption_record_condition(captions, records, conditioner, vocab, source="tokens",
                              max_len=64, device=DEV, return_tokens=False):
     if source == "embedding":
         embs = record_text_embedding_tensor(records, device=device)
-        return conditioner(embs, return_tokens=return_tokens)
+        return conditioner(embs, return_tokens=text_condition_return_tokens(
+            conditioner, return_tokens=return_tokens))
     return caption_condition(captions, conditioner, vocab, max_len=max_len, device=device,
                              return_tokens=return_tokens)
 
@@ -3929,7 +5485,8 @@ def cached_caption_condition(cache, idx, conditioner, source="tokens", device=DE
             cache, conditioner, source=source, device=device, return_tokens=return_tokens)
     if source == "embedding":
         embs = cache["text_embeddings"][idx].to(device=device)
-        return conditioner(embs, return_tokens=return_tokens)
+        return conditioner(embs, return_tokens=text_condition_return_tokens(
+            conditioner, return_tokens=return_tokens))
     ids = cache["caption_ids"][idx]
     return caption_condition_ids(ids, conditioner, device=device, return_tokens=return_tokens)
 
@@ -3938,7 +5495,8 @@ def cached_caption_payload_condition(payload, conditioner, source="tokens", devi
                                      return_tokens=False):
     if source == "embedding":
         embs = payload["text_embeddings"].to(device=device)
-        return conditioner(embs, return_tokens=return_tokens)
+        return conditioner(embs, return_tokens=text_condition_return_tokens(
+            conditioner, return_tokens=return_tokens))
     ids = payload["caption_ids"]
     return caption_condition_ids(ids, conditioner, device=device, return_tokens=return_tokens)
 
@@ -3957,16 +5515,165 @@ def rescale_guided_velocity(v_guided, v_cond, cfg_rescale=0.0, eps=1.0e-6):
     return cfg_rescale * v_rescaled + (1.0 - cfg_rescale) * v_guided
 
 
+def sampler_tensor_stats(x):
+    raw = x.detach().float()
+    finite = torch.isfinite(raw)
+    finite_frac = float(finite.float().mean().detach().cpu())
+    clean = torch.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+    flat = clean.flatten(1) if clean.ndim > 1 else clean.reshape(1, -1)
+    rms = flat.square().mean(dim=1).sqrt()
+    return {
+        "finite_frac": finite_frac,
+        "rms_mean": float(rms.mean().detach().cpu()),
+        "rms_max": float(rms.max().detach().cpu()),
+        "abs_max": float(clean.abs().max().detach().cpu()),
+    }
+
+
+def init_sample_trace(steps, sample_finite_guard=False, sample_velocity_clip=0.0,
+                      sample_latent_clip=0.0):
+    return {
+        "sample_trace_steps": int(steps),
+        "sample_finite_guard": bool(sample_finite_guard),
+        "sample_velocity_clip": float(sample_velocity_clip),
+        "sample_latent_clip": float(sample_latent_clip),
+        "sample_trace_min_velocity_finite_frac": 1.0,
+        "sample_trace_max_velocity_rms": 0.0,
+        "sample_trace_max_velocity_abs": 0.0,
+        "sample_trace_velocity_nonfinite_steps": 0,
+        "sample_trace_min_latent_finite_frac": 1.0,
+        "sample_trace_max_latent_rms": 0.0,
+        "sample_trace_max_latent_abs": 0.0,
+        "sample_trace_latent_nonfinite_steps": 0,
+        "sample_trace_finite_guard_events": 0,
+        "sample_trace_velocity_clip_events": 0,
+        "sample_trace_latent_clip_events": 0,
+        "sample_trace_stabilized": bool(
+            sample_finite_guard or sample_velocity_clip > 0.0 or sample_latent_clip > 0.0
+        ),
+    }
+
+
+def prefix_sample_trace(trace, prefix):
+    out = {}
+    for key, value in dict(trace).items():
+        if key.startswith("sample_trace_"):
+            out[f"{prefix}_trace_{key[len('sample_trace_'):]}"] = value
+        elif key.startswith("sample_"):
+            out[f"{prefix}_{key[len('sample_'):]}"] = value
+        else:
+            out[f"{prefix}_{key}"] = value
+    return out
+
+
+def merge_sample_traces(left, right):
+    if not left:
+        return dict(right)
+    out = dict(left)
+    for key, value in dict(right).items():
+        if key.endswith("_min_finite_frac") or key.endswith("_final_latent_finite_frac"):
+            out[key] = min(float(out.get(key, 1.0)), float(value))
+        elif (key.endswith("_max_rms") or key.endswith("_max_abs")
+              or key.endswith("_final_latent_rms") or key.endswith("_final_latent_abs")):
+            out[key] = max(float(out.get(key, 0.0)), float(value))
+        elif key.endswith("_nonfinite_steps") or key.endswith("_events"):
+            out[key] = int(out.get(key, 0)) + int(value)
+        else:
+            out[key] = value
+    return out
+
+
+def update_sample_trace(trace, role, x):
+    stats = sampler_tensor_stats(x)
+    finite_key = f"sample_trace_min_{role}_finite_frac"
+    rms_key = f"sample_trace_max_{role}_rms"
+    abs_key = f"sample_trace_max_{role}_abs"
+    nonfinite_key = f"sample_trace_{role}_nonfinite_steps"
+    trace[finite_key] = min(float(trace.get(finite_key, 1.0)), stats["finite_frac"])
+    trace[rms_key] = max(float(trace.get(rms_key, 0.0)), stats["rms_max"])
+    trace[abs_key] = max(float(trace.get(abs_key, 0.0)), stats["abs_max"])
+    if stats["finite_frac"] < 1.0:
+        trace[nonfinite_key] = int(trace.get(nonfinite_key, 0)) + 1
+    return stats
+
+
+def finite_guard_tensor(x):
+    nonfinite = ~torch.isfinite(x)
+    events = int(nonfinite.flatten(1).any(dim=1).sum().detach().cpu()) if x.ndim > 1 else (
+        1 if bool(nonfinite.any().detach().cpu()) else 0
+    )
+    if events:
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    return x, events
+
+
+def clip_tensor_rms(x, max_rms, eps=1.0e-8):
+    max_rms = float(max_rms)
+    if max_rms <= 0.0:
+        return x, 0
+    flat = torch.nan_to_num(x.detach().float(), nan=0.0, posinf=0.0, neginf=0.0).flatten(1)
+    rms = flat.square().mean(dim=1).sqrt()
+    scale = (max_rms / rms.clamp_min(float(eps))).clamp(max=1.0)
+    events = int(scale.lt(1.0).sum().detach().cpu())
+    if events:
+        view_shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        x = x * scale.to(dtype=x.dtype, device=x.device).reshape(view_shape)
+    return x, events
+
+
+def clip_tensor_abs(x, max_abs):
+    max_abs = float(max_abs)
+    if max_abs <= 0.0:
+        return x, 0
+    clean = torch.nan_to_num(x.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    events = int(clean.abs().flatten(1).amax(dim=1).gt(max_abs).sum().detach().cpu())
+    if events:
+        x = x.clamp(-max_abs, max_abs)
+    return x, events
+
+
+def expand_time_batch(t, batch):
+    batch = int(batch)
+    if t.ndim == 0:
+        return t.reshape(1).expand(batch)
+    if int(t.shape[0]) == batch:
+        return t
+    if int(t.shape[0]) == 1:
+        return t.expand((batch,) + tuple(t.shape[1:]))
+    raise ValueError("time batch must match latent batch")
+
+
 @torch.no_grad()
-def guided_velocity(flow, z, t, cond, cfg_scale=1.0, cfg_rescale=0.0, cfg_uncond=None):
+def guided_velocity(flow, z, t, cond, cfg_scale=1.0, cfg_rescale=0.0, cfg_uncond=None,
+                    cfg_mode="standard"):
     """Classifier-free guidance in latent velocity space."""
-    if cfg_scale == 1.0:
+    cfg_mode = str(cfg_mode)
+    if cfg_mode not in CFG_MODES:
+        raise ValueError(f"unknown cfg_mode {cfg_mode!r}")
+    if cfg_scale == 1.0 and cfg_mode == "standard":
         return flow(z, t, cond)
-    uncond = zero_condition(cond) if cfg_uncond is None else cfg_uncond
-    v_uncond = flow(z, t, uncond)
-    v_cond = flow(z, t, cond)
+    uncond = null_condition(cond) if cfg_uncond is None else cfg_uncond
+    batch = int(z.shape[0])
+    if condition_batch(cond) != batch or condition_batch(uncond) != batch:
+        raise ValueError("CFG condition batch must match latent batch")
+    t = expand_time_batch(t, batch)
+    v = flow(
+        torch.cat([z, z], dim=0),
+        torch.cat([t, t], dim=0),
+        concat_conditions(uncond, cond),
+    )
+    v_uncond, v_cond = v.chunk(2, dim=0)
     guided = v_uncond + cfg_scale * (v_cond - v_uncond)
-    return rescale_guided_velocity(guided, v_cond, cfg_rescale=cfg_rescale)
+    guided = rescale_guided_velocity(guided, v_cond, cfg_rescale=cfg_rescale)
+    if cfg_mode == "standard":
+        return guided
+    t_mix = t
+    if t_mix.ndim == 1:
+        t_mix = t_mix[:, None]
+    while t_mix.ndim < guided.ndim:
+        t_mix = t_mix.unsqueeze(-1)
+    t_mix = t_mix.to(dtype=guided.dtype, device=guided.device).clamp(0.0, 1.0)
+    return (1.0 - t_mix) * guided + t_mix * v_uncond
 
 
 @torch.no_grad()
@@ -3985,7 +5692,9 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                    feature_guidance_features=None,
                    feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                    quality_guidance_w=0.0, quality_guidance_scorer=None,
-                   quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
+                   quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                   sample_finite_guard=False, sample_velocity_clip=0.0,
+                   sample_latent_clip=0.0, cfg_mode="standard", return_trace=False):
     batch = condition_batch(cond)
     if cfg_uncond is not None and condition_batch(cfg_uncond) != batch:
         raise ValueError("cfg_uncond batch must match cond batch")
@@ -4034,8 +5743,17 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
     sample_churn = float(sample_churn)
     if sample_churn < 0.0:
         raise ValueError("sample_churn must be non-negative")
+    sample_velocity_clip = float(sample_velocity_clip)
+    sample_latent_clip = float(sample_latent_clip)
+    if sample_velocity_clip < 0.0:
+        raise ValueError("sample_velocity_clip must be non-negative")
+    if sample_latent_clip < 0.0:
+        raise ValueError("sample_latent_clip must be non-negative")
     if cfg_rescale < 0.0 or cfg_rescale > 1.0:
         raise ValueError("cfg_rescale must be in [0, 1]")
+    cfg_mode = str(cfg_mode)
+    if cfg_mode not in CFG_MODES:
+        raise ValueError(f"unknown cfg_mode {cfg_mode!r}")
     cfg_interval = validate_guidance_interval(cfg_interval, name="cfg_interval")
     semantic_guidance_interval = validate_guidance_interval(
         semantic_guidance_interval, name="semantic_guidance_interval")
@@ -4049,6 +5767,32 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         quality_guidance_interval, name="quality_guidance_interval")
     schedule = flow_time_schedule(
         steps, device=device, shift=sample_time_shift, schedule=sample_schedule)
+    trace = init_sample_trace(
+        steps, sample_finite_guard=sample_finite_guard,
+        sample_velocity_clip=sample_velocity_clip,
+        sample_latent_clip=sample_latent_clip)
+    update_sample_trace(trace, "latent", z)
+
+    def stabilize_latent(z_in):
+        update_sample_trace(trace, "latent", z_in)
+        if sample_finite_guard:
+            z_in, events = finite_guard_tensor(z_in)
+            trace["sample_trace_finite_guard_events"] += int(events)
+        if sample_latent_clip > 0.0:
+            z_in, events = clip_tensor_abs(z_in, sample_latent_clip)
+            trace["sample_trace_latent_clip_events"] += int(events)
+        return z_in
+
+    def stabilize_velocity(v_in):
+        update_sample_trace(trace, "velocity", v_in)
+        if sample_finite_guard:
+            v_in, events = finite_guard_tensor(v_in)
+            trace["sample_trace_finite_guard_events"] += int(events)
+        if sample_velocity_clip > 0.0:
+            v_in, events = clip_tensor_rms(v_in, sample_velocity_clip)
+            trace["sample_trace_velocity_clip_events"] += int(events)
+        return v_in
+
     for i in range(steps):
         t_scalar = float(schedule[i].detach().cpu())
         t_next_scalar = float(schedule[i + 1].detach().cpu())
@@ -4060,12 +5804,17 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
             if noise_std > 0.0:
                 z = z + noise_std * _seeded_randn(
                     tuple(z.shape), device=device, seed=int(seed) + 104729 * (i + 1))
+                z = stabilize_latent(z)
 
         def velocity_at(z_in, raw_t):
             t = torch.full((batch, 1, 1, 1), float(raw_t), device=device)
-            step_cfg = cfg_scale if interval_active(float(raw_t), cfg_interval) else 1.0
-            return guided_velocity(flow, z_in, t, cond, cfg_scale=step_cfg,
-                                   cfg_rescale=cfg_rescale, cfg_uncond=cfg_uncond)
+            cfg_active = interval_active(float(raw_t), cfg_interval)
+            step_cfg = cfg_scale if cfg_active else 1.0
+            step_cfg_mode = cfg_mode if cfg_active else "standard"
+            v = guided_velocity(flow, z_in, t, cond, cfg_scale=step_cfg,
+                                cfg_rescale=cfg_rescale, cfg_uncond=cfg_uncond,
+                                cfg_mode=step_cfg_mode)
+            return stabilize_velocity(v)
 
         v0 = velocity_at(z, t_scalar)
         if sample_method == "euler":
@@ -4088,6 +5837,7 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
             z = z + (dt / 6.0) * (v0 + 2.0 * v2 + 2.0 * v3 + v4)
         else:
             raise ValueError(f"unknown sample method {sample_method!r}")
+        z = stabilize_latent(z)
         if (semantic_guidance_w > 0.0
                 and interval_active(t_scalar, semantic_guidance_interval)):
             z_raw = denormalize_latent(z, latent_stats)
@@ -4095,6 +5845,7 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                                            weight=semantic_guidance_w,
                                            step_size=dt, mode=semantic_guidance_mode)
             z = normalize_latent(z_raw, latent_stats)
+            z = stabilize_latent(z)
         if (text_guidance_w > 0.0
                 and interval_active(t_scalar, text_guidance_interval)):
             z_raw = denormalize_latent(z, latent_stats)
@@ -4102,6 +5853,7 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                 text_guidance_aligner, z_raw, text_guidance_cond,
                 weight=text_guidance_w, step_size=dt)
             z = normalize_latent(z_raw, latent_stats)
+            z = stabilize_latent(z)
         if (feature_guidance_w > 0.0
                 and interval_active(t_scalar, feature_guidance_interval)):
             z_raw = denormalize_latent(z, latent_stats)
@@ -4109,6 +5861,7 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                 feature_guidance_aligner, z_raw, feature_guidance_features,
                 weight=feature_guidance_w, step_size=dt)
             z = normalize_latent(z_raw, latent_stats)
+            z = stabilize_latent(z)
         if (quality_guidance_w > 0.0
                 and interval_active(t_scalar, quality_guidance_interval)):
             z_raw = denormalize_latent(z, latent_stats)
@@ -4116,7 +5869,17 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                 quality_guidance_scorer, z_raw,
                 weight=quality_guidance_w, step_size=dt)
             z = normalize_latent(z_raw, latent_stats)
-    return denormalize_latent(z, latent_stats)
+            z = stabilize_latent(z)
+    final_stats = sampler_tensor_stats(z)
+    trace.update({
+        "sample_trace_final_latent_finite_frac": final_stats["finite_frac"],
+        "sample_trace_final_latent_rms": final_stats["rms_mean"],
+        "sample_trace_final_latent_abs": final_stats["abs_max"],
+    })
+    out = denormalize_latent(z, latent_stats)
+    if return_trace:
+        return out, trace
+    return out
 
 
 @torch.no_grad()
@@ -4135,39 +5898,124 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
                   feature_guidance_features=None,
                   feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                   quality_guidance_w=0.0, quality_guidance_scorer=None,
-                  quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
-    z = sample_latents(flow, cond, latent_shape=latent_shape, steps=steps, device=device,
-                       seed=seed, cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
-                       ae=ae, semantic_cond=semantic_cond,
-                       semantic_guidance_w=semantic_guidance_w,
-                       semantic_guidance_mode=semantic_guidance_mode,
-                       sample_method=sample_method, cfg_interval=cfg_interval,
-                       semantic_guidance_interval=semantic_guidance_interval,
-                       sample_time_shift=sample_time_shift,
-                       sample_schedule=sample_schedule, cfg_uncond=cfg_uncond,
-                       sample_churn=sample_churn,
-                       sample_churn_interval=sample_churn_interval,
-                       text_guidance_w=text_guidance_w,
-                       text_guidance_aligner=text_guidance_aligner,
-                       text_guidance_cond=text_guidance_cond,
-                       text_guidance_interval=text_guidance_interval,
-                       feature_guidance_w=feature_guidance_w,
-                       feature_guidance_aligner=feature_guidance_aligner,
-                       feature_guidance_features=feature_guidance_features,
-                       feature_guidance_interval=feature_guidance_interval,
-                       quality_guidance_w=quality_guidance_w,
-                       quality_guidance_scorer=quality_guidance_scorer,
-                       quality_guidance_interval=quality_guidance_interval)
+                  quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                  sample_finite_guard=False, sample_velocity_clip=0.0,
+                  sample_latent_clip=0.0, cfg_mode="standard", return_trace=False):
+    latent_out = sample_latents(
+        flow, cond, latent_shape=latent_shape, steps=steps, device=device,
+        seed=seed, cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
+        ae=ae, semantic_cond=semantic_cond,
+        semantic_guidance_w=semantic_guidance_w,
+        semantic_guidance_mode=semantic_guidance_mode,
+        sample_method=sample_method, cfg_interval=cfg_interval,
+        semantic_guidance_interval=semantic_guidance_interval,
+        sample_time_shift=sample_time_shift,
+        sample_schedule=sample_schedule, cfg_uncond=cfg_uncond,
+        sample_churn=sample_churn,
+        sample_churn_interval=sample_churn_interval,
+        text_guidance_w=text_guidance_w,
+        text_guidance_aligner=text_guidance_aligner,
+        text_guidance_cond=text_guidance_cond,
+        text_guidance_interval=text_guidance_interval,
+        feature_guidance_w=feature_guidance_w,
+        feature_guidance_aligner=feature_guidance_aligner,
+        feature_guidance_features=feature_guidance_features,
+        feature_guidance_interval=feature_guidance_interval,
+        quality_guidance_w=quality_guidance_w,
+        quality_guidance_scorer=quality_guidance_scorer,
+        quality_guidance_interval=quality_guidance_interval,
+        sample_finite_guard=sample_finite_guard,
+        sample_velocity_clip=sample_velocity_clip,
+        sample_latent_clip=sample_latent_clip,
+        cfg_mode=cfg_mode,
+        return_trace=return_trace)
+    if return_trace:
+        z, trace = latent_out
+    else:
+        z, trace = latent_out, None
     ae.eval()
-    return ae.decode(z).clamp(-1.0, 1.0)
+    sample = ae.decode(z).clamp(-1.0, 1.0)
+    if return_trace:
+        return sample, trace
+    return sample
 
 
 def _rgb8_from_samples(samples):
     if samples.ndim != 4 or samples.shape[1] != 3:
         raise ValueError(f"expected BCHW RGB samples, got shape {tuple(samples.shape)}")
-    arr = samples.detach().cpu().float().clamp(-1.0, 1.0)
+    arr = torch.nan_to_num(
+        samples.detach().cpu().float(), nan=-1.0, posinf=1.0, neginf=-1.0
+    ).clamp(-1.0, 1.0)
     arr = ((arr + 1.0) * 127.5).round().to(torch.uint8)
     return arr.permute(0, 2, 3, 1).contiguous().numpy()
+
+
+def sample_health_metrics(samples, prefix="sample", eps=1.0e-8):
+    if samples.ndim != 4 or samples.shape[1] != 3:
+        raise ValueError(f"expected BCHW RGB samples, got shape {tuple(samples.shape)}")
+    raw = samples.detach().float()
+    finite = torch.isfinite(raw)
+    image_nonfinite = (~finite).flatten(1).any(dim=1)
+    clean = torch.nan_to_num(raw, nan=-1.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+    rgb = (clean + 1.0) * 0.5
+    lum = (
+        0.2126 * rgb[:, 0]
+        + 0.7152 * rgb[:, 1]
+        + 0.0722 * rgb[:, 2]
+    )
+    rgb_flat = rgb.flatten(1)
+    lum_flat = lum.flatten(1)
+    rgb_std = rgb_flat.std(dim=1, unbiased=False)
+    lum_std = lum_flat.std(dim=1, unbiased=False)
+    dynamic_range = lum_flat.max(dim=1).values - lum_flat.min(dim=1).values
+    low_frac = lum_flat.le(0.01).float().mean(dim=1)
+    high_frac = lum_flat.ge(0.99).float().mean(dim=1)
+    collapsed = image_nonfinite | dynamic_range.lt(0.05) | lum_std.lt(0.01)
+    health_score = (
+        lum_std.mean()
+        * dynamic_range.mean().clamp_min(float(eps))
+        * (1.0 - collapsed.float().mean())
+    )
+    return {
+        f"{prefix}_finite_frac": float(finite.float().mean().detach().cpu()),
+        f"{prefix}_nonfinite_frac": float((~finite).float().mean().detach().cpu()),
+        f"{prefix}_luminance_mean": float(lum_flat.mean().detach().cpu()),
+        f"{prefix}_luminance_std": float(lum_std.mean().detach().cpu()),
+        f"{prefix}_rgb_std": float(rgb_std.mean().detach().cpu()),
+        f"{prefix}_dynamic_range": float(dynamic_range.mean().detach().cpu()),
+        f"{prefix}_low_luminance_frac": float(low_frac.mean().detach().cpu()),
+        f"{prefix}_high_luminance_frac": float(high_frac.mean().detach().cpu()),
+        f"{prefix}_collapsed_frac": float(collapsed.float().mean().detach().cpu()),
+        f"{prefix}_health_score": float(health_score.detach().cpu()),
+    }
+
+
+def sample_candidate_health_scores(samples, eps=1.0e-8):
+    if samples.ndim != 4 or samples.shape[1] != 3:
+        raise ValueError(f"expected BCHW RGB samples, got shape {tuple(samples.shape)}")
+    raw = samples.detach().float()
+    finite = torch.isfinite(raw)
+    image_nonfinite = (~finite).flatten(1).any(dim=1)
+    finite_frac = finite.float().flatten(1).mean(dim=1)
+    clean = torch.nan_to_num(raw, nan=-1.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+    rgb = (clean + 1.0) * 0.5
+    lum = (
+        0.2126 * rgb[:, 0]
+        + 0.7152 * rgb[:, 1]
+        + 0.0722 * rgb[:, 2]
+    )
+    rgb_std = rgb.flatten(1).std(dim=1, unbiased=False)
+    lum_flat = lum.flatten(1)
+    lum_std = lum_flat.std(dim=1, unbiased=False)
+    dynamic_range = lum_flat.max(dim=1).values - lum_flat.min(dim=1).values
+    collapsed = image_nonfinite | dynamic_range.lt(0.05) | lum_std.lt(0.01)
+    return (
+        finite_frac
+        + lum_std * dynamic_range.clamp_min(float(eps))
+        + 0.05 * rgb_std
+        - collapsed.float()
+        - image_nonfinite.float()
+    )
 
 
 def write_ppm_grid(samples, path, rows, cols, pad=2, bg=32):
@@ -4207,6 +6055,67 @@ def write_ppm_grid(samples, path, rows, cols, pad=2, bg=32):
     }
 
 
+def _sample_manifest_image_dir(manifest_path, image_dir=""):
+    if image_dir:
+        return image_dir
+    base = os.path.splitext(os.path.basename(manifest_path))[0] or "samples"
+    return os.path.join(os.path.dirname(manifest_path) or ".", f"{base}_images")
+
+
+def write_sample_manifest(samples, manifest_path, captions, image_dir="", metadata=None,
+                          row_metadata=None, prefix="sample", split="generated"):
+    """Write generated samples as individual PPM files plus a JSONL image manifest."""
+    captions = [str(c) for c in captions]
+    arr = _rgb8_from_samples(samples)
+    n, h, w, c = arr.shape
+    if c != 3:
+        raise ValueError(f"expected RGB samples, got {c} channels")
+    if len(captions) != n:
+        raise ValueError(f"expected {n} captions/prompts, got {len(captions)}")
+    manifest_path = str(manifest_path)
+    out_dir = _sample_manifest_image_dir(manifest_path, image_dir=image_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(manifest_path) or ".", exist_ok=True)
+    manifest_dir = os.path.dirname(os.path.abspath(manifest_path))
+    rows = []
+    metadata = dict(metadata or {})
+    if row_metadata is None:
+        row_metadata = [{} for _ in range(n)]
+    if len(row_metadata) != n:
+        raise ValueError(f"expected {n} per-row metadata records, got {len(row_metadata)}")
+    for idx, (img, caption) in enumerate(zip(arr, captions)):
+        name = f"{prefix}_{idx:05d}.ppm"
+        img_path = os.path.join(out_dir, name)
+        with open(img_path, "wb") as f:
+            f.write(f"P6\n{w} {h}\n255\n".encode("ascii"))
+            f.write(img.tobytes())
+        rel = os.path.relpath(os.path.abspath(img_path), manifest_dir)
+        row = {
+            "image": rel,
+            "caption": caption,
+            "prompt": caption,
+            "split": split,
+            "source": "image_latent_generated",
+            "width": int(w),
+            "height": int(h),
+            "sample_index": int(idx),
+        }
+        row.update(metadata)
+        row.update(dict(row_metadata[idx] or {}))
+        rows.append(row)
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+    return {
+        "sample_manifest": manifest_path,
+        "sample_manifest_image_dir": out_dir,
+        "sample_manifest_records": int(n),
+        "sample_manifest_format": "jsonl",
+        "sample_manifest_image_format": "ppm",
+        "sample_manifest_split": split,
+    }
+
+
 def make_condition_grid_specs(samples_per_combo=1):
     samples_per_combo = int(samples_per_combo)
     if samples_per_combo <= 0:
@@ -4221,7 +6130,7 @@ def make_condition_grid_specs(samples_per_combo=1):
 @torch.no_grad()
 def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1,
                              text_aligner=None, image_feature_aligner=None,
-                             prompt_features=None):
+                             prompt_features=None, quality_scorer=None):
     candidates_per_prompt = int(candidates_per_prompt)
     if candidates_per_prompt <= 0:
         raise ValueError("candidates_per_prompt must be positive")
@@ -4238,6 +6147,13 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
     }
     if candidates_per_prompt == 1:
         return samples, meta
+
+    def normalize_candidate_scores(raw_scores):
+        raw_scores = raw_scores.reshape(n, candidates_per_prompt).float()
+        centered = raw_scores - raw_scores.mean(dim=1, keepdim=True)
+        scale = centered.std(dim=1, keepdim=True, unbiased=False).clamp_min(1.0e-6)
+        return centered / scale
+
     scorers = []
     z = None
     if text_aligner is not None:
@@ -4263,27 +6179,64 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
                 f"prompt feature dim {int(feature_rows.shape[-1])} != "
                 f"image feature dim {feature_dim}"
             )
+    if quality_scorer is not None:
+        quality_scorer.eval()
+        if z is None:
+            z = ae.encode(samples)
+        scorers.append(("quality_scorer", quality_scorer.score(z).float()))
     if not scorers:
-        meta["sample_grid_selection_scorer"] = "first_candidate_no_compatible_scorer"
-        return samples[::candidates_per_prompt].contiguous(), meta
-    scores = torch.stack([score for _name, score in scorers], dim=0).mean(dim=0)
-    scores = scores.reshape(n, candidates_per_prompt)
+        scores = sample_candidate_health_scores(samples).reshape(n, candidates_per_prompt)
+        best = scores.argmax(dim=1)
+        base = torch.arange(n, device=samples.device) * candidates_per_prompt
+        selected = base + best.to(device=samples.device)
+        chosen = samples.index_select(0, selected)
+        best_scores = scores.gather(1, best[:, None]).squeeze(1)
+        meta.update({
+            "sample_grid_selection_scorer": "sample_health",
+            "sample_grid_selected_candidate_indices": [
+                int(x) for x in best.detach().cpu().tolist()
+            ],
+            "sample_grid_selection_score_mean": float(best_scores.mean().detach().cpu()),
+            "sample_grid_selection_score_min": float(best_scores.min().detach().cpu()),
+            "sample_grid_selection_score_max": float(best_scores.max().detach().cpu()),
+        })
+        return chosen.contiguous(), meta
+    component_scores = [
+        (name, normalize_candidate_scores(score))
+        for name, score in scorers
+    ]
+    scores = torch.stack([score for _name, score in component_scores], dim=0).mean(dim=0)
     best = scores.argmax(dim=1)
     base = torch.arange(n, device=samples.device) * candidates_per_prompt
     selected = base + best.to(device=samples.device)
     chosen = samples.index_select(0, selected)
     best_scores = scores.gather(1, best[:, None]).squeeze(1)
-    meta.update({
+    scorer_labels = {
+        "text_aligner": "text_aligner_cosine",
+        "image_feature_aligner": "image_feature_aligner_cosine",
+        "quality_scorer": "quality_scorer_score",
+    }
+    selection_meta = {
         "sample_grid_selection_scorer": "+".join(
-            f"{name}_cosine" for name, _score in scorers
+            scorer_labels.get(name, name) for name, _score in scorers
         ),
+        "sample_grid_selection_component_count": int(len(component_scores)),
         "sample_grid_selected_candidate_indices": [
             int(x) for x in best.detach().cpu().tolist()
         ],
         "sample_grid_selection_score_mean": float(best_scores.mean().detach().cpu()),
         "sample_grid_selection_score_min": float(best_scores.min().detach().cpu()),
         "sample_grid_selection_score_max": float(best_scores.max().detach().cpu()),
-    })
+    }
+    for name, score in component_scores:
+        selected_scores = score.gather(1, best[:, None]).squeeze(1)
+        selection_meta[f"sample_grid_selection_{name}_mean"] = float(
+            selected_scores.mean().detach().cpu())
+        selection_meta[f"sample_grid_selection_{name}_min"] = float(
+            selected_scores.min().detach().cpu())
+        selection_meta[f"sample_grid_selection_{name}_max"] = float(
+            selected_scores.max().detach().cpu())
+    meta.update(selection_meta)
     return chosen.contiguous(), meta
 
 
@@ -4297,7 +6250,10 @@ def save_sample_grid(ae, flow, path, size=32, device=DEV, cond_mode="facts", con
                      semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                      samples_per_combo=1, seed=0, sample_time_shift=1.0,
                      sample_schedule="linear", sample_churn=0.0,
-                     sample_churn_interval=DEFAULT_CHURN_INTERVAL):
+                     sample_churn_interval=DEFAULT_CHURN_INTERVAL,
+                     sample_finite_guard=False, sample_velocity_clip=0.0,
+                     sample_latent_clip=0.0, cfg_mode="standard",
+                     sample_manifest_out="", sample_image_dir=""):
     ae.eval()
     flow.eval()
     specs, rows, cols = make_condition_grid_specs(samples_per_combo=samples_per_combo)
@@ -4310,21 +6266,28 @@ def save_sample_grid(ae, flow, path, size=32, device=DEV, cond_mode="facts", con
     cond = model_condition(specs, fact_cond, cond_mode=cond_mode, conditioner=conditioner,
                            prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
                            rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
-    sample = sample_images(ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
-                           steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
-                           cfg_rescale=cfg_rescale,
-                           semantic_cond=fact_cond, semantic_guidance_w=semantic_guidance_w,
-                           semantic_guidance_mode=semantic_guidance_mode,
-                           sample_method=sample_method, cfg_interval=cfg_interval,
-                           semantic_guidance_interval=semantic_guidance_interval,
-                           sample_time_shift=sample_time_shift,
-                           sample_schedule=sample_schedule,
-                           sample_churn=sample_churn,
-                           sample_churn_interval=sample_churn_interval)
+    sample, trace = sample_images(
+        ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
+        steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
+        cfg_rescale=cfg_rescale,
+        semantic_cond=fact_cond, semantic_guidance_w=semantic_guidance_w,
+        semantic_guidance_mode=semantic_guidance_mode,
+        sample_method=sample_method, cfg_interval=cfg_interval,
+        semantic_guidance_interval=semantic_guidance_interval,
+        sample_time_shift=sample_time_shift,
+        sample_schedule=sample_schedule,
+        sample_churn=sample_churn,
+        sample_churn_interval=sample_churn_interval,
+        sample_finite_guard=sample_finite_guard,
+        sample_velocity_clip=sample_velocity_clip,
+        sample_latent_clip=sample_latent_clip,
+        cfg_mode=cfg_mode,
+        return_trace=True)
     meta = write_ppm_grid(sample, path, rows=rows, cols=cols)
     meta.update({
         "sample_grid_cfg_scale": float(cfg_scale),
         "sample_grid_cfg_rescale": float(cfg_rescale),
+        "sample_grid_cfg_mode": cfg_mode,
         "sample_grid_sample_steps": int(sample_steps),
         "sample_grid_sample_time_shift": float(sample_time_shift),
         "sample_grid_sample_method": sample_method,
@@ -4341,6 +6304,36 @@ def save_sample_grid(ae, flow, path, size=32, device=DEV, cond_mode="facts", con
         "sample_grid_seed": int(seed),
         "sample_grid_samples_per_combo": int(samples_per_combo),
     })
+    meta.update(prefix_sample_trace(trace, "sample_grid"))
+    meta.update(sample_health_metrics(sample, prefix="sample_grid"))
+    if sample_manifest_out:
+        captions = [
+            " ".join(render_prompt(spec, templates=prompt_templates, index=0))
+            .replace(" .", ".").replace(" ,", ",")
+            for spec in specs
+        ]
+        row_meta = [
+            {
+                "conditioning_mode": cond_mode,
+                "conditioning_color": spec.color,
+                "conditioning_shape": spec.shape,
+                "conditioning_slot": spec.slot,
+            }
+            for spec in specs
+        ]
+        meta.update(write_sample_manifest(
+            sample, sample_manifest_out, captions, image_dir=sample_image_dir,
+            metadata={
+                "sample_grid": path,
+                "sample_cfg_scale": float(cfg_scale),
+                "sample_cfg_rescale": float(cfg_rescale),
+                "sample_cfg_mode": cfg_mode,
+                "sample_steps": int(sample_steps),
+                "sample_method": sample_method,
+                "sample_schedule": sample_schedule,
+                "sample_seed": int(seed),
+            },
+            row_metadata=row_meta, prefix="fact_sample"))
     return meta
 
 
@@ -4352,7 +6345,10 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
                              samples=16, seed=0, caption_cond_source="tokens",
                              sample_time_shift=1.0, sample_schedule="linear",
                              sample_churn=0.0,
-                             sample_churn_interval=DEFAULT_CHURN_INTERVAL):
+                             sample_churn_interval=DEFAULT_CHURN_INTERVAL,
+                             sample_finite_guard=False, sample_velocity_clip=0.0,
+                             sample_latent_clip=0.0, cfg_mode="standard",
+                             sample_manifest_out="", sample_image_dir=""):
     ae.eval()
     flow.eval()
     rng = np.random.default_rng(seed)
@@ -4363,20 +6359,27 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
     cond = caption_record_condition(
         captions, chosen, conditioner, prompt_vocab, source=caption_cond_source,
         max_len=caption_max_len, device=device, return_tokens=flow_uses_cond_tokens(flow))
-    sample = sample_images(ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
-                           steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
-                           cfg_rescale=cfg_rescale,
-                           sample_method=sample_method, cfg_interval=cfg_interval,
-                           sample_time_shift=sample_time_shift,
-                           sample_schedule=sample_schedule,
-                           sample_churn=sample_churn,
-                           sample_churn_interval=sample_churn_interval)
+    sample, trace = sample_images(
+        ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
+        steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
+        cfg_rescale=cfg_rescale,
+        sample_method=sample_method, cfg_interval=cfg_interval,
+        sample_time_shift=sample_time_shift,
+        sample_schedule=sample_schedule,
+        sample_churn=sample_churn,
+        sample_churn_interval=sample_churn_interval,
+        sample_finite_guard=sample_finite_guard,
+        sample_velocity_clip=sample_velocity_clip,
+        sample_latent_clip=sample_latent_clip,
+        cfg_mode=cfg_mode,
+        return_trace=True)
     cols = int(np.ceil(np.sqrt(n)))
     rows = int(np.ceil(n / cols))
     meta = write_ppm_grid(sample, path, rows=rows, cols=cols)
     meta.update({
         "sample_grid_cfg_scale": float(cfg_scale),
         "sample_grid_cfg_rescale": float(cfg_rescale),
+        "sample_grid_cfg_mode": cfg_mode,
         "sample_grid_sample_steps": int(sample_steps),
         "sample_grid_sample_time_shift": float(sample_time_shift),
         "sample_grid_sample_method": sample_method,
@@ -4391,6 +6394,32 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
         "sample_grid_caption_count": int(n),
         "sample_grid_captions": captions[:min(5, len(captions))],
     })
+    meta.update(prefix_sample_trace(trace, "sample_grid"))
+    meta.update(sample_health_metrics(sample, prefix="sample_grid"))
+    if sample_manifest_out:
+        row_meta = [
+            {
+                "conditioning_mode": "caption",
+                "conditioning_caption": rec.caption,
+                "conditioning_image": rec.path,
+                "conditioning_source": rec.source,
+            }
+            for rec in chosen
+        ]
+        meta.update(write_sample_manifest(
+            sample, sample_manifest_out, captions, image_dir=sample_image_dir,
+            metadata={
+                "sample_grid": path,
+                "sample_cfg_scale": float(cfg_scale),
+                "sample_cfg_rescale": float(cfg_rescale),
+                "sample_cfg_mode": cfg_mode,
+                "sample_steps": int(sample_steps),
+                "sample_method": sample_method,
+                "sample_schedule": sample_schedule,
+                "sample_seed": int(seed),
+                "caption_cond_source": caption_cond_source,
+            },
+            row_metadata=row_meta, prefix="caption_sample"))
     return meta
 
 
@@ -4407,13 +6436,18 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                                  prompt_embed_device=None, prompt_embed_dtype="auto",
                                  prompt_embed_normalize=True, prompt_embed_stats_dim=0,
                                  prompt_embed_trust_remote_code=False,
+                                 prompt_embed_text_sequence_model="",
+                                 prompt_embed_text_sequence_max_length=0,
                                  negative_prompts=(), candidates_per_prompt=1,
                                  text_guidance_w=0.0,
                                  text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                                  feature_guidance_w=0.0,
                                  feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                                  quality_guidance_w=0.0,
-                                 quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL):
+                                 quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                                 sample_finite_guard=False, sample_velocity_clip=0.0,
+                                 sample_latent_clip=0.0, cfg_mode="standard",
+                                 sample_manifest_out="", sample_image_dir=""):
     ae.eval()
     flow.eval()
     prompts = tuple(str(p).strip() for p in prompts if str(p).strip())
@@ -4437,24 +6471,30 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         raise ValueError("quality_guidance_w must be non-negative")
     quality_guidance_interval = validate_guidance_interval(
         quality_guidance_interval, name="quality_guidance_interval")
+    prompt_return_tokens = flow_uses_cond_tokens(flow)
     cond, prompt_features = text_prompt_condition(
         prompts, conditioner, prompt_vocab=prompt_vocab, caption_max_len=caption_max_len,
-        source=caption_cond_source, device=device, return_tokens=flow_uses_cond_tokens(flow),
+        source=caption_cond_source, device=device, return_tokens=prompt_return_tokens,
         embed_backend=prompt_embed_backend, embed_model=prompt_embed_model,
         embed_device=prompt_embed_device, embed_dtype=prompt_embed_dtype,
         embed_normalize=prompt_embed_normalize, embed_stats_dim=prompt_embed_stats_dim,
-        trust_remote_code=prompt_embed_trust_remote_code, return_embedding=True)
+        trust_remote_code=prompt_embed_trust_remote_code,
+        text_sequence_model=prompt_embed_text_sequence_model,
+        text_sequence_max_length=prompt_embed_text_sequence_max_length,
+        return_embedding=True)
     negative_prompts = expand_negative_prompts(negative_prompts, len(prompts))
     cfg_uncond = None
     if negative_prompts:
         cfg_uncond = text_prompt_condition(
             negative_prompts, conditioner, prompt_vocab=prompt_vocab,
             caption_max_len=caption_max_len, source=caption_cond_source, device=device,
-            return_tokens=flow_uses_cond_tokens(flow),
+            return_tokens=prompt_return_tokens,
             embed_backend=prompt_embed_backend, embed_model=prompt_embed_model,
             embed_device=prompt_embed_device, embed_dtype=prompt_embed_dtype,
             embed_normalize=prompt_embed_normalize, embed_stats_dim=prompt_embed_stats_dim,
-            trust_remote_code=prompt_embed_trust_remote_code)
+            trust_remote_code=prompt_embed_trust_remote_code,
+            text_sequence_model=prompt_embed_text_sequence_model,
+            text_sequence_max_length=prompt_embed_text_sequence_max_length)
     sample_cond = repeat_condition_rows(cond, candidates_per_prompt)
     sample_uncond = repeat_condition_rows(cfg_uncond, candidates_per_prompt)
     text_aligner = getattr(flow, "text_aligner", None)
@@ -4464,29 +6504,35 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         prompt_features.repeat_interleave(candidates_per_prompt, dim=0)
         if torch.is_tensor(prompt_features) else None
     )
-    sample = sample_images(ae, flow, sample_cond, latent_shape=ae_latent_shape(ae, size),
-                           steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
-                           cfg_rescale=cfg_rescale,
-                           sample_method=sample_method, cfg_interval=cfg_interval,
-                           sample_time_shift=sample_time_shift,
-                           sample_schedule=sample_schedule, cfg_uncond=sample_uncond,
-                           sample_churn=sample_churn,
-                           sample_churn_interval=sample_churn_interval,
-                           text_guidance_w=text_guidance_w,
-                           text_guidance_aligner=text_aligner,
-                           text_guidance_cond=sample_cond,
-                           text_guidance_interval=text_guidance_interval,
-                           feature_guidance_w=feature_guidance_w,
-                           feature_guidance_aligner=image_feature_aligner,
-                           feature_guidance_features=sample_prompt_features,
-                           feature_guidance_interval=feature_guidance_interval,
-                           quality_guidance_w=quality_guidance_w,
-                           quality_guidance_scorer=quality_scorer,
-                           quality_guidance_interval=quality_guidance_interval)
+    sample, trace = sample_images(
+        ae, flow, sample_cond, latent_shape=ae_latent_shape(ae, size),
+        steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
+        cfg_rescale=cfg_rescale,
+        sample_method=sample_method, cfg_interval=cfg_interval,
+        sample_time_shift=sample_time_shift,
+        sample_schedule=sample_schedule, cfg_uncond=sample_uncond,
+        sample_churn=sample_churn,
+        sample_churn_interval=sample_churn_interval,
+        text_guidance_w=text_guidance_w,
+        text_guidance_aligner=text_aligner,
+        text_guidance_cond=sample_cond,
+        text_guidance_interval=text_guidance_interval,
+        feature_guidance_w=feature_guidance_w,
+        feature_guidance_aligner=image_feature_aligner,
+        feature_guidance_features=sample_prompt_features,
+        feature_guidance_interval=feature_guidance_interval,
+        quality_guidance_w=quality_guidance_w,
+        quality_guidance_scorer=quality_scorer,
+        quality_guidance_interval=quality_guidance_interval,
+        sample_finite_guard=sample_finite_guard,
+        sample_velocity_clip=sample_velocity_clip,
+        sample_latent_clip=sample_latent_clip,
+        cfg_mode=cfg_mode,
+        return_trace=True)
     sample, selection_meta = select_prompt_candidates(
         ae, sample, sample_cond, prompts, candidates_per_prompt=candidates_per_prompt,
         text_aligner=text_aligner, image_feature_aligner=image_feature_aligner,
-        prompt_features=prompt_features)
+        prompt_features=prompt_features, quality_scorer=quality_scorer)
     n = len(prompts)
     cols = int(np.ceil(np.sqrt(n)))
     rows = int(np.ceil(n / cols))
@@ -4494,6 +6540,7 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
     meta.update({
         "sample_grid_cfg_scale": float(cfg_scale),
         "sample_grid_cfg_rescale": float(cfg_rescale),
+        "sample_grid_cfg_mode": cfg_mode,
         "sample_grid_sample_steps": int(sample_steps),
         "sample_grid_sample_time_shift": float(sample_time_shift),
         "sample_grid_sample_method": sample_method,
@@ -4520,7 +6567,9 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         "sample_grid_cond_mode": "prompt",
         "sample_grid_caption_cond_source": caption_cond_source,
         "sample_grid_cfg_uncond_mode": (
-            "negative_prompt" if negative_prompts else "zero"
+            "negative_prompt" if negative_prompts
+            else "learned_null" if condition_has_null(cond)
+            else "zero"
         ),
         "sample_grid_negative_prompt_count": int(len(negative_prompts)),
         "sample_grid_negative_prompts": list(
@@ -4534,11 +6583,54 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         "sample_grid_prompt_embed_model": (
             prompt_embed_model if caption_cond_source == "embedding" else ""
         ),
+        "sample_grid_prompt_embed_text_sequence_model": (
+            prompt_embed_text_sequence_model if caption_cond_source == "embedding" else ""
+        ),
+        "sample_grid_prompt_embed_text_sequence_max_length": (
+            int(prompt_embed_text_sequence_max_length)
+            if caption_cond_source == "embedding" else 0
+        ),
         "sample_grid_prompt_embed_normalize": (
             bool(prompt_embed_normalize) if caption_cond_source == "embedding" else False
         ),
+        "sample_grid_prompt_embed_text_mode": (
+            "both" if caption_cond_source == "embedding" and prompt_return_tokens
+            else "pooled" if caption_cond_source == "embedding" else ""
+        ),
     })
     meta.update(selection_meta)
+    meta.update(prefix_sample_trace(trace, "sample_grid"))
+    meta.update(sample_health_metrics(sample, prefix="sample_grid"))
+    if sample_manifest_out:
+        selected = selection_meta.get("sample_grid_selected_candidate_indices", [])
+        row_meta = [
+            {
+                "conditioning_mode": "prompt",
+                "conditioning_prompt": prompt,
+                "negative_prompt": negative_prompts[idx] if negative_prompts else "",
+                "selected_candidate_index": int(selected[idx]) if idx < len(selected) else 0,
+                "candidates_per_prompt": int(candidates_per_prompt),
+            }
+            for idx, prompt in enumerate(prompts)
+        ]
+        meta.update(write_sample_manifest(
+            sample, sample_manifest_out, list(prompts), image_dir=sample_image_dir,
+            metadata={
+                "sample_grid": path,
+                "sample_cfg_scale": float(cfg_scale),
+                "sample_cfg_rescale": float(cfg_rescale),
+                "sample_cfg_mode": cfg_mode,
+                "sample_steps": int(sample_steps),
+                "sample_method": sample_method,
+                "sample_schedule": sample_schedule,
+                "sample_seed": int(seed),
+                "caption_cond_source": caption_cond_source,
+                "prompt_embed_backend": (
+                    prompt_embed_backend if caption_cond_source == "embedding" else ""),
+                "prompt_embed_model": (
+                    prompt_embed_model if caption_cond_source == "embedding" else ""),
+            },
+            row_metadata=row_meta, prefix="prompt_sample"))
     return meta
 
 
@@ -4552,7 +6644,9 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, cfg_resc
                           semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                           sample_time_shift=1.0, sample_schedule="linear",
                           sample_churn=0.0,
-                          sample_churn_interval=DEFAULT_CHURN_INTERVAL):
+                          sample_churn_interval=DEFAULT_CHURN_INTERVAL,
+                          sample_finite_guard=False, sample_velocity_clip=0.0,
+                          sample_latent_clip=0.0, cfg_mode="standard"):
     """Generate from every canonical color/shape request and re-read facts from the image."""
     samples_per_combo = int(samples_per_combo)
     if samples_per_combo <= 0:
@@ -4591,7 +6685,11 @@ def conditional_roundtrip(ae, flow, size=32, device=DEV, cfg_scale=1.0, cfg_resc
                                    sample_time_shift=sample_time_shift,
                                    sample_schedule=sample_schedule,
                                    sample_churn=sample_churn,
-                                   sample_churn_interval=sample_churn_interval)
+                                   sample_churn_interval=sample_churn_interval,
+                                   sample_finite_guard=sample_finite_guard,
+                                   sample_velocity_clip=sample_velocity_clip,
+                                   sample_latent_clip=sample_latent_clip,
+                                   cfg_mode=cfg_mode)
             out = ae(sample)
             pc = out["color"].argmax(-1)
             ps = out["shape"].argmax(-1)
@@ -4625,7 +6723,9 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
              cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
              semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
              sample_time_shift=1.0, sample_schedule="linear", time_shift=1.0,
-             sample_churn=0.0, sample_churn_interval=DEFAULT_CHURN_INTERVAL):
+             sample_churn=0.0, sample_churn_interval=DEFAULT_CHURN_INTERVAL,
+             sample_finite_guard=False, sample_velocity_clip=0.0,
+             sample_latent_clip=0.0, cfg_mode="standard"):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     ae.eval()
@@ -4667,17 +6767,23 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
     cond = model_condition([spec], fact_cond, cond_mode=cond_mode, conditioner=conditioner,
                            prompt_vocab=prompt_vocab, prompt_templates=prompt_templates,
                            rng=rng, device=device, return_tokens=flow_uses_cond_tokens(flow))
-    sample = sample_images(ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
-                           steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
-                           cfg_rescale=cfg_rescale,
-                           semantic_cond=fact_cond, semantic_guidance_w=semantic_guidance_w,
-                           semantic_guidance_mode=semantic_guidance_mode,
-                           sample_method=sample_method, cfg_interval=cfg_interval,
-                           semantic_guidance_interval=semantic_guidance_interval,
-                           sample_time_shift=sample_time_shift,
-                           sample_schedule=sample_schedule,
-                           sample_churn=sample_churn,
-                           sample_churn_interval=sample_churn_interval)
+    sample, trace = sample_images(
+        ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
+        steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
+        cfg_rescale=cfg_rescale,
+        semantic_cond=fact_cond, semantic_guidance_w=semantic_guidance_w,
+        semantic_guidance_mode=semantic_guidance_mode,
+        sample_method=sample_method, cfg_interval=cfg_interval,
+        semantic_guidance_interval=semantic_guidance_interval,
+        sample_time_shift=sample_time_shift,
+        sample_schedule=sample_schedule,
+        sample_churn=sample_churn,
+        sample_churn_interval=sample_churn_interval,
+        sample_finite_guard=sample_finite_guard,
+        sample_velocity_clip=sample_velocity_clip,
+        sample_latent_clip=sample_latent_clip,
+        cfg_mode=cfg_mode,
+        return_trace=True)
     target = torch.tensor(render_object(spec, size=side) * 2.0 - 1.0,
                           dtype=torch.float32, device=device)[None]
     report = {
@@ -4696,6 +6802,7 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
         "latent_endpoint_time_gap": float(np.mean(endpoint_time_gaps)),
         "cfg_scale": float(cfg_scale),
         "cfg_rescale": float(cfg_rescale),
+        "cfg_mode": cfg_mode,
         "cfg_interval": list(validate_guidance_interval(cfg_interval)),
         "sample_steps": int(sample_steps),
         "sample_time_shift": float(sample_time_shift),
@@ -4710,6 +6817,8 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
         "semantic_guidance_interval": list(validate_guidance_interval(
             semantic_guidance_interval)),
     }
+    report.update(trace)
+    report.update(sample_health_metrics(sample))
     if factor_orth_losses:
         report.update({
             "latent_factor_orth_loss": float(np.mean(factor_orth_losses)),
@@ -4731,7 +6840,11 @@ def evaluate(ae, flow, n=128, batch=64, seed=10, size=32, device=DEV, cfg_scale=
                                         sample_time_shift=sample_time_shift,
                                         sample_schedule=sample_schedule,
                                         sample_churn=sample_churn,
-                                        sample_churn_interval=sample_churn_interval))
+                                        sample_churn_interval=sample_churn_interval,
+                                        sample_finite_guard=sample_finite_guard,
+                                        sample_velocity_clip=sample_velocity_clip,
+                                        sample_latent_clip=sample_latent_clip,
+                                        cfg_mode=cfg_mode))
     if intervention_samples:
         report.update(latent_intervention_diagnostic(
             ae, n=intervention_samples, batch=batch, seed=seed + 31, size=size, device=device))
@@ -4758,7 +6871,9 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                            feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                            quality_guidance_w=0.0,
                            quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-                           generated_eval_n=0):
+                           generated_eval_n=0, generated_eval_candidates_per_prompt=1,
+                           sample_finite_guard=False, sample_velocity_clip=0.0,
+                           sample_latent_clip=0.0, cfg_mode="standard"):
     rng = np.random.default_rng(seed)
     ae.eval()
     flow.eval()
@@ -4779,6 +6894,9 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
     generated_eval_n = int(generated_eval_n)
     if generated_eval_n < 0:
         raise ValueError("generated_eval_n must be non-negative")
+    generated_eval_candidates_per_prompt = int(generated_eval_candidates_per_prompt)
+    if generated_eval_candidates_per_prompt <= 0:
+        raise ValueError("generated_eval_candidates_per_prompt must be positive")
     if text_guidance_w < 0.0:
         raise ValueError("text_guidance_w must be non-negative")
     if text_guidance_w > 0.0 and text_aligner is None:
@@ -4856,7 +6974,13 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
     sample_batch = max(1, int(batch))
     sample_rng = np.random.default_rng(seed + 17)
     sample_parts, sample_x_parts, sample_captions, sample_records = [], [], [], []
+    selection_scorer = "none"
+    selection_component_count = 0
+    selected_candidate_indices = []
+    selection_scores = []
+    selection_component_scores = defaultdict(list)
     sample_done = 0
+    sample_trace = {}
     while sample_done < sample_target_n:
         sample_b = min(sample_batch, sample_target_n - sample_done)
         chunk_x, chunk_captions, chunk_records = sample_image_text_batch(
@@ -4866,12 +6990,19 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
             chunk_captions, chunk_records, conditioner, prompt_vocab,
             source=caption_cond_source, max_len=caption_max_len, device=device,
             return_tokens=flow_uses_cond_tokens(flow))
+        chunk_sample_cond = repeat_condition_rows(
+            chunk_cond, generated_eval_candidates_per_prompt)
         chunk_text_features = (
             record_text_embedding_tensor(chunk_records, device=device)
-            if feature_guidance_w > 0.0 else None
+            if (feature_guidance_w > 0.0 or image_feature_aligner is not None) else None
         )
-        sample_parts.append(sample_images(
-            ae, flow, chunk_cond,
+        chunk_guidance_features = (
+            chunk_text_features.repeat_interleave(
+                generated_eval_candidates_per_prompt, dim=0)
+            if feature_guidance_w > 0.0 and torch.is_tensor(chunk_text_features) else None
+        )
+        chunk_sample, chunk_trace = sample_images(
+            ae, flow, chunk_sample_cond,
             latent_shape=ae_latent_shape(ae, size),
             steps=sample_steps, device=device,
             seed=(seed if sample_done == 0 else seed + sample_done),
@@ -4884,18 +7015,45 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
             sample_churn_interval=sample_churn_interval,
             text_guidance_w=text_guidance_w,
             text_guidance_aligner=text_aligner,
-            text_guidance_cond=chunk_cond,
+            text_guidance_cond=chunk_sample_cond,
             text_guidance_interval=text_guidance_interval,
             feature_guidance_w=feature_guidance_w,
             feature_guidance_aligner=image_feature_aligner,
-            feature_guidance_features=chunk_text_features,
+            feature_guidance_features=chunk_guidance_features,
             feature_guidance_interval=feature_guidance_interval,
             quality_guidance_w=quality_guidance_w,
             quality_guidance_scorer=image_quality_scorer,
-            quality_guidance_interval=quality_guidance_interval))
+            quality_guidance_interval=quality_guidance_interval,
+            sample_finite_guard=sample_finite_guard,
+            sample_velocity_clip=sample_velocity_clip,
+            sample_latent_clip=sample_latent_clip,
+            cfg_mode=cfg_mode,
+            return_trace=True)
+        chunk_sample, chunk_selection = select_prompt_candidates(
+            ae, chunk_sample, chunk_sample_cond, chunk_captions,
+            candidates_per_prompt=generated_eval_candidates_per_prompt,
+            text_aligner=text_aligner, image_feature_aligner=image_feature_aligner,
+            prompt_features=chunk_text_features, quality_scorer=image_quality_scorer)
+        sample_parts.append(chunk_sample)
+        sample_trace = merge_sample_traces(sample_trace, chunk_trace)
         sample_x_parts.append(chunk_x)
         sample_captions.extend(chunk_captions)
         sample_records.extend(chunk_records)
+        selection_scorer = str(chunk_selection.get(
+            "sample_grid_selection_scorer", selection_scorer))
+        selection_component_count = max(
+            int(selection_component_count),
+            int(chunk_selection.get("sample_grid_selection_component_count", 0) or 0))
+        selected_candidate_indices.extend(
+            int(x) for x in chunk_selection.get(
+                "sample_grid_selected_candidate_indices", []))
+        if "sample_grid_selection_score_mean" in chunk_selection:
+            selection_scores.append(float(chunk_selection["sample_grid_selection_score_mean"]))
+        for key, value in chunk_selection.items():
+            if (key.startswith("sample_grid_selection_")
+                    and key.endswith("_mean")
+                    and key != "sample_grid_selection_score_mean"):
+                selection_component_scores[key].append(float(value))
         sample_done += sample_b
     sample = torch.cat(sample_parts, dim=0)
     sample_x = torch.cat(sample_x_parts, dim=0)
@@ -4916,11 +7074,20 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         "caption_sample_mse": float(F.mse_loss(sample, sample_x[:sample.shape[0]]).detach().cpu()),
         "cfg_scale": float(cfg_scale),
         "cfg_rescale": float(cfg_rescale),
+        "cfg_mode": cfg_mode,
         "cfg_interval": list(validate_guidance_interval(cfg_interval)),
         "sample_steps": int(sample_steps),
         "generated_eval_n": int(sample.shape[0]),
         "generated_eval_n_requested": int(generated_eval_n),
         "generated_eval_batch": int(sample_batch),
+        "generated_eval_candidates_per_prompt": int(generated_eval_candidates_per_prompt),
+        "generated_eval_raw_candidates": int(
+            sample.shape[0] * generated_eval_candidates_per_prompt),
+        "generated_eval_selection_scorer": selection_scorer,
+        "generated_eval_selection_component_count": int(selection_component_count),
+        "generated_eval_selected_candidate_indices": selected_candidate_indices,
+        "generated_eval_selection_score_mean": (
+            float(np.mean(selection_scores)) if selection_scores else 0.0),
         "sample_time_shift": float(sample_time_shift),
         "time_shift": float(time_shift),
         "sample_method": sample_method,
@@ -4939,6 +7106,10 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         "data_mode": "image_manifest",
         "eval_captions": sample_captions[:min(3, len(sample_captions))],
     }
+    report.update(sample_trace)
+    report.update(sample_health_metrics(sample))
+    for key, values in selection_component_scores.items():
+        report[key.replace("sample_grid_", "generated_eval_")] = float(np.mean(values))
     if text_aligner is not None:
         sample_z = ae.encode(sample)
         _sample_align_loss, sample_align_parts = image_text_alignment_loss(
@@ -5035,6 +7206,21 @@ def load_flow_state(flow, state_dict):
     return {"missing": list(missing), "unexpected": list(unexpected)}
 
 
+def load_conditioner_state(conditioner, state_dict):
+    missing, unexpected = conditioner.load_state_dict(state_dict, strict=False)
+    allowed_missing = [
+        key for key in missing
+        if key.startswith("null_") or key in ("null_vec", "null_token", "null_tokens")
+    ]
+    bad_missing = sorted(set(missing) - set(allowed_missing))
+    if bad_missing or unexpected:
+        raise RuntimeError(
+            f"conditioner checkpoint mismatch: missing={bad_missing}, "
+            f"unexpected={list(unexpected)}"
+        )
+    return {"missing": list(missing), "unexpected": list(unexpected)}
+
+
 def clone_state_dict(module):
     return {k: v.detach().clone() for k, v in module.state_dict().items()}
 
@@ -5081,6 +7267,10 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     ae_res_blocks = int(ckpt.get("ae_res_blocks", report.get("ae_res_blocks", 0)))
     latent_max_tokens = int(ckpt.get("latent_max_tokens",
                                      report.get("latent_max_tokens", 256)))
+    latent_patch_size = int(ckpt.get("latent_patch_size",
+                                     report.get("latent_patch_size", 1)) or 1)
+    if latent_patch_size <= 0:
+        raise ValueError("latent_patch_size must be positive")
     dit_depth = int(ckpt.get("dit_depth", report.get("dit_depth", 3)))
     dit_heads = int(ckpt.get("dit_heads", report.get("dit_heads", 4)))
     dit_head_width_mult = int(ckpt.get("dit_head_width_mult",
@@ -5093,10 +7283,17 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                         or "learned")
     if dit_pos_embed not in DIT_POS_EMBEDS:
         raise ValueError(f"unknown DiT positional embedding {dit_pos_embed!r}")
+    dit_mlp = str(ckpt.get("dit_mlp", report.get("dit_mlp", "gelu")) or "gelu")
+    if dit_mlp not in DIT_MLPS:
+        raise ValueError(f"unknown DiT MLP {dit_mlp!r}")
     flow_checkpoint_blocks = bool(ckpt.get(
         "flow_checkpoint_blocks", report.get("flow_checkpoint_blocks", False)))
-    cond_mode = ckpt.get("cond_mode", report.get("cond_mode", "facts"))
-    data_mode = ckpt.get("data_mode", report.get("data_mode", "synthetic_factors"))
+    cond_mode = ckpt.get("cond_mode", report.get("cond_mode", "text"))
+    data_mode = ckpt.get(
+        "data_mode",
+        report.get(
+            "data_mode",
+            "synthetic_fixture" if cond_mode == "facts" else "image_manifest"))
     cond_dim = int(ckpt.get("cond_dim", report.get("cond_dim", len(FACT_VOCAB))))
     caption_cond_source = ckpt.get("caption_cond_source",
                                    report.get("caption_cond_source", "tokens"))
@@ -5113,6 +7310,15 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "flow_quality_score_w", report.get("flow_quality_score_w", 0.0)) or 0.0)
     flow_repa_embed_dim = int(ckpt.get(
         "flow_repa_embed_dim", report.get("flow_repa_embed_dim", 128)) or 128)
+    flow_repa_mode = str(ckpt.get("flow_repa_mode", report.get("flow_repa_mode", "pooled"))
+                         or "pooled")
+    flow_self_repa_embed_dim = int(ckpt.get(
+        "flow_self_repa_embed_dim",
+        report.get("flow_self_repa_embed_dim", 128)) or 128)
+    flow_self_repa_mode = str(ckpt.get(
+        "flow_self_repa_mode", report.get("flow_self_repa_mode", "pooled")) or "pooled")
+    flow_sra_mode = str(ckpt.get(
+        "flow_sra_mode", report.get("flow_sra_mode", "token")) or "token")
     ae_hf_model = str(ckpt.get("ae_hf_model", report.get("ae_hf_model", "")) or "")
     ae_hf_subfolder = str(ckpt.get(
         "ae_hf_subfolder", report.get("ae_hf_subfolder", "")) or "")
@@ -5141,7 +7347,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         cond_state = ckpt["conditioner_state_dict"]
         if prefer_ema and ckpt.get("conditioner_ema_state_dict"):
             cond_state = ckpt["conditioner_ema_state_dict"]
-        conditioner.load_state_dict(cond_state)
+        load_conditioner_state(conditioner, cond_state)
         conditioner.eval()
     text_aligner = None
     if ckpt.get("text_aligner_state_dict"):
@@ -5180,6 +7386,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                      dit_qk_norm=dit_qk_norm,
                      dit_attn_impl=dit_attn_impl,
                      dit_pos_embed=dit_pos_embed,
+                     dit_mlp=dit_mlp,
+                     latent_patch_size=latent_patch_size,
                      flow_checkpoint_blocks=flow_checkpoint_blocks).to(device)
     flow_repa_aligner = None
     if ckpt.get("flow_repa_aligner_state_dict"):
@@ -5193,6 +7401,17 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
             hidden=hidden, embed_dim=flow_repa_embed_dim).to(device)
         flow_repa_aligner.load_state_dict(ckpt["flow_repa_aligner_state_dict"])
         flow_repa_aligner.eval()
+    flow_self_repa_aligner = None
+    if ckpt.get("flow_self_repa_aligner_state_dict"):
+        hidden_feature_dim = flow_hidden_feature_dim(flow)
+        if hidden_feature_dim <= 0:
+            raise ValueError("self-REPA-aligned checkpoint requires a transformer flow")
+        flow_self_repa_aligner = FlowLatentAligner(
+            hidden_dim=hidden_feature_dim, latent_ch=latent_ch,
+            patch_size=latent_patch_size, hidden=hidden,
+            embed_dim=flow_self_repa_embed_dim).to(device)
+        flow_self_repa_aligner.load_state_dict(ckpt["flow_self_repa_aligner_state_dict"])
+        flow_self_repa_aligner.eval()
     latent_stats = latent_stats_to_device(
         ckpt.get("latent_stats", {"mode": ckpt.get("latent_normalize", "none")}),
         device)
@@ -5210,6 +7429,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     attach_image_feature_aligner(flow, image_feature_aligner)
     attach_image_quality_scorer(flow, image_quality_scorer)
     attach_flow_repa_aligner(flow, flow_repa_aligner)
+    attach_flow_self_repa_aligner(flow, flow_self_repa_aligner)
     ae.eval()
     flow.eval()
     return ae, flow, conditioner, prompt_vocab, prompt_templates, {
@@ -5230,6 +7450,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "latent_downsample": int(getattr(ae, "downsample", latent_downsample)),
         "ae_res_blocks": int(ae_res_blocks) if ae_arch == "residual" else 0,
         "latent_max_tokens": int(latent_max_tokens),
+        "latent_patch_size": int(latent_patch_size),
         "hidden": hidden,
         "flow_arch": flow_arch,
         "dit_depth": dit_depth if flow_arch in ("dit", "crossdit", "mmdit") else 0,
@@ -5240,6 +7461,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "dit_qk_norm": bool(dit_qk_norm) if flow_arch == "mmdit" else False,
         "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
         "dit_pos_embed": dit_pos_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
+        "dit_mlp": dit_mlp if flow_arch in ("dit", "crossdit", "mmdit") else "",
+        "uses_swiglu_mlp": bool(getattr(flow, "uses_swiglu_mlp", False)),
         "flow_checkpoint_blocks": bool(getattr(flow, "checkpoint_blocks", False)),
         "activation_checkpointing": bool(getattr(flow, "uses_activation_checkpointing", False)),
         "uses_2d_pos_embed": bool(getattr(flow, "uses_2d_pos_embed", False)),
@@ -5277,6 +7500,13 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
             "time_shift_dim_scale", report.get("time_shift_dim_scale", 1.0))),
         "flow_loss_weight": str(ckpt.get(
             "flow_loss_weight", report.get("flow_loss_weight", "none"))),
+        "flow_noise_coupling": str(ckpt.get(
+            "flow_noise_coupling", report.get("flow_noise_coupling", "random"))),
+        "flow_noise_coupling_projections": int(ckpt.get(
+            "flow_noise_coupling_projections",
+            report.get("flow_noise_coupling_projections", 1)) or 1),
+        "flow_endpoint_w": float(ckpt.get(
+            "flow_endpoint_w", report.get("flow_endpoint_w", 0.0)) or 0.0),
         "flow_loss_weight_gamma": float(ckpt.get(
             "flow_loss_weight_gamma", report.get("flow_loss_weight_gamma", 5.0))),
         "flow_loss_weight_normalize": bool(ckpt.get(
@@ -5284,12 +7514,20 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "sample_time_shift": float(ckpt.get(
             "sample_time_shift", report.get("sample_time_shift",
                                              report.get("time_shift", 1.0)))),
+        "cfg_mode": str(ckpt.get("cfg_mode", report.get("cfg_mode", "standard"))
+                        or "standard"),
         "sample_churn": float(ckpt.get(
             "sample_churn", report.get("sample_churn", 0.0)) or 0.0),
         "sample_churn_interval": tuple(ckpt.get(
             "sample_churn_interval",
             report.get("sample_churn_interval", DEFAULT_CHURN_INTERVAL))
             or DEFAULT_CHURN_INTERVAL),
+        "sample_finite_guard": bool(ckpt.get(
+            "sample_finite_guard", report.get("sample_finite_guard", False))),
+        "sample_velocity_clip": float(ckpt.get(
+            "sample_velocity_clip", report.get("sample_velocity_clip", 0.0)) or 0.0),
+        "sample_latent_clip": float(ckpt.get(
+            "sample_latent_clip", report.get("sample_latent_clip", 0.0)) or 0.0),
         "flow_ema_warmup": bool(ckpt.get("flow_ema_warmup",
                                          report.get("flow_ema_warmup", False))),
         "flow_ema_effective_decay": float(ckpt.get(
@@ -5319,6 +7557,11 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "flow_quality_score_w": float(flow_quality_score_w),
         "flow_repa_aligner": flow_repa_aligner is not None,
         "flow_repa_embed_dim": int(flow_repa_embed_dim),
+        "flow_repa_mode": str(flow_repa_mode),
+        "flow_self_repa_aligner": flow_self_repa_aligner is not None,
+        "flow_self_repa_embed_dim": int(flow_self_repa_embed_dim),
+        "flow_self_repa_mode": str(flow_self_repa_mode),
+        "flow_sra_mode": str(flow_sra_mode),
         "image_text_align_w": float(ckpt.get(
             "image_text_align_w", report.get("image_text_align_w", 0.0))),
         "flow_text_align_w": float(ckpt.get(
@@ -5330,6 +7573,15 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "flow_repa_w": float(ckpt.get("flow_repa_w", report.get("flow_repa_w", 0.0))),
         "flow_repa_steps": int(ckpt.get(
             "flow_repa_steps", report.get("flow_repa_steps", 0)) or 0),
+        "flow_self_repa_w": float(ckpt.get(
+            "flow_self_repa_w", report.get("flow_self_repa_w", 0.0))),
+        "flow_self_repa_steps": int(ckpt.get(
+            "flow_self_repa_steps", report.get("flow_self_repa_steps", 0)) or 0),
+        "flow_sra_w": float(ckpt.get("flow_sra_w", report.get("flow_sra_w", 0.0))),
+        "flow_sra_steps": int(ckpt.get(
+            "flow_sra_steps", report.get("flow_sra_steps", 0)) or 0),
+        "flow_sra_time_gap": float(ckpt.get(
+            "flow_sra_time_gap", report.get("flow_sra_time_gap", 0.25)) or 0.25),
     }
 
 
@@ -5340,21 +7592,30 @@ def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                   prompt_templates=DEFAULT_PROMPT_TEMPLATES, semantic_guidance_w=0.0,
                   semantic_guidance_weights=None, semantic_guidance_mode="decoded",
                   sample_method="euler", sample_methods=None, cfg_rescales=(0.0,),
+                  cfg_modes=None,
                   sample_schedule="linear", sample_schedules=None,
                   sample_churn=0.0, sample_churns=None,
                   sample_churn_interval=DEFAULT_CHURN_INTERVAL,
                   cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                   semantic_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-                  sample_time_shift=1.0, time_shift=1.0):
+                  sample_time_shift=1.0, time_shift=1.0,
+                  sample_finite_guard=False, sample_velocity_clip=0.0,
+                  sample_latent_clip=0.0):
     if semantic_guidance_weights is None:
         semantic_guidance_weights = (semantic_guidance_w,)
     if sample_methods is None:
         sample_methods = (sample_method,)
     if sample_schedules is None:
         sample_schedules = (sample_schedule,)
+    if cfg_modes is None:
+        cfg_modes = ("standard",)
     if sample_churns is None:
         sample_churns = (sample_churn,)
     cfg_rescales = tuple(float(x) for x in cfg_rescales)
+    cfg_modes = tuple(str(x) for x in cfg_modes)
+    bad_cfg_modes = sorted(set(cfg_modes) - set(CFG_MODES))
+    if bad_cfg_modes:
+        raise ValueError(f"unknown cfg mode(s): {','.join(bad_cfg_modes)}")
     sample_churns = tuple(float(x) for x in sample_churns)
     if any(x < 0.0 for x in sample_churns):
         raise ValueError("sample_churns must be non-negative")
@@ -5363,39 +7624,50 @@ def sampler_sweep(ae, flow, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
     rows = []
     for cfg_scale in cfg_scales:
         for cfg_rescale in cfg_rescales:
-            for sample_steps in sample_steps_list:
-                for method in sample_methods:
-                    for schedule in sample_schedules:
-                        for churn in sample_churns:
-                            for guidance_w in semantic_guidance_weights:
-                                row = evaluate(
-                                    ae, flow, n=n, batch=batch, seed=seed, size=size,
-                                    device=device, cfg_scale=float(cfg_scale),
-                                    cfg_rescale=float(cfg_rescale),
-                                    sample_steps=int(sample_steps),
-                                    roundtrip_samples=roundtrip_samples,
-                                    cond_mode=cond_mode, conditioner=conditioner,
-                                    prompt_vocab=prompt_vocab,
-                                    prompt_templates=prompt_templates,
-                                    semantic_guidance_w=float(guidance_w),
-                                    semantic_guidance_mode=semantic_guidance_mode,
-                                    sample_method=method, sample_schedule=schedule,
-                                    cfg_interval=cfg_interval,
-                                    semantic_guidance_interval=semantic_guidance_interval,
-                                    sample_time_shift=sample_time_shift, time_shift=time_shift,
-                                    sample_churn=float(churn),
-                                    sample_churn_interval=sample_churn_interval)
-                                row["sweep_key"] = (
-                                    f"cfg={float(cfg_scale):g};rescale={float(cfg_rescale):g};"
-                                    f"steps={int(sample_steps)};method={method};"
-                                    f"schedule={schedule};churn={float(churn):g};"
-                                    f"churnint={format_interval(sample_churn_interval)};"
-                                    f"sem={float(guidance_w):g};"
-                                    f"shift={float(sample_time_shift):g};"
-                                    f"cfgint={format_interval(cfg_interval)};"
-                                    f"semint={format_interval(semantic_guidance_interval)}"
-                                )
-                                rows.append(row)
+            for cfg_mode in cfg_modes:
+                for sample_steps in sample_steps_list:
+                    for method in sample_methods:
+                        for schedule in sample_schedules:
+                            for churn in sample_churns:
+                                for guidance_w in semantic_guidance_weights:
+                                    row = evaluate(
+                                        ae, flow, n=n, batch=batch, seed=seed, size=size,
+                                        device=device, cfg_scale=float(cfg_scale),
+                                        cfg_rescale=float(cfg_rescale),
+                                        cfg_mode=cfg_mode,
+                                        sample_steps=int(sample_steps),
+                                        roundtrip_samples=roundtrip_samples,
+                                        cond_mode=cond_mode, conditioner=conditioner,
+                                        prompt_vocab=prompt_vocab,
+                                        prompt_templates=prompt_templates,
+                                        semantic_guidance_w=float(guidance_w),
+                                        semantic_guidance_mode=semantic_guidance_mode,
+                                        sample_method=method, sample_schedule=schedule,
+                                        cfg_interval=cfg_interval,
+                                        semantic_guidance_interval=semantic_guidance_interval,
+                                        sample_time_shift=sample_time_shift,
+                                        time_shift=time_shift,
+                                        sample_churn=float(churn),
+                                        sample_churn_interval=sample_churn_interval,
+                                        sample_finite_guard=sample_finite_guard,
+                                        sample_velocity_clip=sample_velocity_clip,
+                                        sample_latent_clip=sample_latent_clip)
+                                    row["sweep_key"] = (
+                                        f"cfg={float(cfg_scale):g};"
+                                        f"rescale={float(cfg_rescale):g};"
+                                        f"cfgmode={cfg_mode};"
+                                        f"steps={int(sample_steps)};method={method};"
+                                        f"schedule={schedule};churn={float(churn):g};"
+                                        f"churnint={format_interval(sample_churn_interval)};"
+                                        f"sem={float(guidance_w):g};"
+                                        f"shift={float(sample_time_shift):g};"
+                                        f"finiteguard={int(bool(sample_finite_guard))};"
+                                        f"vclip={float(sample_velocity_clip):g};"
+                                        f"zclip={float(sample_latent_clip):g};"
+                                        f"cfgint={format_interval(cfg_interval)};"
+                                        f"semint={format_interval(semantic_guidance_interval)}"
+                                    )
+                                    rows.append(row)
     return rows
 
 
@@ -5404,6 +7676,7 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                        n=128, batch=64, seed=10, size=32, device=DEV, conditioner=None,
                        prompt_vocab=None, caption_max_len=64, sample_method="euler",
                        sample_methods=None, cfg_rescales=(0.0,),
+                       cfg_modes=None,
                        sample_schedule="linear", sample_schedules=None,
                        cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
                        text_aligner=None, image_feature_aligner=None,
@@ -5418,14 +7691,22 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                        feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                        quality_guidance_weights=(0.0,),
                        quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
-                       generated_eval_n=0):
+                       generated_eval_n=0, generated_eval_candidates_per_prompt=1,
+                       sample_finite_guard=False, sample_velocity_clip=0.0,
+                       sample_latent_clip=0.0):
     if sample_methods is None:
         sample_methods = (sample_method,)
     if sample_schedules is None:
         sample_schedules = (sample_schedule,)
+    if cfg_modes is None:
+        cfg_modes = ("standard",)
     if sample_churns is None:
         sample_churns = (sample_churn,)
     cfg_rescales = tuple(float(x) for x in cfg_rescales)
+    cfg_modes = tuple(str(x) for x in cfg_modes)
+    bad_cfg_modes = sorted(set(cfg_modes) - set(CFG_MODES))
+    if bad_cfg_modes:
+        raise ValueError(f"unknown cfg mode(s): {','.join(bad_cfg_modes)}")
     sample_churns = tuple(float(x) for x in sample_churns)
     if any(x < 0.0 for x in sample_churns):
         raise ValueError("sample_churns must be non-negative")
@@ -5434,62 +7715,79 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
     text_guidance_weights = tuple(float(x) for x in (text_guidance_weights or (0.0,)))
     feature_guidance_weights = tuple(float(x) for x in (feature_guidance_weights or (0.0,)))
     quality_guidance_weights = tuple(float(x) for x in (quality_guidance_weights or (0.0,)))
+    generated_eval_candidates_per_prompt = int(generated_eval_candidates_per_prompt)
+    if generated_eval_candidates_per_prompt <= 0:
+        raise ValueError("generated_eval_candidates_per_prompt must be positive")
     rows = []
     for cfg_scale in cfg_scales:
         for cfg_rescale in cfg_rescales:
-            for sample_steps in sample_steps_list:
-                for method in sample_methods:
-                    for schedule in sample_schedules:
-                        for churn in sample_churns:
-                            for text_w in text_guidance_weights:
-                                for feature_w in feature_guidance_weights:
-                                    for quality_w in quality_guidance_weights:
-                                        row = evaluate_image_records(
-                                            ae, flow, records, n=n, batch=batch, seed=seed,
-                                            size=size, device=device, conditioner=conditioner,
-                                            prompt_vocab=prompt_vocab,
-                                            caption_max_len=caption_max_len,
-                                            cfg_scale=float(cfg_scale),
-                                            cfg_rescale=float(cfg_rescale),
-                                            sample_steps=int(sample_steps), sample_method=method,
-                                            sample_schedule=schedule,
-                                            cfg_interval=cfg_interval,
-                                            text_aligner=text_aligner,
-                                            image_feature_aligner=image_feature_aligner,
-                                            image_quality_scorer=image_quality_scorer,
-                                            caption_cond_source=caption_cond_source,
-                                            sample_time_shift=sample_time_shift,
-                                            time_shift=time_shift,
-                                            sample_churn=float(churn),
-                                            sample_churn_interval=sample_churn_interval,
-                                            text_guidance_w=float(text_w),
-                                            text_guidance_interval=text_guidance_interval,
-                                            feature_guidance_w=float(feature_w),
-                                            feature_guidance_interval=feature_guidance_interval,
-                                            quality_guidance_w=float(quality_w),
-                                            quality_guidance_interval=quality_guidance_interval,
-                                            generated_eval_n=generated_eval_n)
-                                        row["semantic_guidance_w"] = 0.0
-                                        row["semantic_guidance_mode"] = "none"
-                                        row["semantic_guidance_interval"] = list(
-                                            DEFAULT_GUIDANCE_INTERVAL)
-                                        row["sweep_key"] = (
-                                            f"cfg={float(cfg_scale):g};"
-                                            f"rescale={float(cfg_rescale):g};"
-                                            f"steps={int(sample_steps)};method={method};"
-                                            f"schedule={schedule};"
-                                            f"churn={float(churn):g};"
-                                            f"churnint={format_interval(sample_churn_interval)};"
-                                            f"shift={float(sample_time_shift):g};"
-                                            f"text={float(text_w):g};"
-                                            f"feature={float(feature_w):g};"
-                                            f"quality={float(quality_w):g};"
-                                            f"cfgint={format_interval(cfg_interval)};"
-                                            f"textint={format_interval(text_guidance_interval)};"
-                                            f"featureint={format_interval(feature_guidance_interval)};"
-                                            f"qualityint={format_interval(quality_guidance_interval)}"
-                                        )
-                                        rows.append(row)
+            for cfg_mode in cfg_modes:
+                for sample_steps in sample_steps_list:
+                    for method in sample_methods:
+                        for schedule in sample_schedules:
+                            for churn in sample_churns:
+                                for text_w in text_guidance_weights:
+                                    for feature_w in feature_guidance_weights:
+                                        for quality_w in quality_guidance_weights:
+                                            row = evaluate_image_records(
+                                                ae, flow, records, n=n, batch=batch, seed=seed,
+                                                size=size, device=device, conditioner=conditioner,
+                                                prompt_vocab=prompt_vocab,
+                                                caption_max_len=caption_max_len,
+                                                cfg_scale=float(cfg_scale),
+                                                cfg_rescale=float(cfg_rescale),
+                                                cfg_mode=cfg_mode,
+                                                sample_steps=int(sample_steps),
+                                                sample_method=method,
+                                                sample_schedule=schedule,
+                                                cfg_interval=cfg_interval,
+                                                text_aligner=text_aligner,
+                                                image_feature_aligner=image_feature_aligner,
+                                                image_quality_scorer=image_quality_scorer,
+                                                caption_cond_source=caption_cond_source,
+                                                sample_time_shift=sample_time_shift,
+                                                time_shift=time_shift,
+                                                sample_churn=float(churn),
+                                                sample_churn_interval=sample_churn_interval,
+                                                text_guidance_w=float(text_w),
+                                                text_guidance_interval=text_guidance_interval,
+                                                feature_guidance_w=float(feature_w),
+                                                feature_guidance_interval=feature_guidance_interval,
+                                                quality_guidance_w=float(quality_w),
+                                                quality_guidance_interval=quality_guidance_interval,
+                                                generated_eval_n=generated_eval_n,
+                                                generated_eval_candidates_per_prompt=(
+                                                    generated_eval_candidates_per_prompt),
+                                                sample_finite_guard=sample_finite_guard,
+                                                sample_velocity_clip=sample_velocity_clip,
+                                                sample_latent_clip=sample_latent_clip)
+                                            row["semantic_guidance_w"] = 0.0
+                                            row["semantic_guidance_mode"] = "none"
+                                            row["semantic_guidance_interval"] = list(
+                                                DEFAULT_GUIDANCE_INTERVAL)
+                                            row["sweep_key"] = (
+                                                f"cfg={float(cfg_scale):g};"
+                                                f"rescale={float(cfg_rescale):g};"
+                                                f"cfgmode={cfg_mode};"
+                                                f"steps={int(sample_steps)};method={method};"
+                                                f"schedule={schedule};"
+                                                f"churn={float(churn):g};"
+                                                f"churnint={format_interval(sample_churn_interval)};"
+                                                f"shift={float(sample_time_shift):g};"
+                                                f"finiteguard={int(bool(sample_finite_guard))};"
+                                                f"vclip={float(sample_velocity_clip):g};"
+                                                f"zclip={float(sample_latent_clip):g};"
+                                                f"candidates="
+                                                f"{int(generated_eval_candidates_per_prompt)};"
+                                                f"text={float(text_w):g};"
+                                                f"feature={float(feature_w):g};"
+                                                f"quality={float(quality_w):g};"
+                                                f"cfgint={format_interval(cfg_interval)};"
+                                                f"textint={format_interval(text_guidance_interval)};"
+                                                f"featureint={format_interval(feature_guidance_interval)};"
+                                                f"qualityint={format_interval(quality_guidance_interval)}"
+                                            )
+                                            rows.append(row)
     return rows
 
 
@@ -5533,7 +7831,37 @@ SWEEP_METRICS = (
     "generated_external_text_image_score_t2i_acc",
     "image_quality_score_pred_mean",
     "generated_image_quality_score_pred_mean",
+    "generated_eval_raw_candidates",
+    "generated_eval_selection_component_count",
+    "generated_eval_selection_score_mean",
+    "generated_eval_selection_text_aligner_mean",
+    "generated_eval_selection_image_feature_aligner_mean",
+    "generated_eval_selection_quality_scorer_mean",
     "sample_center_target_mse",
+    "sample_finite_frac",
+    "sample_nonfinite_frac",
+    "sample_trace_min_velocity_finite_frac",
+    "sample_trace_min_latent_finite_frac",
+    "sample_trace_final_latent_finite_frac",
+    "sample_trace_velocity_nonfinite_steps",
+    "sample_trace_latent_nonfinite_steps",
+    "sample_trace_finite_guard_events",
+    "sample_trace_velocity_clip_events",
+    "sample_trace_latent_clip_events",
+    "sample_trace_max_velocity_rms",
+    "sample_trace_max_velocity_abs",
+    "sample_trace_max_latent_rms",
+    "sample_trace_max_latent_abs",
+    "sample_trace_final_latent_rms",
+    "sample_trace_final_latent_abs",
+    "sample_luminance_mean",
+    "sample_luminance_std",
+    "sample_rgb_std",
+    "sample_dynamic_range",
+    "sample_low_luminance_frac",
+    "sample_high_luminance_frac",
+    "sample_collapsed_frac",
+    "sample_health_score",
     "recon_mse",
     "latent_velocity_mse",
     "latent_endpoint_mse",
@@ -5555,6 +7883,7 @@ def report_selection_key(report):
         float(report.get("sample_roundtrip_color_acc", 0.0)),
         float(report.get("generated_external_text_image_score_cos", 0.0)),
         float(report.get("generated_image_quality_score_pred_mean", 0.0)),
+        float(report.get("generated_eval_selection_score_mean", 0.0)),
         float(report.get("generated_image_feature_retrieval_i2f_acc", 0.0)),
         -float(report.get("generated_image_feature_distribution_frechet", inf)),
         -float(report.get("generated_image_feature_distribution_mmd_rbf", inf)),
@@ -5563,6 +7892,17 @@ def report_selection_key(report):
         -abs(math.log(max(float(
             report.get("generated_image_feature_distribution_diversity_l2_ratio", 1.0)
         ), 1.0e-8))),
+        float(report.get("sample_health_score", 0.0)),
+        float(report.get("sample_finite_frac", 0.0)),
+        -float(report.get("sample_nonfinite_frac", 1.0)),
+        float(report.get("sample_trace_min_velocity_finite_frac", 0.0)),
+        float(report.get("sample_trace_min_latent_finite_frac", 0.0)),
+        float(report.get("sample_trace_final_latent_finite_frac", 0.0)),
+        -float(report.get("sample_trace_velocity_nonfinite_steps", 1.0e9)),
+        -float(report.get("sample_trace_latent_nonfinite_steps", 1.0e9)),
+        float(report.get("sample_dynamic_range", 0.0)),
+        float(report.get("sample_luminance_std", 0.0)),
+        -float(report.get("sample_collapsed_frac", 1.0)),
         float(report.get("external_text_image_score_cos", 0.0)),
         float(report.get("image_feature_retrieval_i2f_acc", 0.0)),
         float(report.get("generated_caption_retrieval_i2t_acc", 0.0)),
@@ -5585,6 +7925,7 @@ def aggregate_selection_key(report):
         float(report.get("sample_roundtrip_color_acc_mean", 0.0)),
         float(report.get("generated_external_text_image_score_cos_mean", 0.0)),
         float(report.get("generated_image_quality_score_pred_mean_mean", 0.0)),
+        float(report.get("generated_eval_selection_score_mean_mean", 0.0)),
         float(report.get("generated_image_feature_retrieval_i2f_acc_mean", 0.0)),
         -float(report.get("generated_image_feature_distribution_frechet_mean", inf)),
         -float(report.get("generated_image_feature_distribution_mmd_rbf_mean", inf)),
@@ -5593,6 +7934,17 @@ def aggregate_selection_key(report):
         -abs(math.log(max(float(
             report.get("generated_image_feature_distribution_diversity_l2_ratio_mean", 1.0)
         ), 1.0e-8))),
+        float(report.get("sample_health_score_mean", 0.0)),
+        float(report.get("sample_finite_frac_mean", 0.0)),
+        -float(report.get("sample_nonfinite_frac_mean", 1.0)),
+        float(report.get("sample_trace_min_velocity_finite_frac_mean", 0.0)),
+        float(report.get("sample_trace_min_latent_finite_frac_mean", 0.0)),
+        float(report.get("sample_trace_final_latent_finite_frac_mean", 0.0)),
+        -float(report.get("sample_trace_velocity_nonfinite_steps_mean", 1.0e9)),
+        -float(report.get("sample_trace_latent_nonfinite_steps_mean", 1.0e9)),
+        float(report.get("sample_dynamic_range_mean", 0.0)),
+        float(report.get("sample_luminance_std_mean", 0.0)),
+        -float(report.get("sample_collapsed_frac_mean", 1.0)),
         float(report.get("external_text_image_score_cos_mean", 0.0)),
         float(report.get("image_feature_retrieval_i2f_acc_mean", 0.0)),
         float(report.get("generated_caption_retrieval_i2t_acc_mean", 0.0)),
@@ -5609,10 +7961,14 @@ def eval_report_summary(report):
         "eval_weight_mode",
         "cfg_scale",
         "cfg_rescale",
+        "cfg_mode",
         "cfg_interval",
         "sample_steps",
         "generated_eval_n",
         "generated_eval_n_requested",
+        "generated_eval_candidates_per_prompt",
+        "generated_eval_raw_candidates",
+        "generated_eval_selection_component_count",
         "sample_time_shift",
         "time_shift",
         "sample_method",
@@ -5661,6 +8017,33 @@ def eval_report_summary(report):
         "image_quality_score_pred_mean",
         "generated_image_quality_score_pred_mean",
         "sample_center_target_mse",
+        "sample_finite_frac",
+        "sample_nonfinite_frac",
+        "sample_finite_guard",
+        "sample_velocity_clip",
+        "sample_latent_clip",
+        "sample_trace_min_velocity_finite_frac",
+        "sample_trace_min_latent_finite_frac",
+        "sample_trace_final_latent_finite_frac",
+        "sample_trace_velocity_nonfinite_steps",
+        "sample_trace_latent_nonfinite_steps",
+        "sample_trace_finite_guard_events",
+        "sample_trace_velocity_clip_events",
+        "sample_trace_latent_clip_events",
+        "sample_trace_max_velocity_rms",
+        "sample_trace_max_velocity_abs",
+        "sample_trace_max_latent_rms",
+        "sample_trace_max_latent_abs",
+        "sample_trace_final_latent_rms",
+        "sample_trace_final_latent_abs",
+        "sample_luminance_mean",
+        "sample_luminance_std",
+        "sample_rgb_std",
+        "sample_dynamic_range",
+        "sample_low_luminance_frac",
+        "sample_high_luminance_frac",
+        "sample_collapsed_frac",
+        "sample_health_score",
         "recon_mse",
         "latent_velocity_mse",
         "latent_endpoint_mse",
@@ -5691,6 +8074,7 @@ def aggregate_sweep_rows(rows):
                tuple(float(x) for x in row.get("sample_churn_interval",
                                                 DEFAULT_CHURN_INTERVAL)),
                float(row.get("cfg_rescale", 0.0)),
+               str(row.get("cfg_mode", "standard")),
                float(row.get("semantic_guidance_w", 0.0)),
                str(row.get("semantic_guidance_mode", "decoded")),
                tuple(float(x) for x in row.get("cfg_interval", DEFAULT_GUIDANCE_INTERVAL)),
@@ -5704,27 +8088,38 @@ def aggregate_sweep_rows(rows):
                                                 DEFAULT_GUIDANCE_INTERVAL)),
                float(row.get("quality_guidance_w", 0.0)),
                tuple(float(x) for x in row.get("quality_guidance_interval",
-                                                DEFAULT_GUIDANCE_INTERVAL)))
+                                                DEFAULT_GUIDANCE_INTERVAL)),
+               int(row.get("generated_eval_candidates_per_prompt", 1)),
+               bool(row.get("sample_finite_guard", False)),
+               float(row.get("sample_velocity_clip", 0.0)),
+               float(row.get("sample_latent_clip", 0.0)))
         grouped.setdefault(key, []).append(row)
     out = []
     for (cfg_scale, sample_steps, sample_method, sample_schedule, sample_time_shift,
          sample_churn, sample_churn_interval,
-         cfg_rescale,
+         cfg_rescale, cfg_mode,
          semantic_guidance_w,
          semantic_guidance_mode, cfg_interval, semantic_guidance_interval,
          text_guidance_w, text_guidance_interval,
          feature_guidance_w, feature_guidance_interval,
-         quality_guidance_w, quality_guidance_interval), group in sorted(grouped.items()):
+         quality_guidance_w, quality_guidance_interval,
+         generated_eval_candidates_per_prompt,
+         sample_finite_guard, sample_velocity_clip, sample_latent_clip), group in sorted(
+             grouped.items()):
         agg = {
             "sweep_key": (
                 f"cfg={cfg_scale:g};steps={sample_steps};method={sample_method};"
                 f"schedule={sample_schedule};shift={sample_time_shift:g};"
                 f"churn={sample_churn:g};churnint={format_interval(sample_churn_interval)};"
-                f"rescale={cfg_rescale:g};"
+                f"rescale={cfg_rescale:g};cfgmode={cfg_mode};"
                 f"sem={semantic_guidance_w:g};"
                 f"text={text_guidance_w:g};"
                 f"feature={feature_guidance_w:g};"
                 f"quality={quality_guidance_w:g};"
+                f"candidates={int(generated_eval_candidates_per_prompt)};"
+                f"finiteguard={int(bool(sample_finite_guard))};"
+                f"vclip={sample_velocity_clip:g};"
+                f"zclip={sample_latent_clip:g};"
                 f"cfgint={format_interval(cfg_interval)};"
                 f"semint={format_interval(semantic_guidance_interval)};"
                 f"textint={format_interval(text_guidance_interval)};"
@@ -5733,6 +8128,7 @@ def aggregate_sweep_rows(rows):
             ),
             "cfg_scale": float(cfg_scale),
             "cfg_rescale": float(cfg_rescale),
+            "cfg_mode": cfg_mode,
             "cfg_interval": list(cfg_interval),
             "sample_steps": int(sample_steps),
             "sample_method": sample_method,
@@ -5749,6 +8145,11 @@ def aggregate_sweep_rows(rows):
             "feature_guidance_interval": list(feature_guidance_interval),
             "quality_guidance_w": float(quality_guidance_w),
             "quality_guidance_interval": list(quality_guidance_interval),
+            "generated_eval_candidates_per_prompt": int(
+                generated_eval_candidates_per_prompt),
+            "sample_finite_guard": bool(sample_finite_guard),
+            "sample_velocity_clip": float(sample_velocity_clip),
+            "sample_latent_clip": float(sample_latent_clip),
             "runs": len(group),
             "eval_seeds": [int(r["eval_seed"]) for r in group if "eval_seed" in r],
         }
@@ -5773,6 +8174,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         sample_method="euler", sample_methods=None,
                         sample_schedule="linear", sample_schedules=None,
                         cfg_rescales=(0.0,),
+                        cfg_modes=None,
                         sample_churn=0.0, sample_churns=None,
                         sample_churn_interval=DEFAULT_CHURN_INTERVAL,
                         cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
@@ -5785,12 +8187,21 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                         eval_image_manifest="", eval_image_root="", eval_image_split="eval",
                         eval_image_min_aesthetic=None, eval_image_max_records=0,
-                        sample_time_shift=None, generated_eval_n=0):
+                        sample_time_shift=None, generated_eval_n=0,
+                        generated_eval_candidates_per_prompt=1,
+                        sample_finite_guard=False, sample_velocity_clip=0.0,
+                        sample_latent_clip=0.0):
     if weight_mode is None:
         weight_mode = "ema" if prefer_ema else "raw"
     if weight_mode not in EVAL_WEIGHT_MODES:
         raise ValueError(f"unknown checkpoint weight mode {weight_mode!r}")
     eval_seeds = tuple(eval_seeds) if eval_seeds is not None else (seed,)
+    if cfg_modes is None:
+        cfg_modes = ("standard",)
+    cfg_modes = tuple(str(x) for x in cfg_modes)
+    bad_cfg_modes = sorted(set(cfg_modes) - set(CFG_MODES))
+    if bad_cfg_modes:
+        raise ValueError(f"unknown cfg mode(s): {','.join(bad_cfg_modes)}")
     text_guidance_weights = tuple(float(x) for x in (text_guidance_weights or (0.0,)))
     feature_guidance_weights = tuple(float(x) for x in (feature_guidance_weights or (0.0,)))
     quality_guidance_weights = tuple(float(x) for x in (quality_guidance_weights or (0.0,)))
@@ -5802,6 +8213,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
     sample_churn_interval = validate_guidance_interval(
         sample_churn_interval, name="sample_churn_interval")
     generated_eval_n = int(generated_eval_n)
+    generated_eval_candidates_per_prompt = int(generated_eval_candidates_per_prompt)
     if any(w < 0.0 for w in text_guidance_weights):
         raise ValueError("text guidance weights must be non-negative")
     if any(w < 0.0 for w in feature_guidance_weights):
@@ -5810,6 +8222,14 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
         raise ValueError("quality guidance weights must be non-negative")
     if generated_eval_n < 0:
         raise ValueError("generated_eval_n must be non-negative")
+    if generated_eval_candidates_per_prompt <= 0:
+        raise ValueError("generated_eval_candidates_per_prompt must be positive")
+    sample_velocity_clip = float(sample_velocity_clip)
+    sample_latent_clip = float(sample_latent_clip)
+    if sample_velocity_clip < 0.0:
+        raise ValueError("sample_velocity_clip must be non-negative")
+    if sample_latent_clip < 0.0:
+        raise ValueError("sample_latent_clip must be non-negative")
 
     def run_mode(mode):
         ae, flow, conditioner, prompt_vocab, prompt_templates, meta = load_checkpoint(
@@ -5861,6 +8281,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         sample_churns=sample_churns,
                         sample_churn_interval=sample_churn_interval,
                         cfg_rescales=cfg_rescales,
+                        cfg_modes=cfg_modes,
                         cfg_interval=cfg_interval,
                         text_aligner=getattr(flow, "text_aligner", None),
                         image_feature_aligner=getattr(flow, "image_feature_aligner", None),
@@ -5874,7 +8295,12 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         feature_guidance_interval=feature_guidance_interval,
                         quality_guidance_weights=quality_guidance_weights,
                         quality_guidance_interval=quality_guidance_interval,
-                        generated_eval_n=generated_eval_n):
+                        generated_eval_n=generated_eval_n,
+                        generated_eval_candidates_per_prompt=(
+                            generated_eval_candidates_per_prompt),
+                        sample_finite_guard=sample_finite_guard,
+                        sample_velocity_clip=sample_velocity_clip,
+                        sample_latent_clip=sample_latent_clip):
                     row["eval_seed"] = int(eval_seed)
                     row["checkpoint_weight_mode"] = actual_mode
                     rows.append(row)
@@ -5894,10 +8320,16 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                 "sample_methods": list(sample_methods or (sample_method,)),
                 "sample_schedule": sample_schedule,
                 "sample_schedules": list(sample_schedules or (sample_schedule,)),
+                "cfg_modes": list(cfg_modes),
                 "sample_churn": float(sample_churn),
                 "sample_churns": [float(x) for x in sample_churns],
                 "sample_churn_interval": list(sample_churn_interval),
+                "sample_finite_guard": bool(sample_finite_guard),
+                "sample_velocity_clip": float(sample_velocity_clip),
+                "sample_latent_clip": float(sample_latent_clip),
                 "generated_eval_n_requested": int(generated_eval_n),
+                "generated_eval_candidates_per_prompt": int(
+                    generated_eval_candidates_per_prompt),
                 "cfg_rescales": [float(x) for x in cfg_rescales],
                 "sample_time_shift": float(actual_sample_time_shift),
                 "time_shift": float(train_time_shift),
@@ -5951,10 +8383,14 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                                      sample_churns=sample_churns,
                                      sample_churn_interval=sample_churn_interval,
                                      cfg_rescales=cfg_rescales,
+                                     cfg_modes=cfg_modes,
                                      cfg_interval=cfg_interval,
                                      sample_time_shift=actual_sample_time_shift,
                                      time_shift=train_time_shift,
-                                     semantic_guidance_interval=semantic_guidance_interval):
+                                     semantic_guidance_interval=semantic_guidance_interval,
+                                     sample_finite_guard=sample_finite_guard,
+                                     sample_velocity_clip=sample_velocity_clip,
+                                     sample_latent_clip=sample_latent_clip):
                 row["eval_seed"] = int(eval_seed)
                 row["checkpoint_weight_mode"] = actual_mode
                 rows.append(row)
@@ -5975,9 +8411,13 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             "sample_methods": list(sample_methods or (sample_method,)),
             "sample_schedule": sample_schedule,
             "sample_schedules": list(sample_schedules or (sample_schedule,)),
+            "cfg_modes": list(cfg_modes),
             "sample_churn": float(sample_churn),
             "sample_churns": [float(x) for x in sample_churns],
             "sample_churn_interval": list(sample_churn_interval),
+            "sample_finite_guard": bool(sample_finite_guard),
+            "sample_velocity_clip": float(sample_velocity_clip),
+            "sample_latent_clip": float(sample_latent_clip),
             "cfg_rescales": [float(x) for x in cfg_rescales],
             "sample_time_shift": float(actual_sample_time_shift),
             "time_shift": float(train_time_shift),
@@ -6025,15 +8465,20 @@ def selected_grid_settings(report, fallback_cfg=1.0, fallback_cfg_rescale=0.0, f
                            fallback_method="euler", fallback_semantic_w=0.0,
                            fallback_semantic_mode="decoded",
                            fallback_cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
+                           fallback_cfg_mode="standard",
                            fallback_semantic_interval=DEFAULT_GUIDANCE_INTERVAL,
                            fallback_sample_time_shift=1.0,
                            fallback_sample_schedule="linear",
                            fallback_sample_churn=0.0,
-                           fallback_sample_churn_interval=DEFAULT_CHURN_INTERVAL):
+                           fallback_sample_churn_interval=DEFAULT_CHURN_INTERVAL,
+                           fallback_sample_finite_guard=False,
+                           fallback_sample_velocity_clip=0.0,
+                           fallback_sample_latent_clip=0.0):
     best = report.get("best") or report
     return {
         "cfg_scale": float(best.get("cfg_scale", fallback_cfg)),
         "cfg_rescale": float(best.get("cfg_rescale", fallback_cfg_rescale)),
+        "cfg_mode": str(best.get("cfg_mode", fallback_cfg_mode)),
         "cfg_interval": tuple(best.get("cfg_interval", fallback_cfg_interval)),
         "sample_steps": int(best.get("sample_steps", fallback_steps)),
         "sample_time_shift": float(best.get("sample_time_shift",
@@ -6043,6 +8488,12 @@ def selected_grid_settings(report, fallback_cfg=1.0, fallback_cfg_rescale=0.0, f
         "sample_churn": float(best.get("sample_churn", fallback_sample_churn)),
         "sample_churn_interval": tuple(best.get(
             "sample_churn_interval", fallback_sample_churn_interval)),
+        "sample_finite_guard": bool(best.get(
+            "sample_finite_guard", fallback_sample_finite_guard)),
+        "sample_velocity_clip": float(best.get(
+            "sample_velocity_clip", fallback_sample_velocity_clip)),
+        "sample_latent_clip": float(best.get(
+            "sample_latent_clip", fallback_sample_latent_clip)),
         "semantic_guidance_w": float(best.get("semantic_guidance_w", fallback_semantic_w)),
         "semantic_guidance_mode": str(best.get("semantic_guidance_mode",
                                                fallback_semantic_mode)),
@@ -6054,29 +8505,44 @@ def selected_grid_settings(report, fallback_cfg=1.0, fallback_cfg_rescale=0.0, f
 def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidden=64,
                       lr=2e-4, fact_w=1.0, seed=0, size=32, device=DEV, flow_arch="conv",
                       dit_depth=3, dit_heads=4, cond_drop=0.0, cfg_scale=1.0,
-                      cfg_rescale=0.0,
+                      cfg_rescale=0.0, cfg_mode="standard",
                       dit_head_width_mult=1, latent_max_tokens=256,
                       dit_pos_embed="learned",
+                      dit_mlp="gelu",
+                      latent_patch_size=1,
                       flow_checkpoint_blocks=False,
                       ae_arch="semantic", latent_downsample=4, ae_res_blocks=1,
                       ae_hf_model="", ae_hf_subfolder="", ae_hf_scaling_factor=0.0,
-                      ae_recon_loss="mse", ae_grad_w=0.0, ae_ms_w=0.0,
+                      ae_recon_loss="mse", ae_grad_w=0.0, ae_ms_w=0.0, ae_fft_w=0.0,
                       ae_latent_reg_w=0.0,
                       image_text_align_w=0.0, flow_text_align_w=0.0, text_embed_dim=128,
                       image_feature_align_w=0.0, flow_feature_align_w=0.0,
                       image_feature_embed_dim=128,
                       flow_repa_w=0.0, flow_repa_steps=0, flow_repa_embed_dim=128,
+                      flow_repa_mode="pooled",
+                      flow_self_repa_w=0.0, flow_self_repa_steps=0,
+                      flow_self_repa_embed_dim=128, flow_self_repa_mode="pooled",
+                      flow_sra_w=0.0, flow_sra_steps=0, flow_sra_time_gap=0.25,
+                      flow_sra_mode="token",
                       sample_steps=4, roundtrip_samples=1, flow_semantic_w=0.0,
-                      flow_consistency_w=0.0,
+                      flow_consistency_w=0.0, flow_endpoint_w=0.0,
                       flow_distill_steps=0, flow_distill_w=1.0,
                       flow_distill_time_gap=0.25, flow_distill_teacher="auto",
-                      cond_mode="facts", text_cond_dim=0,
+                      flow_guidance_distill_w=0.0,
+                      flow_guidance_distill_cfg_scale=1.5,
+                      flow_guidance_distill_cfg_rescale=0.0,
+                      cond_mode="text", text_cond_dim=0,
                       size_buckets=(),
                       image_manifest="", image_root="", image_split="train",
                       image_min_aesthetic=None, image_max_records=0,
                       image_quality_weight=0.0,
                       image_source_weights="",
                       image_quality_score_w=0.0, flow_quality_score_w=0.0,
+                      quality_score_steps=0,
+                      image_quality_rank_w=0.0, quality_score_rank_w=0.0,
+                      flow_quality_rank_w=0.0, quality_rank_margin=0.0,
+                      image_preference_manifest="", image_preference_root="",
+                      image_preference_max_pairs=0, image_preference_w=0.0,
                       caption_vocab_max=8192, caption_max_len=64,
                       caption_cond_source="tokens",
                       image_crop_mode="center", image_hflip_prob=0.0,
@@ -6086,6 +8552,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       time_curriculum_frac=0.0,
                       time_shift_mode="manual", time_shift_ref_dim=1024.0,
                       time_shift_dim_power=0.5,
+                      flow_noise_coupling="random", flow_noise_coupling_projections=1,
                       flow_loss_weight="none", flow_loss_weight_gamma=5.0,
                       flow_loss_weight_normalize=True,
                       latent_normalize="auto", latent_stat_samples=512,
@@ -6097,13 +8564,18 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       sample_schedule="linear",
                       sample_churn=0.0,
                       sample_churn_interval=DEFAULT_CHURN_INTERVAL,
+                      sample_finite_guard=False, sample_velocity_clip=0.0,
+                      sample_latent_clip=0.0,
                       flow_ema_decay=0.0, flow_ema_warmup=True, eval_with_ema=True,
                       eval_weight_mode="auto", intervention_samples=32,
+                      eval_generated_candidates_per_prompt=1,
                       train_precision="fp32", ae_accum_steps=1, flow_accum_steps=1,
                       grad_clip=0.0,
                       flow_cache_latents=False, flow_cache_records=0, flow_cache_batch=64,
-                      flow_cache_dir="", flow_cache_shard_size=1024,
-                      return_conditioner=False, return_ema=False, return_aligner=False):
+                      flow_cache_dir="", flow_cache_shard_size=1024, flow_cache_dtype="fp32",
+                      flow_cache_max_loaded_shards=0,
+                      return_conditioner=False, return_ema=False, return_aligner=False,
+                      allow_synthetic_fixture=False):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     size = image_hw(size, default=32)
@@ -6118,6 +8590,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("ae_arch='hf-vae' requires ae_hf_model")
     if cfg_rescale < 0.0 or cfg_rescale > 1.0:
         raise ValueError("cfg_rescale must be in [0, 1]")
+    cfg_mode = str(cfg_mode)
+    if cfg_mode not in CFG_MODES:
+        raise ValueError(f"unknown cfg_mode {cfg_mode!r}")
     image_records = None
     if image_manifest:
         if cond_mode != "text":
@@ -6129,6 +8604,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         image_records = read_image_manifest(
             image_manifest, root=image_root, split=image_split,
             min_aesthetic=image_min_aesthetic, max_records=image_max_records)
+        flow_repa_mode = str(flow_repa_mode)
+        if flow_repa_mode not in FLOW_REPA_MODES:
+            raise ValueError(f"unknown flow_repa_mode {flow_repa_mode!r}")
         caption_cond_source, text_embedding_in_dim = resolve_caption_cond_source(
             caption_cond_source, image_records)
         image_embedding_in_dim = (
@@ -6139,6 +8617,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         if (image_feature_align_w > 0.0 or flow_feature_align_w > 0.0 or flow_repa_w > 0.0
                 ) and image_embedding_in_dim <= 0:
             raise ValueError("image feature/REPA alignment requires image_embedding rows")
+        if flow_repa_w > 0.0 and flow_repa_mode in ("token", "both"):
+            if not records_have_image_embedding_sequences(image_records):
+                raise ValueError(
+                    f"flow_repa_mode={flow_repa_mode!r} requires image_embedding_sequence rows")
+    elif not allow_synthetic_fixture:
+        raise ValueError(
+            "image_latent training now requires image_manifest data; the synthetic "
+            "color/shape generator is only available to selftest fixtures")
     elif (image_text_align_w > 0.0 or flow_text_align_w > 0.0
           or image_feature_align_w > 0.0 or flow_feature_align_w > 0.0
           or flow_repa_w > 0.0):
@@ -6146,6 +8632,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     else:
         caption_cond_source, text_embedding_in_dim = "tokens", 0
         image_embedding_in_dim = 0
+        flow_repa_mode = str(flow_repa_mode)
+        if flow_repa_mode not in FLOW_REPA_MODES:
+            raise ValueError(f"unknown flow_repa_mode {flow_repa_mode!r}")
+    flow_self_repa_mode = str(flow_self_repa_mode or "pooled")
+    if flow_self_repa_mode not in FLOW_REPA_MODES:
+        raise ValueError(f"unknown flow_self_repa_mode {flow_self_repa_mode!r}")
+    flow_sra_mode = str(flow_sra_mode or "token")
+    if flow_sra_mode not in FLOW_REPA_MODES:
+        raise ValueError(f"unknown flow_sra_mode {flow_sra_mode!r}")
     if image_records is None:
         if requested_size_buckets:
             raise ValueError("size_buckets require image_manifest training")
@@ -6170,6 +8665,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("time_shift_ref_dim must be positive")
     if flow_loss_weight not in FLOW_LOSS_WEIGHTS:
         raise ValueError(f"unknown flow loss weighting mode {flow_loss_weight!r}")
+    flow_noise_coupling = str(flow_noise_coupling)
+    if flow_noise_coupling not in FLOW_NOISE_COUPLINGS:
+        raise ValueError(f"unknown flow noise coupling {flow_noise_coupling!r}")
+    flow_noise_coupling_projections = int(flow_noise_coupling_projections)
+    if flow_noise_coupling_projections <= 0:
+        raise ValueError("flow_noise_coupling_projections must be positive")
     if flow_loss_weight_gamma <= 0.0:
         raise ValueError("flow_loss_weight_gamma must be positive")
     requested_latent_normalize = str(latent_normalize or "none")
@@ -6182,21 +8683,47 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     source_weight_map = parse_source_weight_spec(image_source_weights)
     if source_weight_map and image_records is None:
         raise ValueError("image_source_weights require image_manifest training")
-    if image_quality_score_w < 0.0 or flow_quality_score_w < 0.0:
+    if (image_quality_score_w < 0.0 or flow_quality_score_w < 0.0
+            or image_quality_rank_w < 0.0 or quality_score_rank_w < 0.0
+            or flow_quality_rank_w < 0.0):
         raise ValueError("quality score weights must be non-negative")
-    if (image_quality_score_w > 0.0 or flow_quality_score_w > 0.0) and image_records is None:
+    if quality_rank_margin < 0.0:
+        raise ValueError("quality_rank_margin must be non-negative")
+    quality_score_steps = int(quality_score_steps)
+    if quality_score_steps < 0:
+        raise ValueError("quality_score_steps must be non-negative")
+    image_preference_max_pairs = int(image_preference_max_pairs)
+    if image_preference_max_pairs < 0:
+        raise ValueError("image_preference_max_pairs must be non-negative")
+    image_preference_w = float(image_preference_w)
+    if image_preference_w < 0.0:
+        raise ValueError("image_preference_w must be non-negative")
+    if image_preference_w > 0.0 and not image_preference_manifest:
+        raise ValueError("image_preference_w requires image_preference_manifest")
+    if image_preference_w > 0.0 and quality_score_steps <= 0:
+        raise ValueError("image_preference_w requires quality_score_steps > 0")
+    if image_preference_manifest and image_records is None:
+        raise ValueError("image_preference_manifest requires image_manifest training")
+    if quality_score_rank_w > 0.0 and quality_score_steps <= 0:
+        raise ValueError("quality_score_rank_w requires quality_score_steps > 0")
+    if (image_quality_score_w > 0.0 or flow_quality_score_w > 0.0
+            or image_quality_rank_w > 0.0 or quality_score_rank_w > 0.0
+            or flow_quality_rank_w > 0.0
+            or quality_score_steps > 0) and image_records is None:
         raise ValueError("quality score losses require image_manifest training")
-    if flow_quality_score_w > 0.0 and image_quality_score_w <= 0.0:
-        raise ValueError("flow_quality_score_w requires image_quality_score_w > 0")
-    if flow_quality_score_w > 0.0 and (flow_cache_latents or flow_cache_dir):
-        raise ValueError("flow_quality_score_w is not yet compatible with flow latent cache")
+    if ((flow_quality_score_w > 0.0 or flow_quality_rank_w > 0.0)
+            and image_quality_score_w <= 0.0 and image_quality_rank_w <= 0.0
+            and quality_score_steps <= 0):
+        raise ValueError(
+            "flow quality losses require image_quality_score_w/image_quality_rank_w > 0 "
+            "or quality_score_steps > 0")
     if image_crop_mode not in ("center", "random", "none", "pad"):
         raise ValueError(f"unknown image crop mode {image_crop_mode!r}")
     if image_hflip_prob < 0.0 or image_hflip_prob > 1.0:
         raise ValueError("image_hflip_prob must be in [0, 1]")
     if ae_recon_loss not in AE_RECON_LOSSES:
         raise ValueError(f"unknown AE reconstruction loss {ae_recon_loss!r}")
-    if ae_grad_w < 0.0 or ae_ms_w < 0.0 or ae_latent_reg_w < 0.0:
+    if ae_grad_w < 0.0 or ae_ms_w < 0.0 or ae_fft_w < 0.0 or ae_latent_reg_w < 0.0:
         raise ValueError("AE reconstruction weights must be non-negative")
     if image_text_align_w < 0.0 or flow_text_align_w < 0.0:
         raise ValueError("image/text alignment weights must be non-negative")
@@ -6206,12 +8733,24 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("flow_repa_w must be non-negative")
     if flow_repa_steps < 0:
         raise ValueError("flow_repa_steps must be non-negative")
+    if flow_self_repa_w < 0.0:
+        raise ValueError("flow_self_repa_w must be non-negative")
+    if flow_self_repa_steps < 0:
+        raise ValueError("flow_self_repa_steps must be non-negative")
+    if flow_sra_w < 0.0:
+        raise ValueError("flow_sra_w must be non-negative")
+    if flow_sra_steps < 0:
+        raise ValueError("flow_sra_steps must be non-negative")
+    if flow_sra_time_gap <= 0.0 or flow_sra_time_gap > 1.0:
+        raise ValueError("flow_sra_time_gap must be in (0, 1]")
     if text_embed_dim <= 0:
         raise ValueError("text_embed_dim must be positive")
     if image_feature_embed_dim <= 0:
         raise ValueError("image_feature_embed_dim must be positive")
     if flow_repa_embed_dim <= 0:
         raise ValueError("flow_repa_embed_dim must be positive")
+    if flow_self_repa_embed_dim <= 0:
+        raise ValueError("flow_self_repa_embed_dim must be positive")
     amp_cfg = amp_config(device, train_precision)
     ae_accum_steps = max(1, int(ae_accum_steps))
     flow_accum_steps = max(1, int(flow_accum_steps))
@@ -6225,6 +8764,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("semantic_guidance_w must be non-negative")
     if flow_consistency_w < 0.0:
         raise ValueError("flow_consistency_w must be non-negative")
+    if flow_endpoint_w < 0.0:
+        raise ValueError("flow_endpoint_w must be non-negative")
     flow_distill_steps = int(flow_distill_steps)
     if flow_distill_steps < 0:
         raise ValueError("flow_distill_steps must be non-negative")
@@ -6232,6 +8773,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("flow_distill_w must be non-negative")
     if flow_distill_time_gap <= 0.0 or flow_distill_time_gap > 1.0:
         raise ValueError("flow_distill_time_gap must be in (0, 1]")
+    if flow_guidance_distill_w < 0.0:
+        raise ValueError("flow_guidance_distill_w must be non-negative")
+    if flow_guidance_distill_cfg_scale < 1.0:
+        raise ValueError("flow_guidance_distill_cfg_scale must be >= 1")
+    if flow_guidance_distill_cfg_rescale < 0.0 or flow_guidance_distill_cfg_rescale > 1.0:
+        raise ValueError("flow_guidance_distill_cfg_rescale must be in [0, 1]")
     flow_distill_teacher = str(flow_distill_teacher)
     if flow_distill_teacher not in FLOW_DISTILL_TEACHERS:
         raise ValueError(f"unknown flow distillation teacher {flow_distill_teacher!r}")
@@ -6246,6 +8793,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("flow cache record/batch settings must be non-negative/positive")
     if flow_cache_shard_size <= 0:
         raise ValueError("flow cache shard size must be positive")
+    flow_cache_dtype = str(flow_cache_dtype)
+    latent_cache_torch_dtype(flow_cache_dtype)
+    flow_cache_max_loaded_shards = int(flow_cache_max_loaded_shards)
+    if flow_cache_max_loaded_shards < 0:
+        raise ValueError("flow_cache_max_loaded_shards must be non-negative")
     if semantic_guidance_mode not in ("latent", "decoded"):
         raise ValueError(f"unknown semantic guidance mode {semantic_guidance_mode!r}")
     if sample_method not in SAMPLE_METHODS:
@@ -6255,8 +8807,17 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     sample_churn = float(sample_churn)
     if sample_churn < 0.0:
         raise ValueError("sample_churn must be non-negative")
+    sample_velocity_clip = float(sample_velocity_clip)
+    sample_latent_clip = float(sample_latent_clip)
+    if sample_velocity_clip < 0.0:
+        raise ValueError("sample_velocity_clip must be non-negative")
+    if sample_latent_clip < 0.0:
+        raise ValueError("sample_latent_clip must be non-negative")
     sample_churn_interval = validate_guidance_interval(
         sample_churn_interval, name="sample_churn_interval")
+    eval_generated_candidates_per_prompt = int(eval_generated_candidates_per_prompt)
+    if eval_generated_candidates_per_prompt <= 0:
+        raise ValueError("eval_generated_candidates_per_prompt must be positive")
     cfg_interval = validate_guidance_interval(cfg_interval, name="cfg_interval")
     semantic_guidance_interval = validate_guidance_interval(
         semantic_guidance_interval, name="semantic_guidance_interval")
@@ -6267,9 +8828,19 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     dit_pos_embed = str(dit_pos_embed)
     if dit_pos_embed not in DIT_POS_EMBEDS:
         raise ValueError(f"unknown DiT positional embedding {dit_pos_embed!r}")
+    dit_mlp = str(dit_mlp)
+    if dit_mlp not in DIT_MLPS:
+        raise ValueError(f"unknown DiT MLP {dit_mlp!r}")
+    if dit_mlp != "gelu" and flow_arch == "dit":
+        raise ValueError("custom DiT MLPs are supported by CrossDiT/MM-DiT flows")
     flow_checkpoint_blocks = bool(flow_checkpoint_blocks)
     if latent_max_tokens <= 0:
         raise ValueError("latent_max_tokens must be positive")
+    latent_patch_size = int(latent_patch_size)
+    if latent_patch_size <= 0:
+        raise ValueError("latent_patch_size must be positive")
+    if latent_patch_size != 1 and flow_arch == "conv":
+        raise ValueError("latent_patch_size is only supported by DiT/CrossDiT/MM-DiT flows")
     if flow_ema_decay < 0.0 or flow_ema_decay >= 1.0:
         raise ValueError("flow_ema_decay must be in [0, 1)")
     if eval_weight_mode not in EVAL_WEIGHT_MODES:
@@ -6314,13 +8885,28 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             "size_bucket_sampling_probs": {},
         }
     )
+    image_preference_pairs = (
+        read_image_preference_pairs(
+            image_preference_manifest,
+            root=image_preference_root or image_root,
+            max_pairs=image_preference_max_pairs)
+        if image_preference_manifest else []
+    )
     image_quality_score_stats = (
         quality_score_stats(image_records) if image_records is not None else
         {"n": 0, "missing": 0, "min": 0.0, "mean": 0.0, "max": 0.0, "has_range": False}
     )
-    if (image_quality_score_w > 0.0 or flow_quality_score_w > 0.0
-            ) and image_quality_score_stats["n"] <= 0:
+    scalar_quality_requested = (
+        image_quality_score_w > 0.0 or flow_quality_score_w > 0.0
+        or image_quality_rank_w > 0.0 or quality_score_rank_w > 0.0
+        or flow_quality_rank_w > 0.0
+        or (quality_score_steps > 0 and image_preference_w <= 0.0)
+    )
+    if scalar_quality_requested and image_quality_score_stats["n"] <= 0:
         raise ValueError("quality score losses require manifest aesthetic/score/quality values")
+    if (image_quality_rank_w > 0.0 or quality_score_rank_w > 0.0
+            or flow_quality_rank_w > 0.0) and not image_quality_score_stats["has_range"]:
+        raise ValueError("quality rank losses require at least two distinct quality values")
     if cond_mode == "text":
         prompt_vocab = (
             None if image_records is not None and caption_cond_source == "embedding"
@@ -6361,12 +8947,20 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             latent_ch=latent_ch, feature_dim=image_embedding_in_dim, hidden=hidden,
             embed_dim=image_feature_embed_dim).to(device)
     image_quality_scorer = None
-    if image_records is not None and (image_quality_score_w > 0.0 or flow_quality_score_w > 0.0):
+    if image_records is not None and (
+            image_quality_score_w > 0.0 or flow_quality_score_w > 0.0
+            or image_quality_rank_w > 0.0 or quality_score_rank_w > 0.0
+            or flow_quality_rank_w > 0.0 or quality_score_steps > 0):
         image_quality_scorer = ImageQualityScorer(latent_ch=latent_ch, hidden=hidden).to(device)
     latent_shape = ae_latent_shape(ae, size)
-    latent_tokens = latent_shape[1] * latent_shape[2]
+    latent_cells = latent_shape[1] * latent_shape[2]
+    latent_tokens = latent_token_count(latent_shape, patch_size=latent_patch_size)
     train_latent_shapes = [ae_latent_shape(ae, bucket) for bucket in train_size_buckets]
-    max_train_latent_tokens = max(shape[1] * shape[2] for shape in train_latent_shapes)
+    max_train_latent_cells = max(shape[1] * shape[2] for shape in train_latent_shapes)
+    max_train_latent_tokens = max(
+        latent_token_count(shape, patch_size=latent_patch_size)
+        for shape in train_latent_shapes
+    )
     max_train_latent_shape = max(
         train_latent_shapes, key=lambda shape: shape[1] * shape[2])
     time_shift_report = resolve_time_shift(
@@ -6379,7 +8973,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError(
             f"latent token count {max_required_latent_tokens} exceeds "
             f"latent_max_tokens={latent_max_tokens}; "
-            "increase --latent-max-tokens or use a larger --latent-downsample"
+            "increase --latent-max-tokens, use a larger --latent-patch-size, "
+            "or use a larger --latent-downsample"
         )
     flow = make_flow(flow_arch=flow_arch, latent_ch=latent_ch, hidden=hidden,
                      dit_depth=dit_depth, dit_heads=dit_heads, cond_dim=cond_dim,
@@ -6388,6 +8983,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                      dit_qk_norm=bool(dit_qk_norm),
                      dit_attn_impl=dit_attn_impl,
                      dit_pos_embed=dit_pos_embed,
+                     dit_mlp=dit_mlp,
+                     latent_patch_size=latent_patch_size,
                      flow_checkpoint_blocks=flow_checkpoint_blocks).to(device)
     flow_repa_aligner = None
     if image_records is not None and flow_repa_w > 0.0:
@@ -6397,16 +8994,30 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         flow_repa_aligner = FlowFeatureAligner(
             hidden_dim=hidden_feature_dim, feature_dim=image_embedding_in_dim,
             hidden=hidden, embed_dim=flow_repa_embed_dim).to(device)
+    flow_self_repa_aligner = None
+    if flow_self_repa_w > 0.0:
+        hidden_feature_dim = flow_hidden_feature_dim(flow)
+        if hidden_feature_dim <= 0:
+            raise ValueError(
+                "flow self-REPA alignment requires DiT/CrossDiT/MM-DiT flow architecture")
+        flow_self_repa_aligner = FlowLatentAligner(
+            hidden_dim=hidden_feature_dim, latent_ch=latent_ch,
+            patch_size=latent_patch_size, hidden=hidden,
+            embed_dim=flow_self_repa_embed_dim).to(device)
+    if flow_sra_w > 0.0 and flow_hidden_feature_dim(flow) <= 0:
+        raise ValueError("flow SRA alignment requires DiT/CrossDiT/MM-DiT flow architecture")
     attach_text_aligner(flow, text_aligner)
     attach_image_feature_aligner(flow, image_feature_aligner)
     attach_image_quality_scorer(flow, image_quality_scorer)
     attach_flow_repa_aligner(flow, flow_repa_aligner)
+    attach_flow_self_repa_aligner(flow, flow_self_repa_aligner)
     ae_params = [p for p in ae.parameters() if p.requires_grad]
     if text_aligner is not None and image_text_align_w > 0.0:
         ae_params += list(conditioner.parameters()) + list(text_aligner.parameters())
     if image_feature_aligner is not None and image_feature_align_w > 0.0:
         ae_params += list(image_feature_aligner.parameters())
-    if image_quality_scorer is not None and image_quality_score_w > 0.0:
+    if image_quality_scorer is not None and (
+            image_quality_score_w > 0.0 or image_quality_rank_w > 0.0):
         ae_params += list(image_quality_scorer.parameters())
     opt_ae = (
         torch.optim.AdamW(ae_params, lr=lr, weight_decay=0.01)
@@ -6444,11 +9055,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 if image_records is None:
                     loss, parts = autoencoder_loss(
                         out, x, yc, ys, fact_w=fact_w, recon_loss=ae_recon_loss,
-                        grad_w=ae_grad_w, ms_w=ae_ms_w, latent_reg_w=ae_latent_reg_w)
+                        grad_w=ae_grad_w, ms_w=ae_ms_w, fft_w=ae_fft_w,
+                        latent_reg_w=ae_latent_reg_w)
                 else:
                     loss, parts = reconstruction_loss_parts(
                         out["recon"], x, mode=ae_recon_loss, grad_w=ae_grad_w,
-                        ms_w=ae_ms_w, latent=out.get("latent"),
+                        ms_w=ae_ms_w, fft_w=ae_fft_w, latent=out.get("latent"),
                         latent_reg_w=ae_latent_reg_w)
                     if text_aligner is not None and image_text_align_w > 0.0:
                         cond_vec = caption_record_condition(
@@ -6473,6 +9085,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                             image_quality_score_stats, prefix="quality_score")
                         loss = loss + float(image_quality_score_w) * quality_loss
                         parts.update(quality_parts)
+                    if image_quality_scorer is not None and image_quality_rank_w > 0.0:
+                        quality_rank, quality_rank_parts = image_quality_rank_loss(
+                            image_quality_scorer, out["latent"], chosen_records,
+                            image_quality_score_stats, prefix="quality_rank",
+                            margin=quality_rank_margin)
+                        loss = loss + float(image_quality_rank_w) * quality_rank
+                        parts.update(quality_rank_parts)
                 if image_records is None and ae_intervention_w > 0.0:
                     intervention, intervention_parts = latent_intervention_training_loss(
                         ae, out["latent"], fact_cond)
@@ -6502,15 +9121,23 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         flow_params += list(image_feature_aligner.parameters())
     if flow_repa_aligner is not None and flow_repa_w > 0.0:
         flow_params += list(flow_repa_aligner.parameters())
+    if flow_self_repa_aligner is not None and flow_self_repa_w > 0.0:
+        flow_params += list(flow_self_repa_aligner.parameters())
     opt_flow = torch.optim.AdamW(flow_params, lr=lr, weight_decay=0.01)
     ae.eval()
     for p in ae.parameters():
         p.requires_grad_(False)
-    if image_quality_scorer is not None:
-        image_quality_scorer.eval()
-        for p in image_quality_scorer.parameters():
-            p.requires_grad_(False)
     flow_cache = None
+    quality_score_steps_run = 0
+    last_quality_score = {}
+    has_image_embedding_sequences = (
+        records_have_image_embedding_sequences(image_records)
+        if image_records is not None else False)
+    flow_repa_cache_sequences = (
+        flow_repa_w > 0.0
+        and (flow_repa_mode in ("token", "both")
+             or (flow_repa_mode == "auto" and has_image_embedding_sequences))
+    )
     if flow_cache_latents:
         flow_cache = build_image_latent_cache(
             ae, image_records, prompt_vocab, caption_max_len=caption_max_len,
@@ -6519,9 +9146,16 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             cond_source=caption_cond_source, cache_dir=flow_cache_dir,
             shard_size=flow_cache_shard_size,
             include_image_embeddings=flow_feature_align_w > 0.0 or flow_repa_w > 0.0,
+            include_image_embedding_sequences=flow_repa_cache_sequences,
+            include_quality_targets=(
+                flow_quality_score_w > 0.0 or flow_quality_rank_w > 0.0
+                or (quality_score_steps > 0 and image_quality_score_stats["n"] > 0)),
+            quality_stats=image_quality_score_stats,
             crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
             size_buckets=train_size_buckets, bucket_records=bucket_records,
-            record_weights=image_record_weights)
+            record_weights=image_record_weights, cache_dtype=flow_cache_dtype)
+        configure_latent_cache_runtime(
+            flow_cache, max_loaded_shards=flow_cache_max_loaded_shards)
     if image_records is None:
         latent_stats = estimate_latent_stats(
             ae, n=latent_stat_samples, batch=batch, seed=seed + 97, size=size, device=device,
@@ -6545,15 +9179,163 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             weights=image_sample_weights)
     attach_latent_stats(flow, latent_stats)
 
+    if image_quality_scorer is not None and quality_score_steps > 0:
+        for p in image_quality_scorer.parameters():
+            p.requires_grad_(True)
+        image_quality_scorer.train()
+        quality_params = list(image_quality_scorer.parameters())
+        opt_quality = torch.optim.AdamW(quality_params, lr=lr, weight_decay=0.01)
+        quality_live_records = [
+            rec for rec in image_records
+            if rec.aesthetic is not None and np.isfinite(float(rec.aesthetic))
+        ]
+        quality_bucket_records, _quality_missing_dims = (
+            bucket_records_by_aspect(quality_live_records, train_size_buckets)
+            if image_records is not None and quality_live_records else ({}, 0)
+        )
+        quality_record_weights = (
+            record_weight_lookup(
+                quality_live_records,
+                weights_for_records(quality_live_records, image_record_weights))
+            if image_record_weights is not None and quality_live_records else None
+        )
+        quality_bucket_probs = (
+            size_bucket_sampling_probs(
+                quality_live_records, train_size_buckets,
+                bucket_records=quality_bucket_records,
+                record_weights=quality_record_weights)
+            if quality_live_records else None
+        )
+        preference_live_pairs = image_preference_pairs if image_preference_w > 0.0 else []
+        for _quality_step in range(int(quality_score_steps)):
+            opt_quality.zero_grad(set_to_none=True)
+            quality_targets = None
+            quality_masks = None
+            chosen_quality_records = None
+            quality_loss = None
+            quality_parts = {}
+            if flow_cache is not None and flow_cache.get("has_quality_targets", False):
+                zq, quality_payload = sample_latent_cache(
+                    flow_cache, rng, batch, device=device)
+                quality_targets = quality_payload.get("quality_targets")
+                quality_masks = quality_payload.get("quality_masks")
+                if quality_targets is None or quality_masks is None:
+                    raise ValueError("quality scorer pretrain cache is missing targets")
+                with amp_autocast(device, train_precision):
+                    quality_loss, quality_parts = image_quality_score_target_loss(
+                        image_quality_scorer, zq, quality_targets, quality_masks,
+                        prefix="quality_score_pretrain")
+            else:
+                if not quality_live_records and not preference_live_pairs:
+                    raise ValueError(
+                        "quality_score_steps require manifest quality values or preference pairs")
+                if quality_live_records:
+                    batch_size, xq, _captions_q, chosen_quality_records = (
+                        sample_bucketed_image_text_batch(
+                            quality_live_records, rng, batch=batch,
+                            size_buckets=train_size_buckets,
+                            bucket_records=quality_bucket_records,
+                            device=device, return_records=True,
+                            crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
+                            record_weights=quality_record_weights,
+                            bucket_probs=quality_bucket_probs))
+                    size_bucket_sample_counts[image_size_key(batch_size)] += int(batch)
+                    with torch.no_grad(), amp_autocast(device, train_precision):
+                        zq = ae.encode(xq)
+                    with amp_autocast(device, train_precision):
+                        quality_loss, quality_parts = image_quality_score_loss(
+                            image_quality_scorer, zq, chosen_quality_records,
+                            image_quality_score_stats, prefix="quality_score_pretrain")
+            if (quality_loss is not None and not quality_loss.requires_grad
+                    and quality_live_records):
+                batch_size, xq, _captions_q, chosen_quality_records = (
+                    sample_bucketed_image_text_batch(
+                        quality_live_records, rng, batch=batch,
+                        size_buckets=train_size_buckets,
+                        bucket_records=quality_bucket_records,
+                        device=device, return_records=True,
+                        crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
+                        record_weights=quality_record_weights,
+                        bucket_probs=quality_bucket_probs))
+                size_bucket_sample_counts[image_size_key(batch_size)] += int(batch)
+                with torch.no_grad(), amp_autocast(device, train_precision):
+                    zq = ae.encode(xq)
+                with amp_autocast(device, train_precision):
+                    quality_loss, quality_parts = image_quality_score_loss(
+                        image_quality_scorer, zq, chosen_quality_records,
+                        image_quality_score_stats, prefix="quality_score_pretrain")
+                quality_targets = None
+                quality_masks = None
+            if preference_live_pairs:
+                pref_size = choose_image_size_bucket_weighted(
+                    rng, train_size_buckets, bucket_probs=image_bucket_probs)
+                x_pref_chosen, x_pref_rejected, pref_gaps = (
+                    sample_image_preference_pair_batch(
+                        preference_live_pairs, rng, batch=batch, size=pref_size,
+                        device=device, crop_mode=image_crop_mode,
+                        hflip_prob=image_hflip_prob))
+                size_bucket_sample_counts[image_size_key(pref_size)] += int(batch)
+                with torch.no_grad(), amp_autocast(device, train_precision):
+                    z_pref_chosen = ae.encode(x_pref_chosen)
+                    z_pref_rejected = ae.encode(x_pref_rejected)
+                with amp_autocast(device, train_precision):
+                    pref_loss, pref_parts = image_quality_preference_pair_loss(
+                        image_quality_scorer, z_pref_chosen, z_pref_rejected,
+                        pref_gaps, prefix="quality_preference_pretrain",
+                        margin=quality_rank_margin)
+                quality_loss = (
+                    float(image_preference_w) * pref_loss
+                    if quality_loss is None else
+                    quality_loss + float(image_preference_w) * pref_loss
+                )
+                quality_parts.update(pref_parts)
+            if quality_score_rank_w > 0.0 and quality_loss is not None:
+                with amp_autocast(device, train_precision):
+                    if quality_targets is not None and quality_masks is not None:
+                        rank_loss, rank_parts = image_quality_rank_target_loss(
+                            image_quality_scorer, zq, quality_targets, quality_masks,
+                            prefix="quality_rank_pretrain", margin=quality_rank_margin)
+                    else:
+                        rank_loss, rank_parts = image_quality_rank_loss(
+                            image_quality_scorer, zq, chosen_quality_records,
+                            image_quality_score_stats, prefix="quality_rank_pretrain",
+                            margin=quality_rank_margin)
+                quality_loss = quality_loss + float(quality_score_rank_w) * rank_loss
+                quality_parts.update(rank_parts)
+            if quality_loss is None:
+                continue
+            last_quality_score = {
+                k: float(v.detach().cpu()) for k, v in quality_parts.items()
+            }
+            last_quality_score["total_loss"] = float(quality_loss.detach().cpu())
+            if not quality_loss.requires_grad:
+                continue
+            scaler.scale(quality_loss).backward()
+            if grad_clip > 0.0:
+                scaler.unscale_(opt_quality)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    quality_params, float(grad_clip))
+                last_quality_score["grad_norm"] = float(grad_norm.detach().cpu())
+            scaler.step(opt_quality)
+            scaler.update()
+            quality_score_steps_run += 1
+
+    if image_quality_scorer is not None:
+        image_quality_scorer.eval()
+        for p in image_quality_scorer.parameters():
+            p.requires_grad_(False)
+
     def sample_flow_distill_batch(teacher_conditioner=None):
         return_tokens = flow_uses_cond_tokens(flow)
         if flow_cache is not None:
             z1, cache_payload = sample_latent_cache(flow_cache, rng, batch, device=device)
             if caption_cond_source == "embedding":
                 embs = cache_payload["text_embeddings"].to(device=device)
-                cond = conditioner(embs, return_tokens=return_tokens)
+                cond = conditioner(embs, return_tokens=text_condition_return_tokens(
+                    conditioner, return_tokens=return_tokens))
                 teacher_cond = (
-                    teacher_conditioner(embs, return_tokens=return_tokens)
+                    teacher_conditioner(embs, return_tokens=text_condition_return_tokens(
+                        teacher_conditioner, return_tokens=return_tokens))
                     if teacher_conditioner is not None else cond
                 )
             else:
@@ -6576,9 +9358,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 return z1, cond, cond
             ids = prompt_ids(
                 specs, prompt_vocab, rng=rng, templates=prompt_templates, device=device)
-            cond = conditioner(ids, return_tokens=return_tokens)
+            cond = conditioner(ids, return_tokens=text_condition_return_tokens(
+                conditioner, return_tokens=return_tokens))
             teacher_cond = (
-                teacher_conditioner(ids, return_tokens=return_tokens)
+                teacher_conditioner(ids, return_tokens=text_condition_return_tokens(
+                    teacher_conditioner, return_tokens=return_tokens))
                 if teacher_conditioner is not None else cond
             )
             return z1, cond, teacher_cond
@@ -6591,16 +9375,20 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             z1 = ae.encode(x)
         if caption_cond_source == "embedding":
             embs = record_text_embedding_tensor(chosen_records, device=device)
-            cond = conditioner(embs, return_tokens=return_tokens)
+            cond = conditioner(embs, return_tokens=text_condition_return_tokens(
+                conditioner, return_tokens=return_tokens))
             teacher_cond = (
-                teacher_conditioner(embs, return_tokens=return_tokens)
+                teacher_conditioner(embs, return_tokens=text_condition_return_tokens(
+                    teacher_conditioner, return_tokens=return_tokens))
                 if teacher_conditioner is not None else cond
             )
         else:
             ids = caption_ids(captions, prompt_vocab, max_len=caption_max_len, device=device)
-            cond = conditioner(ids, return_tokens=return_tokens)
+            cond = conditioner(ids, return_tokens=text_condition_return_tokens(
+                conditioner, return_tokens=return_tokens))
             teacher_cond = (
-                teacher_conditioner(ids, return_tokens=return_tokens)
+                teacher_conditioner(ids, return_tokens=text_condition_return_tokens(
+                    teacher_conditioner, return_tokens=return_tokens))
                 if teacher_conditioner is not None else cond
             )
         return z1, cond, teacher_cond
@@ -6616,6 +9404,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         image_quality_scorer.eval()
     if flow_repa_aligner is not None:
         flow_repa_aligner.train()
+    if flow_self_repa_aligner is not None:
+        flow_self_repa_aligner.train()
     last_flow = {}
     flow_ema = clone_state_dict(flow) if flow_ema_decay > 0.0 else None
     conditioner_ema = (clone_state_dict(conditioner)
@@ -6628,6 +9418,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         active_flow_repa_w = float(flow_repa_w)
         if flow_repa_steps > 0 and flow_step >= int(flow_repa_steps):
             active_flow_repa_w = 0.0
+        active_flow_self_repa_w = float(flow_self_repa_w)
+        if flow_self_repa_steps > 0 and flow_step >= int(flow_self_repa_steps):
+            active_flow_self_repa_w = 0.0
+        active_flow_sra_w = float(flow_sra_w)
+        if flow_sra_steps > 0 and flow_step >= int(flow_sra_steps):
+            active_flow_sra_w = 0.0
         active_time_sampling = active_time_sampling_mode(
             time_sampling, flow_step=flow_step, flow_steps=flow_steps,
             time_curriculum_frac=time_curriculum_frac)
@@ -6640,8 +9436,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     cache_payload, conditioner, source=caption_cond_source,
                     device=device, return_tokens=flow_uses_cond_tokens(flow))
                 image_features = cache_payload.get("image_embeddings")
+                image_feature_tokens = cache_payload.get("image_embedding_sequences")
+                quality_targets = cache_payload.get("quality_targets")
+                quality_masks = cache_payload.get("quality_masks")
             elif image_records is None:
                 image_features = None
+                image_feature_tokens = None
+                quality_targets = None
+                quality_masks = None
                 chosen_records = None
                 x, fact_cond, _yc, _ys, specs = _batch(batch, rng, size=size, device=device,
                                                        return_specs=True)
@@ -6669,24 +9471,48 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     record_image_embedding_tensor(chosen_records, device=device)
                     if flow_feature_align_w > 0.0 or active_flow_repa_w > 0.0 else None
                 )
+                image_feature_tokens = (
+                    record_image_embedding_sequence_tensor(chosen_records, device=device)
+                    if active_flow_repa_w > 0.0
+                    and (flow_repa_mode in ("token", "both")
+                         or (flow_repa_mode == "auto" and has_image_embedding_sequences))
+                    else None
+                )
+                quality_targets = None
+                quality_masks = None
             with amp_autocast(device, train_precision):
                 loss, parts = latent_flow_losses(
                     flow, z1, cond, cond_drop=cond_drop, ae=ae,
                     semantic_w=flow_semantic_w, semantic_cond=fact_cond,
                     time_sampling=active_time_sampling, time_logit_mean=time_logit_mean,
                     time_logit_std=time_logit_std, time_shift=effective_time_shift,
+                    flow_noise_coupling=flow_noise_coupling,
+                    flow_noise_coupling_projections=flow_noise_coupling_projections,
                     flow_loss_weight=flow_loss_weight,
                     flow_loss_weight_gamma=flow_loss_weight_gamma,
                     flow_loss_weight_normalize=flow_loss_weight_normalize,
                     consistency_w=flow_consistency_w,
+                    endpoint_w=flow_endpoint_w,
                     text_aligner=text_aligner, text_align_w=flow_text_align_w,
                     feature_aligner=image_feature_aligner, image_features=image_features,
                     feature_align_w=flow_feature_align_w,
                     repa_aligner=flow_repa_aligner, repa_w=active_flow_repa_w,
+                    image_feature_tokens=image_feature_tokens,
+                    repa_mode=flow_repa_mode,
+                    self_repa_aligner=flow_self_repa_aligner,
+                    self_repa_w=active_flow_self_repa_w,
+                    self_repa_mode=flow_self_repa_mode,
+                    sra_w=active_flow_sra_w,
+                    sra_time_gap=flow_sra_time_gap,
+                    sra_mode=flow_sra_mode,
                     quality_scorer=image_quality_scorer,
                     quality_records=chosen_records,
                     quality_stats=image_quality_score_stats,
-                    quality_w=flow_quality_score_w)
+                    quality_targets=quality_targets,
+                    quality_masks=quality_masks,
+                    quality_w=flow_quality_score_w,
+                    quality_rank_w=flow_quality_rank_w,
+                    quality_rank_margin=quality_rank_margin)
                 scaled_loss = loss / float(flow_accum_steps)
             scaler.scale(scaled_loss).backward()
             last_flow = {"total_loss": float(loss.detach().cpu())}
@@ -6730,6 +9556,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             latent_max_tokens=max_train_latent_tokens,
             dit_qk_norm=dit_qk_norm, dit_attn_impl=dit_attn_impl,
             dit_pos_embed=dit_pos_embed,
+            dit_mlp=dit_mlp,
+            latent_patch_size=latent_patch_size,
             flow_checkpoint_blocks=flow_checkpoint_blocks).to(device)
         load_flow_state(teacher_flow, teacher_state)
         attach_latent_stats(teacher_flow, latent_stats)
@@ -6760,7 +9588,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                         time_sampling=distill_time_sampling,
                         time_logit_mean=time_logit_mean, time_logit_std=time_logit_std,
                         time_shift=effective_time_shift, latent_stats=latent_stats,
-                        time_gap=flow_distill_time_gap)
+                        time_gap=flow_distill_time_gap,
+                        guidance_w=flow_guidance_distill_w,
+                        guidance_cfg_scale=flow_guidance_distill_cfg_scale,
+                        guidance_cfg_rescale=flow_guidance_distill_cfg_rescale)
                     scaled_loss = (float(flow_distill_w) * loss) / float(flow_accum_steps)
                 scaler.scale(scaled_loss).backward()
                 last_distill = {
@@ -6797,6 +9628,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         image_quality_scorer.eval()
     if flow_repa_aligner is not None:
         flow_repa_aligner.eval()
+    if flow_self_repa_aligner is not None:
+        flow_self_repa_aligner.eval()
     raw_flow = clone_state_dict(flow)
     raw_conditioner = clone_state_dict(conditioner) if conditioner is not None else None
     requested_eval_weight_mode = "raw" if not eval_with_ema else eval_weight_mode
@@ -6819,6 +9652,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         if image_records is None:
             candidate = evaluate(ae, flow, seed=seed + 1, size=size, device=device,
                                  cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
+                                 cfg_mode=cfg_mode,
                                  sample_steps=sample_steps,
                                  roundtrip_samples=roundtrip_samples, cond_mode=cond_mode,
                                  conditioner=conditioner, prompt_vocab=prompt_vocab,
@@ -6833,13 +9667,17 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                                  sample_time_shift=effective_time_shift,
                                  time_shift=effective_time_shift,
                                  sample_churn=sample_churn,
-                                 sample_churn_interval=sample_churn_interval)
+                                 sample_churn_interval=sample_churn_interval,
+                                 sample_finite_guard=sample_finite_guard,
+                                 sample_velocity_clip=sample_velocity_clip,
+                                 sample_latent_clip=sample_latent_clip)
         else:
             candidate = evaluate_image_records(
                 ae, flow, image_records, seed=seed + 1, size=size, device=device,
                 conditioner=conditioner, prompt_vocab=prompt_vocab,
                 caption_max_len=caption_max_len, cfg_scale=cfg_scale,
                 cfg_rescale=cfg_rescale,
+                cfg_mode=cfg_mode,
                 sample_steps=sample_steps, sample_method=sample_method,
                 sample_schedule=sample_schedule,
                 cfg_interval=cfg_interval, text_aligner=text_aligner,
@@ -6848,7 +9686,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 caption_cond_source=caption_cond_source,
                 sample_time_shift=effective_time_shift, time_shift=effective_time_shift,
                 sample_churn=sample_churn,
-                sample_churn_interval=sample_churn_interval)
+                sample_churn_interval=sample_churn_interval,
+                generated_eval_candidates_per_prompt=(
+                    eval_generated_candidates_per_prompt),
+                sample_finite_guard=sample_finite_guard,
+                sample_velocity_clip=sample_velocity_clip,
+                sample_latent_clip=sample_latent_clip)
         candidate["eval_weight_mode"] = mode
         candidate_reports[mode] = candidate
     selected_eval_weights = max(candidate_reports, key=lambda mode: report_selection_key(
@@ -6863,6 +9706,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "ae_train_steps_run": int(ae_train_steps_run),
         "ae_trainable": bool(ae_has_trainable_params),
         "ae_trainable_param_count": int(ae_trainable_param_count),
+        "quality_score_steps": int(quality_score_steps),
+        "quality_score_steps_run": int(quality_score_steps_run),
         "flow_steps": int(flow_steps),
         "batch": int(batch),
         "flow_cache_latents": bool(flow_cache is not None),
@@ -6873,6 +9718,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_cache_max_records": int(flow_cache_records),
         "flow_cache_batch": int(flow_cache_batch),
         "flow_cache_shard_size": int(flow_cache_shard_size),
+        "flow_cache_reused": bool(
+            flow_cache.get("cache_reused", False) if flow_cache is not None else False
+        ),
+        "flow_cache_latent_dtype": (
+            latent_cache_dtype_name(flow_cache) if flow_cache is not None else flow_cache_dtype
+        ),
         "flow_cache_shards": (
             int(flow_cache.get("shard_count", len(flow_cache.get("shards", []))))
             if flow_cache is not None else 0
@@ -6894,7 +9745,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_cache_weighted": bool(
             flow_cache.get("weighted", False) if flow_cache is not None else False
         ),
+        "flow_cache_has_quality_targets": bool(
+            flow_cache.get("has_quality_targets", False) if flow_cache is not None else False
+        ),
+        **latent_cache_runtime_report(flow_cache),
         **latent_cache_text_embedding_report(flow_cache),
+        **latent_cache_image_embedding_sequence_report(flow_cache),
         "ae_accum_steps": int(ae_accum_steps),
         "flow_accum_steps": int(flow_accum_steps),
         "ae_effective_batch": int(batch) * int(ae_accum_steps),
@@ -6924,11 +9780,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "ae_res_blocks": int(ae_res_blocks) if ae_arch == "residual" else 0,
         "latent_h": int(latent_shape[1]),
         "latent_w": int(latent_shape[2]),
+        "latent_cells": int(latent_cells),
         "latent_tokens": int(latent_tokens),
         "max_train_latent_h": int(max_train_latent_shape[1]),
         "max_train_latent_w": int(max_train_latent_shape[2]),
+        "max_train_latent_cells": int(max_train_latent_cells),
         "max_train_latent_tokens": int(max_train_latent_tokens),
         "latent_max_tokens": int(latent_max_tokens),
+        "latent_patch_size": int(latent_patch_size),
         "hidden": int(hidden),
         "flow_arch": flow_arch,
         "dit_depth": int(dit_depth) if flow_arch in ("dit", "crossdit", "mmdit") else 0,
@@ -6939,10 +9798,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "dit_qk_norm": bool(dit_qk_norm) if flow_arch == "mmdit" else False,
         "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
         "dit_pos_embed": dit_pos_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
+        "dit_mlp": dit_mlp if flow_arch in ("dit", "crossdit", "mmdit") else "",
         "flow_checkpoint_blocks": bool(getattr(flow, "checkpoint_blocks", False)),
         "activation_checkpointing": bool(getattr(flow, "uses_activation_checkpointing", False)),
         "uses_2d_pos_embed": bool(getattr(flow, "uses_2d_pos_embed", False)),
         "uses_rope2d_pos_embed": bool(getattr(flow, "uses_rope2d_pos_embed", False)),
+        "uses_swiglu_mlp": bool(getattr(flow, "uses_swiglu_mlp", False)),
         "adaptive_modulation": bool(getattr(flow, "uses_adaptive_modulation", False)),
         "residual_gating": bool(getattr(flow, "uses_residual_gating", False)),
         "zero_residual_gating": bool(getattr(flow, "uses_zero_residual_gating", False)),
@@ -6950,6 +9811,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "ae_recon_loss": ae_recon_loss,
         "ae_grad_w": float(ae_grad_w),
         "ae_ms_w": float(ae_ms_w),
+        "ae_fft_w": float(ae_fft_w),
         "ae_latent_reg_w": float(ae_latent_reg_w),
         "image_text_align_w": float(image_text_align_w),
         "flow_text_align_w": float(flow_text_align_w),
@@ -6965,12 +9827,33 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             int(flow_steps) if flow_repa_w > 0.0 and int(flow_repa_steps) == 0
             else min(int(flow_steps), int(flow_repa_steps)) if flow_repa_w > 0.0 else 0
         ),
+        "flow_repa_mode": str(flow_repa_mode),
+        "flow_repa_token_sequences": bool(flow_repa_cache_sequences),
         "flow_repa_embed_dim": int(flow_repa_embed_dim),
         "flow_repa_aligner": flow_repa_aligner is not None,
+        "flow_self_repa_w": float(flow_self_repa_w),
+        "flow_self_repa_steps": int(flow_self_repa_steps),
+        "flow_self_repa_active_steps": (
+            int(flow_steps) if flow_self_repa_w > 0.0 and int(flow_self_repa_steps) == 0
+            else min(int(flow_steps), int(flow_self_repa_steps))
+            if flow_self_repa_w > 0.0 else 0
+        ),
+        "flow_self_repa_mode": str(flow_self_repa_mode),
+        "flow_self_repa_embed_dim": int(flow_self_repa_embed_dim),
+        "flow_self_repa_aligner": flow_self_repa_aligner is not None,
+        "flow_sra_w": float(flow_sra_w),
+        "flow_sra_steps": int(flow_sra_steps),
+        "flow_sra_active_steps": (
+            int(flow_steps) if flow_sra_w > 0.0 and int(flow_sra_steps) == 0
+            else min(int(flow_steps), int(flow_sra_steps)) if flow_sra_w > 0.0 else 0
+        ),
+        "flow_sra_time_gap": float(flow_sra_time_gap),
+        "flow_sra_mode": str(flow_sra_mode),
         "ae_intervention_w": float(ae_intervention_w),
         "ae_factor_orth_w": float(ae_factor_orth_w),
         "cond_drop": float(cond_drop),
         "cfg_rescale": float(cfg_rescale),
+        "cfg_mode": cfg_mode,
         "cfg_interval": list(cfg_interval),
         "sample_method": sample_method,
         "sample_schedule": sample_schedule,
@@ -6979,12 +9862,16 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "semantic_guidance_interval": list(semantic_guidance_interval),
         "flow_semantic_w": float(flow_semantic_w),
         "flow_consistency_w": float(flow_consistency_w),
+        "flow_endpoint_w": float(flow_endpoint_w),
         "flow_distill_steps": int(flow_distill_steps),
         "flow_distill_steps_run": int(flow_distill_steps_run),
         "flow_distill_w": float(flow_distill_w),
         "flow_distill_time_gap": float(flow_distill_time_gap),
         "flow_distill_teacher": flow_distill_teacher,
         "flow_distill_teacher_used": flow_distill_teacher_used,
+        "flow_guidance_distill_w": float(flow_guidance_distill_w),
+        "flow_guidance_distill_cfg_scale": float(flow_guidance_distill_cfg_scale),
+        "flow_guidance_distill_cfg_rescale": float(flow_guidance_distill_cfg_rescale),
         "flow_ema_decay": float(flow_ema_decay),
         "flow_ema_warmup": bool(flow_ema_warmup),
         "flow_ema_updates": int(ema_updates),
@@ -6993,6 +9880,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "eval_weight_mode": requested_eval_weight_mode,
         "selected_eval_weights": selected_eval_weights,
         "eval_with_ema": selected_eval_weights == "ema",
+        "eval_generated_candidates_per_prompt": int(
+            eval_generated_candidates_per_prompt),
         "intervention_samples": int(intervention_samples),
         "weight_eval_candidates": {
             mode: eval_report_summary(candidate)
@@ -7009,14 +9898,23 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "time_logit_std": float(time_logit_std),
         **time_shift_report,
         "flow_loss_weight": flow_loss_weight,
+        "flow_noise_coupling": flow_noise_coupling,
+        "flow_noise_coupling_projections": int(flow_noise_coupling_projections),
         "flow_loss_weight_gamma": float(flow_loss_weight_gamma),
         "flow_loss_weight_normalize": bool(flow_loss_weight_normalize),
         "sample_time_shift": float(effective_time_shift),
+        "sample_finite_guard": bool(sample_finite_guard),
+        "sample_velocity_clip": float(sample_velocity_clip),
+        "sample_latent_clip": float(sample_latent_clip),
         "latent_stat_samples": int(latent_stat_samples),
         "latent_normalize_requested": requested_latent_normalize,
         **latent_stats_report(latent_stats),
         "cond_mode": cond_mode,
-        "data_mode": "image_manifest" if image_records is not None else "synthetic_factors",
+        "conditioner_learned_null": conditioner_has_learned_null(conditioner),
+        "cfg_uncond_default": (
+            "learned_null" if conditioner_has_learned_null(conditioner) else "zero"
+        ),
+        "data_mode": "image_manifest" if image_records is not None else "synthetic_fixture",
         "image_manifest": image_manifest,
         "image_root": image_root if image_records is not None else "",
         "image_split": image_split if image_records is not None else "",
@@ -7037,6 +9935,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         ),
         "image_quality_score_w": float(image_quality_score_w),
         "flow_quality_score_w": float(flow_quality_score_w),
+        "image_quality_rank_w": float(image_quality_rank_w),
+        "quality_score_rank_w": float(quality_score_rank_w),
+        "flow_quality_rank_w": float(flow_quality_rank_w),
+        "quality_rank_margin": float(quality_rank_margin),
+        "image_preference_manifest": image_preference_manifest,
+        "image_preference_root": image_preference_root or image_root,
+        "image_preference_max_pairs": int(image_preference_max_pairs),
+        "image_preference_w": float(image_preference_w),
+        "image_preference_pairs": int(len(image_preference_pairs)),
         "image_quality_scorer": image_quality_scorer is not None,
         "image_quality_score_records": int(image_quality_score_stats["n"]),
         "image_quality_score_missing": int(image_quality_score_stats["missing"]),
@@ -7058,6 +9965,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         ),
         "prompt_vocab_size": len(prompt_vocab) if prompt_vocab is not None else 0,
         "last_ae": last_ae,
+        "last_quality_score": last_quality_score,
         "last_flow": last_flow,
         "last_distill": last_distill,
         "last_flow_loss": last_flow.get("velocity_mse"),
@@ -7083,13 +9991,65 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
 
 def selftest():
     ae, flow, report = train_latent_flow(ae_steps=2, flow_steps=2, batch=4, latent_ch=4,
-                                         hidden=16, seed=0, device="cpu", sample_steps=2)
+                                         hidden=16, seed=0, device="cpu", sample_steps=2,
+                                         cond_mode="facts", allow_synthetic_fixture=True)
     assert report["experiment"] == "image3_latent_fact_conditioned_rectified_flow"
     assert report["latent_color_acc"] >= 0.0 and report["latent_shape_acc"] >= 0.0
     assert "sample_roundtrip_both_acc" in report and report["sample_roundtrip_n"] == 15
     assert "latent_endpoint_consistency_mse" in report
     assert "latent_intervention_score" in report and report["latent_intervention_n"] > 0
     assert "latent_factor_orth_loss" in report
+    assert "sample_health_score" in report and report["sample_health_score"] >= 0.0
+    assert "sample_finite_frac" in report and 0.0 <= report["sample_finite_frac"] <= 1.0
+    assert "sample_nonfinite_frac" in report and 0.0 <= report["sample_nonfinite_frac"] <= 1.0
+    assert "sample_trace_min_velocity_finite_frac" in report
+    assert "sample_trace_final_latent_finite_frac" in report
+    assert "sample_dynamic_range" in report and report["sample_dynamic_range"] >= 0.0
+    bad_samples = torch.linspace(-1.0, 1.0, 2 * 3 * 4 * 4).reshape(2, 3, 4, 4)
+    bad_samples[0, 0, 0, 0] = float("nan")
+    bad_metrics = sample_health_metrics(bad_samples, prefix="bad_sample")
+    assert bad_metrics["bad_sample_nonfinite_frac"] > 0.0
+    assert bad_metrics["bad_sample_collapsed_frac"] >= 0.5
+    assert math.isfinite(bad_metrics["bad_sample_health_score"])
+    candidate_scores = sample_candidate_health_scores(bad_samples)
+    assert candidate_scores.shape == (2,)
+    assert torch.isfinite(candidate_scores).all()
+    assert float(candidate_scores[1]) > float(candidate_scores[0])
+    mixed_text_records = [
+        ImageTextRecord(path="a.ppm", caption="a", text_embedding=(1.0, 0.0),
+                        text_embedding_sequence=((1.0, 0.0, 0.0),)),
+        ImageTextRecord(path="b.ppm", caption="b", text_embedding=(0.0, 1.0),
+                        text_embedding_sequence=((0.0, 1.0, 0.0),)),
+    ]
+    assert infer_text_embedding_dim(mixed_text_records) == 3
+    short_cond = {"vec": torch.zeros(1, 2), "tokens": torch.zeros(1, 2, 2),
+                  "mask": torch.zeros(1, 2, dtype=torch.bool)}
+    long_cond = {"vec": torch.ones(1, 2), "tokens": torch.ones(1, 3, 2),
+                 "mask": torch.zeros(1, 3, dtype=torch.bool)}
+    joined_cond = concat_conditions(short_cond, long_cond)
+    assert joined_cond["tokens"].shape == (2, 3, 2)
+    assert bool(joined_cond["mask"][0, 2])
+    fft_loss = frequency_recon_loss(bad_samples[1:2], bad_samples[1:2])
+    assert float(fft_loss) < 1.0e-8
+    data_pair = torch.tensor([0.0, 10.0], dtype=torch.float32).view(2, 1, 1, 1)
+    noise_pair = torch.tensor([9.0, 1.0], dtype=torch.float32).view(2, 1, 1, 1)
+    coupled_noise, coupling_parts = couple_flow_noise_to_data(
+        noise_pair, data_pair, mode="sliced_ot", projections=3)
+    assert coupled_noise.shape == noise_pair.shape
+    assert float(coupling_parts["flow_noise_pair_mse_after"]) < float(
+        coupling_parts["flow_noise_pair_mse_before"])
+    assert float(coupling_parts["flow_noise_coupling_accepted"]) == 1.0
+    assert float(coupling_parts["flow_noise_coupling_projections"]) == 3.0
+    class NaNFlow(nn.Module):
+        def forward(self, z, t, cond):
+            return torch.full_like(z, float("nan"))
+    bad_cond = torch.zeros(2, len(FACT_VOCAB))
+    bad_latents, bad_trace = sample_latents(
+        NaNFlow(), bad_cond, latent_shape=(4, 4, 4), steps=1, device="cpu",
+        sample_finite_guard=True, return_trace=True)
+    assert torch.isfinite(bad_latents).all()
+    assert bad_trace["sample_trace_min_velocity_finite_frac"] == 0.0
+    assert bad_trace["sample_trace_finite_guard_events"] > 0
     assert report["latent_normalize_requested"] == "auto"
     assert report["latent_normalize"] == "none"
     shifted = flow_time_schedule(4, device="cpu", shift=4.0)
@@ -7123,13 +10083,32 @@ def selftest():
                                semantic_guidance_interval=(0.0, 0.5))
     assert guided_img.shape == (1, 3, 32, 32)
     grid_path = "/tmp/image_latent_selftest_grid.ppm"
+    grid_manifest = "/tmp/image_latent_selftest_grid_manifest.jsonl"
     grid_meta = save_sample_grid(ae, flow, grid_path, size=32, device="cpu",
                                  sample_steps=1, samples_per_combo=1, seed=9,
-                                 cfg_rescale=0.4)
+                                 cfg_rescale=0.4,
+                                 sample_manifest_out=grid_manifest)
     assert grid_meta["sample_grid_n"] == len(COLORS) * len(SHAPES)
     assert grid_meta["sample_grid_cfg_rescale"] == 0.4
+    assert grid_meta["sample_manifest_records"] == grid_meta["sample_grid_n"]
+    assert "sample_grid_health_score" in grid_meta
+    assert "sample_grid_finite_frac" in grid_meta
+    assert "sample_grid_nonfinite_frac" in grid_meta
+    assert "sample_grid_trace_min_velocity_finite_frac" in grid_meta
+    assert "sample_grid_trace_final_latent_finite_frac" in grid_meta
+    assert "sample_grid_collapsed_frac" in grid_meta
     with open(grid_path, "rb") as f:
         assert f.read(2) == b"P6"
+    with open(grid_manifest, "r", encoding="utf-8") as f:
+        manifest_rows = [json.loads(line) for line in f if line.strip()]
+    assert len(manifest_rows) == grid_meta["sample_grid_n"]
+    assert manifest_rows[0]["split"] == "generated"
+    assert manifest_rows[0]["source"] == "image_latent_generated"
+    assert manifest_rows[0]["caption"]
+    assert manifest_rows[0]["conditioning_color"] in COLORS
+    assert manifest_rows[0]["conditioning_shape"] in SHAPES
+    assert os.path.exists(os.path.join(
+        os.path.dirname(grid_manifest), manifest_rows[0]["image"]))
     ae2, flow2, report2 = train_latent_flow(ae_steps=1, flow_steps=2, batch=2, latent_ch=4,
                                             hidden=32, flow_arch="dit", dit_depth=1,
                                             dit_heads=2, seed=1, device="cpu", cond_drop=0.5,
@@ -7138,10 +10117,16 @@ def selftest():
                                             flow_semantic_w=0.25, ae_intervention_w=0.1,
                                             ae_factor_orth_w=0.05,
                                             flow_consistency_w=0.1,
+                                            flow_endpoint_w=0.25,
+                                            flow_noise_coupling="sliced_ot",
+                                            flow_noise_coupling_projections=3,
                                             flow_distill_steps=1,
                                             flow_distill_w=0.5,
                                             flow_distill_time_gap=0.25,
                                             flow_distill_teacher="raw",
+                                            flow_guidance_distill_w=0.25,
+                                            flow_guidance_distill_cfg_scale=1.4,
+                                            flow_guidance_distill_cfg_rescale=0.2,
                                             time_sampling="logit-normal",
                                             time_curriculum_frac=0.5,
                                             flow_loss_weight="min-snr-v",
@@ -7150,16 +10135,23 @@ def selftest():
                                             latent_stat_samples=8,
                                             dit_pos_embed="sincos2d",
                                             cfg_interval=(0.0, 0.5),
-                                            semantic_guidance_interval=(0.0, 0.5))
+                                            semantic_guidance_interval=(0.0, 0.5),
+                                            cond_mode="facts", allow_synthetic_fixture=True)
     assert report2["flow_arch"] == "dit"
     assert report2["cond_drop"] == 0.5 and report2["cfg_scale"] == 1.5
     assert report2["cfg_rescale"] == 0.5
     assert report2["flow_semantic_w"] == 0.25
     assert report2["flow_consistency_w"] == 0.1
+    assert report2["flow_endpoint_w"] == 0.25
+    assert report2["flow_noise_coupling"] == "sliced_ot"
+    assert report2["flow_noise_coupling_projections"] == 3
     assert report2["flow_distill_steps"] == 1
     assert report2["flow_distill_steps_run"] == 1
     assert report2["flow_distill_w"] == 0.5
     assert report2["flow_distill_teacher_used"] == "raw"
+    assert report2["flow_guidance_distill_w"] == 0.25
+    assert report2["flow_guidance_distill_cfg_scale"] == 1.4
+    assert report2["flow_guidance_distill_cfg_rescale"] == 0.2
     assert report2["time_sampling"] == "logit-normal"
     assert report2["time_curriculum_frac"] == 0.5
     assert report2["time_curriculum_switch_step"] == 1
@@ -7180,25 +10172,54 @@ def selftest():
     assert "latent_factor_orth_loss" in report2["last_ae"]
     assert "semantic_endpoint_ce" in report2["last_flow"]
     assert "endpoint_consistency_mse" in report2["last_flow"]
+    assert "flow_endpoint_target_mse" in report2["last_flow"]
+    assert report2["last_flow"]["flow_endpoint_w"] == 0.25
+    assert report2["last_flow"]["flow_noise_coupling_active"] == 1.0
+    assert report2["last_flow"]["flow_noise_coupling_projections"] == 3.0
+    assert "flow_noise_coupling_accepted" in report2["last_flow"]
+    assert "flow_noise_pair_mse_after" in report2["last_flow"]
     assert "distill_endpoint_mse" in report2["last_distill"]
+    assert "distill_guidance_endpoint_mse" in report2["last_distill"]
+    assert report2["last_distill"]["distill_guidance_w"] == 0.25
     assert report2["last_distill"]["time_sampling"] == "uniform"
     assert "velocity_mse_unweighted" in report2["last_flow"]
     assert report2["last_flow"]["velocity_weight_max"] >= report2["last_flow"]["velocity_weight_min"]
     img2 = sample_images(ae2, flow2, cond, latent_shape=(4, 8, 8), steps=1, device="cpu",
                          seed=1, cfg_scale=1.5)
     assert img2.shape == (1, 3, 32, 32)
+    cfg_z = _seeded_randn((2, 4, 8, 8), device="cpu", seed=123)
+    cfg_t = torch.full((2, 1, 1, 1), 0.35, device="cpu")
+    cfg_cond = torch.cat([cond, fact_condition(
+        object_facts(ObjectSpec("p0", "red", "square")), device="cpu")[None]], dim=0)
+    cfg_uncond = zero_condition(cfg_cond)
+    cfg_seq_uncond = flow2(cfg_z, cfg_t, cfg_uncond)
+    cfg_seq_cond = flow2(cfg_z, cfg_t, cfg_cond)
+    cfg_expected = rescale_guided_velocity(
+        cfg_seq_uncond + 1.7 * (cfg_seq_cond - cfg_seq_uncond),
+        cfg_seq_cond,
+        cfg_rescale=0.25,
+    )
+    cfg_got = guided_velocity(flow2, cfg_z, cfg_t, cfg_cond, cfg_scale=1.7,
+                              cfg_rescale=0.25)
+    assert torch.allclose(cfg_got, cfg_expected, atol=1.0e-4, rtol=1.0e-4)
+    cfgpp_expected = (1.0 - cfg_t) * cfg_expected + cfg_t * cfg_seq_uncond
+    cfgpp_got = guided_velocity(flow2, cfg_z, cfg_t, cfg_cond, cfg_scale=1.7,
+                                cfg_rescale=0.25, cfg_mode="cfgpp")
+    assert torch.allclose(cfgpp_got, cfgpp_expected, atol=1.0e-4, rtol=1.0e-4)
     ae_res, flow_res, report_res = train_latent_flow(
         ae_steps=1, flow_steps=1, batch=2, latent_ch=6, hidden=32, flow_arch="dit",
         dit_depth=1, dit_heads=2, seed=12, device="cpu", sample_steps=1,
         ae_arch="residual", latent_downsample=8, ae_res_blocks=1,
         latent_max_tokens=32, ae_recon_loss="hybrid", ae_grad_w=0.1, ae_ms_w=0.1,
-        ae_latent_reg_w=0.01, train_precision="bf16", ae_accum_steps=2,
+        ae_fft_w=0.05, ae_latent_reg_w=0.01, train_precision="bf16", ae_accum_steps=2,
         flow_accum_steps=2, grad_clip=1.0, intervention_samples=0,
-        time_shift_mode="dim", time_shift_ref_dim=24.0)
+        time_shift_mode="dim", time_shift_ref_dim=24.0,
+        cond_mode="facts", allow_synthetic_fixture=True)
     assert report_res["ae_arch"] == "residual"
     assert report_res["ae_trainable"] is True and report_res["ae_train_steps_run"] == 1
     assert report_res["ae_trainable_param_count"] > 0
     assert report_res["ae_recon_loss"] == "hybrid"
+    assert report_res["ae_fft_w"] == 0.05
     assert report_res["ae_accum_steps"] == 2 and report_res["flow_accum_steps"] == 2
     assert report_res["ae_effective_batch"] == 4 and report_res["flow_effective_batch"] == 4
     assert report_res["train_precision"] == "bf16" and report_res["train_amp_enabled"] is False
@@ -7213,6 +10234,7 @@ def selftest():
     assert report_res["last_flow"]["time_shift"] == 2.0
     assert "recon_grad_l1" in report_res["last_ae"]
     assert "recon_multiscale_l1" in report_res["last_ae"]
+    assert "recon_fft_l1" in report_res["last_ae"]
     assert "latent_l2" in report_res["last_ae"]
     assert "grad_norm" in report_res["last_ae"] and "grad_norm" in report_res["last_flow"]
     img_res = sample_images(ae_res, flow_res, cond, latent_shape=ae_latent_shape(ae_res, 32),
@@ -7244,20 +10266,32 @@ def selftest():
     assert ae_latent_shape(ae_res2, 32) == (6, 4, 4)
     sweep = sampler_sweep(ae2, flow2, cfg_scales=(1.0, 1.5), sample_steps_list=(1,),
                           cfg_rescales=(0.0, 0.7),
+                          cfg_modes=CFG_MODES,
                           semantic_guidance_weights=(0.0, 0.05),
                           sample_methods=SAMPLE_METHODS,
                           n=4, batch=2, seed=3, device="cpu")
-    assert len(sweep) == 32 and "sample_roundtrip_both_acc" in sweep[0]
+    assert len(sweep) == 64 and "sample_roundtrip_both_acc" in sweep[0]
     agg = aggregate_sweep_rows([dict(r, eval_seed=i) for i, r in enumerate(sweep)])
-    assert len(agg) == 32 and "sample_roundtrip_both_acc_mean" in agg[0]
+    assert len(agg) == 64 and "sample_roundtrip_both_acc_mean" in agg[0]
     assert "semantic_guidance_w" in agg[0] and "sample_method" in agg[0]
-    assert "cfg_rescale" in agg[0]
+    assert "cfg_rescale" in agg[0] and "cfg_mode" in agg[0]
     assert {row["sample_method"] for row in sweep} == set(SAMPLE_METHODS)
+    assert {row["cfg_mode"] for row in sweep} == set(CFG_MODES)
     ae3, flow3, conditioner3, vocab3, report3 = train_latent_flow(
         ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="dit",
         dit_depth=1, dit_heads=2, seed=2, device="cpu", cond_mode="text",
-        text_cond_dim=8, flow_semantic_w=0.1, sample_steps=1, return_conditioner=True)
+        text_cond_dim=8, flow_semantic_w=0.1, sample_steps=1, return_conditioner=True,
+        allow_synthetic_fixture=True)
     assert report3["cond_mode"] == "text" and report3["prompt_vocab_size"] > 0
+    assert report3["conditioner_learned_null"] is True
+    assert report3["cfg_uncond_default"] == "learned_null"
+    text_cond_payload = caption_condition(
+        ("a blue triangle", "a red square"), conditioner3, vocab3,
+        max_len=16, device="cpu", return_tokens=False)
+    assert isinstance(text_cond_payload, dict) and condition_has_null(text_cond_payload)
+    text_drop = condition_dropout(text_cond_payload, 1.0)
+    assert int(condition_active_mask(text_drop).sum().detach().cpu()) == 0
+    assert torch.allclose(text_drop["vec"], text_cond_payload["null_vec"])
     text_sweep = sampler_sweep(ae3, flow3, cfg_scales=(1.0,), sample_steps_list=(1,), n=4,
                                batch=2, seed=4, device="cpu", cond_mode="text",
                                conditioner=conditioner3, prompt_vocab=vocab3)
@@ -7269,25 +10303,34 @@ def selftest():
         seed=10)
     assert text_grid_meta["sample_grid_cond_mode"] == "text"
     prompt_grid_path = "/tmp/image_latent_selftest_prompt_grid.ppm"
+    prompt_manifest = "/tmp/image_latent_selftest_prompt_manifest.jsonl"
     prompt_grid_meta = save_text_prompt_sample_grid(
         ae3, flow3, ("a blue triangle", "a red square"), prompt_grid_path,
         size=32, device="cpu", conditioner=conditioner3, prompt_vocab=vocab3,
         cfg_scale=1.5, sample_steps=1, seed=13, caption_cond_source="tokens",
-        negative_prompts=("blurry",), candidates_per_prompt=2)
+        negative_prompts=("blurry",), candidates_per_prompt=2,
+        sample_manifest_out=prompt_manifest)
     assert prompt_grid_meta["sample_grid_cond_mode"] == "prompt"
     assert prompt_grid_meta["sample_grid_prompt_count"] == 2
     assert prompt_grid_meta["sample_grid_cfg_uncond_mode"] == "negative_prompt"
     assert prompt_grid_meta["sample_grid_negative_prompt_count"] == 2
     assert prompt_grid_meta["sample_grid_candidates_per_prompt"] == 2
-    assert prompt_grid_meta["sample_grid_selection_scorer"] == (
-        "first_candidate_no_compatible_scorer"
-    )
+    assert prompt_grid_meta["sample_grid_selection_scorer"] == "sample_health"
+    assert "sample_grid_selection_score_mean" in prompt_grid_meta
+    assert len(prompt_grid_meta["sample_grid_selected_candidate_indices"]) == 2
+    assert prompt_grid_meta["sample_manifest_records"] == 2
+    with open(prompt_manifest, "r", encoding="utf-8") as f:
+        prompt_rows = [json.loads(line) for line in f if line.strip()]
+    assert [row["caption"] for row in prompt_rows] == ["a blue triangle", "a red square"]
+    assert all("selected_candidate_index" in row for row in prompt_rows)
     ae4, flow4, conditioner4, vocab4, report4 = train_latent_flow(
         ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32, flow_arch="crossdit",
         dit_depth=1, dit_heads=2, seed=5, device="cpu", cond_mode="text",
         text_cond_dim=8, sample_steps=1, time_sampling="logit-normal",
-        time_shift=2.0, return_conditioner=True)
+        time_shift=2.0, dit_mlp="swiglu", return_conditioner=True,
+        allow_synthetic_fixture=True)
     assert report4["flow_arch"] == "crossdit" and flow_uses_cond_tokens(flow4)
+    assert report4["dit_mlp"] == "swiglu" and report4["uses_swiglu_mlp"] is True
     assert report4["time_sampling"] == "logit-normal" and "time_mean" in report4["last_flow"]
     assert report4["time_shift"] == 2.0 and report4["sample_time_shift"] == 2.0
     assert report4["last_flow"]["time_shift"] == 2.0
@@ -7302,21 +10345,40 @@ def selftest():
         dit_depth=1, dit_heads=2, seed=7, device="cpu", cond_mode="text",
         text_cond_dim=8, sample_steps=1, time_sampling="logit-normal",
         flow_ema_decay=0.5, dit_head_width_mult=2, dit_qk_norm=True,
-        dit_attn_impl=("sdpa" if hasattr(F, "scaled_dot_product_attention") else "auto"),
-        dit_pos_embed="rope2d", flow_checkpoint_blocks=True,
-        return_conditioner=True)
+        dit_attn_impl="linear",
+        dit_pos_embed="rope2d", dit_mlp="swiglu", flow_checkpoint_blocks=True,
+        latent_patch_size=2, flow_self_repa_w=0.1,
+        flow_self_repa_embed_dim=13, flow_self_repa_mode="both",
+        flow_sra_w=0.1, flow_sra_mode="both", flow_sra_time_gap=0.2,
+        return_conditioner=True, allow_synthetic_fixture=True)
     assert report5["flow_arch"] == "mmdit" and flow_uses_cond_tokens(flow5)
     assert report5["dit_head_width_mult"] == 2
     assert report5["dit_qk_norm"] is True
-    assert report5["dit_attn_impl"] in ("sdpa", "auto")
+    assert report5["dit_attn_impl"] == "linear"
     assert report5["dit_pos_embed"] == "rope2d"
+    assert report5["dit_mlp"] == "swiglu"
+    assert report5["latent_patch_size"] == 2
+    assert report5["latent_cells"] == 64 and report5["latent_tokens"] == 16
     assert report5["uses_2d_pos_embed"] is True
     assert report5["uses_rope2d_pos_embed"] is True
+    assert report5["uses_swiglu_mlp"] is True
     assert report5["zero_residual_gating"] is True
     assert flow5.uses_zero_residual_gating is True
     assert report5["flow_checkpoint_blocks"] is True
     assert report5["activation_checkpointing"] is True
     assert flow5.uses_activation_checkpointing is True
+    assert report5["flow_self_repa_aligner"] is True
+    assert report5["flow_self_repa_mode"] == "both"
+    assert report5["flow_self_repa_embed_dim"] == 13
+    assert "flow_self_repa_loss" in report5["last_flow"]
+    assert "flow_self_repa_token_loss" in report5["last_flow"]
+    assert report5["last_flow"]["flow_self_repa_components"] == 2.0
+    assert report5["flow_sra_w"] == 0.1
+    assert report5["flow_sra_mode"] == "both"
+    assert report5["flow_sra_time_gap"] == 0.2
+    assert "flow_sra_loss" in report5["last_flow"]
+    assert "flow_sra_token_loss" in report5["last_flow"]
+    assert report5["last_flow"]["flow_sra_components"] == 2.0
     assert any("q_norm" in k for k in flow5.state_dict())
     assert report5["adaptive_modulation"] is True
     assert report5["residual_gating"] is True
@@ -7328,6 +10390,81 @@ def selftest():
     assert "latent_intervention_score" in report5["weight_eval_candidates"]["raw"]
     assert report5["flow_ema_warmup"] is True and report5["flow_ema_effective_decay"] < 0.5
     assert load_flow_state(flow5, flow5.state_dict()) == {"missing": [], "unexpected": []}
+    with torch.no_grad():
+        conditioner5.null_vec.fill_(0.125)
+        conditioner5.null_tokens.fill_(0.25)
+    token_cond = caption_condition(
+        ("a blue triangle", "a red square"), conditioner5, vocab5,
+        max_len=16, device="cpu", return_tokens=True)
+    token_null = null_condition(token_cond)
+    assert torch.allclose(token_null["vec"], token_cond["null_vec"])
+    assert torch.allclose(token_null["tokens"], token_cond["null_tokens"])
+    token_uncond = zero_condition(token_cond)
+    token_cat = concat_conditions(token_uncond, token_cond)
+    assert condition_batch(token_cat) == 4 and token_cat["tokens"].shape[0] == 4
+    token_z = _seeded_randn((2, 4, 8, 8), device="cpu", seed=321)
+    token_t = torch.full((2, 1, 1, 1), 0.55, device="cpu")
+    token_seq_uncond = flow5(token_z, token_t, token_uncond)
+    token_seq_cond = flow5(token_z, token_t, token_cond)
+    token_expected = token_seq_uncond + 1.6 * (token_seq_cond - token_seq_uncond)
+    token_got = guided_velocity(flow5, token_z, token_t, token_cond, cfg_scale=1.6,
+                                cfg_uncond=token_uncond)
+    assert torch.allclose(token_got, token_expected, atol=1.0e-4, rtol=1.0e-4)
+    token_null_seq = flow5(token_z, token_t, token_null)
+    token_null_expected = token_null_seq + 1.6 * (token_seq_cond - token_null_seq)
+    token_null_got = guided_velocity(flow5, token_z, token_t, token_cond, cfg_scale=1.6)
+    assert torch.allclose(token_null_got, token_null_expected, atol=1.0e-4, rtol=1.0e-4)
+    token_cfgpp_expected = (1.0 - token_t) * token_expected + token_t * token_seq_uncond
+    token_cfgpp_got = guided_velocity(
+        flow5, token_z, token_t, token_cond, cfg_scale=1.6,
+        cfg_uncond=token_uncond, cfg_mode="cfgpp")
+    assert torch.allclose(
+        token_cfgpp_got, token_cfgpp_expected, atol=1.0e-4, rtol=1.0e-4)
+    swiglu_ckpt = "/tmp/image_latent_mmdit_swiglu_selftest.pt"
+    torch.save({
+        "autoencoder_state_dict": ae5.state_dict(),
+        "flow_state_dict": flow5.state_dict(),
+        "conditioner_state_dict": conditioner5.state_dict(),
+        "report": report5,
+        "fact_vocab": FACT_VOCAB,
+        "latent_ch": 4,
+        "hidden": 32,
+        "flow_arch": "mmdit",
+        "dit_depth": 1,
+        "dit_heads": 2,
+        "dit_head_width_mult": 2,
+        "dit_qk_norm": True,
+        "dit_attn_impl": report5["dit_attn_impl"],
+        "dit_pos_embed": "rope2d",
+        "dit_mlp": "swiglu",
+        "latent_patch_size": 2,
+        "flow_self_repa_w": 0.1,
+        "flow_self_repa_embed_dim": 13,
+        "flow_self_repa_mode": "both",
+        "flow_sra_w": 0.1,
+        "flow_sra_time_gap": 0.2,
+        "flow_sra_mode": "both",
+        "cond_mode": "text",
+        "cond_dim": 8,
+        "caption_max_len": 32,
+        "prompt_vocab": vocab5,
+        "latent_stats": latent_stats_state(flow_latent_stats(flow5)),
+        "flow_self_repa_aligner_state_dict": (
+            getattr(flow5, "flow_self_repa_aligner").state_dict()
+        ),
+    }, swiglu_ckpt)
+    _ae_sw, flow_sw, _cond_sw, _vocab_sw, _tpl_sw, meta_sw = load_checkpoint(
+        swiglu_ckpt, device="cpu", prefer_ema=False)
+    assert meta_sw["dit_mlp"] == "swiglu"
+    assert meta_sw["latent_patch_size"] == 2
+    assert meta_sw["flow_self_repa_aligner"] is True
+    assert meta_sw["flow_self_repa_embed_dim"] == 13
+    assert meta_sw["flow_self_repa_mode"] == "both"
+    assert meta_sw["flow_sra_w"] == 0.1
+    assert meta_sw["flow_sra_time_gap"] == 0.2
+    assert meta_sw["flow_sra_mode"] == "both"
+    assert getattr(flow_sw, "flow_self_repa_aligner", None) is not None
+    assert getattr(flow_sw, "uses_swiglu_mlp", False) is True
     mm_sweep = sampler_sweep(ae5, flow5, cfg_scales=(1.0,), sample_steps_list=(1,), n=4,
                              batch=2, seed=8, device="cpu", cond_mode="text",
                              conditioner=conditioner5, prompt_vocab=vocab5)
@@ -7359,10 +10496,22 @@ def selftest():
                              [float(i % 2), float(i + 2), 1.0, 0.0],
                          ] + ([[float(i + 3), 0.0, 1.0, 1.0]] if i % 2 else []),
                          "image_embedding": [float(i), float(i + 2),
-                                             float((i + 1) % 2), 1.0]})
+                                             float((i + 1) % 2), 1.0],
+                         "image_embedding_sequence": [
+                             [float(i), float(i + 2), 0.0, 1.0],
+                             [float((i + 1) % 2), float(i + 1), 1.0, 0.0],
+                         ] + ([[float(i + 4), 1.0, 0.0, 1.0]] if i % 2 else [])})
         with open(manifest, "w", encoding="utf-8") as f:
             for row in rows:
                 f.write(json.dumps(row) + "\n")
+        preference_manifest = os.path.join(td, "preferences.jsonl")
+        with open(preference_manifest, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "prompt": "train color patch preference",
+                "chosen_image": "green.ppm",
+                "rejected_image": "red.ppm",
+                "score_gap": 1.0,
+            }) + "\n")
         ae6, flow6, conditioner6, vocab6, aligner6, report6 = train_latent_flow(
             ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32,
             flow_arch="mmdit", dit_depth=1, dit_heads=2, seed=9,
@@ -7373,10 +10522,16 @@ def selftest():
             image_text_align_w=0.1, flow_text_align_w=0.1, text_embed_dim=12,
             image_feature_align_w=0.1, flow_feature_align_w=0.1,
             image_feature_embed_dim=10, flow_repa_w=0.1, flow_repa_embed_dim=11,
+            flow_repa_mode="both",
             image_quality_weight=2.0,
             image_source_weights="curated=3.0,synthetic=0.5,*=1.0",
             image_quality_score_w=0.1,
+            flow_quality_score_w=0.1,
+            quality_score_steps=1,
+            image_preference_manifest=preference_manifest,
+            image_preference_w=0.5,
             flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
+            flow_cache_dtype="bf16",
             intervention_samples=0, return_conditioner=True, return_aligner=True)
         assert report6["data_mode"] == "image_manifest"
         assert report6["latent_normalize_requested"] == "auto"
@@ -7390,18 +10545,33 @@ def selftest():
         assert "flow_caption_align_i2t_acc" in report6["last_flow"]
         assert "flow_image_feature_align_i2f_acc" in report6["last_flow"]
         assert "flow_repa_h2f_acc" in report6["last_flow"]
+        assert "flow_repa_token_loss" in report6["last_flow"]
+        assert "flow_repa_token_h2f_cos" in report6["last_flow"]
+        assert report6["last_flow"]["flow_repa_components"] == 2.0
+        assert report6["flow_repa_mode"] == "both"
+        assert report6["flow_repa_token_sequences"] is True
         assert report6["image_embedding_in_dim"] == 4
+        assert report6["image_embedding_sequence_records"] == 2
+        assert report6["image_embedding_sequence_dims"] == [4]
         assert report6["text_embedding_in_dim"] == 4
         assert report6["text_embedding_sequence_records"] == 2
         assert report6["text_embedding_sequence_dims"] == [4]
         assert report6["flow_cache_text_embedding_ndim"] == 3
         assert report6["flow_cache_text_embedding_seq_len"] == 3
+        assert report6["flow_cache_image_embedding_sequence_ndim"] == 3
+        assert report6["flow_cache_image_embedding_sequence_len"] == 3
         assert report6["flow_repa_embed_dim"] == 11
         assert "generated_external_text_image_score_cos" in report6
         assert "generated_image_feature_distribution_frechet" in report6
         assert report6["generated_image_feature_distribution_n"] >= 1
         assert "generated_image_feature_distribution_support_precision" in report6
         assert "generated_image_feature_distribution_diversity_l2_ratio" in report6
+        assert "sample_health_score" in report6 and report6["sample_health_score"] >= 0.0
+        assert "sample_finite_frac" in report6
+        assert "sample_nonfinite_frac" in report6
+        assert "sample_trace_min_velocity_finite_frac" in report6
+        assert "sample_trace_final_latent_finite_frac" in report6
+        assert "sample_dynamic_range" in report6
         assert report6["image_quality_weighted"] is True
         assert report6["image_quality_weight_source"] == "aesthetic_score_quality"
         assert report6["image_quality_weight_records"] == 2
@@ -7416,8 +10586,15 @@ def selftest():
         assert report6["image_quality_scorer"] is True
         assert report6["image_quality_score_records"] == 2
         assert "quality_score_loss" in report6["last_ae"]
+        assert report6["quality_score_steps_run"] == 1
+        assert report6["image_preference_pairs"] == 1
+        assert report6["image_preference_w"] == 0.5
+        assert "quality_preference_pretrain_loss" in report6["last_quality_score"]
+        assert report6["flow_cache_has_quality_targets"] is True
+        assert "flow_quality_score_loss" in report6["last_flow"]
         assert report6["flow_cache_latents"] is True
         assert report6["flow_cache_backend"] == "memory"
+        assert report6["flow_cache_latent_dtype"] == "bf16"
         assert report6["flow_cache_weighted"] is True
         assert report6["flow_cache_records"] == 2 and report6["flow_cache_bytes"] > 0
         assert report6["flow_cache_shards"] == 0
@@ -7439,8 +10616,10 @@ def selftest():
         assert embed_prompt_meta["sample_grid_negative_prompt_count"] == 2
         assert embed_prompt_meta["sample_grid_candidates_per_prompt"] == 2
         assert embed_prompt_meta["sample_grid_selection_scorer"] == (
-            "text_aligner_cosine+image_feature_aligner_cosine"
+            "text_aligner_cosine+image_feature_aligner_cosine+quality_scorer_score"
         )
+        assert embed_prompt_meta["sample_grid_selection_component_count"] == 3
+        assert "sample_grid_selection_quality_scorer_mean" in embed_prompt_meta
         assert "sample_grid_selection_score_mean" in embed_prompt_meta
         assert embed_prompt_meta["sample_grid_text_guidance_w"] == 0.05
         assert embed_prompt_meta["sample_grid_text_guidance_scorer"] == "text_aligner"
@@ -7448,6 +10627,12 @@ def selftest():
         assert embed_prompt_meta["sample_grid_feature_guidance_scorer"] == "image_feature_aligner"
         assert embed_prompt_meta["sample_grid_quality_guidance_w"] == 0.05
         assert embed_prompt_meta["sample_grid_quality_guidance_scorer"] == "image_quality_scorer"
+        assert "sample_grid_health_score" in embed_prompt_meta
+        assert "sample_grid_finite_frac" in embed_prompt_meta
+        assert "sample_grid_nonfinite_frac" in embed_prompt_meta
+        assert "sample_grid_trace_min_velocity_finite_frac" in embed_prompt_meta
+        assert "sample_grid_trace_final_latent_finite_frac" in embed_prompt_meta
+        assert "sample_grid_dynamic_range" in embed_prompt_meta
         _ae_q, _flow_q, _cond_q, _vocab_q, report_q = train_latent_flow(
             ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=16,
             flow_arch="dit", dit_depth=1, dit_heads=2, seed=15,
@@ -7461,6 +10646,25 @@ def selftest():
         assert report_q["latent_normalize_requested"] == "auto"
         assert report_q["latent_normalize"] == "channel"
         assert "flow_quality_score_loss" in report_q["last_flow"]
+        _ae_qs, _flow_qs, _cond_qs, _vocab_qs, report_qs = train_latent_flow(
+            ae_steps=0, flow_steps=1, batch=2, latent_ch=4, hidden=16,
+            flow_arch="dit", dit_depth=1, dit_heads=2, seed=16,
+            device="cpu", cond_mode="text", text_cond_dim=8,
+            image_manifest=manifest, image_root=img_dir, image_split="train",
+            image_max_records=2, caption_max_len=8, sample_steps=1,
+            caption_cond_source="embedding", image_quality_score_w=0.0,
+            flow_quality_score_w=0.1, quality_score_steps=1,
+            quality_score_rank_w=0.1, flow_quality_rank_w=0.1,
+            flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
+            intervention_samples=0, return_conditioner=True)
+        assert report_qs["image_quality_scorer"] is True
+        assert report_qs["quality_score_steps"] == 1
+        assert report_qs["quality_score_steps_run"] == 1
+        assert report_qs["flow_cache_has_quality_targets"] is True
+        assert "quality_score_pretrain_loss" in report_qs["last_quality_score"]
+        assert "quality_rank_pretrain_loss" in report_qs["last_quality_score"]
+        assert "flow_quality_score_loss" in report_qs["last_flow"]
+        assert "flow_quality_rank_loss" in report_qs["last_flow"]
         ae_rect, flow_rect, conditioner_rect, vocab_rect, report_rect = train_latent_flow(
             ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=16,
             flow_arch="dit", dit_depth=1, dit_heads=2, seed=14,
@@ -7561,31 +10765,74 @@ def selftest():
                 image_feature_align_w=0.1, flow_feature_align_w=0.1,
                 image_feature_embed_dim=10,
                 image_quality_weight=1.0,
+                image_quality_score_w=0.1, flow_quality_score_w=0.1,
                 flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
                 flow_cache_dir=disk_cache_dir, flow_cache_shard_size=1,
+                flow_cache_dtype="fp16", flow_cache_max_loaded_shards=1,
                 latent_normalize="channel", latent_stat_samples=2,
                 intervention_samples=0, return_conditioner=True, return_aligner=True))
         assert report_disk["flow_cache_backend"] == "disk"
+        assert report_disk["flow_cache_reused"] is False
+        assert report_disk["flow_cache_latent_dtype"] == "fp16"
+        assert report_disk["flow_cache_max_loaded_shards"] == 1
+        assert report_disk["flow_cache_loaded_shards"] <= 1
+        assert report_disk["flow_cache_shard_loads"] >= 1
         assert report_disk["flow_cache_records"] == 2
         assert report_disk["flow_cache_shards"] == 2
         assert report_disk["flow_cache_weighted"] is True
+        assert report_disk["flow_cache_has_quality_targets"] is True
+        assert "flow_quality_score_loss" in report_disk["last_flow"]
         assert report_disk["flow_cache_text_embedding_ndim"] == 3
         assert report_disk["flow_cache_text_embedding_seq_len"] == 3
         assert report_disk["image_feature_aligner"] is True
         assert report_disk["flow_cache_bytes"] > 0
         assert os.path.exists(os.path.join(disk_cache_dir, "meta.json"))
         assert report_disk["latent_normalize"] == "channel"
+        _ae_disk2, _flow_disk2, _cond_disk2, _vocab_disk2, _aligner_disk2, report_disk2 = (
+            train_latent_flow(
+                ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=32,
+                flow_arch="mmdit", dit_depth=1, dit_heads=2, seed=13,
+                device="cpu", cond_mode="text", text_cond_dim=8,
+                image_manifest=manifest, image_root=img_dir, image_split="train",
+                image_max_records=2, caption_max_len=8, sample_steps=1,
+                caption_cond_source="embedding",
+                image_text_align_w=0.1, flow_text_align_w=0.1, text_embed_dim=12,
+                image_feature_align_w=0.1, flow_feature_align_w=0.1,
+                image_feature_embed_dim=10,
+                image_quality_weight=1.0,
+                image_quality_score_w=0.1, flow_quality_score_w=0.1,
+                flow_cache_latents=True, flow_cache_batch=1, flow_cache_records=2,
+                flow_cache_dir=disk_cache_dir, flow_cache_shard_size=1,
+                flow_cache_dtype="fp16", flow_cache_max_loaded_shards=1,
+                latent_normalize="channel", latent_stat_samples=2,
+                intervention_samples=0, return_conditioner=True, return_aligner=True))
+        assert report_disk2["flow_cache_backend"] == "disk"
+        assert report_disk2["flow_cache_reused"] is True
+        assert report_disk2["flow_cache_has_quality_targets"] is True
+        assert report_disk2["flow_cache_latent_dtype"] == "fp16"
+        assert report_disk2["flow_cache_max_loaded_shards"] == 1
+        assert report_disk2["flow_cache_loaded_shards"] <= 1
+        assert report_disk2["flow_cache_shard_loads"] >= 1
         manifest_rows = read_image_manifest(manifest, root=img_dir, split="eval")
         img_sweep = image_record_sweep(
             ae6, flow6, manifest_rows, cfg_scales=(1.0,), sample_steps_list=(1,),
             n=2, batch=2, seed=10, device="cpu", conditioner=conditioner6,
             prompt_vocab=vocab6, caption_max_len=8, text_aligner=aligner6,
             image_feature_aligner=getattr(flow6, "image_feature_aligner", None),
-            caption_cond_source="embedding", generated_eval_n=3)
+            image_quality_scorer=getattr(flow6, "image_quality_scorer", None),
+            caption_cond_source="embedding", generated_eval_n=3,
+            generated_eval_candidates_per_prompt=2)
         img_agg = aggregate_sweep_rows([dict(r, eval_seed=10) for r in img_sweep])
         assert img_sweep[0]["sample_steps"] == 1
         assert img_sweep[0]["generated_eval_n"] == 3
         assert img_sweep[0]["generated_eval_n_requested"] == 3
+        assert img_sweep[0]["generated_eval_candidates_per_prompt"] == 2
+        assert img_sweep[0]["generated_eval_raw_candidates"] == 6
+        assert img_sweep[0]["generated_eval_selection_component_count"] >= 2
+        assert len(img_sweep[0]["generated_eval_selected_candidate_indices"]) == 3
+        assert "quality_scorer_score" in img_sweep[0]["generated_eval_selection_scorer"]
+        assert img_agg[0]["generated_eval_candidates_per_prompt"] == 2
+        assert img_agg[0]["generated_eval_raw_candidates_mean"] == 6.0
         assert "caption_sample_mse_mean" in img_agg[0]
         assert "generated_caption_retrieval_i2t_acc_mean" in img_agg[0]
         assert "generated_image_feature_retrieval_i2f_acc_mean" in img_agg[0]
@@ -7649,13 +10896,20 @@ def selftest():
             text_guidance_weights=(0.0, 0.01),
             feature_guidance_weights=(0.0, 0.01),
             quality_guidance_weights=(0.0, 0.01),
-            generated_eval_n=3)
+            generated_eval_n=3,
+            generated_eval_candidates_per_prompt=2)
         assert eval6["experiment"] == "image_latent_manifest_sampler_sweep"
         assert eval6["generated_eval_n_requested"] == 3
+        assert eval6["generated_eval_candidates_per_prompt"] == 2
         assert all(row["sample_steps"] == 1 for row in eval6["rows"])
         assert all(row["generated_eval_n"] == 3 for row in eval6["rows"])
         assert all(row["generated_eval_n_requested"] == 3 for row in eval6["rows"])
+        assert all(row["generated_eval_candidates_per_prompt"] == 2
+                   for row in eval6["rows"])
+        assert all(row["generated_eval_raw_candidates"] == 6 for row in eval6["rows"])
         assert eval6["best"]["caption_sample_mse_mean"] >= 0.0
+        assert eval6["best"]["generated_eval_candidates_per_prompt"] == 2
+        assert eval6["best"]["generated_eval_raw_candidates_mean"] == 6.0
         assert eval6["text_aligner"] is True
         assert eval6["image_feature_aligner"] is True
         assert eval6["image_quality_scorer"] is True
@@ -7701,6 +10955,10 @@ def main(argv=None):
                     dest="eval_generated_samples",
                     help=("generated manifest samples per eval row; 0 uses "
                           "min(batch,sample_steps)"))
+    ap.add_argument("--eval-generated-candidates-per-prompt", type=int, default=1,
+                    dest="eval_generated_candidates_per_prompt",
+                    help=("manifest eval candidates drawn per caption before learned "
+                          "aligner/quality reranking"))
     ap.add_argument("--ae-steps", type=int, default=200, dest="ae_steps")
     ap.add_argument("--flow-steps", type=int, default=200, dest="flow_steps")
     ap.add_argument("--batch", type=int, default=64)
@@ -7719,6 +10977,12 @@ def main(argv=None):
     ap.add_argument("--flow-cache-shard-size", type=int, default=1024,
                     dest="flow_cache_shard_size",
                     help="records per shard for --flow-cache-dir")
+    ap.add_argument("--flow-cache-dtype", default="fp32", choices=LATENT_CACHE_DTYPES,
+                    dest="flow_cache_dtype",
+                    help="dtype used to store cached AE latents")
+    ap.add_argument("--flow-cache-max-loaded-shards", type=int, default=0,
+                    dest="flow_cache_max_loaded_shards",
+                    help="LRU disk-cache shards kept loaded in CPU RAM; 0 disables")
     ap.add_argument("--train-precision", default="fp32", choices=TRAIN_PRECISIONS,
                     dest="train_precision",
                     help="training precision; bf16/fp16 AMP is enabled on CUDA")
@@ -7746,6 +11010,8 @@ def main(argv=None):
                     help="residual blocks per AE stage when --ae-arch residual")
     ap.add_argument("--latent-max-tokens", type=int, default=256, dest="latent_max_tokens",
                     help="maximum latent grid tokens for DiT/CrossDiT/MM-DiT flows")
+    ap.add_argument("--latent-patch-size", type=int, default=1, dest="latent_patch_size",
+                    help="spatial latent patch size for DiT/CrossDiT/MM-DiT image tokens")
     ap.add_argument("--ae-recon-loss", default="mse", choices=AE_RECON_LOSSES,
                     dest="ae_recon_loss",
                     help="base reconstruction loss for the image autoencoder")
@@ -7753,6 +11019,8 @@ def main(argv=None):
                     help="edge/gradient reconstruction loss weight")
     ap.add_argument("--ae-ms-w", type=float, default=0.0, dest="ae_ms_w",
                     help="multi-scale reconstruction loss weight")
+    ap.add_argument("--ae-fft-w", type=float, default=0.0, dest="ae_fft_w",
+                    help="frequency-spectrum reconstruction loss weight")
     ap.add_argument("--ae-latent-reg-w", type=float, default=0.0, dest="ae_latent_reg_w",
                     help="latent L2 regularization weight during AE training")
     ap.add_argument("--image-text-align-w", type=float, default=0.0,
@@ -7779,6 +11047,33 @@ def main(argv=None):
     ap.add_argument("--flow-repa-embed-dim", type=int, default=128,
                     dest="flow_repa_embed_dim",
                     help="shared embedding width for REPA hidden/image-feature alignment")
+    ap.add_argument("--flow-repa-mode", default="pooled", choices=FLOW_REPA_MODES,
+                    dest="flow_repa_mode",
+                    help="REPA target: pooled image feature, token sequence, both, or auto")
+    ap.add_argument("--flow-self-repa-w", type=float, default=0.0,
+                    dest="flow_self_repa_w",
+                    help=("no-extra-data REPA-style hidden/clean-latent alignment "
+                          "weight for transformer flows"))
+    ap.add_argument("--flow-self-repa-steps", type=int, default=0,
+                    dest="flow_self_repa_steps",
+                    help="limit self-REPA alignment to the first N flow steps; 0 means all steps")
+    ap.add_argument("--flow-self-repa-embed-dim", type=int, default=128,
+                    dest="flow_self_repa_embed_dim",
+                    help="shared embedding width for self-REPA hidden/latent alignment")
+    ap.add_argument("--flow-self-repa-mode", default="pooled", choices=FLOW_REPA_MODES,
+                    dest="flow_self_repa_mode",
+                    help="self-REPA target: pooled clean latent, latent patch tokens, both, or auto")
+    ap.add_argument("--flow-sra-w", type=float, default=0.0, dest="flow_sra_w",
+                    help=("self-representation alignment weight: match noisy-step hidden "
+                          "tokens to detached cleaner-step hidden tokens"))
+    ap.add_argument("--flow-sra-steps", type=int, default=0, dest="flow_sra_steps",
+                    help="limit flow SRA alignment to the first N flow steps; 0 means all steps")
+    ap.add_argument("--flow-sra-time-gap", type=float, default=0.25,
+                    dest="flow_sra_time_gap",
+                    help="fractional move toward clean data for the detached SRA teacher pass")
+    ap.add_argument("--flow-sra-mode", default="token", choices=FLOW_REPA_MODES,
+                    dest="flow_sra_mode",
+                    help="flow SRA target: pooled hidden state, patch tokens, both, or auto")
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--fact-w", type=float, default=1.0, dest="fact_w")
@@ -7804,6 +11099,8 @@ def main(argv=None):
                     dest="dit_pos_embed",
                     help=("image-token positional embedding for DiT/CrossDiT/MM-DiT flows; "
                           "rope2d is MM-DiT-only"))
+    ap.add_argument("--dit-mlp", default="gelu", choices=DIT_MLPS, dest="dit_mlp",
+                    help="feed-forward block for CrossDiT/MM-DiT image-token transformers")
     ap.add_argument("--flow-checkpoint-blocks", action="store_true",
                     dest="flow_checkpoint_blocks",
                     help=("checkpoint DiT/CrossDiT/MM-DiT transformer blocks during "
@@ -7812,6 +11109,8 @@ def main(argv=None):
     ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
     ap.add_argument("--cfg-rescale", type=float, default=0.0, dest="cfg_rescale",
                     help="rescale guided velocity toward conditional velocity std; 0 disables")
+    ap.add_argument("--cfg-mode", default="standard", choices=CFG_MODES, dest="cfg_mode",
+                    help="classifier-free guidance variant for sampling")
     ap.add_argument("--cfg-interval", default="0.0,1.0", dest="cfg_interval",
                     help="CFG active interval over rectified-flow time, formatted start,end")
     ap.add_argument("--sample-steps", type=int, default=4, dest="sample_steps")
@@ -7834,6 +11133,15 @@ def main(argv=None):
     ap.add_argument("--sample-churn-interval", default="0.0,0.8",
                     dest="sample_churn_interval",
                     help="flow-time interval where stochastic sampler churn is active")
+    ap.add_argument("--sample-finite-guard", action="store_true",
+                    dest="sample_finite_guard",
+                    help="replace non-finite latent/velocity sampler values with zeros")
+    ap.add_argument("--sample-velocity-clip", type=float, default=0.0,
+                    dest="sample_velocity_clip",
+                    help="per-sample velocity RMS clip during sampling; 0 disables")
+    ap.add_argument("--sample-latent-clip", type=float, default=0.0,
+                    dest="sample_latent_clip",
+                    help="absolute latent clamp during sampling; 0 disables")
     ap.add_argument("--semantic-guidance-w", type=float, default=0.0,
                     dest="semantic_guidance_w",
                     help="sampling-time semantic AE guidance weight")
@@ -7862,6 +11170,8 @@ def main(argv=None):
                     help="comma-separated CFG scales for --eval-checkpoint")
     ap.add_argument("--cfg-rescales", default="0.0", dest="cfg_rescales",
                     help="comma-separated CFG rescale values for --eval-checkpoint")
+    ap.add_argument("--cfg-modes", default="", dest="cfg_modes",
+                    help="comma-separated CFG modes for --eval-checkpoint; default uses --cfg-mode")
     ap.add_argument("--sample-steps-list", default="4,8,16", dest="sample_steps_list",
                     help="comma-separated sampler step counts for --eval-checkpoint")
     ap.add_argument("--eval-seeds", default="", dest="eval_seeds",
@@ -7875,6 +11185,15 @@ def main(argv=None):
     ap.add_argument("--flow-consistency-w", type=float, default=0.0,
                     dest="flow_consistency_w",
                     help="same-path clean-endpoint consistency loss weight for latent flow")
+    ap.add_argument("--flow-endpoint-w", type=float, default=0.0,
+                    dest="flow_endpoint_w",
+                    help="direct clean-endpoint latent prediction loss weight for latent flow")
+    ap.add_argument("--flow-noise-coupling", default="random", choices=FLOW_NOISE_COUPLINGS,
+                    dest="flow_noise_coupling",
+                    help="source-noise/data pairing for flow matching")
+    ap.add_argument("--flow-noise-coupling-projections", type=int, default=1,
+                    dest="flow_noise_coupling_projections",
+                    help="random projections to try for sliced_ot flow noise coupling")
     ap.add_argument("--flow-distill-steps", type=int, default=0,
                     dest="flow_distill_steps",
                     help="post-flow own-model endpoint distillation steps")
@@ -7887,6 +11206,15 @@ def main(argv=None):
     ap.add_argument("--flow-distill-teacher", default="auto", choices=FLOW_DISTILL_TEACHERS,
                     dest="flow_distill_teacher",
                     help="teacher snapshot for own-model distillation")
+    ap.add_argument("--flow-guidance-distill-w", type=float, default=0.0,
+                    dest="flow_guidance_distill_w",
+                    help="inside distillation, match a CFG-guided frozen-teacher endpoint")
+    ap.add_argument("--flow-guidance-distill-cfg-scale", type=float, default=1.5,
+                    dest="flow_guidance_distill_cfg_scale",
+                    help="CFG scale used by the frozen teacher for guidance distillation")
+    ap.add_argument("--flow-guidance-distill-cfg-rescale", type=float, default=0.0,
+                    dest="flow_guidance_distill_cfg_rescale",
+                    help="CFG rescale used by the frozen teacher for guidance distillation")
     ap.add_argument("--flow-ema-decay", type=float, default=0.0, dest="flow_ema_decay",
                     help="EMA decay for flow/conditioner weights; 0 disables EMA")
     ap.add_argument("--no-ema-warmup", action="store_true", dest="no_ema_warmup",
@@ -7935,8 +11263,8 @@ def main(argv=None):
     ap.add_argument("--latent-stat-samples", type=int, default=512,
                     dest="latent_stat_samples",
                     help="number of AE samples used to estimate latent normalization stats")
-    ap.add_argument("--cond-mode", default="facts", choices=("facts", "text"), dest="cond_mode",
-                    help="conditioning source for latent flow")
+    ap.add_argument("--cond-mode", default="text", choices=("text",), dest="cond_mode",
+                    help="caption/text conditioning source for manifest latent flow")
     ap.add_argument("--text-cond-dim", type=int, default=0, dest="text_cond_dim",
                     help="text condition vector width; default uses --hidden")
     ap.add_argument("--image-manifest", default="", dest="image_manifest",
@@ -7962,7 +11290,37 @@ def main(argv=None):
     ap.add_argument("--flow-quality-score-w", type=float, default=0.0,
                     dest="flow_quality_score_w",
                     help=("preserve the learned quality score on predicted flow endpoints; "
-                          "requires --image-quality-score-w"))
+                          "requires --image-quality-score-w or --quality-score-steps"))
+    ap.add_argument("--quality-score-steps", type=int, default=0,
+                    dest="quality_score_steps",
+                    help=("standalone latent quality-scorer pretrain steps from cached "
+                          "or encoded manifest latents"))
+    ap.add_argument("--image-quality-rank-w", type=float, default=0.0,
+                    dest="image_quality_rank_w",
+                    help="AE-phase pairwise quality preference ranking loss weight")
+    ap.add_argument("--quality-score-rank-w", type=float, default=0.0,
+                    dest="quality_score_rank_w",
+                    help="standalone scorer pretrain pairwise quality ranking loss weight")
+    ap.add_argument("--flow-quality-rank-w", type=float, default=0.0,
+                    dest="flow_quality_rank_w",
+                    help="preserve batch quality preference ordering on flow endpoints")
+    ap.add_argument("--quality-rank-margin", type=float, default=0.0,
+                    dest="quality_rank_margin",
+                    help="minimum scorer-logit margin for quality preference ranking")
+    ap.add_argument("--image-preference-manifest", default="",
+                    dest="image_preference_manifest",
+                    help=("JSONL chosen/rejected image-pair manifest for latent quality "
+                          "scorer pretraining"))
+    ap.add_argument("--image-preference-root", default="",
+                    dest="image_preference_root",
+                    help="base directory for relative paths in --image-preference-manifest")
+    ap.add_argument("--image-preference-max-pairs", type=int, default=0,
+                    dest="image_preference_max_pairs",
+                    help="cap preference pairs loaded for quality scorer pretraining; 0 means all")
+    ap.add_argument("--image-preference-w", type=float, default=0.0,
+                    dest="image_preference_w",
+                    help=("pairwise chosen/rejected preference loss weight inside "
+                          "--quality-score-steps"))
     ap.add_argument("--image-max-records", type=int, default=0, dest="image_max_records",
                     help="cap manifest rows for smoke tests; 0 means all")
     ap.add_argument("--caption-vocab-max", type=int, default=8192, dest="caption_vocab_max",
@@ -7979,16 +11337,22 @@ def main(argv=None):
                     dest="image_hflip_prob",
                     help="random horizontal flip probability for manifest training images")
     ap.add_argument("--prompt-templates", default="", dest="prompt_templates",
-                    help="semicolon-separated prompt templates using {color} and {shape}")
+                    help="internal fixture prompt templates; production runs use captions/prompts")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="runs/image_latent_flow.pt")
     ap.add_argument("--eval-out", default="", dest="eval_out",
                     help="JSON path for --eval-checkpoint report")
     ap.add_argument("--sample-grid-out", default="", dest="sample_grid_out",
-                    help="optional PPM path for a color x shape generated sample grid")
+                    help="optional PPM path for a prompt/caption generated sample grid")
     ap.add_argument("--sample-grid-samples", type=int, default=1,
                     dest="sample_grid_samples",
                     help="generated samples per color/shape condition in --sample-grid-out")
+    ap.add_argument("--sample-manifest-out", default="", dest="sample_manifest_out",
+                    help=("optional JSONL manifest path for individual generated samples "
+                          "from --sample-grid-out"))
+    ap.add_argument("--sample-image-dir", default="", dest="sample_image_dir",
+                    help=("optional directory for individual generated PPM samples; "
+                          "default is derived from --sample-manifest-out"))
     ap.add_argument("--sample-prompts", default="", dest="sample_prompts",
                     help="semicolon/newline separated prompts for --sample-grid-out")
     ap.add_argument("--sample-negative-prompts", default="", dest="sample_negative_prompts",
@@ -7996,8 +11360,8 @@ def main(argv=None):
                           "--sample-prompts CFG baselines"))
     ap.add_argument("--sample-candidates-per-prompt", type=int, default=1,
                     dest="sample_candidates_per_prompt",
-                    help=("number of candidates to draw per sample prompt; when compatible "
-                          "aligners are available the best candidate is selected"))
+                    help=("number of candidates to draw per sample prompt; compatible "
+                          "aligners/quality scorers select the best candidate"))
     ap.add_argument("--sample-text-guidance-w", type=float, default=0.0,
                     dest="sample_text_guidance_w",
                     help=("sampling-time text-image alignment guidance weight for "
@@ -8028,6 +11392,14 @@ def main(argv=None):
                     help="text embedding backend used by --sample-prompts with embedding conditioning")
     ap.add_argument("--prompt-embed-model", default="", dest="prompt_embed_model",
                     help="Hugging Face model id for --prompt-embed-backend hf")
+    ap.add_argument("--prompt-embed-text-sequence-model", default="",
+                    dest="prompt_embed_text_sequence_model",
+                    help=("optional Hugging Face text encoder for token-level live prompt "
+                          "conditioning; primary --prompt-embed-model still supplies pooled "
+                          "prompt features"))
+    ap.add_argument("--prompt-embed-text-sequence-max-length", type=int, default=0,
+                    dest="prompt_embed_text_sequence_max_length",
+                    help="optional tokenizer max_length for --prompt-embed-text-sequence-model")
     ap.add_argument("--prompt-embed-device", default="", dest="prompt_embed_device",
                     help="device for live prompt embedding; default uses image_latent device")
     ap.add_argument("--prompt-embed-dtype", default="auto",
@@ -8078,13 +11450,22 @@ def main(argv=None):
         sample_schedules = (
             _parse_string_list(args.sample_schedules) if args.sample_schedules else None
         )
+        cfg_modes = (
+            _parse_string_list(args.cfg_modes) if args.cfg_modes else (args.cfg_mode,)
+        )
     except ValueError as e:
         ap.error(str(e))
     if args.selftest:
         selftest()
         return
+    if args.train and not args.image_manifest:
+        ap.error("--train requires --image-manifest; synthetic visual fixtures are not a public training path")
     if sample_prompts and not args.sample_grid_out:
         ap.error("--sample-prompts requires --sample-grid-out")
+    if args.sample_manifest_out and not args.sample_grid_out:
+        ap.error("--sample-manifest-out requires --sample-grid-out")
+    if args.sample_image_dir and not args.sample_manifest_out:
+        ap.error("--sample-image-dir requires --sample-manifest-out")
     if sample_negative_prompts and not sample_prompts:
         ap.error("--sample-negative-prompts requires --sample-prompts")
     if args.sample_candidates_per_prompt <= 0:
@@ -8093,6 +11474,53 @@ def main(argv=None):
         ap.error("--sample-candidates-per-prompt > 1 requires --sample-prompts")
     if args.eval_generated_samples < 0:
         ap.error("--eval-generated-samples must be non-negative")
+    if args.eval_generated_candidates_per_prompt <= 0:
+        ap.error("--eval-generated-candidates-per-prompt must be positive")
+    if args.sample_velocity_clip < 0.0:
+        ap.error("--sample-velocity-clip must be non-negative")
+    if args.sample_latent_clip < 0.0:
+        ap.error("--sample-latent-clip must be non-negative")
+    if args.flow_endpoint_w < 0.0:
+        ap.error("--flow-endpoint-w must be non-negative")
+    if args.flow_self_repa_w < 0.0:
+        ap.error("--flow-self-repa-w must be non-negative")
+    if args.flow_self_repa_steps < 0:
+        ap.error("--flow-self-repa-steps must be non-negative")
+    if args.flow_self_repa_embed_dim <= 0:
+        ap.error("--flow-self-repa-embed-dim must be positive")
+    if args.flow_sra_w < 0.0:
+        ap.error("--flow-sra-w must be non-negative")
+    if args.flow_sra_steps < 0:
+        ap.error("--flow-sra-steps must be non-negative")
+    if args.flow_sra_time_gap <= 0.0 or args.flow_sra_time_gap > 1.0:
+        ap.error("--flow-sra-time-gap must be in (0, 1]")
+    if args.flow_noise_coupling_projections <= 0:
+        ap.error("--flow-noise-coupling-projections must be positive")
+    if args.flow_guidance_distill_w < 0.0:
+        ap.error("--flow-guidance-distill-w must be non-negative")
+    if args.flow_guidance_distill_cfg_scale < 1.0:
+        ap.error("--flow-guidance-distill-cfg-scale must be >= 1")
+    if args.flow_guidance_distill_cfg_rescale < 0.0 or args.flow_guidance_distill_cfg_rescale > 1.0:
+        ap.error("--flow-guidance-distill-cfg-rescale must be in [0, 1]")
+    if args.flow_cache_max_loaded_shards < 0:
+        ap.error("--flow-cache-max-loaded-shards must be non-negative")
+    if args.quality_score_steps < 0:
+        ap.error("--quality-score-steps must be non-negative")
+    if (args.image_quality_rank_w < 0.0 or args.quality_score_rank_w < 0.0
+            or args.flow_quality_rank_w < 0.0):
+        ap.error("quality rank weights must be non-negative")
+    if args.quality_rank_margin < 0.0:
+        ap.error("--quality-rank-margin must be non-negative")
+    if args.image_preference_max_pairs < 0:
+        ap.error("--image-preference-max-pairs must be non-negative")
+    if args.image_preference_w < 0.0:
+        ap.error("--image-preference-w must be non-negative")
+    if args.image_preference_w > 0.0 and not args.image_preference_manifest:
+        ap.error("--image-preference-w requires --image-preference-manifest")
+    if args.image_preference_w > 0.0 and args.quality_score_steps <= 0:
+        ap.error("--image-preference-w requires --quality-score-steps > 0")
+    if args.image_preference_manifest and not args.image_manifest and args.train:
+        ap.error("--image-preference-manifest requires --image-manifest training")
     if args.sample_text_guidance_w < 0.0:
         ap.error("--sample-text-guidance-w must be non-negative")
     if args.sample_text_guidance_w > 0.0 and not sample_prompts:
@@ -8111,6 +11539,12 @@ def main(argv=None):
         ap.error("--sample-quality-guidance-w must be non-negative")
     if args.sample_quality_guidance_w > 0.0 and not sample_prompts:
         ap.error("--sample-quality-guidance-w requires --sample-prompts")
+    if args.prompt_embed_text_sequence_max_length < 0:
+        ap.error("--prompt-embed-text-sequence-max-length must be non-negative")
+    if args.prompt_embed_text_sequence_model and args.prompt_embed_backend != "hf":
+        ap.error("--prompt-embed-text-sequence-model requires --prompt-embed-backend hf")
+    if args.prompt_embed_text_sequence_model and not sample_prompts:
+        ap.error("--prompt-embed-text-sequence-model requires --sample-prompts")
     if args.sample_churn < 0.0:
         ap.error("--sample-churn must be non-negative")
     if sample_churns is not None and any(x < 0.0 for x in sample_churns):
@@ -8123,6 +11557,9 @@ def main(argv=None):
         bad_schedules = sorted(set(sample_schedules) - set(SAMPLE_SCHEDULES))
         if bad_schedules:
             ap.error(f"unknown sample schedule(s): {','.join(bad_schedules)}")
+    bad_cfg_modes = sorted(set(cfg_modes) - set(CFG_MODES))
+    if bad_cfg_modes:
+        ap.error(f"unknown cfg mode(s): {','.join(bad_cfg_modes)}")
     if args.image_source_weights and not args.image_manifest:
         ap.error("--image-source-weights requires --image-manifest")
     if args.eval_checkpoint:
@@ -8165,6 +11602,12 @@ def main(argv=None):
             eval_image_max_records=args.eval_image_max_records,
             sample_time_shift=args.sample_time_shift,
             generated_eval_n=args.eval_generated_samples,
+            generated_eval_candidates_per_prompt=(
+                args.eval_generated_candidates_per_prompt),
+            sample_finite_guard=args.sample_finite_guard,
+            sample_velocity_clip=args.sample_velocity_clip,
+            sample_latent_clip=args.sample_latent_clip,
+            cfg_modes=cfg_modes,
         )
         if args.sample_grid_out:
             selected_weights = report.get("selected_checkpoint_weights",
@@ -8180,6 +11623,10 @@ def main(argv=None):
                 fallback_sample_schedule=args.sample_schedule,
                 fallback_sample_churn=args.sample_churn,
                 fallback_sample_churn_interval=sample_churn_interval,
+                fallback_sample_finite_guard=args.sample_finite_guard,
+                fallback_sample_velocity_clip=args.sample_velocity_clip,
+                fallback_sample_latent_clip=args.sample_latent_clip,
+                fallback_cfg_mode=args.cfg_mode,
                 fallback_semantic_w=args.semantic_guidance_w,
                 fallback_semantic_mode=args.semantic_guidance_mode,
                 fallback_cfg_interval=cfg_interval,
@@ -8197,6 +11644,7 @@ def main(argv=None):
                     size=grid_size,
                     cfg_scale=settings["cfg_scale"],
                     cfg_rescale=settings["cfg_rescale"],
+                    cfg_mode=settings["cfg_mode"],
                     cfg_interval=settings["cfg_interval"],
                     sample_time_shift=settings["sample_time_shift"],
                     sample_steps=settings["sample_steps"],
@@ -8212,6 +11660,9 @@ def main(argv=None):
                     prompt_embed_dtype=args.prompt_embed_dtype,
                     prompt_embed_normalize=not args.prompt_embed_no_normalize,
                     prompt_embed_stats_dim=args.prompt_embed_stats_dim,
+                    prompt_embed_text_sequence_model=args.prompt_embed_text_sequence_model,
+                    prompt_embed_text_sequence_max_length=(
+                        args.prompt_embed_text_sequence_max_length),
                     prompt_embed_trust_remote_code=args.prompt_embed_trust_remote_code,
                     negative_prompts=sample_negative_prompts,
                     candidates_per_prompt=args.sample_candidates_per_prompt,
@@ -8220,7 +11671,12 @@ def main(argv=None):
                     feature_guidance_w=args.sample_feature_guidance_w,
                     feature_guidance_interval=sample_feature_guidance_interval,
                     quality_guidance_w=args.sample_quality_guidance_w,
-                    quality_guidance_interval=sample_quality_guidance_interval)
+                    quality_guidance_interval=sample_quality_guidance_interval,
+                    sample_finite_guard=settings["sample_finite_guard"],
+                    sample_velocity_clip=settings["sample_velocity_clip"],
+                    sample_latent_clip=settings["sample_latent_clip"],
+                    sample_manifest_out=args.sample_manifest_out,
+                    sample_image_dir=args.sample_image_dir)
             elif report.get("experiment") == "image_latent_manifest_sampler_sweep":
                 grid_records = read_image_manifest(
                     report["eval_image_manifest"], root=report.get("eval_image_root", ""),
@@ -8233,6 +11689,7 @@ def main(argv=None):
                     size=grid_size,
                     cfg_scale=settings["cfg_scale"],
                     cfg_rescale=settings["cfg_rescale"],
+                    cfg_mode=settings["cfg_mode"],
                     cfg_interval=settings["cfg_interval"],
                     sample_time_shift=settings["sample_time_shift"],
                     sample_steps=settings["sample_steps"],
@@ -8240,9 +11697,14 @@ def main(argv=None):
                     sample_schedule=settings["sample_schedule"],
                     sample_churn=settings["sample_churn"],
                     sample_churn_interval=settings["sample_churn_interval"],
+                    sample_finite_guard=settings["sample_finite_guard"],
+                    sample_velocity_clip=settings["sample_velocity_clip"],
+                    sample_latent_clip=settings["sample_latent_clip"],
                     samples=args.sample_grid_samples,
                     seed=args.seed + 991,
-                    caption_cond_source=meta["caption_cond_source"])
+                    caption_cond_source=meta["caption_cond_source"],
+                    sample_manifest_out=args.sample_manifest_out,
+                    sample_image_dir=args.sample_image_dir)
             else:
                 grid_meta = save_sample_grid(
                     ae, flow, args.sample_grid_out, size=grid_size, cond_mode=meta["cond_mode"],
@@ -8250,6 +11712,7 @@ def main(argv=None):
                     prompt_templates=prompt_templates,
                     cfg_scale=settings["cfg_scale"],
                     cfg_rescale=settings["cfg_rescale"],
+                    cfg_mode=settings["cfg_mode"],
                     cfg_interval=settings["cfg_interval"],
                     sample_steps=settings["sample_steps"],
                     sample_time_shift=settings["sample_time_shift"],
@@ -8260,8 +11723,13 @@ def main(argv=None):
                     semantic_guidance_w=settings["semantic_guidance_w"],
                     semantic_guidance_mode=settings["semantic_guidance_mode"],
                     semantic_guidance_interval=settings["semantic_guidance_interval"],
+                    sample_finite_guard=settings["sample_finite_guard"],
+                    sample_velocity_clip=settings["sample_velocity_clip"],
+                    sample_latent_clip=settings["sample_latent_clip"],
                     samples_per_combo=args.sample_grid_samples,
-                    seed=args.seed + 991)
+                    seed=args.seed + 991,
+                    sample_manifest_out=args.sample_manifest_out,
+                    sample_image_dir=args.sample_image_dir)
             grid_meta["sample_grid_checkpoint_weight_mode"] = (
                 "ema" if meta["ema_loaded"] else "raw")
             report.update(grid_meta)
@@ -8284,19 +11752,23 @@ def main(argv=None):
         latent_ch=args.latent_ch, hidden=args.hidden, lr=args.lr, fact_w=args.fact_w,
         seed=args.seed, size=run_size, flow_arch=args.flow_arch, dit_depth=args.dit_depth,
         dit_heads=args.dit_heads, cond_drop=args.cond_drop, cfg_scale=args.cfg_scale,
-        cfg_rescale=args.cfg_rescale,
+        cfg_rescale=args.cfg_rescale, cfg_mode=args.cfg_mode,
         dit_head_width_mult=args.dit_head_width_mult,
         dit_qk_norm=args.dit_qk_norm,
         dit_attn_impl=args.dit_attn_impl,
         dit_pos_embed=args.dit_pos_embed,
+        dit_mlp=args.dit_mlp,
         flow_checkpoint_blocks=args.flow_checkpoint_blocks,
-        latent_max_tokens=args.latent_max_tokens, ae_arch=args.ae_arch,
+        latent_max_tokens=args.latent_max_tokens,
+        latent_patch_size=args.latent_patch_size,
+        ae_arch=args.ae_arch,
         latent_downsample=args.latent_downsample, ae_res_blocks=args.ae_res_blocks,
         ae_hf_model=args.ae_hf_model,
         ae_hf_subfolder=args.ae_hf_subfolder,
         ae_hf_scaling_factor=args.ae_hf_scaling_factor,
         ae_recon_loss=args.ae_recon_loss, ae_grad_w=args.ae_grad_w,
-        ae_ms_w=args.ae_ms_w, ae_latent_reg_w=args.ae_latent_reg_w,
+        ae_ms_w=args.ae_ms_w, ae_fft_w=args.ae_fft_w,
+        ae_latent_reg_w=args.ae_latent_reg_w,
         image_text_align_w=args.image_text_align_w,
         flow_text_align_w=args.flow_text_align_w,
         text_embed_dim=args.text_embed_dim,
@@ -8306,13 +11778,29 @@ def main(argv=None):
         flow_repa_w=args.flow_repa_w,
         flow_repa_steps=args.flow_repa_steps,
         flow_repa_embed_dim=args.flow_repa_embed_dim,
+        flow_repa_mode=args.flow_repa_mode,
+        flow_self_repa_w=args.flow_self_repa_w,
+        flow_self_repa_steps=args.flow_self_repa_steps,
+        flow_self_repa_embed_dim=args.flow_self_repa_embed_dim,
+        flow_self_repa_mode=args.flow_self_repa_mode,
+        flow_sra_w=args.flow_sra_w,
+        flow_sra_steps=args.flow_sra_steps,
+        flow_sra_time_gap=args.flow_sra_time_gap,
+        flow_sra_mode=args.flow_sra_mode,
         sample_steps=args.sample_steps, roundtrip_samples=args.roundtrip_samples,
         flow_semantic_w=args.flow_semantic_w, cond_mode=args.cond_mode,
-        flow_consistency_w=args.flow_consistency_w, size_buckets=cli_size_buckets,
+        flow_consistency_w=args.flow_consistency_w,
+        flow_endpoint_w=args.flow_endpoint_w,
+        flow_noise_coupling=args.flow_noise_coupling,
+        flow_noise_coupling_projections=args.flow_noise_coupling_projections,
+        size_buckets=cli_size_buckets,
         flow_distill_steps=args.flow_distill_steps,
         flow_distill_w=args.flow_distill_w,
         flow_distill_time_gap=args.flow_distill_time_gap,
         flow_distill_teacher=args.flow_distill_teacher,
+        flow_guidance_distill_w=args.flow_guidance_distill_w,
+        flow_guidance_distill_cfg_scale=args.flow_guidance_distill_cfg_scale,
+        flow_guidance_distill_cfg_rescale=args.flow_guidance_distill_cfg_rescale,
         text_cond_dim=args.text_cond_dim, prompt_templates=templates,
         image_manifest=args.image_manifest, image_root=args.image_root,
         image_split=args.image_split, image_min_aesthetic=args.image_min_aesthetic,
@@ -8321,6 +11809,15 @@ def main(argv=None):
         image_source_weights=args.image_source_weights,
         image_quality_score_w=args.image_quality_score_w,
         flow_quality_score_w=args.flow_quality_score_w,
+        quality_score_steps=args.quality_score_steps,
+        image_quality_rank_w=args.image_quality_rank_w,
+        quality_score_rank_w=args.quality_score_rank_w,
+        flow_quality_rank_w=args.flow_quality_rank_w,
+        quality_rank_margin=args.quality_rank_margin,
+        image_preference_manifest=args.image_preference_manifest,
+        image_preference_root=args.image_preference_root,
+        image_preference_max_pairs=args.image_preference_max_pairs,
+        image_preference_w=args.image_preference_w,
         caption_vocab_max=args.caption_vocab_max,
         caption_max_len=args.caption_max_len, caption_cond_source=args.caption_cond_source,
         image_crop_mode=args.image_crop_mode, image_hflip_prob=args.image_hflip_prob,
@@ -8346,11 +11843,15 @@ def main(argv=None):
         sample_schedule=args.sample_schedule,
         sample_churn=args.sample_churn,
         sample_churn_interval=sample_churn_interval,
+        sample_finite_guard=args.sample_finite_guard,
+        sample_velocity_clip=args.sample_velocity_clip,
+        sample_latent_clip=args.sample_latent_clip,
         flow_ema_decay=args.flow_ema_decay,
         flow_ema_warmup=not args.no_ema_warmup,
         eval_with_ema=args.ema_eval_mode != "raw",
         eval_weight_mode=args.ema_eval_mode,
         intervention_samples=args.intervention_samples,
+        eval_generated_candidates_per_prompt=args.eval_generated_candidates_per_prompt,
         train_precision=args.train_precision,
         ae_accum_steps=args.ae_accum_steps,
         flow_accum_steps=args.flow_accum_steps,
@@ -8360,6 +11861,8 @@ def main(argv=None):
         flow_cache_batch=args.flow_cache_batch,
         flow_cache_dir=args.flow_cache_dir,
         flow_cache_shard_size=args.flow_cache_shard_size,
+        flow_cache_dtype=args.flow_cache_dtype,
+        flow_cache_max_loaded_shards=args.flow_cache_max_loaded_shards,
         return_conditioner=True, return_ema=True, return_aligner=True)
     if args.sample_grid_out:
         raw_flow = clone_state_dict(flow)
@@ -8379,6 +11882,10 @@ def main(argv=None):
             fallback_sample_schedule=args.sample_schedule,
             fallback_sample_churn=args.sample_churn,
             fallback_sample_churn_interval=sample_churn_interval,
+            fallback_sample_finite_guard=args.sample_finite_guard,
+            fallback_sample_velocity_clip=args.sample_velocity_clip,
+            fallback_sample_latent_clip=args.sample_latent_clip,
+            fallback_cfg_mode=args.cfg_mode,
             fallback_semantic_w=args.semantic_guidance_w,
             fallback_semantic_mode=args.semantic_guidance_mode,
             fallback_cfg_interval=cfg_interval,
@@ -8391,6 +11898,7 @@ def main(argv=None):
                 size=run_size,
                 cfg_scale=settings["cfg_scale"],
                 cfg_rescale=settings["cfg_rescale"],
+                cfg_mode=settings["cfg_mode"],
                 cfg_interval=settings["cfg_interval"],
                 sample_steps=settings["sample_steps"],
                 sample_time_shift=settings["sample_time_shift"],
@@ -8406,6 +11914,9 @@ def main(argv=None):
                 prompt_embed_dtype=args.prompt_embed_dtype,
                 prompt_embed_normalize=not args.prompt_embed_no_normalize,
                 prompt_embed_stats_dim=args.prompt_embed_stats_dim,
+                prompt_embed_text_sequence_model=args.prompt_embed_text_sequence_model,
+                prompt_embed_text_sequence_max_length=(
+                    args.prompt_embed_text_sequence_max_length),
                 prompt_embed_trust_remote_code=args.prompt_embed_trust_remote_code,
                 negative_prompts=sample_negative_prompts,
                 candidates_per_prompt=args.sample_candidates_per_prompt,
@@ -8414,7 +11925,12 @@ def main(argv=None):
                 feature_guidance_w=args.sample_feature_guidance_w,
                 feature_guidance_interval=sample_feature_guidance_interval,
                 quality_guidance_w=args.sample_quality_guidance_w,
-                quality_guidance_interval=sample_quality_guidance_interval)
+                quality_guidance_interval=sample_quality_guidance_interval,
+                sample_finite_guard=settings["sample_finite_guard"],
+                sample_velocity_clip=settings["sample_velocity_clip"],
+                sample_latent_clip=settings["sample_latent_clip"],
+                sample_manifest_out=args.sample_manifest_out,
+                sample_image_dir=args.sample_image_dir)
         elif args.image_manifest:
             grid_records = read_image_manifest(
                 args.image_manifest, root=args.image_root, split=args.image_split,
@@ -8425,6 +11941,7 @@ def main(argv=None):
                 size=run_size,
                 cfg_scale=settings["cfg_scale"],
                 cfg_rescale=settings["cfg_rescale"],
+                cfg_mode=settings["cfg_mode"],
                 cfg_interval=settings["cfg_interval"],
                 sample_steps=settings["sample_steps"],
                 sample_time_shift=settings["sample_time_shift"],
@@ -8432,9 +11949,14 @@ def main(argv=None):
                 sample_schedule=settings["sample_schedule"],
                 sample_churn=settings["sample_churn"],
                 sample_churn_interval=settings["sample_churn_interval"],
+                sample_finite_guard=settings["sample_finite_guard"],
+                sample_velocity_clip=settings["sample_velocity_clip"],
+                sample_latent_clip=settings["sample_latent_clip"],
                 samples=args.sample_grid_samples,
                 seed=args.seed + 991,
-                caption_cond_source=report.get("caption_cond_source", "tokens"))
+                caption_cond_source=report.get("caption_cond_source", "tokens"),
+                sample_manifest_out=args.sample_manifest_out,
+                sample_image_dir=args.sample_image_dir)
         else:
             grid_meta = save_sample_grid(
                 ae, flow, args.sample_grid_out, size=run_size, cond_mode=args.cond_mode,
@@ -8442,6 +11964,7 @@ def main(argv=None):
                 prompt_vocab=prompt_vocab, prompt_templates=templates,
                 cfg_scale=settings["cfg_scale"],
                 cfg_rescale=settings["cfg_rescale"],
+                cfg_mode=settings["cfg_mode"],
                 cfg_interval=settings["cfg_interval"],
                 sample_steps=settings["sample_steps"],
                 sample_time_shift=settings["sample_time_shift"],
@@ -8452,8 +11975,13 @@ def main(argv=None):
                 semantic_guidance_w=settings["semantic_guidance_w"],
                 semantic_guidance_mode=settings["semantic_guidance_mode"],
                 semantic_guidance_interval=settings["semantic_guidance_interval"],
+                sample_finite_guard=settings["sample_finite_guard"],
+                sample_velocity_clip=settings["sample_velocity_clip"],
+                sample_latent_clip=settings["sample_latent_clip"],
                 samples_per_combo=args.sample_grid_samples,
-                seed=args.seed + 991)
+                seed=args.seed + 991,
+                sample_manifest_out=args.sample_manifest_out,
+                sample_image_dir=args.sample_image_dir)
         grid_meta["sample_grid_checkpoint_weight_mode"] = grid_weight_mode
         report.update(grid_meta)
         load_flow_state(flow, raw_flow)
@@ -8483,9 +12011,11 @@ def main(argv=None):
         "latent_downsample": report.get("latent_downsample", args.latent_downsample),
         "ae_res_blocks": report.get("ae_res_blocks", args.ae_res_blocks),
         "latent_max_tokens": args.latent_max_tokens,
+        "latent_patch_size": report.get("latent_patch_size", args.latent_patch_size),
         "ae_recon_loss": args.ae_recon_loss,
         "ae_grad_w": args.ae_grad_w,
         "ae_ms_w": args.ae_ms_w,
+        "ae_fft_w": args.ae_fft_w,
         "ae_latent_reg_w": args.ae_latent_reg_w,
         "image_text_align_w": args.image_text_align_w,
         "flow_text_align_w": args.flow_text_align_w,
@@ -8496,6 +12026,15 @@ def main(argv=None):
         "flow_repa_w": args.flow_repa_w,
         "flow_repa_steps": args.flow_repa_steps,
         "flow_repa_embed_dim": args.flow_repa_embed_dim,
+        "flow_repa_mode": args.flow_repa_mode,
+        "flow_self_repa_w": args.flow_self_repa_w,
+        "flow_self_repa_steps": args.flow_self_repa_steps,
+        "flow_self_repa_embed_dim": args.flow_self_repa_embed_dim,
+        "flow_self_repa_mode": args.flow_self_repa_mode,
+        "flow_sra_w": args.flow_sra_w,
+        "flow_sra_steps": args.flow_sra_steps,
+        "flow_sra_time_gap": args.flow_sra_time_gap,
+        "flow_sra_mode": args.flow_sra_mode,
         "hidden": args.hidden,
         "ae_accum_steps": args.ae_accum_steps,
         "flow_accum_steps": args.flow_accum_steps,
@@ -8506,9 +12045,19 @@ def main(argv=None):
         "flow_cache_max_records": args.flow_cache_records,
         "flow_cache_batch": args.flow_cache_batch,
         "flow_cache_shard_size": args.flow_cache_shard_size,
+        "flow_cache_reused": report.get("flow_cache_reused", False),
+        "flow_cache_latent_dtype": report.get(
+            "flow_cache_latent_dtype", args.flow_cache_dtype),
+        "flow_cache_max_loaded_shards": report.get(
+            "flow_cache_max_loaded_shards", args.flow_cache_max_loaded_shards),
+        "flow_cache_loaded_shards": report.get("flow_cache_loaded_shards", 0),
+        "flow_cache_shard_loads": report.get("flow_cache_shard_loads", 0),
+        "flow_cache_shard_cache_hits": report.get("flow_cache_shard_cache_hits", 0),
+        "flow_cache_shard_cache_misses": report.get("flow_cache_shard_cache_misses", 0),
         "flow_cache_shards": report.get("flow_cache_shards", 0),
         "flow_cache_bytes": report.get("flow_cache_bytes", 0),
         "flow_cache_weighted": report.get("flow_cache_weighted", False),
+        "flow_cache_has_quality_targets": report.get("flow_cache_has_quality_targets", False),
         "train_precision": args.train_precision,
         "train_amp_enabled": report.get("train_amp_enabled", False),
         "grad_clip": args.grad_clip,
@@ -8519,14 +12068,16 @@ def main(argv=None):
         "dit_qk_norm": report.get("dit_qk_norm", False),
         "dit_attn_impl": report.get("dit_attn_impl", "manual"),
         "dit_pos_embed": report.get("dit_pos_embed", "") or args.dit_pos_embed,
+        "dit_mlp": report.get("dit_mlp", "") or args.dit_mlp,
         "flow_checkpoint_blocks": report.get("flow_checkpoint_blocks", False),
         "activation_checkpointing": report.get("activation_checkpointing", False),
         "zero_residual_gating": report.get("zero_residual_gating", False),
         "uses_2d_pos_embed": report.get("uses_2d_pos_embed", False),
         "uses_rope2d_pos_embed": report.get("uses_rope2d_pos_embed", False),
+        "uses_swiglu_mlp": report.get("uses_swiglu_mlp", False),
         "cond_mode": args.cond_mode,
         "cond_dim": report["cond_dim"],
-        "data_mode": report.get("data_mode", "synthetic_factors"),
+        "data_mode": report.get("data_mode", "image_manifest"),
         "image_manifest": args.image_manifest,
         "image_root": args.image_root,
         "image_split": args.image_split,
@@ -8539,6 +12090,17 @@ def main(argv=None):
         "image_sampling_weighted": report.get("image_sampling_weighted", False),
         "image_quality_score_w": args.image_quality_score_w,
         "flow_quality_score_w": args.flow_quality_score_w,
+        "quality_score_steps": args.quality_score_steps,
+        "quality_score_steps_run": report.get("quality_score_steps_run", 0),
+        "image_quality_rank_w": args.image_quality_rank_w,
+        "quality_score_rank_w": args.quality_score_rank_w,
+        "flow_quality_rank_w": args.flow_quality_rank_w,
+        "quality_rank_margin": args.quality_rank_margin,
+        "image_preference_manifest": args.image_preference_manifest,
+        "image_preference_root": args.image_preference_root,
+        "image_preference_max_pairs": args.image_preference_max_pairs,
+        "image_preference_w": args.image_preference_w,
+        "image_preference_pairs": report.get("image_preference_pairs", 0),
         "image_quality_scorer": report.get("image_quality_scorer", False),
         "image_max_records": args.image_max_records,
         "image_crop_mode": report.get("image_crop_mode", ""),
@@ -8551,12 +12113,16 @@ def main(argv=None):
         "cond_drop": args.cond_drop,
         "cfg_scale": args.cfg_scale,
         "cfg_rescale": args.cfg_rescale,
+        "cfg_mode": args.cfg_mode,
         "cfg_interval": list(cfg_interval),
         "sample_steps": args.sample_steps,
         "sample_method": args.sample_method,
         "sample_schedule": args.sample_schedule,
         "sample_churn": args.sample_churn,
         "sample_churn_interval": list(sample_churn_interval),
+        "sample_finite_guard": args.sample_finite_guard,
+        "sample_velocity_clip": args.sample_velocity_clip,
+        "sample_latent_clip": args.sample_latent_clip,
         "semantic_guidance_w": args.semantic_guidance_w,
         "semantic_guidance_mode": args.semantic_guidance_mode,
         "semantic_guidance_interval": list(semantic_guidance_interval),
@@ -8572,6 +12138,12 @@ def main(argv=None):
             "flow_distill_time_gap", args.flow_distill_time_gap),
         "flow_distill_teacher": report.get("flow_distill_teacher", args.flow_distill_teacher),
         "flow_distill_teacher_used": report.get("flow_distill_teacher_used", ""),
+        "flow_guidance_distill_w": report.get(
+            "flow_guidance_distill_w", args.flow_guidance_distill_w),
+        "flow_guidance_distill_cfg_scale": report.get(
+            "flow_guidance_distill_cfg_scale", args.flow_guidance_distill_cfg_scale),
+        "flow_guidance_distill_cfg_rescale": report.get(
+            "flow_guidance_distill_cfg_rescale", args.flow_guidance_distill_cfg_rescale),
         "flow_ema_decay": args.flow_ema_decay,
         "flow_ema_warmup": not args.no_ema_warmup,
         "flow_ema_effective_decay": report.get("flow_ema_effective_decay", 0.0),
@@ -8592,6 +12164,10 @@ def main(argv=None):
         "latent_effective_dim": report.get("latent_effective_dim", 0),
         "time_shift_dim_scale": report.get("time_shift_dim_scale", 1.0),
         "flow_loss_weight": args.flow_loss_weight,
+        "flow_noise_coupling": report.get("flow_noise_coupling", args.flow_noise_coupling),
+        "flow_noise_coupling_projections": report.get(
+            "flow_noise_coupling_projections", args.flow_noise_coupling_projections),
+        "flow_endpoint_w": report.get("flow_endpoint_w", args.flow_endpoint_w),
         "flow_loss_weight_gamma": args.flow_loss_weight_gamma,
         "flow_loss_weight_normalize": not args.no_flow_loss_weight_normalize,
         "sample_time_shift": report.get("sample_time_shift", report.get("time_shift", args.time_shift)),
@@ -8616,6 +12192,10 @@ def main(argv=None):
         "flow_repa_aligner_state_dict": (
             getattr(flow, "flow_repa_aligner", None).state_dict()
             if getattr(flow, "flow_repa_aligner", None) is not None else {}
+        ),
+        "flow_self_repa_aligner_state_dict": (
+            getattr(flow, "flow_self_repa_aligner", None).state_dict()
+            if getattr(flow, "flow_self_repa_aligner", None) is not None else {}
         ),
         "flow_ema_state_dict": flow_ema if flow_ema is not None else {},
         "conditioner_ema_state_dict": (conditioner_ema if conditioner_ema is not None else {}),

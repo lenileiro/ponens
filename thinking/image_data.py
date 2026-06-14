@@ -1,7 +1,7 @@
-"""Captioned image manifest utilities for real image-generation rungs.
+"""Captioned image manifest utilities for real vision and image-generation rungs.
 
-The synthetic image rungs are useful for factor probes, but high-quality image generation needs
-large image/text corpora.  This module is deliberately light on dependencies:
+High-quality vision and generation work needs real image/text corpora.  This module is
+deliberately light on dependencies:
 
 * PPM is supported directly for tests and tiny local fixtures.
 * JPEG/PNG/WebP use Pillow when it is installed on the GPU box.
@@ -35,15 +35,55 @@ class ImageTextRecord:
     split: str = "train"
     source: str = ""
     aesthetic: float | None = None
+    nsfw: float | None = None
+    watermark: float | None = None
     width: int = 0
     height: int = 0
     text_embedding: tuple[float, ...] | None = None
     text_embedding_sequence: tuple[tuple[float, ...], ...] | None = None
     image_embedding: tuple[float, ...] | None = None
+    image_embedding_sequence: tuple[tuple[float, ...], ...] | None = None
 
 
 def caption_tokens(text: str) -> list[str]:
     return [m.group(0).lower() for m in TOKEN_RE.finditer(str(text))]
+
+
+def _coerce_optional_float(raw):
+    if raw in ("", None):
+        return None
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+        low = raw.lower()
+        if low in ("true", "yes"):
+            return 1.0
+        if low in ("false", "no"):
+            return 0.0
+    if isinstance(raw, bool):
+        return 1.0 if raw else 0.0
+    return float(raw)
+
+
+def _row_float(row, *keys, mode="first"):
+    vals = []
+    for key in keys:
+        try:
+            val = _coerce_optional_float(row.get(key))
+        except (TypeError, ValueError):
+            continue
+        if val is not None:
+            if mode == "first":
+                return val
+            vals.append(val)
+    if not vals:
+        return None
+    if mode == "max":
+        return max(vals)
+    if mode == "min":
+        return min(vals)
+    raise ValueError(f"unknown float aggregation mode {mode!r}")
 
 
 def _coerce_float_embedding(raw):
@@ -90,6 +130,10 @@ def _coerce_image_embedding(raw):
     return _coerce_float_embedding(raw)
 
 
+def _coerce_image_embedding_sequence(raw):
+    return _coerce_float_embedding_sequence(raw)
+
+
 def _coerce_record(row, manifest_dir, root=""):
     image = row.get("image") or row.get("path") or row.get("file") or row.get("filepath")
     caption = row.get("caption") or row.get("text") or row.get("prompt")
@@ -99,11 +143,13 @@ def _coerce_record(row, manifest_dir, root=""):
     path = str(image)
     if base and not os.path.isabs(path):
         path = os.path.join(base, path)
-    aesthetic = row.get("aesthetic", row.get("score", row.get("quality")))
-    if aesthetic in ("", None):
-        aesthetic = None
-    else:
-        aesthetic = float(aesthetic)
+    aesthetic = _row_float(
+        row, "aesthetic", "aesthetic_score", "score", "quality", "quality_score")
+    nsfw = _row_float(
+        row, "nsfw", "image_nsfw", "prompt_nsfw", "unsafe", "safety_score", mode="max")
+    watermark = _row_float(
+        row, "watermark", "watermark_score", "has_watermark", "text_watermark",
+        mode="max")
     width = int(row.get("width") or 0)
     height = int(row.get("height") or 0)
     text_embedding = _coerce_text_embedding(
@@ -127,6 +173,15 @@ def _coerce_record(row, manifest_dir, root=""):
                                                 row.get("image_emb",
                                                         row.get("visual_emb")))))))
     )
+    image_embedding_sequence = _coerce_image_embedding_sequence(
+        row.get("image_embedding_sequence",
+                row.get("visual_embedding_sequence",
+                        row.get("vision_embedding_sequence",
+                                row.get("image_token_embeddings",
+                                        row.get("visual_token_embeddings",
+                                                row.get("dino_token_embeddings",
+                                                        row.get("clip_image_token_embeddings")))))))
+    )
     return ImageTextRecord(
         path=os.path.normpath(path),
         caption=str(caption),
@@ -140,11 +195,14 @@ def _coerce_record(row, manifest_dir, root=""):
             or ""
         ),
         aesthetic=aesthetic,
+        nsfw=nsfw,
+        watermark=watermark,
         width=width,
         height=height,
         text_embedding=text_embedding,
         text_embedding_sequence=text_embedding_sequence,
         image_embedding=image_embedding,
+        image_embedding_sequence=image_embedding_sequence,
     )
 
 
@@ -217,20 +275,32 @@ def merge_embedding_sidecar(records, sidecar_path, root="", key="image", overwri
                                                     row.get("image_emb",
                                                             row.get("visual_emb")))))))
         )
-        if text_embedding is None and text_embedding_sequence is None and image_embedding is None:
+        image_embedding_sequence = _coerce_image_embedding_sequence(
+            row.get("image_embedding_sequence",
+                    row.get("visual_embedding_sequence",
+                            row.get("vision_embedding_sequence",
+                                    row.get("image_token_embeddings",
+                                            row.get("visual_token_embeddings",
+                                                    row.get("dino_token_embeddings",
+                                                            row.get("clip_image_token_embeddings")))))))
+        )
+        if (text_embedding is None and text_embedding_sequence is None
+                and image_embedding is None and image_embedding_sequence is None):
             skipped_no_embedding += 1
             continue
         if row_key in index:
             duplicate_keys += 1
             continue
-        index[row_key] = (text_embedding, text_embedding_sequence, image_embedding)
+        index[row_key] = (
+            text_embedding, text_embedding_sequence,
+            image_embedding, image_embedding_sequence)
 
     merged = []
     matched = missing = 0
     text_added = image_added = 0
-    text_sequence_added = 0
+    text_sequence_added = image_sequence_added = 0
     text_preserved = image_preserved = 0
-    text_sequence_preserved = 0
+    text_sequence_preserved = image_sequence_preserved = 0
     for rec in records:
         rec_key = _embedding_key_from_record(rec, key=key)
         vals = index.get(rec_key)
@@ -239,10 +309,11 @@ def merge_embedding_sidecar(records, sidecar_path, root="", key="image", overwri
             merged.append(rec)
             continue
         matched += 1
-        text_embedding, text_embedding_sequence, image_embedding = vals
+        text_embedding, text_embedding_sequence, image_embedding, image_embedding_sequence = vals
         new_text = rec.text_embedding
         new_text_sequence = rec.text_embedding_sequence
         new_image = rec.image_embedding
+        new_image_sequence = rec.image_embedding_sequence
         if text_embedding is not None:
             if overwrite or rec.text_embedding is None:
                 if rec.text_embedding != text_embedding:
@@ -264,20 +335,36 @@ def merge_embedding_sidecar(records, sidecar_path, root="", key="image", overwri
                 new_image = image_embedding
             else:
                 image_preserved += 1
+        if image_embedding_sequence is not None:
+            if overwrite or rec.image_embedding_sequence is None:
+                if rec.image_embedding_sequence != image_embedding_sequence:
+                    image_sequence_added += 1
+                new_image_sequence = image_embedding_sequence
+            else:
+                image_sequence_preserved += 1
         merged.append(replace(
             rec, text_embedding=new_text, text_embedding_sequence=new_text_sequence,
-            image_embedding=new_image))
+            image_embedding=new_image, image_embedding_sequence=new_image_sequence))
 
     text_dims = sorted({len(v[0]) for v in index.values() if v[0] is not None})
     text_sequence_dims = sorted({
         len(row)
-        for _flat, seq, _img in index.values() if seq is not None
+        for _flat, seq, _img, _img_seq in index.values() if seq is not None
         for row in seq[:1]
     })
     text_sequence_lengths = [
-        len(seq) for _flat, seq, _img in index.values() if seq is not None
+        len(seq) for _flat, seq, _img, _img_seq in index.values() if seq is not None
     ]
     image_dims = sorted({len(v[2]) for v in index.values() if v[2] is not None})
+    image_sequence_dims = sorted({
+        len(row)
+        for _flat, _seq, _img, img_seq in index.values() if img_seq is not None
+        for row in img_seq[:1]
+    })
+    image_sequence_lengths = [
+        len(img_seq) for _flat, _seq, _img, img_seq in index.values()
+        if img_seq is not None
+    ]
     report = {
         "embedding_sidecar": sidecar_path,
         "embedding_key": key,
@@ -291,9 +378,11 @@ def merge_embedding_sidecar(records, sidecar_path, root="", key="image", overwri
         "embedding_text_written": int(text_added),
         "embedding_text_sequence_written": int(text_sequence_added),
         "embedding_image_written": int(image_added),
+        "embedding_image_sequence_written": int(image_sequence_added),
         "embedding_text_preserved": int(text_preserved),
         "embedding_text_sequence_preserved": int(text_sequence_preserved),
         "embedding_image_preserved": int(image_preserved),
+        "embedding_image_sequence_preserved": int(image_sequence_preserved),
         "embedding_overwrite": bool(overwrite),
     }
     if text_dims:
@@ -304,6 +393,10 @@ def merge_embedding_sidecar(records, sidecar_path, root="", key="image", overwri
         report["embedding_text_sequence_len_max"] = int(max(text_sequence_lengths))
     if image_dims:
         report["embedding_image_dims"] = image_dims
+    if image_sequence_dims:
+        report["embedding_image_sequence_dims"] = image_sequence_dims
+        report["embedding_image_sequence_len_min"] = int(min(image_sequence_lengths))
+        report["embedding_image_sequence_len_max"] = int(max(image_sequence_lengths))
     return merged, report
 
 
@@ -330,7 +423,8 @@ def _read_manifest_rows(path):
     raise ValueError(f"unsupported image manifest format {ext!r}; use .jsonl, .csv, or .tsv")
 
 
-def read_image_manifest(path, root="", split="train", min_aesthetic=None, max_records=0):
+def read_image_manifest(path, root="", split="train", min_aesthetic=None, max_records=0,
+                        max_nsfw=None, max_watermark=None):
     """Read captioned image records from JSONL/CSV/TSV.
 
     JSONL fields: image/path/file, caption/text/prompt, optional split/aesthetic/width/height.
@@ -347,6 +441,12 @@ def read_image_manifest(path, root="", split="train", min_aesthetic=None, max_re
         if min_aesthetic is not None and rec.aesthetic is not None:
             if rec.aesthetic < float(min_aesthetic):
                 continue
+        if max_nsfw is not None and rec.nsfw is not None:
+            if rec.nsfw > float(max_nsfw):
+                continue
+        if max_watermark is not None and rec.watermark is not None:
+            if rec.watermark > float(max_watermark):
+                continue
         records.append(rec)
         if max_records and len(records) >= int(max_records):
             break
@@ -360,6 +460,8 @@ def summarize_records(records: Iterable[ImageTextRecord]):
     splits = {}
     sources = {}
     aesthetic = []
+    nsfw = []
+    watermark = []
     caption_lens = []
     for rec in rows:
         splits[rec.split] = splits.get(rec.split, 0) + 1
@@ -368,6 +470,10 @@ def summarize_records(records: Iterable[ImageTextRecord]):
             sources[source] = sources.get(source, 0) + 1
         if rec.aesthetic is not None:
             aesthetic.append(float(rec.aesthetic))
+        if rec.nsfw is not None:
+            nsfw.append(float(rec.nsfw))
+        if rec.watermark is not None:
+            watermark.append(float(rec.watermark))
         caption_lens.append(len(caption_tokens(rec.caption)))
     out = {
         "image_records": len(rows),
@@ -378,6 +484,8 @@ def summarize_records(records: Iterable[ImageTextRecord]):
         "text_embedding_sequence_records": sum(
             1 for r in rows if r.text_embedding_sequence is not None),
         "image_embedding_records": sum(1 for r in rows if r.image_embedding is not None),
+        "image_embedding_sequence_records": sum(
+            1 for r in rows if r.image_embedding_sequence is not None),
     }
     dims = sorted({len(r.text_embedding) for r in rows if r.text_embedding is not None})
     if dims:
@@ -398,11 +506,36 @@ def summarize_records(records: Iterable[ImageTextRecord]):
     image_dims = sorted({len(r.image_embedding) for r in rows if r.image_embedding is not None})
     if image_dims:
         out["image_embedding_dims"] = image_dims
+    image_seq_dims = sorted({
+        len(seq[0])
+        for r in rows if r.image_embedding_sequence is not None
+        for seq in (r.image_embedding_sequence,)
+        if seq
+    })
+    image_seq_lens = [len(r.image_embedding_sequence)
+                      for r in rows if r.image_embedding_sequence is not None]
+    if image_seq_dims:
+        out["image_embedding_sequence_dims"] = image_seq_dims
+        out["image_embedding_sequence_len_mean"] = float(np.mean(image_seq_lens))
+        out["image_embedding_sequence_len_min"] = int(np.min(image_seq_lens))
+        out["image_embedding_sequence_len_max"] = int(np.max(image_seq_lens))
     if aesthetic:
         out.update({
             "aesthetic_mean": float(np.mean(aesthetic)),
             "aesthetic_min": float(np.min(aesthetic)),
             "aesthetic_max": float(np.max(aesthetic)),
+        })
+    if nsfw:
+        out.update({
+            "nsfw_mean": float(np.mean(nsfw)),
+            "nsfw_min": float(np.min(nsfw)),
+            "nsfw_max": float(np.max(nsfw)),
+        })
+    if watermark:
+        out.update({
+            "watermark_mean": float(np.mean(watermark)),
+            "watermark_min": float(np.min(watermark)),
+            "watermark_max": float(np.max(watermark)),
         })
     return out
 
@@ -422,6 +555,212 @@ def _stats(vals):
     }
 
 
+def _record_embedding_vector(rec, side):
+    if side == "text":
+        vec = rec.text_embedding
+        seq = rec.text_embedding_sequence
+    elif side == "image":
+        vec = rec.image_embedding
+        seq = rec.image_embedding_sequence
+    else:
+        raise ValueError(f"unknown embedding side {side!r}")
+    if vec is not None:
+        arr = np.asarray(vec, dtype=np.float64)
+    elif seq is not None:
+        arr = np.asarray(seq, dtype=np.float64)
+        if arr.ndim == 2 and arr.shape[0] > 0:
+            arr = arr.mean(axis=0)
+    else:
+        return None, f"missing_{side}_embedding"
+    if arr.ndim != 1 or arr.size <= 0:
+        return None, f"invalid_{side}_embedding"
+    if not np.all(np.isfinite(arr)):
+        return None, f"nonfinite_{side}_embedding"
+    norm = float(np.linalg.norm(arr))
+    if norm <= 0.0:
+        return None, f"zero_{side}_embedding"
+    return arr / norm, ""
+
+
+def image_text_embedding_cosine(rec):
+    text, text_reason = _record_embedding_vector(rec, "text")
+    if text is None:
+        return None, text_reason
+    image, image_reason = _record_embedding_vector(rec, "image")
+    if image is None:
+        return None, image_reason
+    if text.shape != image.shape:
+        return None, "embedding_dim_mismatch"
+    return float(np.dot(text, image)), ""
+
+
+def filter_records_by_image_text_cosine(records, min_cosine=None, sample_errors=8):
+    threshold = None if min_cosine is None else float(min_cosine)
+    kept, rejected = [], []
+    scores = []
+    reject_causes = Counter()
+    comparable = 0
+    for idx, rec in enumerate(records):
+        score, reason = image_text_embedding_cosine(rec)
+        if score is None:
+            reject_causes[reason] += 1
+            if threshold is None:
+                kept.append(rec)
+            else:
+                rejected.append({
+                    "row": idx,
+                    "path": rec.path,
+                    "caption": rec.caption,
+                    "reasons": [reason],
+                })
+            continue
+        comparable += 1
+        scores.append(score)
+        if threshold is not None and score < threshold:
+            reject_causes["image_text_cosine_below_threshold"] += 1
+            rejected.append({
+                "row": idx,
+                "path": rec.path,
+                "caption": rec.caption,
+                "reasons": ["image_text_cosine_below_threshold"],
+                "image_text_cosine": float(score),
+            })
+        else:
+            kept.append(rec)
+    report = {
+        "image_text_cosine_filter_enabled": threshold is not None,
+        "image_text_cosine_min": threshold,
+        "image_text_cosine_records": int(comparable),
+        "image_text_cosine_missing_or_invalid": int(len(records) - comparable),
+        "image_text_cosine_stats": _stats(scores),
+        "image_text_cosine_records_kept": len(kept),
+        "image_text_cosine_records_rejected": len(rejected),
+        "image_text_cosine_reject_causes": dict(sorted(reject_causes.items())),
+        "image_text_cosine_error_examples": rejected[:max(0, int(sample_errors))],
+    }
+    return kept, report, rejected
+
+
+def _lsh_projection_tables(dim, bits, tables, seed):
+    projections = []
+    for table in range(int(tables)):
+        rng = np.random.default_rng(int(seed) + 1000003 * table + 9176 * int(dim))
+        proj = rng.standard_normal((int(bits), int(dim))).astype(np.float64)
+        norm = np.linalg.norm(proj, axis=1, keepdims=True)
+        projections.append(proj / np.maximum(norm, 1.0e-12))
+    return projections
+
+
+def _lsh_key(vec, proj):
+    signs = (proj @ vec) >= 0.0
+    return np.packbits(signs.astype(np.uint8)).tobytes()
+
+
+def _dedupe_quality_score(rec):
+    if rec.aesthetic is not None:
+        return float(rec.aesthetic)
+    return 0.0
+
+
+def filter_records_by_image_near_duplicates(records, max_cosine=None, lsh_bits=18,
+                                            lsh_tables=4, seed=0,
+                                            prefer_quality=True, sample_errors=8):
+    threshold = None if max_cosine is None else float(max_cosine)
+    if threshold is None:
+        return list(records), {
+            "image_near_duplicate_filter_enabled": False,
+            "image_near_duplicate_max_cosine": None,
+            "image_near_duplicate_records": 0,
+            "image_near_duplicate_records_kept": len(records),
+            "image_near_duplicate_records_rejected": 0,
+        }, []
+    bits = max(1, int(lsh_bits))
+    tables = max(1, int(lsh_tables))
+    indexed_vectors = {}
+    projections_by_dim = {}
+    buckets = {}
+    kept_indices = []
+    rejected = []
+    reject_causes = Counter()
+    invalid_causes = Counter()
+    missing_or_invalid = 0
+    comparable = 0
+    exact_comparisons = 0
+    candidate_pool_sizes = []
+    order = list(range(len(records)))
+    if prefer_quality:
+        order.sort(key=lambda i: (-_dedupe_quality_score(records[i]), i))
+    for idx in order:
+        rec = records[idx]
+        vec, reason = _record_embedding_vector(rec, "image")
+        if vec is None:
+            missing_or_invalid += 1
+            invalid_causes[reason] += 1
+            kept_indices.append(idx)
+            continue
+        comparable += 1
+        dim = int(vec.shape[0])
+        if dim not in projections_by_dim:
+            projections_by_dim[dim] = _lsh_projection_tables(dim, bits, tables, seed)
+        candidate_ids = set()
+        keys = []
+        for table, proj in enumerate(projections_by_dim[dim]):
+            key = (dim, table, _lsh_key(vec, proj))
+            keys.append(key)
+            candidate_ids.update(buckets.get(key, ()))
+        candidate_pool_sizes.append(len(candidate_ids))
+        best_idx = None
+        best_score = -2.0
+        for cand_idx in candidate_ids:
+            cand_vec = indexed_vectors.get(cand_idx)
+            if cand_vec is None:
+                continue
+            score = float(np.dot(vec, cand_vec))
+            exact_comparisons += 1
+            if score > best_score:
+                best_score = score
+                best_idx = cand_idx
+        if best_idx is not None and best_score >= threshold:
+            reject_causes["image_near_duplicate"] += 1
+            rejected.append({
+                "row": idx,
+                "path": rec.path,
+                "caption": rec.caption,
+                "reasons": ["image_near_duplicate"],
+                "image_duplicate_cosine": float(best_score),
+                "duplicate_of_row": int(best_idx),
+                "duplicate_of_path": records[best_idx].path,
+            })
+            continue
+        kept_indices.append(idx)
+        indexed_vectors[idx] = vec
+        for key in keys:
+            buckets.setdefault(key, []).append(idx)
+    kept_indices = sorted(kept_indices)
+    kept = [records[i] for i in kept_indices]
+    bucket_sizes = [len(v) for v in buckets.values()]
+    report = {
+        "image_near_duplicate_filter_enabled": True,
+        "image_near_duplicate_max_cosine": float(threshold),
+        "image_near_duplicate_lsh_bits": int(bits),
+        "image_near_duplicate_lsh_tables": int(tables),
+        "image_near_duplicate_lsh_seed": int(seed),
+        "image_near_duplicate_prefer_quality": bool(prefer_quality),
+        "image_near_duplicate_records": int(comparable),
+        "image_near_duplicate_missing_or_invalid": int(missing_or_invalid),
+        "image_near_duplicate_exact_comparisons": int(exact_comparisons),
+        "image_near_duplicate_bucket_count": int(len(buckets)),
+        "image_near_duplicate_bucket_size_stats": _stats(bucket_sizes),
+        "image_near_duplicate_candidate_pool_stats": _stats(candidate_pool_sizes),
+        "image_near_duplicate_records_kept": len(kept),
+        "image_near_duplicate_records_rejected": len(rejected),
+        "image_near_duplicate_reject_causes": dict(sorted(reject_causes.items())),
+        "image_near_duplicate_invalid_causes": dict(sorted(invalid_causes.items())),
+        "image_near_duplicate_error_examples": rejected[:max(0, int(sample_errors))],
+    }
+    return kept, report, rejected
+
+
 def build_caption_vocab(records, max_vocab=8192, min_freq=1):
     counts = {}
     for rec in records:
@@ -435,10 +774,17 @@ def build_caption_vocab(records, max_vocab=8192, min_freq=1):
     return {tok: i for i, tok in enumerate(toks)}
 
 
+def vocab_unknown_id(vocab):
+    if "<unk>" in vocab:
+        return int(vocab["<unk>"])
+    nonpad = sorted(int(v) for v in vocab.values() if int(v) != 0)
+    return int(nonpad[0]) if nonpad else 0
+
+
 def caption_ids(captions, vocab, max_len=64, device="cpu"):
     max_len = max(1, int(max_len))
     ids = torch.zeros((len(captions), max_len), dtype=torch.long, device=device)
-    unk = int(vocab.get("<unk>", 0))
+    unk = vocab_unknown_id(vocab)
     for i, caption in enumerate(captions):
         row = [vocab.get(tok, unk) for tok in caption_tokens(caption)[:max_len]]
         if row:
@@ -512,6 +858,109 @@ def _ppm_dimensions(path):
     return width, height
 
 
+def _png_dimensions_from_bytes(raw):
+    if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
+        raise ValueError("invalid PNG header")
+    width = int.from_bytes(raw[16:20], "big")
+    height = int.from_bytes(raw[20:24], "big")
+    if width <= 0 or height <= 0:
+        raise ValueError("invalid PNG dimensions")
+    return width, height
+
+
+def _jpeg_dimensions_from_bytes(raw):
+    if len(raw) < 4 or raw[:2] != b"\xff\xd8":
+        raise ValueError("invalid JPEG header")
+    i = 2
+    sof_markers = {
+        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+    }
+    while i + 3 < len(raw):
+        while i < len(raw) and raw[i] != 0xFF:
+            i += 1
+        while i < len(raw) and raw[i] == 0xFF:
+            i += 1
+        if i >= len(raw):
+            break
+        marker = raw[i]
+        i += 1
+        if marker in (0xD8, 0xD9, 0x01) or 0xD0 <= marker <= 0xD7:
+            continue
+        if i + 2 > len(raw):
+            break
+        seg_len = int.from_bytes(raw[i:i + 2], "big")
+        if seg_len < 2 or i + seg_len > len(raw):
+            break
+        if marker in sof_markers:
+            if seg_len < 7:
+                raise ValueError("invalid JPEG SOF segment")
+            height = int.from_bytes(raw[i + 3:i + 5], "big")
+            width = int.from_bytes(raw[i + 5:i + 7], "big")
+            if width <= 0 or height <= 0:
+                raise ValueError("invalid JPEG dimensions")
+            return width, height
+        i += seg_len
+    raise ValueError("JPEG dimensions not found")
+
+
+def _webp_dimensions_from_bytes(raw):
+    if len(raw) < 20 or raw[:4] != b"RIFF" or raw[8:12] != b"WEBP":
+        raise ValueError("invalid WebP header")
+    chunk = raw[12:16]
+    data = raw[20:]
+    if chunk == b"VP8X":
+        if len(data) < 10:
+            raise ValueError("truncated WebP VP8X header")
+        width = 1 + int.from_bytes(data[4:7], "little")
+        height = 1 + int.from_bytes(data[7:10], "little")
+    elif chunk == b"VP8 ":
+        if len(data) < 10 or data[3:6] != b"\x9d\x01\x2a":
+            raise ValueError("invalid WebP VP8 header")
+        width = int.from_bytes(data[6:8], "little") & 0x3FFF
+        height = int.from_bytes(data[8:10], "little") & 0x3FFF
+    elif chunk == b"VP8L":
+        if len(data) < 5 or data[0] != 0x2F:
+            raise ValueError("invalid WebP VP8L header")
+        bits = int.from_bytes(data[1:5], "little")
+        width = 1 + (bits & 0x3FFF)
+        height = 1 + ((bits >> 14) & 0x3FFF)
+    else:
+        raise ValueError(f"unsupported WebP chunk {chunk!r}")
+    if width <= 0 or height <= 0:
+        raise ValueError("invalid WebP dimensions")
+    return width, height
+
+
+def _bmp_dimensions_from_bytes(raw):
+    if len(raw) < 26 or raw[:2] != b"BM":
+        raise ValueError("invalid BMP header")
+    dib_size = int.from_bytes(raw[14:18], "little")
+    if dib_size == 12:
+        width = int.from_bytes(raw[18:20], "little")
+        height = int.from_bytes(raw[20:22], "little")
+    else:
+        width = int.from_bytes(raw[18:22], "little", signed=True)
+        height = int.from_bytes(raw[22:26], "little", signed=True)
+    width, height = abs(int(width)), abs(int(height))
+    if width <= 0 or height <= 0:
+        raise ValueError("invalid BMP dimensions")
+    return width, height
+
+
+def image_dimensions_from_bytes(raw, ext=""):
+    ext = str(ext).lower()
+    if ext in (".png", "") and raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return _png_dimensions_from_bytes(raw)
+    if ext in (".jpg", ".jpeg", "") and raw[:2] == b"\xff\xd8":
+        return _jpeg_dimensions_from_bytes(raw)
+    if ext in (".webp", "") and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return _webp_dimensions_from_bytes(raw)
+    if ext in (".bmp", "") and raw[:2] == b"BM":
+        return _bmp_dimensions_from_bytes(raw)
+    raise ValueError(f"unsupported image header for extension {ext!r}")
+
+
 def _pil_image(path):
     try:
         from PIL import Image
@@ -527,6 +976,13 @@ def image_dimensions(path):
     ext = os.path.splitext(path)[1].lower()
     if ext in (".ppm", ".pnm"):
         return _ppm_dimensions(path)
+    if ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+        with open(path, "rb") as f:
+            raw = f.read()
+        try:
+            return image_dimensions_from_bytes(raw, ext=ext)
+        except Exception:
+            pass
     try:
         from PIL import Image
     except Exception as e:  # pragma: no cover - depends on optional runtime package.
@@ -628,6 +1084,10 @@ def _record_to_manifest_row(rec: ImageTextRecord, root=""):
         row["source"] = rec.source
     if rec.aesthetic is not None:
         row["aesthetic"] = float(rec.aesthetic)
+    if rec.nsfw is not None:
+        row["nsfw"] = float(rec.nsfw)
+    if rec.watermark is not None:
+        row["watermark"] = float(rec.watermark)
     if rec.width:
         row["width"] = int(rec.width)
     if rec.height:
@@ -640,13 +1100,18 @@ def _record_to_manifest_row(rec: ImageTextRecord, root=""):
         ]
     if rec.image_embedding is not None:
         row["image_embedding"] = [float(x) for x in rec.image_embedding]
+    if rec.image_embedding_sequence is not None:
+        row["image_embedding_sequence"] = [
+            [float(x) for x in seq_row] for seq_row in rec.image_embedding_sequence
+        ]
     return row
 
 
 def inspect_image_manifest(path, root="", split="", min_aesthetic=None, max_records=0,
                            check_images=True, min_side=0, max_aspect=0.0,
                            min_caption_tokens=1, max_caption_tokens=0,
-                           dedupe_paths=True, sample_errors=8):
+                           dedupe_paths=True, sample_errors=8,
+                           max_nsfw=None, max_watermark=None):
     """Validate and summarize a captioned-image manifest.
 
     This is data-plane tooling for real image generation: it catches missing files, corrupt
@@ -662,6 +1127,8 @@ def inspect_image_manifest(path, root="", split="", min_aesthetic=None, max_reco
     seen_any_paths = Counter()
     skipped_split = 0
     skipped_aesthetic = 0
+    skipped_nsfw = 0
+    skipped_watermark = 0
     inspected = 0
 
     for row_index, row in enumerate(rows):
@@ -679,6 +1146,16 @@ def inspect_image_manifest(path, root="", split="", min_aesthetic=None, max_reco
         if min_aesthetic is not None and rec.aesthetic is not None:
             if rec.aesthetic < float(min_aesthetic):
                 skipped_aesthetic += 1
+                continue
+        if max_nsfw is not None and rec.nsfw is not None:
+            if rec.nsfw > float(max_nsfw):
+                skipped_nsfw += 1
+                reject_causes["nsfw_above_threshold"] += 1
+                continue
+        if max_watermark is not None and rec.watermark is not None:
+            if rec.watermark > float(max_watermark):
+                skipped_watermark += 1
+                reject_causes["watermark_above_threshold"] += 1
                 continue
         inspected += 1
         reasons = []
@@ -742,12 +1219,16 @@ def inspect_image_manifest(path, root="", split="", min_aesthetic=None, max_reco
         for rec in kept if rec.width and rec.height
     ]
     aesthetic = [rec.aesthetic for rec in kept if rec.aesthetic is not None]
+    nsfw = [rec.nsfw for rec in kept if rec.nsfw is not None]
+    watermark = [rec.watermark for rec in kept if rec.watermark is not None]
     duplicate_total = sum(max(0, n - 1) for n in seen_any_paths.values())
     report = {
         "manifest": path,
         "root": root,
         "split_filter": split,
         "min_aesthetic": float(min_aesthetic) if min_aesthetic is not None else None,
+        "max_nsfw": float(max_nsfw) if max_nsfw is not None else None,
+        "max_watermark": float(max_watermark) if max_watermark is not None else None,
         "max_records": int(max_records),
         "check_images": bool(check_images),
         "min_side": int(min_side),
@@ -761,6 +1242,8 @@ def inspect_image_manifest(path, root="", split="", min_aesthetic=None, max_reco
         "records_rejected": len(rejected),
         "records_skipped_split": int(skipped_split),
         "records_skipped_aesthetic": int(skipped_aesthetic),
+        "records_skipped_nsfw": int(skipped_nsfw),
+        "records_skipped_watermark": int(skipped_watermark),
         "duplicate_path_rows": int(duplicate_total),
         "reject_causes": dict(sorted(reject_causes.items())),
         "extension_counts": dict(sorted(extension_counts.items())),
@@ -771,6 +1254,8 @@ def inspect_image_manifest(path, root="", split="", min_aesthetic=None, max_reco
         "min_side_stats": _stats(min_sides),
         "aspect_stats": _stats(aspects),
         "aesthetic_stats": _stats(aesthetic),
+        "nsfw_stats": _stats(nsfw),
+        "watermark_stats": _stats(watermark),
         "kept_summary": summarize_records(kept),
         "error_examples": rejected[:max(0, int(sample_errors))],
     }
@@ -842,14 +1327,20 @@ def selftest():
                 "text_embedding": [0.1, 0.2, 0.3],
                 "text_embedding_sequence": [[0.1, 0.0], [0.0, 0.2]],
                 "image_embedding": [0.4, 0.5, 0.6, 0.7],
+                "image_embedding_sequence": [[0.4, 0.5], [0.6, 0.7], [0.8, 0.9]],
                 "aesthetic": 7.5,
+                "nsfw": 0.1,
+                "watermark": 0.0,
             }) + "\n")
         records = read_image_manifest(manifest)
         assert len(records) == 1 and records[0].caption.startswith("red")
         assert records[0].source == "fixture"
+        assert records[0].nsfw == 0.1 and records[0].watermark == 0.0
         assert records[0].text_embedding == (0.1, 0.2, 0.3)
         assert records[0].text_embedding_sequence == ((0.1, 0.0), (0.0, 0.2))
         assert records[0].image_embedding == (0.4, 0.5, 0.6, 0.7)
+        assert records[0].image_embedding_sequence == (
+            (0.4, 0.5), (0.6, 0.7), (0.8, 0.9))
         x = load_image_tensor(records[0].path, size=4)
         assert x.shape == (3, 4, 4) and float(x.max()) <= 1.0 and float(x.min()) >= -1.0
         xr = load_image_tensor(records[0].path, size=4, crop_mode="random",
@@ -886,13 +1377,17 @@ def selftest():
         assert summary["text_embedding_sequence_records"] == 1
         assert summary["text_embedding_sequence_dims"] == [2]
         assert summary["image_embedding_records"] == 1 and summary["image_embedding_dims"] == [4]
+        assert summary["image_embedding_sequence_records"] == 1
+        assert summary["image_embedding_sequence_dims"] == [2]
         qa_manifest = os.path.join(td, "qa.jsonl")
         with open(qa_manifest, "w", encoding="utf-8") as f:
             for row in (
                     {"image": "sample.ppm", "caption": "red green blocks",
                      "split": "train", "source": "qa", "text_embedding": [1.0, 0.0],
                      "text_embedding_sequence": [[1.0, 0.0], [0.0, 1.0]],
-                     "image_embedding": [0.0, 1.0]},
+                     "image_embedding": [0.0, 1.0],
+                     "image_embedding_sequence": [[0.0, 1.0], [1.0, 0.0]],
+                     "nsfw": 0.0, "watermark": 0.0},
                     {"image": "sample.ppm", "caption": "duplicate patch", "split": "train"},
                     {"image": "missing.ppm", "caption": "x", "split": "train"},
                     {"image": "sample.ppm", "caption": "held out patch", "split": "eval"}):
@@ -911,6 +1406,7 @@ def selftest():
             filtered_row = json.loads(f.readline())
         assert filtered_row["image"] == "sample.ppm"
         assert filtered_row["source"] == "qa"
+        assert filtered_row["nsfw"] == 0.0 and filtered_row["watermark"] == 0.0
         assert filtered_row["text_embedding"] == [1.0, 0.0]
         assert filtered_row["text_embedding_sequence"] == [[1.0, 0.0], [0.0, 1.0]]
         assert filtered_row["image_embedding"] == [0.0, 1.0]
@@ -921,6 +1417,7 @@ def selftest():
                 "text_embedding": [9.0, 8.0],
                 "text_embedding_sequence": [[9.0, 0.0], [0.0, 8.0], [1.0, 1.0]],
                 "image_embedding": [7.0, 6.0, 5.0],
+                "image_embedding_sequence": [[7.0, 6.0], [5.0, 4.0]],
             }) + "\n")
         preserved, preserved_report = merge_embedding_sidecar(
             kept, sidecar, root=td, key="image", overwrite=False)
@@ -928,6 +1425,7 @@ def selftest():
         assert preserved_report["embedding_text_preserved"] == 1
         assert preserved_report["embedding_text_sequence_preserved"] == 1
         assert preserved_report["embedding_image_preserved"] == 1
+        assert preserved_report["embedding_image_sequence_preserved"] == 1
         assert preserved[0].text_embedding == (1.0, 0.0)
         assert preserved[0].text_embedding_sequence == ((1.0, 0.0), (0.0, 1.0))
         overwritten, overwrite_report = merge_embedding_sidecar(
@@ -936,13 +1434,70 @@ def selftest():
         assert overwrite_report["embedding_text_sequence_written"] == 1
         assert overwrite_report["embedding_text_sequence_dims"] == [2]
         assert overwrite_report["embedding_image_written"] == 1
+        assert overwrite_report["embedding_image_sequence_written"] == 1
+        assert overwrite_report["embedding_image_sequence_dims"] == [2]
         assert overwritten[0].text_embedding == (9.0, 8.0)
         assert overwritten[0].text_embedding_sequence == (
             (9.0, 0.0), (0.0, 8.0), (1.0, 1.0))
         assert overwritten[0].image_embedding == (7.0, 6.0, 5.0)
+        assert overwritten[0].image_embedding_sequence == ((7.0, 6.0), (5.0, 4.0))
         reread = read_image_manifest(filtered, root=td, split="train")
         assert len(reread) == 1 and reread[0].width == 8 and reread[0].height == 6
         assert reread[0].source == "qa"
+        scored_manifest = os.path.join(td, "scored.jsonl")
+        with open(scored_manifest, "w", encoding="utf-8") as f:
+            for row in (
+                    {"image": "sample.ppm", "caption": "safe image", "split": "train",
+                     "image_nsfw": 0.1, "watermark_score": 0.0},
+                    {"image": "sample.ppm", "caption": "unsafe image", "split": "train",
+                     "image_nsfw": 0.9, "watermark_score": 0.0},
+                    {"image": "sample.ppm", "caption": "watermarked image", "split": "train",
+                     "image_nsfw": 0.1, "watermark_score": 0.8}):
+                f.write(json.dumps(row) + "\n")
+        score_report, score_kept, _score_rejected = inspect_image_manifest(
+            scored_manifest, split="train", max_nsfw=0.5, max_watermark=0.5,
+            dedupe_paths=False)
+        assert score_report["records_kept"] == 1 and len(score_kept) == 1
+        assert score_report["records_skipped_nsfw"] == 1
+        assert score_report["records_skipped_watermark"] == 1
+        assert score_report["nsfw_stats"]["max"] == 0.1
+        aligned_records = [
+            replace(records[0], caption="aligned", text_embedding=(1.0, 0.0),
+                    image_embedding=(0.9, 0.1)),
+            replace(records[0], caption="misaligned", text_embedding=(1.0, 0.0),
+                    image_embedding=(0.0, 1.0)),
+            replace(records[0], caption="missing", text_embedding=None,
+                    text_embedding_sequence=None, image_embedding=(1.0, 0.0)),
+        ]
+        align_kept, align_report, align_rejected = filter_records_by_image_text_cosine(
+            aligned_records, min_cosine=0.8)
+        assert [r.caption for r in align_kept] == ["aligned"]
+        assert len(align_rejected) == 2
+        assert align_report["image_text_cosine_records"] == 2
+        assert align_report["image_text_cosine_reject_causes"][
+            "image_text_cosine_below_threshold"] == 1
+        assert align_report["image_text_cosine_reject_causes"]["missing_text_embedding"] == 1
+        dup_records = [
+            replace(records[0], caption="low quality duplicate",
+                    image_embedding=(1.0, 0.0), aesthetic=1.0),
+            replace(records[0], caption="different image",
+                    image_embedding=(0.0, 1.0), aesthetic=1.0),
+            replace(records[0], caption="high quality duplicate",
+                    image_embedding=(1.0, 0.0), aesthetic=9.0),
+            replace(records[0], caption="missing embedding",
+                    image_embedding=None, image_embedding_sequence=None),
+        ]
+        dedupe_kept, dedupe_report, dedupe_rejected = (
+            filter_records_by_image_near_duplicates(
+                dup_records, max_cosine=0.99, lsh_bits=8, lsh_tables=2, seed=0)
+        )
+        assert [r.caption for r in dedupe_kept] == [
+            "different image", "high quality duplicate", "missing embedding"]
+        assert len(dedupe_rejected) == 1
+        assert dedupe_rejected[0]["caption"] == "low quality duplicate"
+        assert dedupe_report["image_near_duplicate_records_rejected"] == 1
+        assert dedupe_report["image_near_duplicate_invalid_causes"][
+            "missing_image_embedding"] == 1
     print("image_data selftest OK")
 
 
@@ -955,12 +1510,16 @@ def main(argv=None):
                     help="optional split filter; default inspects all splits")
     ap.add_argument("--min-aesthetic", type=float, default=None,
                     help="skip rows with aesthetic/score/quality below this threshold")
+    ap.add_argument("--max-nsfw", type=float, default=None,
+                    help="skip rows with nsfw/image_nsfw/prompt_nsfw above this threshold")
     ap.add_argument("--max-records", type=int, default=0,
                     help="cap inspected records for smoke tests; 0 means all")
     ap.add_argument("--min-side", type=int, default=0,
                     help="reject images whose smaller side is below this size")
     ap.add_argument("--max-aspect", type=float, default=0.0,
                     help="reject images wider/taller than this aspect ratio; 0 disables")
+    ap.add_argument("--max-watermark", type=float, default=None,
+                    help="skip rows with watermark/watermark_score above this threshold")
     ap.add_argument("--min-caption-tokens", type=int, default=1,
                     help="reject captions shorter than this token count")
     ap.add_argument("--max-caption-tokens", type=int, default=0,
@@ -984,15 +1543,41 @@ def main(argv=None):
                     help="join key for --embedding-manifest")
     ap.add_argument("--embedding-overwrite", action="store_true",
                     help="replace existing manifest embeddings with sidecar values")
+    ap.add_argument("--min-image-text-cosine", type=float, default=None,
+                    help=("after embedding merge, reject rows whose pooled text/image "
+                          "embedding cosine is below this threshold"))
+    ap.add_argument("--max-image-duplicate-cosine", type=float, default=None,
+                    help=("after embedding merge, reject near-duplicate image embeddings "
+                          "with cosine at or above this threshold"))
+    ap.add_argument("--image-dedupe-lsh-bits", type=int, default=18,
+                    help="random-hyperplane LSH bits per table for image duplicate filtering")
+    ap.add_argument("--image-dedupe-lsh-tables", type=int, default=4,
+                    help="number of LSH tables for image duplicate filtering")
+    ap.add_argument("--image-dedupe-seed", type=int, default=0,
+                    help="deterministic LSH seed for image duplicate filtering")
+    ap.add_argument("--image-dedupe-keep-first", action="store_true",
+                    help="keep first row among near duplicates instead of preferring quality score")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest()
         return
     if not args.manifest:
         ap.error("use --selftest or --manifest")
+    if (args.min_image_text_cosine is not None
+            and (args.min_image_text_cosine < -1.0 or args.min_image_text_cosine > 1.0)):
+        ap.error("--min-image-text-cosine must be in [-1, 1]")
+    if (args.max_image_duplicate_cosine is not None
+            and (args.max_image_duplicate_cosine < -1.0
+                 or args.max_image_duplicate_cosine > 1.0)):
+        ap.error("--max-image-duplicate-cosine must be in [-1, 1]")
+    if args.image_dedupe_lsh_bits <= 0:
+        ap.error("--image-dedupe-lsh-bits must be positive")
+    if args.image_dedupe_lsh_tables <= 0:
+        ap.error("--image-dedupe-lsh-tables must be positive")
     report, kept, _rejected = inspect_image_manifest(
         args.manifest, root=args.root, split=args.split,
         min_aesthetic=args.min_aesthetic, max_records=args.max_records,
+        max_nsfw=args.max_nsfw, max_watermark=args.max_watermark,
         check_images=not args.no_check_images, min_side=args.min_side,
         max_aspect=args.max_aspect, min_caption_tokens=args.min_caption_tokens,
         max_caption_tokens=args.max_caption_tokens,
@@ -1004,6 +1589,46 @@ def main(argv=None):
             key=args.embedding_key, overwrite=args.embedding_overwrite)
         report["embedding_merge"] = embedding_report
         report.update(summarize_records(kept))
+    pre_embedding_filter_kept = len(kept)
+    pre_embedding_filter_rejected = int(report["records_rejected"])
+    kept_after_alignment, alignment_report, alignment_rejected = (
+        filter_records_by_image_text_cosine(
+            kept, min_cosine=args.min_image_text_cosine, sample_errors=args.sample_errors)
+    )
+    embedding_filter_rejected = []
+    if args.min_image_text_cosine is not None:
+        kept = kept_after_alignment
+        embedding_filter_rejected.extend(alignment_rejected)
+    kept_after_dedupe, dedupe_report, dedupe_rejected = (
+        filter_records_by_image_near_duplicates(
+            kept, max_cosine=args.max_image_duplicate_cosine,
+            lsh_bits=args.image_dedupe_lsh_bits,
+            lsh_tables=args.image_dedupe_lsh_tables,
+            seed=args.image_dedupe_seed,
+            prefer_quality=not args.image_dedupe_keep_first,
+            sample_errors=args.sample_errors)
+    )
+    if args.max_image_duplicate_cosine is not None:
+        kept = kept_after_dedupe
+        embedding_filter_rejected.extend(dedupe_rejected)
+    if args.min_image_text_cosine is not None or args.max_image_duplicate_cosine is not None:
+        report["records_kept_before_embedding_filters"] = int(pre_embedding_filter_kept)
+        report["records_rejected_before_embedding_filters"] = int(pre_embedding_filter_rejected)
+        report["records_kept"] = len(kept)
+        report["records_rejected"] = pre_embedding_filter_rejected + len(
+            embedding_filter_rejected)
+        inspected = max(1, int(report["records_inspected"]))
+        report["quality_pass_rate"] = float(len(kept) / inspected)
+        causes = Counter(report.get("reject_causes", {}))
+        if args.min_image_text_cosine is not None:
+            causes.update(alignment_report.get("image_text_cosine_reject_causes", {}))
+        if args.max_image_duplicate_cosine is not None:
+            causes.update(dedupe_report.get("image_near_duplicate_reject_causes", {}))
+        report["reject_causes"] = dict(sorted(causes.items()))
+        report["kept_summary"] = summarize_records(kept)
+        report.update(summarize_records(kept))
+    report["image_text_cosine_filter"] = alignment_report
+    report["image_near_duplicate_filter"] = dedupe_report
     if args.write_filtered:
         write_image_manifest(kept, args.write_filtered, root=args.root)
         report["filtered_manifest"] = args.write_filtered

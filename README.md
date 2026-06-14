@@ -36,7 +36,7 @@ memorization, and curriculum.
 | `datalog.py` | minimal Datalog: least-fixpoint closure with provenance, entailment oracle, proof trees, SLD backward chaining |
 | `surfaces.json` | frontier-distilled surface bank: 1,300+ validated English patterns across 8 education registers (preschool → scholar), with held-out splits |
 | `runpod/` | H100 launchers (tar-over-ssh, timeout-bounded, always-terminate) |
-| `thinking/vision.py`, `thinking/image2.py`, `thinking/image_flow.py`, `thinking/image_data.py`, `thinking/image_embed.py`, `thinking/image_latent.py` | Image rungs: synthetic visual factors → canonical facts, head-aware FER probes, captioned image data, embedding sidecars, pixel flow, and semantic latent flow |
+| `thinking/vision.py`, `thinking/image2.py`, `thinking/image_flow.py`, `thinking/image_data.py`, `thinking/image_caption.py`, `thinking/image_embed.py`, `thinking/image_score.py`, `thinking/image_preferences.py`, `thinking/image_eval.py`, `thinking/image_latent.py` | Image rungs: synthetic visual factors → canonical facts, head-aware FER probes, captioned image data, recaptioning, embedding/quality/preference sidecars, offline image-quality eval, pixel flow, and semantic latent flow |
 | `thinking/text.py` | Text-0 semantic understanding rung: web-imported English records → canonical facts, with artifact controls |
 | `thinking/audio.py`, `thinking/multimodal.py` | Audio factors and the M-0 multimodal bridge: image+audio+transcript prefixes → one canonical extraction trace |
 | `thinking/listen.py`, `thinking/speak.py` | speech: **listen** (transcribe real synthesized speech, speaker-invariant), **speak** (emit audio tokens *verified by round-trip* through the frozen listener — the checker, applied to generation) |
@@ -93,15 +93,54 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
 .venv/bin/python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --ae-steps 40 --flow-steps 40 --cond-drop 0.1 --cfg-scale 1.5 \
     --sample-steps 4 --flow-semantic-w 0.25 --time-sampling logit-normal \
-    --flow-consistency-w 0.05 --flow-ema-decay 0.99 --flow-checkpoint-blocks \
+    --flow-consistency-w 0.05 --flow-endpoint-w 0.1 \
+    --flow-noise-coupling sliced_ot --flow-noise-coupling-projections 4 \
+    --flow-ema-decay 0.99 --flow-checkpoint-blocks \
+    --dit-mlp swiglu \
     --sample-churn 0.05 --sample-churn-interval 0.0,0.8 \
     --out runs/image_latent_mmdit_text.pt
-.venv/bin/python -m thinking.image_embed --manifest data/images/train.jsonl \
+.venv/bin/python -m thinking.image_fetch --source text-to-image-2m-512-2m \
+    --max-records 1024 --image-dir data/images/web_fetch \
+    --manifest data/images/train_web.jsonl --root data/images \
+    --report-out runs/image_fetch_report.json
+.venv/bin/python -m thinking.image_caption --manifest data/images/train_web.jsonl \
+    --root data/images --backend hf --model Salesforce/blip-image-captioning-large \
+    --mode replace --batch 16 --device cuda \
+    --out data/images/train_web_captioned.jsonl \
+    --report-out runs/image_caption_report.json
+.venv/bin/python -m thinking.image_score --manifest data/images/train_web_captioned.jsonl \
+    --root data/images --backend stats --image-size 256 \
+    --out data/images/train_web_scored.jsonl \
+    --sidecar-out data/images/train_web_quality_scores.jsonl \
+    --report-out runs/image_score_report.json
+# To use a web/HF preference model, write any JSONL/CSV/TSV sidecar with image + score fields
+# and merge it generically instead of hardcoding a reward model into training:
+# .venv/bin/python -m thinking.image_score --manifest data/images/train_web_captioned.jsonl \
+#     --root data/images --backend ensemble --technical-w 0.3 \
+#     --external-sidecar data/images/preference_scores.jsonl \
+#     --external-score-field image_reward --external-w 0.7 \
+#     --out data/images/train_web_scored.jsonl \
+#     --report-out runs/image_score_report.json
+# Optional alternate web source: DiffusionDB zip parts. Add --diffusiondb-metadata
+# with the official metadata.parquet URL or a local copy to preserve nsfw/size fields.
+.venv/bin/python -m thinking.image_fetch --source diffusiondb-2m \
+    --max-records 1024 --diffusiondb-start-part 1 --diffusiondb-end-part 1 \
+    --image-dir data/images/diffusiondb_fetch \
+    --manifest data/images/train_diffusiondb.jsonl --root data/images \
+    --report-out runs/image_fetch_diffusiondb_report.json
+.venv/bin/python -m thinking.image_embed --manifest data/images/train_web_scored.jsonl \
     --root data/images --backend hf --model google/siglip-base-patch16-224 \
-    --features both --batch 64 --device cuda --out data/images/embeddings.jsonl \
+    --features both --text-embed-mode both \
+    --text-sequence-model google-t5/t5-base \
+    --batch 64 --device cuda \
+    --out data/images/embeddings.jsonl \
     --report-out runs/image_embed_report.json
-.venv/bin/python -m thinking.image_data --manifest data/images/train.jsonl \
+The optional T5 sequence encoder needs `transformers` plus `sentencepiece`; the RunPod preset
+installs those when this path is active.
+.venv/bin/python -m thinking.image_data --manifest data/images/train_web_scored.jsonl \
     --root data/images --min-side 256 --max-aspect 2.0 \
+    --max-nsfw 0.2 --max-watermark 0.5 --min-image-text-cosine 0.15 \
+    --max-image-duplicate-cosine 0.985 \
     --embedding-manifest data/images/embeddings.jsonl --embedding-key image \
     --min-caption-tokens 3 --write-filtered data/images/train_clean.jsonl \
     --report-out runs/image_manifest_report.json
@@ -109,22 +148,62 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --image-manifest data/images/train_clean.jsonl --image-root data/images \
     --caption-cond-source auto \
     --size 64 --ae-arch residual --latent-downsample 8 --latent-max-tokens 128 \
-    --dit-pos-embed rope2d \
-    --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 \
+    --dit-pos-embed rope2d --dit-mlp swiglu --latent-patch-size 2 \
+    --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 --ae-fft-w 0.05 \
     --image-text-align-w 0.1 --flow-text-align-w 0.05 --text-embed-dim 128 \
     --image-feature-align-w 0.1 --flow-feature-align-w 0.05 \
     --image-feature-embed-dim 128 \
+    --flow-repa-w 0.05 --flow-repa-mode auto \
+    --flow-self-repa-w 0.05 --flow-self-repa-mode auto \
+    --flow-sra-w 0.05 --flow-sra-mode both --flow-sra-time-gap 0.25 \
     --ae-accum-steps 2 --flow-accum-steps 2 --grad-clip 1.0 \
     --flow-cache-latents --flow-cache-dir runs/image_manifest_cache \
-    --flow-cache-shard-size 2048 --flow-cache-batch 32 \
+    --flow-cache-shard-size 2048 --flow-cache-batch 32 --flow-cache-dtype bf16 \
+    --flow-cache-max-loaded-shards 4 \
     --ae-steps 40 --flow-steps 40 --sample-grid-out runs/image_manifest_grid.ppm \
-    --flow-consistency-w 0.05 --out runs/image_manifest_mmdit.pt
+    --flow-consistency-w 0.05 --flow-endpoint-w 0.1 \
+    --flow-distill-steps 20 --flow-guidance-distill-w 0.1 \
+    --flow-guidance-distill-cfg-scale 1.5 \
+    --flow-noise-coupling sliced_ot --flow-noise-coupling-projections 4 \
+    --out runs/image_manifest_mmdit.pt
 .venv/bin/python -m thinking.image_latent --eval-checkpoint runs/image_manifest_mmdit.pt \
     --eval-image-manifest data/images/train_clean.jsonl --eval-image-root data/images \
     --eval-image-split eval --size 64 --cfg-scales 1.0,1.5 --sample-steps-list 4,8 \
-    --sample-churns 0.0,0.05 --eval-seeds 1,2,3 \
+    --cfg-modes standard,cfgpp --sample-churns 0.0,0.05 --eval-seeds 1,2,3 \
+    --eval-generated-samples 16 --eval-generated-candidates-per-prompt 2 \
     --sample-grid-out runs/image_manifest_eval_grid.ppm \
+    --sample-manifest-out data/images/generated_captioned.jsonl \
     --eval-out runs/image_manifest_mmdit_sweep.json
+.venv/bin/python -m thinking.image_embed --manifest data/images/generated_captioned.jsonl \
+    --root data/images --backend hf --model google/siglip-base-patch16-224 \
+    --features both --text-embed-mode pooled --batch 64 --device cuda \
+    --out data/images/generated_embeddings.jsonl \
+    --report-out runs/generated_image_embed_report.json
+# Score distribution drift, support coverage, diversity, and image-text alignment offline.
+.venv/bin/python -m thinking.image_eval \
+    --real-manifest data/images/train_clean.jsonl \
+    --generated-manifest data/images/generated_captioned.jsonl \
+    --generated-embedding-sidecar data/images/generated_embeddings.jsonl \
+    --embedding-key image --max-records 2048 --min-score 0.25 \
+    --report-out runs/image_eval_report.json
+# Preference-loop artifact: score multiple generated candidates per prompt, then emit
+# chosen/rejected pairs for DPO-style tuning or quality-scorer training.
+.venv/bin/python -m thinking.image_score --manifest data/images/generated_captioned.jsonl \
+    --root data/images --backend ensemble --technical-w 0.3 \
+    --external-sidecar data/images/generated_reward_scores.jsonl \
+    --external-score-field reward_score --external-w 0.7 \
+    --out data/images/generated_scored.jsonl \
+    --report-out runs/generated_score_report.json
+.venv/bin/python -m thinking.image_preferences --manifest data/images/generated_scored.jsonl \
+    --root data/images --group-by prompt_id,prompt,caption --mode top-bottom \
+    --min-score-gap 0.05 --out data/images/generated_preferences.jsonl \
+    --report-out runs/generated_preferences_report.json
+RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
+    --image-quality-preset web-hf-vae
+# The preset also writes a generated sample manifest, embeds it, and runs image_eval; add
+# --image-generated-eval-fail-on-gate plus threshold flags to make quality gates hard. It also
+# runs image_score before embedding/cleaning so quality_score metadata reaches sampling,
+# duplicate selection, quality-head training, and quality-guided prompt sampling.
 .venv/bin/python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.5 --sample-steps-list 4,8 --eval-seeds 1,2,3 \
     --eval-out runs/image_latent_dit_sweep.json
@@ -362,10 +441,14 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
 .venv/bin/python -m thinking.multimodal --steps 240 --eval-n 120 --free-n 20 \
     --counterfactual-n 40 --free-counterfactual-n 20 --trunk-arch residual \
     --trunk-width 96 --trunk-depth 2 --txt-tokens 12 --agreement-w 0.1 \
-    --concept-tokens 4 --fusion-layers 1 \
+    --concept-tokens 4 --fusion-layers 1 --concept-prefix \
     --concept-w 0.25 --concept-agreement-w 0.1 --concept-distill-w 0.1 \
     --concept-rank-distill-w 0.1 --concept-rank-distill-margin 0.05 \
     --concept-transfer-w 0.1 --concept-transfer-margin 0.05 \
+    --concept-contrast-w 0.05 --concept-contrast-temperature 0.1 \
+    --concept-centroid-w 0.05 --concept-state-spread-w 0.01 \
+    --concept-prototype-w 0.05 --concept-prototype-spread-w 0.01 \
+    --latent-concept-slots 4 --latent-concept-w 0.02 \
     --modality-dropout 0.05 \
     --out runs/m0_multimodal_transfer_real.json \
     --checkpoint runs/m0_multimodal_transfer_real.pt

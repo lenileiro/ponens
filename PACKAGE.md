@@ -961,6 +961,23 @@ slot states together while other values for that slot separate; reports expose
 `fact_concept_geometry` nearest-same accuracy and same-vs-different cosine margin. The multimodal
 bridge exposes the same mechanism as `--concept-contrast-w`, so color/shape/sound factors and text
 facts improve through one learned concept geometry rather than through task-specific QA handling.
+RunPod forwards the multimodal form as `--multimodal-concept-contrast-w` and
+`--multimodal-concept-contrast-temperature`.
+
+The geometry head also supports learned per-value prototypes. Text runs expose
+`--fact-concept-prototype-w` and `--fact-concept-prototype-spread-w`; multimodal runs expose the
+parallel `--concept-prototype-w` and `--concept-prototype-spread-w`. These are schema-generic:
+targets come from data-supplied factor ids, while the loss only sees key-local prototype classes
+and an anti-collapse margin. RunPod forwards these as `--multimodal-concept-prototype-w`,
+`--multimodal-concept-prototype-spread-w`, and
+`--multimodal-concept-prototype-spread-margin`.
+
+Multimodal also mirrors the newer text concept plumbing with `--concept-prefix`,
+`--concept-centroid-w`, and `--concept-state-spread-w`. The prefix path prepends schema-key
+concept states to the decoder, while centroid/state-spread objectives use only data-supplied
+factor ids to improve reusable geometry. RunPod forwards the same controls as
+`--multimodal-concept-prefix`, `--multimodal-concept-centroid-*`, and
+`--multimodal-concept-state-spread-*`.
 
 ## 3b. Image grounding: synthetic visual factors first
 
@@ -994,14 +1011,34 @@ python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --cfg-rescale 0.7 \
     --sample-steps 8 --flow-semantic-w 0.25 --time-sampling logit-normal \
     --flow-ema-decay 0.999 --ae-intervention-w 0.1 --ae-factor-orth-w 0.05 \
+    --dit-mlp swiglu \
+    --flow-noise-coupling sliced_ot --flow-noise-coupling-projections 4 \
     --semantic-guidance-w 2.0 --sample-churn 0.05 --sample-churn-interval 0.0,0.8 \
     --out runs/image_latent_mmdit_text.pt
-python -m thinking.image_embed --manifest data/images/train.jsonl \
+python -m thinking.image_fetch --source text-to-image-2m-512-2m \
+    --max-records 1024 --image-dir data/images/web_fetch \
+    --manifest data/images/train_web.jsonl --root data/images \
+    --report-out runs/image_fetch_report.json
+python -m thinking.image_caption --manifest data/images/train_web.jsonl \
+    --root data/images --backend hf --model Salesforce/blip-image-captioning-large \
+    --mode replace --batch 16 --device cuda \
+    --out data/images/train_web_captioned.jsonl \
+    --report-out runs/image_caption_report.json
+python -m thinking.image_score --manifest data/images/train_web_captioned.jsonl \
+    --root data/images --backend stats --image-size 256 \
+    --out data/images/train_web_scored.jsonl \
+    --sidecar-out data/images/train_web_quality_scores.jsonl \
+    --report-out runs/image_score_report.json
+python -m thinking.image_embed --manifest data/images/train_web_scored.jsonl \
     --root data/images --backend hf --model google/siglip-base-patch16-224 \
-    --features both --batch 64 --device cuda --out data/images/embeddings.jsonl \
+    --features both --text-embed-mode both \
+    --text-sequence-model google-t5/t5-base --batch 64 --device cuda \
+    --out data/images/embeddings.jsonl \
     --report-out runs/image_embed_report.json
-python -m thinking.image_data --manifest data/images/train.jsonl \
+python -m thinking.image_data --manifest data/images/train_web_scored.jsonl \
     --root data/images --min-side 256 --max-aspect 2.0 \
+    --max-nsfw 0.2 --max-watermark 0.5 --min-image-text-cosine 0.15 \
+    --max-image-duplicate-cosine 0.985 \
     --embedding-manifest data/images/embeddings.jsonl --embedding-key image \
     --min-caption-tokens 3 --write-filtered data/images/train_clean.jsonl \
     --report-out runs/image_manifest_report.json
@@ -1010,15 +1047,24 @@ python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --caption-cond-source auto \
     --image-quality-weight 1.5 \
     --size 64 --ae-arch residual --latent-downsample 8 --latent-max-tokens 128 \
-    --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 \
+    --dit-mlp swiglu --latent-patch-size 2 \
+    --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 --ae-fft-w 0.05 \
     --image-text-align-w 0.1 --flow-text-align-w 0.05 --text-embed-dim 128 \
     --image-feature-align-w 0.1 --flow-feature-align-w 0.05 \
     --image-feature-embed-dim 128 \
+    --flow-repa-w 0.05 --flow-repa-mode auto \
+    --flow-self-repa-w 0.05 --flow-self-repa-mode auto \
+    --flow-sra-w 0.05 --flow-sra-mode both --flow-sra-time-gap 0.25 \
     --ae-accum-steps 2 --flow-accum-steps 2 --grad-clip 1.0 \
     --flow-cache-latents --flow-cache-dir runs/image_manifest_cache \
-    --flow-cache-shard-size 2048 --flow-cache-batch 32 \
+    --flow-cache-shard-size 2048 --flow-cache-batch 32 --flow-cache-dtype bf16 \
+    --flow-cache-max-loaded-shards 4 \
     --ae-steps 400 --flow-steps 400 --sample-steps 8 \
-    --flow-consistency-w 0.05 --sample-grid-out runs/image_manifest_grid.ppm \
+    --flow-consistency-w 0.05 --flow-endpoint-w 0.1 \
+    --flow-distill-steps 20000 --flow-guidance-distill-w 0.1 \
+    --flow-guidance-distill-cfg-scale 1.5 \
+    --flow-noise-coupling sliced_ot --flow-noise-coupling-projections 4 \
+    --sample-grid-out runs/image_manifest_grid.ppm \
     --out runs/image_manifest_mmdit.pt
 python -m thinking.image_latent --eval-checkpoint runs/image_manifest_mmdit.pt \
     --eval-image-manifest data/images/train_clean.jsonl --eval-image-root data/images \
@@ -1026,7 +1072,29 @@ python -m thinking.image_latent --eval-checkpoint runs/image_manifest_mmdit.pt \
     --cfg-rescales 0.0,0.7 --sample-steps-list 4,8,16 --sample-churns 0.0,0.05 \
     --eval-seeds 1,2,3 \
     --sample-grid-out runs/image_manifest_eval_grid.ppm \
+    --sample-manifest-out data/images/generated_captioned.jsonl \
     --eval-out runs/image_manifest_mmdit_sweep.json
+python -m thinking.image_embed --manifest data/images/generated_captioned.jsonl \
+    --root data/images --backend hf --model google/siglip-base-patch16-224 \
+    --features both --text-embed-mode pooled --batch 64 --device cuda \
+    --out data/images/generated_embeddings.jsonl \
+    --report-out runs/generated_image_embed_report.json
+python -m thinking.image_eval \
+    --real-manifest data/images/train_clean.jsonl \
+    --generated-manifest data/images/generated_captioned.jsonl \
+    --generated-embedding-sidecar data/images/generated_embeddings.jsonl \
+    --embedding-key image --max-records 2048 \
+    --report-out runs/image_eval_report.json
+python -m thinking.image_score --manifest data/images/generated_captioned.jsonl \
+    --root data/images --backend ensemble --technical-w 0.3 \
+    --external-sidecar data/images/generated_reward_scores.jsonl \
+    --external-score-field reward_score --external-w 0.7 \
+    --out data/images/generated_scored.jsonl \
+    --report-out runs/generated_score_report.json
+python -m thinking.image_preferences --manifest data/images/generated_scored.jsonl \
+    --root data/images --group-by prompt_id,prompt,caption --mode top-bottom \
+    --min-score-gap 0.05 --out data/images/generated_preferences.jsonl \
+    --report-out runs/generated_preferences_report.json
 python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.25,1.5,2.0 --cfg-rescales 0.0,0.7 \
     --sample-steps-list 4,8,16 \
@@ -1043,8 +1111,9 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --image-latent --image-laten
     --image-cond-mode text --image-dit-head-width-mult 2 \
     --image-cond-drop 0.1 --image-cfg-scale 1.5 --image-cfg-rescale 0.7 \
     --image-sample-steps 8 --image-flow-semantic-w 0.25 \
-    --image-flow-consistency-w 0.05 \
+    --image-flow-consistency-w 0.05 --image-flow-endpoint-w 0.1 \
     --image-time-sampling logit-normal --image-flow-ema-decay 0.999 \
+    --image-dit-mlp swiglu \
     --image-latent-normalize channel --image-latent-stat-samples 1024 \
     --image-cfg-interval 0.0,0.8 --image-semantic-guidance-interval 0.0,0.75 \
     --image-ae-intervention-w 0.1 --image-ae-factor-orth-w 0.05 \
@@ -1059,26 +1128,40 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
     --image-clean-min-side 256 --image-clean-max-aspect 2.0 \
     --image-latent --image-latent-arch mmdit \
     --image-cond-mode text --image-dit-head-width-mult 2 --image-dit-qk-norm \
-    --image-dit-attn-impl sdpa --image-dit-pos-embed rope2d \
+    --image-dit-attn-impl sdpa --image-dit-pos-embed rope2d --image-dit-mlp swiglu \
     --image-manifest data/images/train.jsonl --image-root data/images \
     --image-caption-cond-source auto \
     --image-crop-mode pad --image-hflip-prob 0.5 \
     --image-quality-weight 1.5 \
     --image-size 128x192 --image-size-buckets 128x128,128x192,192x128 \
     --image-ae-arch residual --image-latent-downsample 8 \
+    --image-latent-patch-size 2 \
     --image-latent-max-tokens 384 \
     --image-ae-recon-loss hybrid --image-ae-grad-w 0.1 --image-ae-ms-w 0.1 \
+    --image-ae-fft-w 0.05 \
     --image-text-align-w 0.1 --image-flow-text-align-w 0.05 \
     --image-text-embed-dim 128 \
     --image-feature-align-w 0.1 --image-flow-feature-align-w 0.05 \
     --image-feature-embed-dim 128 \
     --image-flow-repa-w 0.05 --image-flow-repa-steps 20000 \
+    --image-flow-repa-mode auto \
     --image-flow-repa-embed-dim 128 \
+    --image-flow-self-repa-w 0.05 --image-flow-self-repa-steps 20000 \
+    --image-flow-self-repa-mode auto \
+    --image-flow-self-repa-embed-dim 128 \
+    --image-flow-sra-w 0.05 --image-flow-sra-steps 20000 \
+    --image-flow-sra-mode both --image-flow-sra-time-gap 0.25 \
+    --image-quality-score-w 0.1 --image-flow-quality-score-w 0.1 \
+    --image-quality-score-steps 2000 \
+    --image-quality-score-rank-w 0.05 --image-flow-quality-rank-w 0.05 \
     --image-ae-accum-steps 2 --image-flow-accum-steps 2 \
     --image-train-precision bf16 --image-grad-clip 1.0 \
     --image-flow-cache-latents --image-flow-cache-dir runs/image_manifest_cache \
     --image-flow-cache-shard-size 2048 --image-flow-cache-batch 64 \
+    --image-flow-cache-dtype bf16 --image-flow-cache-max-loaded-shards 4 \
     --image-sample-steps 8 --image-flow-consistency-w 0.05 \
+    --image-flow-endpoint-w 0.1 --image-flow-noise-coupling sliced_ot \
+    --image-flow-noise-coupling-projections 4 \
     --image-time-sampling logit-normal --image-time-shift 1.25 \
     --image-time-shift-mode dim --image-time-shift-ref-dim 1024 \
     --image-flow-loss-weight min-snr-v --image-flow-loss-weight-gamma 5.0 \
@@ -1089,7 +1172,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py --upload-image-data --image-
 
 `thinking.image2` is the head-aware FER experiment: shared factored heads vs explicit
 bottleneck vs one joint color×shape classifier on held-out color/shape combinations. It reports
-both the old embedding probe and the new factor-space probe, fixing the Image-1 blind spot where
+both the embedding probe and the factor-space probe, fixing the Image-1 blind spot where
 the embedding layer missed where factorization lived.
 
 `thinking.image_flow` is the first generation scaffold. It trains a small fact-conditioned
@@ -1128,7 +1211,7 @@ for trace reasoning, label accuracy is not enough; probes must inspect the right
 Image-2 GPU update (H100, 1000 steps, seed 0): the explicit bottleneck keeps **1.00 seen
 accuracy**, reaches **0.84 held-out color/shape combo accuracy** vs **0.61** for shared factored
 heads and **0.00** for the joint classifier, and cuts factor-space leakage from **0.75 → 0.10**.
-The factor-space probe now tracks behavior (`best_factor_space_arm = bottleneck`), while the old
+The factor-space probe now tracks behavior (`best_factor_space_arm = bottleneck`), while the
 shared embedding probe still reports `ufr_score=0.0` because the concatenated representation is
 still entangled. `thinking.image_flow` also trains the first fact-conditioned rectified-flow
 scaffold to `velocity_mse ≈ 0.29` after 1000 steps; this proves the generation path is wired, not
@@ -1354,11 +1437,11 @@ CLI/RunPod controls, so real-image runs can move beyond 32px while keeping DiT/M
 explicit.
 
 Image-33 adds dependency-free AE reconstruction-quality controls. `--ae-recon-loss
-mse|l1|hybrid`, `--ae-grad-w`, `--ae-ms-w`, and `--ae-latent-reg-w` let real-image runs optimize
-pixel fidelity, image gradients, multi-scale structure, and latent magnitude without adding LPIPS
-or discriminator dependencies. This is not a replacement for full perceptual/adversarial AE
-training, but it moves the local/RPU smoke path away from plain MSE compression and records the
-loss configuration in reports/checkpoints.
+mse|l1|hybrid`, `--ae-grad-w`, `--ae-ms-w`, `--ae-fft-w`, and `--ae-latent-reg-w` let real-image
+runs optimize pixel fidelity, image gradients, multi-scale structure, frequency-spectrum detail,
+and latent magnitude without adding LPIPS or discriminator dependencies. This is not a replacement
+for full perceptual/adversarial AE training, but it moves the local/RPU smoke path away from plain
+MSE compression and records the loss configuration in reports/checkpoints.
 
 Image-34 adds GPU training-scale controls for latent image runs. `--ae-accum-steps`,
 `--flow-accum-steps`, `--train-precision fp32|bf16|fp16`, and `--grad-clip` make the per-step
@@ -1370,7 +1453,9 @@ Image-35 adds optional cached-latent flow training for manifest runs. `--flow-ca
 encodes the post-AE training manifest once, stores raw AE latents and caption token IDs on CPU,
 uses the cache for latent normalization stats, and trains the flow from cached latents instead of
 reloading images and re-running `ae.encode` every microstep. This follows the latent-diffusion
-separation between compression and generative-model training while keeping the cache opt-in and
+separation between compression and generative-model training while keeping the cache opt-in.
+`--flow-cache-dtype fp32|bf16|fp16` stores cached latents in reduced precision when requested; sampled
+training latents are cast back to float32 for stable CPU and CUDA AMP execution. Cache use is
 auditable via `flow_cache_*` report/checkpoint fields.
 
 Image-36 adds a generic caption-image alignment objective for real-image manifests.
@@ -1392,9 +1477,10 @@ provider or adding renderer-specific rules.
 Image-38 adds disk-backed manifest latent caching. `--flow-cache-dir` writes AE latents,
 caption token IDs or text embeddings, and shard metadata to disk, then flow training samples from
 those shards instead of keeping the full cache resident in CPU RAM. Reports/checkpoints now expose
-`flow_cache_backend`, `flow_cache_dir`, `flow_cache_shards`, shard size, and byte count. This keeps
-the latent-diffusion separation practical for larger real-image manifests: encode pixels once,
-train the rectified-flow transformer from reusable latent shards, and avoid a hidden RAM ceiling.
+`flow_cache_backend`, `flow_cache_dir`, `flow_cache_shards`, shard size, latent dtype, and byte
+count. This keeps the latent-diffusion separation practical for larger real-image manifests:
+encode pixels once, train the rectified-flow transformer from reusable latent shards, and avoid a
+hidden RAM ceiling.
 
 Image-39 adds manifest-level visual embedding alignment. Rows may include `image_embedding` /
 `visual_embedding` / `vision_embedding` / `clip_image_embedding` / `dino_embedding` arrays, and
@@ -1448,18 +1534,22 @@ Image-46 adds optional per-head QK RMSNorm to the custom MM-DiT attention path. 
 runs; checkpoint metadata records the flag so qk-normalized checkpoints reload with the same
 attention modules, while existing checkpoints keep the default non-normalized architecture.
 
-Image-47 adds an MM-DiT attention implementation selector. `--dit-attn-impl manual|sdpa|auto`
-keeps the original explicit attention path available, uses PyTorch scaled-dot-product attention for
-fused/flash kernels when requested, or falls back automatically. RunPod exposes the same setting as
-`--image-dit-attn-impl`, and checkpoint metadata records the selected implementation.
+Image-47 adds an MM-DiT attention implementation selector. `--dit-attn-impl
+manual|sdpa|linear|auto` keeps the original explicit attention path available, uses PyTorch
+scaled-dot-product attention for fused/flash kernels when requested, enables an opt-in linear
+attention approximation for longer latent token grids, or falls back automatically. RunPod exposes
+the same setting as `--image-dit-attn-impl`, and checkpoint metadata records the selected
+implementation.
 
 Image-48 adds a REPA-style hidden-state representation alignment path for real-image latent flows.
 `--flow-repa-w` trains the flow transformer's noisy-step image-token states against generic
 manifest `image_embedding` rows, separately from endpoint feature alignment, and
-`--flow-repa-steps` can restrict that auxiliary pressure to early training. RunPod exposes the same
-settings as `--image-flow-repa-w`, `--image-flow-repa-steps`, and
-`--image-flow-repa-embed-dim`; disk latent caches now carry image embeddings when either endpoint
-feature alignment or REPA needs them.
+`--flow-repa-steps` can restrict that auxiliary pressure to early training. `--flow-repa-mode
+pooled|token|both|auto` additionally uses manifest `image_embedding_sequence` rows for token-level
+hidden/visual representation matching when available. RunPod exposes the same settings as
+`--image-flow-repa-w`, `--image-flow-repa-steps`, `--image-flow-repa-embed-dim`, and
+`--image-flow-repa-mode`; disk latent caches now carry pooled image embeddings and token sequences
+when endpoint feature alignment or REPA needs them.
 
 Image-49 adds optional Min-SNR-style velocity loss weighting for rectified-flow training.
 `--flow-loss-weight none|min-snr-v|soft-min-snr-v` keeps the exact original objective by default,
@@ -1541,6 +1631,14 @@ and `last_distill.distill_endpoint_mse`; RunPod exposes the same controls as
 `--image-flow-distill-steps`, `--image-flow-distill-w`, `--image-flow-distill-time-gap`, and
 `--image-flow-distill-teacher`.
 
+Image-59 also supports guidance distillation. `--flow-guidance-distill-w` adds a frozen-teacher
+CFG endpoint target inside the same post-flow distillation loop, with
+`--flow-guidance-distill-cfg-scale` and `--flow-guidance-distill-cfg-rescale` controlling the
+teacher guidance. This lets the conditional student absorb some sampling-time CFG behavior without
+adding caption-specific rules. RunPod exposes the same controls as
+`--image-flow-guidance-distill-w`, `--image-flow-guidance-distill-cfg-scale`, and
+`--image-flow-guidance-distill-cfg-rescale`.
+
 Image-60 lets sample grids use arbitrary prompt text even when a manifest run trained on external
 caption embeddings. `thinking.image_latent --eval-checkpoint CKPT --sample-grid-out grid.ppm
 --sample-prompts "a glass house at sunrise; a red canoe on a lake"` now routes prompts through
@@ -1576,9 +1674,10 @@ negative-prompt baseline.
 Image-64 adds best-of-N prompt sample selection. `--sample-candidates-per-prompt K` draws K samples
 per arbitrary prompt and, when the checkpoint has the generic image/text aligner from real-image
 training, keeps the candidate with the highest learned image-text cosine score. Checkpoints without
-that scorer fall back to the first candidate and record the fallback in sample-grid metadata. RunPod
-forwards the same knob as `--image-sample-candidates-per-prompt`, so GPU prompt grids can use
-alignment-guided inspection without changing training or adding prompt-specific rules.
+that scorer use the generic finite/collapse/luminance health score instead of silently keeping the
+first candidate. RunPod forwards the same knob as `--image-sample-candidates-per-prompt`, so GPU
+prompt grids can use alignment- or health-guided inspection without changing training or adding
+prompt-specific rules.
 
 Image-65 adds sampling-time text-alignment guidance for prompt grids. `--sample-text-guidance-w`
 uses the checkpoint's learned image/text aligner as a differentiable latent reward during sampling:
@@ -1593,7 +1692,8 @@ that score on predicted flow endpoints, and prompt grids can use
 `--sample-quality-guidance-w` to nudge samples toward higher learned quality. Checkpoints save the
 scorer separately from the flow, eval reports include generated quality-score means, and RunPod
 exposes the same training/guidance knobs. This turns quality metadata into a reusable model signal,
-not only a row-sampling weight.
+not only a row-sampling weight. `--quality-score-steps` / RunPod
+`--image-quality-score-steps` can also train this scorer as a standalone latent phase.
 
 Image-67 makes latent normalization safe by default for scale runs. `--latent-normalize auto`
 now resolves to `channel` when training on image manifests or an external HF VAE, and to `none`
@@ -1704,6 +1804,301 @@ deterministic per-step latent noise during the selected flow-time interval, whil
 `--sample-churns ...`; reports, aggregate keys, sample grids, checkpoints, and RunPod expose the
 same fields so deterministic and stochastic candidate settings are directly comparable.
 
+Image-82 adds opt-in SwiGLU feed-forward blocks for the scalable CrossDiT/MM-DiT latent flow
+path. `thinking.image_latent --dit-mlp swiglu` replaces the GELU MLP inside CrossDiT/MM-DiT
+blocks with a parameter-comparable gated feed-forward layer; plain `dit` keeps the existing Torch
+encoder layer. Reports/checkpoints record `dit_mlp` and `uses_swiglu_mlp`, and RunPod exposes the
+same setting as `--image-dit-mlp swiglu`.
+
+Image-83 adds latent patch tokens for transformer flows. `--latent-patch-size 2` groups each
+2x2 latent neighborhood into one DiT/CrossDiT/MM-DiT token, reducing attention length while
+unpatchifying the predicted velocity back to the full latent grid before decoding. Reports now
+separate `latent_cells` from active `latent_tokens`, record `latent_patch_size`, and use the
+patched token count for `latent_max_tokens` validation. RunPod exposes this as
+`--image-latent-patch-size`.
+
+Image-84 batches classifier-free guidance inside the latent sampler. When `cfg_scale != 1`,
+the conditional and unconditional velocity queries are concatenated into one model forward and
+split afterward, preserving the same guidance math while reducing sampler launches for high-step
+MM-DiT runs.
+
+Image-85 adds generated sample health metrics to catch visual collapse. Eval rows and sample-grid
+metadata now report finite/non-finite fractions, luminance mean/std, RGB std, dynamic range,
+low/high luminance fractions, collapsed-sample fraction, and a generic `sample_health_score`.
+Checkpoint and sampler selection keys include these fields after semantic/feature metrics, so
+flat black or numerically unstable outputs are penalized without adding renderer- or
+prompt-specific rules. Prompt-grid best-of-N selection now uses the same generic health signal
+whenever no learned text/feature scorer is available.
+
+Image-86 adds sampler trajectory tracing and generic stability controls. Eval rows and sample-grid
+metadata now report latent/velocity finite fractions, non-finite step counts, RMS/max-absolute
+trajectory bounds, and stabilization events. `--sample-finite-guard` zeroes non-finite
+latent/velocity entries, `--sample-velocity-clip` clips per-sample velocity RMS, and
+`--sample-latent-clip` clamps latent magnitude; RunPod exposes the same controls with
+`--image-sample-*`. These are generic numerical controls, not renderer or prompt rules.
+
+Image-86 also fixes the root cause of the first black MM-DiT prompt grids: token negative prompts
+with only out-of-vocabulary words were becoming all-padding rows, which can make transformer
+attention return NaNs. New synthetic prompt vocabs include `<unk>`, and tokenization falls back to
+a non-pad unknown id when loading a checkpoint vocab that has no explicit `<unk>`. A local
+negative-prompt MM-DiT eval now stays finite without the finite guard
+(`sample_grid_nonfinite_frac=0.0`, `sample_grid_trace_velocity_nonfinite_steps=0`), though the
+actual image quality is still noisy and needs further training/architecture work.
+
+Image-87 adds an opt-in clean-endpoint auxiliary objective for latent rectified flow.
+`--flow-endpoint-w` directly penalizes the predicted clean latent endpoint
+`zt + (1-t) * velocity` against the training latent, while preserving the main velocity loss and
+existing timestep weighting. Reports/checkpoints record `flow_endpoint_w`, and `last_flow` always
+reports weighted/unweighted `flow_endpoint_target_mse` so GPU runs can tell whether the learned
+vector field is improving the decode endpoint or only reducing velocity MSE. RunPod exposes the
+same objective as `--image-flow-endpoint-w`.
+
+Image-88 adds a dependency-free frequency-spectrum AE reconstruction term. `--ae-fft-w` compares
+log FFT magnitudes with a mild high-frequency weight, so residual/HF-free autoencoder runs can
+penalize blurred spectra in addition to pixel, gradient, and multi-scale losses. RunPod exposes the
+same control as `--image-ae-fft-w`; reports/checkpoints record `ae_fft_w`, and `last_ae` includes
+`recon_fft_l1` whenever the term is active.
+
+Image-89 adds optional source-noise coupling for latent flow matching. `--flow-noise-coupling
+sliced_ot` sorts each clean-latent batch and Gaussian source batch along one or more random latent
+projections, then pairs matching ranks from the projection with the lowest pair MSE before forming
+the rectified-flow target. `--flow-noise-coupling-projections K` trades extra cheap dot products for
+better pairings; if none beats the original random pairing, training keeps the original source
+noise. This sliced-OT approximation preserves the Gaussian source marginal while reducing
+arbitrary source/data pairing noise; `last_flow` reports before/after pair MSE, projection count,
+selected projection, and whether coupling was active/accepted. RunPod exposes the same mode as
+`--image-flow-noise-coupling sliced_ot --image-flow-noise-coupling-projections K`.
+
+Image-90 adds reduced-precision latent-cache storage for real-image flow training.
+`--flow-cache-dtype bf16|fp16` stores memory and disk cached AE latents in the requested dtype while
+sampling them back as float32 for the flow. This cuts cache RAM/disk/IO pressure for external-VAE
+or high-resolution manifests without changing the training objective. RunPod exposes the same knob
+as `--image-flow-cache-dtype`.
+
+Image-91 makes disk latent caches actually reusable. When `--flow-cache-dir` already contains a
+`meta.json`, training now fingerprints the selected manifest rows, image file stats, crop/flip
+settings, cache dtype, conditioning source, and AE identity/state. Matching caches are loaded
+directly and report `flow_cache_reused=true`; mismatches rebuild the cache instead of silently
+using stale latents.
+
+Image-92 adds bounded in-process shard caching for disk latent caches. `--flow-cache-max-loaded-shards
+N` keeps up to N recently sampled `.pt` latent shards loaded in CPU RAM, using LRU eviction, instead
+of `torch.load`-ing every shard on every sampled batch. Reports/checkpoints expose
+`flow_cache_loaded_shards`, `flow_cache_shard_loads`, and hit/miss counters, and RunPod exposes the
+same knob as `--image-flow-cache-max-loaded-shards`. Set it to fit available CPU RAM; `0` preserves
+the previous streaming behavior.
+
+Image-93 lets quality-aware flow training scale with latent caches. When
+`--flow-quality-score-w` is active, memory and disk flow caches now store normalized quality targets
+and masks from manifest `aesthetic` / `score` / `quality` metadata, and sampled cache payloads feed
+those targets into the frozen quality scorer loss. Reports expose
+`flow_cache_has_quality_targets`, so cached real-image runs can combine reduced-precision latent
+shards, bounded shard loading, and quality-preserving flow training instead of falling back to
+per-step image decode.
+
+Image-94 decouples quality-scorer learning from AE training. `--quality-score-steps N` runs a
+standalone scorer pretrain phase after AE freezing and latent-cache construction, using cached
+latents plus cached quality targets when available, or live no-grad AE encodes otherwise. This lets
+external/frozen VAE runs use `--flow-quality-score-w` without also spending AE loss weight on
+`--image-quality-score-w`. Reports/checkpoints expose `quality_score_steps`,
+`quality_score_steps_run`, and `last_quality_score`; RunPod forwards the same control as
+`--image-quality-score-steps`.
+
+Image-95 adds generic quality preference ranking. `--image-quality-rank-w`,
+`--quality-score-rank-w`, and `--flow-quality-rank-w` build same-batch preference pairs from
+normalized manifest `aesthetic` / `score` / `quality` values, train the scorer to rank better rows
+above worse rows, and preserve that ordering on predicted flow endpoints. The loss is pairwise and
+schema-free: it consumes only score ordering, not caption grammar, hand-written visual rules, or
+dataset-specific labels. RunPod exposes the same controls as `--image-quality-rank-w`,
+`--image-quality-score-rank-w`, `--image-flow-quality-rank-w`, and
+`--image-quality-rank-margin`.
+
+Image-96 makes prompt-grid best-of-N selection quality-aware. When
+`--sample-candidates-per-prompt K` is greater than one, selection now includes the checkpoint's
+learned quality scorer in addition to compatible text and external-feature aligners. Each scorer is
+normalized within a prompt's K candidates before averaging, so cosine aligners and scalar quality
+scores can contribute without hand-tuned scale constants. Reports expose the component count,
+selected candidate indices, and selected component scores.
+
+Image-97 applies the same best-of-K reranking to held-out manifest generation eval. Use
+`--eval-generated-candidates-per-prompt K` with `--eval-generated-samples N` to draw K candidates
+per caption, rerank with the checkpoint's generic learned text aligner, external feature aligner,
+and quality scorer when available, and keep one selected image per caption for metrics. Reports now
+separate selected sample count from `generated_eval_raw_candidates`, preserve selected candidate
+indices, include the composite selection score, and aggregate candidate K without mixing K=1 and
+K>1 rows. RunPod exposes the same control as
+`--image-eval-generated-candidates-per-prompt`.
+
+Image-98 replaces zero-only text CFG dropout with a learned null condition for token and
+precomputed-embedding conditioners. Text training still uses the same `--cond-drop` knob, but
+dropped rows now train a real unconditional payload (`null_vec` plus null condition tokens), and
+sampling uses that learned null branch whenever no negative prompt is supplied. Auxiliary
+semantic/text alignment losses use an explicit dropout mask, so the learned null vector can become
+nonzero without being mistaken for an active caption. Reports expose `conditioner_learned_null`
+and `cfg_uncond_default`, while old checkpoints without null parameters still load with the new
+null state initialized from defaults.
+
+Image-99 adds a CFG++-style sampler mode for latent rectified-flow generation. `--cfg-mode
+standard|cfgpp` keeps the existing guided velocity path by default, while `cfgpp` mixes the guided
+clean endpoint direction with the unconditional source direction as
+`(1 - t) * v_guided + t * v_uncond`. This is generic to any condition payload, including
+learned-null text CFG, negative
+prompts, and external caption embeddings. Checkpoint sweeps can compare modes with `--cfg-modes
+standard,cfgpp`; rows, aggregates, sample-grid metadata, checkpoint metadata, and RunPod
+(`--image-cfg-mode`, `--image-cfg-modes`) all record the selected mode.
+
+Image-100 adds no-extra-data self-REPA for latent rectified-flow training. `--flow-self-repa-w`
+aligns the flow transformer's noisy-step image-token states to the same sample's clean AE latent
+patches using paired cosine regression, so the signal is linear in token count and does not require
+manifest image embeddings, grammar rules, or extra labels. `--flow-self-repa-mode pooled|token|both|auto`
+uses pooled latent targets, patch-token targets, or both; `auto` selects both because latent patch
+tokens are always present. `--flow-self-repa-steps` can keep the pressure to early training, and
+`--flow-self-repa-embed-dim` controls the auxiliary projection width. Checkpoints save and reload the
+auxiliary aligner explicitly. RunPod exposes the same generic path as
+`--image-flow-self-repa-w`, `--image-flow-self-repa-steps`, `--image-flow-self-repa-embed-dim`, and
+`--image-flow-self-repa-mode`.
+
+Image-101 adds no-extra-component self-representation alignment for transformer latent flows.
+`--flow-sra-w` runs a detached teacher pass at a cleaner timestep on the same rectified-flow path
+and aligns the noisy-step hidden image tokens toward that cleaner hidden representation. This is
+generic over synthetic factors, caption manifests, cached latents, and HF-VAE latents because it
+uses only the model's own hidden states and the sampled flow path, not image embeddings or
+renderer-specific labels. `--flow-sra-mode pooled|token|both|auto` controls pooled vs per-patch
+alignment, `--flow-sra-time-gap` controls how far the teacher step moves toward clean data, and
+`--flow-sra-steps` can restrict the signal to early training. RunPod exposes the same path as
+`--image-flow-sra-w`, `--image-flow-sra-steps`, `--image-flow-sra-time-gap`, and
+`--image-flow-sra-mode`.
+
+Image-102 adds a reproducible web-data bootstrap for image generation. `thinking.image_fetch`
+streams captioned WebDataset tar shards into local image files plus the existing JSONL manifest
+format, stopping at `--max-records` so smoke runs do not accidentally pull a full corpus. The
+scale source is `text-to-image-2m-512-2m`, discovered from the Hugging Face dataset tree at fetch
+time; `text-to-image-2m-1024-10k` remains available for high-resolution smoke fetches. RunPod can
+run the fetch as part of one command with `--image-fetch`, `--image-fetch-source`,
+`--image-fetch-max-records`, `--image-fetch-dir`, and `--image-fetch-manifest`; downstream
+embedding, manifest QA, latent caching, and flow training then consume that fetched manifest
+instead of a hand-prepared local dataset.
+
+Image-103 adds a RunPod quality preset for the real-image path. `runpod/launch_thinking.py
+--image-quality-preset web-hf-vae` expands to a full web-data training profile: fetch from the
+512px text-to-image 2M shard set, compute HF text/image embeddings with SigLIP plus token-level T5
+text sequences, clean the manifest, train the flow in a frozen SDXL VAE latent space, use MM-DiT
+with rope2d/SwiGLU/QK norm/linear attention, cache bf16 latents, enable self-REPA and SRA, and
+write prompt grids. The preset intentionally leaves quality-score/ranking losses off because the
+built-in web shards have captions but no aesthetic score metadata.
+
+Image-104 makes web-data QA dependency-free and score-aware. `thinking.image_data` now reads
+JPEG/PNG/WebP/BMP dimensions from headers before falling back to Pillow, so local and pod-side
+manifest cleaning can enforce `--min-side` / `--max-aspect` without optional image libraries.
+`thinking.image_fetch` writes width/height from source metadata or image headers, and both fetch
+and QA preserve generic `aesthetic`, `nsfw`, and `watermark` scores when datasets provide them.
+`--max-nsfw` and `--max-watermark` filter numeric metadata thresholds without caption grammar or
+dataset-specific visual labels; RunPod forwards the same controls as `--image-clean-max-nsfw` and
+`--image-clean-max-watermark`, and the `web-hf-vae` preset applies conservative defaults.
+
+Image-105 adds generic image-text alignment filtering for real-image data. After
+`thinking.image_embed` writes pooled text and image embeddings, `thinking.image_data
+--min-image-text-cosine T` rejects rows whose paired embedding cosine is too low and reports score
+distribution, missing/mismatch counts, and sampled reject examples. The filter also works with
+manifests that already carry pooled embeddings or sequence embeddings that can be mean-pooled. This
+implements a CLIP/DataComp-style data quality gate without prompt grammar, hand-written visual
+classes, or source-specific captions; RunPod exposes it as
+`--image-clean-min-image-text-cosine`, and the `web-hf-vae` preset starts with a conservative
+`0.15` threshold.
+
+Image-106 upgrades external text conditioning for real-image MM-DiT runs. `thinking.image_embed
+--text-embed-mode both` now writes both pooled `text_embedding` rows for alignment filtering and
+token-level `text_embedding_sequence` rows for the generator. `caption_cond_source=auto` then
+chooses embedding conditioning and feeds token sequences to CrossDiT/MM-DiT while preserving pooled
+text features for image-text cosine filtering and prompt-grid guidance. Prompt grids now request
+token-aware live prompt embeddings when the checkpoint flow consumes condition tokens, so sampling
+matches the training conditioning path. RunPod's `web-hf-vae` preset uses this combined mode by
+default.
+
+Image-107 adds a second real web-data ingestion path for image training. `thinking.image_fetch
+--source diffusiondb-2m` downloads DiffusionDB zip parts into the same generic image/caption JSONL
+manifest as the WebDataset path, using each part's JSON metadata for prompts and optionally merging
+`metadata.parquet` via `--diffusiondb-metadata` when `pyarrow` is available. The emitted rows still
+use only generic fields (`caption`, `width`, `height`, `nsfw`, `watermark`, `aesthetic`), so the
+downstream cleaner and model keep the no-hardcoded-rules contract. RunPod exposes the path through
+`--image-fetch-source diffusiondb-2m`, `--image-fetch-diffusiondb-start-part`,
+`--image-fetch-diffusiondb-end-part`, and `--image-fetch-diffusiondb-metadata`.
+
+Image-108 adds hybrid text-encoder preprocessing for real-image generation. `thinking.image_embed
+--text-sequence-model MODEL` keeps the primary HF vision-language encoder responsible for
+`image_embedding` and pooled `text_embedding` rows, while a separate HF text encoder writes the
+token-level `text_embedding_sequence` used by CrossDiT/MM-DiT conditioning. This mirrors the
+multi-encoder shape used by modern text-to-image systems without tying the code to a prompt grammar
+or a single provider; pooled VLM dimensions and token text-encoder dimensions may differ, and
+training uses the token-sequence width for conditioning while preserving pooled rows for
+alignment/filtering. Prompt grids expose matching
+`--prompt-embed-text-sequence-model` / RunPod
+`--image-prompt-embed-text-sequence-model` controls so live prompts use the same token width as
+training; the `web-hf-vae` preset defaults this path to `google-t5/t5-base` and keeps SigLIP for
+pooled alignment/filtering.
+
+Image-109 adds generic semantic near-duplicate filtering for image manifests. After embedding
+merge, `thinking.image_data --max-image-duplicate-cosine T` uses deterministic random-hyperplane
+LSH over normalized image embeddings, then performs exact cosine checks only within candidate
+buckets. This keeps the curation pass roughly linear for large manifests while removing repeated or
+near-repeated visual rows; when generic `aesthetic`/`quality` metadata is present, the filter keeps
+the higher-quality duplicate rather than simply the first row. Reports expose LSH settings,
+comparison counts, bucket/candidate stats, missing-embedding diagnostics, and duplicate examples.
+RunPod forwards the same controls as `--image-clean-max-image-duplicate-cosine`,
+`--image-clean-dedupe-lsh-*`, and `--image-clean-dedupe-keep-first`; `web-hf-vae` enables a
+conservative `0.985` duplicate cosine threshold by default.
+
+Image-110 adds optional recaptioning as a generic data-plane stage. `thinking.image_caption` reads
+the same image manifest format, generates `generated_caption` rows with either a dependency-free
+stats backend or a Hugging Face image-captioning model, preserves `original_caption`, and writes a
+new manifest via `--mode replace|append|fill-empty|sidecar`. This targets the DALL-E 3/PixArt-style
+lesson that prompt following improves when image/text pairs carry dense, image-grounded captions,
+without adding caption grammar or visual-label rules to the generator. RunPod exposes it as
+`--image-caption` between fetch/upload and embedding, so downstream SigLIP/T5 embeddings,
+alignment filtering, semantic deduplication, latent caching, and flow training all consume the
+caption-improved manifest.
+
+Image-111 adds checkpoint-independent image-generation evaluation. `thinking.image_eval` compares
+any real/generated manifest pair that carries generic `image_embedding` and optional
+`text_embedding` fields, then reports Fréchet-style embedding distance, RBF-MMD, diversity ratio,
+nearest-neighbor support precision/recall, and CLIPScore-style image/text retrieval. This gives
+the web-data and generated-sample loop an offline quality gate before expensive training or GPU
+sweeps, and it is encoder-agnostic: SigLIP, CLIP, DINO, or future multimodal embedding sidecars
+use the same manifest contract.
+
+Image-112 closes that eval loop for actual model samples. `thinking.image_latent
+--sample-manifest-out generated.jsonl` now writes each generated grid sample as an individual PPM
+plus a captioned manifest row with the conditioning prompt/caption, sampler settings, and
+best-of-N selection metadata. The manifest can be fed directly to `thinking.image_embed` and then
+`thinking.image_eval`, so GPU prompt grids and checkpoint sweeps produce metric-ready artifacts
+instead of only a visual contact sheet. RunPod exposes the same path as
+`--image-sample-manifest-out` / `--image-sample-image-dir`. `--image-eval-generated` then embeds
+that generated manifest and runs `thinking.image_eval` against the cleaned/effective reference
+manifest, writing `*_embeddings.jsonl`, `*_embed_report.json`, and `*_eval_report.json` by
+default. `thinking.image_eval` now reports a composite `image_eval_score` over distribution
+distance, support precision/recall, diversity parity, and image-text alignment; optional
+`--min-score`, `--min-support-*`, `--min-image-text-cos`, `--max-frechet`, and `--max-mmd-rbf`
+thresholds produce `image_eval_gate_*` fields, and `--fail-on-gate` turns them into a hard CI/GPU
+gate. The `web-hf-vae` preset enables this loop automatically, so each GPU quality run returns
+both image artifacts and comparable generated-vs-reference metrics.
+
+Image-113 adds a generic quality/preference scoring data stage. `thinking.image_score` reads a
+captioned manifest, writes a scored manifest with `quality_score`/`aesthetic` metadata, and can
+also emit a score-only sidecar. The dependency-free `stats` backend is for local smoke tests and
+technical image-health filtering; the `external` and `ensemble` paths merge arbitrary JSONL/CSV/TSV
+scores from preference/reward models without hardcoding ImageReward, PickScore, HPS, or future
+reward APIs into model training. RunPod exposes this as `--image-score`, and `web-hf-vae` now
+enables it before embedding/cleaning with modest quality sampling, quality-head, ranking, and
+quality-guidance weights, so the existing generic training hooks can use preference metadata when
+it is available.
+
+Image-114 adds the preference-pair artifact needed for DPO-style image tuning. `thinking.image_preferences`
+groups a scored manifest by generic prompt fields (`preference_group`, `prompt_id`, `prompt`, or
+`caption` by default), selects chosen/rejected image pairs by `quality_score` or any requested
+reward field, and writes JSONL rows with prompt, chosen image, rejected image, scores, and score
+gap. This is the bridge from generated best-of-N candidates or human/reward-model annotations to
+future preference optimization without coupling the repo to a specific reward model API.
+
 ## 3c. Multimodal bridge: image + audio into the same trace language
 
 `thinking.audio` transposes the Image-2 FER setup to sound: pitch × timbre × envelope are rendered
@@ -1763,6 +2158,41 @@ toward the discovered concept without dragging the full reader backward. This is
 concept transfer before decoding, not token prediction and not a hard-coded fact table. RunPod
 exposes the same path as `--multimodal-concept-transfer-w` and
 `--multimodal-concept-transfer-margin`.
+
+M-5 carries the text concept-geometry objective into multimodal fusion. `--concept-contrast-w`
+uses the shared schema head's projected concept states and clusters examples with the same
+data-supplied factor value while separating other values for that factor. Reports now include
+`concept_geometry` for full, text-only, and sensor-only modes with nearest-same accuracy and
+same-vs-different cosine margins. RunPod exposes the same controls as
+`--multimodal-concept-contrast-w` and `--multimodal-concept-contrast-temperature`.
+
+M-6 carries the newer text prototype objective into multimodal fusion. `--concept-prototype-w`
+classifies projected concept states against learned per-key value prototypes, while
+`--concept-prototype-spread-w` keeps those prototypes from collapsing inside each schema key. This
+keeps the reusable concept geometry anchored even when a batch has few same-value pairs for the
+contrastive loss. RunPod exposes the same controls as `--multimodal-concept-prototype-w`,
+`--multimodal-concept-prototype-spread-w`, and
+`--multimodal-concept-prototype-spread-margin`.
+
+M-7 carries the latest text concept-prefix and batch-geometry improvements into the multimodal
+decoder path. `--concept-prefix` prepends schema-key concept states computed by the generic
+`SchemaConceptHead` to the decoder prefix, so the trace decoder can consume reusable factors
+directly instead of relying only on auxiliary losses over hidden tokens. `--concept-centroid-w`
+aligns states to same-value centroids discovered inside the current batch, and
+`--concept-state-spread-w` keeps those projected states from collapsing. RunPod exposes this as
+`--multimodal-concept-prefix`, `--multimodal-concept-centroid-w`, and
+`--multimodal-concept-state-spread-w` with matching temperature, margin, variance, and covariance
+controls.
+
+M-8 carries the schema-free latent concept slots from `thinking.text` into the multimodal bridge.
+`--latent-concept-slots` adds trainable concept queries that read the fused image/audio/text prefix,
+and `--latent-concept-w` aligns those slots across full, sensor-only, and text-only views with
+VICReg-style invariance, variance, and covariance terms. This is deliberately grammar-free: the
+loss only sees paired views of the same example, not factor names or value rules. The training loop
+now extracts latent slots from the existing `mode_bundle` prefixes, so the loss does not re-run the
+image/audio/text encoders. RunPod exposes the same controls as
+`--multimodal-latent-concept-slots`, `--multimodal-latent-concept-w`, and the matching
+`--multimodal-latent-concept-*-w` term weights.
 
 M-4 real local run (`runs/m0_multimodal_transfer_real.json`, 240 steps on MPS) gates both the
 decoder and upstream concept head with `--concept-transfer-w 0.1`: `gate=true`,

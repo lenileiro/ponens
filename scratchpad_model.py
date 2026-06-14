@@ -171,7 +171,7 @@ class CausalBlock(nn.Module):
         self.knorm = RMSNorm(self.hd)
         # learnable per-head logit scale: QK-norm caps the dot-product, blurring softmax so it cannot
         # single out one key among many (the MQAR 'right set, wrong binding' plateau). A trainable
-        # temperature lets attention SHARPEN past that cap. Init = the old fixed 1/sqrt(hd) (compat).
+        # temperature lets attention SHARPEN past that cap. Init matches fixed 1/sqrt(hd).
         self.logit_scale = nn.Parameter(torch.full((heads,), 1.0 / math.sqrt(self.hd)))
         self.proj = nn.Linear(d, d, bias=False)
         self.norm2 = RMSNorm(d)
