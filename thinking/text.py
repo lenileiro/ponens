@@ -1835,6 +1835,40 @@ def batch_reading_cluster_records(clusters, rng, batch):
     return records[:batch], cluster_ids[:batch]
 
 
+def mine_reading_sequence_pairs(records, split="train", n=0, seed=0):
+    """Pair adjacent reading chunks from the same source/order metadata."""
+    groups = {}
+    total = 0
+    for pos, rec in enumerate(records):
+        if rec.split != split:
+            continue
+        total += 1
+        meta = rec.meta if isinstance(rec.meta, dict) else {}
+        source = str(meta.get("source", meta.get("document", "__records__")))
+        raw_order = meta.get(
+            "chunk_index", meta.get("order", meta.get("position", pos)))
+        try:
+            order = float(raw_order)
+        except (TypeError, ValueError):
+            order = float(pos)
+        groups.setdefault(source, []).append((order, pos, rec))
+    pairs = []
+    for rows in groups.values():
+        rows = sorted(rows, key=lambda row: (row[0], row[1]))
+        pairs.extend((a[2], b[2]) for a, b in zip(rows, rows[1:]))
+    sampled = bool(n and n < len(pairs))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(pairs), size=int(n), replace=False)
+        pairs = [pairs[int(i)] for i in idx]
+    return pairs, {"n_records": int(total),
+                   "n_pairs": len(pairs),
+                   "n_sources": len(groups),
+                   "sampled": sampled,
+                   "split": split,
+                   "skipped": not bool(pairs)}
+
+
 def reading_latent_neighborhood_loss(model, pairs, vocab, device=DEV,
                                      token_drop_p=0.15, token_replace_p=0.05,
                                      feature_dropout=0.1, temperature=0.1,
@@ -1856,6 +1890,52 @@ def reading_latent_neighborhood_loss(model, pairs, vocab, device=DEV,
         positive_txt, feature_dropout=feature_dropout, project=True)
     return latent_concept_neighborhood_loss(
         anchor_slots, positive_slots, temperature=temperature, margin=margin)
+
+
+def reading_sequence_prediction_loss(model, pairs, vocab, device=DEV,
+                                     token_drop_p=0.15, token_replace_p=0.05,
+                                     feature_dropout=0.1, temperature=0.1):
+    if (getattr(model, "latent_concepts", None) is None
+            or not hasattr(model, "reading_predictor")
+            or not pairs or len(pairs) <= 1):
+        dev = next(model.parameters()).device
+        return torch.tensor(0.0, device=dev)
+    anchors = [a for a, _b in pairs]
+    positives = [b for _a, b in pairs]
+    anchor_txt = corrupt_reading_tokens(
+        pack_reading(anchors, vocab, device), vocab.pad, vocab.unk,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    positive_txt = corrupt_reading_tokens(
+        pack_reading(positives, vocab, device), vocab.pad, vocab.unk,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+    source_slots = model.latent_concept_states(
+        anchor_txt, feature_dropout=feature_dropout, project=False)
+    target_slots = model.latent_concept_states(
+        positive_txt, feature_dropout=0.0, project=False).detach()
+    predicted = model.reading_predictor(source_slots)
+    predicted = F.normalize(predicted.reshape(predicted.shape[0], -1), dim=-1)
+    target = F.normalize(target_slots.reshape(target_slots.shape[0], -1), dim=-1)
+    logits = predicted.matmul(target.t()) / max(float(temperature), 1e-6)
+    labels = torch.arange(logits.shape[0], device=logits.device)
+    return F.cross_entropy(logits, labels)
+
+
+@torch.no_grad()
+def update_reading_sequence_transitions(model, pairs, vocab, device=DEV,
+                                        feature_dropout=0.0, decay=0.99):
+    memory = getattr(model, "latent_concept_memory", None)
+    if (getattr(model, "latent_concepts", None) is None
+            or memory is None or not pairs):
+        return 0
+    anchors = [a for a, _b in pairs]
+    positives = [b for _a, b in pairs]
+    anchor_txt = pack_reading(anchors, vocab, device)
+    positive_txt = pack_reading(positives, vocab, device)
+    source_slots = model.latent_concept_states(
+        anchor_txt, feature_dropout=feature_dropout, project=True)
+    target_slots = model.latent_concept_states(
+        positive_txt, feature_dropout=0.0, project=True)
+    return int(memory.update_transitions(source_slots, target_slots, decay=decay))
 
 
 def reading_latent_transition_loss(model, pairs, vocab, device=DEV,
@@ -2006,6 +2086,65 @@ def reading_context_target_retrieval_eval(model, vocab, records, device=DEV, n=0
             "n_records": total,
             "sampled": bool(n > 0 and n < eval_count),
             "skipped": False}
+
+
+def reading_sequence_retrieval_eval(model, vocab, records, device=DEV, n=0,
+                                    seed=0, token_drop_p=0.15,
+                                    token_replace_p=0.05):
+    if (getattr(model, "latent_concepts", None) is None
+            or not hasattr(model, "reading_predictor")):
+        return {"sequence_acc": 0.0, "n_records": 0, "n_pairs": 0,
+                "sampled": False, "skipped": True}
+    pairs, mine_report = mine_reading_sequence_pairs(
+        records, split="eval", n=n, seed=seed)
+    if len(pairs) <= 1:
+        return {"sequence_acc": 0.0, "n_records": mine_report.get("n_records", 0),
+                "n_pairs": len(pairs), "sampled": mine_report.get("sampled", False),
+                "skipped": True, "mining": mine_report}
+    correct = total = 0
+    pos_sum = neg_sum = 0.0
+    neg_count = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(pairs), 64):
+            pair_batch = pairs[off:off + 64]
+            if len(pair_batch) <= 1:
+                continue
+            anchors = [a for a, _b in pair_batch]
+            positives = [b for _a, b in pair_batch]
+            anchor_txt = corrupt_reading_tokens(
+                pack_reading(anchors, vocab, device), vocab.pad, vocab.unk,
+                token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+            positive_txt = corrupt_reading_tokens(
+                pack_reading(positives, vocab, device), vocab.pad, vocab.unk,
+                token_drop_p=token_drop_p, token_replace_p=token_replace_p)
+            source_slots = model.latent_concept_states(anchor_txt, project=False)
+            target_slots = model.latent_concept_states(positive_txt, project=False)
+            predicted = model.reading_predictor(source_slots)
+            predicted = F.normalize(predicted.reshape(predicted.shape[0], -1), dim=-1)
+            target = F.normalize(target_slots.reshape(target_slots.shape[0], -1), dim=-1)
+            sim = predicted.matmul(target.t())
+            labels = torch.arange(sim.shape[0], device=sim.device)
+            nearest = sim.argmax(-1)
+            correct += int(nearest.eq(labels).sum())
+            total += int(sim.shape[0])
+            pos_sum += float(sim.diag().sum())
+            eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+            neg_sum += float(sim.masked_select(~eye).sum())
+            neg_count += int((~eye).sum())
+    if total == 0:
+        return {"sequence_acc": 0.0, "n_records": mine_report.get("n_records", 0),
+                "n_pairs": len(pairs), "sampled": mine_report.get("sampled", False),
+                "skipped": True, "mining": mine_report}
+    return {"sequence_acc": correct / max(1, total),
+            "positive_cosine": pos_sum / max(1, total),
+            "negative_cosine": neg_sum / max(1, neg_count),
+            "margin": (pos_sum / max(1, total)) - (neg_sum / max(1, neg_count)),
+            "n_records": mine_report.get("n_records", 0),
+            "n_pairs": len(pairs),
+            "sampled": mine_report.get("sampled", False),
+            "skipped": False,
+            "mining": mine_report}
 
 
 def reading_neighborhood_retrieval_eval(model, vocab, records, device=DEV, n=0,
@@ -2198,10 +2337,10 @@ def reading_fer_eval(model, vocab, records, device=DEV, n=0, seed=0,
 
 
 READING_SCORE_METRICS = (
-    "view", "context", "neighborhood", "cluster", "fer", "bridge",
+    "view", "context", "sequence", "neighborhood", "cluster", "fer", "bridge",
     "both", "min", "all", "balanced", "mastery")
 READING_DISCOVERY_SIGNALS = (
-    "view", "context", "neighborhood", "cluster", "fer", "bridge")
+    "view", "context", "sequence", "neighborhood", "cluster", "fer", "bridge")
 READING_STUDY_STRATEGIES = (
     "random", "errors", "curiosity", "graph", "cycle", "discovery", "auto")
 READING_MEMORY_STUDY_STRATEGIES = ("curiosity", "graph", "discovery")
@@ -2225,7 +2364,7 @@ def resolve_reading_study_strategy(study_strategy, model):
 def reading_discovery_score_components(view_eval, context_eval, metric="both",
                                        margin_w=0.1, neighborhood_eval=None,
                                        cluster_eval=None, fer_eval=None,
-                                       bridge_eval=None):
+                                       bridge_eval=None, sequence_eval=None):
     metric = str(metric)
     if metric not in READING_SCORE_METRICS:
         raise ValueError(f"unknown reading score metric {metric!r}")
@@ -2234,6 +2373,9 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     view_margin = float(view_eval.get("margin", 0.0))
     context_acc = float(context_eval.get("context_target_acc", 0.0))
     context_margin = float(context_eval.get("margin", 0.0))
+    sequence_eval = sequence_eval or {}
+    sequence_acc = float(sequence_eval.get("sequence_acc", 0.0))
+    sequence_margin = float(sequence_eval.get("margin", 0.0))
     neighborhood_eval = neighborhood_eval or {}
     neighborhood_acc = float(neighborhood_eval.get("neighbor_acc", 0.0))
     neighborhood_margin = float(neighborhood_eval.get("margin", 0.0))
@@ -2253,13 +2395,16 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
                     else 0.5 * (bridge_resolution + bridge_connectivity))
     view_score = view_acc + margin_w * view_margin
     context_score = context_acc + margin_w * context_margin
+    sequence_score = sequence_acc + margin_w * sequence_margin
     neighborhood_score = neighborhood_acc + margin_w * neighborhood_margin
     cluster_score = cluster_acc + margin_w * cluster_margin
     scores = {"view": view_score, "context": context_score,
+              "sequence": sequence_score,
               "neighborhood": neighborhood_score, "cluster": cluster_score,
               "fer": fer_score, "bridge": bridge_score}
     skipped = {"view": bool(view_eval.get("skipped", False)),
                "context": bool(context_eval.get("skipped", False)),
+               "sequence": bool(sequence_eval.get("skipped", False)),
                "neighborhood": bool(neighborhood_eval.get("skipped", False)),
                "cluster": bool(cluster_eval.get("skipped", False)),
                "fer": bool(fer_eval.get("skipped", False)),
@@ -2280,6 +2425,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
         score = view_score
     elif metric == "context":
         score = context_score
+    elif metric == "sequence":
+        score = sequence_score
     elif metric == "neighborhood":
         score = neighborhood_score
     elif metric == "cluster":
@@ -2325,12 +2472,16 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "paired_view_margin": view_margin,
             "context_target_acc": context_acc,
             "context_target_margin": context_margin,
+            "sequence_score": float(sequence_score),
+            "sequence_acc": sequence_acc,
+            "sequence_margin": sequence_margin,
             "neighborhood_acc": neighborhood_acc,
             "neighborhood_margin": neighborhood_margin,
             "cluster_acc": cluster_acc,
             "cluster_margin": cluster_margin,
             "view_skipped": skipped["view"],
             "context_skipped": skipped["context"],
+            "sequence_skipped": skipped["sequence"],
             "neighborhood_skipped": skipped["neighborhood"],
             "cluster_skipped": skipped["cluster"],
             "fer_skipped": skipped["fer"],
@@ -2347,6 +2498,9 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
     context = reading_context_target_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 23,
         context_keep_p=context_keep_p)
+    sequence = reading_sequence_retrieval_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 25,
+        token_drop_p=token_drop_p, token_replace_p=token_replace_p)
     neighborhood = reading_neighborhood_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 29,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p)
@@ -2361,6 +2515,7 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
         feature_dropout=0.0)
     return {"view": view,
             "context_target": context,
+            "sequence": sequence,
             "neighborhood": neighborhood,
             "cluster": cluster,
             "fer": fer,
@@ -2368,7 +2523,7 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
             "score_components": reading_discovery_score_components(
                 view, context, metric=score_metric, margin_w=score_margin_w,
                 neighborhood_eval=neighborhood, cluster_eval=cluster,
-                fer_eval=fer, bridge_eval=bridge)}
+                fer_eval=fer, bridge_eval=bridge, sequence_eval=sequence)}
 
 
 def reading_latent_bridge_graph_state(model):
@@ -3108,6 +3263,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          bridge_w=0.0,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
+                         sequence_w=0.05, sequence_batch=0,
+                         sequence_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
                          neighborhood_probe_n=0, neighborhood_refresh_steps=0,
                          neighborhood_temperature=0.1,
@@ -3208,6 +3365,12 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading graph cycle consistency weight must be non-negative")
     if float(bridge_w) < 0.0:
         raise ValueError("reading bridge weight must be non-negative")
+    if float(sequence_w) < 0.0:
+        raise ValueError("reading sequence loss weight must be non-negative")
+    if int(sequence_batch) < 0 or int(sequence_batch) == 1:
+        raise ValueError("reading sequence batch must be 0 or at least 2")
+    if float(sequence_temperature) <= 0.0:
+        raise ValueError("reading sequence temperature must be positive")
     if float(neighborhood_w) < 0.0:
         raise ValueError("reading neighborhood loss weight must be non-negative")
     if int(neighborhood_batch) < 0:
@@ -3285,8 +3448,11 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading replay batch must be non-negative")
     replay_batch = replay_batch or max(1, batch // 2)
     neighborhood_batch = int(neighborhood_batch) or max(1, batch // 2)
+    sequence_batch = int(sequence_batch) or max(2, batch // 2)
     transition_batch = int(transition_batch) or max(1, batch // 2)
     cluster_batch = int(cluster_batch) or max(2, batch)
+    sequence_pairs, sequence_report = mine_reading_sequence_pairs(
+        records, split="train")
     neighborhood_pairs = []
     neighborhood_reports = []
     clusters = []
@@ -3311,6 +3477,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_graph_cycle = 0.0
     last_bridge = 0.0
     last_context_target = 0.0
+    last_sequence = 0.0
+    last_sequence_transition_updates = 0
     last_neighborhood = 0.0
     last_transition = 0.0
     last_cluster = 0.0
@@ -3552,6 +3720,16 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 feature_dropout=feature_dropout,
                 temperature=context_target_temperature)
             if context_target_w else view_loss * 0.0)
+        sequence_loss = view_loss * 0.0
+        if sequence_w and sequence_pairs:
+            sequence_pair_batch = batch_reading_neighbor_pairs(
+                sequence_pairs, rng, sequence_batch)
+            sequence_loss = reading_sequence_prediction_loss(
+                model, sequence_pair_batch, vocab, device=device,
+                token_drop_p=token_drop_p,
+                token_replace_p=token_replace_p,
+                feature_dropout=feature_dropout,
+                temperature=sequence_temperature)
         neighborhood_loss = view_loss * 0.0
         if neighborhood_w and neighborhood_pairs:
             pair_batch = batch_reading_neighbor_pairs(
@@ -3602,6 +3780,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 + float(graph_cycle_w) * graph_cycle_loss
                 + float(bridge_w) * bridge_loss
                 + float(context_target_w) * context_target
+                + float(sequence_w) * sequence_loss
                 + float(neighborhood_w) * neighborhood_loss
                 + float(transition_w) * transition_loss
                 + float(cluster_w) * cluster_loss
@@ -3623,6 +3802,15 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
             last_transition_updates = int(update_reading_latent_transitions(
                 model, txt, vocab.pad, context_keep_p=context_keep_p,
                 feature_dropout=0.0, decay=association_decay))
+        last_sequence_transition_updates = 0
+        if sequence_pairs and (sequence_w or graph_predict_w
+                               or graph_cycle_w or bridge_w):
+            sequence_pair_batch = batch_reading_neighbor_pairs(
+                sequence_pairs, rng, sequence_batch)
+            last_sequence_transition_updates = int(
+                update_reading_sequence_transitions(
+                    model, sequence_pair_batch, vocab, device=device,
+                    feature_dropout=0.0, decay=association_decay))
         last_loss = float(loss.detach())
         last_view_loss = float(view_loss.detach())
         last_factorization = float(factorization_loss.detach())
@@ -3638,6 +3826,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_graph_cycle = float(graph_cycle_loss.detach())
         last_bridge = float(bridge_loss.detach())
         last_context_target = float(context_target.detach())
+        last_sequence = float(sequence_loss.detach())
         last_neighborhood = float(neighborhood_loss.detach())
         last_transition = float(transition_loss.detach())
         last_cluster = float(cluster_loss.detach())
@@ -3654,6 +3843,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                   f"graph-cycle {last_graph_cycle:.3f} "
                   f"bridge {last_bridge:.3f} "
                   f"context-target {last_context_target:.3f} "
+                  f"sequence {last_sequence:.3f} "
                   f"neighborhood {last_neighborhood:.3f} "
                   f"transition {last_transition:.3f} "
                   f"cluster {last_cluster:.3f} "
@@ -3785,6 +3975,14 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "bridge_loss": last_bridge,
         "bridge_w": float(bridge_w),
         "context_target_loss": last_context_target,
+        "sequence_loss": last_sequence,
+        "sequence_w": float(sequence_w),
+        "sequence_batch": int(sequence_batch),
+        "sequence_temperature": float(sequence_temperature),
+        "sequence_pairs": len(sequence_pairs),
+        "sequence_report": sequence_report,
+        "sequence_transition_last_batch_updates": int(
+            last_sequence_transition_updates),
         "neighborhood_loss": last_neighborhood,
         "transition_loss": last_transition,
         "transition_w": float(transition_w),
@@ -3874,6 +4072,7 @@ def fit_reading_concepts_select_best(
         bridge_w=0.0,
         context_target_w=0.1, context_keep_p=0.5,
         context_target_temperature=0.1,
+        sequence_w=0.05, sequence_batch=0, sequence_temperature=0.1,
         neighborhood_w=0.0, neighborhood_batch=0,
         neighborhood_probe_n=0, neighborhood_refresh_steps=0,
         neighborhood_temperature=0.1, neighborhood_margin=0.0,
@@ -4020,6 +4219,9 @@ def fit_reading_concepts_select_best(
             context_target_w=context_target_w,
             context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            sequence_w=sequence_w,
+            sequence_batch=sequence_batch,
+            sequence_temperature=sequence_temperature,
             neighborhood_w=neighborhood_w,
             neighborhood_batch=neighborhood_batch,
             neighborhood_probe_n=neighborhood_probe_n,
@@ -4178,6 +4380,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            bridge_w=0.0,
                            context_target_w=0.1, context_keep_p=0.5,
                            context_target_temperature=0.1,
+                           sequence_w=0.05, sequence_batch=0,
+                           sequence_temperature=0.1,
                            neighborhood_w=0.0, neighborhood_batch=0,
                            neighborhood_probe_n=0, neighborhood_refresh_steps=0,
                            neighborhood_temperature=0.1,
@@ -4253,6 +4457,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         bridge_w=bridge_w,
         context_target_w=context_target_w, context_keep_p=context_keep_p,
         context_target_temperature=context_target_temperature,
+        sequence_w=sequence_w, sequence_batch=sequence_batch,
+        sequence_temperature=sequence_temperature,
         neighborhood_w=neighborhood_w,
         neighborhood_batch=neighborhood_batch,
         neighborhood_probe_n=neighborhood_probe_n,
@@ -4316,6 +4522,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          bridge_w=0.0,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
+                         sequence_w=0.05, sequence_batch=0,
+                         sequence_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
                          neighborhood_probe_n=0, neighborhood_refresh_steps=0,
                          neighborhood_temperature=0.1,
@@ -4404,6 +4612,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             bridge_w=bridge_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            sequence_w=sequence_w, sequence_batch=sequence_batch,
+            sequence_temperature=sequence_temperature,
             neighborhood_w=neighborhood_w,
             neighborhood_batch=neighborhood_batch,
             neighborhood_probe_n=neighborhood_probe_n,
@@ -4479,6 +4689,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             bridge_w=bridge_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            sequence_w=sequence_w, sequence_batch=sequence_batch,
+            sequence_temperature=sequence_temperature,
             neighborhood_w=neighborhood_w,
             neighborhood_batch=neighborhood_batch,
             neighborhood_probe_n=neighborhood_probe_n,
@@ -4508,6 +4720,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
     after = after_bundle["view"]
     before_context = before_bundle["context_target"]
     after_context = after_bundle["context_target"]
+    before_sequence = before_bundle["sequence"]
+    after_sequence = after_bundle["sequence"]
     before_neighborhood = before_bundle["neighborhood"]
     after_neighborhood = after_bundle["neighborhood"]
     before_cluster = before_bundle["cluster"]
@@ -4581,6 +4795,9 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
+              "sequence_w": float(sequence_w),
+              "sequence_batch": int(sequence_batch),
+              "sequence_temperature": float(sequence_temperature),
               "neighborhood_w": float(neighborhood_w),
               "neighborhood_batch": int(neighborhood_batch),
               "neighborhood_probe_n": int(neighborhood_probe_n),
@@ -4616,6 +4833,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "after": after,
               "before_context_target": before_context,
               "after_context_target": after_context,
+              "before_sequence": before_sequence,
+              "after_sequence": after_sequence,
               "before_neighborhood": before_neighborhood,
               "after_neighborhood": after_neighborhood,
               "before_cluster": before_cluster,
@@ -4652,6 +4871,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                   "context_target_margin": (
                       after_context.get("margin", 0.0)
                       - before_context.get("margin", 0.0)),
+                  "sequence_acc": (
+                      after_sequence.get("sequence_acc", 0.0)
+                      - before_sequence.get("sequence_acc", 0.0)),
+                  "sequence_margin": (
+                      after_sequence.get("margin", 0.0)
+                      - before_sequence.get("margin", 0.0)),
                   "neighborhood_acc": (
                       after_neighborhood.get("neighbor_acc", 0.0)
                       - before_neighborhood.get("neighbor_acc", 0.0)),
@@ -4792,6 +5017,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              bridge_w=0.0,
                              context_target_w=0.1, context_keep_p=0.5,
                              context_target_temperature=0.1,
+                             sequence_w=0.05, sequence_batch=0,
+                             sequence_temperature=0.1,
                              neighborhood_w=0.0, neighborhood_batch=0,
                              neighborhood_probe_n=0, neighborhood_refresh_steps=0,
                              neighborhood_temperature=0.1,
@@ -4901,6 +5128,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             bridge_w=bridge_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            sequence_w=sequence_w, sequence_batch=sequence_batch,
+            sequence_temperature=sequence_temperature,
             neighborhood_w=neighborhood_w,
             neighborhood_batch=neighborhood_batch,
             neighborhood_probe_n=neighborhood_probe_n,
@@ -4980,6 +5209,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             bridge_w=bridge_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
+            sequence_w=sequence_w, sequence_batch=sequence_batch,
+            sequence_temperature=sequence_temperature,
             neighborhood_w=neighborhood_w,
             neighborhood_batch=neighborhood_batch,
             neighborhood_probe_n=neighborhood_probe_n,
@@ -5019,6 +5250,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
     after = after_bundle["view"]
     before_context = before_bundle["context_target"]
     after_context = after_bundle["context_target"]
+    before_sequence = before_bundle["sequence"]
+    after_sequence = after_bundle["sequence"]
     before_neighborhood = before_bundle["neighborhood"]
     after_neighborhood = after_bundle["neighborhood"]
     before_cluster = before_bundle["cluster"]
@@ -5100,6 +5333,9 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
+              "sequence_w": float(sequence_w),
+              "sequence_batch": int(sequence_batch),
+              "sequence_temperature": float(sequence_temperature),
               "neighborhood_w": float(neighborhood_w),
               "neighborhood_batch": int(neighborhood_batch),
               "neighborhood_probe_n": int(neighborhood_probe_n),
@@ -5142,6 +5378,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "after": after,
               "before_context_target": before_context,
               "after_context_target": after_context,
+              "before_sequence": before_sequence,
+              "after_sequence": after_sequence,
               "before_neighborhood": before_neighborhood,
               "after_neighborhood": after_neighborhood,
               "before_cluster": before_cluster,
@@ -5180,6 +5418,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                   "context_target_margin": (
                       after_context.get("margin", 0.0)
                       - before_context.get("margin", 0.0)),
+                  "sequence_acc": (
+                      after_sequence.get("sequence_acc", 0.0)
+                      - before_sequence.get("sequence_acc", 0.0)),
+                  "sequence_margin": (
+                      after_sequence.get("margin", 0.0)
+                      - before_sequence.get("margin", 0.0)),
                   "neighborhood_acc": (
                       after_neighborhood.get("neighbor_acc", 0.0)
                       - before_neighborhood.get("neighbor_acc", 0.0)),
@@ -6617,13 +6861,23 @@ def selftest():
         "score_allowed"]
     reading_records = [
         ReadingRecord("read-train-1", "train",
-                      tuple(split_words("language concepts connect across repeated views"))),
+                      tuple(split_words("language concepts connect across repeated views")),
+                      meta={"source": "selftest-train", "chunk_index": 0}),
         ReadingRecord("read-train-2", "train",
-                      tuple(split_words("models can revise concepts from reading"))),
+                      tuple(split_words("models can revise concepts from reading")),
+                      meta={"source": "selftest-train", "chunk_index": 1}),
+        ReadingRecord("read-train-3", "train",
+                      tuple(split_words("later chunks predict the next idea")),
+                      meta={"source": "selftest-train", "chunk_index": 2}),
         ReadingRecord("read-eval-1", "eval",
-                      tuple(split_words("reading updates preserve concept identity"))),
+                      tuple(split_words("reading updates preserve concept identity")),
+                      meta={"source": "selftest-eval", "chunk_index": 0}),
         ReadingRecord("read-eval-2", "eval",
-                      tuple(split_words("self teaching compares two views of text"))),
+                      tuple(split_words("self teaching compares two views of text")),
+                      meta={"source": "selftest-eval", "chunk_index": 1}),
+        ReadingRecord("read-eval-3", "eval",
+                      tuple(split_words("sequence learning connects adjacent meaning")),
+                      meta={"source": "selftest-eval", "chunk_index": 2}),
     ]
     reading_vocab = build_reading_vocab(reading_records)
     reading_model = TextFactLM(
@@ -6660,6 +6914,15 @@ def selftest():
         decay=0.5)
     assert transition_updates > 0
     assert int(reading_model.latent_concept_memory.transition_updates.item()) > 0
+    seq_pairs, seq_report = mine_reading_sequence_pairs(
+        reading_records, split="train")
+    assert seq_report["n_pairs"] == 2 and seq_report["skipped"] is False
+    assert torch.isfinite(reading_sequence_prediction_loss(
+        reading_model, seq_pairs, reading_vocab, device="cpu",
+        token_drop_p=0.1, token_replace_p=0.0))
+    seq_updates = update_reading_sequence_transitions(
+        reading_model, seq_pairs, reading_vocab, device="cpu", decay=0.5)
+    assert seq_updates > 0
     assert torch.isfinite(reading_latent_memory_loss(
         reading_model, reading_txt, feature_dropout=0.1))
     assert torch.isfinite(reading_latent_association_loss(
@@ -6701,7 +6964,7 @@ def selftest():
     assert math.isfinite(bridge_eval["mean_bridge_score"])
     pairs, pair_report = mine_reading_latent_neighbors(
         reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0)
-    assert pair_report["n_pairs"] == 2 and pairs
+    assert pair_report["n_pairs"] == 3 and pairs
     clusters, cluster_report = mine_reading_latent_clusters(
         reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0)
     assert cluster_report["n_clusters"] >= 1 and clusters
@@ -6721,12 +6984,19 @@ def selftest():
     assert bridge_bundle["score_components"]["metric"] == "bridge"
     assert bridge_bundle["score_components"]["bridge_skipped"] is False
     assert math.isfinite(bridge_bundle["score_components"]["bridge_score"])
+    sequence_bundle = reading_eval_bundle(
+        reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
+        score_metric="sequence")
+    assert sequence_bundle["score_components"]["metric"] == "sequence"
+    assert sequence_bundle["score_components"]["sequence_skipped"] is False
+    assert math.isfinite(sequence_bundle["score_components"]["sequence_score"])
     mastery_bundle = reading_eval_bundle(
         reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
         score_metric="mastery")
     assert mastery_bundle["score_components"]["metric"] == "mastery"
     assert ("mastery_score" in mastery_bundle["score_components"]
             and "signal_coverage" in mastery_bundle["score_components"]
+            and "sequence_score" in mastery_bundle["score_components"]
             and "bridge_score" in mastery_bundle["score_components"])
     assert mastery_bundle["score_components"]["bridge_skipped"] is False
     assert (mastery_bundle["score_components"]["score"]
@@ -6738,6 +7008,7 @@ def selftest():
         study_hard_max=2, study_refresh_steps=1, context_target_w=0.1,
         context_keep_p=0.5, memory_size=8, composition_w=0.1, graph_predict_w=0.1,
         graph_cycle_w=0.1, bridge_w=0.1, fer_w=0.1,
+        sequence_w=0.1, sequence_batch=2, sequence_temperature=0.1,
         neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2,
         transition_w=0.1, transition_batch=2,
         cluster_w=0.1, cluster_batch=4, cluster_probe_n=4)
@@ -6748,6 +7019,11 @@ def selftest():
     assert reading_model.reading_train_metrics["graph_predict_w"] == 0.1
     assert reading_model.reading_train_metrics["graph_cycle_w"] == 0.1
     assert reading_model.reading_train_metrics["bridge_w"] == 0.1
+    assert reading_model.reading_train_metrics["sequence_w"] == 0.1
+    assert reading_model.reading_train_metrics["sequence_pairs"] == 2
+    assert math.isfinite(reading_model.reading_train_metrics["sequence_loss"])
+    assert (reading_model.reading_train_metrics[
+        "sequence_transition_last_batch_updates"] > 0)
     assert reading_model.reading_train_metrics["fer_w"] == 0.1
     assert math.isfinite(reading_model.reading_train_metrics["fer_score"])
     assert math.isfinite(reading_model.reading_train_metrics["graph_cycle_loss"])
@@ -6820,6 +7096,9 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-context-target-w", type=float, default=0.1)
     ap.add_argument("--reading-context-keep-p", type=float, default=0.5)
     ap.add_argument("--reading-context-target-temperature", type=float, default=0.1)
+    ap.add_argument("--reading-sequence-w", type=float, default=0.05)
+    ap.add_argument("--reading-sequence-batch", type=int, default=0)
+    ap.add_argument("--reading-sequence-temperature", type=float, default=0.1)
     ap.add_argument("--reading-factorization-w", type=float, default=0.05)
     ap.add_argument("--reading-factorization-variance", type=float, default=0.05)
     ap.add_argument("--reading-factorization-margin", type=float, default=0.2)
@@ -6940,6 +7219,9 @@ def _reading_kwargs(args):
                 context_target_w=args.reading_context_target_w,
                 context_keep_p=args.reading_context_keep_p,
                 context_target_temperature=args.reading_context_target_temperature,
+                sequence_w=args.reading_sequence_w,
+                sequence_batch=args.reading_sequence_batch,
+                sequence_temperature=args.reading_sequence_temperature,
                 neighborhood_w=args.reading_neighborhood_w,
                 neighborhood_batch=args.reading_neighborhood_batch,
                 neighborhood_probe_n=args.reading_neighborhood_probe_n,
