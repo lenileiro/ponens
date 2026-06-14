@@ -31,7 +31,6 @@ Example:
 import argparse
 import copy
 import csv
-import itertools
 import io
 import json
 import math
@@ -592,122 +591,6 @@ def import_hans(out, train_source=HANS_TRAIN_URL, eval_source=HANS_EVAL_URL,
     return report
 
 
-def _grounded_facts(gold, trace_tokens_fn):
-    return [list(fact) for fact in parse_facts(trace_tokens_fn(gold))]
-
-
-def _grounded_changed(base, edited, trace_tokens_fn):
-    before = {(slot, pred): val for slot, pred, val in parse_facts(trace_tokens_fn(base))}
-    after = {(slot, pred): val for slot, pred, val in parse_facts(trace_tokens_fn(edited))}
-    return [[slot, pred, val] for (slot, pred), val in after.items()
-            if before.get((slot, pred)) != val]
-
-
-def _grounded_combo_id(gold, factor_names):
-    return "-".join(gold[factor] for factor in factor_names)
-
-
-def _sample_grounded_gold(rng, factor_values):
-    return {factor: values[int(rng.integers(len(values)))]
-            for factor, values in factor_values.items()}
-
-
-def _all_grounded_combos(factor_values):
-    keys = tuple(factor_values)
-    for vals in itertools.product(*(factor_values[k] for k in keys)):
-        yield dict(zip(keys, vals))
-
-
-def _render_grounded_template(template, gold):
-    return split_words(template.format(**gold))
-
-
-def grounded_records(surfaces_path=None, max_train=6000, max_eval=1200,
-                     counterfactual_n=300, seed=0):
-    """Generate transcript -> sensory-fact records from the multimodal oracle world.
-
-    The transcript is the only model input for these records.  Image/audio factors define the
-    canonical target, but no English parser or word-level rule is encoded here.
-    """
-    from .multimodal import (FACTOR_VALUES, load_text_surfaces, mutate_factor,
-                             trace_tokens as multimodal_trace_tokens)
-
-    surfaces = load_text_surfaces(surfaces_path)
-    rng = np.random.default_rng(seed)
-    records = []
-    factor_names = tuple(FACTOR_VALUES)
-    train_templates = surfaces["train"]
-    eval_templates = surfaces["eval"]
-    if not train_templates or not eval_templates:
-        raise ValueError("grounded text import requires train and eval templates")
-
-    for i in range(max_train):
-        gold = _sample_grounded_gold(rng, FACTOR_VALUES)
-        tidx = int(rng.integers(len(train_templates)))
-        records.append({"split": "train", "id": f"grounded-train-{i}",
-                        "tokens": _render_grounded_template(train_templates[tidx], gold),
-                        "facts": _grounded_facts(gold, multimodal_trace_tokens),
-                        "kind": "grounded_multimodal_text",
-                        "group": f"grounded-train-{_grounded_combo_id(gold, factor_names)}",
-                        "meta": {"template_index": tidx,
-                                 "surface_path": surfaces_path or "default"}})
-
-    combos = list(_all_grounded_combos(FACTOR_VALUES))
-    order = rng.permutation(len(combos))
-    eval_count = 0
-    for raw_idx in order:
-        if eval_count >= max_eval:
-            break
-        gold = combos[int(raw_idx)]
-        group = f"grounded-eval-{_grounded_combo_id(gold, factor_names)}"
-        for tidx, template in enumerate(eval_templates):
-            if eval_count >= max_eval:
-                break
-            records.append({"split": "eval", "id": f"grounded-eval-{eval_count}",
-                            "tokens": _render_grounded_template(template, gold),
-                            "facts": _grounded_facts(gold, multimodal_trace_tokens),
-                            "kind": "grounded_multimodal_text",
-                            "group": group,
-                            "meta": {"template_index": tidx,
-                                     "surface_path": surfaces_path or "default"}})
-            eval_count += 1
-
-    for i in range(counterfactual_n):
-        base = _sample_grounded_gold(rng, FACTOR_VALUES)
-        factor = factor_names[i % len(factor_names)]
-        edited = mutate_factor(base, factor, rng)
-        tidx = int(rng.integers(len(eval_templates)))
-        records.append({"split": "eval", "id": f"grounded-counterfactual-{i}",
-                        "tokens": _render_grounded_template(eval_templates[tidx], edited),
-                        "facts": _grounded_facts(edited, multimodal_trace_tokens),
-                        "kind": "grounded_counterfactual",
-                        "base_id": f"grounded-base-{i}",
-                        "changed": _grounded_changed(base, edited, multimodal_trace_tokens),
-                        "group": f"grounded-cf-{i}",
-                        "meta": {"edited_factor": factor, "template_index": tidx,
-                                 "surface_path": surfaces_path or "default"}})
-    return records
-
-
-def import_grounded(out, surfaces_path=None, max_train=6000, max_eval=1200,
-                    counterfactual_n=300, seed=0):
-    records = grounded_records(surfaces_path=surfaces_path, max_train=max_train,
-                               max_eval=max_eval, counterfactual_n=counterfactual_n,
-                               seed=seed)
-    write_jsonl(records, out)
-    report = {"source": surfaces_path or "data/multimodal_transcripts.json",
-              "out": out, "records": len(records),
-              "train_records": sum(r["split"] == "train" for r in records),
-              "eval_records": sum(r["split"] == "eval" for r in records),
-              "counterfactual_records": sum(r["kind"] == "grounded_counterfactual"
-                                            for r in records),
-              "seed": int(seed),
-              "representation": "transcript-only multimodal descriptions -> canonical sensory facts",
-              "facts": sorted({tuple(f[:2]) for r in records for f in r["facts"]})}
-    print(json.dumps(report, indent=1), flush=True)
-    return report
-
-
 def trace_tokens(facts):
     toks = ["extract"]
     for slot, pred, val in facts:
@@ -1058,6 +941,14 @@ class TextFactLM(nn.Module):
             return 0
         return self.latent_concept_memory.update(
             slots, momentum=momentum, relation_decay=relation_decay)
+
+    @torch.no_grad()
+    def update_latent_concept_transitions(self, source_slots, target_slots,
+                                          decay=0.99):
+        if self.latent_concept_memory is None:
+            return 0
+        return self.latent_concept_memory.update_transitions(
+            source_slots, target_slots, decay=decay)
 
     def enable_latent_concept_refiner(self, heads=None, gate_init=-2.0):
         if self.latent_concepts is None:
@@ -1619,10 +1510,33 @@ def reading_context_graph_prediction_loss(
             transitive_w=transitive_w, target_power=target_power)
     return latent_concept_graph_prediction_loss(
         source_slots, target_slots, model.latent_concept_memory.active(),
-        model.latent_concept_memory.active_relations(),
+        model.latent_concept_memory.active_prediction_relations(),
         temperature=temperature, self_loop_w=self_loop_w,
         transitive_steps=transitive_steps, transitive_w=transitive_w,
         target_power=target_power)
+
+
+@torch.no_grad()
+def update_reading_latent_transitions(model, txt, pad, context_keep_p=0.5,
+                                      feature_dropout=0.0, decay=0.99):
+    if (getattr(model, "latent_concepts", None) is None
+            or getattr(model, "latent_concept_memory", None) is None):
+        return 0
+    was_training = model.training
+    model.eval()
+    context_txt, target_txt = split_reading_context_target(
+        txt, pad, context_keep_p=context_keep_p)
+    source_slots = model.latent_concept_states(
+        context_txt, feature_dropout=feature_dropout, project=True)
+    target_slots = model.latent_concept_states(
+        target_txt, feature_dropout=0.0, project=True)
+    if was_training:
+        model.train()
+    if hasattr(model, "update_latent_concept_transitions"):
+        return model.update_latent_concept_transitions(
+            source_slots, target_slots, decay=decay)
+    return model.latent_concept_memory.update_transitions(
+        source_slots, target_slots, decay=decay)
 
 
 def reading_teacher_latent_consistency_loss(model, teacher_model, records, vocab,
@@ -2373,7 +2287,7 @@ def reading_latent_graph_prediction_records(
             else:
                 scores, parts = latent_concept_graph_prediction_scores(
                     source_slots, heldout_slots, memory.active(),
-                    memory.active_relations(), temperature=temperature,
+                    memory.active_prediction_relations(), temperature=temperature,
                     self_loop_w=self_loop_w,
                     transitive_steps=transitive_steps,
                     transitive_w=transitive_w, target_power=target_power)
@@ -2788,6 +2702,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_factorization = 0.0
     last_memory = 0.0
     last_memory_updates = 0
+    last_transition_updates = 0
     last_association = 0.0
     last_composition = 0.0
     last_graph_predict = 0.0
@@ -2804,8 +2719,11 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         if memory is None:
             return False
         filled = int(getattr(memory, "filled", torch.zeros((), dtype=torch.long)).item())
-        updates = int(getattr(memory, "relation_updates", torch.zeros((), dtype=torch.long)).item())
-        return filled > 0 and updates > 0
+        relation_updates = int(
+            getattr(memory, "relation_updates", torch.zeros((), dtype=torch.long)).item())
+        transition_updates = int(
+            getattr(memory, "transition_updates", torch.zeros((), dtype=torch.long)).item())
+        return filled > 0 and (relation_updates > 0 or transition_updates > 0)
 
     def refresh_study_pool(step):
         nonlocal study_pool
@@ -3015,6 +2933,11 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
             relation_decay=(association_decay
                             if (association_w or composition_w or graph_predict_w)
                             else None)))
+        last_transition_updates = 0
+        if graph_predict_w or study_strategy == "graph":
+            last_transition_updates = int(update_reading_latent_transitions(
+                model, txt, vocab.pad, context_keep_p=context_keep_p,
+                feature_dropout=0.0, decay=association_decay))
         last_loss = float(loss.detach())
         last_view_loss = float(view_loss.detach())
         last_factorization = float(factorization_loss.detach())
@@ -3059,6 +2982,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
             getattr(getattr(model, "latent_concept_memory", None), "updates",
                     torch.zeros((), dtype=torch.long)).item()),
         "memory_last_batch_updates": int(last_memory_updates),
+        "graph_transition_last_batch_updates": int(last_transition_updates),
         "memory_temperature": float(memory_temperature),
         "memory_momentum": float(memory_momentum),
         "memory_balance_w": float(memory_balance_w),
@@ -3076,6 +3000,12 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "association_active_edges": int(
             getattr(getattr(model, "latent_concept_memory", None),
                     "relations", torch.zeros(0)).gt(0).sum().item()),
+        "graph_transition_updates": int(
+            getattr(getattr(model, "latent_concept_memory", None),
+                    "transition_updates", torch.zeros((), dtype=torch.long)).item()),
+        "graph_transition_active_edges": int(
+            getattr(getattr(model, "latent_concept_memory", None),
+                    "transitions", torch.zeros(0)).gt(0).sum().item()),
         "composition_loss": last_composition,
         "composition_w": float(composition_w),
         "composition_temperature": float(composition_temperature),
@@ -5652,6 +5582,11 @@ def selftest():
                                            relation_decay=0.5)
     assert updates > 0
     assert int(reading_model.latent_concept_memory.relation_updates.item()) > 0
+    transition_updates = update_reading_latent_transitions(
+        reading_model, reading_txt, reading_vocab.pad, context_keep_p=0.5,
+        decay=0.5)
+    assert transition_updates > 0
+    assert int(reading_model.latent_concept_memory.transition_updates.item()) > 0
     assert torch.isfinite(reading_latent_memory_loss(
         reading_model, reading_txt, feature_dropout=0.1))
     assert torch.isfinite(reading_latent_association_loss(
@@ -5684,6 +5619,7 @@ def selftest():
         cluster_w=0.1, cluster_batch=4, cluster_probe_n=4)
     assert reading_model.reading_train_metrics["memory_active"] > 0
     assert reading_model.reading_train_metrics["graph_predict_w"] == 0.1
+    assert reading_model.reading_train_metrics["graph_transition_updates"] > 0
     assert any(r.get("strategy") == "graph" for r in reading_model.reading_study_reports)
     scored = [r.get("mean_score", 0.0) for r in reading_model.reading_study_reports
               if r.get("strategy") == "graph" and not r.get("skipped")]
@@ -5853,7 +5789,6 @@ def main(argv=None):
     ap.add_argument("--import-snli", action="store_true")
     ap.add_argument("--import-mnli", action="store_true")
     ap.add_argument("--import-hans", action="store_true")
-    ap.add_argument("--import-grounded", action="store_true")
     ap.add_argument("--scan-url", default=SCAN_URL)
     ap.add_argument("--scan-max", type=int, default=2000)
     ap.add_argument("--scan-eval-frac", type=float, default=0.10)
@@ -5872,10 +5807,6 @@ def main(argv=None):
     ap.add_argument("--hans-train", type=int, default=5000)
     ap.add_argument("--hans-eval", type=int, default=3000)
     ap.add_argument("--hans-label-mode", choices=("snli", "binary"), default="snli")
-    ap.add_argument("--grounded-surfaces", default=None)
-    ap.add_argument("--grounded-train", type=int, default=6000)
-    ap.add_argument("--grounded-eval", type=int, default=1200)
-    ap.add_argument("--grounded-counterfactual", type=int, default=300)
     ap.add_argument("--data", action="append")
     _add_reading_args(ap)
     ap.add_argument("--steps", type=int, default=400)
@@ -5972,8 +5903,8 @@ def main(argv=None):
     if args.selftest:
         selftest()
         return
-    if ((args.import_scan or args.import_snli or args.import_mnli or args.import_hans
-         or args.import_grounded) and not args.out):
+    if ((args.import_scan or args.import_snli or args.import_mnli or args.import_hans)
+            and not args.out):
         ap.error("--out is required for import commands")
     if args.import_scan:
         import_scan(args.out, url=args.scan_url, max_records=args.scan_max,
@@ -5995,12 +5926,6 @@ def main(argv=None):
                     eval_source=args.hans_eval_file or args.hans_eval_url,
                     max_train=args.hans_train, max_eval=args.hans_eval,
                     seed=args.seed, label_mode=args.hans_label_mode)
-        return
-    if args.import_grounded:
-        import_grounded(args.out, surfaces_path=args.grounded_surfaces,
-                        max_train=args.grounded_train, max_eval=args.grounded_eval,
-                        counterfactual_n=args.grounded_counterfactual,
-                        seed=args.seed)
         return
     if args.reading_data:
         reading_common = _reading_kwargs(args)

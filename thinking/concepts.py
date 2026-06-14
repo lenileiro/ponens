@@ -129,6 +129,8 @@ class LatentConceptMemory(nn.Module):
         self.register_buffer("updates", torch.zeros((), dtype=torch.long))
         self.register_buffer("relations", torch.zeros(self.size, self.size))
         self.register_buffer("relation_updates", torch.zeros((), dtype=torch.long))
+        self.register_buffer("transitions", torch.zeros(self.size, self.size))
+        self.register_buffer("transition_updates", torch.zeros((), dtype=torch.long))
 
     def active(self):
         n = int(self.filled.item())
@@ -136,6 +138,19 @@ class LatentConceptMemory(nn.Module):
 
     def active_relations(self):
         n = int(self.filled.item())
+        return self.relations[:n, :n]
+
+    def active_transitions(self):
+        n = int(self.filled.item())
+        return self.transitions[:n, :n]
+
+    def active_prediction_relations(self):
+        n = int(self.filled.item())
+        if n <= 0:
+            return self.relations[:0, :0]
+        transitions = self.transitions[:n, :n]
+        if int(self.transition_updates.item()) > 0 and bool(transitions.gt(0.0).any()):
+            return transitions
         return self.relations[:n, :n]
 
     def forward(self, slots, temperature=0.1, balance_w=0.0):
@@ -163,7 +178,7 @@ class LatentConceptMemory(nn.Module):
                               self_loop_w=0.05, transitive_steps=2,
                               transitive_w=0.1, target_power=1.0):
         return latent_concept_graph_prediction_loss(
-            source_slots, target_slots, self.active(), self.active_relations(),
+            source_slots, target_slots, self.active(), self.active_prediction_relations(),
             temperature=temperature, self_loop_w=self_loop_w,
             transitive_steps=transitive_steps, transitive_w=transitive_w,
             target_power=target_power)
@@ -172,7 +187,7 @@ class LatentConceptMemory(nn.Module):
                                 self_loop_w=0.05, transitive_steps=2,
                                 transitive_w=0.1, target_power=1.0):
         return latent_concept_graph_prediction_scores(
-            source_slots, target_slots, self.active(), self.active_relations(),
+            source_slots, target_slots, self.active(), self.active_prediction_relations(),
             temperature=temperature, self_loop_w=self_loop_w,
             transitive_steps=transitive_steps, transitive_w=transitive_w,
             target_power=target_power)
@@ -252,6 +267,49 @@ class LatentConceptMemory(nn.Module):
         target.mul_(dec).add_(batch_rel.to(target), alpha=1.0 - dec)
         self.relation_updates.add_(1)
         return int(present.shape[0])
+
+    @torch.no_grad()
+    def update_transitions(self, source_slots, target_slots, decay=0.99):
+        if source_slots is None or target_slots is None:
+            return 0
+        if source_slots.ndim != 3 or target_slots.ndim != 3:
+            raise ValueError("latent concept transition update expects [batch, slots, dim]")
+        if source_slots.shape[0] != target_slots.shape[0]:
+            raise ValueError("latent concept transition update batch mismatch")
+        if source_slots.shape[-1] != self.d or target_slots.shape[-1] != self.d:
+            raise ValueError("latent concept transition update dimension mismatch")
+        filled = int(self.filled.item())
+        if filled <= 0:
+            return 0
+        dec = float(decay)
+        if dec < 0.0 or dec >= 1.0:
+            raise ValueError("latent concept transition decay must be in [0, 1)")
+        source = F.normalize(source_slots.detach(), dim=-1)
+        target = F.normalize(target_slots.detach(), dim=-1)
+        source_valid = torch.isfinite(source).all(-1)
+        target_valid = torch.isfinite(target).all(-1)
+        if not bool(source_valid.any()) or not bool(target_valid.any()):
+            return 0
+        active = F.normalize(self.memory[:filled], dim=-1)
+        source_nearest = source.to(active).matmul(active.t()).argmax(-1)
+        target_nearest = target.to(active).matmul(active.t()).argmax(-1)
+        source_hot = F.one_hot(source_nearest, num_classes=filled).to(dtype=active.dtype)
+        target_hot = F.one_hot(target_nearest, num_classes=filled).to(dtype=active.dtype)
+        source_hot = source_hot * source_valid.to(dtype=active.dtype).unsqueeze(-1)
+        target_hot = target_hot * target_valid.to(dtype=active.dtype).unsqueeze(-1)
+        source_present = source_hot.sum(1).gt(0).to(dtype=active.dtype)
+        target_present = target_hot.sum(1).gt(0).to(dtype=active.dtype)
+        usable = source_present.sum(-1).gt(0) & target_present.sum(-1).gt(0)
+        if not bool(usable.any()):
+            return 0
+        edge = source_present[usable, :, None] * target_present[usable, None, :]
+        batch_transitions = edge.mean(0)
+        if float(batch_transitions.sum()) <= 0.0:
+            return 0
+        target_buffer = self.transitions[:filled, :filled]
+        target_buffer.mul_(dec).add_(batch_transitions.to(target_buffer), alpha=1.0 - dec)
+        self.transition_updates.add_(1)
+        return int(usable.sum().item())
 
 
 def latent_concept_memory_loss(slots, memory, temperature=0.1, balance_w=0.0):
