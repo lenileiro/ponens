@@ -6335,7 +6335,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              latent_concept_slots=0, latent_concept_layers=None,
                              latent_concept_prefix=None,
                              latent_concept_refine=None,
-                             latent_concept_refine_gate_init=None):
+                             latent_concept_refine_gate_init=None,
+                             print_report=True):
     records = load_reading_records(
         data, text_field=text_field, max_tokens=max_tokens, min_tokens=min_tokens,
         eval_frac=eval_frac, seed=seed)
@@ -6836,7 +6837,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         with open(out, "w") as f:
             json.dump(report, f, indent=1)
-    print(json.dumps(report, indent=1), flush=True)
+    if print_report:
+        print(json.dumps(report, indent=1), flush=True)
     return report
 
 
@@ -8559,6 +8561,53 @@ def selftest():
                                          {"experiment": "reading-selftest"})
     assert reading_payload["fact_schema"] is None
     assert reading_payload["latent_concept_memory_size"] == 8
+    with tempfile.TemporaryDirectory() as td:
+        base_ckpt = os.path.join(td, "reading_base.pt")
+        studied_ckpt = os.path.join(td, "reading_studied.pt")
+        study_data = os.path.join(td, "study_reading.jsonl")
+        study_out = os.path.join(td, "study_report.json")
+        torch.save(reading_payload, base_ckpt)
+        study_rows = [
+            {"id": "study-new-1", "split": "train",
+             "text": "novel abstractions crystallize through rereading"},
+            {"id": "study-new-2", "split": "train",
+             "text": "concept memory links unfamiliar symbols together"},
+            {"id": "study-new-3", "split": "eval",
+             "text": "rereading updates a connected concept graph"},
+        ]
+        with open(study_data, "w") as f:
+            for row in study_rows:
+                f.write(json.dumps(row) + "\n")
+        study_report = study_reading_checkpoint(
+            base_ckpt, [study_data], out_checkpoint=studied_ckpt,
+            out=study_out, steps=1, batch=2, lr=1e-4, seed=23,
+            device="cpu", log_every=10, max_tokens=16, min_tokens=3,
+            eval_n=0, memory_size=8, memory_w=0.05,
+            association_w=0.05, discovery_w=0.05, reanalysis_w=0.05,
+            gap_w=0.05, study_strategy="gap", study_probe_n=2,
+            study_hard_max=1, study_refresh_steps=1,
+            study_select_best=False, context_target_w=0.0,
+            sequence_w=0.0, transition_w=0.0, print_report=False)
+        assert study_report["experiment"] == "text_raw_reading_checkpoint_study"
+        assert study_report["checkpoint_experiment"] == "reading-selftest"
+        assert os.path.exists(studied_ckpt)
+        assert os.path.exists(study_out)
+        assert study_report["new_vocab_size"] >= study_report["old_vocab_size"]
+        assert study_report["new_tokens"] > 0
+        assert study_report["discovery_w"] == 0.05
+        assert study_report["reanalysis_w"] == 0.05
+        assert study_report["gap_w"] == 0.05
+        assert study_report["train_metrics"]["study_strategy"] == "gap"
+        assert study_report["train_metrics"]["memory_active"] > 0
+        assert study_report["train_metrics"]["discovery_w"] == 0.05
+        assert study_report["train_metrics"]["reanalysis_w"] == 0.05
+        assert study_report["train_metrics"]["gap_w"] == 0.05
+        assert math.isfinite(study_report["train_metrics"]["gap_loss"])
+        _studied_model, studied_vocab, studied_payload = load_checkpoint(
+            studied_ckpt, device="cpu")
+        assert "crystallize" in studied_vocab.stoi
+        assert (studied_payload["report"]["experiment"]
+                == "text_raw_reading_checkpoint_study")
     print("text selftest OK")
 
 

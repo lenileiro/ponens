@@ -3425,6 +3425,47 @@ def selftest():
             heads=4, pad=vocab.pad, view_tokens=2, txt_tokens=4,
             concept_tokens=2, latent_concept_slots=3,
             latent_concept_memory_size=8).to("cpu")
+        from .text import TextFactLM, checkpoint_payload as text_checkpoint_payload
+        text_ckpt = os.path.join(tmpdir, "text_reading.pt")
+        text_model = TextFactLM(
+            len(vocab), d=32, layers=1, heads=4, pad=vocab.pad,
+            fact_schema=None, latent_concept_slots=3,
+            latent_concept_memory_size=8).to("cpu")
+        with torch.no_grad():
+            sample_idx = vocab.stoi["sample"]
+            text_model.txt.emb.weight[sample_idx].fill_(0.125)
+            memory_values = torch.linspace(
+                0.0, 1.0,
+                steps=text_model.latent_concept_memory.memory.numel())
+            text_model.latent_concept_memory.memory.copy_(
+                memory_values.view_as(text_model.latent_concept_memory.memory))
+            text_model.latent_concept_memory.filled.fill_(1)
+            for param in text_model.reading_predictor.parameters():
+                param.fill_(0.03125)
+        torch.save(text_checkpoint_payload(
+            text_model, vocab, 32, 1, 4,
+            {"experiment": "text-raw-reading-selftest"}), text_ckpt)
+        transfer_model = MultimodalLM(
+            len(vocab), view_dims=view_dims, d=32, layers=1,
+            heads=4, pad=vocab.pad, view_tokens=2, txt_tokens=4,
+            concept_tokens=2, latent_concept_slots=3,
+            latent_concept_memory_size=8).to("cpu")
+        transfer_report = import_text_checkpoint(
+            transfer_model, vocab, text_ckpt, device="cpu")
+        assert transfer_report["copied"] is True
+        assert transfer_report["checkpoint_experiment"] == "text-raw-reading-selftest"
+        assert transfer_report["copied_token_embeddings"] > 0
+        assert transfer_report["copied_latent_tensor_count"] > 0
+        assert transfer_report["copied_sequence_tensor_count"] > 0
+        assert torch.allclose(
+            transfer_model.txt.emb.weight[sample_idx],
+            text_model.txt.emb.weight[sample_idx])
+        assert torch.allclose(
+            transfer_model.latent_concept_memory.memory,
+            text_model.latent_concept_memory.memory)
+        assert torch.allclose(
+            transfer_model.concept_sequence_predictor[0].weight,
+            text_model.reading_predictor[0].weight)
         batch = records[:2]
         features, txt, ids = _batch_from_records(
             batch, vocab, "cpu", view_dims)
