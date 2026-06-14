@@ -7345,12 +7345,13 @@ def _rgb8_from_samples(samples):
     return arr.permute(0, 2, 3, 1).contiguous().numpy()
 
 
-def sample_health_metrics(samples, prefix="sample", eps=1.0e-8):
+def sample_health_components(samples, eps=1.0e-8):
     if samples.ndim != 4 or samples.shape[1] != 3:
         raise ValueError(f"expected BCHW RGB samples, got shape {tuple(samples.shape)}")
     raw = samples.detach().float()
     finite = torch.isfinite(raw)
     image_nonfinite = (~finite).flatten(1).any(dim=1)
+    finite_frac = finite.float().flatten(1).mean(dim=1)
     clean = torch.nan_to_num(raw, nan=-1.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
     rgb = (clean + 1.0) * 0.5
     lum = (
@@ -7365,52 +7366,122 @@ def sample_health_metrics(samples, prefix="sample", eps=1.0e-8):
     dynamic_range = lum_flat.max(dim=1).values - lum_flat.min(dim=1).values
     low_frac = lum_flat.le(0.01).float().mean(dim=1)
     high_frac = lum_flat.ge(0.99).float().mean(dim=1)
-    collapsed = image_nonfinite | dynamic_range.lt(0.05) | lum_std.lt(0.01)
-    health_score = (
-        lum_std.mean()
-        * dynamic_range.mean().clamp_min(float(eps))
-        * (1.0 - collapsed.float().mean())
+    rgb_clip_frac = (rgb.le(0.01) | rgb.ge(0.99)).float().flatten(1).mean(dim=1)
+    midtone_frac = (
+        lum_flat.gt(0.05) & lum_flat.lt(0.95)
+    ).float().mean(dim=1)
+    channel_means = rgb.flatten(2).mean(dim=2)
+    channel_imbalance = channel_means.std(dim=1, unbiased=False)
+    if lum.shape[-1] > 1:
+        grad_x = (lum[:, :, 1:] - lum[:, :, :-1]).abs().flatten(1).mean(dim=1)
+    else:
+        grad_x = lum.new_zeros(lum.shape[0])
+    if lum.shape[-2] > 1:
+        grad_y = (lum[:, 1:, :] - lum[:, :-1, :]).abs().flatten(1).mean(dim=1)
+    else:
+        grad_y = lum.new_zeros(lum.shape[0])
+    grad_energy = 0.5 * (grad_x + grad_y)
+    lum4 = lum[:, None]
+    local_mean = F.avg_pool2d(
+        lum4, kernel_size=3, stride=1, padding=1, count_include_pad=False)
+    texture_energy = (lum4 - local_mean).abs().flatten(1).mean(dim=1)
+    lap_kernel = lum.new_tensor(
+        [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]]
+    ).reshape(1, 1, 3, 3)
+    lap = F.conv2d(F.pad(lum4, (1, 1, 1, 1), mode="replicate"), lap_kernel)
+    lap_energy = lap.abs().flatten(1).mean(dim=1)
+    detail_energy = 0.5 * grad_energy + 0.3 * texture_energy + 0.2 * lap_energy
+    exposure_deviation = (lum_flat.mean(dim=1) - 0.5).abs()
+    collapsed = (
+        image_nonfinite
+        | dynamic_range.lt(0.05)
+        | lum_std.lt(0.01)
+        | detail_energy.lt(0.002)
     )
+    detail_score = (detail_energy / 0.08).clamp(0.0, 2.0)
+    contrast_score = (lum_std / 0.20).clamp(0.0, 2.0)
+    range_score = (dynamic_range / 0.75).clamp(0.0, 1.5)
+    color_score = (rgb_std / 0.20).clamp(0.0, 1.5)
+    clip_penalty = 1.5 * rgb_clip_frac + 0.75 * (low_frac + high_frac)
+    exposure_penalty = 0.8 * exposure_deviation
+    imbalance_penalty = 0.5 * channel_imbalance.sub(0.25).clamp_min(0.0)
+    health_score = (
+        0.4 * finite_frac
+        + 0.9 * contrast_score
+        + 0.8 * range_score
+        + 0.9 * detail_score
+        + 0.2 * color_score
+        + 0.2 * midtone_frac
+        - clip_penalty
+        - exposure_penalty
+        - imbalance_penalty
+        - 2.0 * collapsed.float()
+        - 2.0 * image_nonfinite.float()
+    )
+    return {
+        "finite": finite,
+        "image_nonfinite": image_nonfinite,
+        "finite_frac": finite_frac,
+        "luminance_mean": lum_flat.mean(dim=1),
+        "luminance_std": lum_std,
+        "rgb_std": rgb_std,
+        "dynamic_range": dynamic_range,
+        "low_luminance_frac": low_frac,
+        "high_luminance_frac": high_frac,
+        "pixel_clip_frac": rgb_clip_frac,
+        "midtone_frac": midtone_frac,
+        "channel_imbalance": channel_imbalance,
+        "edge_energy": grad_energy,
+        "texture_energy": texture_energy,
+        "laplacian_energy": lap_energy,
+        "detail_energy": detail_energy,
+        "exposure_deviation": exposure_deviation,
+        "collapsed": collapsed,
+        "health_score": health_score,
+    }
+
+
+def sample_health_metrics(samples, prefix="sample", eps=1.0e-8):
+    components = sample_health_components(samples, eps=eps)
+    finite = components["finite"]
+    collapsed = components["collapsed"]
     return {
         f"{prefix}_finite_frac": float(finite.float().mean().detach().cpu()),
         f"{prefix}_nonfinite_frac": float((~finite).float().mean().detach().cpu()),
-        f"{prefix}_luminance_mean": float(lum_flat.mean().detach().cpu()),
-        f"{prefix}_luminance_std": float(lum_std.mean().detach().cpu()),
-        f"{prefix}_rgb_std": float(rgb_std.mean().detach().cpu()),
-        f"{prefix}_dynamic_range": float(dynamic_range.mean().detach().cpu()),
-        f"{prefix}_low_luminance_frac": float(low_frac.mean().detach().cpu()),
-        f"{prefix}_high_luminance_frac": float(high_frac.mean().detach().cpu()),
+        f"{prefix}_luminance_mean": float(
+            components["luminance_mean"].mean().detach().cpu()),
+        f"{prefix}_luminance_std": float(
+            components["luminance_std"].mean().detach().cpu()),
+        f"{prefix}_rgb_std": float(components["rgb_std"].mean().detach().cpu()),
+        f"{prefix}_dynamic_range": float(
+            components["dynamic_range"].mean().detach().cpu()),
+        f"{prefix}_low_luminance_frac": float(
+            components["low_luminance_frac"].mean().detach().cpu()),
+        f"{prefix}_high_luminance_frac": float(
+            components["high_luminance_frac"].mean().detach().cpu()),
+        f"{prefix}_pixel_clip_frac": float(
+            components["pixel_clip_frac"].mean().detach().cpu()),
+        f"{prefix}_midtone_frac": float(
+            components["midtone_frac"].mean().detach().cpu()),
+        f"{prefix}_channel_imbalance": float(
+            components["channel_imbalance"].mean().detach().cpu()),
+        f"{prefix}_edge_energy": float(components["edge_energy"].mean().detach().cpu()),
+        f"{prefix}_texture_energy": float(
+            components["texture_energy"].mean().detach().cpu()),
+        f"{prefix}_laplacian_energy": float(
+            components["laplacian_energy"].mean().detach().cpu()),
+        f"{prefix}_detail_energy": float(
+            components["detail_energy"].mean().detach().cpu()),
+        f"{prefix}_exposure_deviation": float(
+            components["exposure_deviation"].mean().detach().cpu()),
         f"{prefix}_collapsed_frac": float(collapsed.float().mean().detach().cpu()),
-        f"{prefix}_health_score": float(health_score.detach().cpu()),
+        f"{prefix}_health_score": float(
+            components["health_score"].mean().detach().cpu()),
     }
 
 
 def sample_candidate_health_scores(samples, eps=1.0e-8):
-    if samples.ndim != 4 or samples.shape[1] != 3:
-        raise ValueError(f"expected BCHW RGB samples, got shape {tuple(samples.shape)}")
-    raw = samples.detach().float()
-    finite = torch.isfinite(raw)
-    image_nonfinite = (~finite).flatten(1).any(dim=1)
-    finite_frac = finite.float().flatten(1).mean(dim=1)
-    clean = torch.nan_to_num(raw, nan=-1.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
-    rgb = (clean + 1.0) * 0.5
-    lum = (
-        0.2126 * rgb[:, 0]
-        + 0.7152 * rgb[:, 1]
-        + 0.0722 * rgb[:, 2]
-    )
-    rgb_std = rgb.flatten(1).std(dim=1, unbiased=False)
-    lum_flat = lum.flatten(1)
-    lum_std = lum_flat.std(dim=1, unbiased=False)
-    dynamic_range = lum_flat.max(dim=1).values - lum_flat.min(dim=1).values
-    collapsed = image_nonfinite | dynamic_range.lt(0.05) | lum_std.lt(0.01)
-    return (
-        finite_frac
-        + lum_std * dynamic_range.clamp_min(float(eps))
-        + 0.05 * rgb_std
-        - collapsed.float()
-        - image_nonfinite.float()
-    )
+    return sample_health_components(samples, eps=eps)["health_score"]
 
 
 def write_ppm_grid(samples, path, rows, cols, pad=2, bg=32):
@@ -7576,13 +7647,19 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
         chosen = samples.index_select(0, selected)
         best_scores = scores.gather(1, best[:, None]).squeeze(1)
         meta.update({
-            "sample_grid_selection_scorer": "sample_health",
+            "sample_grid_selection_scorer": "sample_health_v2",
             "sample_grid_selected_candidate_indices": [
                 int(x) for x in best.detach().cpu().tolist()
             ],
             "sample_grid_selection_score_mean": float(best_scores.mean().detach().cpu()),
             "sample_grid_selection_score_min": float(best_scores.min().detach().cpu()),
             "sample_grid_selection_score_max": float(best_scores.max().detach().cpu()),
+            "sample_grid_selection_candidate_health_mean": float(
+                scores.mean().detach().cpu()),
+            "sample_grid_selection_candidate_health_min": float(
+                scores.min().detach().cpu()),
+            "sample_grid_selection_candidate_health_max": float(
+                scores.max().detach().cpu()),
         })
         return chosen.contiguous(), meta
     component_scores = [
@@ -11780,6 +11857,24 @@ def selftest():
         assert float(dyn_out.abs().max()) <= 1.0 + 1.0e-6
         dyn_same, dyn_same_events = dynamic_threshold_tensor(dyn, percentile=0.0)
         assert dyn_same_events == 0 and torch.allclose(dyn_same, dyn)
+        flat_sample = torch.zeros(1, 3, 16, 16)
+        clipped_sample = torch.ones(1, 3, 16, 16)
+        ramp = torch.linspace(-1.0, 1.0, 16)
+        yy, xx = torch.meshgrid(ramp, ramp, indexing="ij")
+        textured_sample = torch.stack([
+            xx,
+            yy,
+            torch.sin(xx * math.pi * 4.0) * torch.cos(yy * math.pi * 4.0),
+        ], dim=0).unsqueeze(0)
+        health_scores = sample_candidate_health_scores(torch.cat([
+            flat_sample, clipped_sample, textured_sample], dim=0))
+        assert torch.isfinite(health_scores).all()
+        assert float(health_scores[2]) > float(health_scores[0])
+        assert float(health_scores[2]) > float(health_scores[1])
+        health_meta = sample_health_metrics(
+            torch.cat([flat_sample, textured_sample], dim=0), prefix="unit")
+        assert "unit_detail_energy" in health_meta
+        assert "unit_pixel_clip_frac" in health_meta
         structure_aligner = FlowFeatureAligner(
             hidden_dim=6, feature_dim=3, hidden=8, embed_dim=4)
         structure_loss, structure_parts = flow_hidden_feature_structure_loss(
