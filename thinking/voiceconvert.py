@@ -81,10 +81,10 @@ class Decoder(nn.Module):
 
 
 class VoiceConverter(nn.Module):
-    def __init__(self, speaker_encoder):
+    def __init__(self, speaker_encoder, content_dim=4, down=4):
         super().__init__()
-        self.content = ContentEncoder()
-        self.decoder = Decoder()
+        self.content = ContentEncoder(content_dim=content_dim, down=down)
+        self.decoder = Decoder(content_dim=content_dim, down=down)
         self.spk_enc = speaker_encoder                     # frozen
 
     def convert(self, source_mel, ref_mel):
@@ -124,7 +124,7 @@ def _pad_to(mels, T):
     return np.stack(out)
 
 
-def train(steps=8000, seed=0, device=DEV, batch=32, lr=1e-3, T=98):
+def train(steps=8000, seed=0, device=DEV, batch=32, lr=1e-3, T=98, content_dim=6, down=2, spk_w=1.0):
     torch.manual_seed(seed); rng = np.random.default_rng(seed)
     by_spk = load_with_words()
     train_spk, _ = split_speakers(by_spk, seed=seed)
@@ -133,7 +133,7 @@ def train(steps=8000, seed=0, device=DEV, batch=32, lr=1e-3, T=98):
     spk_enc.eval()
     for p in spk_enc.parameters():
         p.requires_grad_(False)
-    model = VoiceConverter(spk_enc).to(device)
+    model = VoiceConverter(spk_enc, content_dim=content_dim, down=down).to(device)
     opt = torch.optim.AdamW(list(model.content.parameters()) + list(model.decoder.parameters()), lr=lr)
     spks = [s for s in train_spk if len(train_spk[s]) >= 2]
     for st in range(1, steps + 1):
@@ -159,7 +159,7 @@ def train(steps=8000, seed=0, device=DEV, batch=32, lr=1e-3, T=98):
             tgt_emb = F.normalize(model.spk_enc(xref), dim=-1)
         gen_emb = F.normalize(model.spk_enc(conv), dim=-1)
         spk_consist = (1 - (gen_emb * tgt_emb).sum(-1)).mean()   # cosine: gen voice == target voice
-        loss = recon + 3.0 * spk_consist
+        loss = recon + spk_w * spk_consist
         opt.zero_grad(); loss.backward(); opt.step()
         if st % max(1, steps // 8) == 0 or st == steps:
             print(f"  vcv {st}/{steps} recon {recon.item():.4f} spk-consist {spk_consist.item():.4f}",
@@ -204,8 +204,8 @@ def evaluate(model, by_spk, device=DEV, n=400, seed=1, T=98):
             "n_holdout_speakers": len(hold), "voice_chance": 1 / len(hold), "n": total}
 
 
-def run(steps=8000, seed=0, device=DEV):
-    model, by_spk = train(steps=steps, seed=seed, device=device)
+def run(steps=8000, seed=0, device=DEV, content_dim=6, down=2, spk_w=1.0):
+    model, by_spk = train(steps=steps, seed=seed, device=device, content_dim=content_dim, down=down, spk_w=spk_w)
     ev = evaluate(model, by_spk, device=device)
     report = {"experiment": "voiceconvert_zeroshot", "steps": steps, **ev,
               "zero_shot_clone_works": ev["voice_match"] > 5 * ev["voice_chance"] and ev["content_acc"] > 0.4}
@@ -236,6 +236,9 @@ def main(argv=None):
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--train", action="store_true")
     ap.add_argument("--steps", type=int, default=8000)
+    ap.add_argument("--content-dim", type=int, default=6, dest="content_dim")
+    ap.add_argument("--down", type=int, default=2)
+    ap.add_argument("--spk-w", type=float, default=1.0, dest="spk_w")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="runs/voiceconvert.json")
     ap.add_argument("--checkpoint", default="runs/voiceconvert.pt")
@@ -243,7 +246,7 @@ def main(argv=None):
     if args.selftest:
         selftest(); return
     if args.train:
-        report, model = run(steps=args.steps, seed=args.seed)
+        report, model = run(steps=args.steps, seed=args.seed, content_dim=args.content_dim, down=args.down, spk_w=args.spk_w)
         os.makedirs(os.path.dirname(args.checkpoint) or ".", exist_ok=True)
         torch.save({"state_dict": model.state_dict()}, args.checkpoint)
         json.dump(report, open(args.out, "w"), indent=1)
