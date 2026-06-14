@@ -3846,8 +3846,10 @@ def fit_reading_concepts_select_best(
         "score_margin_w": float(score_margin_w),
         "replay_retention_w": float(replay_retention_w),
         "selected_round": int(best_round),
+        "accepted_update": bool(best_round > 0),
         "selected_score": float(best_score),
         "before_score": float(initial_row["score"]),
+        "selected_score_delta": float(best_score - initial_row["score"]),
         "before_base_score": float(initial_row["base_score"]),
         "before_replay_score": (
             float(before_replay_bundle["score_components"]["score"])
@@ -4053,7 +4055,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          cluster_min_size=2,
                          study_strategy="auto", study_probe_n=0,
                          study_hard_max=0, study_refresh_steps=0,
-                         study_select_best=False, study_rounds=1,
+                         study_select_best=True, study_rounds=1,
                          study_score_metric="mastery", study_score_margin_w=0.1,
                          text_field="text", max_tokens=128, min_tokens=8,
                          eval_frac=0.10, eval_n=64, out=None, checkpoint=None):
@@ -4505,7 +4507,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              cluster_min_size=2,
                              study_strategy="auto", study_probe_n=0,
                              study_hard_max=0, study_refresh_steps=0,
-                             study_select_best=False, study_rounds=1,
+                             study_select_best=True, study_rounds=1,
                              study_score_metric="mastery", study_score_margin_w=0.1,
                              replay_w=0.0, replay_batch=0,
                              replay_retention_w=0.0,
@@ -6511,7 +6513,8 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-study-probe-n", type=int, default=0)
     ap.add_argument("--reading-study-hard-max", type=int, default=0)
     ap.add_argument("--reading-study-refresh-steps", type=int, default=0)
-    ap.add_argument("--reading-study-select-best", action="store_true")
+    ap.add_argument("--reading-study-select-best",
+                    action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--reading-study-rounds", type=int, default=1)
     ap.add_argument("--reading-study-score-metric", choices=READING_SCORE_METRICS,
                     default="mastery")
