@@ -720,6 +720,28 @@ def concept_evaluate(model, vocab, surfaces, n=200, seed=11, device=DEV, text_sp
     return {k: v / n for k, v in hits.items()}
 
 
+def latent_factor_evaluate(model, vocab, surfaces, n=200, seed=12, device=DEV,
+                           text_split="eval", mode="full"):
+    """Factor accuracy when data-defined factor heads read only latent slots."""
+    if getattr(model, "latent_concepts", None) is None:
+        return {k: 0.0 for k in VALUE_POS} | {"n_records": 0, "skipped": True}
+    rng = np.random.default_rng(seed)
+    model.eval()
+    hits = {k: 0 for k in VALUE_POS}
+    with torch.no_grad():
+        for off in range(0, n, 50):
+            b = min(50, n - off)
+            img, aud, txt, _ids, golds = _batch(b, rng, vocab, device, surfaces,
+                                                text_split=text_split)
+            logits = model.latent_factor_logits(img, aud, txt, mode=mode)
+            for factor in VALUE_POS:
+                pred = logits[factor].argmax(-1)
+                values = FACTOR_VALUES[factor]
+                for r in range(b):
+                    hits[factor] += int(values[int(pred[r])] == golds[r][factor])
+    return {k: v / n for k, v in hits.items()} | {"n_records": int(n), "skipped": False}
+
+
 def concept_geometry_evaluate(model, vocab, surfaces, n=200, seed=13, device=DEV,
                               text_split="eval", mode="full"):
     """Same-value geometry diagnostic for schema concept states.
@@ -1603,6 +1625,14 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                     text_split="eval", mode="text_only")
     concept_sensor = concept_evaluate(model, vocab, surfaces, n=eval_n, device=device,
                                       text_split="eval", mode="sensor_only")
+    latent_factor_full = latent_factor_evaluate(
+        model, vocab, surfaces, n=eval_n, device=device, text_split="eval", mode="full")
+    latent_factor_text = latent_factor_evaluate(
+        model, vocab, surfaces, n=eval_n, device=device, text_split="eval",
+        mode="text_only")
+    latent_factor_sensor = latent_factor_evaluate(
+        model, vocab, surfaces, n=eval_n, device=device, text_split="eval",
+        mode="sensor_only")
     concept_geometry_full = concept_geometry_evaluate(
         model, vocab, surfaces, n=eval_n, device=device, text_split="eval", mode="full")
     concept_geometry_text = concept_geometry_evaluate(
@@ -1691,6 +1721,9 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
               "concept_head": {"full": concept_full,
                                "text_only_eval_phrasings": concept_text,
                                "sensor_only": concept_sensor},
+              "latent_factor_head": {"full": latent_factor_full,
+                                     "text_only_eval_phrasings": latent_factor_text,
+                                     "sensor_only": latent_factor_sensor},
               "concept_geometry": {"full": concept_geometry_full,
                                    "text_only_eval_phrasings": concept_geometry_text,
                                    "sensor_only": concept_geometry_sensor},
@@ -1702,6 +1735,12 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                   and concept_text[k] >= thresholds[k]
                                   and concept_sensor[k] >= thresholds[k]
                                   for k in VALUE_POS),
+              "latent_factor_gate": (
+                  not latent_factor_full.get("skipped", False)
+                  and all(latent_factor_full[k] >= thresholds[k]
+                          and latent_factor_text[k] >= thresholds[k]
+                          and latent_factor_sensor[k] >= thresholds[k]
+                          for k in VALUE_POS)),
               "gate": all(full[k] >= thresholds[k] and text[k] >= thresholds[k]
                           and sensor[k] >= thresholds[k] for k in VALUE_POS)
               and (not counterfactual or (
@@ -1822,6 +1861,11 @@ def selftest():
     assert set(latent_factor_logits) == set(VALUE_POS)
     assert torch.isfinite(latent_factor_loss(
         {"full": latent_factor_logits}, golds))
+    latent_factor_eval = latent_factor_evaluate(
+        latent_prefix_model, vocab, surfaces, n=4, seed=6, device="cpu", mode="full")
+    assert set(VALUE_POS).issubset(latent_factor_eval)
+    assert latent_factor_eval["n_records"] == 4
+    assert latent_factor_eval["skipped"] is False
     rel_txt_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
                                  text_arch="relational", text_layers=1).to("cpu")
     assert rel_txt_model.txt.arch == "relational"

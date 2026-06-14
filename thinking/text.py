@@ -4071,6 +4071,35 @@ def fact_concept_eval(model, vocab, records, device=DEV, n=0, seed=0):
             "skipped": bool(n < 0)}
 
 
+def latent_fact_concept_eval(model, vocab, records, device=DEV, n=0, seed=0):
+    if (model.fact_schema is None or getattr(model, "fact_concepts", None) is None
+            or getattr(model, "latent_concepts", None) is None):
+        return {"fact_value_acc": 0.0, "n_facts": 0, "n_records": 0,
+                "sampled": False, "skipped": bool(n < 0)}
+    selected = eval_records(records, n=n, seed=seed)
+    value_index = model.fact_schema.value_index
+    correct = total = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(selected), 64):
+            batch = selected[off:off + 64]
+            txt, _ids = pack(batch, vocab, device)
+            logits = model.latent_fact_concept_logits(txt)
+            for r, rec in enumerate(batch):
+                for slot, pred, val in rec.facts:
+                    key = (slot, pred)
+                    if key not in logits or (key, val) not in value_index:
+                        continue
+                    pred_id = int(logits[key][r].argmax(-1))
+                    correct += int(pred_id == value_index[(key, val)])
+                    total += 1
+    eval_count = len([r for r in records if r.split == "eval"])
+    return {"fact_value_acc": correct / max(1, total), "n_facts": total,
+            "n_records": len(selected),
+            "sampled": bool(n > 0 and n < eval_count),
+            "skipped": bool(n < 0)}
+
+
 def fact_concept_geometry_eval(model, vocab, records, device=DEV, n=0, seed=0):
     if model.fact_schema is None or getattr(model, "fact_concepts", None) is None:
         return {"nearest_same_acc": 0.0, "same_mean": 0.0, "diff_mean": 0.0,
@@ -4478,6 +4507,8 @@ def bucket_fact_eval(model, vocab, records, device=DEV, n=0, seed=0):
                                       seed=seed + 3001 * i)
         fact_concept = fact_concept_eval(model, vocab, rows, device=device, n=n,
                                          seed=seed + 3001 * i)
+        latent_fact = latent_fact_concept_eval(model, vocab, rows, device=device, n=n,
+                                               seed=seed + 3001 * i)
         choice = choice_head_eval(model, vocab, rows, device=device, n=n,
                                   seed=seed + 4001 * i)
         out[name] = {"n": len(rows),
@@ -4486,6 +4517,9 @@ def bucket_fact_eval(model, vocab, records, device=DEV, n=0, seed=0):
                      "teacher_forced_fact_value_acc": teacher["fact_value_acc"],
                      "semantic_fact_value_acc": semantic["fact_value_acc"],
                      "fact_concept_fact_value_acc": fact_concept["fact_value_acc"],
+                     "latent_fact_concept_fact_value_acc": (
+                         latent_fact["fact_value_acc"]),
+                     "latent_fact_concept_records": latent_fact["n_records"],
                      "choice_head_fact_value_acc": choice["fact_value_acc"],
                      "choice_head_records": choice["n_records"]}
     return out
@@ -5098,6 +5132,8 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
                                   seed=seed + 11)
     fact_concept = fact_concept_eval(model, vocab, records, device=device, n=fact_n,
                                      seed=seed + 11)
+    latent_fact_concept = latent_fact_concept_eval(
+        model, vocab, records, device=device, n=fact_n, seed=seed + 11)
     fact_concept_geometry = fact_concept_geometry_eval(
         model, vocab, records, device=device, n=fact_n, seed=seed + 12)
     choice_head = choice_head_eval(model, vocab, records, device=device, n=fact_n,
@@ -5168,6 +5204,7 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
     return {"teacher_forced": teacher, "free_decode": free,
             "semantic_head": semantic,
             "fact_concept_head": fact_concept,
+            "latent_fact_concept_head": latent_fact_concept,
             "fact_concept_geometry": fact_concept_geometry,
             "choice_head": choice_head,
             "by_kind": by_kind,
@@ -5185,6 +5222,7 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
             "gate_thresholds": {"fact_value_acc": 0.80, "free_f1": 0.80,
                                 "semantic_fact_value_acc": 0.80,
                                 "fact_concept_fact_value_acc": 0.80,
+                                "latent_fact_concept_fact_value_acc": 0.80,
                                 "fact_concept_geometry_margin": 0.05,
                                 "choice_head_fact_value_acc": 0.80,
                                 "paraphrase_consistent": 0.80,
@@ -5328,6 +5366,9 @@ def _fact_value_scores(eval_report):
     concept = eval_report.get("fact_concept_head") or {}
     if concept.get("n_records", 0) and not concept.get("skipped"):
         scores["concept"] = float(concept["fact_value_acc"])
+    latent = eval_report.get("latent_fact_concept_head") or {}
+    if latent.get("n_records", 0) and not latent.get("skipped"):
+        scores["latent"] = float(latent["fact_value_acc"])
     choice = eval_report.get("choice_head") or {}
     if choice.get("n_records", 0):
         scores["choice"] = float(choice["fact_value_acc"])
@@ -5428,10 +5469,14 @@ def _kind_score(row, metric):
     teacher = float(row.get("teacher_forced_fact_value_acc", 0.0))
     semantic = float(row.get("semantic_fact_value_acc", 0.0))
     choice = float(row.get("choice_head_fact_value_acc", 0.0))
+    latent = float(row.get("latent_fact_concept_fact_value_acc", 0.0))
     if metric == "teacher":
         return teacher
     if metric == "semantic":
         return semantic
+    if metric == "latent":
+        return latent if row.get("latent_fact_concept_records", 0) else 0.5 * (
+            teacher + semantic)
     if metric == "choice":
         return choice if row.get("choice_head_records", 0) else 0.5 * (teacher + semantic)
     if metric == "both":
@@ -5516,6 +5561,7 @@ def study_selection_components(study_eval, replay_eval, replay_ref=None, metric=
         "study_score": study_score,
         "study_semantic_fact_value_acc": _fact_value_scores(study_eval)["semantic"],
         "study_teacher_fact_value_acc": _fact_value_scores(study_eval)["teacher"],
+        "study_latent_fact_value_acc": _fact_value_scores(study_eval).get("latent"),
         "study_choice_fact_value_acc": _fact_value_scores(study_eval).get("choice"),
         "replay_score": replay_score,
         "replay_ref_score": replay_ref_score,
@@ -6584,6 +6630,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                     round_study_eval["teacher_forced"]["fact_value_acc"],
                 "semantic_fact_value_acc":
                     round_study_eval["semantic_head"]["fact_value_acc"],
+                "latent_fact_concept_fact_value_acc":
+                    round_study_eval["latent_fact_concept_head"]["fact_value_acc"],
                 "choice_head_fact_value_acc":
                     round_study_eval["choice_head"]["fact_value_acc"],
                 "gate": round_study_eval["gate"],
@@ -6594,6 +6642,8 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                         round_replay_eval["teacher_forced"]["fact_value_acc"],
                     "semantic_fact_value_acc":
                         round_replay_eval["semantic_head"]["fact_value_acc"],
+                    "latent_fact_concept_fact_value_acc":
+                        round_replay_eval["latent_fact_concept_head"]["fact_value_acc"],
                     "choice_head_fact_value_acc":
                         round_replay_eval["choice_head"]["fact_value_acc"],
                     "gate": round_replay_eval["gate"],
@@ -6671,6 +6721,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
         "semantic_fact_value_acc": (
             after["semantic_head"]["fact_value_acc"]
             - before["semantic_head"]["fact_value_acc"]),
+        "latent_fact_concept_fact_value_acc": (
+            after["latent_fact_concept_head"]["fact_value_acc"]
+            - before["latent_fact_concept_head"]["fact_value_acc"]),
         "choice_head_fact_value_acc": (
             after["choice_head"]["fact_value_acc"]
             - before["choice_head"]["fact_value_acc"]),
@@ -6683,6 +6736,9 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
         "semantic_fact_value_acc": (
             replay_after["semantic_head"]["fact_value_acc"]
             - replay_before["semantic_head"]["fact_value_acc"]),
+        "latent_fact_concept_fact_value_acc": (
+            replay_after["latent_fact_concept_head"]["fact_value_acc"]
+            - replay_before["latent_fact_concept_head"]["fact_value_acc"]),
         "choice_head_fact_value_acc": (
             replay_after["choice_head"]["fact_value_acc"]
             - replay_before["choice_head"]["fact_value_acc"]),
@@ -7211,12 +7267,17 @@ def selftest():
     assert "fact_error_rate" in hard_report
     assert isinstance(hard, list)
     score_a = {"semantic_head": {"fact_value_acc": 0.8},
-               "teacher_forced": {"fact_value_acc": 0.7}}
+               "teacher_forced": {"fact_value_acc": 0.7},
+               "latent_fact_concept_head": {"fact_value_acc": 0.65,
+                                            "n_records": 2}}
     score_b = {"semantic_head": {"fact_value_acc": 0.6},
-               "teacher_forced": {"fact_value_acc": 0.7}}
+               "teacher_forced": {"fact_value_acc": 0.7},
+               "latent_fact_concept_head": {"fact_value_acc": 0.55,
+                                            "n_records": 2}}
     assert study_selection_score(score_a, score_b, score_a, retention_w=1.0) < 0.8
     assert abs(_score_metric(score_a, "both") - 0.75) < 1e-6
     assert abs(_score_metric(score_a, "min") - 0.7) < 1e-6
+    assert abs(_score_metric(score_a, "latent") - 0.65) < 1e-6
     score_choice = score_a | {
         "choice_head": {"fact_value_acc": 0.55, "n_records": 2},
         "qa_ablation_control": {
@@ -7303,7 +7364,8 @@ def selftest():
     assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in model.parameters())
     report = evaluate_all(model, vocab, records, device="cpu", max_new=12)
     assert set(report) >= {"teacher_forced", "free_decode", "paraphrase_consistency",
-                           "counterfactual", "semantic_head", "choice_head", "by_kind",
+                           "counterfactual", "semantic_head",
+                           "latent_fact_concept_head", "choice_head", "by_kind",
                            "fact_concept_geometry", "free_decode_by_kind", "qa_ablation_control",
                            "qa_question_swap_control",
                            "qa_candidate_replacement_control",
@@ -7726,7 +7788,7 @@ def main(argv=None):
     ap.add_argument("--study-select-best", action="store_true",
                     help="evaluate each study round and restore the best scoring weights")
     ap.add_argument("--study-score-metric", choices=("semantic", "teacher", "concept",
-                                                     "both", "min", "choice"),
+                                                     "latent", "both", "min", "choice"),
                     default="both",
                     help="metric used by --study-select-best")
     ap.add_argument("--study-retention-w", type=float, default=1.0,
