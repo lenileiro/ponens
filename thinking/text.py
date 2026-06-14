@@ -55,6 +55,7 @@ from .concepts import (
     SchemaConceptHead,
     SchemaConceptRefiner,
     latent_concept_composition_loss,
+    latent_concept_graph_cycle_loss,
     latent_concept_graph_prediction_loss,
     latent_concept_graph_prediction_scores,
     latent_concept_graph_curiosity_scores,
@@ -918,6 +919,22 @@ class TextFactLM(nn.Module):
             self_loop_w=self_loop_w, transitive_steps=transitive_steps,
             transitive_w=transitive_w, target_power=target_power)
 
+    def latent_concept_graph_cycle_loss(
+            self, source_slots, target_slots, temperature=0.1,
+            self_loop_w=0.05, transitive_steps=2, transitive_w=0.1,
+            target_power=1.0, cycle_w=0.5):
+        if self.latent_concept_memory is None:
+            if source_slots is not None:
+                return source_slots.sum() * 0.0
+            if target_slots is not None:
+                return target_slots.sum() * 0.0
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        return self.latent_concept_memory.graph_cycle_loss(
+            source_slots, target_slots, temperature=temperature,
+            self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+            transitive_w=transitive_w, target_power=target_power,
+            cycle_w=cycle_w)
+
     def latent_concept_graph_prediction_scores(
             self, source_slots, target_slots, temperature=0.1,
             self_loop_w=0.05, transitive_steps=2, transitive_w=0.1,
@@ -1514,6 +1531,33 @@ def reading_context_graph_prediction_loss(
         temperature=temperature, self_loop_w=self_loop_w,
         transitive_steps=transitive_steps, transitive_w=transitive_w,
         target_power=target_power)
+
+
+def reading_context_graph_cycle_loss(
+        model, txt, pad, context_keep_p=0.5, feature_dropout=0.1,
+        temperature=0.1, self_loop_w=0.05, transitive_steps=2,
+        transitive_w=0.1, target_power=1.0, cycle_w=0.5):
+    if (getattr(model, "latent_concepts", None) is None
+            or getattr(model, "latent_concept_memory", None) is None):
+        return torch.tensor(0.0, device=txt.device)
+    context_txt, target_txt = split_reading_context_target(
+        txt, pad, context_keep_p=context_keep_p)
+    source_slots = model.latent_concept_states(
+        context_txt, feature_dropout=feature_dropout, project=True)
+    target_slots = model.latent_concept_states(
+        target_txt, feature_dropout=feature_dropout, project=True)
+    if hasattr(model, "latent_concept_graph_cycle_loss"):
+        return model.latent_concept_graph_cycle_loss(
+            source_slots, target_slots, temperature=temperature,
+            self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+            transitive_w=transitive_w, target_power=target_power,
+            cycle_w=cycle_w)
+    return latent_concept_graph_cycle_loss(
+        source_slots, target_slots, model.latent_concept_memory.active(),
+        model.latent_concept_memory.active_prediction_relations(),
+        temperature=temperature, self_loop_w=self_loop_w,
+        transitive_steps=transitive_steps, transitive_w=transitive_w,
+        target_power=target_power, cycle_w=cycle_w)
 
 
 @torch.no_grad()
@@ -2541,6 +2585,12 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          graph_predict_transitive_steps=2,
                          graph_predict_transitive_w=0.1,
                          graph_predict_target_power=1.0,
+                         graph_cycle_w=0.0, graph_cycle_temperature=0.1,
+                         graph_cycle_self_loop_w=0.05,
+                         graph_cycle_transitive_steps=2,
+                         graph_cycle_transitive_w=0.1,
+                         graph_cycle_target_power=1.0,
+                         graph_cycle_consistency_w=0.5,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
@@ -2619,6 +2669,20 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading graph prediction transitive weight must be non-negative")
     if float(graph_predict_target_power) <= 0.0:
         raise ValueError("reading graph prediction target power must be positive")
+    if float(graph_cycle_w) < 0.0:
+        raise ValueError("reading graph cycle weight must be non-negative")
+    if float(graph_cycle_temperature) <= 0.0:
+        raise ValueError("reading graph cycle temperature must be positive")
+    if float(graph_cycle_self_loop_w) < 0.0:
+        raise ValueError("reading graph cycle self-loop weight must be non-negative")
+    if int(graph_cycle_transitive_steps) < 1:
+        raise ValueError("reading graph cycle transitive steps must be positive")
+    if float(graph_cycle_transitive_w) < 0.0:
+        raise ValueError("reading graph cycle transitive weight must be non-negative")
+    if float(graph_cycle_target_power) <= 0.0:
+        raise ValueError("reading graph cycle target power must be positive")
+    if float(graph_cycle_consistency_w) < 0.0:
+        raise ValueError("reading graph cycle consistency weight must be non-negative")
     if float(neighborhood_w) < 0.0:
         raise ValueError("reading neighborhood loss weight must be non-negative")
     if int(neighborhood_batch) < 0:
@@ -2673,6 +2737,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading composition requires latent concept memory")
     if graph_predict_w and getattr(model, "latent_concept_memory", None) is None:
         raise ValueError("reading graph prediction requires latent concept memory")
+    if graph_cycle_w and getattr(model, "latent_concept_memory", None) is None:
+        raise ValueError("reading graph cycle requires latent concept memory")
     if study_strategy == "curiosity" and getattr(model, "latent_concept_memory", None) is None:
         raise ValueError("reading curiosity study requires latent concept memory")
     if study_strategy == "graph" and getattr(model, "latent_concept_memory", None) is None:
@@ -2706,6 +2772,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_association = 0.0
     last_composition = 0.0
     last_graph_predict = 0.0
+    last_graph_cycle = 0.0
     last_context_target = 0.0
     last_neighborhood = 0.0
     last_transition = 0.0
@@ -2868,6 +2935,17 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 transitive_w=graph_predict_transitive_w,
                 target_power=graph_predict_target_power)
             if graph_predict_w else view_loss * 0.0)
+        graph_cycle_loss = (
+            reading_context_graph_cycle_loss(
+                model, txt, vocab.pad, context_keep_p=context_keep_p,
+                feature_dropout=feature_dropout,
+                temperature=graph_cycle_temperature,
+                self_loop_w=graph_cycle_self_loop_w,
+                transitive_steps=graph_cycle_transitive_steps,
+                transitive_w=graph_cycle_transitive_w,
+                target_power=graph_cycle_target_power,
+                cycle_w=graph_cycle_consistency_w)
+            if graph_cycle_w else view_loss * 0.0)
         context_target = (
             reading_context_target_loss(
                 model, txt, vocab.pad, context_keep_p=context_keep_p,
@@ -2920,6 +2998,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 + float(association_w) * association_loss
                 + float(composition_w) * composition_loss
                 + float(graph_predict_w) * graph_predict_loss
+                + float(graph_cycle_w) * graph_cycle_loss
                 + float(context_target_w) * context_target
                 + float(neighborhood_w) * neighborhood_loss
                 + float(transition_w) * transition_loss
@@ -2931,10 +3010,11 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_memory_updates = int(update_reading_latent_memory(
             model, txt, feature_dropout=0.0, momentum=memory_momentum,
             relation_decay=(association_decay
-                            if (association_w or composition_w or graph_predict_w)
+                            if (association_w or composition_w
+                                or graph_predict_w or graph_cycle_w)
                             else None)))
         last_transition_updates = 0
-        if graph_predict_w or study_strategy == "graph":
+        if graph_predict_w or graph_cycle_w or study_strategy == "graph":
             last_transition_updates = int(update_reading_latent_transitions(
                 model, txt, vocab.pad, context_keep_p=context_keep_p,
                 feature_dropout=0.0, decay=association_decay))
@@ -2945,6 +3025,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_association = float(association_loss.detach())
         last_composition = float(composition_loss.detach())
         last_graph_predict = float(graph_predict_loss.detach())
+        last_graph_cycle = float(graph_cycle_loss.detach())
         last_context_target = float(context_target.detach())
         last_neighborhood = float(neighborhood_loss.detach())
         last_transition = float(transition_loss.detach())
@@ -2958,6 +3039,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                   f"assoc {last_association:.3f} "
                   f"compose {last_composition:.3f} "
                   f"graph-predict {last_graph_predict:.3f} "
+                  f"graph-cycle {last_graph_cycle:.3f} "
                   f"context-target {last_context_target:.3f} "
                   f"neighborhood {last_neighborhood:.3f} "
                   f"transition {last_transition:.3f} "
@@ -3020,6 +3102,14 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "graph_predict_transitive_steps": int(graph_predict_transitive_steps),
         "graph_predict_transitive_w": float(graph_predict_transitive_w),
         "graph_predict_target_power": float(graph_predict_target_power),
+        "graph_cycle_loss": last_graph_cycle,
+        "graph_cycle_w": float(graph_cycle_w),
+        "graph_cycle_temperature": float(graph_cycle_temperature),
+        "graph_cycle_self_loop_w": float(graph_cycle_self_loop_w),
+        "graph_cycle_transitive_steps": int(graph_cycle_transitive_steps),
+        "graph_cycle_transitive_w": float(graph_cycle_transitive_w),
+        "graph_cycle_target_power": float(graph_cycle_target_power),
+        "graph_cycle_consistency_w": float(graph_cycle_consistency_w),
         "context_target_loss": last_context_target,
         "neighborhood_loss": last_neighborhood,
         "transition_loss": last_transition,
@@ -3095,6 +3185,10 @@ def fit_reading_concepts_select_best(
         graph_predict_w=0.0, graph_predict_temperature=0.1,
         graph_predict_self_loop_w=0.05, graph_predict_transitive_steps=2,
         graph_predict_transitive_w=0.1, graph_predict_target_power=1.0,
+        graph_cycle_w=0.0, graph_cycle_temperature=0.1,
+        graph_cycle_self_loop_w=0.05, graph_cycle_transitive_steps=2,
+        graph_cycle_transitive_w=0.1, graph_cycle_target_power=1.0,
+        graph_cycle_consistency_w=0.5,
         context_target_w=0.1, context_keep_p=0.5,
         context_target_temperature=0.1,
         neighborhood_w=0.0, neighborhood_batch=0,
@@ -3202,6 +3296,13 @@ def fit_reading_concepts_select_best(
             graph_predict_transitive_steps=graph_predict_transitive_steps,
             graph_predict_transitive_w=graph_predict_transitive_w,
             graph_predict_target_power=graph_predict_target_power,
+            graph_cycle_w=graph_cycle_w,
+            graph_cycle_temperature=graph_cycle_temperature,
+            graph_cycle_self_loop_w=graph_cycle_self_loop_w,
+            graph_cycle_transitive_steps=graph_cycle_transitive_steps,
+            graph_cycle_transitive_w=graph_cycle_transitive_w,
+            graph_cycle_target_power=graph_cycle_target_power,
+            graph_cycle_consistency_w=graph_cycle_consistency_w,
             context_target_w=context_target_w,
             context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
@@ -3319,6 +3420,12 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            graph_predict_transitive_steps=2,
                            graph_predict_transitive_w=0.1,
                            graph_predict_target_power=1.0,
+                           graph_cycle_w=0.0, graph_cycle_temperature=0.1,
+                           graph_cycle_self_loop_w=0.05,
+                           graph_cycle_transitive_steps=2,
+                           graph_cycle_transitive_w=0.1,
+                           graph_cycle_target_power=1.0,
+                           graph_cycle_consistency_w=0.5,
                            context_target_w=0.1, context_keep_p=0.5,
                            context_target_temperature=0.1,
                            neighborhood_w=0.0, neighborhood_batch=0,
@@ -3382,6 +3489,13 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         graph_predict_transitive_steps=graph_predict_transitive_steps,
         graph_predict_transitive_w=graph_predict_transitive_w,
         graph_predict_target_power=graph_predict_target_power,
+        graph_cycle_w=graph_cycle_w,
+        graph_cycle_temperature=graph_cycle_temperature,
+        graph_cycle_self_loop_w=graph_cycle_self_loop_w,
+        graph_cycle_transitive_steps=graph_cycle_transitive_steps,
+        graph_cycle_transitive_w=graph_cycle_transitive_w,
+        graph_cycle_target_power=graph_cycle_target_power,
+        graph_cycle_consistency_w=graph_cycle_consistency_w,
         context_target_w=context_target_w, context_keep_p=context_keep_p,
         context_target_temperature=context_target_temperature,
         neighborhood_w=neighborhood_w,
@@ -3436,6 +3550,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          graph_predict_transitive_steps=2,
                          graph_predict_transitive_w=0.1,
                          graph_predict_target_power=1.0,
+                         graph_cycle_w=0.0, graph_cycle_temperature=0.1,
+                         graph_cycle_self_loop_w=0.05,
+                         graph_cycle_transitive_steps=2,
+                         graph_cycle_transitive_w=0.1,
+                         graph_cycle_target_power=1.0,
+                         graph_cycle_consistency_w=0.5,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
@@ -3511,6 +3631,13 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             graph_predict_transitive_steps=graph_predict_transitive_steps,
             graph_predict_transitive_w=graph_predict_transitive_w,
             graph_predict_target_power=graph_predict_target_power,
+            graph_cycle_w=graph_cycle_w,
+            graph_cycle_temperature=graph_cycle_temperature,
+            graph_cycle_self_loop_w=graph_cycle_self_loop_w,
+            graph_cycle_transitive_steps=graph_cycle_transitive_steps,
+            graph_cycle_transitive_w=graph_cycle_transitive_w,
+            graph_cycle_target_power=graph_cycle_target_power,
+            graph_cycle_consistency_w=graph_cycle_consistency_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -3571,6 +3698,13 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             graph_predict_transitive_steps=graph_predict_transitive_steps,
             graph_predict_transitive_w=graph_predict_transitive_w,
             graph_predict_target_power=graph_predict_target_power,
+            graph_cycle_w=graph_cycle_w,
+            graph_cycle_temperature=graph_cycle_temperature,
+            graph_cycle_self_loop_w=graph_cycle_self_loop_w,
+            graph_cycle_transitive_steps=graph_cycle_transitive_steps,
+            graph_cycle_transitive_w=graph_cycle_transitive_w,
+            graph_cycle_target_power=graph_cycle_target_power,
+            graph_cycle_consistency_w=graph_cycle_consistency_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -3652,6 +3786,13 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "graph_predict_transitive_steps": int(graph_predict_transitive_steps),
               "graph_predict_transitive_w": float(graph_predict_transitive_w),
               "graph_predict_target_power": float(graph_predict_target_power),
+              "graph_cycle_w": float(graph_cycle_w),
+              "graph_cycle_temperature": float(graph_cycle_temperature),
+              "graph_cycle_self_loop_w": float(graph_cycle_self_loop_w),
+              "graph_cycle_transitive_steps": int(graph_cycle_transitive_steps),
+              "graph_cycle_transitive_w": float(graph_cycle_transitive_w),
+              "graph_cycle_target_power": float(graph_cycle_target_power),
+              "graph_cycle_consistency_w": float(graph_cycle_consistency_w),
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
@@ -3817,6 +3958,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              graph_predict_transitive_steps=2,
                              graph_predict_transitive_w=0.1,
                              graph_predict_target_power=1.0,
+                             graph_cycle_w=0.0, graph_cycle_temperature=0.1,
+                             graph_cycle_self_loop_w=0.05,
+                             graph_cycle_transitive_steps=2,
+                             graph_cycle_transitive_w=0.1,
+                             graph_cycle_target_power=1.0,
+                             graph_cycle_consistency_w=0.5,
                              context_target_w=0.1, context_keep_p=0.5,
                              context_target_temperature=0.1,
                              neighborhood_w=0.0, neighborhood_batch=0,
@@ -3913,6 +4060,13 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             graph_predict_transitive_steps=graph_predict_transitive_steps,
             graph_predict_transitive_w=graph_predict_transitive_w,
             graph_predict_target_power=graph_predict_target_power,
+            graph_cycle_w=graph_cycle_w,
+            graph_cycle_temperature=graph_cycle_temperature,
+            graph_cycle_self_loop_w=graph_cycle_self_loop_w,
+            graph_cycle_transitive_steps=graph_cycle_transitive_steps,
+            graph_cycle_transitive_w=graph_cycle_transitive_w,
+            graph_cycle_target_power=graph_cycle_target_power,
+            graph_cycle_consistency_w=graph_cycle_consistency_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -3978,6 +4132,13 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             graph_predict_transitive_steps=graph_predict_transitive_steps,
             graph_predict_transitive_w=graph_predict_transitive_w,
             graph_predict_target_power=graph_predict_target_power,
+            graph_cycle_w=graph_cycle_w,
+            graph_cycle_temperature=graph_cycle_temperature,
+            graph_cycle_self_loop_w=graph_cycle_self_loop_w,
+            graph_cycle_transitive_steps=graph_cycle_transitive_steps,
+            graph_cycle_transitive_w=graph_cycle_transitive_w,
+            graph_cycle_target_power=graph_cycle_target_power,
+            graph_cycle_consistency_w=graph_cycle_consistency_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -4077,6 +4238,13 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "graph_predict_transitive_steps": int(graph_predict_transitive_steps),
               "graph_predict_transitive_w": float(graph_predict_transitive_w),
               "graph_predict_target_power": float(graph_predict_target_power),
+              "graph_cycle_w": float(graph_cycle_w),
+              "graph_cycle_temperature": float(graph_cycle_temperature),
+              "graph_cycle_self_loop_w": float(graph_cycle_self_loop_w),
+              "graph_cycle_transitive_steps": int(graph_cycle_transitive_steps),
+              "graph_cycle_transitive_w": float(graph_cycle_transitive_w),
+              "graph_cycle_target_power": float(graph_cycle_target_power),
+              "graph_cycle_consistency_w": float(graph_cycle_consistency_w),
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
@@ -5598,6 +5766,10 @@ def selftest():
     assert torch.isfinite(reading_context_graph_prediction_loss(
         reading_model, reading_txt, reading_vocab.pad, context_keep_p=0.5,
         feature_dropout=0.1, transitive_steps=2, transitive_w=0.1))
+    assert torch.isfinite(reading_context_graph_cycle_loss(
+        reading_model, reading_txt, reading_vocab.pad, context_keep_p=0.5,
+        feature_dropout=0.1, transitive_steps=2, transitive_w=0.1,
+        cycle_w=0.5))
     graph_records, graph_report = reading_latent_graph_prediction_records(
         reading_model, reading_vocab, reading_records, device="cpu", n=0,
         context_keep_p=0.5, transitive_steps=2, transitive_w=0.1)
@@ -5614,11 +5786,14 @@ def selftest():
         token_replace_p=0.0, study_strategy="graph", study_probe_n=4,
         study_hard_max=2, study_refresh_steps=1, context_target_w=0.1,
         context_keep_p=0.5, memory_size=8, composition_w=0.1, graph_predict_w=0.1,
+        graph_cycle_w=0.1,
         neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2,
         transition_w=0.1, transition_batch=2,
         cluster_w=0.1, cluster_batch=4, cluster_probe_n=4)
     assert reading_model.reading_train_metrics["memory_active"] > 0
     assert reading_model.reading_train_metrics["graph_predict_w"] == 0.1
+    assert reading_model.reading_train_metrics["graph_cycle_w"] == 0.1
+    assert math.isfinite(reading_model.reading_train_metrics["graph_cycle_loss"])
     assert reading_model.reading_train_metrics["graph_transition_updates"] > 0
     assert any(r.get("strategy") == "graph" for r in reading_model.reading_study_reports)
     scored = [r.get("mean_score", 0.0) for r in reading_model.reading_study_reports
@@ -5684,6 +5859,13 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-graph-predict-transitive-steps", type=int, default=2)
     ap.add_argument("--reading-graph-predict-transitive-w", type=float, default=0.1)
     ap.add_argument("--reading-graph-predict-target-power", type=float, default=1.0)
+    ap.add_argument("--reading-graph-cycle-w", type=float, default=0.0)
+    ap.add_argument("--reading-graph-cycle-temperature", type=float, default=0.1)
+    ap.add_argument("--reading-graph-cycle-self-loop-w", type=float, default=0.05)
+    ap.add_argument("--reading-graph-cycle-transitive-steps", type=int, default=2)
+    ap.add_argument("--reading-graph-cycle-transitive-w", type=float, default=0.1)
+    ap.add_argument("--reading-graph-cycle-target-power", type=float, default=1.0)
+    ap.add_argument("--reading-graph-cycle-consistency-w", type=float, default=0.5)
     ap.add_argument("--reading-neighborhood-w", type=float, default=0.0)
     ap.add_argument("--reading-neighborhood-batch", type=int, default=0)
     ap.add_argument("--reading-neighborhood-probe-n", type=int, default=0)
@@ -5747,6 +5929,13 @@ def _reading_kwargs(args):
                 graph_predict_transitive_steps=args.reading_graph_predict_transitive_steps,
                 graph_predict_transitive_w=args.reading_graph_predict_transitive_w,
                 graph_predict_target_power=args.reading_graph_predict_target_power,
+                graph_cycle_w=args.reading_graph_cycle_w,
+                graph_cycle_temperature=args.reading_graph_cycle_temperature,
+                graph_cycle_self_loop_w=args.reading_graph_cycle_self_loop_w,
+                graph_cycle_transitive_steps=args.reading_graph_cycle_transitive_steps,
+                graph_cycle_transitive_w=args.reading_graph_cycle_transitive_w,
+                graph_cycle_target_power=args.reading_graph_cycle_target_power,
+                graph_cycle_consistency_w=args.reading_graph_cycle_consistency_w,
                 context_target_w=args.reading_context_target_w,
                 context_keep_p=args.reading_context_keep_p,
                 context_target_temperature=args.reading_context_target_temperature,

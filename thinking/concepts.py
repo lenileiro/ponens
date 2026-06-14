@@ -192,6 +192,16 @@ class LatentConceptMemory(nn.Module):
             transitive_steps=transitive_steps, transitive_w=transitive_w,
             target_power=target_power)
 
+    def graph_cycle_loss(self, source_slots, target_slots, temperature=0.1,
+                         self_loop_w=0.05, transitive_steps=2,
+                         transitive_w=0.1, target_power=1.0,
+                         cycle_w=0.5):
+        return latent_concept_graph_cycle_loss(
+            source_slots, target_slots, self.active(), self.active_prediction_relations(),
+            temperature=temperature, self_loop_w=self_loop_w,
+            transitive_steps=transitive_steps, transitive_w=transitive_w,
+            target_power=target_power, cycle_w=cycle_w)
+
     @torch.no_grad()
     def update(self, slots, momentum=0.95, relation_decay=None):
         if slots is None:
@@ -626,6 +636,90 @@ def latent_concept_graph_prediction_loss(source_slots, target_slots, memory,
     if scores.numel() == 0:
         return torch.tensor(0.0)
     return scores.mean()
+
+
+def latent_concept_graph_cycle_loss(source_slots, target_slots, memory, relations,
+                                    temperature=0.1, self_loop_w=0.05,
+                                    transitive_steps=2, transitive_w=0.1,
+                                    target_power=1.0, cycle_w=0.5):
+    """Make learned concept transitions reversible enough to support discovery.
+
+    Source slots and target slots are two views of the same example: a context and
+    its held-out continuation, or a partial modality and the fuller multimodal
+    observation.  The learned graph should predict target concepts from source
+    concepts and also reconstruct each side after a forward-then-reverse walk.
+    The objective is entirely defined by the model's own prototype memory and
+    graph; it does not need labels, answer choices, schemas, or hand-authored
+    language rules.
+    """
+    if source_slots is None or target_slots is None:
+        return _latent_graph_zero_scores(source_slots, target_slots).sum()
+    if memory is None or memory.numel() == 0:
+        return source_slots.sum() * 0.0
+    if relations is None or relations.numel() == 0:
+        return source_slots.sum() * 0.0
+    if source_slots.ndim != 3 or target_slots.ndim != 3:
+        raise ValueError("latent graph cycle expects [batch, slots, dim]")
+    if source_slots.shape[0] != target_slots.shape[0]:
+        raise ValueError("latent graph cycle batch mismatch")
+    if source_slots.shape[-1] != target_slots.shape[-1]:
+        raise ValueError("latent graph cycle source/target dimension mismatch")
+    if source_slots.shape[-1] != memory.shape[-1]:
+        raise ValueError("latent graph cycle memory dimension mismatch")
+    mem = F.normalize(
+        memory.to(device=source_slots.device, dtype=source_slots.dtype), dim=-1)
+    rel = _latent_relation_targets(
+        relations, mem.shape[0], source_slots.device, source_slots.dtype,
+        self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+        transitive_w=transitive_w)
+    rev = _latent_relation_targets(
+        relations.t(), mem.shape[0], source_slots.device, source_slots.dtype,
+        self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+        transitive_w=transitive_w)
+    if rel is None or rev is None:
+        return source_slots.sum() * 0.0
+    temp = max(float(temperature), 1e-6)
+    power = float(target_power)
+    if power <= 0.0:
+        raise ValueError("latent graph cycle target power must be positive")
+    cyc_w = float(cycle_w)
+    if cyc_w < 0.0:
+        raise ValueError("latent graph cycle weight must be non-negative")
+
+    source = F.normalize(source_slots, dim=-1)
+    target = F.normalize(target_slots.to(source_slots), dim=-1)
+    source_dist = (source.matmul(mem.t()) / temp).softmax(-1).mean(1)
+    target_dist = (target.matmul(mem.t()) / temp).softmax(-1).mean(1)
+    source_target = source_dist.detach()
+    target_target = target_dist.detach()
+    if power != 1.0:
+        source_target = source_target.clamp_min(1e-8).pow(power)
+        target_target = target_target.clamp_min(1e-8).pow(power)
+    source_target = source_target / source_target.sum(-1, keepdim=True).clamp_min(1e-8)
+    target_target = target_target / target_target.sum(-1, keepdim=True).clamp_min(1e-8)
+
+    forward = source_dist.matmul(rel)
+    forward = forward / forward.sum(-1, keepdim=True).clamp_min(1e-8)
+    reverse = target_dist.matmul(rev)
+    reverse = reverse / reverse.sum(-1, keepdim=True).clamp_min(1e-8)
+    losses = [
+        F.kl_div(forward.clamp_min(1e-8).log(), target_target, reduction="batchmean"),
+        F.kl_div(reverse.clamp_min(1e-8).log(), source_target, reduction="batchmean"),
+    ]
+    if cyc_w:
+        source_cycle = forward.matmul(rev)
+        source_cycle = source_cycle / source_cycle.sum(-1, keepdim=True).clamp_min(1e-8)
+        target_cycle = reverse.matmul(rel)
+        target_cycle = target_cycle / target_cycle.sum(-1, keepdim=True).clamp_min(1e-8)
+        losses.extend([
+            cyc_w * F.kl_div(
+                source_cycle.clamp_min(1e-8).log(), source_target,
+                reduction="batchmean"),
+            cyc_w * F.kl_div(
+                target_cycle.clamp_min(1e-8).log(), target_target,
+                reduction="batchmean"),
+        ])
+    return torch.stack(losses).mean()
 
 
 class SchemaConceptHead(nn.Module):
