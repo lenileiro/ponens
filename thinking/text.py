@@ -2369,15 +2369,37 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
                 fer_eval=fer, bridge_eval=bridge)}
 
 
-def reading_latent_bridge_eval(model, vocab, records, device=DEV, n=0, seed=0,
-                               feature_dropout=0.0):
+def reading_latent_bridge_graph_state(model):
     memory = getattr(model, "latent_concept_memory", None)
     if getattr(model, "latent_concepts", None) is None or memory is None:
+        return None
+    return {
+        "memory": memory.active().detach().clone(),
+        "relations": memory.active_relations().detach().clone(),
+        "transitions": memory.active_transitions().detach().clone(),
+        "memory_filled": int(
+            getattr(memory, "filled", torch.zeros((), dtype=torch.long)).item()),
+        "relation_updates": int(
+            getattr(memory, "relation_updates",
+                    torch.zeros((), dtype=torch.long)).item()),
+        "transition_updates": int(
+            getattr(memory, "transition_updates",
+                    torch.zeros((), dtype=torch.long)).item()),
+    }
+
+
+def reading_latent_bridge_eval(model, vocab, records, device=DEV, n=0, seed=0,
+                               feature_dropout=0.0, bridge_graph=None):
+    graph_source = "snapshot" if bridge_graph is not None else "current"
+    if bridge_graph is None:
+        bridge_graph = reading_latent_bridge_graph_state(model)
+    if getattr(model, "latent_concepts", None) is None or bridge_graph is None:
         return {"n_records": 0, "sampled": False, "mean_bridge_score": 0.0,
                 "max_bridge_score": 0.0, "mean_bridge_entropy": 0.0,
                 "mean_bridge_connectivity": 1.0, "memory_filled": 0,
                 "relation_updates": 0, "transition_updates": 0,
-                "graph_ready": False, "skipped": True,
+                "graph_ready": False, "graph_source": graph_source,
+                "skipped": True,
                 "skip_reason": "latent_concept_memory_unavailable"}
     candidates = list(records)
     sampled = bool(n and n < len(candidates))
@@ -2390,16 +2412,15 @@ def reading_latent_bridge_eval(model, vocab, records, device=DEV, n=0, seed=0,
                 "max_bridge_score": 0.0, "mean_bridge_entropy": 0.0,
                 "mean_bridge_connectivity": 1.0, "memory_filled": 0,
                 "relation_updates": 0, "transition_updates": 0,
-                "graph_ready": False, "skipped": True,
+                "graph_ready": False, "graph_source": graph_source,
+                "skipped": True,
                 "skip_reason": "no_records"}
-    active_memory = memory.active()
-    relations = memory.active_relations()
-    transitions = memory.active_transitions()
+    active_memory = bridge_graph["memory"]
+    relations = bridge_graph["relations"]
+    transitions = bridge_graph["transitions"]
     filled = int(active_memory.shape[0])
-    relation_updates = int(
-        getattr(memory, "relation_updates", torch.zeros((), dtype=torch.long)).item())
-    transition_updates = int(
-        getattr(memory, "transition_updates", torch.zeros((), dtype=torch.long)).item())
+    relation_updates = int(bridge_graph.get("relation_updates", 0))
+    transition_updates = int(bridge_graph.get("transition_updates", 0))
 
     def has_offdiag_edges(mat):
         if mat is None or mat.numel() == 0 or mat.shape[0] <= 1:
@@ -2418,7 +2439,8 @@ def reading_latent_bridge_eval(model, vocab, records, device=DEV, n=0, seed=0,
                 "memory_filled": filled,
                 "relation_updates": relation_updates,
                 "transition_updates": transition_updates,
-                "graph_ready": False, "skipped": True,
+                "graph_ready": False, "graph_source": graph_source,
+                "skipped": True,
                 "skip_reason": "latent_concept_graph_unavailable"}
     score_values = []
     entropy_values = []
@@ -2450,6 +2472,7 @@ def reading_latent_bridge_eval(model, vocab, records, device=DEV, n=0, seed=0,
             "relation_updates": relation_updates,
             "transition_updates": transition_updates,
             "graph_ready": True,
+            "graph_source": graph_source,
             "skipped": False}
 
 
@@ -3289,6 +3312,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     clusters = []
     cluster_reports = []
     study_pool = []
+    study_pool_bridge_reference = None
     study_reports = []
     last_loss = 0.0
     last_view_loss = 0.0
@@ -3329,7 +3353,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         return filled > 0 and (relation_updates > 0 or transition_updates > 0)
 
     def refresh_study_pool(step):
-        nonlocal study_pool
+        nonlocal study_pool, study_pool_bridge_reference
         probe_n = int(study_probe_n) if int(study_probe_n) > 0 else max(batch * 4, 1)
         if study_strategy == "curiosity":
             selected, report = reading_latent_curiosity_records(
@@ -3407,9 +3431,10 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
             report = report | {"capped": False, "n_error_records_used": len(selected)}
         if selected:
             study_pool = selected
+            study_pool_bridge_reference = reading_latent_bridge_graph_state(model)
         pool_bridge = reading_latent_bridge_eval(
             model, vocab, selected, device=device, n=0, seed=seed + 1871 + int(step),
-            feature_dropout=0.0)
+            feature_dropout=0.0, bridge_graph=study_pool_bridge_reference)
         report = report | {"step": int(step), "pool_active": bool(study_pool),
                            "pool_size": len(study_pool),
                            "hard_record_ids": selected_id_sample(selected),
@@ -3659,6 +3684,16 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     study_pool_bridge_after = (
         reading_latent_bridge_eval(
             model, vocab, study_pool, device=device, n=0, seed=seed + 2909,
+            feature_dropout=0.0, bridge_graph=study_pool_bridge_reference)
+        if study_pool else {"n_records": 0, "sampled": False,
+                            "mean_bridge_score": 0.0,
+                            "max_bridge_score": 0.0,
+                            "mean_bridge_entropy": 0.0,
+                            "mean_bridge_connectivity": 1.0,
+                            "skipped": True})
+    study_pool_bridge_after_current = (
+        reading_latent_bridge_eval(
+            model, vocab, study_pool, device=device, n=0, seed=seed + 2917,
             feature_dropout=0.0)
         if study_pool else {"n_records": 0, "sampled": False,
                             "mean_bridge_score": 0.0,
@@ -3803,6 +3838,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "context_target_temperature": float(context_target_temperature),
         "study_pool_bridge_before": study_pool_bridge_before,
         "study_pool_bridge_after": study_pool_bridge_after,
+        "study_pool_bridge_after_current": study_pool_bridge_after_current,
         "study_pool_insight": study_pool_insight,
         "study_pool_bridge_score_reduction": float(bridge_score_reduction),
         "study_pool_bridge_connectivity_gain": float(bridge_connectivity_gain),
@@ -3893,6 +3929,8 @@ def fit_reading_concepts_select_best(
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=score_metric,
         score_margin_w=score_margin_w)
+    bridge_insight_gate = bool(
+        bridge_w and initial_study_strategy in READING_POOL_STUDY_STRATEGIES)
     replay_records = list(replay_records or [])
     before_replay_bundle = None
     if replay_records and replay_retention_w:
@@ -3925,6 +3963,15 @@ def fit_reading_concepts_select_best(
             "replay_score_components": (
                 replay_bundle["score_components"] if replay_bundle is not None else None),
         }
+
+    def bridge_insight_delta(insight):
+        if (not bridge_insight_gate or not insight
+                or bool(insight.get("skipped", True))):
+            return 0.0, True
+        reduction = float(insight.get("bridge_score_reduction", 0.0))
+        connectivity = float(insight.get("bridge_connectivity_gain", 0.0))
+        delta = 0.5 * (reduction + connectivity)
+        return float(delta), delta >= -1e-9
 
     best_state = _model_state_copy(model)
     initial_replay_bundle = before_replay_bundle
@@ -4042,11 +4089,15 @@ def fit_reading_concepts_select_best(
         row = selection_row(round_i, round_steps, bundle, replay_bundle)
         score = float(row["score"])
         score_delta_from_best = float(score - best_score)
-        selected = score_delta_from_best > score_min_delta
+        insight = round_train_metrics.get("study_pool_insight")
+        insight_delta, insight_allowed = bridge_insight_delta(insight)
+        selected = insight_allowed and score_delta_from_best > score_min_delta
         rounds_report.append(row | {
             "selected": bool(selected),
             "score_delta_from_best": score_delta_from_best,
-            "study_pool_insight": round_train_metrics.get("study_pool_insight"),
+            "bridge_insight_delta": float(insight_delta),
+            "bridge_insight_allowed": bool(insight_allowed),
+            "study_pool_insight": insight,
             "study_pool_bridge_before": round_train_metrics.get(
                 "study_pool_bridge_before"),
             "study_pool_bridge_after": round_train_metrics.get(
@@ -4076,6 +4127,7 @@ def fit_reading_concepts_select_best(
         "score_margin_w": float(score_margin_w),
         "score_min_delta": float(score_min_delta),
         "score_patience": int(score_patience),
+        "bridge_insight_gate": bool(bridge_insight_gate),
         "stopped_early": bool(stopped_early),
         "stop_round": int(stop_round),
         "no_improve_rounds": int(no_improve_rounds),
@@ -6735,6 +6787,9 @@ def selftest():
     insight = reading_model.reading_train_metrics["study_pool_insight"]
     assert "bridge_score_reduction" in insight
     assert math.isfinite(insight["bridge_connectivity_gain"])
+    assert (reading_model.reading_train_metrics[
+        "study_pool_bridge_before"].get("graph_source") == "snapshot")
+    assert "study_pool_bridge_after_current" in reading_model.reading_train_metrics
     patience_model = TextFactLM(
         len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
         fact_schema=None, latent_concept_slots=2,
@@ -6744,7 +6799,9 @@ def selftest():
         batch=2, lr=1e-4, seed=7, device="cpu", log_every=10,
         token_drop_p=0.1, token_replace_p=0.0, study_strategy="auto",
         study_probe_n=2, study_hard_max=1, study_refresh_steps=1,
-        memory_size=8, eval_n=0, score_min_delta=999.0, score_patience=1)
+        memory_size=8, bridge_w=0.1, eval_n=0, score_min_delta=999.0,
+        score_patience=1)
+    assert patience_selection["bridge_insight_gate"] is True
     assert patience_selection["stopped_early"] is True
     assert patience_selection["rounds_run"] == 1
     assert patience_selection["stop_round"] == 1
