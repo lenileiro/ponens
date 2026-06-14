@@ -95,13 +95,21 @@ def _jsonable_meta(meta):
     return json.loads(json.dumps(meta, default=str))
 
 
-def reading_record_to_bank_row(rec):
+def reading_record_to_bank_row(rec, replay_meta=None):
+    replay_meta = dict(replay_meta or {})
+    if not replay_meta and isinstance(rec.meta, dict):
+        replay_meta = {
+            "priority": rec.meta.get("replay_priority", 0.0),
+            "reasons": rec.meta.get("replay_reasons", ()),
+        }
     return {
         "id": str(rec.rec_id),
         "split": str(rec.split),
         "tokens": list(rec.tokens),
         "kind": str(rec.kind),
         "meta": _jsonable_meta(rec.meta),
+        "replay_priority": float(replay_meta.get("priority", 0.0)),
+        "replay_reasons": list(replay_meta.get("reasons", ())),
     }
 
 
@@ -116,6 +124,10 @@ def reading_record_from_bank_row(row, idx=0):
         raise ValueError(f"reading replay bank row {idx} has no tokens")
     meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
     meta = meta | {"replay_bank": True}
+    if "replay_priority" in row:
+        meta["replay_priority"] = float(row.get("replay_priority", 0.0))
+    if "replay_reasons" in row:
+        meta["replay_reasons"] = list(row.get("replay_reasons", ()))
     return ReadingRecord(
         rec_id=str(row.get("id", f"reading-replay-{idx}")),
         split=split,
@@ -151,6 +163,38 @@ def reading_hard_record_ids(study_reports):
     return ids
 
 
+def reading_replay_record_metadata(study_reports):
+    meta = {}
+
+    def bump(rec_id, reason, priority):
+        rec_id = str(rec_id)
+        if not rec_id:
+            return
+        row = meta.setdefault(rec_id, {"priority": 0.0, "reasons": []})
+        row["priority"] = max(float(row["priority"]), float(priority))
+        if reason and reason not in row["reasons"]:
+            row["reasons"].append(reason)
+
+    for report in study_reports or ():
+        if not isinstance(report, dict):
+            continue
+        strategy = str(report.get("strategy", "study"))
+        score = float(report.get("mean_score", report.get("mean_gap_score", 0.0)) or 0.0)
+        for raw_id in report.get("hard_record_ids", ()):
+            bump(raw_id, f"hard:{strategy}", 2.0 + score)
+        insight = report.get("study_pool_insight")
+        if isinstance(insight, dict):
+            insight_delta = max(
+                0.0,
+                float(insight.get("bridge_score_reduction", 0.0))
+                + float(insight.get("bridge_connectivity_gain", 0.0)))
+            for raw_id in insight.get("record_ids", ()):
+                bump(raw_id, "concept_insight", 1.5 + insight_delta)
+        for raw_id in report.get("record_ids", ()):
+            bump(raw_id, f"study_pool:{strategy}", 1.0 + score)
+    return meta
+
+
 def build_reading_replay_bank(records, study_reports=None,
                               max_records=READING_REPLAY_BANK_SIZE, seed=0):
     max_records = int(max_records)
@@ -160,13 +204,32 @@ def build_reading_replay_bank(records, study_reports=None,
     records = unique_reading_records_by_id(records)
     by_id = {rec.rec_id: rec for rec in records}
     hard_ids = reading_hard_record_ids(study_reports)
+    replay_meta = reading_replay_record_metadata(study_reports)
+    for rec in records:
+        if not isinstance(getattr(rec, "meta", None), dict):
+            continue
+        priority = float(rec.meta.get("replay_priority", 0.0) or 0.0)
+        if priority <= 0.0:
+            continue
+        row = replay_meta.setdefault(rec.rec_id, {"priority": 0.0, "reasons": []})
+        row["priority"] = max(float(row["priority"]), priority)
+        for reason in rec.meta.get("replay_reasons", ()) or ():
+            if reason not in row["reasons"]:
+                row["reasons"].append(reason)
     hard_id_set = set(hard_ids)
     hard = [by_id[rec_id] for rec_id in hard_ids if rec_id in by_id]
+    insight = [
+        by_id[rec_id] for rec_id, meta in sorted(
+            replay_meta.items(),
+            key=lambda item: float(item[1].get("priority", 0.0)),
+            reverse=True)
+        if rec_id in by_id and rec_id not in hard_id_set]
+    priority_ids = hard_id_set | {rec.rec_id for rec in insight}
     evals = [rec for rec in records if rec.split == "eval"
-             and rec.rec_id not in {r.rec_id for r in hard}]
+             and rec.rec_id not in priority_ids]
     train = [rec for rec in records if rec.split == "train"
-             and rec.rec_id not in {r.rec_id for r in hard}]
-    ordered = unique_reading_records_by_id(hard, evals, train)
+             and rec.rec_id not in priority_ids]
+    ordered = unique_reading_records_by_id(hard, insight, evals, train)
     if len(ordered) > max_records:
         keep = ordered[:max_records]
         if hard:
@@ -184,7 +247,11 @@ def build_reading_replay_bank(records, study_reports=None,
         "max_records": max_records,
         "record_count": len(ordered),
         "hard_record_count": sum(1 for rec in ordered if rec.rec_id in hard_id_set),
-        "records": [reading_record_to_bank_row(rec) for rec in ordered],
+        "priority_record_count": sum(
+            1 for rec in ordered if rec.rec_id in replay_meta),
+        "records": [
+            reading_record_to_bank_row(rec, replay_meta.get(rec.rec_id))
+            for rec in ordered],
     }
 
 
@@ -412,6 +479,7 @@ class TextReadingLM(nn.Module):
     def __init__(self, vocab_size, d=96, layers=3, heads=4, pad=0, max_len=512,
                  text_encoder_arch="transformer", text_encoder_layers=1,
                  latent_concept_slots=0, latent_concept_layers=1,
+                 latent_concept_topk=0,
                  latent_concept_prefix=False,
                  latent_concept_refine=False,
                  latent_concept_refine_gate_init=-2.0,
@@ -421,6 +489,7 @@ class TextReadingLM(nn.Module):
         self.heads = int(heads)
         self.latent_concept_slots = int(latent_concept_slots)
         self.latent_concept_layers = int(latent_concept_layers)
+        self.latent_concept_topk = int(latent_concept_topk)
         self.latent_concept_prefix = bool(latent_concept_prefix)
         self.latent_concept_refine = bool(latent_concept_refine)
         self.latent_concept_refine_gate_init = float(latent_concept_refine_gate_init)
@@ -430,6 +499,8 @@ class TextReadingLM(nn.Module):
             raise ValueError("latent concept prefix/refine require latent slots")
         if self.latent_concept_memory_size < 0:
             raise ValueError("latent concept memory size must be non-negative")
+        if self.latent_concept_topk < 0:
+            raise ValueError("latent concept topk must be non-negative")
         if self.latent_concept_memory_size and self.latent_concept_slots <= 0:
             raise ValueError("latent concept memory requires latent slots")
         self.text_encoder_arch = str(text_encoder_arch)
@@ -443,7 +514,8 @@ class TextReadingLM(nn.Module):
         self.latent_concept_refiner = None
         self.latent_concepts = (LatentConceptHead(
             self.latent_concept_slots, d, heads=heads,
-            mixer_layers=self.latent_concept_layers)
+            mixer_layers=self.latent_concept_layers,
+            topk=self.latent_concept_topk)
             if self.latent_concept_slots > 0 else None)
         self.latent_concept_memory = (LatentConceptMemory(
             self.latent_concept_memory_size, d)
@@ -452,10 +524,13 @@ class TextReadingLM(nn.Module):
             self.latent_concept_refiner = SchemaConceptRefiner(
                 d, heads=heads, gate_init=self.latent_concept_refine_gate_init)
 
-    def enable_latent_concepts(self, slots, heads=None, layers=1):
+    def enable_latent_concepts(self, slots, heads=None, layers=1, topk=None):
         slots = int(slots)
         latent_heads = int(heads or self.heads)
         latent_layers = int(layers)
+        latent_topk = int(self.latent_concept_topk if topk is None else topk)
+        if latent_topk < 0:
+            raise ValueError("latent concept topk must be non-negative")
         if slots <= 0:
             self.latent_concepts = None
             self.latent_concept_slots = 0
@@ -464,17 +539,22 @@ class TextReadingLM(nn.Module):
             self.latent_concept_refiner = None
             self.latent_concept_memory = None
             self.latent_concept_memory_size = 0
+            self.latent_concept_topk = 0
             return self
         if (self.latent_concepts is None
                 or self.latent_concept_slots != slots
                 or getattr(self.latent_concepts, "heads", latent_heads) != latent_heads
                 or getattr(self.latent_concepts, "mixer_layers", latent_layers)
-                != latent_layers):
+                != latent_layers
+                or getattr(self.latent_concepts, "topk", latent_topk)
+                != latent_topk):
             self.latent_concepts = LatentConceptHead(
-                slots, self.d, heads=latent_heads, mixer_layers=latent_layers)
+                slots, self.d, heads=latent_heads, mixer_layers=latent_layers,
+                topk=latent_topk)
             self.latent_concepts.to(next(self.parameters()).device)
         self.latent_concept_slots = slots
         self.latent_concept_layers = latent_layers
+        self.latent_concept_topk = latent_topk
         return self
 
     def enable_latent_concept_memory(self, size):
@@ -666,6 +746,26 @@ def pack_reading(records, vocab, device):
 
 def batch_records(records, rng, batch):
     return [records[int(rng.integers(len(records)))] for _ in range(batch)]
+
+
+def reading_replay_sampling_weights(records, priority_power=1.0):
+    weights = []
+    for rec in records or ():
+        priority = 0.0
+        if isinstance(getattr(rec, "meta", None), dict):
+            priority = float(rec.meta.get("replay_priority", 0.0) or 0.0)
+        weights.append(max(0.0, priority) ** float(priority_power))
+    total = float(sum(weights))
+    if total <= 0.0:
+        return None
+    return [float(w) / total for w in weights]
+
+
+def batch_replay_records(records, rng, batch, weights=None):
+    if not weights:
+        return batch_records(records, rng, batch)
+    idx = rng.choice(len(records), size=int(batch), replace=True, p=np.asarray(weights))
+    return [records[int(i)] for i in idx]
 
 
 def copy_pretrained_text_weights(src_model, src_vocab, dst_model, dst_vocab):
@@ -2157,6 +2257,10 @@ READING_TRANSITION_STUDY_STRATEGIES = (
 READING_GRAPH_READY_STUDY_STRATEGIES = ("graph", "cycle", "gap")
 READING_BRIDGE_INSIGHT_STUDY_STRATEGIES = (
     "curiosity", "graph", "cycle", "gap", "discovery")
+READING_CONCEPT_INSIGHT_SCORE_KEYS = (
+    "floor_score", "balanced_score", "signal_coverage", "fer_score",
+    "bridge_score", "bridge_connectivity", "neighborhood_score",
+    "cluster_score")
 READING_SELF_TEACH_SCORE_KEYS = {
     "view": "view_score",
     "context": "context_score",
@@ -2382,6 +2486,62 @@ def reading_self_teach_weight_maps(score_components=None, budget=0.0,
         key: float(base[key]) + float(extras.get(key, 0.0))
         for key in READING_SELF_TEACH_WEIGHT_KEYS}
     return plan, base, effective
+
+
+def reading_bridge_insight_delta(insight, enabled=True):
+    if (not enabled or not insight or bool(insight.get("skipped", True))):
+        return 0.0, True
+    reduction = float(insight.get("bridge_score_reduction", 0.0))
+    connectivity = float(insight.get("bridge_connectivity_gain", 0.0))
+    delta = 0.5 * (reduction + connectivity)
+    return float(delta), delta >= -1e-9
+
+
+def reading_concept_insight_report(before_score_components=None,
+                                   after_score_components=None,
+                                   bridge_insight=None, enabled=True):
+    """Measure concept-level discovery separate from the selected score."""
+    if not enabled:
+        return {
+            "enabled": False,
+            "allowed": True,
+            "delta": 0.0,
+            "raw_delta": 0.0,
+            "positive_signal_gain": 0.0,
+            "negative_signal_drift": 0.0,
+            "bridge_delta": 0.0,
+            "bridge_allowed": True,
+            "signal_gains": {},
+        }
+    before_score_components = before_score_components or {}
+    after_score_components = after_score_components or {}
+    gains = {}
+    positive = 0.0
+    negative = 0.0
+    for key in READING_CONCEPT_INSIGHT_SCORE_KEYS:
+        before = float(before_score_components.get(key, 0.0))
+        after = float(after_score_components.get(key, before))
+        gain = after - before
+        gains[key] = float(gain)
+        positive += max(0.0, gain)
+        negative += max(0.0, -gain)
+    denom = float(max(1, len(READING_CONCEPT_INSIGHT_SCORE_KEYS)))
+    positive_mean = positive / denom
+    negative_mean = negative / denom
+    bridge_delta, bridge_allowed = reading_bridge_insight_delta(
+        bridge_insight, enabled=bridge_insight is not None)
+    raw_delta = positive_mean + max(0.0, bridge_delta) - 0.5 * negative_mean
+    return {
+        "enabled": True,
+        "allowed": bool(bridge_allowed and raw_delta >= -1e-9),
+        "delta": float(max(0.0, raw_delta)),
+        "raw_delta": float(raw_delta),
+        "positive_signal_gain": float(positive_mean),
+        "negative_signal_drift": float(negative_mean),
+        "bridge_delta": float(bridge_delta),
+        "bridge_allowed": bool(bridge_allowed),
+        "signal_gains": gains,
+    }
 
 
 def reading_discovery_score_components(view_eval, context_eval, metric="both",
@@ -3886,6 +4046,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("cannot train reading concepts without train records")
     replay_records = list(replay_records or [])
     replay_sources = [r for r in replay_records if r.split == "train"] or replay_records
+    replay_sampling_weights = reading_replay_sampling_weights(replay_sources)
+    replay_priority_active = replay_sampling_weights is not None
     if int(memory_size) > 0:
         model.enable_latent_concept_memory(int(memory_size))
     study_strategy = resolve_reading_study_strategy(
@@ -4004,6 +4166,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_transition = 0.0
     last_cluster = 0.0
     last_replay = 0.0
+    last_replay_priority_mean = 0.0
+    last_replay_priority_max = 0.0
 
     def selected_id_sample(selected, limit=16):
         return [rec.rec_id for rec in selected[:int(limit)]]
@@ -4504,7 +4668,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 min_cluster_size=cluster_min_size)
         replay_loss = view_loss * 0.0
         if replay_w and replay_sources:
-            replay_batch_records = batch_records(replay_sources, rng, replay_batch)
+            replay_batch_records = batch_replay_records(
+                replay_sources, rng, replay_batch, weights=replay_sampling_weights)
             replay_loss = reading_teacher_latent_consistency_loss(
                 model, replay_teacher_model, replay_batch_records, vocab,
                 replay_teacher_vocab, device=device,
@@ -4645,6 +4810,13 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_transition = float(transition_loss.detach())
         last_cluster = float(cluster_loss.detach())
         last_replay = float(replay_loss.detach())
+        replay_priorities = [
+            float(getattr(rec, "meta", {}).get("replay_priority", 0.0) or 0.0)
+            for rec in replay_batch_records] if replay_w and replay_sources else []
+        last_replay_priority_mean = (
+            sum(replay_priorities) / float(len(replay_priorities))
+            if replay_priorities else 0.0)
+        last_replay_priority_max = max(replay_priorities) if replay_priorities else 0.0
         if st % log_every == 0 or st == steps:
             print(f"  reading {st}/{steps} loss {last_loss:.3f} "
                   f"view {last_view_loss:.3f} "
@@ -4905,6 +5077,13 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "replay_w": float(replay_w),
         "replay_batch": int(replay_batch),
         "replay_records": len(replay_sources),
+        "replay_priority_sampling": bool(replay_priority_active),
+        "replay_priority_record_count": int(
+            sum(1 for rec in replay_sources
+                if float(getattr(rec, "meta", {}).get("replay_priority", 0.0)
+                         or 0.0) > 0.0)),
+        "replay_priority_mean": float(last_replay_priority_mean),
+        "replay_priority_max": float(last_replay_priority_max),
         "context_target_w": float(context_target_w),
         "context_keep_p": float(context_keep_p),
         "context_target_temperature": float(context_target_temperature),
@@ -5082,15 +5261,6 @@ def fit_reading_concepts_select_best(
                 replay_bundle["score_components"] if replay_bundle is not None else None),
         }
 
-    def bridge_insight_delta(insight, round_bridge_insight_gate):
-        if (not round_bridge_insight_gate or not insight
-                or bool(insight.get("skipped", True))):
-            return 0.0, True
-        reduction = float(insight.get("bridge_score_reduction", 0.0))
-        connectivity = float(insight.get("bridge_connectivity_gain", 0.0))
-        delta = 0.5 * (reduction + connectivity)
-        return float(delta), delta >= -1e-9
-
     best_state = _model_state_copy(model)
     initial_replay_bundle = before_replay_bundle
     initial_row = selection_row(0, 0, before_bundle, initial_replay_bundle)
@@ -5141,6 +5311,9 @@ def fit_reading_concepts_select_best(
         round_bridge_insight_gate = bool(
             bridge_w and round_study_strategy in (
                 READING_BRIDGE_INSIGHT_STUDY_STRATEGIES))
+        round_concept_insight_gate = bool(
+            round_study_strategy in READING_BRIDGE_INSIGHT_STUDY_STRATEGIES
+            and getattr(model, "latent_concept_memory", None) is not None)
         fit_reading_concepts(
             model, vocab, records, steps=round_steps, batch=batch, lr=lr,
             seed=seed + round_i * 1009, device=device, log_every=log_every,
@@ -5301,12 +5474,16 @@ def fit_reading_concepts_select_best(
         row["target_met"] = bool(score_target > 0.0 and score >= score_target)
         score_delta_from_best = float(score - best_score)
         insight = round_train_metrics.get("study_pool_insight")
-        insight_delta, insight_allowed = bridge_insight_delta(
+        bridge_delta, bridge_allowed = reading_bridge_insight_delta(
             insight, round_bridge_insight_gate)
+        concept_insight = reading_concept_insight_report(
+            current_bundle["score_components"], bundle["score_components"],
+            bridge_insight=insight, enabled=round_concept_insight_gate)
         decision = reading_round_selection_decision(
             score_delta_from_best, score_min_delta,
-            insight_delta=insight_delta, insight_allowed=insight_allowed,
-            bridge_insight_gate=round_bridge_insight_gate,
+            insight_delta=concept_insight["delta"],
+            insight_allowed=concept_insight["allowed"],
+            bridge_insight_gate=round_concept_insight_gate,
             insight_accept_w=insight_accept_w,
             insight_min_delta=insight_min_delta)
         selected = decision["selected"]
@@ -5319,8 +5496,20 @@ def fit_reading_concepts_select_best(
             "study_strategy_used": round_study_strategy,
             "study_strategy_requested": str(study_strategy),
             "bridge_insight_gate": bool(round_bridge_insight_gate),
-            "bridge_insight_delta": float(insight_delta),
-            "bridge_insight_allowed": bool(insight_allowed),
+            "bridge_insight_delta": float(bridge_delta),
+            "bridge_insight_allowed": bool(bridge_allowed),
+            "concept_insight_gate": bool(round_concept_insight_gate),
+            "concept_insight_delta": float(concept_insight["delta"]),
+            "concept_insight_allowed": bool(concept_insight["allowed"]),
+            "concept_insight": concept_insight,
+            "replay_priority_sampling": bool(
+                round_train_metrics.get("replay_priority_sampling", False)),
+            "replay_priority_record_count": int(
+                round_train_metrics.get("replay_priority_record_count", 0)),
+            "replay_priority_mean": float(
+                round_train_metrics.get("replay_priority_mean", 0.0)),
+            "replay_priority_max": float(
+                round_train_metrics.get("replay_priority_max", 0.0)),
             "selected_by_score": bool(decision["selected_by_score"]),
             "selected_by_insight": bool(decision["selected_by_insight"]),
             "insight_score_boost": float(decision["insight_score_boost"]),
@@ -5377,6 +5566,9 @@ def fit_reading_concepts_select_best(
         "adaptive_study_strategy": str(study_strategy) == "auto",
         "branch_from_best": True,
         "bridge_insight_gate": bool(bridge_insight_gate),
+        "concept_insight_gate": bool(
+            initial_study_strategy in READING_BRIDGE_INSIGHT_STUDY_STRATEGIES
+            and getattr(model, "latent_concept_memory", None) is not None),
         "insight_accept_w": float(insight_accept_w),
         "insight_min_delta": float(insight_min_delta),
         "stopped_early": bool(stopped_early),
@@ -5427,6 +5619,7 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            text_encoder_arch="transformer", text_encoder_layers=1,
                            latent_concept_slots=READING_DEFAULT_LATENT_CONCEPT_SLOTS,
                            latent_concept_layers=1,
+                           latent_concept_topk=0,
                            latent_concept_prefix=False,
                            latent_concept_refine=False,
                            latent_concept_refine_gate_init=-2.0,
@@ -5521,6 +5714,7 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                        text_encoder_layers=text_encoder_layers,
                        latent_concept_slots=latent_concept_slots,
                        latent_concept_layers=latent_concept_layers,
+                       latent_concept_topk=latent_concept_topk,
                        latent_concept_prefix=latent_concept_prefix,
                        latent_concept_refine=latent_concept_refine,
                        latent_concept_refine_gate_init=(
@@ -5780,6 +5974,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          text_encoder_arch="transformer", text_encoder_layers=1,
                          latent_concept_slots=READING_DEFAULT_LATENT_CONCEPT_SLOTS,
                          latent_concept_layers=1,
+                         latent_concept_topk=0,
                          latent_concept_prefix=False, latent_concept_refine=False,
                          latent_concept_refine_gate_init=-2.0,
                          lr=1e-3, seed=0, device=DEV, log_every=100,
@@ -5875,6 +6070,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                        text_encoder_layers=text_encoder_layers,
                        latent_concept_slots=latent_concept_slots,
                        latent_concept_layers=latent_concept_layers,
+                       latent_concept_topk=latent_concept_topk,
                        latent_concept_prefix=latent_concept_prefix,
                        latent_concept_refine=latent_concept_refine,
                        latent_concept_refine_gate_init=(
@@ -6164,6 +6360,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "text_encoder_layers": int(text_encoder_layers),
               "latent_concept_slots": int(latent_concept_slots),
               "latent_concept_layers": int(latent_concept_layers),
+              "latent_concept_topk": int(latent_concept_topk),
               "latent_concept_prefix": bool(latent_concept_prefix),
               "latent_concept_refine": bool(latent_concept_refine),
               "latent_concept_refine_gate_init": float(
@@ -6391,6 +6588,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
 def expanded_reading_checkpoint_model(checkpoint, reading_records, device=DEV,
                                       latent_concept_slots=0,
                                       latent_concept_layers=None,
+                                      latent_concept_topk=None,
                                       latent_concept_prefix=None,
                                       latent_concept_refine=None,
                                       latent_concept_refine_gate_init=None,
@@ -6403,6 +6601,9 @@ def expanded_reading_checkpoint_model(checkpoint, reading_records, device=DEV,
                 or READING_DEFAULT_LATENT_CONCEPT_SLOTS)
     layers = int(latent_concept_layers if latent_concept_layers is not None
                  else ckpt.get("latent_concept_layers", 1))
+    topk = int(latent_concept_topk if latent_concept_topk is not None
+               else getattr(src_model, "latent_concept_topk",
+                            ckpt.get("latent_concept_topk", 0)))
     use_prefix = (bool(latent_concept_prefix)
                   if latent_concept_prefix is not None
                   else bool(ckpt.get("latent_concept_prefix", False)))
@@ -6425,6 +6626,7 @@ def expanded_reading_checkpoint_model(checkpoint, reading_records, device=DEV,
         text_encoder_layers=int(ckpt.get("text_encoder_layers", 1)),
         latent_concept_slots=slots,
         latent_concept_layers=layers,
+        latent_concept_topk=topk,
         latent_concept_prefix=use_prefix,
         latent_concept_refine=use_refine,
         latent_concept_refine_gate_init=refine_gate,
@@ -6523,6 +6725,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              text_field="text", max_tokens=128, min_tokens=8,
                              eval_frac=0.10, eval_n=64,
                              latent_concept_slots=0, latent_concept_layers=None,
+                             latent_concept_topk=None,
                              latent_concept_prefix=None,
                              latent_concept_refine=None,
                              latent_concept_refine_gate_init=None,
@@ -6552,6 +6755,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         checkpoint, records + replay_records, device=device,
         latent_concept_slots=latent_concept_slots,
         latent_concept_layers=latent_concept_layers,
+        latent_concept_topk=latent_concept_topk,
         latent_concept_prefix=latent_concept_prefix,
         latent_concept_refine=latent_concept_refine,
         latent_concept_refine_gate_init=latent_concept_refine_gate_init,
@@ -6883,6 +7087,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "text_encoder_layers": int(ckpt.get("text_encoder_layers", 1)),
               "latent_concept_slots": int(getattr(model, "latent_concept_slots", 0)),
               "latent_concept_layers": int(getattr(model, "latent_concept_layers", 1)),
+              "latent_concept_topk": int(getattr(model, "latent_concept_topk", 0)),
               "latent_concept_prefix": bool(
                   getattr(model, "latent_concept_prefix", False)),
               "latent_concept_refine": bool(
@@ -7162,6 +7367,8 @@ def load_checkpoint(path, device=DEV):
                               ckpt.get("latent_concept_slots", 0)),
                           latent_concept_layers=int(
                               ckpt.get("latent_concept_layers", 1)),
+                          latent_concept_topk=int(
+                              ckpt.get("latent_concept_topk", 0)),
                           latent_concept_prefix=bool(
                               ckpt.get("latent_concept_prefix", False)),
                           latent_concept_refine=bool(
@@ -7181,6 +7388,7 @@ def checkpoint_payload(model, vocab, d, layers, heads, report):
         "state_dict": model.state_dict(), "vocab": vocab.itos,
         "latent_concept_slots": int(getattr(model, "latent_concept_slots", 0)),
         "latent_concept_layers": int(getattr(model, "latent_concept_layers", 1)),
+        "latent_concept_topk": int(getattr(model, "latent_concept_topk", 0)),
         "latent_concept_prefix": bool(
             getattr(model, "latent_concept_prefix", False)),
         "latent_concept_refine": bool(
@@ -7232,6 +7440,15 @@ def selftest():
     assert (resolve_reading_study_strategy("auto", memoryless_reading_model)
             == "closure")
     reading_txt = pack_reading(reading_records[:2], reading_vocab, "cpu")
+    sparse_reading_model = TextReadingLM(
+        len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
+        latent_concept_slots=4, latent_concept_topk=2).to("cpu")
+    sparse_slots = sparse_reading_model.latent_concept_states(reading_txt)
+    assert int(sparse_slots.norm(dim=-1).gt(0.0).sum(dim=1).max().item()) <= 2
+    sparse_payload = checkpoint_payload(
+        sparse_reading_model, reading_vocab, d=32, layers=1, heads=4,
+        report={"experiment": "selftest_sparse_topk"})
+    assert sparse_payload["latent_concept_topk"] == 2
     assert torch.isfinite(reading_latent_view_loss(
         reading_model, reading_txt, reading_vocab.pad, reading_vocab.unk,
         token_drop_p=0.1, token_replace_p=0.0))
@@ -7441,6 +7658,21 @@ def selftest():
     assert self_teach_plan["weight_extras"]["bridge_w"] > 0.0
     assert math.isclose(sum(self_teach_plan["weight_extras"].values()),
                         0.12, rel_tol=1e-6, abs_tol=1e-6)
+    concept_insight = reading_concept_insight_report(
+        {"floor_score": 0.2, "signal_coverage": 0.5, "bridge_score": 0.2},
+        {"floor_score": 0.3, "signal_coverage": 0.75, "bridge_score": 0.4},
+        {"skipped": False, "bridge_score_reduction": 0.2,
+         "bridge_connectivity_gain": 0.1},
+        enabled=True)
+    assert concept_insight["allowed"] is True
+    assert concept_insight["delta"] > 0.0
+    regressed_concept_insight = reading_concept_insight_report(
+        {"floor_score": 0.8, "balanced_score": 0.8, "signal_coverage": 1.0},
+        {"floor_score": 0.1, "balanced_score": 0.2, "signal_coverage": 0.5},
+        {"skipped": False, "bridge_score_reduction": -0.2,
+         "bridge_connectivity_gain": -0.2},
+        enabled=True)
+    assert regressed_concept_insight["allowed"] is False
     mastery_kwargs = reading_objective_profile_kwargs(
         "mastery",
         factorization_w=0.0, fer_w=0.0, memory_w=0.0,
@@ -7677,6 +7909,7 @@ def selftest():
     assert helper_selection["enabled"] is True
     assert helper_selection["adaptive_study_strategy"] is True
     assert helper_selection["branch_from_best"] is True
+    assert helper_selection["concept_insight_gate"] is True
     assert helper_selection["self_teach_w"] == 0.05
     assert helper_selection["self_teach_reports"]
     assert helper_selection["self_teach_reports"][0]["branch_from_round"] == 0
@@ -7685,9 +7918,13 @@ def selftest():
     assert helper_selection["rounds"][1]["self_teach_plan"]["enabled"] is True
     assert helper_selection["rounds"][1]["study_strategy_used"] in (
         READING_STUDY_STRATEGIES)
+    assert "concept_insight" in helper_selection["rounds"][1]
+    assert "concept_insight_delta" in helper_selection["rounds"][1]
+    assert "replay_priority_sampling" in helper_selection["rounds"][1]
     if (helper_selection["rounds"][1]["study_strategy_used"]
             not in READING_BRIDGE_INSIGHT_STUDY_STRATEGIES):
         assert helper_selection["rounds"][1]["bridge_insight_gate"] is False
+        assert helper_selection["rounds"][1]["concept_insight_gate"] is False
     assert "self_teach_top_signal" in helper_selection["rounds"][1]
     assert helper_selection["accepted_update"] is False
     assert helper_selection["selected_round"] == 0
@@ -7725,12 +7962,55 @@ def selftest():
     assert reading_payload["reading_replay_bank"]["record_count"] > 0
     assert reading_replay_bank_records_from_payload(reading_payload)
     assert reading_payload["latent_concept_memory_size"] == 8
+    priority_replay_bank = build_reading_replay_bank(
+        reading_records,
+        study_reports=[{
+            "strategy": "discovery",
+            "mean_score": 0.4,
+            "hard_record_ids": ["read-eval-1"],
+            "study_pool_insight": {
+                "record_ids": ["read-train-2"],
+                "bridge_score_reduction": 0.3,
+                "bridge_connectivity_gain": 0.2,
+            },
+            "record_ids": ["read-train-3"],
+        }],
+        max_records=3)
+    assert priority_replay_bank["priority_record_count"] == 3
+    priority_rows = priority_replay_bank["records"]
+    assert priority_rows[0]["id"] == "read-eval-1"
+    assert "hard:discovery" in priority_rows[0]["replay_reasons"]
+    assert priority_rows[1]["id"] == "read-train-2"
+    assert "concept_insight" in priority_rows[1]["replay_reasons"]
+    priority_records = reading_replay_bank_records_from_payload(
+        {"reading_replay_bank": priority_replay_bank})
+    assert priority_records[0].meta["replay_priority"] > 0.0
+    assert "hard:discovery" in priority_records[0].meta["replay_reasons"]
+    carried_priority_bank = build_reading_replay_bank(
+        priority_records, study_reports=[], max_records=3)
+    assert carried_priority_bank["priority_record_count"] == 3
+    assert carried_priority_bank["records"][0]["replay_priority"] > 0.0
+    replay_weights = reading_replay_sampling_weights(priority_records)
+    assert replay_weights is not None
+    assert math.isclose(sum(replay_weights), 1.0, rel_tol=1e-6, abs_tol=1e-6)
+    assert replay_weights[0] == max(replay_weights)
+    priority_batch = batch_replay_records(
+        priority_records, np.random.default_rng(0), batch=8,
+        weights=replay_weights)
+    assert any(rec.rec_id == "read-eval-1" for rec in priority_batch)
     with tempfile.TemporaryDirectory() as td:
         base_ckpt = os.path.join(td, "reading_base.pt")
+        sparse_ckpt = os.path.join(td, "reading_sparse.pt")
         studied_ckpt = os.path.join(td, "reading_studied.pt")
         study_data = os.path.join(td, "study_reading.jsonl")
         study_out = os.path.join(td, "study_report.json")
         torch.save(reading_payload, base_ckpt)
+        torch.save(sparse_payload, sparse_ckpt)
+        sparse_loaded, _sparse_vocab, sparse_loaded_ckpt = load_checkpoint(
+            sparse_ckpt, device="cpu")
+        assert sparse_loaded_ckpt["latent_concept_topk"] == 2
+        assert sparse_loaded.latent_concept_topk == 2
+        assert sparse_loaded.latent_concepts.topk == 2
         study_rows = [
             {"id": "study-new-1", "split": "train",
              "text": "novel abstractions crystallize through rereading"},
@@ -7787,6 +8067,9 @@ def selftest():
         assert sum(study_report["train_metrics"]["self_teach_plan"][
             "weight_extras"].values()) > 0.0
         assert study_report["train_metrics"]["replay_records"] > 0
+        if reading_payload["reading_replay_bank"]["priority_record_count"] > 0:
+            assert study_report["train_metrics"]["replay_priority_sampling"] is True
+            assert study_report["train_metrics"]["replay_priority_record_count"] > 0
         assert math.isfinite(study_report["train_metrics"]["gap_loss"])
         _studied_model, studied_vocab, studied_payload = load_checkpoint(
             studied_ckpt, device="cpu")
@@ -8077,6 +8360,9 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--latent-concept-slots", type=int, default=0)
     ap.add_argument("--latent-concept-layers", type=int, default=1)
+    ap.add_argument("--latent-concept-topk", type=int, default=0,
+                    help=("keep only the top-k latent concept slots per record; "
+                          "0 keeps all slots"))
     ap.add_argument("--latent-concept-prefix", action="store_true")
     ap.add_argument("--latent-concept-refine", action="store_true")
     ap.add_argument("--latent-concept-refine-gate-init", type=float, default=-2.0)
@@ -8086,6 +8372,8 @@ def main(argv=None):
     if args.selftest:
         selftest()
         return
+    if args.latent_concept_topk < 0:
+        raise SystemExit("--latent-concept-topk must be non-negative")
     if not args.reading_data:
         raise SystemExit("--reading-data is required unless --selftest is set")
     reading_common = _reading_kwargs(args)
@@ -8100,6 +8388,7 @@ def main(argv=None):
             replay_retention_w=args.reading_replay_retention_w,
             latent_concept_slots=args.latent_concept_slots,
             latent_concept_layers=args.latent_concept_layers,
+            latent_concept_topk=args.latent_concept_topk,
             latent_concept_prefix=args.latent_concept_prefix,
             latent_concept_refine=args.latent_concept_refine,
             latent_concept_refine_gate_init=(
@@ -8113,6 +8402,7 @@ def main(argv=None):
         text_encoder_layers=args.text_encoder_layers,
         latent_concept_slots=_new_reading_latent_slots(args),
         latent_concept_layers=args.latent_concept_layers,
+        latent_concept_topk=args.latent_concept_topk,
         latent_concept_prefix=args.latent_concept_prefix,
         latent_concept_refine=args.latent_concept_refine,
         latent_concept_refine_gate_init=(

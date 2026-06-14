@@ -32,16 +32,24 @@ graph, bridge, cluster, and reanalysis losses, then runs a selected-round study 
 patience and a mastery-score target. In `auto` study mode, each round routes to the
 weakest evaluated signal, such as sequence, closure, FER, or discovery, and each
 round branches from the best accepted state so rejected self-teaching attempts do not
-poison the next attempt. Checkpoint continuation also turns on replay and retention
-from the checkpoint's own reading replay bank when available. Use `manual` for exact
-low-level ablations.
+poison the next attempt. Concept-memory study rounds also report a model-derived
+concept-insight delta from weak-signal gains and bridge connectivity, giving the loop
+a generic "new connection discovered" acceptance path without English-specific rules.
+Checkpoint continuation also turns on replay and retention from the checkpoint's own
+reading replay bank when available; replay rows carry model-derived priority and
+reasons such as hard-study examples or concept-insight records, and continuation
+sampling uses those priorities before falling back to uniform replay. Use `manual`
+for exact low-level ablations.
+Optional `--latent-concept-topk` applies the shared latent-slot sparsity gate used by
+multimodal, keeping only the strongest schema-free concept slots per record so reading
+runs can encourage slot specialization without task-specific rules.
 
 ```bash
 python -m thinking.text --selftest
 
 python -m thinking.text --reading-data data/reading.jsonl \
     --steps 40000 --batch 16 --d 256 --layers 4 --heads 8 \
-    --latent-concept-slots 4 --reading-memory-size 256 \
+    --latent-concept-slots 4 --latent-concept-topk 2 --reading-memory-size 256 \
     --reading-objective-profile mastery \
     --reading-study-strategy auto --reading-study-probe-n 256 \
     --reading-discovery-w 0.05 --reading-reanalysis-w 0.05 \

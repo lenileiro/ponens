@@ -219,7 +219,7 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --eval-out runs/image_latent_dit_sweep.json
 .venv/bin/python -m thinking.text --reading-data NEWER-TECHNIQUES.md \
     --steps 4 --batch 16 --d 96 --layers 2 --heads 4 \
-    --latent-concept-slots 6 --latent-concept-layers 1 \
+    --latent-concept-slots 6 --latent-concept-topk 3 --latent-concept-layers 1 \
     --reading-max-tokens 96 --reading-min-tokens 8 --reading-eval-n 32 \
     --reading-objective-profile mastery \
     --reading-study-strategy auto --reading-study-probe-n 48 \
