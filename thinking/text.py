@@ -2185,6 +2185,24 @@ READING_SCORE_METRICS = (
     "view", "context", "neighborhood", "cluster", "fer", "both", "min", "all",
     "balanced")
 READING_DISCOVERY_SIGNALS = ("view", "context", "neighborhood", "cluster", "fer")
+READING_STUDY_STRATEGIES = (
+    "random", "errors", "curiosity", "graph", "cycle", "discovery", "auto")
+READING_MEMORY_STUDY_STRATEGIES = ("curiosity", "graph", "discovery")
+READING_POOL_STUDY_STRATEGIES = (
+    "errors", "curiosity", "graph", "cycle", "discovery")
+READING_TRANSITION_STUDY_STRATEGIES = ("graph", "cycle", "discovery")
+READING_GRAPH_READY_STUDY_STRATEGIES = ("graph", "cycle")
+
+
+def resolve_reading_study_strategy(study_strategy, model):
+    requested = str(study_strategy)
+    if requested not in READING_STUDY_STRATEGIES:
+        raise ValueError(f"unknown reading study strategy {requested!r}")
+    if requested == "auto":
+        return ("discovery"
+                if getattr(model, "latent_concept_memory", None) is not None
+                else "errors")
+    return requested
 
 
 def reading_discovery_score_components(view_eval, context_eval, metric="both",
@@ -2958,7 +2976,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          cluster_probe_n=0, cluster_refresh_steps=0,
                          cluster_temperature=0.1, cluster_margin=0.0,
                          cluster_min_size=2,
-                         study_strategy="errors", study_probe_n=0,
+                         study_strategy="auto", study_probe_n=0,
                          study_hard_max=0, study_refresh_steps=0,
                          replay_records=None, replay_teacher_model=None,
                          replay_teacher_vocab=None, replay_w=0.0,
@@ -3081,10 +3099,10 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading cluster min size must be at least two")
     if float(replay_w) < 0.0:
         raise ValueError("reading replay loss weight must be non-negative")
-    study_strategy = str(study_strategy)
-    if study_strategy not in (
-            "random", "errors", "curiosity", "graph", "cycle", "discovery"):
-        raise ValueError(f"unknown reading study strategy {study_strategy!r}")
+    requested_study_strategy = str(study_strategy)
+    if requested_study_strategy not in READING_STUDY_STRATEGIES:
+        raise ValueError(
+            f"unknown reading study strategy {requested_study_strategy!r}")
     rng = np.random.default_rng(seed)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     train_records = [r for r in records if r.split == "train"]
@@ -3094,6 +3112,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     replay_sources = [r for r in replay_records if r.split == "train"] or replay_records
     if int(memory_size) > 0:
         model.enable_latent_concept_memory(int(memory_size))
+    study_strategy = resolve_reading_study_strategy(
+        requested_study_strategy, model)
     if association_w and getattr(model, "latent_concept_memory", None) is None:
         raise ValueError("reading association requires latent concept memory")
     if composition_w and getattr(model, "latent_concept_memory", None) is None:
@@ -3102,13 +3122,10 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading graph prediction requires latent concept memory")
     if graph_cycle_w and getattr(model, "latent_concept_memory", None) is None:
         raise ValueError("reading graph cycle requires latent concept memory")
-    if study_strategy == "curiosity" and getattr(model, "latent_concept_memory", None) is None:
-        raise ValueError("reading curiosity study requires latent concept memory")
-    if study_strategy == "graph" and getattr(model, "latent_concept_memory", None) is None:
-        raise ValueError("reading graph study requires latent concept memory")
-    if (study_strategy == "discovery"
+    if (study_strategy in READING_MEMORY_STUDY_STRATEGIES
             and getattr(model, "latent_concept_memory", None) is None):
-        raise ValueError("reading discovery study requires latent concept memory")
+        raise ValueError(
+            f"reading {study_strategy} study requires latent concept memory")
     if replay_w and (not replay_sources or replay_teacher_model is None
                      or replay_teacher_vocab is None):
         raise ValueError("reading replay loss requires replay records and teacher checkpoint")
@@ -3152,7 +3169,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
 
     def graph_study_ready():
         memory = getattr(model, "latent_concept_memory", None)
-        if study_strategy not in ("graph", "cycle"):
+        if study_strategy not in READING_GRAPH_READY_STUDY_STRATEGIES:
             return True
         if memory is None:
             return False
@@ -3231,7 +3248,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
             selected = list(hard)
             report = report | {"strategy": "errors"}
         if study_hard_max and len(selected) > int(study_hard_max):
-            if study_strategy in ("curiosity", "graph", "cycle", "discovery"):
+            if study_strategy in READING_POOL_STUDY_STRATEGIES:
                 selected = selected[:int(study_hard_max)]
             else:
                 cap_rng = np.random.default_rng(seed + 1759 + int(step))
@@ -3277,9 +3294,9 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         model.train()
         refresh_due = (not study_pool or st == 1 or (
             study_refresh_steps and (st - 1) % int(study_refresh_steps) == 0))
-        if study_strategy in (
-                "errors", "curiosity", "graph", "cycle", "discovery") and refresh_due:
-            if study_strategy not in ("graph", "cycle") or graph_study_ready():
+        if study_strategy in READING_POOL_STUDY_STRATEGIES and refresh_due:
+            if (study_strategy not in READING_GRAPH_READY_STUDY_STRATEGIES
+                    or graph_study_ready()):
                 refresh_study_pool(st)
                 model.train()
         if (neighborhood_w or transition_w) and (st == 1 or (
@@ -3292,8 +3309,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 and (st - 1) % int(cluster_refresh_steps) == 0)):
             refresh_clusters(st)
             model.train()
-        source = (study_pool if study_strategy in (
-            "errors", "curiosity", "graph", "cycle", "discovery")
+        source = (study_pool if study_strategy in READING_POOL_STUDY_STRATEGIES
                   and study_pool else train_records)
         rec_batch = batch_records(source, rng, batch)
         txt = pack_reading(rec_batch, vocab, device)
@@ -3437,7 +3453,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                             else None)))
         last_transition_updates = 0
         if (graph_predict_w or graph_cycle_w
-                or study_strategy in ("graph", "cycle", "discovery")):
+                or study_strategy in READING_TRANSITION_STUDY_STRATEGIES):
             last_transition_updates = int(update_reading_latent_transitions(
                 model, txt, vocab.pad, context_keep_p=context_keep_p,
                 feature_dropout=0.0, decay=association_decay))
@@ -3477,6 +3493,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                   flush=True)
     model.reading_train_metrics = {
         "loss": last_loss,
+        "study_strategy_requested": requested_study_strategy,
+        "study_strategy": study_strategy,
         "latent_view_loss": last_view_loss,
         "factorization_loss": last_factorization,
         "factorization_w": float(factorization_w),
@@ -3640,7 +3658,7 @@ def fit_reading_concepts_select_best(
         cluster_probe_n=0, cluster_refresh_steps=0,
         cluster_temperature=0.1, cluster_margin=0.0,
         cluster_min_size=2,
-        study_strategy="errors", study_probe_n=0,
+        study_strategy="auto", study_probe_n=0,
         study_hard_max=0, study_refresh_steps=0,
         replay_records=None, replay_teacher_model=None,
         replay_teacher_vocab=None, replay_w=0.0, replay_batch=0,
@@ -3652,6 +3670,8 @@ def fit_reading_concepts_select_best(
         raise ValueError("reading selected training requires at least one step")
     if int(memory_size) > 0:
         model.enable_latent_concept_memory(int(memory_size))
+    initial_study_strategy = resolve_reading_study_strategy(
+        study_strategy, model)
     before_bundle = before_bundle or reading_eval_bundle(
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
@@ -3695,7 +3715,10 @@ def fit_reading_concepts_select_best(
     initial_row = selection_row(0, 0, before_bundle, initial_replay_bundle)
     best_score = float(initial_row["score"])
     best_round = 0
-    best_metrics = dict(getattr(model, "reading_train_metrics", {}))
+    best_metrics = {
+        "study_strategy_requested": str(study_strategy),
+        "study_strategy": initial_study_strategy,
+    } | dict(getattr(model, "reading_train_metrics", {}))
     rounds_report = [initial_row]
     all_study_reports = []
     all_neighborhood_reports = []
@@ -3884,7 +3907,7 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            cluster_probe_n=0, cluster_refresh_steps=0,
                            cluster_temperature=0.1, cluster_margin=0.0,
                            cluster_min_size=2,
-                           study_strategy="errors", study_probe_n=0,
+                           study_strategy="auto", study_probe_n=0,
                            study_hard_max=0, study_refresh_steps=0):
     if int(latent_concept_slots) <= 0:
         raise ValueError("raw reading concept training requires latent_concept_slots > 0")
@@ -4020,7 +4043,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          cluster_probe_n=0, cluster_refresh_steps=0,
                          cluster_temperature=0.1, cluster_margin=0.0,
                          cluster_min_size=2,
-                         study_strategy="errors", study_probe_n=0,
+                         study_strategy="auto", study_probe_n=0,
                          study_hard_max=0, study_refresh_steps=0,
                          study_select_best=False, study_rounds=1,
                          study_score_metric="balanced", study_score_margin_w=0.1,
@@ -4202,6 +4225,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
     after_cluster = after_bundle["cluster"]
     before_fer = before_bundle["fer"]
     after_fer = after_bundle["fer"]
+    train_metrics = getattr(model, "reading_train_metrics", {})
+    resolved_study_strategy = train_metrics.get("study_strategy", study_strategy)
+    requested_study_strategy = train_metrics.get(
+        "study_strategy_requested", study_strategy)
     report = {"experiment": "text_raw_reading_concept_pretrain",
               "data": data,
               "steps": int(steps), "batch": int(batch), "lr": float(lr),
@@ -4279,7 +4306,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "cluster_temperature": float(cluster_temperature),
               "cluster_margin": float(cluster_margin),
               "cluster_min_size": int(cluster_min_size),
-              "study_strategy": study_strategy,
+              "study_strategy_requested": requested_study_strategy,
+              "study_strategy": resolved_study_strategy,
               "study_probe_n": int(study_probe_n),
               "study_hard_max": int(study_hard_max),
               "study_refresh_steps": int(study_refresh_steps),
@@ -4332,7 +4360,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                       after_fer.get("fer_score", 0.0)
                       - before_fer.get("fer_score", 0.0)),
               },
-              "train_metrics": getattr(model, "reading_train_metrics", {}),
+              "train_metrics": train_metrics,
               "study_hard_examples": getattr(model, "reading_study_reports", []),
               "study_neighborhoods": getattr(
                   model, "reading_neighborhood_reports", []),
@@ -4452,7 +4480,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              cluster_probe_n=0, cluster_refresh_steps=0,
                              cluster_temperature=0.1, cluster_margin=0.0,
                              cluster_min_size=2,
-                             study_strategy="errors", study_probe_n=0,
+                             study_strategy="auto", study_probe_n=0,
                              study_hard_max=0, study_refresh_steps=0,
                              study_select_best=False, study_rounds=1,
                              study_score_metric="balanced", study_score_margin_w=0.1,
@@ -4673,6 +4701,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
     d = int(ckpt.get("d", 96))
     layers = int(ckpt.get("layers", 3))
     heads = int(ckpt.get("heads", 4))
+    train_metrics = getattr(model, "reading_train_metrics", {})
+    resolved_study_strategy = train_metrics.get("study_strategy", study_strategy)
+    requested_study_strategy = train_metrics.get(
+        "study_strategy_requested", study_strategy)
     report = {"experiment": "text_raw_reading_checkpoint_study",
               "checkpoint": checkpoint,
               "checkpoint_experiment": ckpt.get("report", {}).get("experiment"),
@@ -4755,7 +4787,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "cluster_temperature": float(cluster_temperature),
               "cluster_margin": float(cluster_margin),
               "cluster_min_size": int(cluster_min_size),
-              "study_strategy": study_strategy,
+              "study_strategy_requested": requested_study_strategy,
+              "study_strategy": resolved_study_strategy,
               "study_probe_n": int(study_probe_n),
               "study_hard_max": int(study_hard_max),
               "study_refresh_steps": int(study_refresh_steps),
@@ -4822,7 +4855,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                       - (before_replay_bundle or {}).get("score_components", {}).get(
                           "score", 0.0)),
               },
-              "train_metrics": getattr(model, "reading_train_metrics", {}),
+              "train_metrics": train_metrics,
               "study_hard_examples": getattr(model, "reading_study_reports", []),
               "study_neighborhoods": getattr(
                   model, "reading_neighborhood_reports", []),
@@ -6238,6 +6271,13 @@ def selftest():
         len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
         fact_schema=None, latent_concept_slots=2,
         latent_concept_memory_size=8).to("cpu")
+    memoryless_reading_model = TextFactLM(
+        len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
+        fact_schema=None, latent_concept_slots=2,
+        latent_concept_memory_size=0).to("cpu")
+    assert resolve_reading_study_strategy("auto", reading_model) == "discovery"
+    assert (resolve_reading_study_strategy("auto", memoryless_reading_model)
+            == "errors")
     reading_txt = pack_reading(reading_records[:2], reading_vocab, "cpu")
     assert torch.isfinite(reading_latent_view_loss(
         reading_model, reading_txt, reading_vocab.pad, reading_vocab.unk,
@@ -6316,6 +6356,9 @@ def selftest():
         transition_w=0.1, transition_batch=2,
         cluster_w=0.1, cluster_batch=4, cluster_probe_n=4)
     assert reading_model.reading_train_metrics["memory_active"] > 0
+    assert (reading_model.reading_train_metrics["study_strategy_requested"]
+            == "discovery")
+    assert reading_model.reading_train_metrics["study_strategy"] == "discovery"
     assert reading_model.reading_train_metrics["graph_predict_w"] == 0.1
     assert reading_model.reading_train_metrics["graph_cycle_w"] == 0.1
     assert reading_model.reading_train_metrics["fer_w"] == 0.1
@@ -6418,9 +6461,7 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-cluster-margin", type=float, default=0.0)
     ap.add_argument("--reading-cluster-min-size", type=int, default=2)
     ap.add_argument("--reading-study-strategy",
-                    choices=("random", "errors", "curiosity", "graph", "cycle",
-                             "discovery"),
-                    default="errors")
+                    choices=READING_STUDY_STRATEGIES, default="auto")
     ap.add_argument("--reading-study-probe-n", type=int, default=0)
     ap.add_argument("--reading-study-hard-max", type=int, default=0)
     ap.add_argument("--reading-study-refresh-steps", type=int, default=0)
