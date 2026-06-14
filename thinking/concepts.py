@@ -58,12 +58,17 @@ class LatentConceptHead(nn.Module):
     caller gives them.
     """
 
-    def __init__(self, slots, d, heads=4, mixer_layers=1, init_scale=0.02):
+    def __init__(self, slots, d, heads=4, mixer_layers=1, init_scale=0.02, topk=0):
         super().__init__()
         self.slots = int(slots)
         self.d = int(d)
         self.heads = int(heads)
         self.mixer_layers = int(mixer_layers)
+        self.topk = int(topk)                            # >0: keep only top-k slots per example
+        #   STRUCTURAL concept sparsity: each example keeps only its top-k slots (by energy),
+        #   zeroing the rest -> slots specialize (fragmentation ~1.0 -> ~log(k)/log(K)). Loss
+        #   penalties (FER, low-variance VICReg) could not move it; hard top-k does. Ported from
+        #   mind.py; matters here because the multimodal decoder USES these slots.
         if self.slots <= 0:
             raise ValueError("latent concept slots must be positive")
         if self.heads <= 0:
@@ -111,8 +116,15 @@ class LatentConceptHead(nn.Module):
             slots = self.projector(slots)
             if all_masked is not None and bool(all_masked.any()):
                 slots = slots.masked_fill(all_masked[:, None, None], 0.0)
+        return self._topk_gate(slots)
+
+    def _topk_gate(self, slots):
+        k = self.topk
+        if not k or not (0 < k < slots.shape[1]):
             return slots
-        return slots
+        norm = slots.norm(dim=-1)                         # (B, K)
+        thresh = norm.topk(k, dim=1).values[:, -1:]       # (B, 1)
+        return slots * (norm >= thresh).to(slots.dtype).unsqueeze(-1)
 
 
 class LatentConceptSequencePredictor(nn.Sequential):

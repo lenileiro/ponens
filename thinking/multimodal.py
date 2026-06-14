@@ -518,7 +518,8 @@ class MultimodalLM(nn.Module):
                  trunk_arch="mlp", trunk_width=128, trunk_depth=1, text_layers=1,
                  modality_dropout=0.0, text_arch="transformer", concept_tokens=4,
                  fusion_layers=1, latent_concept_slots=0, latent_concept_layers=1,
-                 latent_concept_prefix=False, latent_concept_memory_size=0):
+                 latent_concept_prefix=False, latent_concept_memory_size=0,
+                 latent_concept_topk=0):
         super().__init__()
         view_dims = OrderedDict((str(k), int(v)) for k, v in (view_dims or {}).items())
         if view_tokens <= 0 or txt_tokens <= 0:
@@ -556,12 +557,14 @@ class MultimodalLM(nn.Module):
             "latent_concept_layers": int(latent_concept_layers),
             "latent_concept_prefix": bool(latent_concept_prefix),
             "latent_concept_memory_size": int(latent_concept_memory_size),
+            "latent_concept_topk": int(latent_concept_topk),
         }
         self.modality_dropout = float(modality_dropout)
         self.latent_concept_slots = int(latent_concept_slots)
         self.latent_concept_layers = int(latent_concept_layers)
         self.latent_concept_prefix = bool(latent_concept_prefix)
         self.latent_concept_memory_size = int(latent_concept_memory_size)
+        self.latent_concept_topk = int(latent_concept_topk)
         self.view_names = tuple(view_names)
         self.lm = ScratchpadLM(vocab_size, d=d, layers=layers, heads=heads, max_len=max_len,
                                pad=pad, pointer=False, loop=False)
@@ -579,7 +582,7 @@ class MultimodalLM(nn.Module):
                                     layers=fusion_layers)
         self.latent_concepts = (LatentConceptHead(
             self.latent_concept_slots, d, heads=heads,
-            mixer_layers=self.latent_concept_layers)
+            mixer_layers=self.latent_concept_layers, topk=self.latent_concept_topk)
             if self.latent_concept_slots > 0 else None)
         self.concept_sequence_predictor = (
             LatentConceptSequencePredictor(d)
@@ -2611,6 +2614,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           latent_concept_completion_refresh_steps=0,
           latent_concept_memory_w=0.0,
           latent_concept_memory_size=0,
+          latent_concept_topk=0,
           latent_concept_memory_temperature=0.1,
           latent_concept_memory_momentum=0.95,
           latent_concept_memory_balance_w=0.01,
@@ -2827,7 +2831,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_concept_slots=latent_concept_slots,
         latent_concept_layers=latent_concept_layers,
         latent_concept_prefix=latent_concept_prefix,
-        latent_concept_memory_size=latent_concept_memory_size).to(device)
+        latent_concept_memory_size=latent_concept_memory_size,
+        latent_concept_topk=latent_concept_topk).to(device)
     if text_checkpoint:
         import_text_checkpoint(model, vocab, text_checkpoint, device=device)
     else:
@@ -4286,6 +4291,9 @@ def main(argv=None):
                     help="transformer layers used by latent prefix fusion")
     ap.add_argument("--latent-concept-slots", type=int, default=0,
                     dest="latent_concept_slots")
+    ap.add_argument("--latent-concept-topk", type=int, default=0,
+                    dest="latent_concept_topk",
+                    help="keep only top-k concept slots per example (structural sparsity)")
     ap.add_argument("--latent-concept-layers", type=int, default=1,
                     dest="latent_concept_layers")
     ap.add_argument("--latent-concept-prefix", action="store_true",
@@ -4708,6 +4716,7 @@ def main(argv=None):
             args.latent_concept_completion_refresh_steps),
         latent_concept_memory_w=args.latent_concept_memory_w,
         latent_concept_memory_size=args.latent_concept_memory_size,
+        latent_concept_topk=args.latent_concept_topk,
         latent_concept_memory_temperature=args.latent_concept_memory_temperature,
         latent_concept_memory_momentum=args.latent_concept_memory_momentum,
         latent_concept_memory_balance_w=args.latent_concept_memory_balance_w,
