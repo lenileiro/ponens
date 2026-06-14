@@ -6018,7 +6018,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        endpoint_stats_mean_w=1.0, endpoint_stats_std_w=1.0,
                        straightness_w=0.0,
                        multiscale_w=0.0, multiscale_scales=(2, 4),
-                       self_condition_p=0.0,
+                       self_condition_p=0.0, reference_condition_p=0.0,
                        flow_noise_coupling="random", flow_noise_coupling_projections=1,
                        flow_loss_weight="none", flow_loss_weight_gamma=5.0,
                        flow_loss_weight_normalize=True,
@@ -6073,6 +6073,11 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     self_condition_p = float(self_condition_p)
     if self_condition_p < 0.0 or self_condition_p > 1.0:
         raise ValueError("self_condition_p must be in [0, 1]")
+    reference_condition_p = float(reference_condition_p)
+    if reference_condition_p < 0.0 or reference_condition_p > 1.0:
+        raise ValueError("reference_condition_p must be in [0, 1]")
+    if reference_condition_p > 0.0 and not flow_uses_self_condition(flow):
+        raise ValueError("reference_condition_p requires a self-conditioning flow")
     z1_model = normalize_latent(z1, latent_stats)
     x0 = torch.randn_like(z1_model)
     x0, coupling_parts = couple_flow_noise_to_data(
@@ -6089,8 +6094,14 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     target = z1_model - x0
     cond_model = condition_dropout(cond, cond_drop)
     self_condition_active = False
+    reference_condition_active = False
     if flow_uses_self_condition(flow):
-        if self_condition_p > 0.0 and bool(torch.rand((), device=z1.device) < self_condition_p):
+        if (reference_condition_p > 0.0
+                and bool(torch.rand((), device=z1.device) < reference_condition_p)):
+            cond_model = attach_flow_self_condition(cond_model, z1_model.detach())
+            self_condition_active = True
+            reference_condition_active = True
+        elif self_condition_p > 0.0 and bool(torch.rand((), device=z1.device) < self_condition_p):
             with torch.no_grad():
                 zero_self_cond = attach_flow_self_condition(
                     cond_model, torch.zeros_like(z1_model))
@@ -6150,6 +6161,10 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         "flow_self_condition_p": torch.tensor(float(self_condition_p), device=z1.device),
         "flow_self_condition_active": torch.tensor(
             float(self_condition_active), device=z1.device),
+        "flow_reference_condition_p": torch.tensor(
+            float(reference_condition_p), device=z1.device),
+        "flow_reference_condition_active": torch.tensor(
+            float(reference_condition_active), device=z1.device),
         "velocity_weight_mean": velocity_weights.detach().mean(),
         "velocity_weight_min": velocity_weights.detach().min(),
         "velocity_weight_max": velocity_weights.detach().max(),
@@ -7209,15 +7224,44 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                    quality_guidance_w=0.0, quality_guidance_scorer=None,
                    quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                    sample_finite_guard=False, sample_velocity_clip=0.0,
-                   sample_latent_clip=0.0, cfg_mode="standard", return_trace=False):
+                   sample_latent_clip=0.0, cfg_mode="standard",
+                   reference_latent=None, return_trace=False):
     batch = condition_batch(cond)
     if cfg_uncond is not None and condition_batch(cfg_uncond) != batch:
         raise ValueError("cfg_uncond batch must match cond batch")
     if text_guidance_cond is not None and condition_batch(text_guidance_cond) != batch:
         raise ValueError("text_guidance_cond batch must match cond batch")
     latent_stats = flow_latent_stats(flow)
-    z = _seeded_randn((batch,) + tuple(latent_shape), device=device, seed=seed)
+    latent_shape = tuple(int(x) for x in latent_shape)
+    z = _seeded_randn((batch,) + latent_shape, device=device, seed=seed)
     self_cond_state = torch.zeros_like(z) if flow_uses_self_condition(flow) else None
+    fixed_self_condition = False
+    reference_condition = reference_latent is not None
+    if reference_condition:
+        if not flow_uses_self_condition(flow):
+            raise ValueError("reference_latent sampling requires flow self-conditioning")
+        if torch.is_tensor(reference_latent):
+            ref = reference_latent.to(device=device, dtype=z.dtype)
+        else:
+            ref = torch.as_tensor(reference_latent, device=device, dtype=z.dtype)
+        if ref.ndim == 3:
+            ref = ref.unsqueeze(0)
+        if ref.ndim != 4:
+            raise ValueError(
+                f"reference_latent must be CHW or BCHW, got shape {tuple(ref.shape)}")
+        ref = normalize_latent(ref, latent_stats).to(device=device, dtype=z.dtype)
+        if tuple(ref.shape[1:]) != latent_shape:
+            raise ValueError(
+                f"reference_latent shape {tuple(ref.shape[1:])} does not match "
+                f"latent_shape {latent_shape}")
+        if int(ref.shape[0]) == 1 and batch > 1:
+            ref = ref.expand(batch, -1, -1, -1)
+        elif int(ref.shape[0]) != batch:
+            raise ValueError(
+                f"reference_latent batch {int(ref.shape[0])} does not match "
+                f"condition batch {batch}")
+        self_cond_state = ref.detach()
+        fixed_self_condition = True
     flow.eval()
     if ae is not None:
         ae.eval()
@@ -7285,6 +7329,8 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
     trace["sample_trace_cfg_schedule"] = cfg_schedule
     trace["sample_trace_requested_cfg_scale"] = float(cfg_scale)
     trace["sample_trace_self_condition"] = bool(flow_uses_self_condition(flow))
+    trace["sample_trace_reference_condition"] = bool(reference_condition)
+    trace["sample_trace_reference_condition_fixed"] = bool(fixed_self_condition)
     trace["sample_trace_self_condition_updates"] = 0
     trace["sample_trace_self_condition_rollbacks"] = 0
     update_sample_trace(trace, "latent", z)
@@ -7387,7 +7433,7 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                                 cfg_rescale=cfg_rescale, cfg_uncond=step_uncond,
                                 cfg_mode=step_cfg_mode)
             v = stabilize_velocity(v)
-            if self_cond_state is not None:
+            if self_cond_state is not None and not fixed_self_condition:
                 tt = t
                 while tt.ndim < z_in.ndim:
                     tt = tt.unsqueeze(-1)
@@ -7531,7 +7577,7 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
                   sample_latent_clip=0.0, cfg_mode="standard",
                   sample_pixel_dynamic_threshold_percentile=0.0,
                   sample_pixel_dynamic_threshold_max=1.0,
-                  return_trace=False):
+                  reference_latent=None, return_trace=False):
     latent_out = sample_latents(
         flow, cond, latent_shape=latent_shape, steps=steps, device=device,
         seed=seed, cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
@@ -7556,6 +7602,7 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
         sample_velocity_clip=sample_velocity_clip,
         sample_latent_clip=sample_latent_clip,
         cfg_mode=cfg_mode,
+        reference_latent=reference_latent,
         return_trace=return_trace)
     if return_trace:
         z, trace = latent_out
@@ -7814,6 +7861,30 @@ def sample_quality_gate_failure_message(report, prefix="sample_grid"):
 
 def sample_candidate_health_scores(samples, eps=1.0e-8):
     return sample_health_components(samples, eps=eps)["health_score"]
+
+
+def image_reproduction_metrics(reference, candidate, prefix="reference"):
+    if reference.shape != candidate.shape:
+        raise ValueError(
+            f"reproduction metric shapes must match, got "
+            f"{tuple(reference.shape)} and {tuple(candidate.shape)}")
+    ref = torch.nan_to_num(
+        reference.detach().float(), nan=-1.0, posinf=1.0, neginf=-1.0
+    ).clamp(-1.0, 1.0)
+    cand = torch.nan_to_num(
+        candidate.detach().float(), nan=-1.0, posinf=1.0, neginf=-1.0
+    ).clamp(-1.0, 1.0)
+    diff = cand - ref
+    return {
+        f"{prefix}_pixel_mse": float(diff.pow(2).mean().detach().cpu()),
+        f"{prefix}_pixel_mae": float(diff.abs().mean().detach().cpu()),
+        f"{prefix}_structure_edge_l1": float(
+            image_gradient_loss(cand, ref).detach().cpu()),
+        f"{prefix}_structure_multiscale_l1": float(
+            multiscale_recon_loss(cand, ref).detach().cpu()),
+        f"{prefix}_structure_frequency_l1": float(
+            frequency_recon_loss(cand, ref).detach().cpu()),
+    }
 
 
 def write_ppm_grid(samples, path, rows, cols, pad=2, bg=32):
@@ -8282,6 +8353,95 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
                 "caption_cond_source": caption_cond_source,
             },
             row_metadata=row_meta, prefix="caption_sample"))
+    return meta
+
+
+@torch.no_grad()
+def save_reference_reproduction_grid(ae, flow, records, path, size=32, device=DEV,
+                                     conditioner=None, prompt_vocab=None,
+                                     caption_max_len=64, cfg_scale=1.0,
+                                     cfg_rescale=0.0, sample_steps=4,
+                                     sample_method="euler",
+                                     cfg_interval=DEFAULT_GUIDANCE_INTERVAL,
+                                     cfg_schedule="constant", samples=4, seed=0,
+                                     caption_cond_source="tokens",
+                                     sample_time_shift=1.0,
+                                     sample_schedule="linear",
+                                     sample_churn=0.0,
+                                     sample_churn_interval=DEFAULT_CHURN_INTERVAL,
+                                     sample_finite_guard=False,
+                                     sample_velocity_clip=0.0,
+                                     sample_latent_clip=0.0,
+                                     cfg_mode="standard",
+                                     sample_pixel_dynamic_threshold_percentile=0.0,
+                                     sample_pixel_dynamic_threshold_max=1.0):
+    ae.eval()
+    flow.eval()
+    if not flow_uses_self_condition(flow):
+        raise ValueError(
+            "reference reproduction requires a checkpoint with flow self-conditioning")
+    records = list(records)
+    if not records:
+        raise ValueError("reference reproduction requires at least one image record")
+    rng = np.random.default_rng(seed)
+    n = min(max(1, int(samples)), len(records))
+    x, captions, chosen = sample_image_text_batch(
+        records, rng, batch=n, size=size, device=device, return_records=True)
+    z_ref = ae.encode(x)
+    recon = ae.decode(z_ref).clamp(-1.0, 1.0)
+    cond = caption_record_condition(
+        captions, chosen, conditioner, prompt_vocab, source=caption_cond_source,
+        max_len=caption_max_len, device=device, return_tokens=flow_uses_cond_tokens(flow))
+    cond = attach_image_geometry_condition(
+        cond, records=chosen, target_size=size, enabled=flow_uses_image_geometry(flow))
+    sample, trace = sample_images(
+        ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
+        steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
+        cfg_rescale=cfg_rescale,
+        sample_method=sample_method, cfg_interval=cfg_interval,
+        cfg_schedule=cfg_schedule,
+        sample_time_shift=sample_time_shift,
+        sample_schedule=sample_schedule,
+        sample_churn=sample_churn,
+        sample_churn_interval=sample_churn_interval,
+        sample_finite_guard=sample_finite_guard,
+        sample_velocity_clip=sample_velocity_clip,
+        sample_latent_clip=sample_latent_clip,
+        sample_pixel_dynamic_threshold_percentile=(
+            sample_pixel_dynamic_threshold_percentile),
+        sample_pixel_dynamic_threshold_max=sample_pixel_dynamic_threshold_max,
+        cfg_mode=cfg_mode,
+        reference_latent=z_ref,
+        return_trace=True)
+    grid = torch.stack((x, recon, sample), dim=1).reshape(n * 3, *x.shape[1:])
+    meta = write_ppm_grid(grid, path, rows=n, cols=3)
+    meta.update({
+        "sample_grid_cfg_scale": float(cfg_scale),
+        "sample_grid_cfg_rescale": float(cfg_rescale),
+        "sample_grid_cfg_mode": cfg_mode,
+        "sample_grid_cfg_schedule": cfg_schedule,
+        "sample_grid_sample_steps": int(sample_steps),
+        "sample_grid_sample_time_shift": float(sample_time_shift),
+        "sample_grid_sample_method": sample_method,
+        "sample_grid_sample_schedule": sample_schedule,
+        "sample_grid_sample_churn": float(sample_churn),
+        "sample_grid_sample_churn_interval": list(validate_guidance_interval(
+            sample_churn_interval, name="sample_churn_interval")),
+        "sample_grid_cfg_interval": list(validate_guidance_interval(cfg_interval)),
+        "sample_grid_cond_mode": "reference_image",
+        "sample_grid_reference_columns": [
+            "reference", "autoencoder_reconstruction", "flow_reproduction"],
+        "sample_grid_reference_count": int(n),
+        "sample_grid_caption_cond_source": caption_cond_source,
+        "sample_grid_seed": int(seed),
+        "sample_grid_captions": captions[:min(5, len(captions))],
+        "sample_grid_reference_paths": [rec.path for rec in chosen[:min(5, len(chosen))]],
+    })
+    meta.update(prefix_sample_trace(trace, "reference_flow_sample"))
+    meta.update(sample_health_metrics(sample, prefix="sample_grid"))
+    meta.update(sample_health_metrics(sample, prefix="reference_flow_sample"))
+    meta.update(image_reproduction_metrics(x, recon, prefix="reference_recon"))
+    meta.update(image_reproduction_metrics(x, sample, prefix="reference_flow"))
     return meta
 
 
@@ -10459,6 +10619,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       dit_register_tokens=0,
                       flow_time_embed="scalar", flow_time_embed_dim=0,
                       flow_self_condition=False, flow_self_condition_p=0.5,
+                      flow_reference_condition_p=0.0,
                       latent_patch_size=1,
                       flow_checkpoint_blocks=False,
                       ae_arch="semantic", latent_downsample=4, ae_res_blocks=1,
@@ -10894,6 +11055,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_self_condition_p = float(flow_self_condition_p)
     if flow_self_condition_p < 0.0 or flow_self_condition_p > 1.0:
         raise ValueError("flow_self_condition_p must be in [0, 1]")
+    flow_reference_condition_p = float(flow_reference_condition_p)
+    if flow_reference_condition_p < 0.0 or flow_reference_condition_p > 1.0:
+        raise ValueError("flow_reference_condition_p must be in [0, 1]")
+    if flow_reference_condition_p > 0.0 and not flow_self_condition:
+        raise ValueError("flow_reference_condition_p requires flow_self_condition")
     if latent_max_tokens <= 0:
         raise ValueError("latent_max_tokens must be positive")
     latent_patch_size = int(latent_patch_size)
@@ -11670,6 +11836,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     multiscale_w=flow_multiscale_w,
                     multiscale_scales=flow_multiscale_scales,
                     self_condition_p=flow_self_condition_p,
+                    reference_condition_p=flow_reference_condition_p,
                     text_aligner=text_aligner, text_align_w=flow_text_align_w,
                     feature_aligner=image_feature_aligner, image_features=image_features,
                     feature_align_w=flow_feature_align_w,
@@ -12039,6 +12206,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_checkpoint_blocks": bool(getattr(flow, "checkpoint_blocks", False)),
         "flow_self_condition": bool(getattr(flow, "uses_self_condition", False)),
         "flow_self_condition_p": float(flow_self_condition_p),
+        "flow_reference_condition_p": float(flow_reference_condition_p),
         "flow_boundary_mode": get_flow_boundary_mode(flow),
         "activation_checkpointing": bool(getattr(flow, "uses_activation_checkpointing", False)),
         "uses_2d_pos_embed": bool(getattr(flow, "uses_2d_pos_embed", False)),
@@ -12610,6 +12778,7 @@ def selftest():
             flow_boundary_mode="double-cosine",
             flow_time_embed="fourier", flow_time_embed_dim=8,
             flow_self_condition=True, flow_self_condition_p=1.0,
+            flow_reference_condition_p=1.0,
             dit_mlp="swiglu", dit_register_tokens=1,
             time_sampling="adaptive", time_adaptive_bins=4,
             time_stratified=True,
@@ -12654,6 +12823,8 @@ def selftest():
         assert report["flow_time_embed_dim"] == 8
         assert report["flow_self_condition"] is True
         assert math.isclose(report["flow_self_condition_p"], 1.0)
+        assert math.isclose(report["flow_reference_condition_p"], 1.0)
+        assert report["last_flow"]["flow_reference_condition_active"] == 1.0
         assert report["dit_mlp"] == "swiglu"
         assert report["dit_register_tokens"] == 1
         assert report["flow_preference_loss"] == "dpo"
@@ -12706,6 +12877,18 @@ def selftest():
         assert meta["sample_grid_trace_self_condition_updates"] >= 1
         assert meta["sample_grid_trace_self_condition_rollbacks"] >= 0
         assert os.path.exists(sample_path)
+        reference_sample_path = os.path.join(td, "reference_samples.ppm")
+        reference_meta = save_reference_reproduction_grid(
+            ae, flow, read_image_manifest(manifest, root=td), reference_sample_path,
+            size=16, device="cpu", conditioner=conditioner, prompt_vocab=vocab,
+            caption_max_len=8, cfg_scale=1.0, sample_steps=2, samples=1)
+        assert reference_meta["sample_grid_cond_mode"] == "reference_image"
+        assert reference_meta["sample_grid_cols"] == 3
+        assert reference_meta["reference_flow_sample_trace_reference_condition"] is True
+        assert reference_meta["reference_flow_sample_trace_reference_condition_fixed"] is True
+        assert reference_meta["reference_flow_sample_trace_self_condition_updates"] == 0
+        assert "reference_flow_structure_edge_l1" in reference_meta
+        assert os.path.exists(reference_sample_path)
         resume_path = os.path.join(td, "resume.pt")
         torch.save({
             "autoencoder_state_dict": ae.state_dict(),
@@ -13075,6 +13258,10 @@ def main(argv=None):
                     dest="flow_self_condition_p",
                     help=("probability of no-grad endpoint self-conditioning during "
                           "flow training"))
+    ap.add_argument("--flow-reference-condition-p", type=float, default=0.0,
+                    dest="flow_reference_condition_p",
+                    help=("probability of conditioning the flow on the clean reference "
+                          "image latent during training"))
     ap.add_argument("--cond-drop", type=float, default=0.0, dest="cond_drop")
     ap.add_argument("--cfg-scale", type=float, default=1.0, dest="cfg_scale")
     ap.add_argument("--cfg-rescale", type=float, default=0.0, dest="cfg_rescale",
@@ -13398,6 +13585,21 @@ def main(argv=None):
                     help="JSON path for --eval-checkpoint report")
     ap.add_argument("--sample-grid-out", default="", dest="sample_grid_out",
                     help="optional PPM path for a prompt/caption generated sample grid")
+    ap.add_argument("--sample-reference-grid-out", default="",
+                    dest="sample_reference_grid_out",
+                    help=("optional PPM path for reference image reproduction rows: "
+                          "reference, AE reconstruction, flow reproduction"))
+    ap.add_argument("--sample-reference-manifest", default="",
+                    dest="sample_reference_manifest",
+                    help=("image manifest to use for --sample-reference-grid-out; "
+                          "defaults to eval/image manifest"))
+    ap.add_argument("--sample-reference-root", default="",
+                    dest="sample_reference_root",
+                    help=("root for --sample-reference-manifest; defaults to eval/image "
+                          "root"))
+    ap.add_argument("--sample-reference-samples", type=int, default=4,
+                    dest="sample_reference_samples",
+                    help="number of reference-image reproduction rows")
     ap.add_argument("--sample-grid-samples", type=int, default=1,
                     dest="sample_grid_samples",
                     help="generated samples per color/shape condition in --sample-grid-out")
@@ -13623,6 +13825,12 @@ def main(argv=None):
         ap.error("--dit-register-tokens requires --flow-arch dit/crossdit/mmdit")
     if args.flow_self_condition_p < 0.0 or args.flow_self_condition_p > 1.0:
         ap.error("--flow-self-condition-p must be in [0, 1]")
+    if args.flow_reference_condition_p < 0.0 or args.flow_reference_condition_p > 1.0:
+        ap.error("--flow-reference-condition-p must be in [0, 1]")
+    if args.flow_reference_condition_p > 0.0 and not args.flow_self_condition:
+        ap.error("--flow-reference-condition-p requires --flow-self-condition")
+    if args.sample_reference_samples <= 0:
+        ap.error("--sample-reference-samples must be positive")
     if args.flow_endpoint_w < 0.0:
         ap.error("--flow-endpoint-w must be non-negative")
     if args.flow_frequency_w < 0.0:
@@ -13960,6 +14168,83 @@ def main(argv=None):
                 "ema" if meta["ema_loaded"] else "raw")
             report.update(grid_meta)
             report.update(cli_sample_quality_gate_report(report, args))
+        if args.sample_reference_grid_out:
+            selected_weights = report.get("selected_checkpoint_weights",
+                                          report.get("checkpoint_weight_mode", "ema"))
+            ae, flow, conditioner, prompt_vocab, prompt_templates, meta = load_checkpoint(
+                args.eval_checkpoint, prefer_ema=(selected_weights == "ema"))
+            settings = selected_grid_settings(
+                report,
+                fallback_cfg=args.cfg_scale,
+                fallback_cfg_rescale=args.cfg_rescale,
+                fallback_steps=args.sample_steps,
+                fallback_method=args.sample_method,
+                fallback_sample_schedule=args.sample_schedule,
+                fallback_sample_churn=args.sample_churn,
+                fallback_sample_churn_interval=sample_churn_interval,
+                fallback_sample_finite_guard=args.sample_finite_guard,
+                fallback_sample_velocity_clip=args.sample_velocity_clip,
+                fallback_sample_latent_clip=args.sample_latent_clip,
+                fallback_cfg_mode=args.cfg_mode,
+                fallback_cfg_schedule=args.cfg_schedule,
+                fallback_cfg_interval=cfg_interval,
+                fallback_sample_time_shift=(
+                    args.sample_time_shift if args.sample_time_shift is not None
+                    else report.get("sample_time_shift", 1.0)
+                ))
+            grid_size = image_hw(
+                cli_size, default=report.get("image_size", meta.get("image_size", 32)) or 32)
+            reference_manifest = (
+                args.sample_reference_manifest
+                or report.get("eval_image_manifest", "")
+                or args.eval_image_manifest
+                or meta.get("image_manifest", "")
+            )
+            if not reference_manifest:
+                ap.error(
+                    "--sample-reference-grid-out requires --sample-reference-manifest "
+                    "or --eval-image-manifest")
+            reference_root = (
+                args.sample_reference_root
+                or report.get("eval_image_root", "")
+                or args.eval_image_root
+                or meta.get("image_root", "")
+            )
+            reference_records = read_image_manifest(
+                reference_manifest, root=reference_root,
+                split=report.get("eval_image_split", args.eval_image_split),
+                min_aesthetic=report.get("eval_image_min_aesthetic"),
+                max_records=report.get("eval_image_max_records", 0))
+            reference_meta = save_reference_reproduction_grid(
+                ae, flow, reference_records, args.sample_reference_grid_out,
+                conditioner=conditioner,
+                prompt_vocab=prompt_vocab, caption_max_len=meta["caption_max_len"],
+                size=grid_size,
+                cfg_scale=settings["cfg_scale"],
+                cfg_rescale=settings["cfg_rescale"],
+                cfg_mode=settings["cfg_mode"],
+                cfg_schedule=settings["cfg_schedule"],
+                cfg_interval=settings["cfg_interval"],
+                sample_time_shift=settings["sample_time_shift"],
+                sample_steps=settings["sample_steps"],
+                sample_method=settings["sample_method"],
+                sample_schedule=settings["sample_schedule"],
+                sample_churn=settings["sample_churn"],
+                sample_churn_interval=settings["sample_churn_interval"],
+                sample_finite_guard=settings["sample_finite_guard"],
+                sample_velocity_clip=settings["sample_velocity_clip"],
+                sample_latent_clip=settings["sample_latent_clip"],
+                sample_pixel_dynamic_threshold_percentile=(
+                    args.sample_pixel_dynamic_threshold_percentile),
+                sample_pixel_dynamic_threshold_max=(
+                    args.sample_pixel_dynamic_threshold_max),
+                samples=args.sample_reference_samples,
+                seed=args.seed + 1499,
+                caption_cond_source=meta["caption_cond_source"] or "tokens")
+            reference_meta["sample_grid_checkpoint_weight_mode"] = (
+                "ema" if meta["ema_loaded"] else "raw")
+            report.update(reference_meta)
+            report.update(cli_sample_quality_gate_report(report, args))
         if args.eval_out:
             os.makedirs(os.path.dirname(args.eval_out) or ".", exist_ok=True)
             with open(args.eval_out, "w") as f:
@@ -13995,6 +14280,7 @@ def main(argv=None):
         flow_checkpoint_blocks=args.flow_checkpoint_blocks,
         flow_self_condition=args.flow_self_condition,
         flow_self_condition_p=args.flow_self_condition_p,
+        flow_reference_condition_p=args.flow_reference_condition_p,
         latent_max_tokens=args.latent_max_tokens,
         latent_patch_size=args.latent_patch_size,
         ae_arch=args.ae_arch,
@@ -14254,6 +14540,73 @@ def main(argv=None):
         load_flow_state(flow, raw_flow)
         if conditioner is not None and raw_conditioner is not None:
             conditioner.load_state_dict(raw_conditioner)
+    if args.sample_reference_grid_out:
+        raw_flow = clone_state_dict(flow)
+        raw_conditioner = clone_state_dict(conditioner) if conditioner is not None else None
+        grid_weight_mode = "raw"
+        if report.get("selected_eval_weights") == "ema" and flow_ema is not None:
+            load_flow_state(flow, flow_ema)
+            if conditioner is not None and conditioner_ema:
+                conditioner.load_state_dict(conditioner_ema)
+            grid_weight_mode = "ema"
+        settings = selected_grid_settings(
+            report,
+            fallback_cfg=args.cfg_scale,
+            fallback_cfg_rescale=args.cfg_rescale,
+            fallback_steps=args.sample_steps,
+            fallback_method=args.sample_method,
+            fallback_sample_schedule=args.sample_schedule,
+            fallback_sample_churn=args.sample_churn,
+            fallback_sample_churn_interval=sample_churn_interval,
+            fallback_sample_finite_guard=args.sample_finite_guard,
+            fallback_sample_velocity_clip=args.sample_velocity_clip,
+            fallback_sample_latent_clip=args.sample_latent_clip,
+            fallback_cfg_mode=args.cfg_mode,
+            fallback_cfg_schedule=args.cfg_schedule,
+            fallback_cfg_interval=cfg_interval,
+            fallback_sample_time_shift=report.get(
+                "sample_time_shift", report.get("time_shift", args.time_shift)))
+        reference_manifest = args.sample_reference_manifest or args.image_manifest
+        if not reference_manifest:
+            ap.error(
+                "--sample-reference-grid-out requires --sample-reference-manifest "
+                "or --image-manifest")
+        reference_records = read_image_manifest(
+            reference_manifest, root=args.sample_reference_root or args.image_root,
+            split=args.image_split,
+            min_aesthetic=args.image_min_aesthetic,
+            max_records=args.image_max_records)
+        reference_meta = save_reference_reproduction_grid(
+            ae, flow, reference_records, args.sample_reference_grid_out,
+            conditioner=conditioner,
+            prompt_vocab=prompt_vocab, caption_max_len=args.caption_max_len,
+            size=run_size,
+            cfg_scale=settings["cfg_scale"],
+            cfg_rescale=settings["cfg_rescale"],
+            cfg_mode=settings["cfg_mode"],
+            cfg_schedule=settings["cfg_schedule"],
+            cfg_interval=settings["cfg_interval"],
+            sample_steps=settings["sample_steps"],
+            sample_time_shift=settings["sample_time_shift"],
+            sample_method=settings["sample_method"],
+            sample_schedule=settings["sample_schedule"],
+            sample_churn=settings["sample_churn"],
+            sample_churn_interval=settings["sample_churn_interval"],
+            sample_finite_guard=settings["sample_finite_guard"],
+            sample_velocity_clip=settings["sample_velocity_clip"],
+            sample_latent_clip=settings["sample_latent_clip"],
+            sample_pixel_dynamic_threshold_percentile=(
+                args.sample_pixel_dynamic_threshold_percentile),
+            sample_pixel_dynamic_threshold_max=args.sample_pixel_dynamic_threshold_max,
+            samples=args.sample_reference_samples,
+            seed=args.seed + 1499,
+            caption_cond_source=report.get("caption_cond_source", "tokens") or "tokens")
+        reference_meta["sample_grid_checkpoint_weight_mode"] = grid_weight_mode
+        report.update(reference_meta)
+        report.update(cli_sample_quality_gate_report(report, args))
+        load_flow_state(flow, raw_flow)
+        if conditioner is not None and raw_conditioner is not None:
+            conditioner.load_state_dict(raw_conditioner)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save({
         "autoencoder_state_dict": (
@@ -14364,6 +14717,8 @@ def main(argv=None):
             "flow_self_condition", args.flow_self_condition),
         "flow_self_condition_p": report.get(
             "flow_self_condition_p", args.flow_self_condition_p),
+        "flow_reference_condition_p": report.get(
+            "flow_reference_condition_p", args.flow_reference_condition_p),
         "flow_boundary_mode": report.get("flow_boundary_mode", args.flow_boundary_mode),
         "activation_checkpointing": report.get("activation_checkpointing", False),
         "zero_residual_gating": report.get("zero_residual_gating", False),
