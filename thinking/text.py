@@ -56,6 +56,7 @@ from .concepts import (
     SchemaConceptRefiner,
     latent_concept_cluster_prototype_loss,
     latent_concept_neighborhood_loss,
+    latent_concept_slot_factorization_loss,
     latent_concept_vicreg_loss,
     schema_concept_batch_centroid_loss,
     schema_concept_contrastive_loss,
@@ -1918,6 +1919,19 @@ def reading_latent_view_loss(model, txt, pad, unk, token_drop_p=0.15,
     return latent_concept_vicreg_loss(
         a, b, invariance_weight=invariance_w, variance_weight=variance_w,
         covariance_weight=covariance_w, variance_target=variance_target)
+
+
+def reading_latent_factorization_loss(model, txt, feature_dropout=0.1,
+                                      variance_target=0.05,
+                                      separation_margin=0.2,
+                                      covariance_w=0.05):
+    if getattr(model, "latent_concepts", None) is None:
+        return torch.tensor(0.0, device=txt.device)
+    slots = model.latent_concept_states(
+        txt, feature_dropout=feature_dropout, project=True)
+    return latent_concept_slot_factorization_loss(
+        slots, variance_target=variance_target,
+        separation_margin=separation_margin, covariance_weight=covariance_w)
 
 
 def split_reading_context_target(txt, pad, context_keep_p=0.5):
@@ -4855,6 +4869,10 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          feature_dropout=0.1,
                          invariance_w=25.0, variance_w=25.0,
                          covariance_w=1.0, variance_target=1.0,
+                         factorization_w=0.05,
+                         factorization_variance=0.05,
+                         factorization_margin=0.2,
+                         factorization_covariance_w=0.05,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
@@ -4874,6 +4892,14 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("raw reading concept training requires latent concept slots")
     if float(context_target_w) < 0.0:
         raise ValueError("reading context-target loss weight must be non-negative")
+    if float(factorization_w) < 0.0:
+        raise ValueError("reading factorization loss weight must be non-negative")
+    if float(factorization_variance) < 0.0:
+        raise ValueError("reading factorization variance must be non-negative")
+    if float(factorization_margin) < 0.0:
+        raise ValueError("reading factorization margin must be non-negative")
+    if float(factorization_covariance_w) < 0.0:
+        raise ValueError("reading factorization covariance weight must be non-negative")
     if float(neighborhood_w) < 0.0:
         raise ValueError("reading neighborhood loss weight must be non-negative")
     if int(neighborhood_batch) < 0:
@@ -4933,6 +4959,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     study_reports = []
     last_loss = 0.0
     last_view_loss = 0.0
+    last_factorization = 0.0
     last_context_target = 0.0
     last_neighborhood = 0.0
     last_cluster = 0.0
@@ -5009,6 +5036,13 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target)
+        factorization_loss = (
+            reading_latent_factorization_loss(
+                model, txt, feature_dropout=feature_dropout,
+                variance_target=factorization_variance,
+                separation_margin=factorization_margin,
+                covariance_w=factorization_covariance_w)
+            if factorization_w else view_loss * 0.0)
         context_target = (
             reading_context_target_loss(
                 model, txt, vocab.pad, context_keep_p=context_keep_p,
@@ -5045,7 +5079,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 model, replay_teacher_model, replay_batch_records, vocab,
                 replay_teacher_vocab, device=device,
                 feature_dropout=feature_dropout)
-        loss = (view_loss + float(context_target_w) * context_target
+        loss = (view_loss + float(factorization_w) * factorization_loss
+                + float(context_target_w) * context_target
                 + float(neighborhood_w) * neighborhood_loss
                 + float(cluster_w) * cluster_loss
                 + float(replay_w) * replay_loss)
@@ -5054,6 +5089,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         opt.step()
         last_loss = float(loss.detach())
         last_view_loss = float(view_loss.detach())
+        last_factorization = float(factorization_loss.detach())
         last_context_target = float(context_target.detach())
         last_neighborhood = float(neighborhood_loss.detach())
         last_cluster = float(cluster_loss.detach())
@@ -5061,6 +5097,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         if st % log_every == 0 or st == steps:
             print(f"  reading {st}/{steps} loss {last_loss:.3f} "
                   f"view {last_view_loss:.3f} "
+                  f"factor {last_factorization:.3f} "
                   f"context-target {last_context_target:.3f} "
                   f"neighborhood {last_neighborhood:.3f} "
                   f"cluster {last_cluster:.3f} "
@@ -5069,6 +5106,11 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     model.reading_train_metrics = {
         "loss": last_loss,
         "latent_view_loss": last_view_loss,
+        "factorization_loss": last_factorization,
+        "factorization_w": float(factorization_w),
+        "factorization_variance": float(factorization_variance),
+        "factorization_margin": float(factorization_margin),
+        "factorization_covariance_w": float(factorization_covariance_w),
         "context_target_loss": last_context_target,
         "neighborhood_loss": last_neighborhood,
         "cluster_loss": last_cluster,
@@ -5123,6 +5165,8 @@ def fit_reading_concepts_select_best(
         feature_dropout=0.1,
         invariance_w=25.0, variance_w=25.0,
         covariance_w=1.0, variance_target=1.0,
+        factorization_w=0.05, factorization_variance=0.05,
+        factorization_margin=0.2, factorization_covariance_w=0.05,
         context_target_w=0.1, context_keep_p=0.5,
         context_target_temperature=0.1,
         neighborhood_w=0.0, neighborhood_batch=0,
@@ -5197,7 +5241,12 @@ def fit_reading_concepts_select_best(
             token_drop_p=token_drop_p, token_replace_p=token_replace_p,
             feature_dropout=feature_dropout, invariance_w=invariance_w,
             variance_w=variance_w, covariance_w=covariance_w,
-            variance_target=variance_target, context_target_w=context_target_w,
+            variance_target=variance_target,
+            factorization_w=factorization_w,
+            factorization_variance=factorization_variance,
+            factorization_margin=factorization_margin,
+            factorization_covariance_w=factorization_covariance_w,
+            context_target_w=context_target_w,
             context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -5289,6 +5338,9 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            feature_dropout=0.1,
                            invariance_w=25.0, variance_w=25.0,
                            covariance_w=1.0, variance_target=1.0,
+                           factorization_w=0.05, factorization_variance=0.05,
+                           factorization_margin=0.2,
+                           factorization_covariance_w=0.05,
                            context_target_w=0.1, context_keep_p=0.5,
                            context_target_temperature=0.1,
                            neighborhood_w=0.0, neighborhood_batch=0,
@@ -5321,6 +5373,10 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         token_replace_p=token_replace_p, feature_dropout=feature_dropout,
         invariance_w=invariance_w, variance_w=variance_w,
         covariance_w=covariance_w, variance_target=variance_target,
+        factorization_w=factorization_w,
+        factorization_variance=factorization_variance,
+        factorization_margin=factorization_margin,
+        factorization_covariance_w=factorization_covariance_w,
         context_target_w=context_target_w, context_keep_p=context_keep_p,
         context_target_temperature=context_target_temperature,
         neighborhood_w=neighborhood_w,
@@ -5350,6 +5406,9 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          feature_dropout=0.1,
                          invariance_w=25.0, variance_w=25.0,
                          covariance_w=1.0, variance_target=1.0,
+                         factorization_w=0.05, factorization_variance=0.05,
+                         factorization_margin=0.2,
+                         factorization_covariance_w=0.05,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
@@ -5394,6 +5453,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
+            factorization_w=factorization_w,
+            factorization_variance=factorization_variance,
+            factorization_margin=factorization_margin,
+            factorization_covariance_w=factorization_covariance_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -5422,6 +5485,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
+            factorization_w=factorization_w,
+            factorization_variance=factorization_variance,
+            factorization_margin=factorization_margin,
+            factorization_covariance_w=factorization_covariance_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -5471,6 +5538,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "variance_w": float(variance_w),
               "covariance_w": float(covariance_w),
               "variance_target": float(variance_target),
+              "factorization_w": float(factorization_w),
+              "factorization_variance": float(factorization_variance),
+              "factorization_margin": float(factorization_margin),
+              "factorization_covariance_w": float(factorization_covariance_w),
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
@@ -5604,6 +5675,9 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              token_replace_p=0.05, feature_dropout=0.1,
                              invariance_w=25.0, variance_w=25.0,
                              covariance_w=1.0, variance_target=1.0,
+                             factorization_w=0.05, factorization_variance=0.05,
+                             factorization_margin=0.2,
+                             factorization_covariance_w=0.05,
                              context_target_w=0.1, context_keep_p=0.5,
                              context_target_temperature=0.1,
                              neighborhood_w=0.0, neighborhood_batch=0,
@@ -5669,6 +5743,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
+            factorization_w=factorization_w,
+            factorization_variance=factorization_variance,
+            factorization_margin=factorization_margin,
+            factorization_covariance_w=factorization_covariance_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -5702,6 +5780,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
+            factorization_w=factorization_w,
+            factorization_variance=factorization_variance,
+            factorization_margin=factorization_margin,
+            factorization_covariance_w=factorization_covariance_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -5769,6 +5851,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "variance_w": float(variance_w),
               "covariance_w": float(covariance_w),
               "variance_target": float(variance_target),
+              "factorization_w": float(factorization_w),
+              "factorization_variance": float(factorization_variance),
+              "factorization_margin": float(factorization_margin),
+              "factorization_covariance_w": float(factorization_covariance_w),
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
@@ -9285,6 +9371,9 @@ def selftest():
         reading_model, reading_txt, reading_vocab.pad, reading_vocab.unk,
         token_drop_p=0.1, token_replace_p=0.0)
     assert torch.isfinite(reading_loss)
+    reading_factorization = reading_latent_factorization_loss(
+        reading_model, reading_txt, feature_dropout=0.1)
+    assert torch.isfinite(reading_factorization)
     context_txt, target_txt = split_reading_context_target(
         reading_txt, reading_vocab.pad, context_keep_p=0.5)
     assert context_txt.ne(reading_vocab.pad).any(1).all()
@@ -9635,6 +9724,15 @@ def main(argv=None):
                     help="probability that a token stays in the context fragment")
     ap.add_argument("--reading-context-target-temperature", type=float, default=0.1,
                     help="contrastive temperature for context-to-target reading retrieval")
+    ap.add_argument("--reading-factorization-w", type=float, default=0.05,
+                    help=("weight for schema-free latent slot factorization during "
+                          "raw reading"))
+    ap.add_argument("--reading-factorization-variance", type=float, default=0.05,
+                    help="minimum per-slot batch variation for raw reading latent slots")
+    ap.add_argument("--reading-factorization-margin", type=float, default=0.2,
+                    help="allowed same-example cosine before latent slot separation penalty")
+    ap.add_argument("--reading-factorization-covariance-w", type=float, default=0.05,
+                    help="decorrelation weight inside raw reading slot factorization")
     ap.add_argument("--reading-neighborhood-w", type=float, default=0.0,
                     help=("weight for self-mined latent neighborhood discovery loss "
                           "on raw reading chunks"))
@@ -10145,6 +10243,14 @@ def main(argv=None):
         ap.error("--reading-context-keep-p must be in (0, 1)")
     if args.reading_context_target_temperature <= 0.0:
         ap.error("--reading-context-target-temperature must be positive")
+    if args.reading_factorization_w < 0.0:
+        ap.error("--reading-factorization-w must be non-negative")
+    if args.reading_factorization_variance < 0.0:
+        ap.error("--reading-factorization-variance must be non-negative")
+    if args.reading_factorization_margin < 0.0:
+        ap.error("--reading-factorization-margin must be non-negative")
+    if args.reading_factorization_covariance_w < 0.0:
+        ap.error("--reading-factorization-covariance-w must be non-negative")
     if args.reading_neighborhood_w < 0.0:
         ap.error("--reading-neighborhood-w must be non-negative")
     if args.reading_neighborhood_batch < 0:
@@ -10246,6 +10352,11 @@ def main(argv=None):
                 variance_w=args.latent_concept_variance_w,
                 covariance_w=args.latent_concept_covariance_w,
                 variance_target=args.latent_concept_variance_target,
+                factorization_w=args.reading_factorization_w,
+                factorization_variance=args.reading_factorization_variance,
+                factorization_margin=args.reading_factorization_margin,
+                factorization_covariance_w=(
+                    args.reading_factorization_covariance_w),
                 context_target_w=args.reading_context_target_w,
                 context_keep_p=args.reading_context_keep_p,
                 context_target_temperature=(
@@ -10312,6 +10423,11 @@ def main(argv=None):
                 variance_w=args.latent_concept_variance_w,
                 covariance_w=args.latent_concept_covariance_w,
                 variance_target=args.latent_concept_variance_target,
+                factorization_w=args.reading_factorization_w,
+                factorization_variance=args.reading_factorization_variance,
+                factorization_margin=args.reading_factorization_margin,
+                factorization_covariance_w=(
+                    args.reading_factorization_covariance_w),
                 context_target_w=args.reading_context_target_w,
                 context_keep_p=args.reading_context_keep_p,
                 context_target_temperature=(

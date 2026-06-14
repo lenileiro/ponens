@@ -403,6 +403,45 @@ def latent_concept_cluster_prototype_loss(slots, cluster_ids, temperature=0.1,
     return torch.stack(losses).mean()
 
 
+def latent_concept_slot_factorization_loss(slots, variance_target=0.05,
+                                           separation_margin=0.2,
+                                           covariance_weight=0.05):
+    """Encourage schema-free latent slots to become distinct reusable factors.
+
+    This loss is label-free: it only sees the slot tensor. Slots in the same
+    observation are pushed away from duplicate geometry, each slot is kept active
+    across the batch, and dimensions inside each slot are lightly decorrelated.
+    """
+    if slots is None:
+        return torch.tensor(0.0)
+    if slots.ndim != 3:
+        raise ValueError("latent concept factorization expects [batch, slots, dim]")
+    if slots.shape[0] == 0 or slots.shape[1] == 0:
+        return slots.sum() * 0.0
+    losses = []
+    if slots.shape[1] > 1:
+        z = F.normalize(slots, dim=-1)
+        sim = z.matmul(z.transpose(1, 2))
+        eye = torch.eye(slots.shape[1], dtype=torch.bool, device=slots.device)
+        off = sim.masked_select(~eye[None])
+        losses.append(F.relu(off.abs() - float(separation_margin)).pow(2).mean())
+    if slots.shape[0] > 1:
+        centered = slots - slots.mean(dim=0, keepdim=True)
+        std = torch.sqrt(centered.var(dim=0, unbiased=False) + 1e-4)
+        losses.append(F.relu(float(variance_target) - std).mean())
+        cov_losses = []
+        for slot_i in range(slots.shape[1]):
+            x = centered[:, slot_i]
+            if x.shape[0] > 1 and x.shape[1] > 1:
+                cov = x.t().matmul(x) / max(1, x.shape[0] - 1)
+                cov_losses.append(_off_diagonal(cov).pow(2).sum() / x.shape[-1])
+        if cov_losses and float(covariance_weight):
+            losses.append(float(covariance_weight) * torch.stack(cov_losses).mean())
+    if not losses:
+        return slots.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
 def schema_concept_contrastive_loss(states_by_key, target_ids_by_key, temperature=0.1):
     """Cluster same-value concept states and separate other values for the same key.
 
