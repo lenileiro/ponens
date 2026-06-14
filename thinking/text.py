@@ -56,6 +56,7 @@ from .concepts import (
     SchemaConceptHead,
     SchemaConceptRefiner,
     latent_concept_composition_loss,
+    latent_concept_graph_prediction_loss,
     latent_concept_graph_curiosity_scores,
     latent_concept_cluster_prototype_loss,
     latent_concept_neighborhood_loss,
@@ -1416,6 +1417,21 @@ class TextFactLM(nn.Module):
             transitive_steps=transitive_steps, transitive_w=transitive_w,
             margin=margin)
 
+    def latent_concept_graph_prediction_loss(
+            self, source_slots, target_slots, temperature=0.1,
+            self_loop_w=0.05, transitive_steps=2, transitive_w=0.1,
+            target_power=1.0):
+        if self.latent_concept_memory is None:
+            if source_slots is not None:
+                return source_slots.sum() * 0.0
+            if target_slots is not None:
+                return target_slots.sum() * 0.0
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        return self.latent_concept_memory.graph_prediction_loss(
+            source_slots, target_slots, temperature=temperature,
+            self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+            transitive_w=transitive_w, target_power=target_power)
+
     @torch.no_grad()
     def update_latent_concept_memory(self, slots, momentum=0.95,
                                      relation_decay=None):
@@ -2115,6 +2131,32 @@ def reading_context_target_loss(model, txt, pad, context_keep_p=0.5,
     logits = predicted.matmul(target.t()) / max(float(temperature), 1e-6)
     labels = torch.arange(logits.shape[0], device=logits.device)
     return F.cross_entropy(logits, labels)
+
+
+def reading_context_graph_prediction_loss(
+        model, txt, pad, context_keep_p=0.5, feature_dropout=0.1,
+        temperature=0.1, self_loop_w=0.05, transitive_steps=2,
+        transitive_w=0.1, target_power=1.0):
+    if (getattr(model, "latent_concepts", None) is None
+            or getattr(model, "latent_concept_memory", None) is None):
+        return torch.tensor(0.0, device=txt.device)
+    context_txt, target_txt = split_reading_context_target(
+        txt, pad, context_keep_p=context_keep_p)
+    source_slots = model.latent_concept_states(
+        context_txt, feature_dropout=feature_dropout, project=True)
+    target_slots = model.latent_concept_states(
+        target_txt, feature_dropout=0.0, project=True).detach()
+    if hasattr(model, "latent_concept_graph_prediction_loss"):
+        return model.latent_concept_graph_prediction_loss(
+            source_slots, target_slots, temperature=temperature,
+            self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+            transitive_w=transitive_w, target_power=target_power)
+    return latent_concept_graph_prediction_loss(
+        source_slots, target_slots, model.latent_concept_memory.active(),
+        model.latent_concept_memory.active_relations(),
+        temperature=temperature, self_loop_w=self_loop_w,
+        transitive_steps=transitive_steps, transitive_w=transitive_w,
+        target_power=target_power)
 
 
 def reading_teacher_latent_consistency_loss(model, teacher_model, records, vocab,
@@ -5108,6 +5150,12 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          composition_transitive_steps=2,
                          composition_transitive_w=0.1,
                          composition_margin=0.0,
+                         graph_predict_w=0.0,
+                         graph_predict_temperature=0.1,
+                         graph_predict_self_loop_w=0.05,
+                         graph_predict_transitive_steps=2,
+                         graph_predict_transitive_w=0.1,
+                         graph_predict_target_power=1.0,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
@@ -5174,6 +5222,18 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading composition transitive weight must be non-negative")
     if float(composition_margin) < 0.0:
         raise ValueError("reading composition margin must be non-negative")
+    if float(graph_predict_w) < 0.0:
+        raise ValueError("reading graph prediction weight must be non-negative")
+    if float(graph_predict_temperature) <= 0.0:
+        raise ValueError("reading graph prediction temperature must be positive")
+    if float(graph_predict_self_loop_w) < 0.0:
+        raise ValueError("reading graph prediction self-loop weight must be non-negative")
+    if int(graph_predict_transitive_steps) < 1:
+        raise ValueError("reading graph prediction transitive steps must be positive")
+    if float(graph_predict_transitive_w) < 0.0:
+        raise ValueError("reading graph prediction transitive weight must be non-negative")
+    if float(graph_predict_target_power) <= 0.0:
+        raise ValueError("reading graph prediction target power must be positive")
     if float(neighborhood_w) < 0.0:
         raise ValueError("reading neighborhood loss weight must be non-negative")
     if int(neighborhood_batch) < 0:
@@ -5226,6 +5286,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading association requires latent concept memory")
     if composition_w and getattr(model, "latent_concept_memory", None) is None:
         raise ValueError("reading composition requires latent concept memory")
+    if graph_predict_w and getattr(model, "latent_concept_memory", None) is None:
+        raise ValueError("reading graph prediction requires latent concept memory")
     if study_strategy == "curiosity" and getattr(model, "latent_concept_memory", None) is None:
         raise ValueError("reading curiosity study requires latent concept memory")
     if replay_w and (not replay_sources or replay_teacher_model is None
@@ -5255,6 +5317,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_memory_updates = 0
     last_association = 0.0
     last_composition = 0.0
+    last_graph_predict = 0.0
     last_context_target = 0.0
     last_neighborhood = 0.0
     last_transition = 0.0
@@ -5380,6 +5443,16 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 transitive_w=composition_transitive_w,
                 margin=composition_margin)
             if composition_w else view_loss * 0.0)
+        graph_predict_loss = (
+            reading_context_graph_prediction_loss(
+                model, txt, vocab.pad, context_keep_p=context_keep_p,
+                feature_dropout=feature_dropout,
+                temperature=graph_predict_temperature,
+                self_loop_w=graph_predict_self_loop_w,
+                transitive_steps=graph_predict_transitive_steps,
+                transitive_w=graph_predict_transitive_w,
+                target_power=graph_predict_target_power)
+            if graph_predict_w else view_loss * 0.0)
         context_target = (
             reading_context_target_loss(
                 model, txt, vocab.pad, context_keep_p=context_keep_p,
@@ -5431,6 +5504,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 + float(memory_w) * memory_loss
                 + float(association_w) * association_loss
                 + float(composition_w) * composition_loss
+                + float(graph_predict_w) * graph_predict_loss
                 + float(context_target_w) * context_target
                 + float(neighborhood_w) * neighborhood_loss
                 + float(transition_w) * transition_loss
@@ -5442,13 +5516,15 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_memory_updates = int(update_reading_latent_memory(
             model, txt, feature_dropout=0.0, momentum=memory_momentum,
             relation_decay=(association_decay
-                            if (association_w or composition_w) else None)))
+                            if (association_w or composition_w or graph_predict_w)
+                            else None)))
         last_loss = float(loss.detach())
         last_view_loss = float(view_loss.detach())
         last_factorization = float(factorization_loss.detach())
         last_memory = float(memory_loss.detach())
         last_association = float(association_loss.detach())
         last_composition = float(composition_loss.detach())
+        last_graph_predict = float(graph_predict_loss.detach())
         last_context_target = float(context_target.detach())
         last_neighborhood = float(neighborhood_loss.detach())
         last_transition = float(transition_loss.detach())
@@ -5461,6 +5537,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                   f"memory {last_memory:.3f} "
                   f"assoc {last_association:.3f} "
                   f"compose {last_composition:.3f} "
+                  f"graph-predict {last_graph_predict:.3f} "
                   f"context-target {last_context_target:.3f} "
                   f"neighborhood {last_neighborhood:.3f} "
                   f"transition {last_transition:.3f} "
@@ -5509,6 +5586,13 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "composition_transitive_steps": int(composition_transitive_steps),
         "composition_transitive_w": float(composition_transitive_w),
         "composition_margin": float(composition_margin),
+        "graph_predict_loss": last_graph_predict,
+        "graph_predict_w": float(graph_predict_w),
+        "graph_predict_temperature": float(graph_predict_temperature),
+        "graph_predict_self_loop_w": float(graph_predict_self_loop_w),
+        "graph_predict_transitive_steps": int(graph_predict_transitive_steps),
+        "graph_predict_transitive_w": float(graph_predict_transitive_w),
+        "graph_predict_target_power": float(graph_predict_target_power),
         "context_target_loss": last_context_target,
         "neighborhood_loss": last_neighborhood,
         "transition_loss": last_transition,
@@ -5581,6 +5665,9 @@ def fit_reading_concepts_select_best(
         composition_w=0.0, composition_temperature=0.1,
         composition_self_loop_w=0.0, composition_transitive_steps=2,
         composition_transitive_w=0.1, composition_margin=0.0,
+        graph_predict_w=0.0, graph_predict_temperature=0.1,
+        graph_predict_self_loop_w=0.05, graph_predict_transitive_steps=2,
+        graph_predict_transitive_w=0.1, graph_predict_target_power=1.0,
         context_target_w=0.1, context_keep_p=0.5,
         context_target_temperature=0.1,
         neighborhood_w=0.0, neighborhood_batch=0,
@@ -5682,6 +5769,12 @@ def fit_reading_concepts_select_best(
             composition_transitive_steps=composition_transitive_steps,
             composition_transitive_w=composition_transitive_w,
             composition_margin=composition_margin,
+            graph_predict_w=graph_predict_w,
+            graph_predict_temperature=graph_predict_temperature,
+            graph_predict_self_loop_w=graph_predict_self_loop_w,
+            graph_predict_transitive_steps=graph_predict_transitive_steps,
+            graph_predict_transitive_w=graph_predict_transitive_w,
+            graph_predict_target_power=graph_predict_target_power,
             context_target_w=context_target_w,
             context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
@@ -5794,6 +5887,11 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            composition_transitive_steps=2,
                            composition_transitive_w=0.1,
                            composition_margin=0.0,
+                           graph_predict_w=0.0, graph_predict_temperature=0.1,
+                           graph_predict_self_loop_w=0.05,
+                           graph_predict_transitive_steps=2,
+                           graph_predict_transitive_w=0.1,
+                           graph_predict_target_power=1.0,
                            context_target_w=0.1, context_keep_p=0.5,
                            context_target_temperature=0.1,
                            neighborhood_w=0.0, neighborhood_batch=0,
@@ -5851,6 +5949,12 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         composition_transitive_steps=composition_transitive_steps,
         composition_transitive_w=composition_transitive_w,
         composition_margin=composition_margin,
+        graph_predict_w=graph_predict_w,
+        graph_predict_temperature=graph_predict_temperature,
+        graph_predict_self_loop_w=graph_predict_self_loop_w,
+        graph_predict_transitive_steps=graph_predict_transitive_steps,
+        graph_predict_transitive_w=graph_predict_transitive_w,
+        graph_predict_target_power=graph_predict_target_power,
         context_target_w=context_target_w, context_keep_p=context_keep_p,
         context_target_temperature=context_target_temperature,
         neighborhood_w=neighborhood_w,
@@ -5900,6 +6004,11 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          composition_transitive_steps=2,
                          composition_transitive_w=0.1,
                          composition_margin=0.0,
+                         graph_predict_w=0.0, graph_predict_temperature=0.1,
+                         graph_predict_self_loop_w=0.05,
+                         graph_predict_transitive_steps=2,
+                         graph_predict_transitive_w=0.1,
+                         graph_predict_target_power=1.0,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
@@ -5969,6 +6078,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             composition_transitive_steps=composition_transitive_steps,
             composition_transitive_w=composition_transitive_w,
             composition_margin=composition_margin,
+            graph_predict_w=graph_predict_w,
+            graph_predict_temperature=graph_predict_temperature,
+            graph_predict_self_loop_w=graph_predict_self_loop_w,
+            graph_predict_transitive_steps=graph_predict_transitive_steps,
+            graph_predict_transitive_w=graph_predict_transitive_w,
+            graph_predict_target_power=graph_predict_target_power,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -6023,6 +6138,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             composition_transitive_steps=composition_transitive_steps,
             composition_transitive_w=composition_transitive_w,
             composition_margin=composition_margin,
+            graph_predict_w=graph_predict_w,
+            graph_predict_temperature=graph_predict_temperature,
+            graph_predict_self_loop_w=graph_predict_self_loop_w,
+            graph_predict_transitive_steps=graph_predict_transitive_steps,
+            graph_predict_transitive_w=graph_predict_transitive_w,
+            graph_predict_target_power=graph_predict_target_power,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -6098,6 +6219,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "composition_transitive_steps": int(composition_transitive_steps),
               "composition_transitive_w": float(composition_transitive_w),
               "composition_margin": float(composition_margin),
+              "graph_predict_w": float(graph_predict_w),
+              "graph_predict_temperature": float(graph_predict_temperature),
+              "graph_predict_self_loop_w": float(graph_predict_self_loop_w),
+              "graph_predict_transitive_steps": int(graph_predict_transitive_steps),
+              "graph_predict_transitive_w": float(graph_predict_transitive_w),
+              "graph_predict_target_power": float(graph_predict_target_power),
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
@@ -6257,6 +6384,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              composition_transitive_steps=2,
                              composition_transitive_w=0.1,
                              composition_margin=0.0,
+                             graph_predict_w=0.0,
+                             graph_predict_temperature=0.1,
+                             graph_predict_self_loop_w=0.05,
+                             graph_predict_transitive_steps=2,
+                             graph_predict_transitive_w=0.1,
+                             graph_predict_target_power=1.0,
                              context_target_w=0.1, context_keep_p=0.5,
                              context_target_temperature=0.1,
                              neighborhood_w=0.0, neighborhood_batch=0,
@@ -6347,6 +6480,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             composition_transitive_steps=composition_transitive_steps,
             composition_transitive_w=composition_transitive_w,
             composition_margin=composition_margin,
+            graph_predict_w=graph_predict_w,
+            graph_predict_temperature=graph_predict_temperature,
+            graph_predict_self_loop_w=graph_predict_self_loop_w,
+            graph_predict_transitive_steps=graph_predict_transitive_steps,
+            graph_predict_transitive_w=graph_predict_transitive_w,
+            graph_predict_target_power=graph_predict_target_power,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -6406,6 +6545,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             composition_transitive_steps=composition_transitive_steps,
             composition_transitive_w=composition_transitive_w,
             composition_margin=composition_margin,
+            graph_predict_w=graph_predict_w,
+            graph_predict_temperature=graph_predict_temperature,
+            graph_predict_self_loop_w=graph_predict_self_loop_w,
+            graph_predict_transitive_steps=graph_predict_transitive_steps,
+            graph_predict_transitive_w=graph_predict_transitive_w,
+            graph_predict_target_power=graph_predict_target_power,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -6499,6 +6644,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "composition_transitive_steps": int(composition_transitive_steps),
               "composition_transitive_w": float(composition_transitive_w),
               "composition_margin": float(composition_margin),
+              "graph_predict_w": float(graph_predict_w),
+              "graph_predict_temperature": float(graph_predict_temperature),
+              "graph_predict_self_loop_w": float(graph_predict_self_loop_w),
+              "graph_predict_transitive_steps": int(graph_predict_transitive_steps),
+              "graph_predict_transitive_w": float(graph_predict_transitive_w),
+              "graph_predict_target_power": float(graph_predict_target_power),
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
@@ -10047,6 +10198,10 @@ def selftest():
         reading_model, reading_txt, feature_dropout=0.1,
         transitive_steps=2, transitive_w=0.1)
     assert torch.isfinite(reading_composition)
+    reading_graph_predict = reading_context_graph_prediction_loss(
+        reading_model, reading_txt, reading_vocab.pad, context_keep_p=0.5,
+        feature_dropout=0.1, transitive_steps=2, transitive_w=0.1)
+    assert torch.isfinite(reading_graph_predict)
     curiosity_records, curiosity_report = reading_latent_curiosity_records(
         reading_model, reading_vocab, reading_records, device="cpu", n=0,
         transitive_steps=2, transitive_w=0.1)
@@ -10150,7 +10305,7 @@ def selftest():
         seed=5, device="cpu", log_every=1, token_drop_p=0.1,
         token_replace_p=0.0, study_strategy="curiosity", study_probe_n=2,
         study_hard_max=2, context_target_w=0.1, context_keep_p=0.5,
-        composition_w=0.1,
+        composition_w=0.1, graph_predict_w=0.1,
         neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2,
         transition_w=0.1, transition_batch=2,
         cluster_w=0.1, cluster_batch=4, cluster_probe_n=4)
@@ -10163,6 +10318,8 @@ def selftest():
     assert reading_model.reading_train_metrics["association_relation_updates"] > 0
     assert reading_model.reading_train_metrics["composition_w"] == 0.1
     assert reading_model.reading_train_metrics["composition_loss"] >= 0.0
+    assert reading_model.reading_train_metrics["graph_predict_w"] == 0.1
+    assert reading_model.reading_train_metrics["graph_predict_loss"] >= 0.0
     assert reading_model.reading_study_reports[-1]["strategy"] == "curiosity"
     assert reading_model.reading_train_metrics["neighborhood_w"] == 0.1
     assert reading_model.reading_train_metrics["transition_w"] == 0.1
@@ -10471,6 +10628,19 @@ def main(argv=None):
                     help="weight for multi-hop inferred concept composition")
     ap.add_argument("--reading-composition-margin", type=float, default=0.0,
                     help="minimum margin over non-target concept compositions")
+    ap.add_argument("--reading-graph-predict-w", type=float, default=0.0,
+                    help=("weight for predicting held-out reading concepts through "
+                          "the self-mined latent graph"))
+    ap.add_argument("--reading-graph-predict-temperature", type=float, default=0.1,
+                    help="contrastive temperature for latent graph prediction")
+    ap.add_argument("--reading-graph-predict-self-loop-w", type=float, default=0.05,
+                    help="self-loop weight in latent graph prediction targets")
+    ap.add_argument("--reading-graph-predict-transitive-steps", type=int, default=2,
+                    help="graph walk depth for latent graph prediction")
+    ap.add_argument("--reading-graph-predict-transitive-w", type=float, default=0.1,
+                    help="weight for multi-hop graph prediction targets")
+    ap.add_argument("--reading-graph-predict-target-power", type=float, default=1.0,
+                    help="sharpening power for held-out latent concept targets")
     ap.add_argument("--reading-neighborhood-w", type=float, default=0.0,
                     help=("weight for self-mined latent neighborhood discovery loss "
                           "on raw reading chunks"))
@@ -11035,6 +11205,18 @@ def main(argv=None):
         ap.error("--reading-composition-transitive-w must be non-negative")
     if args.reading_composition_margin < 0.0:
         ap.error("--reading-composition-margin must be non-negative")
+    if args.reading_graph_predict_w < 0.0:
+        ap.error("--reading-graph-predict-w must be non-negative")
+    if args.reading_graph_predict_temperature <= 0.0:
+        ap.error("--reading-graph-predict-temperature must be positive")
+    if args.reading_graph_predict_self_loop_w < 0.0:
+        ap.error("--reading-graph-predict-self-loop-w must be non-negative")
+    if args.reading_graph_predict_transitive_steps < 1:
+        ap.error("--reading-graph-predict-transitive-steps must be positive")
+    if args.reading_graph_predict_transitive_w < 0.0:
+        ap.error("--reading-graph-predict-transitive-w must be non-negative")
+    if args.reading_graph_predict_target_power <= 0.0:
+        ap.error("--reading-graph-predict-target-power must be positive")
     if args.reading_neighborhood_w < 0.0:
         ap.error("--reading-neighborhood-w must be non-negative")
     if args.reading_neighborhood_batch < 0:
@@ -11169,6 +11351,14 @@ def main(argv=None):
                     args.reading_composition_transitive_steps),
                 composition_transitive_w=args.reading_composition_transitive_w,
                 composition_margin=args.reading_composition_margin,
+                graph_predict_w=args.reading_graph_predict_w,
+                graph_predict_temperature=args.reading_graph_predict_temperature,
+                graph_predict_self_loop_w=args.reading_graph_predict_self_loop_w,
+                graph_predict_transitive_steps=(
+                    args.reading_graph_predict_transitive_steps),
+                graph_predict_transitive_w=(
+                    args.reading_graph_predict_transitive_w),
+                graph_predict_target_power=args.reading_graph_predict_target_power,
                 context_target_w=args.reading_context_target_w,
                 context_keep_p=args.reading_context_keep_p,
                 context_target_temperature=(
@@ -11264,6 +11454,14 @@ def main(argv=None):
                     args.reading_composition_transitive_steps),
                 composition_transitive_w=args.reading_composition_transitive_w,
                 composition_margin=args.reading_composition_margin,
+                graph_predict_w=args.reading_graph_predict_w,
+                graph_predict_temperature=args.reading_graph_predict_temperature,
+                graph_predict_self_loop_w=args.reading_graph_predict_self_loop_w,
+                graph_predict_transitive_steps=(
+                    args.reading_graph_predict_transitive_steps),
+                graph_predict_transitive_w=(
+                    args.reading_graph_predict_transitive_w),
+                graph_predict_target_power=args.reading_graph_predict_target_power,
                 context_target_w=args.reading_context_target_w,
                 context_keep_p=args.reading_context_keep_p,
                 context_target_temperature=(

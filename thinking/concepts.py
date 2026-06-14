@@ -159,6 +159,15 @@ class LatentConceptMemory(nn.Module):
             transitive_steps=transitive_steps, transitive_w=transitive_w,
             margin=margin)
 
+    def graph_prediction_loss(self, source_slots, target_slots, temperature=0.1,
+                              self_loop_w=0.05, transitive_steps=2,
+                              transitive_w=0.1, target_power=1.0):
+        return latent_concept_graph_prediction_loss(
+            source_slots, target_slots, self.active(), self.active_relations(),
+            temperature=temperature, self_loop_w=self_loop_w,
+            transitive_steps=transitive_steps, transitive_w=transitive_w,
+            target_power=target_power)
+
     @torch.no_grad()
     def update(self, slots, momentum=0.95, relation_decay=None):
         if slots is None:
@@ -461,6 +470,68 @@ def latent_concept_composition_loss(slots, memory, relations, temperature=0.1,
             if bool(finite.any()):
                 losses.append(
                     F.relu(negative_sim[finite] + margin_t - target_sim[finite]).mean())
+    return torch.stack(losses).mean()
+
+
+def latent_concept_graph_prediction_loss(source_slots, target_slots, memory,
+                                         relations, temperature=0.1,
+                                         self_loop_w=0.05,
+                                         transitive_steps=2,
+                                         transitive_w=0.1,
+                                         target_power=1.0):
+    """Infer held-out/full latent concepts through the self-mined graph.
+
+    Source slots form a distribution over persistent latent concepts. The
+    relation graph propagates that distribution into a predicted concept closure,
+    which is trained to match target slots from held-out text or fuller modality
+    evidence. This is a schema-free predictive-coding objective over concepts,
+    not a token prediction or task-label objective.
+    """
+    if source_slots is None or target_slots is None:
+        for slots in (source_slots, target_slots):
+            if slots is not None:
+                return slots.sum() * 0.0
+        return torch.tensor(0.0)
+    if memory is None or memory.numel() == 0:
+        return source_slots.sum() * 0.0
+    if relations is None or relations.numel() == 0:
+        return source_slots.sum() * 0.0
+    if source_slots.ndim != 3 or target_slots.ndim != 3:
+        raise ValueError("latent graph prediction expects [batch, slots, dim]")
+    if source_slots.shape[0] != target_slots.shape[0]:
+        raise ValueError("latent graph prediction batch mismatch")
+    if source_slots.shape[-1] != target_slots.shape[-1]:
+        raise ValueError("latent graph prediction source/target dimension mismatch")
+    if source_slots.shape[-1] != memory.shape[-1]:
+        raise ValueError("latent graph prediction memory dimension mismatch")
+    mem = F.normalize(
+        memory.to(device=source_slots.device, dtype=source_slots.dtype), dim=-1)
+    rel = _latent_relation_targets(
+        relations, mem.shape[0], source_slots.device, source_slots.dtype,
+        self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+        transitive_w=transitive_w)
+    if rel is None:
+        return source_slots.sum() * 0.0
+    temp = max(float(temperature), 1e-6)
+    source = F.normalize(source_slots, dim=-1)
+    target = F.normalize(target_slots.to(source_slots), dim=-1)
+    source_dist = (source.matmul(mem.t()) / temp).softmax(-1).mean(1)
+    pred = source_dist.matmul(rel)
+    pred = pred / pred.sum(-1, keepdim=True).clamp_min(1e-8)
+    with torch.no_grad():
+        target_dist = (target.matmul(mem.t()) / temp).softmax(-1).mean(1)
+        power = float(target_power)
+        if power <= 0.0:
+            raise ValueError("latent graph prediction target power must be positive")
+        if power != 1.0:
+            target_dist = target_dist.clamp_min(1e-8).pow(power)
+        target_dist = target_dist / target_dist.sum(-1, keepdim=True).clamp_min(1e-8)
+        target_center = F.normalize(target_dist.matmul(mem), dim=-1)
+    pred_center = F.normalize(pred.matmul(mem), dim=-1)
+    losses = [
+        F.kl_div(pred.clamp_min(1e-8).log(), target_dist, reduction="batchmean"),
+        (1.0 - (pred_center * target_center).sum(-1)).mean(),
+    ]
     return torch.stack(losses).mean()
 
 
