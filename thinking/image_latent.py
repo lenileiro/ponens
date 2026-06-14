@@ -45,12 +45,16 @@ from .image_data import (ImageTextRecord, build_caption_vocab, caption_ids,
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 SAMPLE_METHODS = ("euler", "heun", "midpoint", "rk4", "adaptive-heun")
-SAMPLE_SCHEDULES = ("linear", "quadratic", "sqrt", "cosine")
+SAMPLE_SCHEDULES = ("linear", "quadratic", "sqrt", "cosine", "karras")
+KARRAS_SCHEDULE_RHO = 7.0
+KARRAS_SCHEDULE_SIGMA_MIN = 1.0e-3
+KARRAS_SCHEDULE_SIGMA_MAX = 1.0
 CFG_MODES = ("standard", "cfgpp")
 CFG_SCHEDULES = ("constant", "linear", "cosine", "triangular")
 MMDIT_ATTN_IMPLS = ("manual", "sdpa", "linear", "auto")
 DIT_POS_EMBEDS = ("learned", "sincos2d", "rope2d")
 DIT_MLPS = ("gelu", "swiglu")
+FLOW_TIME_EMBEDS = ("scalar", "fourier")
 FLOW_LOSS_WEIGHTS = ("none", "min-snr-v", "soft-min-snr-v")
 FLOW_NOISE_COUPLINGS = ("random", "sliced_ot")
 FLOW_REPA_MODES = ("pooled", "token", "both", "auto")
@@ -527,6 +531,188 @@ def size_bucket_probs_subset(size_buckets, bucket_probs, active_buckets):
 
 def image_size_bucket_keys(size_buckets):
     return {image_size_key(bucket) for bucket in tuple(size_buckets)}
+
+
+GEOMETRY_FEATURE_DIM = 20
+
+
+def _transform_meta_int(meta, key, default=0):
+    if not isinstance(meta, dict):
+        return int(default)
+    try:
+        return int(meta.get(key, default) or default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def image_geometry_feature_tensor(records=None, target_size=32, batch=0, device=DEV,
+                                  transform_metadata=None):
+    """Return generic image transform features for latent image conditioning."""
+    target_h, target_w = image_hw(target_size, default=32)
+    if records is None:
+        rows = [None for _ in range(int(batch or 1))]
+    else:
+        rows = list(records)
+    if batch and int(batch) != len(rows):
+        if records is not None:
+            raise ValueError(
+                f"geometry feature batch {int(batch)} does not match records {len(rows)}")
+        rows = [None for _ in range(int(batch))]
+    if transform_metadata is None:
+        metadata_rows = [None for _ in rows]
+    else:
+        metadata_rows = list(transform_metadata)
+        if len(metadata_rows) != len(rows):
+            raise ValueError(
+                f"geometry metadata batch {len(metadata_rows)} "
+                f"does not match records {len(rows)}")
+    vals = []
+    base = 1024.0
+    for rec, meta in zip(rows, metadata_rows):
+        orig_w = _transform_meta_int(
+            meta, "original_width",
+            int(getattr(rec, "width", 0) or 0) if rec is not None else 0)
+        orig_h = _transform_meta_int(
+            meta, "original_height",
+            int(getattr(rec, "height", 0) or 0) if rec is not None else 0)
+        cur_target_h = _transform_meta_int(meta, "target_height", target_h)
+        cur_target_w = _transform_meta_int(meta, "target_width", target_w)
+        if orig_w <= 0:
+            orig_w = int(cur_target_w)
+        if orig_h <= 0:
+            orig_h = int(cur_target_h)
+        orig_h_f = max(1.0, float(orig_h))
+        orig_w_f = max(1.0, float(orig_w))
+        target_h_f = max(1.0, float(cur_target_h))
+        target_w_f = max(1.0, float(cur_target_w))
+        crop_top = max(0.0, float(_transform_meta_int(meta, "crop_top", 0)))
+        crop_left = max(0.0, float(_transform_meta_int(meta, "crop_left", 0)))
+        crop_h = max(1.0, float(_transform_meta_int(meta, "crop_height", orig_h)))
+        crop_w = max(1.0, float(_transform_meta_int(meta, "crop_width", orig_w)))
+        pad_top = max(0.0, float(_transform_meta_int(meta, "pad_top", 0)))
+        pad_left = max(0.0, float(_transform_meta_int(meta, "pad_left", 0)))
+        pad_bottom = max(0.0, float(_transform_meta_int(meta, "pad_bottom", 0)))
+        pad_right = max(0.0, float(_transform_meta_int(meta, "pad_right", 0)))
+        hflip = 1.0 if (isinstance(meta, dict) and bool(meta.get("hflip", False))) else 0.0
+        vals.append([
+            math.log(orig_h_f / base),
+            math.log(orig_w_f / base),
+            math.log(target_h_f / base),
+            math.log(target_w_f / base),
+            math.log(orig_w_f / orig_h_f),
+            math.log(target_w_f / target_h_f),
+            math.log(target_h_f / orig_h_f),
+            math.log(target_w_f / orig_w_f),
+            crop_top / orig_h_f,
+            crop_left / orig_w_f,
+            crop_h / orig_h_f,
+            crop_w / orig_w_f,
+            math.log(crop_w / crop_h),
+            math.log(target_h_f / crop_h),
+            math.log(target_w_f / crop_w),
+            pad_top / target_h_f,
+            pad_left / target_w_f,
+            pad_bottom / target_h_f,
+            pad_right / target_w_f,
+            hflip,
+        ])
+    return torch.tensor(vals, dtype=torch.float32, device=device)
+
+
+def geometry_features_from_size_key(size_key, batch, device=DEV):
+    text = str(size_key or "").strip()
+    target = image_hw(text, default=32) if text else 32
+    return image_geometry_feature_tensor(
+        records=None, target_size=target, batch=int(batch), device=device)
+
+
+def image_geometry_embedding(features, cond_dim):
+    """Map numeric geometry features to a fixed Fourier embedding of cond_dim."""
+    cond_dim = int(cond_dim)
+    if cond_dim <= 0:
+        raise ValueError("geometry condition requires a positive cond_dim")
+    features = features.float()
+    _b, k = int(features.shape[0]), int(features.shape[1])
+    per_feature = max(1, int(math.ceil(cond_dim / float(max(1, k * 2)))))
+    freqs = torch.pow(
+        torch.tensor(2.0, device=features.device, dtype=features.dtype),
+        torch.arange(per_feature, device=features.device, dtype=features.dtype))
+    angles = math.pi * features[:, :, None] * freqs[None, None, :]
+    emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1).flatten(1)
+    if int(emb.shape[1]) < cond_dim:
+        emb = F.pad(emb, (0, cond_dim - int(emb.shape[1])), value=0.0)
+    emb = emb[:, :cond_dim]
+    return emb / math.sqrt(float(max(1, cond_dim)))
+
+
+def attach_image_geometry_condition(cond, records=None, target_size=32, enabled=False,
+                                    geometry_features=None, batch=0,
+                                    transform_metadata=None):
+    """Append crop/size geometry conditioning while preserving it under CFG nulls."""
+    if not enabled:
+        return cond
+    vec = condition_vector(cond)
+    b = int(vec.shape[0])
+    if geometry_features is None:
+        geometry_features = image_geometry_feature_tensor(
+            records=records, target_size=target_size, batch=batch or b, device=vec.device,
+            transform_metadata=transform_metadata)
+    else:
+        geometry_features = geometry_features.to(device=vec.device, dtype=torch.float32)
+    if int(geometry_features.shape[0]) != b:
+        raise ValueError(
+            f"geometry feature batch {int(geometry_features.shape[0])} "
+            f"does not match condition batch {b}")
+    geom = image_geometry_embedding(geometry_features, int(vec.shape[-1])).to(
+        device=vec.device, dtype=vec.dtype)
+    if not isinstance(cond, dict):
+        return cond + geom
+    out = dict(cond)
+    out["geometry_features"] = geometry_features
+    out["geometry_vec"] = geom
+    out["vec"] = cond["vec"] + geom
+    if "tokens" in cond:
+        geom_token = geom[:, None, :].to(dtype=cond["tokens"].dtype)
+        out["tokens"] = torch.cat([cond["tokens"], geom_token], dim=1)
+        if "mask" in cond:
+            geom_mask = torch.zeros((b, 1), dtype=torch.bool, device=cond["mask"].device)
+            out["mask"] = torch.cat([cond["mask"], geom_mask], dim=1)
+    if "null_vec" in cond:
+        out["null_vec"] = cond["null_vec"] + geom
+    if "null_tokens" in cond and "tokens" in out:
+        geom_null = geom[:, None, :].to(dtype=cond["null_tokens"].dtype)
+        out["null_tokens"] = torch.cat([cond["null_tokens"], geom_null], dim=1)
+        if "null_mask" in cond:
+            geom_null_mask = torch.zeros(
+                (b, 1), dtype=torch.bool, device=cond["null_mask"].device)
+            out["null_mask"] = torch.cat([cond["null_mask"], geom_null_mask], dim=1)
+    return out
+
+
+def attach_cached_image_geometry_condition(cond, payload, enabled=False, device=DEV):
+    if not enabled:
+        return cond
+    geometry_features = payload.get("image_geometry_features")
+    if geometry_features is not None:
+        return attach_image_geometry_condition(
+            cond, enabled=True, geometry_features=geometry_features.to(device=device))
+    size_key = str(payload.get("size_bucket", "") or "")
+    if size_key:
+        features = geometry_features_from_size_key(
+            size_key, condition_batch(cond), device=device)
+        return attach_image_geometry_condition(
+            cond, enabled=True, geometry_features=features)
+    return attach_image_geometry_condition(
+        cond, enabled=True, target_size=32, batch=condition_batch(cond))
+
+
+def attach_image_geometry_mode(flow, enabled=False):
+    setattr(flow, "uses_image_geometry_condition", bool(enabled))
+    return flow
+
+
+def flow_uses_image_geometry(flow):
+    return bool(getattr(flow, "uses_image_geometry_condition", False))
 
 
 def quality_sampling_weights(records, strength=0.0):
@@ -1119,7 +1305,7 @@ def cat_text_embedding_tensors(chunks):
 def sample_bucketed_image_text_batch(records, rng, batch=32, size_buckets=(), bucket_records=None,
                                      device=DEV, return_records=False, crop_mode="center",
                                      hflip_prob=0.0, record_weights=None,
-                                     bucket_probs=None):
+                                     bucket_probs=None, return_metadata=False):
     bucket = choose_image_size_bucket_weighted(rng, size_buckets, bucket_probs=bucket_probs)
     rows = list(records)
     if bucket_records is not None:
@@ -1129,7 +1315,8 @@ def sample_bucketed_image_text_batch(records, rng, batch=32, size_buckets=(), bu
     weights = weights_for_records(rows, record_weights)
     payload = sample_image_text_batch(
         rows, rng, batch=batch, size=bucket, device=device, return_records=return_records,
-        crop_mode=crop_mode, hflip_prob=hflip_prob, weights=weights)
+        crop_mode=crop_mode, hflip_prob=hflip_prob, weights=weights,
+        return_metadata=return_metadata)
     return (bucket,) + payload
 
 
@@ -1717,6 +1904,33 @@ def sinusoidal_2d_positions(height, width, dim, device=None, dtype=None):
     return torch.cat([y, x], dim=-1).reshape(1, int(height) * int(width), dim)
 
 
+def flow_time_features(t, mode="scalar", dim=1, dtype=None):
+    mode = str(mode or "scalar")
+    if mode not in FLOW_TIME_EMBEDS:
+        raise ValueError(f"unknown flow time embedding {mode!r}")
+    if t.ndim > 2:
+        t = t.flatten(1)[:, :1]
+    elif t.ndim == 1:
+        t = t[:, None]
+    t = t.float()
+    if mode == "scalar":
+        return t.to(dtype=dtype) if dtype is not None else t
+    dim = int(dim)
+    if dim <= 1:
+        return t.to(dtype=dtype) if dtype is not None else t
+    base_dim = dim - 1
+    half = max(1, base_dim // 2)
+    freqs = torch.exp(
+        torch.linspace(0.0, math.log(10000.0), half, device=t.device, dtype=torch.float32))
+    angles = t * freqs[None, :] * (2.0 * math.pi)
+    emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
+    if int(emb.shape[1]) < base_dim:
+        emb = F.pad(emb, (0, base_dim - int(emb.shape[1])), value=0.0)
+    emb = emb[:, :base_dim]
+    out = torch.cat([t, emb], dim=1)
+    return out.to(dtype=dtype) if dtype is not None else out
+
+
 def rotary_2d_factors(height, width, head_dim, device=None, dtype=None):
     head_dim = int(head_dim)
     if head_dim % 2:
@@ -1779,7 +1993,8 @@ class LatentDiTFlowNet(nn.Module):
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256, head_width_mult=1, pos_embed="learned",
-                 checkpoint_blocks=False, latent_patch_size=1):
+                 checkpoint_blocks=False, latent_patch_size=1,
+                 time_embed="scalar", time_embed_dim=1):
         super().__init__()
         latent_patch_size = int(latent_patch_size)
         if latent_patch_size <= 0:
@@ -1790,6 +2005,9 @@ class LatentDiTFlowNet(nn.Module):
         if pos_embed == "rope2d":
             raise ValueError("rope2d positional embedding is only supported by MM-DiT")
         cond_dim = int(cond_dim or hidden)
+        time_embed = str(time_embed or "scalar")
+        if time_embed not in FLOW_TIME_EMBEDS:
+            raise ValueError(f"unknown flow time embedding {time_embed!r}")
         self.latent_ch = int(latent_ch)
         self.latent_patch_size = latent_patch_size
         self.token_dim = self.latent_ch * self.latent_patch_size * self.latent_patch_size
@@ -1798,6 +2016,8 @@ class LatentDiTFlowNet(nn.Module):
         self.max_tokens = int(max_tokens)
         self.head_width_mult = int(head_width_mult)
         self.dit_pos_embed = pos_embed
+        self.flow_time_embed = time_embed
+        self.flow_time_embed_dim = int(time_embed_dim if time_embed != "scalar" else 1)
         self.uses_2d_pos_embed = pos_embed == "sincos2d"
         self.uses_rope2d_pos_embed = False
         self.checkpoint_blocks = bool(checkpoint_blocks)
@@ -1808,7 +2028,7 @@ class LatentDiTFlowNet(nn.Module):
             if pos_embed == "learned" else None
         )
         self.cond = nn.Sequential(
-            nn.Linear(cond_dim + 1, hidden),
+            nn.Linear(cond_dim + self.flow_time_embed_dim, hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
         )
@@ -1842,7 +2062,10 @@ class LatentDiTFlowNet(nn.Module):
         if n > self.max_tokens:
             raise ValueError(f"latent token count {n} exceeds max_tokens={self.max_tokens}")
         toks, th, tw = patchify_latents(z, patch_size=self.latent_patch_size)
-        ctx = self.cond(torch.cat([cond, t.to(cond.dtype)], dim=1))[:, None, :]
+        t_feat = flow_time_features(
+            t, mode=self.flow_time_embed, dim=self.flow_time_embed_dim,
+            dtype=cond.dtype)
+        ctx = self.cond(torch.cat([cond, t_feat], dim=1))[:, None, :]
         x = self.in_proj(toks)
         x = x + self.image_pos(th, tw, x.device, x.dtype) + ctx
         if should_checkpoint_blocks(self):
@@ -1893,7 +2116,8 @@ class LatentCrossDiTFlowNet(nn.Module):
 
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256, head_width_mult=1, pos_embed="learned",
-                 checkpoint_blocks=False, mlp="gelu", latent_patch_size=1):
+                 checkpoint_blocks=False, mlp="gelu", latent_patch_size=1,
+                 time_embed="scalar", time_embed_dim=1):
         super().__init__()
         latent_patch_size = int(latent_patch_size)
         if latent_patch_size <= 0:
@@ -1907,6 +2131,9 @@ class LatentCrossDiTFlowNet(nn.Module):
         if pos_embed == "rope2d":
             raise ValueError("rope2d positional embedding is only supported by MM-DiT")
         cond_dim = int(cond_dim or hidden)
+        time_embed = str(time_embed or "scalar")
+        if time_embed not in FLOW_TIME_EMBEDS:
+            raise ValueError(f"unknown flow time embedding {time_embed!r}")
         self.latent_ch = int(latent_ch)
         self.latent_patch_size = latent_patch_size
         self.token_dim = self.latent_ch * self.latent_patch_size * self.latent_patch_size
@@ -1916,6 +2143,8 @@ class LatentCrossDiTFlowNet(nn.Module):
         self.head_width_mult = int(head_width_mult)
         self.dit_pos_embed = pos_embed
         self.dit_mlp = mlp
+        self.flow_time_embed = time_embed
+        self.flow_time_embed_dim = int(time_embed_dim if time_embed != "scalar" else 1)
         self.uses_2d_pos_embed = pos_embed == "sincos2d"
         self.uses_rope2d_pos_embed = False
         self.uses_swiglu_mlp = mlp == "swiglu"
@@ -1927,7 +2156,7 @@ class LatentCrossDiTFlowNet(nn.Module):
             if pos_embed == "learned" else None
         )
         self.cond = nn.Sequential(
-            nn.Linear(cond_dim + 1, hidden),
+            nn.Linear(cond_dim + self.flow_time_embed_dim, hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
         )
@@ -1964,7 +2193,10 @@ class LatentCrossDiTFlowNet(nn.Module):
         if n > self.max_tokens:
             raise ValueError(f"latent token count {n} exceeds max_tokens={self.max_tokens}")
         toks, th, tw = patchify_latents(z, patch_size=self.latent_patch_size)
-        global_ctx = self.cond(torch.cat([cond_vec, t.to(cond_vec.dtype)], dim=1))[:, None, :]
+        t_feat = flow_time_features(
+            t, mode=self.flow_time_embed, dim=self.flow_time_embed_dim,
+            dtype=cond_vec.dtype)
+        global_ctx = self.cond(torch.cat([cond_vec, t_feat], dim=1))[:, None, :]
         ctx, ctx_mask = self._context(cond)
         x = self.in_proj(toks)
         x = x + self.image_pos(th, tw, x.device, x.dtype) + global_ctx
@@ -2152,7 +2384,8 @@ class LatentMMDiTFlowNet(nn.Module):
     def __init__(self, latent_ch=16, hidden=96, depth=3, heads=4, cond_dim=None,
                  max_tokens=256, head_width_mult=1, qk_norm=False,
                  attn_impl="manual", pos_embed="learned", checkpoint_blocks=False,
-                 mlp="gelu", latent_patch_size=1):
+                 mlp="gelu", latent_patch_size=1,
+                 time_embed="scalar", time_embed_dim=1):
         super().__init__()
         latent_patch_size = int(latent_patch_size)
         if latent_patch_size <= 0:
@@ -2167,6 +2400,9 @@ class LatentMMDiTFlowNet(nn.Module):
         if pos_embed not in DIT_POS_EMBEDS:
             raise ValueError(f"unknown DiT positional embedding {pos_embed!r}")
         cond_dim = int(cond_dim or hidden)
+        time_embed = str(time_embed or "scalar")
+        if time_embed not in FLOW_TIME_EMBEDS:
+            raise ValueError(f"unknown flow time embedding {time_embed!r}")
         self.latent_ch = int(latent_ch)
         self.latent_patch_size = latent_patch_size
         self.token_dim = self.latent_ch * self.latent_patch_size * self.latent_patch_size
@@ -2180,6 +2416,8 @@ class LatentMMDiTFlowNet(nn.Module):
         self.heads = int(heads)
         self.head_dim = self.hidden // self.heads
         self.dit_pos_embed = pos_embed
+        self.flow_time_embed = time_embed
+        self.flow_time_embed_dim = int(time_embed_dim if time_embed != "scalar" else 1)
         self.uses_zero_residual_gating = True
         self.uses_2d_pos_embed = pos_embed in ("sincos2d", "rope2d")
         self.uses_rope2d_pos_embed = pos_embed == "rope2d"
@@ -2191,7 +2429,8 @@ class LatentMMDiTFlowNet(nn.Module):
             nn.Parameter(torch.zeros(1, max_tokens, hidden))
             if pos_embed == "learned" else None
         )
-        self.time = nn.Sequential(nn.Linear(cond_dim + 1, hidden), nn.GELU(),
+        self.time = nn.Sequential(nn.Linear(cond_dim + self.flow_time_embed_dim, hidden),
+                                  nn.GELU(),
                                   nn.Linear(hidden, hidden))
         self.ctx_proj = nn.Linear(cond_dim, hidden)
         self.blocks = nn.ModuleList([
@@ -2236,7 +2475,10 @@ class LatentMMDiTFlowNet(nn.Module):
         n = th * tw
         if n > self.max_tokens:
             raise ValueError(f"latent token count {n} exceeds max_tokens={self.max_tokens}")
-        cond_ctx = self.time(torch.cat([cond_vec, t.to(cond_vec.dtype)], dim=1))
+        t_feat = flow_time_features(
+            t, mode=self.flow_time_embed, dim=self.flow_time_embed_dim,
+            dtype=cond_vec.dtype)
+        cond_ctx = self.time(torch.cat([cond_vec, t_feat], dim=1))
         toks, th, tw = patchify_latents(z, patch_size=self.latent_patch_size)
         img = self.in_proj(toks)
         image_pos = self.image_pos(th, tw, img.device, img.dtype)
@@ -2267,7 +2509,8 @@ class LatentMMDiTFlowNet(nn.Module):
 def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=4,
               cond_dim=None, dit_head_width_mult=1, latent_max_tokens=256,
               dit_qk_norm=False, dit_attn_impl="auto", dit_pos_embed="learned",
-              dit_mlp="gelu", latent_patch_size=1, flow_checkpoint_blocks=False):
+              dit_mlp="gelu", latent_patch_size=1, flow_checkpoint_blocks=False,
+              flow_time_embed="scalar", flow_time_embed_dim=0):
     latent_patch_size = int(latent_patch_size)
     if latent_patch_size <= 0:
         raise ValueError("latent_patch_size must be positive")
@@ -2275,6 +2518,16 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
         if latent_patch_size != 1:
             raise ValueError("latent_patch_size is only supported by DiT/CrossDiT/MM-DiT flows")
         return LatentFlowNet(latent_ch=latent_ch, hidden=hidden, cond_dim=cond_dim)
+    flow_time_embed = str(flow_time_embed or "scalar")
+    if flow_time_embed not in FLOW_TIME_EMBEDS:
+        raise ValueError(f"unknown flow time embedding {flow_time_embed!r}")
+    flow_time_embed_dim = int(flow_time_embed_dim or 0)
+    if flow_time_embed_dim < 0:
+        raise ValueError("flow_time_embed_dim must be non-negative")
+    if flow_time_embed == "scalar":
+        flow_time_embed_dim = 1
+    elif flow_time_embed_dim <= 1:
+        flow_time_embed_dim = int(hidden)
     dit_mlp = str(dit_mlp)
     if dit_mlp not in DIT_MLPS:
         raise ValueError(f"unknown DiT MLP {dit_mlp!r}")
@@ -2298,7 +2551,9 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                 max_tokens=latent_max_tokens,
                                 pos_embed=dit_pos_embed,
                                 checkpoint_blocks=flow_checkpoint_blocks,
-                                latent_patch_size=latent_patch_size)
+                                latent_patch_size=latent_patch_size,
+                                time_embed=flow_time_embed,
+                                time_embed_dim=flow_time_embed_dim)
     if flow_arch == "crossdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
@@ -2310,7 +2565,9 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                      pos_embed=dit_pos_embed,
                                      checkpoint_blocks=flow_checkpoint_blocks,
                                      mlp=dit_mlp,
-                                     latent_patch_size=latent_patch_size)
+                                     latent_patch_size=latent_patch_size,
+                                     time_embed=flow_time_embed,
+                                     time_embed_dim=flow_time_embed_dim)
     if flow_arch == "mmdit":
         heads = max(1, min(dit_heads, hidden // 16))
         while hidden % heads:
@@ -2324,7 +2581,9 @@ def make_flow(flow_arch="conv", latent_ch=16, hidden=64, dit_depth=3, dit_heads=
                                   pos_embed=dit_pos_embed,
                                   mlp=dit_mlp,
                                   latent_patch_size=latent_patch_size,
-                                  checkpoint_blocks=flow_checkpoint_blocks)
+                                  checkpoint_blocks=flow_checkpoint_blocks,
+                                  time_embed=flow_time_embed,
+                                  time_embed_dim=flow_time_embed_dim)
     raise ValueError(f"unknown latent flow architecture {flow_arch!r}")
 
 
@@ -2702,6 +2961,32 @@ def resolve_time_shift(time_shift=1.0, mode="manual", latent_shape=None,
     }
 
 
+def karras_flow_time_base(u, rho=KARRAS_SCHEDULE_RHO,
+                          sigma_min=KARRAS_SCHEDULE_SIGMA_MIN,
+                          sigma_max=KARRAS_SCHEDULE_SIGMA_MAX):
+    """Karras-style data-time placement for rectified-flow sampling.
+
+    EDM schedules are expressed in decreasing noise sigma. This repo samples in
+    data-time t, where t=0 is pure noise and t=1 is clean data, so we map the
+    monotonically decreasing sigma schedule back to monotonically increasing t.
+    """
+    rho = float(rho)
+    sigma_min = float(sigma_min)
+    sigma_max = float(sigma_max)
+    if rho <= 0.0:
+        raise ValueError("karras rho must be positive")
+    if sigma_min < 0.0 or sigma_max <= sigma_min:
+        raise ValueError("karras sigma range must satisfy 0 <= min < max")
+    inv_rho = 1.0 / rho
+    sigma_min_r = sigma_min ** inv_rho
+    sigma_max_r = sigma_max ** inv_rho
+    sigmas = (
+        sigma_max_r + u * (sigma_min_r - sigma_max_r)
+    ).clamp_min(0.0).pow(rho)
+    base = (sigma_max - sigmas) / (sigma_max - sigma_min)
+    return base.clamp(0.0, 1.0)
+
+
 def flow_time_schedule(steps, device=DEV, shift=1.0, schedule="linear"):
     steps = max(1, int(steps))
     schedule = str(schedule)
@@ -2714,6 +2999,8 @@ def flow_time_schedule(steps, device=DEV, shift=1.0, schedule="linear"):
         base = torch.sqrt(u)
     elif schedule == "cosine":
         base = 0.5 - 0.5 * torch.cos(math.pi * u)
+    elif schedule == "karras":
+        base = karras_flow_time_base(u)
     else:
         raise ValueError(f"unknown sample schedule {schedule!r}")
     return apply_flow_time_shift(base, shift=shift)
@@ -3009,6 +3296,7 @@ def autoencoder_cache_identity(ae):
 def image_latent_cache_fingerprint(ae, rows, size=32, caption_max_len=64,
                                    cond_source="tokens", include_image_embeddings=False,
                                    include_image_embedding_sequences=False,
+                                   include_image_geometry=False,
                                    include_quality_targets=False, quality_stats=None,
                                    crop_mode="center", hflip_prob=0.0, seed=0,
                                    cache_dtype="fp32", shard_size=1024,
@@ -3040,7 +3328,7 @@ def image_latent_cache_fingerprint(ae, rows, size=32, caption_max_len=64,
                 rec.image_embedding_sequence),
         })
     payload = {
-        "version": 1,
+        "version": 2,
         "ae": autoencoder_cache_identity(ae),
         "size": image_size_pair_value(size),
         "size_buckets": [image_size_pair_value(bucket) for bucket in size_buckets],
@@ -3048,6 +3336,8 @@ def image_latent_cache_fingerprint(ae, rows, size=32, caption_max_len=64,
         "cond_source": str(cond_source),
         "include_image_embeddings": bool(include_image_embeddings),
         "include_image_embedding_sequences": bool(include_image_embedding_sequences),
+        "include_image_geometry": bool(include_image_geometry),
+        "image_geometry_feature_dim": int(GEOMETRY_FEATURE_DIM),
         "include_quality_targets": bool(include_quality_targets),
         "quality_stats": (
             {
@@ -3121,6 +3411,7 @@ def load_disk_image_latent_cache(cache_dir, expected_fingerprint=None):
             "has_image_embeddings": bool(meta.get("has_image_embeddings", False)),
             "has_image_embedding_sequences": bool(meta.get(
                 "has_image_embedding_sequences", False)),
+            "has_image_geometry": bool(meta.get("has_image_geometry", False)),
             "has_quality_targets": bool(meta.get("has_quality_targets", False)),
             "latent_dtype": str(meta.get("latent_dtype", "")),
             "weighted": bool(meta.get("weighted", False)),
@@ -3160,6 +3451,7 @@ def load_disk_image_latent_cache(cache_dir, expected_fingerprint=None):
         "has_image_embeddings": bool(meta.get("has_image_embeddings", False)),
         "has_image_embedding_sequences": bool(meta.get(
             "has_image_embedding_sequences", False)),
+        "has_image_geometry": bool(meta.get("has_image_geometry", False)),
         "has_quality_targets": bool(meta.get("has_quality_targets", False)),
         "latent_dtype": str(meta.get("latent_dtype", "")),
         "shard_size": int(meta.get("shard_size", 0)),
@@ -3180,6 +3472,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                              cond_source="tokens", cache_dir="", shard_size=1024,
                              include_image_embeddings=False, crop_mode="center",
                              include_image_embedding_sequences=False,
+                             include_image_geometry=False,
                              include_quality_targets=False, quality_stats=None,
                              hflip_prob=0.0, size_buckets=(), bucket_records=None,
                              record_weights=None, cache_dtype="fp32"):
@@ -3198,6 +3491,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         ae, rows, size=size, caption_max_len=caption_max_len,
         cond_source=cond_source, include_image_embeddings=include_image_embeddings,
         include_image_embedding_sequences=include_image_embedding_sequences,
+        include_image_geometry=include_image_geometry,
         include_quality_targets=include_quality_targets,
         quality_stats=quality_stats,
         crop_mode=crop_mode, hflip_prob=hflip_prob, seed=seed,
@@ -3227,6 +3521,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                 cache_dir=bucket_dir, shard_size=shard_size,
                 include_image_embeddings=include_image_embeddings,
                 include_image_embedding_sequences=include_image_embedding_sequences,
+                include_image_geometry=include_image_geometry,
                 include_quality_targets=include_quality_targets,
                 quality_stats=quality_stats,
                 crop_mode=crop_mode, hflip_prob=hflip_prob,
@@ -3265,6 +3560,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             "cond_source": cond_source,
             "has_image_embeddings": bool(include_image_embeddings),
             "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+            "has_image_geometry": bool(include_image_geometry),
             "has_quality_targets": bool(include_quality_targets),
             "latent_dtype": cache_dtype,
             "weighted": bool(weighted),
@@ -3297,6 +3593,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                     "has_image_embeddings": bool(include_image_embeddings),
                     "has_image_embedding_sequences": bool(
                         include_image_embedding_sequences),
+                    "has_image_geometry": bool(include_image_geometry),
                     "has_quality_targets": bool(include_quality_targets),
                     "latent_dtype": cache_dtype,
                     "weighted": bool(weighted),
@@ -3321,13 +3618,14 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             cond_source=cond_source, cache_dir=cache_dir, shard_size=shard_size,
             include_image_embeddings=include_image_embeddings,
             include_image_embedding_sequences=include_image_embedding_sequences,
+            include_image_geometry=include_image_geometry,
             include_quality_targets=include_quality_targets,
             quality_stats=cache_quality_stats,
             seed=seed,
             crop_mode=crop_mode, hflip_prob=hflip_prob, record_weights=record_weights,
             cache_dtype=cache_dtype, cache_fingerprint=cache_fingerprint)
     latents, captions, embeddings, pooled_embeddings, pooled_masks = [], [], [], [], []
-    image_embeddings, image_embedding_sequences = [], []
+    image_embeddings, image_embedding_sequences, image_geometry_features = [], [], []
     quality_targets, quality_masks = [], []
     sequence_max_len = image_embedding_sequence_max_len(rows)
     weights = weights_for_records(rows, record_weights)
@@ -3335,13 +3633,19 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
     crop_rng = np.random.default_rng(seed + 17)
     for start in range(0, len(rows), max(1, int(batch))):
         chunk = rows[start:start + max(1, int(batch))]
-        x = torch.stack([
-            load_image_tensor(
+        imgs, transform_metadata = [], []
+        for rec in chunk:
+            loaded = load_image_tensor(
                 rec.path, size=size, device=device, crop_mode=crop_mode,
                 hflip=(hflip_prob > 0.0 and float(crop_rng.random()) < float(hflip_prob)),
-                rng=crop_rng)
-            for rec in chunk
-        ], dim=0)
+                rng=crop_rng, return_metadata=include_image_geometry)
+            if include_image_geometry:
+                img, meta = loaded
+                transform_metadata.append(meta)
+            else:
+                img = loaded
+            imgs.append(img)
+        x = torch.stack(imgs, dim=0)
         with amp_autocast(device, precision):
             z = ae.encode(x)
         latents.append(cache_latent_tensor(z, cache_dtype))
@@ -3357,6 +3661,10 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         if include_image_embedding_sequences:
             image_embedding_sequences.append(record_image_embedding_sequence_tensor(
                 chunk, device="cpu", max_len=sequence_max_len))
+        if include_image_geometry:
+            image_geometry_features.append(image_geometry_feature_tensor(
+                chunk, target_size=size, device="cpu",
+                transform_metadata=transform_metadata))
         if include_quality_targets:
             q_target, q_mask = quality_target_tensor(
                 chunk, cache_quality_stats, device="cpu")
@@ -3385,6 +3693,10 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             torch.cat(image_embedding_sequences, dim=0).contiguous()
             if image_embedding_sequences else None
         ),
+        "image_geometry_features": (
+            torch.cat(image_geometry_features, dim=0).contiguous()
+            if image_geometry_features else None
+        ),
         "quality_targets": (
             torch.cat(quality_targets, dim=0).contiguous() if quality_targets else None
         ),
@@ -3394,6 +3706,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         "cond_source": cond_source,
         "has_image_embeddings": bool(image_embeddings),
         "has_image_embedding_sequences": bool(image_embedding_sequences),
+        "has_image_geometry": bool(image_geometry_features),
         "has_quality_targets": bool(quality_targets),
         "latent_dtype": cache_dtype,
         "records": len(rows),
@@ -3439,6 +3752,11 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             cache["image_embedding_sequences"].numel()
             * cache["image_embedding_sequences"].element_size()
         )
+    if cache["image_geometry_features"] is not None:
+        cache["bytes"] += int(
+            cache["image_geometry_features"].numel()
+            * cache["image_geometry_features"].element_size()
+        )
     if cache["quality_targets"] is not None:
         cache["bytes"] += int(
             cache["quality_targets"].numel() * cache["quality_targets"].element_size()
@@ -3456,6 +3774,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
                                   cond_source="tokens", cache_dir="", shard_size=1024,
                                   include_image_embeddings=False, seed=0,
                                   include_image_embedding_sequences=False,
+                                  include_image_geometry=False,
                                   include_quality_targets=False, quality_stats=None,
                                   crop_mode="center", hflip_prob=0.0,
                                   record_weights=None, cache_dtype="fp32",
@@ -3483,18 +3802,25 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
     for shard_i, start in enumerate(range(0, len(rows), shard_size)):
         chunk_rows = rows[start:start + shard_size]
         latents = []
+        transform_metadata = []
         for enc_start in range(0, len(chunk_rows), max(1, int(batch))):
             enc_rows = chunk_rows[enc_start:enc_start + max(1, int(batch))]
-            x = torch.stack([
-                load_image_tensor(
+            imgs = []
+            for rec in enc_rows:
+                loaded = load_image_tensor(
                     rec.path, size=size, device=device, crop_mode=crop_mode,
                     hflip=(
                         hflip_prob > 0.0
                         and float(crop_rng.random()) < float(hflip_prob)
                     ),
-                    rng=crop_rng)
-                for rec in enc_rows
-            ], dim=0)
+                    rng=crop_rng, return_metadata=include_image_geometry)
+                if include_image_geometry:
+                    img, meta = loaded
+                    transform_metadata.append(meta)
+                else:
+                    img = loaded
+                imgs.append(img)
+            x = torch.stack(imgs, dim=0)
             with amp_autocast(device, precision):
                 z = ae.encode(x)
             latents.append(cache_latent_tensor(z, cache_dtype))
@@ -3536,11 +3862,18 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
                     chunk_rows, device="cpu", max_len=sequence_max_len)
                 if include_image_embedding_sequences else None
             ),
+            "image_geometry_features": (
+                image_geometry_feature_tensor(
+                    chunk_rows, target_size=size, device="cpu",
+                    transform_metadata=transform_metadata)
+                if include_image_geometry else None
+            ),
             "quality_targets": q_target.cpu().contiguous() if q_target is not None else None,
             "quality_masks": q_mask.cpu().contiguous() if q_mask is not None else None,
             "cond_source": cond_source,
             "has_image_embeddings": bool(include_image_embeddings),
             "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+            "has_image_geometry": bool(include_image_geometry),
             "has_quality_targets": bool(include_quality_targets),
             "latent_dtype": cache_dtype,
             "weights": chunk_weight_tensor,
@@ -3593,6 +3926,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         "cond_source": cond_source,
         "has_image_embeddings": bool(include_image_embeddings),
         "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+        "has_image_geometry": bool(include_image_geometry),
         "has_quality_targets": bool(include_quality_targets),
         "latent_dtype": cache_dtype,
         "shard_size": int(shard_size),
@@ -3631,6 +3965,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         "cond_source": cond_source,
         "has_image_embeddings": bool(include_image_embeddings),
         "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+        "has_image_geometry": bool(include_image_geometry),
         "has_quality_targets": bool(include_quality_targets),
         "latent_dtype": cache_dtype,
         "shard_size": int(shard_size),
@@ -3886,8 +4221,8 @@ def _load_latent_cache_shard(shard, cache=None):
 
 def _latent_cache_payload(source, ids=None, embeddings=None, pooled_embeddings=None,
                           pooled_masks=None, image_embeddings=None,
-                          image_embedding_sequences=None, quality_targets=None,
-                          quality_masks=None, size_bucket=""):
+                          image_embedding_sequences=None, image_geometry_features=None,
+                          quality_targets=None, quality_masks=None, size_bucket=""):
     return {
         "cond_source": source,
         "caption_ids": ids,
@@ -3896,6 +4231,7 @@ def _latent_cache_payload(source, ids=None, embeddings=None, pooled_embeddings=N
         "text_pooled_masks": pooled_masks,
         "image_embeddings": image_embeddings,
         "image_embedding_sequences": image_embedding_sequences,
+        "image_geometry_features": image_geometry_features,
         "quality_targets": quality_targets,
         "quality_masks": quality_masks,
         "size_bucket": size_bucket,
@@ -3956,6 +4292,10 @@ def sample_latent_cache(cache, rng, batch, device=DEV, bucket_keys=None):
             shard["image_embedding_sequences"][idx]
             if shard.get("image_embedding_sequences") is not None else None
         )
+        image_geom = (
+            shard["image_geometry_features"][idx]
+            if shard.get("image_geometry_features") is not None else None
+        )
         quality_targets = (
             shard["quality_targets"][idx] if shard.get("quality_targets") is not None else None
         )
@@ -3975,11 +4315,13 @@ def sample_latent_cache(cache, rng, batch, device=DEV, bucket_keys=None):
                 "embedding", embeddings=shard["text_embeddings"][idx],
                 pooled_embeddings=pooled_text, pooled_masks=pooled_text_masks,
                 image_embeddings=image_embs, image_embedding_sequences=image_seq,
+                image_geometry_features=image_geom,
                 quality_targets=quality_targets, quality_masks=quality_masks)
         else:
             payload = _latent_cache_payload(
                 "tokens", ids=shard["caption_ids"][idx], image_embeddings=image_embs,
                 image_embedding_sequences=image_seq,
+                image_geometry_features=image_geom,
                 quality_targets=quality_targets, quality_masks=quality_masks)
         return z1, payload
     cache_probs = normalized_sampling_weights(
@@ -3996,6 +4338,10 @@ def sample_latent_cache(cache, rng, batch, device=DEV, bucket_keys=None):
     image_seq = (
         cache["image_embedding_sequences"][idx]
         if cache.get("image_embedding_sequences") is not None else None
+    )
+    image_geom = (
+        cache["image_geometry_features"][idx]
+        if cache.get("image_geometry_features") is not None else None
     )
     quality_targets = (
         cache["quality_targets"][idx] if cache.get("quality_targets") is not None else None
@@ -4016,11 +4362,13 @@ def sample_latent_cache(cache, rng, batch, device=DEV, bucket_keys=None):
             "embedding", embeddings=cache["text_embeddings"][idx],
             pooled_embeddings=pooled_text, pooled_masks=pooled_text_masks,
             image_embeddings=image_embs, image_embedding_sequences=image_seq,
+            image_geometry_features=image_geom,
             quality_targets=quality_targets, quality_masks=quality_masks)
     else:
         payload = _latent_cache_payload(
             "tokens", ids=cache["caption_ids"][idx], image_embeddings=image_embs,
             image_embedding_sequences=image_seq,
+            image_geometry_features=image_geom,
             quality_targets=quality_targets, quality_masks=quality_masks)
     return z1, payload
 
@@ -5909,6 +6257,30 @@ def clip_tensor_abs(x, max_abs):
     return x, events
 
 
+def dynamic_threshold_tensor(x, percentile=0.0, max_abs=1.0, eps=1.0e-8):
+    """Imagen-style per-sample dynamic thresholding for decoded image tensors."""
+    percentile = float(percentile)
+    max_abs = float(max_abs)
+    if percentile <= 0.0:
+        return x, 0
+    if percentile > 1.0:
+        raise ValueError("dynamic threshold percentile must be in (0, 1]")
+    if max_abs <= 0.0:
+        raise ValueError("dynamic threshold max_abs must be positive")
+    if x.ndim < 2:
+        flat = x.detach().float().abs().reshape(1, -1)
+        view_shape = (1,) * x.ndim
+    else:
+        flat = x.detach().float().abs().flatten(1)
+        view_shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    thresh = torch.quantile(flat, percentile, dim=1).clamp_min(float(max_abs))
+    events = int(thresh.gt(float(max_abs) + float(eps)).sum().detach().cpu())
+    if events:
+        thresh_view = thresh.to(device=x.device, dtype=x.dtype).reshape(view_shape)
+        x = x.clamp(-thresh_view, thresh_view) * (float(max_abs) / thresh_view)
+    return x, events
+
+
 def expand_time_batch(t, batch):
     batch = int(batch)
     if t.ndim == 0:
@@ -6256,7 +6628,10 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
                   quality_guidance_w=0.0, quality_guidance_scorer=None,
                   quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                   sample_finite_guard=False, sample_velocity_clip=0.0,
-                  sample_latent_clip=0.0, cfg_mode="standard", return_trace=False):
+                  sample_latent_clip=0.0, cfg_mode="standard",
+                  sample_pixel_dynamic_threshold_percentile=0.0,
+                  sample_pixel_dynamic_threshold_max=1.0,
+                  return_trace=False):
     latent_out = sample_latents(
         flow, cond, latent_shape=latent_shape, steps=steps, device=device,
         seed=seed, cfg_scale=cfg_scale, cfg_rescale=cfg_rescale,
@@ -6287,8 +6662,17 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
     else:
         z, trace = latent_out, None
     ae.eval()
-    sample = ae.decode(z).clamp(-1.0, 1.0)
+    sample = ae.decode(z)
+    sample, threshold_events = dynamic_threshold_tensor(
+        sample, percentile=sample_pixel_dynamic_threshold_percentile,
+        max_abs=sample_pixel_dynamic_threshold_max)
+    sample = sample.clamp(-1.0, 1.0)
     if return_trace:
+        trace["sample_pixel_dynamic_threshold_percentile"] = float(
+            sample_pixel_dynamic_threshold_percentile)
+        trace["sample_pixel_dynamic_threshold_max"] = float(
+            sample_pixel_dynamic_threshold_max)
+        trace["sample_trace_pixel_dynamic_threshold_events"] = int(threshold_events)
         return sample, trace
     return sample
 
@@ -6582,6 +6966,82 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
     return chosen.contiguous(), meta
 
 
+def _cycle_values(values, default, cast):
+    if values is None:
+        return (cast(default),)
+    vals = tuple(cast(x) for x in values)
+    if not vals:
+        return (cast(default),)
+    return vals
+
+
+def prompt_candidate_sampler_settings(candidates_per_prompt, seed=0, cfg_scale=1.0,
+                                      cfg_rescale=0.0, cfg_mode="standard",
+                                      cfg_schedule="constant", sample_steps=4,
+                                      sample_method="euler", sample_schedule="linear",
+                                      sample_churn=0.0, cfg_scales=None,
+                                      cfg_rescales=None, cfg_modes=None,
+                                      cfg_schedules=None, sample_steps_list=None,
+                                      sample_methods=None, sample_schedules=None,
+                                      sample_churns=None, seeds=None):
+    """Return cyclic per-candidate sampler settings for prompt preference mining."""
+    n = int(candidates_per_prompt)
+    if n <= 0:
+        raise ValueError("candidates_per_prompt must be positive")
+    if n == 1:
+        cfg_scales = cfg_rescales = cfg_modes = cfg_schedules = None
+        sample_steps_list = sample_methods = sample_schedules = sample_churns = None
+        seeds = None
+    cfg_scale_vals = _cycle_values(cfg_scales, cfg_scale, float)
+    cfg_rescale_vals = _cycle_values(cfg_rescales, cfg_rescale, float)
+    cfg_mode_vals = _cycle_values(cfg_modes, cfg_mode, str)
+    cfg_schedule_vals = _cycle_values(cfg_schedules, cfg_schedule, str)
+    step_vals = _cycle_values(sample_steps_list, sample_steps, int)
+    method_vals = _cycle_values(sample_methods, sample_method, str)
+    schedule_vals = _cycle_values(sample_schedules, sample_schedule, str)
+    churn_vals = _cycle_values(sample_churns, sample_churn, float)
+    seed_vals = tuple(int(x) for x in seeds) if seeds else ()
+    for value in cfg_rescale_vals:
+        if value < 0.0 or value > 1.0:
+            raise ValueError("candidate cfg_rescale values must be in [0, 1]")
+    for value in cfg_mode_vals:
+        if value not in CFG_MODES:
+            raise ValueError(f"unknown candidate cfg_mode {value!r}")
+    for value in cfg_schedule_vals:
+        validate_cfg_schedule(value)
+    for value in step_vals:
+        if int(value) <= 0:
+            raise ValueError("candidate sample steps must be positive")
+    for value in method_vals:
+        if value not in SAMPLE_METHODS:
+            raise ValueError(f"unknown candidate sample method {value!r}")
+    for value in schedule_vals:
+        if value not in SAMPLE_SCHEDULES:
+            raise ValueError(f"unknown candidate sample schedule {value!r}")
+    for value in churn_vals:
+        if value < 0.0:
+            raise ValueError("candidate sample churn values must be non-negative")
+    settings = []
+    base_seed = int(seed)
+    for idx in range(n):
+        settings.append({
+            "candidate_index": int(idx),
+            "cfg_scale": float(cfg_scale_vals[idx % len(cfg_scale_vals)]),
+            "cfg_rescale": float(cfg_rescale_vals[idx % len(cfg_rescale_vals)]),
+            "cfg_mode": str(cfg_mode_vals[idx % len(cfg_mode_vals)]),
+            "cfg_schedule": str(cfg_schedule_vals[idx % len(cfg_schedule_vals)]),
+            "sample_steps": int(step_vals[idx % len(step_vals)]),
+            "sample_method": str(method_vals[idx % len(method_vals)]),
+            "sample_schedule": str(schedule_vals[idx % len(schedule_vals)]),
+            "sample_churn": float(churn_vals[idx % len(churn_vals)]),
+            "seed": (
+                int(seed_vals[idx % len(seed_vals)])
+                if seed_vals else base_seed + 104729 * int(idx)
+            ),
+        })
+    return settings
+
+
 @torch.no_grad()
 def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, conditioner=None,
                              prompt_vocab=None, caption_max_len=64, cfg_scale=1.0,
@@ -6594,6 +7054,8 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
                              sample_churn_interval=DEFAULT_CHURN_INTERVAL,
                              sample_finite_guard=False, sample_velocity_clip=0.0,
                              sample_latent_clip=0.0, cfg_mode="standard",
+                             sample_pixel_dynamic_threshold_percentile=0.0,
+                             sample_pixel_dynamic_threshold_max=1.0,
                              sample_manifest_out="", sample_image_dir=""):
     ae.eval()
     flow.eval()
@@ -6605,6 +7067,8 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
     cond = caption_record_condition(
         captions, chosen, conditioner, prompt_vocab, source=caption_cond_source,
         max_len=caption_max_len, device=device, return_tokens=flow_uses_cond_tokens(flow))
+    cond = attach_image_geometry_condition(
+        cond, records=chosen, target_size=size, enabled=flow_uses_image_geometry(flow))
     sample, trace = sample_images(
         ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
         steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
@@ -6618,6 +7082,9 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
         sample_finite_guard=sample_finite_guard,
         sample_velocity_clip=sample_velocity_clip,
         sample_latent_clip=sample_latent_clip,
+        sample_pixel_dynamic_threshold_percentile=(
+            sample_pixel_dynamic_threshold_percentile),
+        sample_pixel_dynamic_threshold_max=sample_pixel_dynamic_threshold_max,
         cfg_mode=cfg_mode,
         return_trace=True)
     cols = int(np.ceil(np.sqrt(n)))
@@ -6633,6 +7100,10 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
         "sample_grid_sample_method": sample_method,
         "sample_grid_sample_schedule": sample_schedule,
         "sample_grid_sample_churn": float(sample_churn),
+        "sample_grid_pixel_dynamic_threshold_percentile": float(
+            sample_pixel_dynamic_threshold_percentile),
+        "sample_grid_pixel_dynamic_threshold_max": float(
+            sample_pixel_dynamic_threshold_max),
         "sample_grid_sample_churn_interval": list(validate_guidance_interval(
             sample_churn_interval, name="sample_churn_interval")),
         "sample_grid_cfg_interval": list(validate_guidance_interval(cfg_interval)),
@@ -6697,9 +7168,20 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                                  quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                                  sample_finite_guard=False, sample_velocity_clip=0.0,
                                  sample_latent_clip=0.0, cfg_mode="standard",
+                                 sample_pixel_dynamic_threshold_percentile=0.0,
+                                 sample_pixel_dynamic_threshold_max=1.0,
                                  sample_manifest_out="", sample_image_dir="",
                                  sample_candidates_manifest_out="",
-                                 sample_candidates_image_dir=""):
+                                 sample_candidates_image_dir="",
+                                 candidate_cfg_scales=None,
+                                 candidate_cfg_rescales=None,
+                                 candidate_cfg_modes=None,
+                                 candidate_cfg_schedules=None,
+                                 candidate_sample_steps_list=None,
+                                 candidate_sample_methods=None,
+                                 candidate_sample_schedules=None,
+                                 candidate_sample_churns=None,
+                                 candidate_seeds=None):
     ae.eval()
     flow.eval()
     prompts = tuple(str(p).strip() for p in prompts if str(p).strip())
@@ -6734,6 +7216,10 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         text_sequence_model=prompt_embed_text_sequence_model,
         text_sequence_max_length=prompt_embed_text_sequence_max_length,
         return_embedding=True)
+    text_only_cond = cond
+    cond = attach_image_geometry_condition(
+        cond, target_size=size, batch=len(prompts),
+        enabled=flow_uses_image_geometry(flow))
     negative_prompts = expand_negative_prompts(negative_prompts, len(prompts))
     cfg_uncond = None
     if negative_prompts:
@@ -6747,44 +7233,64 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
             trust_remote_code=prompt_embed_trust_remote_code,
             text_sequence_model=prompt_embed_text_sequence_model,
             text_sequence_max_length=prompt_embed_text_sequence_max_length)
-    sample_cond = repeat_condition_rows(cond, candidates_per_prompt)
-    sample_uncond = repeat_condition_rows(cfg_uncond, candidates_per_prompt)
+        cfg_uncond = attach_image_geometry_condition(
+            cfg_uncond, target_size=size, batch=len(prompts),
+            enabled=flow_uses_image_geometry(flow))
     text_aligner = getattr(flow, "text_aligner", None)
     image_feature_aligner = getattr(flow, "image_feature_aligner", None)
     quality_scorer = getattr(flow, "image_quality_scorer", None)
-    sample_prompt_features = (
-        prompt_features.repeat_interleave(candidates_per_prompt, dim=0)
-        if torch.is_tensor(prompt_features) else None
-    )
-    sample, trace = sample_images(
-        ae, flow, sample_cond, latent_shape=ae_latent_shape(ae, size),
-        steps=sample_steps, device=device, seed=seed, cfg_scale=cfg_scale,
-        cfg_rescale=cfg_rescale,
-        sample_method=sample_method, cfg_interval=cfg_interval,
-        cfg_schedule=cfg_schedule,
-        sample_time_shift=sample_time_shift,
-        sample_schedule=sample_schedule, cfg_uncond=sample_uncond,
-        sample_churn=sample_churn,
-        sample_churn_interval=sample_churn_interval,
-        text_guidance_w=text_guidance_w,
-        text_guidance_aligner=text_aligner,
-        text_guidance_cond=sample_cond,
-        text_guidance_interval=text_guidance_interval,
-        feature_guidance_w=feature_guidance_w,
-        feature_guidance_aligner=image_feature_aligner,
-        feature_guidance_features=sample_prompt_features,
-        feature_guidance_interval=feature_guidance_interval,
-        quality_guidance_w=quality_guidance_w,
-        quality_guidance_scorer=quality_scorer,
-        quality_guidance_interval=quality_guidance_interval,
-        sample_finite_guard=sample_finite_guard,
-        sample_velocity_clip=sample_velocity_clip,
-        sample_latent_clip=sample_latent_clip,
-        cfg_mode=cfg_mode,
-        return_trace=True)
-    candidate_sample = sample
+    candidate_settings = prompt_candidate_sampler_settings(
+        candidates_per_prompt, seed=seed, cfg_scale=cfg_scale,
+        cfg_rescale=cfg_rescale, cfg_mode=cfg_mode, cfg_schedule=cfg_schedule,
+        sample_steps=sample_steps, sample_method=sample_method,
+        sample_schedule=sample_schedule, sample_churn=sample_churn,
+        cfg_scales=candidate_cfg_scales, cfg_rescales=candidate_cfg_rescales,
+        cfg_modes=candidate_cfg_modes, cfg_schedules=candidate_cfg_schedules,
+        sample_steps_list=candidate_sample_steps_list,
+        sample_methods=candidate_sample_methods,
+        sample_schedules=candidate_sample_schedules,
+        sample_churns=candidate_sample_churns, seeds=candidate_seeds)
+    candidate_samples, trace = [], {}
+    for setting in candidate_settings:
+        sample_i, trace_i = sample_images(
+            ae, flow, cond, latent_shape=ae_latent_shape(ae, size),
+            steps=setting["sample_steps"], device=device, seed=setting["seed"],
+            cfg_scale=setting["cfg_scale"],
+            cfg_rescale=setting["cfg_rescale"],
+            sample_method=setting["sample_method"], cfg_interval=cfg_interval,
+            cfg_schedule=setting["cfg_schedule"],
+            sample_time_shift=sample_time_shift,
+            sample_schedule=setting["sample_schedule"], cfg_uncond=cfg_uncond,
+            sample_churn=setting["sample_churn"],
+            sample_churn_interval=sample_churn_interval,
+            text_guidance_w=text_guidance_w,
+            text_guidance_aligner=text_aligner,
+            text_guidance_cond=text_only_cond,
+            text_guidance_interval=text_guidance_interval,
+            feature_guidance_w=feature_guidance_w,
+            feature_guidance_aligner=image_feature_aligner,
+            feature_guidance_features=prompt_features,
+            feature_guidance_interval=feature_guidance_interval,
+            quality_guidance_w=quality_guidance_w,
+            quality_guidance_scorer=quality_scorer,
+            quality_guidance_interval=quality_guidance_interval,
+            sample_finite_guard=sample_finite_guard,
+            sample_velocity_clip=sample_velocity_clip,
+            sample_latent_clip=sample_latent_clip,
+            sample_pixel_dynamic_threshold_percentile=(
+                sample_pixel_dynamic_threshold_percentile),
+            sample_pixel_dynamic_threshold_max=sample_pixel_dynamic_threshold_max,
+            cfg_mode=setting["cfg_mode"],
+            return_trace=True)
+        candidate_samples.append(sample_i)
+        trace = merge_sample_traces(trace, trace_i)
+    candidate_sample = torch.stack(candidate_samples, dim=1).reshape(
+        len(prompts) * candidates_per_prompt, *candidate_samples[0].shape[1:]
+    ).contiguous()
+    sample_text_only_cond = repeat_condition_rows(text_only_cond, candidates_per_prompt)
     sample, selection_meta = select_prompt_candidates(
-        ae, sample, sample_cond, prompts, candidates_per_prompt=candidates_per_prompt,
+        ae, candidate_sample, sample_text_only_cond, prompts,
+        candidates_per_prompt=candidates_per_prompt,
         text_aligner=text_aligner, image_feature_aligner=image_feature_aligner,
         prompt_features=prompt_features, quality_scorer=quality_scorer)
     n = len(prompts)
@@ -6801,6 +7307,29 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         "sample_grid_sample_method": sample_method,
         "sample_grid_sample_schedule": sample_schedule,
         "sample_grid_sample_churn": float(sample_churn),
+        "sample_grid_pixel_dynamic_threshold_percentile": float(
+            sample_pixel_dynamic_threshold_percentile),
+        "sample_grid_pixel_dynamic_threshold_max": float(
+            sample_pixel_dynamic_threshold_max),
+        "sample_grid_candidate_sweep_mode": "cyclic",
+        "sample_grid_candidate_cfg_scales": [
+            setting["cfg_scale"] for setting in candidate_settings],
+        "sample_grid_candidate_cfg_rescales": [
+            setting["cfg_rescale"] for setting in candidate_settings],
+        "sample_grid_candidate_cfg_modes": [
+            setting["cfg_mode"] for setting in candidate_settings],
+        "sample_grid_candidate_cfg_schedules": [
+            setting["cfg_schedule"] for setting in candidate_settings],
+        "sample_grid_candidate_sample_steps": [
+            setting["sample_steps"] for setting in candidate_settings],
+        "sample_grid_candidate_sample_methods": [
+            setting["sample_method"] for setting in candidate_settings],
+        "sample_grid_candidate_sample_schedules": [
+            setting["sample_schedule"] for setting in candidate_settings],
+        "sample_grid_candidate_sample_churns": [
+            setting["sample_churn"] for setting in candidate_settings],
+        "sample_grid_candidate_seeds": [
+            setting["seed"] for setting in candidate_settings],
         "sample_grid_sample_churn_interval": list(validate_guidance_interval(
             sample_churn_interval, name="sample_churn_interval")),
         "sample_grid_cfg_interval": list(validate_guidance_interval(cfg_interval)),
@@ -6868,6 +7397,7 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         for prompt_idx, prompt in enumerate(prompts):
             selected_idx = int(selected[prompt_idx]) if prompt_idx < len(selected) else 0
             for candidate_idx in range(candidates_per_prompt):
+                setting = candidate_settings[candidate_idx]
                 candidate_captions.append(prompt)
                 row = {
                     "conditioning_mode": "prompt",
@@ -6880,6 +7410,20 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                     "selected_candidate_index": int(selected_idx),
                     "selected_by_internal_sampler": bool(candidate_idx == selected_idx),
                     "candidates_per_prompt": int(candidates_per_prompt),
+                    "sample_cfg_scale": float(setting["cfg_scale"]),
+                    "sample_cfg_rescale": float(setting["cfg_rescale"]),
+                    "sample_cfg_mode": setting["cfg_mode"],
+                    "sample_cfg_schedule": setting["cfg_schedule"],
+                    "sample_steps": int(setting["sample_steps"]),
+                    "sample_method": setting["sample_method"],
+                    "sample_schedule": setting["sample_schedule"],
+                    "sample_churn": float(setting["sample_churn"]),
+                    "sample_seed": int(setting["seed"]),
+                    "sample_candidate_sweep_mode": "cyclic",
+                    "sample_pixel_dynamic_threshold_percentile": float(
+                        sample_pixel_dynamic_threshold_percentile),
+                    "sample_pixel_dynamic_threshold_max": float(
+                        sample_pixel_dynamic_threshold_max),
                 }
                 if prompt_text_embeddings is not None:
                     row["text_embedding"] = prompt_text_embeddings[prompt_idx]
@@ -6899,6 +7443,11 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                 "sample_seed": int(seed),
                 "caption_cond_source": caption_cond_source,
                 "sample_candidate_set": "all_prompt_candidates",
+                "sample_candidate_sweep_mode": "cyclic",
+                "sample_pixel_dynamic_threshold_percentile": float(
+                    sample_pixel_dynamic_threshold_percentile),
+                "sample_pixel_dynamic_threshold_max": float(
+                    sample_pixel_dynamic_threshold_max),
                 "prompt_embed_backend": (
                     prompt_embed_backend if caption_cond_source == "embedding" else ""),
                 "prompt_embed_model": (
@@ -6918,16 +7467,31 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         })
     if sample_manifest_out:
         selected = selection_meta.get("sample_grid_selected_candidate_indices", [])
-        row_meta = [
-            {
+        row_meta = []
+        for idx, prompt in enumerate(prompts):
+            selected_idx = int(selected[idx]) if idx < len(selected) else 0
+            setting = candidate_settings[max(0, min(selected_idx, candidates_per_prompt - 1))]
+            row_meta.append({
                 "conditioning_mode": "prompt",
                 "conditioning_prompt": prompt,
                 "negative_prompt": negative_prompts[idx] if negative_prompts else "",
-                "selected_candidate_index": int(selected[idx]) if idx < len(selected) else 0,
+                "selected_candidate_index": selected_idx,
                 "candidates_per_prompt": int(candidates_per_prompt),
-            }
-            for idx, prompt in enumerate(prompts)
-        ]
+                "sample_cfg_scale": float(setting["cfg_scale"]),
+                "sample_cfg_rescale": float(setting["cfg_rescale"]),
+                "sample_cfg_mode": setting["cfg_mode"],
+                "sample_cfg_schedule": setting["cfg_schedule"],
+                "sample_steps": int(setting["sample_steps"]),
+                "sample_method": setting["sample_method"],
+                "sample_schedule": setting["sample_schedule"],
+                "sample_churn": float(setting["sample_churn"]),
+                "sample_seed": int(setting["seed"]),
+                "sample_candidate_sweep_mode": "cyclic",
+                "sample_pixel_dynamic_threshold_percentile": float(
+                    sample_pixel_dynamic_threshold_percentile),
+                "sample_pixel_dynamic_threshold_max": float(
+                    sample_pixel_dynamic_threshold_max),
+            })
         meta.update(write_sample_manifest(
             sample, sample_manifest_out, list(prompts), image_dir=sample_image_dir,
             metadata={
@@ -6941,6 +7505,10 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                 "sample_schedule": sample_schedule,
                 "sample_seed": int(seed),
                 "caption_cond_source": caption_cond_source,
+                "sample_pixel_dynamic_threshold_percentile": float(
+                    sample_pixel_dynamic_threshold_percentile),
+                "sample_pixel_dynamic_threshold_max": float(
+                    sample_pixel_dynamic_threshold_max),
                 "prompt_embed_backend": (
                     prompt_embed_backend if caption_cond_source == "embedding" else ""),
                 "prompt_embed_model": (
@@ -7026,6 +7594,9 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         cond = caption_record_condition(
             captions, chosen_records, conditioner, prompt_vocab, source=caption_cond_source,
             max_len=caption_max_len, device=device, return_tokens=flow_uses_cond_tokens(flow))
+        flow_cond = attach_image_geometry_condition(
+            cond, records=chosen_records, target_size=size,
+            enabled=flow_uses_image_geometry(flow))
         if text_aligner is not None:
             _align_loss, align_parts = image_text_alignment_loss(
                 text_aligner, z, cond, prefix="caption_retrieval")
@@ -7057,8 +7628,8 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         if image_quality_scorer is not None:
             quality_scores.append(float(image_quality_scorer.score(z).detach().mean().cpu()))
         flow_losses.append(float(latent_flow_loss(
-            flow, z, cond, time_shift=time_shift).detach().cpu()))
-        endpoint_metrics = flow_endpoint_metrics(flow, z, cond, time_shift=time_shift)
+            flow, z, flow_cond, time_shift=time_shift).detach().cpu()))
+        endpoint_metrics = flow_endpoint_metrics(flow, z, flow_cond, time_shift=time_shift)
         endpoint_mses.append(endpoint_metrics["latent_endpoint_mse"])
         endpoint_consistency_mses.append(endpoint_metrics["latent_endpoint_consistency_mse"])
         endpoint_time_gaps.append(endpoint_metrics["latent_endpoint_time_gap"])
@@ -7090,7 +7661,12 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
             chunk_captions, chunk_records, conditioner, prompt_vocab,
             source=caption_cond_source, max_len=caption_max_len, device=device,
             return_tokens=flow_uses_cond_tokens(flow))
+        chunk_flow_cond = attach_image_geometry_condition(
+            chunk_cond, records=chunk_records, target_size=size,
+            enabled=flow_uses_image_geometry(flow))
         chunk_sample_cond = repeat_condition_rows(
+            chunk_flow_cond, generated_eval_candidates_per_prompt)
+        chunk_text_sample_cond = repeat_condition_rows(
             chunk_cond, generated_eval_candidates_per_prompt)
         chunk_text_features = (
             record_text_embedding_tensor(chunk_records, device=device)
@@ -7116,7 +7692,7 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
             sample_churn_interval=sample_churn_interval,
             text_guidance_w=text_guidance_w,
             text_guidance_aligner=text_aligner,
-            text_guidance_cond=chunk_sample_cond,
+            text_guidance_cond=chunk_text_sample_cond,
             text_guidance_interval=text_guidance_interval,
             feature_guidance_w=feature_guidance_w,
             feature_guidance_aligner=image_feature_aligner,
@@ -7131,7 +7707,7 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
             cfg_mode=cfg_mode,
             return_trace=True)
         chunk_sample, chunk_selection = select_prompt_candidates(
-            ae, chunk_sample, chunk_sample_cond, chunk_captions,
+            ae, chunk_sample, chunk_text_sample_cond, chunk_captions,
             candidates_per_prompt=generated_eval_candidates_per_prompt,
             text_aligner=text_aligner, image_feature_aligner=image_feature_aligner,
             prompt_features=chunk_text_features, quality_scorer=image_quality_scorer)
@@ -7388,6 +7964,12 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
     dit_mlp = str(ckpt.get("dit_mlp", report.get("dit_mlp", "gelu")) or "gelu")
     if dit_mlp not in DIT_MLPS:
         raise ValueError(f"unknown DiT MLP {dit_mlp!r}")
+    flow_time_embed = str(ckpt.get(
+        "flow_time_embed", report.get("flow_time_embed", "scalar")) or "scalar")
+    if flow_time_embed not in FLOW_TIME_EMBEDS:
+        raise ValueError(f"unknown flow time embedding {flow_time_embed!r}")
+    flow_time_embed_dim = int(ckpt.get(
+        "flow_time_embed_dim", report.get("flow_time_embed_dim", 1)) or 1)
     flow_checkpoint_blocks = bool(ckpt.get(
         "flow_checkpoint_blocks", report.get("flow_checkpoint_blocks", False)))
     checkpoint_flow_boundary_mode = str(ckpt.get(
@@ -7498,7 +8080,11 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
                      dit_pos_embed=dit_pos_embed,
                      dit_mlp=dit_mlp,
                      latent_patch_size=latent_patch_size,
-                     flow_checkpoint_blocks=flow_checkpoint_blocks).to(device)
+                     flow_checkpoint_blocks=flow_checkpoint_blocks,
+                     flow_time_embed=flow_time_embed,
+                     flow_time_embed_dim=flow_time_embed_dim).to(device)
+    attach_image_geometry_mode(flow, bool(ckpt.get(
+        "image_geometry_cond", report.get("image_geometry_cond", False))))
     flow_repa_aligner = None
     if ckpt.get("flow_repa_aligner_state_dict"):
         if image_embedding_in_dim <= 0:
@@ -7573,6 +8159,10 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
         "dit_pos_embed": dit_pos_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
         "dit_mlp": dit_mlp if flow_arch in ("dit", "crossdit", "mmdit") else "",
+        "flow_time_embed": flow_time_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
+        "flow_time_embed_dim": (
+            int(flow_time_embed_dim) if flow_arch in ("dit", "crossdit", "mmdit") else 1
+        ),
         "uses_swiglu_mlp": bool(getattr(flow, "uses_swiglu_mlp", False)),
         "flow_checkpoint_blocks": bool(getattr(flow, "checkpoint_blocks", False)),
         "flow_boundary_mode": get_flow_boundary_mode(flow),
@@ -7666,6 +8256,7 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         **latent_stats_report(latent_stats),
         "cond_mode": cond_mode,
         "data_mode": data_mode,
+        "image_geometry_cond": flow_uses_image_geometry(flow),
         "image_manifest": ckpt.get("image_manifest", report.get("image_manifest", "")),
         "image_root": ckpt.get("image_root", report.get("image_root", "")),
         "image_split": ckpt.get("image_split", report.get("image_split", "")),
@@ -8457,6 +9048,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       dit_head_width_mult=1, latent_max_tokens=256,
                       dit_pos_embed="learned",
                       dit_mlp="gelu",
+                      flow_time_embed="scalar", flow_time_embed_dim=0,
                       latent_patch_size=1,
                       flow_checkpoint_blocks=False,
                       ae_arch="semantic", latent_downsample=4, ae_res_blocks=1,
@@ -8494,6 +9086,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       image_preference_max_pairs=0, image_preference_w=0.0,
                       flow_preference_w=0.0, flow_preference_margin=0.0,
                       flow_preference_batch=0,
+                      image_geometry_cond=False,
                       caption_vocab_max=8192, caption_max_len=64,
                       caption_cond_source="tokens",
                       image_crop_mode="center", image_hflip_prob=0.0,
@@ -8773,6 +9366,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     dit_mlp = str(dit_mlp)
     if dit_mlp not in DIT_MLPS:
         raise ValueError(f"unknown DiT MLP {dit_mlp!r}")
+    flow_time_embed = str(flow_time_embed or "scalar")
+    if flow_time_embed not in FLOW_TIME_EMBEDS:
+        raise ValueError(f"unknown flow time embedding {flow_time_embed!r}")
+    flow_time_embed_dim = int(flow_time_embed_dim or 0)
+    if flow_time_embed_dim < 0:
+        raise ValueError("flow_time_embed_dim must be non-negative")
     if dit_mlp != "gelu" and flow_arch == "dit":
         raise ValueError("custom DiT MLPs are supported by CrossDiT/MM-DiT flows")
     flow_checkpoint_blocks = bool(flow_checkpoint_blocks)
@@ -8928,7 +9527,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                      dit_pos_embed=dit_pos_embed,
                      dit_mlp=dit_mlp,
                      latent_patch_size=latent_patch_size,
-                     flow_checkpoint_blocks=flow_checkpoint_blocks).to(device)
+                     flow_checkpoint_blocks=flow_checkpoint_blocks,
+                     flow_time_embed=flow_time_embed,
+                     flow_time_embed_dim=flow_time_embed_dim).to(device)
+    attach_image_geometry_mode(flow, image_geometry_cond)
     flow_repa_aligner = None
     if flow_repa_w > 0.0:
         hidden_feature_dim = flow_hidden_feature_dim(flow)
@@ -9072,6 +9674,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             shard_size=flow_cache_shard_size,
             include_image_embeddings=flow_feature_align_w > 0.0 or flow_repa_w > 0.0,
             include_image_embedding_sequences=flow_repa_cache_sequences,
+            include_image_geometry=image_geometry_cond,
             include_quality_targets=(
                 flow_quality_score_w > 0.0 or flow_quality_rank_w > 0.0
                 or (quality_score_steps > 0 and image_quality_score_stats["n"] > 0)),
@@ -9253,38 +9856,63 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             cond = cached_caption_payload_condition(
                 cache_payload, conditioner, source=caption_cond_source,
                 device=device, return_tokens=return_tokens)
+            cond = attach_cached_image_geometry_condition(
+                cond, cache_payload, enabled=image_geometry_cond, device=device)
             teacher_cond = (
                 cached_caption_payload_condition(
                     cache_payload, teacher_conditioner, source=caption_cond_source,
                     device=device, return_tokens=return_tokens)
                 if teacher_conditioner is not None else cond
             )
+            if teacher_conditioner is not None:
+                teacher_cond = attach_cached_image_geometry_condition(
+                    teacher_cond, cache_payload, enabled=image_geometry_cond, device=device)
             return z1, cond, teacher_cond
-        _batch_size, x, captions, chosen_records = sample_bucketed_image_text_batch(
+        flow_batch = sample_bucketed_image_text_batch(
             image_records, rng, batch=batch, size_buckets=train_size_buckets,
             bucket_records=bucket_records, device=device, return_records=True,
             crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
-            record_weights=image_record_weights, bucket_probs=image_bucket_probs)
+            record_weights=image_record_weights, bucket_probs=image_bucket_probs,
+            return_metadata=image_geometry_cond)
+        if image_geometry_cond:
+            _batch_size, x, captions, chosen_records, transform_metadata = flow_batch
+        else:
+            _batch_size, x, captions, chosen_records = flow_batch
+            transform_metadata = None
         with torch.no_grad(), amp_autocast(device, train_precision):
             z1 = ae.encode(x)
         if caption_cond_source == "embedding":
             embs = record_text_embedding_tensor(chosen_records, device=device)
             cond = conditioner(embs, return_tokens=text_condition_return_tokens(
                 conditioner, return_tokens=return_tokens))
+            cond = attach_image_geometry_condition(
+                cond, records=chosen_records, target_size=_batch_size,
+                enabled=image_geometry_cond, transform_metadata=transform_metadata)
             teacher_cond = (
                 teacher_conditioner(embs, return_tokens=text_condition_return_tokens(
                     teacher_conditioner, return_tokens=return_tokens))
                 if teacher_conditioner is not None else cond
             )
+            if teacher_conditioner is not None:
+                teacher_cond = attach_image_geometry_condition(
+                    teacher_cond, records=chosen_records, target_size=_batch_size,
+                    enabled=image_geometry_cond, transform_metadata=transform_metadata)
         else:
             ids = caption_ids(captions, prompt_vocab, max_len=caption_max_len, device=device)
             cond = conditioner(ids, return_tokens=text_condition_return_tokens(
                 conditioner, return_tokens=return_tokens))
+            cond = attach_image_geometry_condition(
+                cond, records=chosen_records, target_size=_batch_size,
+                enabled=image_geometry_cond, transform_metadata=transform_metadata)
             teacher_cond = (
                 teacher_conditioner(ids, return_tokens=text_condition_return_tokens(
                     teacher_conditioner, return_tokens=return_tokens))
                 if teacher_conditioner is not None else cond
             )
+            if teacher_conditioner is not None:
+                teacher_cond = attach_image_geometry_condition(
+                    teacher_cond, records=chosen_records, target_size=_batch_size,
+                    enabled=image_geometry_cond, transform_metadata=transform_metadata)
         return z1, cond, teacher_cond
 
     flow.train()
@@ -9358,16 +9986,24 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 cond = cached_caption_payload_condition(
                     cache_payload, conditioner, source=caption_cond_source,
                     device=device, return_tokens=flow_uses_cond_tokens(flow))
+                cond = attach_cached_image_geometry_condition(
+                    cond, cache_payload, enabled=image_geometry_cond, device=device)
                 image_features = cache_payload.get("image_embeddings")
                 image_feature_tokens = cache_payload.get("image_embedding_sequences")
                 quality_targets = cache_payload.get("quality_targets")
                 quality_masks = cache_payload.get("quality_masks")
             else:
-                batch_size, x, captions, chosen_records = sample_bucketed_image_text_batch(
+                flow_batch = sample_bucketed_image_text_batch(
                     image_records, rng, batch=batch, size_buckets=active_size_buckets,
                     bucket_records=active_bucket_records, device=device, return_records=True,
                     crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
-                    record_weights=image_record_weights, bucket_probs=active_bucket_probs)
+                    record_weights=image_record_weights, bucket_probs=active_bucket_probs,
+                    return_metadata=image_geometry_cond)
+                if image_geometry_cond:
+                    batch_size, x, captions, chosen_records, transform_metadata = flow_batch
+                else:
+                    batch_size, x, captions, chosen_records = flow_batch
+                    transform_metadata = None
                 size_bucket_sample_counts[image_size_key(batch_size)] += int(batch)
                 with torch.no_grad(), amp_autocast(device, train_precision):
                     z1 = ae.encode(x)
@@ -9375,6 +10011,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     captions, chosen_records, conditioner, prompt_vocab,
                     source=caption_cond_source, max_len=caption_max_len, device=device,
                     return_tokens=flow_uses_cond_tokens(flow))
+                cond = attach_image_geometry_condition(
+                    cond, records=chosen_records, target_size=batch_size,
+                    enabled=image_geometry_cond, transform_metadata=transform_metadata)
                 image_features = (
                     record_image_embedding_tensor(chosen_records, device=device)
                     if flow_feature_align_w > 0.0 or active_flow_repa_w > 0.0 else None
@@ -9409,6 +10048,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     pref_pairs, conditioner, prompt_vocab, source=caption_cond_source,
                     caption_max_len=caption_max_len, device=device,
                     return_tokens=flow_uses_cond_tokens(flow))
+                if pref_cond is not None:
+                    pref_cond = attach_image_geometry_condition(
+                        pref_cond, target_size=pref_size, batch=pref_batch,
+                        enabled=image_geometry_cond)
                 if pref_cond is None:
                     flow_preference_skipped += 1
                     flow_preference_skip_reason = (
@@ -9524,7 +10167,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             dit_pos_embed=dit_pos_embed,
             dit_mlp=dit_mlp,
             latent_patch_size=latent_patch_size,
-            flow_checkpoint_blocks=flow_checkpoint_blocks).to(device)
+            flow_checkpoint_blocks=flow_checkpoint_blocks,
+            flow_time_embed=flow_time_embed,
+            flow_time_embed_dim=flow_time_embed_dim).to(device)
         load_flow_state(teacher_flow, teacher_state)
         attach_latent_stats(teacher_flow, latent_stats)
         teacher_flow.eval()
@@ -9692,6 +10337,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_cache_has_quality_targets": bool(
             flow_cache.get("has_quality_targets", False) if flow_cache is not None else False
         ),
+        "flow_cache_has_image_geometry": bool(
+            flow_cache.get("has_image_geometry", False) if flow_cache is not None else False
+        ),
         **latent_cache_runtime_report(flow_cache),
         **latent_cache_text_embedding_report(flow_cache),
         **latent_cache_text_pooled_embedding_report(flow_cache),
@@ -9754,6 +10402,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "dit_attn_impl": dit_attn_impl if flow_arch == "mmdit" else "manual",
         "dit_pos_embed": dit_pos_embed if flow_arch in ("dit", "crossdit", "mmdit") else "",
         "dit_mlp": dit_mlp if flow_arch in ("dit", "crossdit", "mmdit") else "",
+        "flow_time_embed": (
+            flow_time_embed if flow_arch in ("dit", "crossdit", "mmdit") else ""
+        ),
+        "flow_time_embed_dim": (
+            int(getattr(flow, "flow_time_embed_dim", 1))
+            if flow_arch in ("dit", "crossdit", "mmdit") else 1
+        ),
         "flow_checkpoint_blocks": bool(getattr(flow, "checkpoint_blocks", False)),
         "flow_boundary_mode": get_flow_boundary_mode(flow),
         "activation_checkpointing": bool(getattr(flow, "uses_activation_checkpointing", False)),
@@ -9811,6 +10466,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_preference_skipped": int(flow_preference_skipped),
         "flow_preference_skip_reason": flow_preference_skip_reason,
         "cond_drop": float(cond_drop),
+        "image_geometry_cond": bool(image_geometry_cond),
         "cfg_rescale": float(cfg_rescale),
         "cfg_mode": cfg_mode,
         "cfg_schedule": cfg_schedule,
@@ -9971,6 +10627,12 @@ def selftest():
     assert math.isclose(large_shift["time_shift_dim_scale"], 2.0)
     assert explicit_dim_shift["time_shift_effective_mode"] == "dim"
     assert explicit_dim_shift["time_shift_dim_scale"] < 1.0
+    linear_schedule = flow_time_schedule(8, device="cpu", shift=1.0, schedule="linear")
+    karras_schedule = flow_time_schedule(8, device="cpu", shift=1.0, schedule="karras")
+    assert torch.allclose(karras_schedule[:1], torch.zeros(1))
+    assert torch.allclose(karras_schedule[-1:], torch.ones(1))
+    assert bool(torch.all(karras_schedule[1:] > karras_schedule[:-1]))
+    assert not torch.allclose(karras_schedule, linear_schedule)
     curriculum_buckets = normalize_image_size_buckets("16x16,32x16,32x32")
     assert [image_size_key(b) for b in size_curriculum_bucket_order(
         curriculum_buckets)] == ["16x16", "32x16", "32x32"]
@@ -10021,12 +10683,80 @@ def selftest():
                 "source": "fixture",
                 "aesthetic": float(i + 1),
                 "text_embedding": [1.0 if j == i else 0.0 for j in range(3)],
+                "text_embedding_sequence": [
+                    [1.0 if j == (i % 2) else 0.0 for j in range(2)],
+                    [0.5 if j == ((i + 1) % 2) else 0.0 for j in range(2)],
+                ],
                 "image_embedding": [1.0 if j == (2 - i) else 0.0 for j in range(3)],
             })
         manifest = os.path.join(td, "manifest.jsonl")
         with open(manifest, "w", encoding="utf-8") as f:
             for row in rows:
                 f.write(json.dumps(row) + "\n")
+        manifest_records = read_image_manifest(manifest, root=td)
+        dual_payload = record_text_condition_payload(manifest_records[:2], device="cpu")
+        assert isinstance(dual_payload, dict)
+        assert tuple(dual_payload["sequence"].shape) == (2, 2, 2)
+        assert tuple(dual_payload["pooled"].shape) == (2, 3)
+        dual_conditioner = PrecomputedTextConditioner(
+            input_dim=2, cond_dim=8, hidden=16, pooled_input_dim=3)
+        dual_cond = dual_conditioner(dual_payload, return_tokens=True)
+        assert tuple(dual_cond["vec"].shape) == (2, 8)
+        assert tuple(dual_cond["tokens"].shape) == (2, 3, 8)
+        assert tuple(dual_cond["mask"].shape) == (2, 3)
+        assert not bool(dual_cond["mask"][0, 0])
+        geom_cond = attach_image_geometry_condition(
+            dual_cond, records=manifest_records[:2], target_size=(16, 16), enabled=True)
+        assert tuple(geom_cond["tokens"].shape) == (2, 4, 8)
+        assert tuple(geom_cond["null_tokens"].shape) == (2, 4, 8)
+        assert tuple(geom_cond["geometry_features"].shape) == (2, GEOMETRY_FEATURE_DIM)
+        assert geom_cond["tokens"][:, -1].detach().abs().sum().item() > 0.0
+        assert null_condition(geom_cond)["tokens"][:, -1].detach().abs().sum().item() > 0.0
+        crop_meta = {
+            "original_height": 10,
+            "original_width": 20,
+            "target_height": 16,
+            "target_width": 16,
+            "crop_top": 2,
+            "crop_left": 4,
+            "crop_height": 10,
+            "crop_width": 10,
+            "pad_top": 1,
+            "pad_bottom": 1,
+            "pad_left": 0,
+            "pad_right": 0,
+            "hflip": True,
+        }
+        geom_features = image_geometry_feature_tensor(
+            manifest_records[:1], target_size=(16, 16),
+            transform_metadata=[crop_meta], device="cpu")
+        assert tuple(geom_features.shape) == (1, GEOMETRY_FEATURE_DIM)
+        assert abs(float(geom_features[0, 8]) - 0.2) < 1.0e-6
+        assert abs(float(geom_features[0, 9]) - 0.2) < 1.0e-6
+        assert float(geom_features[0, -1]) == 1.0
+        candidate_settings = prompt_candidate_sampler_settings(
+            3, seed=11, cfg_scale=1.0, cfg_rescale=0.0,
+            cfg_scales=(1.0, 2.0), cfg_rescales=(0.0, 0.5),
+            cfg_modes=("standard", "cfgpp"), cfg_schedules=("constant", "triangular"),
+            sample_steps_list=(4, 8), sample_methods=("euler", "heun"),
+            sample_schedules=("linear", "cosine"), sample_churns=(0.0, 0.1),
+            seeds=(101, 202))
+        assert [row["cfg_scale"] for row in candidate_settings] == [1.0, 2.0, 1.0]
+        assert [row["sample_method"] for row in candidate_settings] == [
+            "euler", "heun", "euler"]
+        assert [row["seed"] for row in candidate_settings] == [101, 202, 101]
+        single_setting = prompt_candidate_sampler_settings(
+            1, seed=7, cfg_scale=3.0, cfg_scales=(1.0, 2.0),
+            sample_steps=9, sample_steps_list=(4, 8))[0]
+        assert single_setting["cfg_scale"] == 3.0
+        assert single_setting["sample_steps"] == 9 and single_setting["seed"] == 7
+        dyn = torch.tensor([[[[0.0, 0.5], [2.0, -4.0]]]], dtype=torch.float32)
+        dyn_out, dyn_events = dynamic_threshold_tensor(
+            dyn, percentile=0.75, max_abs=1.0)
+        assert dyn_events == 1
+        assert float(dyn_out.abs().max()) <= 1.0 + 1.0e-6
+        dyn_same, dyn_same_events = dynamic_threshold_tensor(dyn, percentile=0.0)
+        assert dyn_same_events == 0 and torch.allclose(dyn_same, dyn)
         pref_manifest = os.path.join(td, "preferences.jsonl")
         with open(pref_manifest, "w", encoding="utf-8") as f:
             f.write(json.dumps({
@@ -10053,8 +10783,10 @@ def selftest():
             image_max_records=3, sample_steps=1, flow_distill_steps=1,
             flow_guidance_distill_w=0.01, flow_ema_decay=0.9,
             flow_boundary_mode="double-cosine",
+            flow_time_embed="fourier", flow_time_embed_dim=8,
             time_sampling="adaptive", time_adaptive_bins=4,
             time_adaptive_uniform_mix=0.1,
+            image_geometry_cond=True,
             return_conditioner=True)
         assert report["experiment"] == "image_latent_manifest_rectified_flow"
         assert report["data_mode"] == "image_manifest"
@@ -10066,6 +10798,9 @@ def selftest():
         assert report["time_adaptive_enabled"] is True
         assert report["time_adaptive_updates"] >= 1
         assert report["time_adaptive_observed_bins"] >= 1
+        assert report["image_geometry_cond"] is True
+        assert report["flow_time_embed"] == "fourier"
+        assert report["flow_time_embed_dim"] == 8
         assert report["flow_boundary_mode"] == "double-cosine"
         assert report["flow_distill_steps_run"] == 1
         assert report["flow_distill_teacher_used"] == "ema"
@@ -10088,7 +10823,8 @@ def selftest():
     mmdit = make_flow(
         flow_arch="mmdit", latent_ch=4, hidden=16, dit_depth=1, dit_heads=2,
         cond_dim=8, dit_qk_norm=True, dit_attn_impl="auto", dit_pos_embed="rope2d",
-        dit_mlp="swiglu", latent_max_tokens=16)
+        dit_mlp="swiglu", latent_max_tokens=16,
+        flow_time_embed="fourier", flow_time_embed_dim=8)
     mmdit_cond = {
         "vec": torch.randn(2, 8),
         "tokens": torch.randn(2, 3, 8),
@@ -10097,6 +10833,8 @@ def selftest():
     mmdit_out = mmdit(torch.randn(2, 4, 4, 4), torch.rand(2, 1, 1, 1), mmdit_cond)
     assert tuple(mmdit_out.shape) == (2, 4, 4, 4)
     assert getattr(mmdit, "attn_impl", "") == "auto"
+    assert getattr(mmdit, "flow_time_embed", "") == "fourier"
+    assert getattr(mmdit, "flow_time_embed_dim", 0) == 8
     print("image_latent selftest OK")
 
 
@@ -10266,6 +11004,14 @@ def main(argv=None):
                           "rope2d is MM-DiT-only"))
     ap.add_argument("--dit-mlp", default="gelu", choices=DIT_MLPS, dest="dit_mlp",
                     help="feed-forward block for CrossDiT/MM-DiT image-token transformers")
+    ap.add_argument("--flow-time-embed", default="scalar", choices=FLOW_TIME_EMBEDS,
+                    dest="flow_time_embed",
+                    help=("timestep embedding for DiT/CrossDiT/MM-DiT flows; "
+                          "scalar keeps legacy behavior"))
+    ap.add_argument("--flow-time-embed-dim", type=int, default=0,
+                    dest="flow_time_embed_dim",
+                    help=("Fourier timestep embedding width; 0 uses hidden width "
+                          "when --flow-time-embed=fourier"))
     ap.add_argument("--flow-checkpoint-blocks", action="store_true",
                     dest="flow_checkpoint_blocks",
                     help=("checkpoint DiT/CrossDiT/MM-DiT transformer blocks during "
@@ -10291,17 +11037,20 @@ def main(argv=None):
                     help="ODE sampler method for latent image generation")
     ap.add_argument("--sample-methods", default="",
                     dest="sample_methods",
-                    help="comma-separated sampler methods for --eval-checkpoint sweeps")
+                    help=("comma-separated sampler methods for --eval-checkpoint sweeps "
+                          "and multi-candidate prompt grids"))
     ap.add_argument("--sample-schedule", default="linear", choices=SAMPLE_SCHEDULES,
                     dest="sample_schedule",
                     help="timestep placement schedule for latent image generation")
     ap.add_argument("--sample-schedules", default="",
                     dest="sample_schedules",
-                    help="comma-separated timestep schedules for --eval-checkpoint sweeps")
+                    help=("comma-separated timestep schedules for --eval-checkpoint sweeps "
+                          "and multi-candidate prompt grids"))
     ap.add_argument("--sample-churn", type=float, default=0.0, dest="sample_churn",
                     help="stochastic latent sampler churn; 0 keeps deterministic ODE sampling")
     ap.add_argument("--sample-churns", default="", dest="sample_churns",
-                    help="comma-separated sampler churn values for --eval-checkpoint sweeps")
+                    help=("comma-separated sampler churn values for --eval-checkpoint sweeps "
+                          "and multi-candidate prompt grids"))
     ap.add_argument("--sample-churn-interval", default="0.0,0.8",
                     dest="sample_churn_interval",
                     help="flow-time interval where stochastic sampler churn is active")
@@ -10314,6 +11063,13 @@ def main(argv=None):
     ap.add_argument("--sample-latent-clip", type=float, default=0.0,
                     dest="sample_latent_clip",
                     help="absolute latent clamp during sampling; 0 disables")
+    ap.add_argument("--sample-pixel-dynamic-threshold-percentile", type=float, default=0.0,
+                    dest="sample_pixel_dynamic_threshold_percentile",
+                    help=("decoded-pixel dynamic threshold percentile in (0,1]; "
+                          "0 disables"))
+    ap.add_argument("--sample-pixel-dynamic-threshold-max", type=float, default=1.0,
+                    dest="sample_pixel_dynamic_threshold_max",
+                    help="decoded-pixel dynamic threshold target max absolute value")
     ap.add_argument("--eval-text-guidance-weights", default="",
                     dest="eval_text_guidance_weights",
                     help=("comma-separated text-aligner guidance weights for manifest "
@@ -10327,18 +11083,23 @@ def main(argv=None):
                     help=("comma-separated quality guidance weights for manifest "
                           "--eval-checkpoint sweeps"))
     ap.add_argument("--cfg-scales", default="1.0,1.25,1.5,2.0", dest="cfg_scales",
-                    help="comma-separated CFG scales for --eval-checkpoint")
+                    help=("comma-separated CFG scales for --eval-checkpoint and "
+                          "multi-candidate prompt grids"))
     ap.add_argument("--cfg-rescales", default="0.0", dest="cfg_rescales",
-                    help="comma-separated CFG rescale values for --eval-checkpoint")
+                    help=("comma-separated CFG rescale values for --eval-checkpoint and "
+                          "multi-candidate prompt grids"))
     ap.add_argument("--cfg-modes", default="", dest="cfg_modes",
-                    help="comma-separated CFG modes for --eval-checkpoint; default uses --cfg-mode")
+                    help=("comma-separated CFG modes for --eval-checkpoint/prompt candidates; "
+                          "default uses --cfg-mode"))
     ap.add_argument("--cfg-schedules", default="", dest="cfg_schedules",
-                    help=("comma-separated CFG schedules for --eval-checkpoint; "
+                    help=("comma-separated CFG schedules for --eval-checkpoint/prompt candidates; "
                           "default uses --cfg-schedule"))
     ap.add_argument("--sample-steps-list", default="4,8,16", dest="sample_steps_list",
-                    help="comma-separated sampler step counts for --eval-checkpoint")
+                    help=("comma-separated sampler step counts for --eval-checkpoint and "
+                          "multi-candidate prompt grids"))
     ap.add_argument("--eval-seeds", default="", dest="eval_seeds",
-                    help="comma-separated eval seeds for --eval-checkpoint; default uses --seed")
+                    help=("comma-separated eval/candidate seeds for --eval-checkpoint or "
+                          "multi-candidate prompt grids; default uses --seed"))
     ap.add_argument("--flow-consistency-w", type=float, default=0.0,
                     dest="flow_consistency_w",
                     help="same-path clean-endpoint consistency loss weight for latent flow")
@@ -10514,6 +11275,10 @@ def main(argv=None):
     ap.add_argument("--caption-cond-source", default="tokens",
                     choices=("tokens", "embedding", "auto"), dest="caption_cond_source",
                     help="caption conditioning source for image manifests")
+    ap.add_argument("--image-geometry-cond", action="store_true",
+                    dest="image_geometry_cond",
+                    help=("append fixed original/target size and aspect conditioning "
+                          "to latent flow text conditions"))
     ap.add_argument("--image-crop-mode", default="center",
                     choices=("center", "random", "none", "pad"), dest="image_crop_mode",
                     help="crop mode for manifest training images")
@@ -10630,6 +11395,13 @@ def main(argv=None):
             _parse_number_list(args.sample_churns, float)
             if args.sample_churns else None
         )
+        cfg_scales = _parse_number_list(args.cfg_scales, float)
+        cfg_rescales = _parse_number_list(args.cfg_rescales, float)
+        sample_steps_list = _parse_number_list(args.sample_steps_list, int)
+        sample_methods = (
+            _parse_string_list(args.sample_methods) if args.sample_methods else None
+        )
+        eval_seeds = _parse_number_list(args.eval_seeds, int) if args.eval_seeds else None
         sample_text_guidance_interval = _parse_interval(args.sample_text_guidance_interval)
         sample_feature_guidance_interval = _parse_interval(
             args.sample_feature_guidance_interval)
@@ -10681,6 +11453,14 @@ def main(argv=None):
         ap.error("--sample-velocity-clip must be non-negative")
     if args.sample_latent_clip < 0.0:
         ap.error("--sample-latent-clip must be non-negative")
+    if args.sample_pixel_dynamic_threshold_percentile < 0.0:
+        ap.error("--sample-pixel-dynamic-threshold-percentile must be non-negative")
+    if args.sample_pixel_dynamic_threshold_percentile > 1.0:
+        ap.error("--sample-pixel-dynamic-threshold-percentile must be <= 1")
+    if args.sample_pixel_dynamic_threshold_max <= 0.0:
+        ap.error("--sample-pixel-dynamic-threshold-max must be positive")
+    if args.flow_time_embed_dim < 0:
+        ap.error("--flow-time-embed-dim must be non-negative")
     if args.flow_endpoint_w < 0.0:
         ap.error("--flow-endpoint-w must be non-negative")
     if args.flow_self_repa_w < 0.0:
@@ -10768,6 +11548,14 @@ def main(argv=None):
         ap.error("--sample-churn must be non-negative")
     if sample_churns is not None and any(x < 0.0 for x in sample_churns):
         ap.error("--sample-churns must be non-negative")
+    if any(x < 0.0 for x in cfg_rescales) or any(x > 1.0 for x in cfg_rescales):
+        ap.error("--cfg-rescales values must be in [0, 1]")
+    if any(x <= 0 for x in sample_steps_list):
+        ap.error("--sample-steps-list values must be positive")
+    if sample_methods is not None:
+        bad_methods = sorted(set(sample_methods) - set(SAMPLE_METHODS))
+        if bad_methods:
+            ap.error(f"unknown sample method(s): {','.join(bad_methods)}")
     if args.time_curriculum_frac < 0.0 or args.time_curriculum_frac > 1.0:
         ap.error("--time-curriculum-frac must be in [0, 1]")
     if args.size_curriculum_frac < 0.0 or args.size_curriculum_frac > 1.0:
@@ -10789,18 +11577,16 @@ def main(argv=None):
     if args.eval_checkpoint:
         report = evaluate_checkpoint(
             args.eval_checkpoint,
-            cfg_scales=_parse_number_list(args.cfg_scales, float),
-            cfg_rescales=_parse_number_list(args.cfg_rescales, float),
-            sample_steps_list=_parse_number_list(args.sample_steps_list, int),
+            cfg_scales=cfg_scales,
+            cfg_rescales=cfg_rescales,
+            sample_steps_list=sample_steps_list,
             seed=args.seed,
             size=cli_size,
-            eval_seeds=(_parse_number_list(args.eval_seeds, int) if args.eval_seeds else None),
+            eval_seeds=eval_seeds,
             prefer_ema=args.checkpoint_weight_mode != "raw",
             weight_mode=args.checkpoint_weight_mode,
             sample_method=args.sample_method,
-            sample_methods=(
-                _parse_string_list(args.sample_methods) if args.sample_methods else None
-            ),
+            sample_methods=sample_methods,
             sample_schedule=args.sample_schedule,
             sample_schedules=sample_schedules,
             sample_churn=args.sample_churn,
@@ -10891,11 +11677,24 @@ def main(argv=None):
                     sample_finite_guard=settings["sample_finite_guard"],
                     sample_velocity_clip=settings["sample_velocity_clip"],
                     sample_latent_clip=settings["sample_latent_clip"],
+                    sample_pixel_dynamic_threshold_percentile=(
+                        args.sample_pixel_dynamic_threshold_percentile),
+                    sample_pixel_dynamic_threshold_max=(
+                        args.sample_pixel_dynamic_threshold_max),
                     sample_manifest_out=args.sample_manifest_out,
                     sample_image_dir=args.sample_image_dir,
                     sample_candidates_manifest_out=(
                         args.sample_candidates_manifest_out),
-                    sample_candidates_image_dir=args.sample_candidates_image_dir)
+                    sample_candidates_image_dir=args.sample_candidates_image_dir,
+                    candidate_cfg_scales=cfg_scales,
+                    candidate_cfg_rescales=cfg_rescales,
+                    candidate_cfg_modes=cfg_modes,
+                    candidate_cfg_schedules=cfg_schedules,
+                    candidate_sample_steps_list=sample_steps_list,
+                    candidate_sample_methods=sample_methods,
+                    candidate_sample_schedules=sample_schedules,
+                    candidate_sample_churns=sample_churns,
+                    candidate_seeds=eval_seeds)
             elif report.get("experiment") == "image_latent_manifest_sampler_sweep":
                 grid_records = read_image_manifest(
                     report["eval_image_manifest"], root=report.get("eval_image_root", ""),
@@ -10920,6 +11719,10 @@ def main(argv=None):
                     sample_finite_guard=settings["sample_finite_guard"],
                     sample_velocity_clip=settings["sample_velocity_clip"],
                     sample_latent_clip=settings["sample_latent_clip"],
+                    sample_pixel_dynamic_threshold_percentile=(
+                        args.sample_pixel_dynamic_threshold_percentile),
+                    sample_pixel_dynamic_threshold_max=(
+                        args.sample_pixel_dynamic_threshold_max),
                     samples=args.sample_grid_samples,
                     seed=args.seed + 991,
                     caption_cond_source=meta["caption_cond_source"],
@@ -10958,6 +11761,8 @@ def main(argv=None):
         dit_attn_impl=args.dit_attn_impl,
         dit_pos_embed=args.dit_pos_embed,
         dit_mlp=args.dit_mlp,
+        flow_time_embed=args.flow_time_embed,
+        flow_time_embed_dim=args.flow_time_embed_dim,
         flow_checkpoint_blocks=args.flow_checkpoint_blocks,
         latent_max_tokens=args.latent_max_tokens,
         latent_patch_size=args.latent_patch_size,
@@ -11021,6 +11826,7 @@ def main(argv=None):
         flow_preference_w=args.flow_preference_w,
         flow_preference_margin=args.flow_preference_margin,
         flow_preference_batch=args.flow_preference_batch,
+        image_geometry_cond=args.image_geometry_cond,
         caption_vocab_max=args.caption_vocab_max,
         caption_max_len=args.caption_max_len, caption_cond_source=args.caption_cond_source,
         image_crop_mode=args.image_crop_mode, image_hflip_prob=args.image_hflip_prob,
@@ -11131,10 +11937,22 @@ def main(argv=None):
                 sample_finite_guard=settings["sample_finite_guard"],
                 sample_velocity_clip=settings["sample_velocity_clip"],
                 sample_latent_clip=settings["sample_latent_clip"],
+                sample_pixel_dynamic_threshold_percentile=(
+                    args.sample_pixel_dynamic_threshold_percentile),
+                sample_pixel_dynamic_threshold_max=args.sample_pixel_dynamic_threshold_max,
                 sample_manifest_out=args.sample_manifest_out,
                 sample_image_dir=args.sample_image_dir,
                 sample_candidates_manifest_out=args.sample_candidates_manifest_out,
-                sample_candidates_image_dir=args.sample_candidates_image_dir)
+                sample_candidates_image_dir=args.sample_candidates_image_dir,
+                candidate_cfg_scales=cfg_scales,
+                candidate_cfg_rescales=cfg_rescales,
+                candidate_cfg_modes=cfg_modes,
+                candidate_cfg_schedules=cfg_schedules,
+                candidate_sample_steps_list=sample_steps_list,
+                candidate_sample_methods=sample_methods,
+                candidate_sample_schedules=sample_schedules,
+                candidate_sample_churns=sample_churns,
+                candidate_seeds=eval_seeds)
         elif args.image_manifest:
             grid_records = read_image_manifest(
                 args.image_manifest, root=args.image_root, split=args.image_split,
@@ -11157,6 +11975,9 @@ def main(argv=None):
                 sample_finite_guard=settings["sample_finite_guard"],
                 sample_velocity_clip=settings["sample_velocity_clip"],
                 sample_latent_clip=settings["sample_latent_clip"],
+                sample_pixel_dynamic_threshold_percentile=(
+                    args.sample_pixel_dynamic_threshold_percentile),
+                sample_pixel_dynamic_threshold_max=args.sample_pixel_dynamic_threshold_max,
                 samples=args.sample_grid_samples,
                 seed=args.seed + 991,
                 caption_cond_source=report.get("caption_cond_source", "tokens"),
@@ -11254,6 +12075,8 @@ def main(argv=None):
         "dit_attn_impl": report.get("dit_attn_impl", "manual"),
         "dit_pos_embed": report.get("dit_pos_embed", "") or args.dit_pos_embed,
         "dit_mlp": report.get("dit_mlp", "") or args.dit_mlp,
+        "flow_time_embed": report.get("flow_time_embed", args.flow_time_embed),
+        "flow_time_embed_dim": report.get("flow_time_embed_dim", args.flow_time_embed_dim),
         "flow_checkpoint_blocks": report.get("flow_checkpoint_blocks", False),
         "flow_boundary_mode": report.get("flow_boundary_mode", args.flow_boundary_mode),
         "activation_checkpointing": report.get("activation_checkpointing", False),
@@ -11324,6 +12147,7 @@ def main(argv=None):
         "text_pooled_embedding_in_dim": report.get("text_pooled_embedding_in_dim", 0),
         "text_condition_dual_pooled_sequence": report.get(
             "text_condition_dual_pooled_sequence", False),
+        "image_geometry_cond": report.get("image_geometry_cond", False),
         "image_embedding_in_dim": report.get("image_embedding_in_dim", 0),
         "cond_drop": args.cond_drop,
         "cfg_scale": args.cfg_scale,
@@ -11340,6 +12164,9 @@ def main(argv=None):
         "sample_finite_guard": args.sample_finite_guard,
         "sample_velocity_clip": args.sample_velocity_clip,
         "sample_latent_clip": args.sample_latent_clip,
+        "sample_pixel_dynamic_threshold_percentile": (
+            args.sample_pixel_dynamic_threshold_percentile),
+        "sample_pixel_dynamic_threshold_max": args.sample_pixel_dynamic_threshold_max,
         "flow_consistency_w": args.flow_consistency_w,
         "flow_distill_steps": report.get("flow_distill_steps", args.flow_distill_steps),
         "flow_distill_steps_run": report.get("flow_distill_steps_run", 0),

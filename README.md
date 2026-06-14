@@ -215,17 +215,21 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
 # high-res source upweighting, PickScore + technical-health quality scoring,
 # stricter cleaning, longer text sequence conditioning, 1024/multi-aspect buckets, latent patching
 # that keeps MM-DiT token count bounded, a 12-block/12-head 768-wide MM-DiT, more sampling steps,
-# larger candidate reranking, and a generated-candidate feedback artifact:
+# Karras-style timestep placement, sampler-diverse candidate reranking, and a
+# generated-candidate feedback artifact:
 # `*_candidates.jsonl` -> PickScore-scored candidates -> `*_preferences.jsonl` chosen/rejected
 # pairs, including sampler/CFG provenance, for the next quality-scorer and direct-flow preference pass. If that portable preference
 # artifact and its candidate images exist locally, the next `web-hf-vae-hq` launch auto-uploads
-# and consumes it; add
+# and consumes it. Prompt candidates now cycle through the configured CFG/sampler/seed
+# sweep lists and record per-candidate provenance for preference mining; add
 # `--image-no-auto-preferences` to force a first-run/no-feedback profile. Both use SigLIP So400m
-# plus T5-large text-sequence conditioning, progressive bucket curriculum, CFG dropout,
+# pooled prompts plus T5-large token-sequence conditioning, crop/flip/pad-aware
+# geometry conditioning for multi-aspect targets, Fourier flow-time conditioning, decoded-pixel
+# dynamic thresholding for high-CFG samples, progressive bucket curriculum, CFG dropout,
 # boundary-enforced double-cosine rectified-flow velocity, logit-normal flow times with soft
 # Min-SNR velocity weighting, adaptive loss-tracked timestep sampling, EMA-teacher guided
-# self-distillation, triangular middle-window CFG scheduling, Heun/adaptive-Heun/RK4 sampling
-# sweeps, and standard CFG plus CFG++ sweeps.
+# self-distillation, triangular middle-window CFG scheduling, Karras/cosine/linear
+# timestep sweeps, Heun/adaptive-Heun/RK4 sampling sweeps, and standard CFG plus CFG++ sweeps.
 # MM-DiT attention defaults to exact auto SDPA on modern PyTorch; use linear only as an
 # explicit memory/speed approximation.
 .venv/bin/python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \

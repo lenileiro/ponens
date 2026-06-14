@@ -22,6 +22,7 @@ REST = "https://rest.runpod.io/v1"
 IMAGE = "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
 REMOTE = "/workspace/fer_relational"
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+IMAGE_SAMPLE_SCHEDULES = ("linear", "quadratic", "sqrt", "cosine", "karras")
 
 
 def api(method, path, key, body=None):
@@ -450,6 +451,7 @@ def apply_image_quality_preset(args):
         float(args.image_size_curriculum_frac), 0.6 if hq else 0.4)
     args.image_ae_arch = "hf-vae"
     args.image_latent_arch = "mmdit"
+    args.image_geometry_cond = True
     if not args.image_ae_hf_model:
         args.image_ae_hf_model = "stabilityai/sdxl-vae"
     args.image_latent_downsample = 8
@@ -470,6 +472,8 @@ def apply_image_quality_preset(args):
     args.image_dit_attn_impl = "auto"
     args.image_dit_pos_embed = "rope2d"
     args.image_dit_mlp = "swiglu"
+    args.image_flow_time_embed = "fourier"
+    args.image_flow_time_embed_dim = max(int(args.image_flow_time_embed_dim), int(args.dim or 0))
     args.image_flow_checkpoint_blocks = True
     args.image_train_precision = "bf16"
     args.image_grad_clip = max(float(args.image_grad_clip), 1.0)
@@ -530,11 +534,21 @@ def apply_image_quality_preset(args):
     if not str(args.image_sample_steps_sweep or "").strip() or str(
             args.image_sample_steps_sweep).strip() == "4,8,16":
         args.image_sample_steps_sweep = "16,24,32" if hq else "8,16,24"
+    if hq and str(args.image_sample_schedule or "linear").strip() == "linear":
+        args.image_sample_schedule = "karras"
+    if (not str(args.image_sample_schedules or "").strip()
+            or str(args.image_sample_schedules).strip() == "linear"):
+        args.image_sample_schedules = (
+            "karras,cosine,linear" if hq else str(args.image_sample_schedule))
     if not str(args.image_cfg_modes or "").strip():
         args.image_cfg_modes = "standard,cfgpp"
     if not str(args.image_cfg_schedules or "").strip():
         args.image_cfg_schedules = "triangular,constant" if hq else args.image_cfg_schedule
     args.image_sample_steps = max(int(args.image_sample_steps), 24 if hq else 16)
+    if hq and float(args.image_sample_pixel_dynamic_threshold_percentile) <= 0.0:
+        args.image_sample_pixel_dynamic_threshold_percentile = 0.995
+    args.image_sample_pixel_dynamic_threshold_max = max(
+        float(args.image_sample_pixel_dynamic_threshold_max), 1.0)
     args.image_eval_sweep = True
     args.image_eval_generated_candidates_per_prompt = max(
         int(args.image_eval_generated_candidates_per_prompt), 4 if hq else 2)
@@ -870,6 +884,20 @@ def payload(args):
                 prompt_grid_args += (
                     f" --sample-candidates-per-prompt "
                     f"{args.image_sample_candidates_per_prompt}")
+                if int(args.image_sample_candidates_per_prompt) > 1:
+                    prompt_grid_args += (
+                        f" --cfg-scales {shlex_quote(args.image_cfg_sweep)} "
+                        f"--cfg-rescales {shlex_quote(args.image_cfg_rescale_sweep)} "
+                        f"--cfg-modes "
+                        f"{shlex_quote(args.image_cfg_modes or args.image_cfg_mode)} "
+                        f"--cfg-schedules "
+                        f"{shlex_quote(args.image_cfg_schedules or args.image_cfg_schedule)} "
+                        f"--sample-steps-list "
+                        f"{shlex_quote(args.image_sample_steps_sweep)} "
+                        f"--sample-methods {shlex_quote(args.image_sample_methods)} "
+                        f"--sample-schedules {shlex_quote(args.image_sample_schedules)} "
+                        f"--sample-churns {shlex_quote(args.image_sample_churns)} "
+                        f"--eval-seeds {shlex_quote(args.image_eval_seeds)}")
                 prompt_grid_args += (
                     f" --sample-text-guidance-w {args.image_sample_text_guidance_w} "
                     f"--sample-text-guidance-interval "
@@ -996,6 +1024,10 @@ def payload(args):
                      f"{shlex_quote(args.image_sample_churn_interval)} "
                      f"--sample-velocity-clip {args.image_sample_velocity_clip} "
                      f"--sample-latent-clip {args.image_sample_latent_clip} "
+                     f"--sample-pixel-dynamic-threshold-percentile "
+                     f"{args.image_sample_pixel_dynamic_threshold_percentile} "
+                     f"--sample-pixel-dynamic-threshold-max "
+                     f"{args.image_sample_pixel_dynamic_threshold_max} "
                      f"--eval-generated-candidates-per-prompt "
                      f"{args.image_eval_generated_candidates_per_prompt} "
                      f"--flow-consistency-w {args.image_flow_consistency_w} "
@@ -1014,6 +1046,8 @@ def payload(args):
                      f"{args.image_flow_guidance_distill_cfg_rescale} "
                      f"--flow-ema-decay {args.image_flow_ema_decay} "
                      f"--ema-eval-mode {args.image_ema_eval_mode} "
+                     f"--flow-time-embed {args.image_flow_time_embed} "
+                     f"--flow-time-embed-dim {args.image_flow_time_embed_dim} "
                      f"--time-sampling {args.image_time_sampling} "
                      f"--time-logit-mean {args.image_time_logit_mean} "
                      f"--time-logit-std {args.image_time_logit_std} "
@@ -1044,6 +1078,8 @@ def payload(args):
                 train += " --dit-qk-norm"
             if args.image_flow_checkpoint_blocks:
                 train += " --flow-checkpoint-blocks"
+            if args.image_geometry_cond:
+                train += " --image-geometry-cond"
             if args.image_flow_cache_latents:
                 train += " --flow-cache-latents"
             if args.image_sample_finite_guard:
@@ -1078,6 +1114,10 @@ def payload(args):
                           f"{shlex_quote(args.image_sample_churn_interval)} "
                           f"--sample-velocity-clip {args.image_sample_velocity_clip} "
                           f"--sample-latent-clip {args.image_sample_latent_clip} "
+                          f"--sample-pixel-dynamic-threshold-percentile "
+                          f"{args.image_sample_pixel_dynamic_threshold_percentile} "
+                          f"--sample-pixel-dynamic-threshold-max "
+                          f"{args.image_sample_pixel_dynamic_threshold_max} "
                           f"--eval-seeds {shlex_quote(args.image_eval_seeds)} "
                           f"--eval-out runs/image_latent_{args.image_latent_arch}"
                           f"{cond_suffix}_sweep.json")
@@ -2264,6 +2304,14 @@ def main():
     ap.add_argument("--image-dit-mlp", default="gelu",
                     choices=("gelu", "swiglu"), dest="image_dit_mlp",
                     help="latent image CrossDiT/MM-DiT feed-forward block")
+    ap.add_argument("--image-flow-time-embed", default="scalar",
+                    choices=("scalar", "fourier"), dest="image_flow_time_embed",
+                    help=("latent image DiT/MM-DiT timestep embedding; scalar keeps "
+                          "legacy behavior"))
+    ap.add_argument("--image-flow-time-embed-dim", type=int, default=0,
+                    dest="image_flow_time_embed_dim",
+                    help=("Fourier timestep embedding width for latent image flow; "
+                          "0 uses hidden width in the HQ preset"))
     ap.add_argument("--image-flow-checkpoint-blocks", action="store_true",
                     dest="image_flow_checkpoint_blocks",
                     help="checkpoint latent image transformer blocks during flow training")
@@ -2460,6 +2508,10 @@ def main():
                     choices=("tokens", "embedding", "auto"),
                     dest="image_caption_cond_source",
                     help="caption conditioning source for image manifests")
+    ap.add_argument("--image-geometry-cond", action="store_true",
+                    dest="image_geometry_cond",
+                    help=("append fixed crop/flip/pad-aware geometry conditioning "
+                          "to latent image text conditions"))
     ap.add_argument("--image-crop-mode", default="center",
                     choices=("center", "random", "none", "pad"), dest="image_crop_mode",
                     help="crop mode for manifest image training")
@@ -2482,7 +2534,8 @@ def main():
                     help="latent image extra-CFG time schedule")
     ap.add_argument("--image-cfg-schedules", default="",
                     dest="image_cfg_schedules",
-                    help="comma-separated latent image CFG schedules for sweeps")
+                    help=("comma-separated latent image CFG schedules for eval sweeps "
+                          "and prompt candidates"))
     ap.add_argument("--image-flow-boundary-mode", default="none",
                     choices=("none", "right-linear", "double-linear", "double-cosine"),
                     dest="image_flow_boundary_mode",
@@ -2498,20 +2551,23 @@ def main():
                     help="latent image ODE sampler method")
     ap.add_argument("--image-sample-methods", default="euler,heun,midpoint",
                     dest="image_sample_methods",
-                    help="comma-separated latent image sampler methods for sweeps")
+                    help=("comma-separated latent image sampler methods for eval sweeps "
+                          "and prompt candidates"))
     ap.add_argument("--image-sample-schedule", default="linear",
-                    choices=("linear", "quadratic", "sqrt", "cosine"),
+                    choices=IMAGE_SAMPLE_SCHEDULES,
                     dest="image_sample_schedule",
                     help="latent image timestep placement schedule")
     ap.add_argument("--image-sample-schedules", default="linear",
                     dest="image_sample_schedules",
-                    help="comma-separated latent image timestep schedules for sweeps")
+                    help=("comma-separated latent image timestep schedules for eval sweeps "
+                          "and prompt candidates"))
     ap.add_argument("--image-sample-churn", type=float, default=0.0,
                     dest="image_sample_churn",
                     help="stochastic latent sampler churn; 0 keeps deterministic ODE sampling")
     ap.add_argument("--image-sample-churns", default="0.0",
                     dest="image_sample_churns",
-                    help="comma-separated stochastic sampler churn values for sweeps")
+                    help=("comma-separated stochastic sampler churn values for eval sweeps "
+                          "and prompt candidates"))
     ap.add_argument("--image-sample-churn-interval", default="0.0,0.8",
                     dest="image_sample_churn_interval",
                     help="latent sampler churn active interval formatted start,end")
@@ -2524,6 +2580,15 @@ def main():
     ap.add_argument("--image-sample-latent-clip", type=float, default=0.0,
                     dest="image_sample_latent_clip",
                     help="absolute latent clamp during sampling; 0 disables")
+    ap.add_argument("--image-sample-pixel-dynamic-threshold-percentile", type=float,
+                    default=0.0,
+                    dest="image_sample_pixel_dynamic_threshold_percentile",
+                    help=("decoded-pixel dynamic threshold percentile in (0,1]; "
+                          "0 disables, HQ preset uses 0.995"))
+    ap.add_argument("--image-sample-pixel-dynamic-threshold-max", type=float,
+                    default=1.0,
+                    dest="image_sample_pixel_dynamic_threshold_max",
+                    help="decoded-pixel dynamic threshold target max absolute value")
     ap.add_argument("--image-sample-grid", action="store_true",
                     dest="image_sample_grid",
                     help="save a generated prompt/caption PPM grid for latent image jobs")
@@ -2798,19 +2863,22 @@ def main():
                     help="latent image checkpoint sweep weight mode")
     ap.add_argument("--image-cfg-sweep", default="1.0,1.25,1.5,2.0",
                     dest="image_cfg_sweep",
-                    help="comma-separated CFG scales for --image-eval-sweep")
+                    help=("comma-separated CFG scales for --image-eval-sweep and "
+                          "prompt candidates"))
     ap.add_argument("--image-cfg-rescale-sweep", default="0.0,0.7",
                     dest="image_cfg_rescale_sweep",
-                    help="comma-separated latent image CFG rescale values for sweeps")
+                    help=("comma-separated latent image CFG rescale values for eval sweeps "
+                          "and prompt candidates"))
     ap.add_argument("--image-cfg-modes", default="",
                     dest="image_cfg_modes",
-                    help=("comma-separated latent image CFG modes for sweeps; "
+                    help=("comma-separated latent image CFG modes for eval sweeps/prompt candidates; "
                           "default uses --image-cfg-mode"))
     ap.add_argument("--image-sample-steps-sweep", default="4,8,16",
                     dest="image_sample_steps_sweep",
-                    help="comma-separated sampler step counts for --image-eval-sweep")
+                    help=("comma-separated sampler step counts for --image-eval-sweep and "
+                          "prompt candidates"))
     ap.add_argument("--image-eval-seeds", default="1,2,3", dest="image_eval_seeds",
-                    help="comma-separated eval seeds for --image-eval-sweep")
+                    help="comma-separated eval/prompt-candidate seeds")
     ap.add_argument("--multimodal", action="store_true",
                     help="train generic manifest-driven multimodal prefix bridge")
     ap.add_argument("--multimodal-manifest", default="", dest="multimodal_manifest",
@@ -3362,6 +3430,14 @@ def main():
             "--image-sample-latent-clip",
         )
         parse_nonnegative_float_csv(
+            str(args.image_sample_pixel_dynamic_threshold_percentile),
+            "--image-sample-pixel-dynamic-threshold-percentile",
+        )
+        parse_nonnegative_float_csv(
+            str(args.image_sample_pixel_dynamic_threshold_max),
+            "--image-sample-pixel-dynamic-threshold-max",
+        )
+        parse_nonnegative_float_csv(
             args.image_eval_text_guidance_sweep,
             "--image-eval-text-guidance-sweep",
         )
@@ -3375,7 +3451,7 @@ def main():
         )
     except ValueError as exc:
         sys.exit(f"ERROR: {exc}")
-    valid_sample_schedules = {"linear", "quadratic", "sqrt", "cosine"}
+    valid_sample_schedules = set(IMAGE_SAMPLE_SCHEDULES)
     bad_sample_schedules = sorted(
         {raw.strip() for raw in str(args.image_sample_schedules).split(",") if raw.strip()}
         - valid_sample_schedules
@@ -3578,6 +3654,11 @@ def main():
         sys.exit("ERROR: --image-sample-candidates-per-prompt must be positive")
     if args.image_sample_candidates_per_prompt > 1 and not args.image_sample_prompts:
         sys.exit("ERROR: --image-sample-candidates-per-prompt > 1 requires --image-sample-prompts")
+    if args.image_sample_pixel_dynamic_threshold_percentile > 1.0:
+        sys.exit(
+            "ERROR: --image-sample-pixel-dynamic-threshold-percentile must be <= 1")
+    if args.image_sample_pixel_dynamic_threshold_max <= 0.0:
+        sys.exit("ERROR: --image-sample-pixel-dynamic-threshold-max must be positive")
     if args.image_sample_text_guidance_w < 0.0:
         sys.exit("ERROR: --image-sample-text-guidance-w must be non-negative")
     if args.image_sample_text_guidance_w > 0.0 and not args.image_sample_prompts:
@@ -3641,6 +3722,8 @@ def main():
         sys.exit("ERROR: --image-dit-depth must be positive")
     if args.image_dit_heads <= 0:
         sys.exit("ERROR: --image-dit-heads must be positive")
+    if args.image_flow_time_embed_dim < 0:
+        sys.exit("ERROR: --image-flow-time-embed-dim must be non-negative")
     if args.image_latent_arch in ("dit", "crossdit", "mmdit"):
         hidden = int(args.dim or 64)
         actual_heads = max(1, min(int(args.image_dit_heads), hidden // 16))

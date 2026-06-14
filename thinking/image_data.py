@@ -1048,7 +1048,7 @@ def _target_hw(size):
 
 
 def load_image_tensor(path, size=256, device="cpu", center_crop=True,
-                      crop_mode=None, hflip=False, rng=None):
+                      crop_mode=None, hflip=False, rng=None, return_metadata=False):
     ext = os.path.splitext(path)[1].lower()
     if ext in (".ppm", ".pnm"):
         arr = _read_ppm(path)
@@ -1057,12 +1057,18 @@ def load_image_tensor(path, size=256, device="cpu", center_crop=True,
         im = _pil_image(path)
         arr = np.asarray(im, dtype=np.uint8)
         x = torch.tensor(arr, dtype=torch.float32).permute(2, 0, 1) / 127.5 - 1.0
+    _c, original_h, original_w = x.shape
     if crop_mode is None:
         crop_mode = "center" if center_crop else "none"
     crop_mode = str(crop_mode)
     if crop_mode not in ("center", "random", "none", "pad"):
         raise ValueError(f"unknown crop mode {crop_mode!r}")
     target_hw = _target_hw(size)
+    crop_top = 0
+    crop_left = 0
+    crop_h = int(original_h)
+    crop_w = int(original_w)
+    pad_top = pad_bottom = pad_left = pad_right = 0
     if crop_mode in ("center", "random"):
         _c, h, w = x.shape
         side = min(h, w)
@@ -1075,6 +1081,10 @@ def load_image_tensor(path, size=256, device="cpu", center_crop=True,
             y0 = (h - side) // 2
             x0 = (w - side) // 2
         x = x[:, y0:y0 + side, x0:x0 + side]
+        crop_top = int(y0)
+        crop_left = int(x0)
+        crop_h = int(side)
+        crop_w = int(side)
     elif crop_mode == "pad" and target_hw is not None:
         _c, h, w = x.shape
         target_h, target_w = target_hw
@@ -1096,7 +1106,27 @@ def load_image_tensor(path, size=256, device="cpu", center_crop=True,
     if target_hw is not None:
         x = F.interpolate(x[None], size=target_hw, mode="bilinear",
                           align_corners=False)[0]
-    return x.to(device=device)
+    x = x.to(device=device)
+    if not return_metadata:
+        return x
+    _c, target_h, target_w = x.shape
+    metadata = {
+        "original_height": int(original_h),
+        "original_width": int(original_w),
+        "target_height": int(target_h),
+        "target_width": int(target_w),
+        "crop_mode": crop_mode,
+        "crop_top": int(crop_top),
+        "crop_left": int(crop_left),
+        "crop_height": int(crop_h),
+        "crop_width": int(crop_w),
+        "pad_top": int(pad_top),
+        "pad_bottom": int(pad_bottom),
+        "pad_left": int(pad_left),
+        "pad_right": int(pad_right),
+        "hflip": bool(hflip),
+    }
+    return x, metadata
 
 
 def _manifest_image_path(path, root=""):
@@ -1365,7 +1395,7 @@ def normalized_sampling_weights(weights, n):
 
 def sample_image_text_batch(records, rng, batch=32, size=256, device="cpu",
                             return_records=False, crop_mode="center", hflip_prob=0.0,
-                            weights=None):
+                            weights=None, return_metadata=False):
     records = list(records)
     probs = normalized_sampling_weights(weights, len(records))
     if probs is None:
@@ -1374,16 +1404,26 @@ def sample_image_text_batch(records, rng, batch=32, size=256, device="cpu",
         idx = rng.choice(len(records), size=int(batch), replace=True, p=probs)
     chosen = [records[int(i)] for i in idx]
     hflip_prob = float(hflip_prob)
-    imgs = [
-        load_image_tensor(
+    imgs, metadata = [], []
+    for rec in chosen:
+        hflip = hflip_prob > 0.0 and float(rng.random()) < hflip_prob
+        loaded = load_image_tensor(
             rec.path, size=size, device=device, crop_mode=crop_mode,
-            hflip=(hflip_prob > 0.0 and float(rng.random()) < hflip_prob), rng=rng)
-        for rec in chosen
-    ]
+            hflip=hflip, rng=rng, return_metadata=return_metadata)
+        if return_metadata:
+            img, meta = loaded
+            metadata.append(meta)
+        else:
+            img = loaded
+        imgs.append(img)
     captions = [rec.caption for rec in chosen]
     if return_records:
-        return torch.stack(imgs, dim=0), captions, chosen
-    return torch.stack(imgs, dim=0), captions
+        out = (torch.stack(imgs, dim=0), captions, chosen)
+    else:
+        out = (torch.stack(imgs, dim=0), captions)
+    if return_metadata:
+        out = out + (metadata,)
+    return out
 
 
 def selftest():
@@ -1426,10 +1466,24 @@ def selftest():
         xf = load_image_tensor(records[0].path, size=4, crop_mode="center", hflip=True)
         assert xr.shape == (3, 4, 4) and xf.shape == (3, 4, 4)
         assert torch.allclose(x[:, :, 0], xf[:, :, -1])
+        xm, meta = load_image_tensor(
+            records[0].path, size=4, crop_mode="center", hflip=True,
+            return_metadata=True)
+        assert xm.shape == (3, 4, 4)
+        assert meta["original_height"] == 6 and meta["original_width"] == 8
+        assert meta["crop_left"] == 1 and meta["crop_top"] == 0
+        assert meta["crop_height"] == 6 and meta["crop_width"] == 6
+        assert meta["target_height"] == 4 and meta["target_width"] == 4
+        assert meta["hflip"] is True
         xp = load_image_tensor(records[0].path, size=8, crop_mode="pad")
         assert xp.shape == (3, 8, 8)
         assert torch.allclose(xp[:, 0, :], torch.zeros_like(xp[:, 0, :]))
         assert torch.allclose(xp[:, -1, :], torch.zeros_like(xp[:, -1, :]))
+        xpm, pmeta = load_image_tensor(
+            records[0].path, size=8, crop_mode="pad", return_metadata=True)
+        assert xpm.shape == (3, 8, 8)
+        assert pmeta["pad_top"] == 1 and pmeta["pad_bottom"] == 1
+        assert pmeta["pad_left"] == 0 and pmeta["pad_right"] == 0
         xt = load_image_tensor(records[0].path, size=(6, 10), crop_mode="pad")
         assert xt.shape == (3, 6, 10)
         vocab = build_caption_vocab(records)
@@ -1444,6 +1498,12 @@ def selftest():
             records, np.random.default_rng(0), batch=2, size=4,
             crop_mode="random", hflip_prob=0.5)
         assert xb.shape == (2, 3, 4, 4) and captions == [records[0].caption] * 2
+        xb_meta, captions_meta, chosen_meta, metas = sample_image_text_batch(
+            records, np.random.default_rng(0), batch=2, size=4, return_records=True,
+            crop_mode="random", hflip_prob=0.5, return_metadata=True)
+        assert xb_meta.shape == (2, 3, 4, 4)
+        assert captions_meta == [records[0].caption] * 2 and chosen_meta == records * 2
+        assert len(metas) == 2 and all(meta["target_width"] == 4 for meta in metas)
         xb_pad, captions_pad = sample_image_text_batch(
             records, np.random.default_rng(1), batch=2, size=8,
             crop_mode="pad")
