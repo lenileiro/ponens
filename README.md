@@ -220,6 +220,7 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --reading-max-tokens 96 --reading-min-tokens 8 --reading-eval-n 32 \
     --reading-study-strategy auto --reading-study-probe-n 48 \
     --reading-study-hard-max 24 --reading-study-refresh-steps 1 \
+    --reading-study-self-teach-w 0.05 \
     --reading-memory-size 64 --reading-memory-w 0.05 \
     --reading-association-w 0.05 --reading-association-transitive-steps 3 \
     --reading-association-transitive-w 0.25 \
@@ -242,6 +243,7 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --reading-checkpoint runs/text_raw_reading_discovery_study_smoke.pt \
     --reading-out-checkpoint runs/text_raw_reading_discovery_study_continued.pt \
     --steps 4 --batch 16 --reading-study-strategy auto \
+    --reading-study-self-teach-w 0.05 \
     --reading-memory-size 64 --reading-memory-w 0.05 \
     --reading-association-w 0.05 --reading-gap-w 0.05 \
     --out runs/text_raw_reading_discovery_study_continued.json

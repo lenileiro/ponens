@@ -391,6 +391,7 @@ def text_reading_cmd(args, py):
         f"{args.reading_study_insight_accept_w} "
         f"--reading-study-insight-min-delta "
         f"{args.reading_study_insight_min_delta} "
+        f"--reading-study-self-teach-w {args.reading_study_self_teach_w} "
         f"--out {shlex_quote(report)}"
     )
     for source in args.reading_data or []:
@@ -1900,6 +1901,8 @@ def main():
                     dest="reading_study_insight_accept_w")
     ap.add_argument("--reading-study-insight-min-delta", type=float, default=0.0,
                     dest="reading_study_insight_min_delta")
+    ap.add_argument("--reading-study-self-teach-w", type=float, default=0.0,
+                    dest="reading_study_self_teach_w")
     ap.add_argument("--ref", default="HEAD",
                     help="deploy this git ref (pinned commit); '' = live tree")
     ap.add_argument("--vision-understanding", action="store_true",
@@ -3400,6 +3403,7 @@ def main():
                 args.reading_study_insight_accept_w),
             "--reading-study-insight-min-delta": (
                 args.reading_study_insight_min_delta),
+            "--reading-study-self-teach-w": args.reading_study_self_teach_w,
         }
         bad_text_nonnegative = [
             name for name, value in text_nonnegative.items() if value < 0

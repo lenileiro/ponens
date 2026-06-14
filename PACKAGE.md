@@ -23,7 +23,9 @@ span completion, context closure, reanalysis, memory-gap, and graph-closure insi
 objectives. No English rules or prompt templates are embedded in the module, and legacy dataset
 importers are not supported APIs.
 Checkpoints carry a bounded raw-reading replay bank selected from the model's own study records,
-so continuation can retain earlier concepts without a separate task-specific harness.
+so continuation can retain earlier concepts without a separate task-specific harness. Optional
+`--reading-study-self-teach-w` allocates extra training weight from the model's own eval deficits
+across view, context, span, closure, sequence, neighborhood, cluster, FER, and bridge signals.
 
 ```bash
 python -m thinking.text --selftest
@@ -32,6 +34,7 @@ python -m thinking.text --reading-data data/reading.jsonl \
     --steps 40000 --batch 16 --d 256 --layers 4 --heads 8 \
     --latent-concept-slots 4 --reading-memory-size 256 \
     --reading-study-strategy auto --reading-study-probe-n 256 \
+    --reading-study-self-teach-w 0.05 \
     --reading-discovery-w 0.05 --reading-reanalysis-w 0.05 \
     --reading-gap-w 0.05 --reading-span-completion-w 0.05 \
     --out runs/text_raw_reading.json \
@@ -42,6 +45,7 @@ python -m thinking.text --reading-data data/new_reading.jsonl \
     --reading-out-checkpoint runs/text_raw_reading_studied.pt \
     --steps 4000 --batch 16 \
     --reading-study-strategy auto --reading-study-probe-n 256 \
+    --reading-study-self-teach-w 0.05 \
     --reading-discovery-w 0.05 --reading-reanalysis-w 0.05 \
     --reading-gap-w 0.05 --reading-span-completion-w 0.05 \
     --reading-replay-w 0.05 \
@@ -161,4 +165,6 @@ be expressed through manifests, corpora, feature views, targets, and learned obj
 self-study, prefer `--reading-study-strategy auto`: with latent memory it resolves to discovery,
 and without memory it falls back to closure study. Discovery ranks raw chunks by the model's own
 graph-predicted gaps, graph-closure insight, bridges, sequence surprise, and partial-context
-closure surprise from prefix/suffix readings into fuller concept states.
+closure surprise from prefix/suffix readings into fuller concept states. Enable
+`--reading-study-self-teach-w` to let round selection turn those eval deficits into extra
+self-supervised objective weight instead of manually picking which surface to emphasize.

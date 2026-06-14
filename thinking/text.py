@@ -2121,6 +2121,32 @@ READING_POOL_STUDY_STRATEGIES = (
 READING_TRANSITION_STUDY_STRATEGIES = (
     "sequence", "graph", "cycle", "gap", "discovery")
 READING_GRAPH_READY_STUDY_STRATEGIES = ("graph", "cycle", "gap")
+READING_SELF_TEACH_SCORE_KEYS = {
+    "view": "view_score",
+    "context": "context_score",
+    "span": "span_score",
+    "closure": "context_closure_score",
+    "sequence": "sequence_score",
+    "neighborhood": "neighborhood_score",
+    "cluster": "cluster_score",
+    "fer": "fer_score",
+    "bridge": "bridge_score",
+}
+READING_SELF_TEACH_SIGNAL_OBJECTIVES = {
+    "view": ("factorization_w",),
+    "context": ("context_target_w",),
+    "span": ("span_completion_w",),
+    "closure": ("context_closure_w",),
+    "sequence": ("sequence_w",),
+    "neighborhood": ("neighborhood_w", "transition_w"),
+    "cluster": ("cluster_w",),
+    "fer": ("fer_w",),
+    "bridge": ("bridge_w", "discovery_w", "gap_w"),
+}
+READING_SELF_TEACH_WEIGHT_KEYS = tuple(dict.fromkeys(
+    key
+    for keys in READING_SELF_TEACH_SIGNAL_OBJECTIVES.values()
+    for key in keys))
 
 
 def resolve_reading_study_strategy(study_strategy, model):
@@ -2134,6 +2160,45 @@ def resolve_reading_study_strategy(study_strategy, model):
                 if getattr(model, "latent_concept_memory", None) is not None
                 else "closure")
     return requested
+
+
+def reading_self_teach_weight_plan(score_components, budget=0.0):
+    budget = float(budget)
+    if budget < 0.0:
+        raise ValueError("reading self-teach budget must be non-negative")
+    extras = {key: 0.0 for key in READING_SELF_TEACH_WEIGHT_KEYS}
+    deficits = {}
+    active = []
+    for signal in READING_DISCOVERY_SIGNALS:
+        if bool(score_components.get(f"{signal}_skipped", False)):
+            continue
+        score_key = READING_SELF_TEACH_SCORE_KEYS[signal]
+        score = float(score_components.get(score_key, 0.0))
+        quality = min(1.0, max(0.0, score))
+        deficit = max(0.0, 1.0 - quality)
+        deficits[signal] = float(deficit)
+        if deficit > 0.0:
+            active.append((signal, deficit))
+    total_deficit = sum(deficit for _signal, deficit in active)
+    if budget > 0.0 and total_deficit > 0.0:
+        for signal, deficit in active:
+            signal_budget = budget * deficit / total_deficit
+            objectives = READING_SELF_TEACH_SIGNAL_OBJECTIVES[signal]
+            objective_share = signal_budget / float(len(objectives))
+            for key in objectives:
+                extras[key] += objective_share
+    top_signal = None
+    if active:
+        top_signal = max(active, key=lambda item: item[1])[0]
+    return {
+        "enabled": bool(budget > 0.0),
+        "budget": float(budget),
+        "total_deficit": float(total_deficit),
+        "top_signal": top_signal,
+        "signal_deficits": deficits,
+        "active_signals": [signal for signal, _deficit in active],
+        "weight_extras": {key: float(value) for key, value in extras.items()},
+    }
 
 
 def reading_discovery_score_components(view_eval, context_eval, metric="both",
@@ -4760,6 +4825,7 @@ def fit_reading_concepts_select_best(
         replay_records=None, replay_teacher_model=None,
         replay_teacher_vocab=None, replay_w=0.0, replay_batch=0,
         replay_retention_w=0.0,
+        study_self_teach_w=0.0,
         eval_n=64, score_metric="mastery", score_margin_w=0.1,
         score_min_delta=0.0, score_patience=0,
         insight_accept_w=0.25, insight_min_delta=0.0,
@@ -4779,6 +4845,9 @@ def fit_reading_concepts_select_best(
     insight_min_delta = float(insight_min_delta)
     if insight_min_delta < 0.0:
         raise ValueError("reading study insight min delta must be non-negative")
+    study_self_teach_w = float(study_self_teach_w)
+    if study_self_teach_w < 0.0:
+        raise ValueError("reading study self-teach weight must be non-negative")
     if int(memory_size) > 0:
         model.enable_latent_concept_memory(int(memory_size))
     initial_study_strategy = resolve_reading_study_strategy(
@@ -4855,7 +4924,13 @@ def fit_reading_concepts_select_best(
     no_improve_rounds = 0
     stopped_early = False
     stop_round = 0
+    current_bundle = before_bundle
+    self_teach_reports = []
     for round_i, round_steps in enumerate(schedule, start=1):
+        self_teach_plan = reading_self_teach_weight_plan(
+            current_bundle["score_components"], budget=study_self_teach_w)
+        self_teach_reports.append(self_teach_plan | {"round": int(round_i)})
+        weight_extras = self_teach_plan["weight_extras"]
         fit_reading_concepts(
             model, vocab, records, steps=round_steps, batch=batch, lr=lr,
             seed=seed + round_i * 1009, device=device, log_every=log_every,
@@ -4863,11 +4938,12 @@ def fit_reading_concepts_select_best(
             feature_dropout=feature_dropout, invariance_w=invariance_w,
             variance_w=variance_w, covariance_w=covariance_w,
             variance_target=variance_target,
-            factorization_w=factorization_w,
+            factorization_w=(
+                factorization_w + weight_extras["factorization_w"]),
             factorization_variance=factorization_variance,
             factorization_margin=factorization_margin,
             factorization_covariance_w=factorization_covariance_w,
-            fer_w=fer_w,
+            fer_w=fer_w + weight_extras["fer_w"],
             fer_fragmentation_w=fer_fragmentation_w,
             fer_correlation_w=fer_correlation_w,
             fer_balance_w=fer_balance_w,
@@ -4881,7 +4957,7 @@ def fit_reading_concepts_select_best(
             consolidation_balance_w=consolidation_balance_w,
             consolidation_anchor_w=consolidation_anchor_w,
             consolidation_fer_w=consolidation_fer_w,
-            discovery_w=discovery_w,
+            discovery_w=discovery_w + weight_extras["discovery_w"],
             discovery_curiosity_w=discovery_curiosity_w,
             discovery_graph_w=discovery_graph_w,
             discovery_cycle_w=discovery_cycle_w,
@@ -4892,7 +4968,7 @@ def fit_reading_concepts_select_best(
             reanalysis_cycle_w=reanalysis_cycle_w,
             reanalysis_bridge_w=reanalysis_bridge_w,
             reanalysis_fer_w=reanalysis_fer_w,
-            gap_w=gap_w,
+            gap_w=gap_w + weight_extras["gap_w"],
             gap_temperature=gap_temperature,
             gap_self_loop_w=gap_self_loop_w,
             gap_transitive_steps=gap_transitive_steps,
@@ -4924,30 +5000,33 @@ def fit_reading_concepts_select_best(
             graph_cycle_transitive_w=graph_cycle_transitive_w,
             graph_cycle_target_power=graph_cycle_target_power,
             graph_cycle_consistency_w=graph_cycle_consistency_w,
-            bridge_w=bridge_w,
-            context_target_w=context_target_w,
+            bridge_w=bridge_w + weight_extras["bridge_w"],
+            context_target_w=(
+                context_target_w + weight_extras["context_target_w"]),
             context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
-            span_completion_w=span_completion_w,
+            span_completion_w=(
+                span_completion_w + weight_extras["span_completion_w"]),
             span_mask_frac=span_mask_frac,
             span_completion_temperature=span_completion_temperature,
-            context_closure_w=context_closure_w,
+            context_closure_w=(
+                context_closure_w + weight_extras["context_closure_w"]),
             context_closure_split_frac=context_closure_split_frac,
             context_closure_temperature=context_closure_temperature,
-            sequence_w=sequence_w,
+            sequence_w=sequence_w + weight_extras["sequence_w"],
             sequence_batch=sequence_batch,
             sequence_temperature=sequence_temperature,
-            neighborhood_w=neighborhood_w,
+            neighborhood_w=neighborhood_w + weight_extras["neighborhood_w"],
             neighborhood_batch=neighborhood_batch,
             neighborhood_probe_n=neighborhood_probe_n,
             neighborhood_refresh_steps=neighborhood_refresh_steps,
             neighborhood_temperature=neighborhood_temperature,
             neighborhood_margin=neighborhood_margin,
-            transition_w=transition_w,
+            transition_w=transition_w + weight_extras["transition_w"],
             transition_batch=transition_batch,
             transition_temperature=transition_temperature,
             transition_margin=transition_margin,
-            cluster_w=cluster_w,
+            cluster_w=cluster_w + weight_extras["cluster_w"],
             cluster_batch=cluster_batch,
             cluster_probe_n=cluster_probe_n,
             cluster_refresh_steps=cluster_refresh_steps,
@@ -4962,6 +5041,21 @@ def fit_reading_concepts_select_best(
             replay_teacher_vocab=replay_teacher_vocab,
             replay_w=replay_w, replay_batch=replay_batch)
         round_train_metrics = dict(getattr(model, "reading_train_metrics", {}))
+        round_train_metrics["self_teach_plan"] = self_teach_plan
+        round_train_metrics["self_teach_base_weights"] = {
+            "factorization_w": float(factorization_w),
+            "fer_w": float(fer_w),
+            "discovery_w": float(discovery_w),
+            "gap_w": float(gap_w),
+            "bridge_w": float(bridge_w),
+            "context_target_w": float(context_target_w),
+            "span_completion_w": float(span_completion_w),
+            "context_closure_w": float(context_closure_w),
+            "sequence_w": float(sequence_w),
+            "neighborhood_w": float(neighborhood_w),
+            "transition_w": float(transition_w),
+            "cluster_w": float(cluster_w),
+        }
         round_study_reports = [
             report | {"round": int(round_i)}
             for report in getattr(model, "reading_study_reports", [])]
@@ -5004,6 +5098,7 @@ def fit_reading_concepts_select_best(
         rounds_report.append(row | {
             "selected": bool(selected),
             "score_delta_from_best": score_delta_from_best,
+            "self_teach_plan": self_teach_plan,
             "bridge_insight_delta": float(insight_delta),
             "bridge_insight_allowed": bool(insight_allowed),
             "selected_by_score": bool(decision["selected_by_score"]),
@@ -5032,6 +5127,7 @@ def fit_reading_concepts_select_best(
                 stopped_early = True
                 stop_round = round_i
                 break
+        current_bundle = bundle
     model.load_state_dict(best_state, strict=False)
     for row in rounds_report:
         row["selected"] = row["round"] == best_round
@@ -5051,6 +5147,8 @@ def fit_reading_concepts_select_best(
         "stop_round": int(stop_round),
         "no_improve_rounds": int(no_improve_rounds),
         "replay_retention_w": float(replay_retention_w),
+        "self_teach_w": float(study_self_teach_w),
+        "self_teach_reports": self_teach_reports,
         "selected_round": int(best_round),
         "accepted_update": bool(best_round > 0),
         "selected_score": float(best_score),
@@ -5172,6 +5270,7 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            study_score_patience=0,
                            study_insight_accept_w=0.25,
                            study_insight_min_delta=0.0,
+                           study_self_teach_w=0.0,
                            eval_n=64):
     if int(latent_concept_slots) <= 0:
         raise ValueError("raw reading concept training requires latent_concept_slots > 0")
@@ -5292,6 +5391,7 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             score_patience=study_score_patience,
             insight_accept_w=study_insight_accept_w,
             insight_min_delta=study_insight_min_delta,
+            study_self_teach_w=study_self_teach_w,
             rounds=study_rounds)
         return model, vocab
     return fit_reading_concepts(
@@ -5476,6 +5576,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          study_score_min_delta=0.0, study_score_patience=0,
                          study_insight_accept_w=0.25,
                          study_insight_min_delta=0.0,
+                         study_self_teach_w=0.0,
                          text_field="text", max_tokens=128, min_tokens=8,
                          eval_frac=0.10, eval_n=64, out=None, checkpoint=None):
     records = load_reading_records(
@@ -5605,6 +5706,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             score_patience=study_score_patience,
             insight_accept_w=study_insight_accept_w,
             insight_min_delta=study_insight_min_delta,
+            study_self_teach_w=study_self_teach_w,
             rounds=study_rounds,
             before_bundle=before_bundle)
     else:
@@ -5841,6 +5943,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "study_score_patience": int(study_score_patience),
               "study_insight_accept_w": float(study_insight_accept_w),
               "study_insight_min_delta": float(study_insight_min_delta),
+              "study_self_teach_w": float(study_self_teach_w),
               "reading_replay_bank": reading_replay_bank,
               "train_records": sum(r.split == "train" for r in records),
               "eval_records": sum(r.split == "eval" for r in records),
@@ -6082,6 +6185,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              study_score_min_delta=0.0, study_score_patience=0,
                              study_insight_accept_w=0.25,
                              study_insight_min_delta=0.0,
+                             study_self_teach_w=0.0,
                              replay_w=0.0, replay_batch=0,
                              replay_retention_w=0.0,
                              text_field="text", max_tokens=128, min_tokens=8,
@@ -6240,6 +6344,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             score_patience=study_score_patience,
             insight_accept_w=study_insight_accept_w,
             insight_min_delta=study_insight_min_delta,
+            study_self_teach_w=study_self_teach_w,
             replay_records=replay_records,
             replay_teacher_model=replay_teacher_model,
             replay_teacher_vocab=replay_teacher_vocab,
@@ -6521,6 +6626,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "study_score_patience": int(study_score_patience),
               "study_insight_accept_w": float(study_insight_accept_w),
               "study_insight_min_delta": float(study_insight_min_delta),
+              "study_self_teach_w": float(study_self_teach_w),
               "replay_w": float(replay_w),
               "replay_batch": int(replay_batch),
               "replay_retention_w": float(replay_retention_w),
@@ -6935,6 +7041,22 @@ def selftest():
     assert mastery_bundle["score_components"]["bridge_skipped"] is False
     assert (mastery_bundle["score_components"]["score"]
             == mastery_bundle["score_components"]["mastery_score"])
+    synthetic_scores = {
+        f"{name}_skipped": False for name in READING_DISCOVERY_SIGNALS}
+    for name, score_key in READING_SELF_TEACH_SCORE_KEYS.items():
+        synthetic_scores[score_key] = 1.0
+    synthetic_scores["context_score"] = 0.0
+    synthetic_scores["context_closure_score"] = 0.5
+    synthetic_scores["bridge_score"] = 0.25
+    self_teach_plan = reading_self_teach_weight_plan(
+        synthetic_scores, budget=0.12)
+    assert self_teach_plan["enabled"] is True
+    assert self_teach_plan["top_signal"] == "context"
+    assert self_teach_plan["weight_extras"]["context_target_w"] > 0.0
+    assert self_teach_plan["weight_extras"]["context_closure_w"] > 0.0
+    assert self_teach_plan["weight_extras"]["bridge_w"] > 0.0
+    assert math.isclose(sum(self_teach_plan["weight_extras"].values()),
+                        0.12, rel_tol=1e-6, abs_tol=1e-6)
     fit_reading_concepts(
         reading_model, reading_vocab, reading_records, steps=3, batch=2, lr=1e-4,
         seed=5, device="cpu", log_every=1, token_drop_p=0.1,
@@ -7105,9 +7227,13 @@ def selftest():
         study_probe_n=2, study_hard_max=1, study_refresh_steps=1,
         study_select_best=True, study_rounds=2,
         study_score_min_delta=999.0, study_score_patience=1,
+        study_self_teach_w=0.05,
         eval_n=0)
     helper_selection = helper_model.reading_train_metrics["selection"]
     assert helper_selection["enabled"] is True
+    assert helper_selection["self_teach_w"] == 0.05
+    assert helper_selection["self_teach_reports"]
+    assert helper_selection["rounds"][1]["self_teach_plan"]["enabled"] is True
     assert helper_selection["accepted_update"] is False
     assert helper_selection["selected_round"] == 0
     assert helper_model.reading_study_reports == []
@@ -7308,6 +7434,7 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-study-insight-accept-w", "--reading-study-insight-w",
                     type=float, default=0.25, dest="reading_study_insight_accept_w")
     ap.add_argument("--reading-study-insight-min-delta", type=float, default=0.0)
+    ap.add_argument("--reading-study-self-teach-w", type=float, default=0.0)
 
 
 def _reading_kwargs(args):
@@ -7420,6 +7547,7 @@ def _reading_kwargs(args):
                 study_score_patience=args.reading_study_score_patience,
                 study_insight_accept_w=args.reading_study_insight_accept_w,
                 study_insight_min_delta=args.reading_study_insight_min_delta,
+                study_self_teach_w=args.reading_study_self_teach_w,
                 text_field=args.reading_text_field,
                 max_tokens=args.reading_max_tokens,
                 min_tokens=args.reading_min_tokens,
