@@ -37,6 +37,7 @@ from .concepts import (
     LatentConceptMemory,
     SchemaConceptHead,
     SchemaConceptRefiner,
+    latent_concept_graph_curiosity_scores,
     latent_concept_cluster_prototype_loss,
     latent_concept_neighborhood_loss,
     latent_concept_slot_factorization_loss,
@@ -1078,6 +1079,69 @@ def multimodal_factor_record_outcomes(model, vocab, surfaces, n=0, seed=0, devic
                              "skipped": False}
 
 
+def multimodal_latent_curiosity_examples(
+        model, vocab, surfaces, n=0, seed=0, device=DEV, text_split="train",
+        mode="full", temperature=0.1, transitive_steps=2, transitive_w=0.1,
+        examples=None):
+    memory = getattr(model, "latent_concept_memory", None)
+    if getattr(model, "latent_concepts", None) is None or memory is None:
+        return [], {"n_records": 0, "sampled": False, "n_selected": 0,
+                    "mean_score": 0.0, "max_score": 0.0,
+                    "mean_novelty": 0.0, "mean_association": 0.0,
+                    "mode": mode, "skipped": True}
+    if examples is None:
+        rng = np.random.default_rng(seed)
+        count = int(n) if int(n) > 0 else 1
+        examples = _sample_examples(count, rng, surfaces, text_split=text_split)
+        sampled = True
+    else:
+        examples = list(examples)
+        sampled = False
+        if n and n < len(examples):
+            rng = np.random.default_rng(seed)
+            idx = rng.choice(len(examples), size=int(n), replace=False)
+            examples = [examples[int(i)] for i in idx]
+            sampled = True
+    scored = []
+    score_values = []
+    novelty_values = []
+    association_values = []
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(examples), 64):
+            batch_examples = examples[off:off + 64]
+            img, aud, txt, _ids, _golds = _batch_from_examples(
+                batch_examples, vocab, device)
+            slots = model.latent_concept_states(
+                img, aud, txt, mode=mode, project=True)
+            scores, parts = latent_concept_graph_curiosity_scores(
+                slots, memory.active(), memory.active_relations(),
+                temperature=temperature, transitive_steps=transitive_steps,
+                transitive_w=transitive_w)
+            novelty = parts.get("novelty", scores.new_zeros(scores.shape))
+            association = parts.get("association", scores.new_zeros(scores.shape))
+            for i, ex in enumerate(batch_examples):
+                score = float(scores[i].detach().cpu())
+                scored.append((score, ex))
+                score_values.append(score)
+                novelty_values.append(float(novelty[i].detach().cpu()))
+                association_values.append(float(association[i].detach().cpu()))
+    scored.sort(key=lambda row: row[0], reverse=True)
+    selected = [ex for _score, ex in scored]
+    return selected, {"n_records": len(examples),
+                      "sampled": sampled,
+                      "n_selected": len(selected),
+                      "mean_score": float(np.mean(score_values)) if score_values else 0.0,
+                      "max_score": float(max(score_values)) if score_values else 0.0,
+                      "mean_novelty": (
+                          float(np.mean(novelty_values)) if novelty_values else 0.0),
+                      "mean_association": (
+                          float(np.mean(association_values))
+                          if association_values else 0.0),
+                      "mode": mode,
+                      "skipped": False}
+
+
 def concept_geometry_evaluate(model, vocab, surfaces, n=200, seed=13, device=DEV,
                               text_split="eval", mode="full"):
     """Same-value geometry diagnostic for schema concept states.
@@ -1906,12 +1970,14 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
         raise ValueError("latent concept cluster min size must be at least two")
     study_strategy = str(study_strategy)
     study_score_metric = str(study_score_metric)
-    if study_strategy not in ("random", "errors"):
+    if study_strategy not in ("random", "errors", "curiosity"):
         raise ValueError(f"unknown multimodal study strategy {study_strategy!r}")
     if study_score_metric not in MULTIMODAL_STUDY_METRICS:
         raise ValueError(f"unknown multimodal study score metric {study_score_metric!r}")
     if study_strategy == "errors" and study_score_metric == "latent" and latent_concept_slots <= 0:
         raise ValueError("latent multimodal study requires latent_concept_slots > 0")
+    if study_strategy == "curiosity" and latent_concept_memory_size <= 0:
+        raise ValueError("multimodal curiosity study requires latent concept memory")
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     surfaces = load_text_surfaces(surfaces_path)
@@ -1948,14 +2014,27 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     def refresh_study_pool(step):
         nonlocal study_pool
         probe_n = int(study_probe_n) if int(study_probe_n) > 0 else max(batch * 4, 1)
-        errors, _correct, hard_report = multimodal_factor_record_outcomes(
-            model, vocab, surfaces, n=probe_n, seed=seed + 1009 + int(step),
-            device=device, text_split="train", metric=study_score_metric)
-        selected = list(errors)
+        if study_strategy == "curiosity":
+            selected, hard_report = multimodal_latent_curiosity_examples(
+                model, vocab, surfaces, n=probe_n, seed=seed + 1009 + int(step),
+                device=device, text_split="train", mode="full",
+                temperature=latent_concept_association_temperature,
+                transitive_steps=latent_concept_association_transitive_steps,
+                transitive_w=latent_concept_association_transitive_w)
+            hard_report = hard_report | {"strategy": "curiosity"}
+        else:
+            errors, _correct, hard_report = multimodal_factor_record_outcomes(
+                model, vocab, surfaces, n=probe_n, seed=seed + 1009 + int(step),
+                device=device, text_split="train", metric=study_score_metric)
+            selected = list(errors)
+            hard_report = hard_report | {"strategy": "errors"}
         if study_hard_max and len(selected) > int(study_hard_max):
-            cap_rng = np.random.default_rng(seed + 2003 + int(step))
-            idx = cap_rng.choice(len(selected), size=int(study_hard_max), replace=False)
-            selected = [selected[int(i)] for i in idx]
+            if study_strategy == "curiosity":
+                selected = selected[:int(study_hard_max)]
+            else:
+                cap_rng = np.random.default_rng(seed + 2003 + int(step))
+                idx = cap_rng.choice(len(selected), size=int(study_hard_max), replace=False)
+                selected = [selected[int(i)] for i in idx]
             hard_report = hard_report | {"capped": True,
                                          "n_error_records_used": len(selected)}
         else:
@@ -1985,11 +2064,11 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     last_latent_factor = 0.0
     for st in range(1, steps + 1):
         model.train()
-        if study_strategy == "errors" and (st == 1 or (
+        if study_strategy in ("errors", "curiosity") and (st == 1 or (
                 study_refresh_steps and (st - 1) % int(study_refresh_steps) == 0)):
             refresh_study_pool(st)
             model.train()
-        if study_strategy == "errors" and study_pool:
+        if study_strategy in ("errors", "curiosity") and study_pool:
             img, aud, txt, ids, golds = _batch_from_examples(
                 _sample_from_pool(study_pool, batch, rng), vocab, device)
         else:
@@ -2773,6 +2852,10 @@ def selftest():
     assert torch.isfinite(latent_multimodal_association_loss_from_views(
         latent_model, latent_views, temperature=0.2,
         transitive_steps=2, transitive_w=0.1))
+    curious_examples, curious_report = multimodal_latent_curiosity_examples(
+        latent_model, vocab, surfaces, n=4, seed=5, device="cpu",
+        transitive_steps=2, transitive_w=0.1)
+    assert curious_examples and curious_report["skipped"] is False
     assert torch.isfinite(latent_multimodal_neighborhood_loss_from_views(
         latent_views, temperature=0.2))
     assert torch.isfinite(latent_multimodal_transition_loss_from_views(
@@ -2865,7 +2948,8 @@ def selftest():
             latent_concept_association_w=0.1,
             latent_concept_neighborhood_w=0.1,
             latent_concept_transition_w=0.1,
-            latent_concept_cluster_w=0.1)
+            latent_concept_cluster_w=0.1,
+            study_strategy="curiosity", study_probe_n=4, study_hard_max=2)
         assert auto_model.latent_concept_slots == 3
         assert auto_model.latent_concept_memory_size == 5
         assert auto_model.text_checkpoint_transfer["copied"] is True
@@ -2876,6 +2960,7 @@ def selftest():
         assert auto_model.train_metrics["latent_association_transitive_steps"] == 2
         assert auto_model.train_metrics["latent_association_transitive_w"] == 0.1
         assert auto_model.train_metrics["latent_association_relation_updates"] > 0
+        assert auto_model.study_reports[-1]["strategy"] == "curiosity"
         assert auto_model.train_metrics["latent_neighborhood_loss"] >= 0.0
         assert auto_model.train_metrics["latent_transition_loss"] >= 0.0
         assert auto_model.train_metrics["latent_cluster_loss"] >= 0.0
@@ -3116,9 +3201,11 @@ def main(argv=None):
                     dest="latent_concept_factor_w",
                     help=("weight for predicting data-defined multimodal factors "
                           "from schema-free latent slots"))
-    ap.add_argument("--study-strategy", choices=("random", "errors"), default="random",
+    ap.add_argument("--study-strategy", choices=("random", "errors", "curiosity"),
+                    default="random",
                     dest="study_strategy",
-                    help="sample normal batches or train on mined current model errors")
+                    help=("sample normal batches, train on current errors, "
+                          "or use concept-graph curiosity"))
     ap.add_argument("--study-score-metric", choices=MULTIMODAL_STUDY_METRICS,
                     default="balanced", dest="study_score_metric",
                     help="metric used to mine multimodal hard examples")

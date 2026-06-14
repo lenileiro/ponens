@@ -322,6 +322,79 @@ def latent_concept_association_loss(slots, memory, relations, temperature=0.1,
     return F.kl_div(pred.clamp_min(1e-8).log(), target, reduction="batchmean")
 
 
+def _latent_relation_targets(relations, n, device, dtype, self_loop_w=0.05,
+                             transitive_steps=1, transitive_w=0.0):
+    rel = relations[:n, :n].to(device=device, dtype=dtype).clamp_min(0.0)
+    if rel.shape != (n, n):
+        raise ValueError("latent concept relation shape mismatch")
+    if float(self_loop_w):
+        rel = rel + float(self_loop_w) * torch.eye(n, dtype=dtype, device=device)
+    row_sum = rel.sum(-1, keepdim=True)
+    if not bool(row_sum.squeeze(-1).gt(0.0).any()):
+        return None
+    rel = rel / row_sum.clamp_min(1e-8)
+    steps = int(transitive_steps)
+    if steps < 1:
+        raise ValueError("latent concept transitive steps must be positive")
+    trans_w = float(transitive_w)
+    if trans_w < 0.0:
+        raise ValueError("latent concept transitive weight must be non-negative")
+    if steps > 1 and trans_w:
+        walk = rel
+        inferred = torch.zeros_like(rel)
+        for _hop in range(2, steps + 1):
+            walk = walk.matmul(rel)
+            inferred = inferred + walk
+        inferred = inferred / max(1, steps - 1)
+        rel = rel + trans_w * inferred
+        rel = rel / rel.sum(-1, keepdim=True).clamp_min(1e-8)
+    return rel
+
+
+def latent_concept_graph_curiosity_scores(slots, memory, relations=None,
+                                          temperature=0.1, self_loop_w=0.05,
+                                          transitive_steps=1, transitive_w=0.0,
+                                          novelty_w=1.0, association_w=1.0):
+    """Score examples for self-study from latent novelty and graph mismatch.
+
+    Higher scores mean the current example is either far from the persistent
+    concept prototypes or poorly explained by the self-mined association graph.
+    The score is label-free and can be used as a curriculum signal.
+    """
+    if slots is None:
+        return torch.zeros(0), {}
+    if memory is None or memory.numel() == 0:
+        return slots.new_zeros((slots.shape[0],)), {
+            "novelty": slots.new_zeros((slots.shape[0],)),
+            "association": slots.new_zeros((slots.shape[0],)),
+        }
+    if slots.ndim != 3:
+        raise ValueError("latent concept curiosity expects [batch, slots, dim]")
+    if slots.shape[-1] != memory.shape[-1]:
+        raise ValueError("latent concept curiosity dimension mismatch")
+    rows = F.normalize(slots, dim=-1)
+    mem = F.normalize(memory.to(device=slots.device, dtype=slots.dtype), dim=-1)
+    sim = rows.matmul(mem.t())
+    nearest_sim, nearest = sim.max(-1)
+    novelty = (1.0 - nearest_sim).clamp_min(0.0).mean(-1)
+    association = torch.zeros_like(novelty)
+    if relations is not None and relations.numel() and float(association_w):
+        rel = _latent_relation_targets(
+            relations, mem.shape[0], slots.device, slots.dtype,
+            self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+            transitive_w=transitive_w)
+        if rel is not None:
+            temp = max(float(temperature), 1e-6)
+            pred = (sim / temp).softmax(-1).mean(1)
+            target = rel[nearest].mean(1).detach()
+            target = target / target.sum(-1, keepdim=True).clamp_min(1e-8)
+            association = F.kl_div(
+                pred.clamp_min(1e-8).log(), target,
+                reduction="none").sum(-1)
+    score = float(novelty_w) * novelty + float(association_w) * association
+    return score, {"novelty": novelty, "association": association}
+
+
 class SchemaConceptHead(nn.Module):
     """Attend over source states and score values for each schema key."""
 

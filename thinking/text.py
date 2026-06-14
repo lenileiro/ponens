@@ -55,6 +55,7 @@ from .concepts import (
     LatentConceptMemory,
     SchemaConceptHead,
     SchemaConceptRefiner,
+    latent_concept_graph_curiosity_scores,
     latent_concept_cluster_prototype_loss,
     latent_concept_neighborhood_loss,
     latent_concept_slot_factorization_loss,
@@ -2736,6 +2737,60 @@ def reading_latent_record_outcomes(model, vocab, records, device=DEV, n=0, seed=
                              "skipped": False}
 
 
+def reading_latent_curiosity_records(
+        model, vocab, records, device=DEV, n=0, seed=0, feature_dropout=0.0,
+        temperature=0.1, transitive_steps=2, transitive_w=0.1):
+    memory = getattr(model, "latent_concept_memory", None)
+    if getattr(model, "latent_concepts", None) is None or memory is None:
+        return [], {"n_records": 0, "sampled": False, "n_selected": 0,
+                    "mean_score": 0.0, "max_score": 0.0,
+                    "mean_novelty": 0.0, "mean_association": 0.0,
+                    "skipped": True}
+    candidates = [r for r in records if r.split == "train"]
+    sampled = bool(n and n < len(candidates))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=n, replace=False)
+        candidates = [candidates[int(i)] for i in idx]
+    scored = []
+    score_values = []
+    novelty_values = []
+    association_values = []
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(candidates), 64):
+            batch = candidates[off:off + 64]
+            txt = pack_reading(batch, vocab, device)
+            slots = model.latent_concept_states(
+                txt, feature_dropout=feature_dropout, project=True)
+            scores, parts = latent_concept_graph_curiosity_scores(
+                slots, memory.active(), memory.active_relations(),
+                temperature=temperature, transitive_steps=transitive_steps,
+                transitive_w=transitive_w)
+            novelty = parts.get("novelty", scores.new_zeros(scores.shape))
+            association = parts.get("association", scores.new_zeros(scores.shape))
+            for i, rec in enumerate(batch):
+                score = float(scores[i].detach().cpu())
+                scored.append((score, rec))
+                score_values.append(score)
+                novelty_values.append(float(novelty[i].detach().cpu()))
+                association_values.append(float(association[i].detach().cpu()))
+    scored.sort(key=lambda row: row[0], reverse=True)
+    selected = [rec for _score, rec in scored]
+    total = len(candidates)
+    return selected, {"n_records": total,
+                      "sampled": sampled,
+                      "n_selected": len(selected),
+                      "mean_score": float(np.mean(score_values)) if score_values else 0.0,
+                      "max_score": float(max(score_values)) if score_values else 0.0,
+                      "mean_novelty": (
+                          float(np.mean(novelty_values)) if novelty_values else 0.0),
+                      "mean_association": (
+                          float(np.mean(association_values))
+                          if association_values else 0.0),
+                      "skipped": False}
+
+
 def latent_fact_concept_loss(model, txt, records, schema):
     if (schema is None or getattr(model, "fact_concepts", None) is None
             or getattr(model, "latent_concepts", None) is None):
@@ -5104,7 +5159,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     if float(replay_w) < 0.0:
         raise ValueError("reading replay loss weight must be non-negative")
     study_strategy = str(study_strategy)
-    if study_strategy not in ("random", "errors"):
+    if study_strategy not in ("random", "errors", "curiosity"):
         raise ValueError(f"unknown reading study strategy {study_strategy!r}")
     rng = np.random.default_rng(seed)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
@@ -5117,6 +5172,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         model.enable_latent_concept_memory(int(memory_size))
     if association_w and getattr(model, "latent_concept_memory", None) is None:
         raise ValueError("reading association requires latent concept memory")
+    if study_strategy == "curiosity" and getattr(model, "latent_concept_memory", None) is None:
+        raise ValueError("reading curiosity study requires latent concept memory")
     if replay_w and (not replay_sources or replay_teacher_model is None
                      or replay_teacher_vocab is None):
         raise ValueError("reading replay loss requires replay records and teacher checkpoint")
@@ -5152,14 +5209,30 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     def refresh_study_pool(step):
         nonlocal study_pool
         probe_n = int(study_probe_n) if int(study_probe_n) > 0 else max(batch * 4, 1)
-        hard, _correct, report = reading_latent_record_outcomes(
-            model, vocab, records, device=device, n=probe_n, seed=seed + 1301 + int(step),
-            token_drop_p=token_drop_p, token_replace_p=token_replace_p)
-        selected = list(hard)
+        if study_strategy == "curiosity":
+            selected, report = reading_latent_curiosity_records(
+                model, vocab, records, device=device, n=probe_n,
+                seed=seed + 1301 + int(step),
+                feature_dropout=0.0,
+                temperature=association_temperature,
+                transitive_steps=association_transitive_steps,
+                transitive_w=association_transitive_w)
+            report = report | {"strategy": "curiosity"}
+        else:
+            hard, _correct, report = reading_latent_record_outcomes(
+                model, vocab, records, device=device, n=probe_n,
+                seed=seed + 1301 + int(step),
+                token_drop_p=token_drop_p,
+                token_replace_p=token_replace_p)
+            selected = list(hard)
+            report = report | {"strategy": "errors"}
         if study_hard_max and len(selected) > int(study_hard_max):
-            cap_rng = np.random.default_rng(seed + 1759 + int(step))
-            idx = cap_rng.choice(len(selected), size=int(study_hard_max), replace=False)
-            selected = [selected[int(i)] for i in idx]
+            if study_strategy == "curiosity":
+                selected = selected[:int(study_hard_max)]
+            else:
+                cap_rng = np.random.default_rng(seed + 1759 + int(step))
+                idx = cap_rng.choice(len(selected), size=int(study_hard_max), replace=False)
+                selected = [selected[int(i)] for i in idx]
             report = report | {"capped": True, "n_error_records_used": len(selected)}
         else:
             report = report | {"capped": False, "n_error_records_used": len(selected)}
@@ -5198,7 +5271,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
 
     for st in range(1, steps + 1):
         model.train()
-        if study_strategy == "errors" and (st == 1 or (
+        if study_strategy in ("errors", "curiosity") and (st == 1 or (
                 study_refresh_steps and (st - 1) % int(study_refresh_steps) == 0)):
             refresh_study_pool(st)
             model.train()
@@ -5212,7 +5285,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 and (st - 1) % int(cluster_refresh_steps) == 0)):
             refresh_clusters(st)
             model.train()
-        source = study_pool if study_strategy == "errors" and study_pool else train_records
+        source = (study_pool if study_strategy in ("errors", "curiosity")
+                  and study_pool else train_records)
         rec_batch = batch_records(source, rng, batch)
         txt = pack_reading(rec_batch, vocab, device)
         view_loss = reading_latent_view_loss(
@@ -9828,6 +9902,11 @@ def selftest():
         reading_model, reading_txt, feature_dropout=0.1,
         transitive_steps=2, transitive_w=0.1)
     assert torch.isfinite(reading_transitive_association_loss)
+    curiosity_records, curiosity_report = reading_latent_curiosity_records(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0,
+        transitive_steps=2, transitive_w=0.1)
+    assert curiosity_records and curiosity_report["skipped"] is False
+    assert curiosity_report["n_selected"] == curiosity_report["n_records"]
     context_txt, target_txt = split_reading_context_target(
         reading_txt, reading_vocab.pad, context_keep_p=0.5)
     assert context_txt.ne(reading_vocab.pad).any(1).all()
@@ -9924,7 +10003,7 @@ def selftest():
     fit_reading_concepts(
         reading_model, reading_vocab, reading_records, steps=1, batch=2, lr=1e-4,
         seed=5, device="cpu", log_every=1, token_drop_p=0.1,
-        token_replace_p=0.0, study_strategy="errors", study_probe_n=2,
+        token_replace_p=0.0, study_strategy="curiosity", study_probe_n=2,
         study_hard_max=2, context_target_w=0.1, context_keep_p=0.5,
         neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2,
         transition_w=0.1, transition_batch=2,
@@ -9936,6 +10015,7 @@ def selftest():
     assert reading_model.reading_train_metrics["association_transitive_steps"] == 2
     assert reading_model.reading_train_metrics["association_transitive_w"] == 0.1
     assert reading_model.reading_train_metrics["association_relation_updates"] > 0
+    assert reading_model.reading_study_reports[-1]["strategy"] == "curiosity"
     assert reading_model.reading_train_metrics["neighborhood_w"] == 0.1
     assert reading_model.reading_train_metrics["transition_w"] == 0.1
     assert reading_model.reading_neighborhood_reports
@@ -10269,9 +10349,10 @@ def main(argv=None):
                     help="minimum margin over other mined cluster prototypes")
     ap.add_argument("--reading-cluster-min-size", type=int, default=2,
                     help="minimum records per mined latent cluster")
-    ap.add_argument("--reading-study-strategy", choices=("random", "errors"),
+    ap.add_argument("--reading-study-strategy", choices=("random", "errors", "curiosity"),
                     default="errors",
-                    help="train raw reading on random chunks or mined retrieval failures")
+                    help=("train raw reading on random chunks, retrieval failures, "
+                          "or concept-graph curiosity"))
     ap.add_argument("--reading-study-probe-n", type=int, default=0,
                     help="number of train chunks to probe for raw reading hard examples")
     ap.add_argument("--reading-study-hard-max", type=int, default=0,
