@@ -1107,6 +1107,109 @@ def payload(args):
                 f"{args.multimodal_latent_concept_covariance_w} "
                 f"--latent-concept-variance-target "
                 f"{args.multimodal_latent_concept_variance_target} "
+                f"--latent-concept-factorization-w "
+                f"{args.multimodal_latent_concept_factorization_w} "
+                f"--latent-concept-factorization-variance "
+                f"{args.multimodal_latent_concept_factorization_variance} "
+                f"--latent-concept-factorization-margin "
+                f"{args.multimodal_latent_concept_factorization_margin} "
+                f"--latent-concept-factorization-covariance-w "
+                f"{args.multimodal_latent_concept_factorization_covariance_w} "
+                f"--latent-concept-fer-w {args.multimodal_latent_concept_fer_w} "
+                f"--latent-concept-fer-fragmentation-w "
+                f"{args.multimodal_latent_concept_fer_fragmentation_w} "
+                f"--latent-concept-fer-correlation-w "
+                f"{args.multimodal_latent_concept_fer_correlation_w} "
+                f"--latent-concept-fer-balance-w "
+                f"{args.multimodal_latent_concept_fer_balance_w} "
+                f"--latent-concept-fer-probe-n "
+                f"{args.multimodal_latent_concept_fer_probe_n} "
+                f"--latent-concept-fer-hard-max "
+                f"{args.multimodal_latent_concept_fer_hard_max} "
+                f"--latent-concept-fer-refresh-steps "
+                f"{args.multimodal_latent_concept_fer_refresh_steps} "
+                f"--latent-concept-discovery-probe-n "
+                f"{args.multimodal_latent_concept_discovery_probe_n} "
+                f"--latent-concept-discovery-hard-max "
+                f"{args.multimodal_latent_concept_discovery_hard_max} "
+                f"--latent-concept-discovery-refresh-steps "
+                f"{args.multimodal_latent_concept_discovery_refresh_steps} "
+                f"--latent-concept-memory-w "
+                f"{args.multimodal_latent_concept_memory_w} "
+                f"--latent-concept-memory-size "
+                f"{args.multimodal_latent_concept_memory_size} "
+                f"--latent-concept-memory-temperature "
+                f"{args.multimodal_latent_concept_memory_temperature} "
+                f"--latent-concept-memory-momentum "
+                f"{args.multimodal_latent_concept_memory_momentum} "
+                f"--latent-concept-memory-balance-w "
+                f"{args.multimodal_latent_concept_memory_balance_w} "
+                f"--latent-concept-association-w "
+                f"{args.multimodal_latent_concept_association_w} "
+                f"--latent-concept-association-temperature "
+                f"{args.multimodal_latent_concept_association_temperature} "
+                f"--latent-concept-association-decay "
+                f"{args.multimodal_latent_concept_association_decay} "
+                f"--latent-concept-association-target-power "
+                f"{args.multimodal_latent_concept_association_target_power} "
+                f"--latent-concept-association-self-loop-w "
+                f"{args.multimodal_latent_concept_association_self_loop_w} "
+                f"--latent-concept-association-transitive-steps "
+                f"{args.multimodal_latent_concept_association_transitive_steps} "
+                f"--latent-concept-association-transitive-w "
+                f"{args.multimodal_latent_concept_association_transitive_w} "
+                f"--latent-concept-composition-w "
+                f"{args.multimodal_latent_concept_composition_w} "
+                f"--latent-concept-composition-temperature "
+                f"{args.multimodal_latent_concept_composition_temperature} "
+                f"--latent-concept-composition-self-loop-w "
+                f"{args.multimodal_latent_concept_composition_self_loop_w} "
+                f"--latent-concept-composition-transitive-steps "
+                f"{args.multimodal_latent_concept_composition_transitive_steps} "
+                f"--latent-concept-composition-transitive-w "
+                f"{args.multimodal_latent_concept_composition_transitive_w} "
+                f"--latent-concept-composition-margin "
+                f"{args.multimodal_latent_concept_composition_margin} "
+                f"--latent-concept-graph-predict-w "
+                f"{args.multimodal_latent_concept_graph_predict_w} "
+                f"--latent-concept-graph-predict-temperature "
+                f"{args.multimodal_latent_concept_graph_predict_temperature} "
+                f"--latent-concept-graph-predict-self-loop-w "
+                f"{args.multimodal_latent_concept_graph_predict_self_loop_w} "
+                f"--latent-concept-graph-predict-transitive-steps "
+                f"{args.multimodal_latent_concept_graph_predict_transitive_steps} "
+                f"--latent-concept-graph-predict-transitive-w "
+                f"{args.multimodal_latent_concept_graph_predict_transitive_w} "
+                f"--latent-concept-graph-predict-target-power "
+                f"{args.multimodal_latent_concept_graph_predict_target_power} "
+                f"--latent-concept-bridge-w "
+                f"{args.multimodal_latent_concept_bridge_w} "
+                f"--latent-concept-sequence-w "
+                f"{args.multimodal_latent_concept_sequence_w} "
+                f"--latent-concept-sequence-batch "
+                f"{args.multimodal_latent_concept_sequence_batch} "
+                f"--latent-concept-sequence-temperature "
+                f"{args.multimodal_latent_concept_sequence_temperature} "
+                f"--latent-concept-neighborhood-w "
+                f"{args.multimodal_latent_concept_neighborhood_w} "
+                f"--latent-concept-neighborhood-temperature "
+                f"{args.multimodal_latent_concept_neighborhood_temperature} "
+                f"--latent-concept-neighborhood-margin "
+                f"{args.multimodal_latent_concept_neighborhood_margin} "
+                f"--latent-concept-transition-w "
+                f"{args.multimodal_latent_concept_transition_w} "
+                f"--latent-concept-transition-temperature "
+                f"{args.multimodal_latent_concept_transition_temperature} "
+                f"--latent-concept-transition-margin "
+                f"{args.multimodal_latent_concept_transition_margin} "
+                f"--latent-concept-cluster-w "
+                f"{args.multimodal_latent_concept_cluster_w} "
+                f"--latent-concept-cluster-temperature "
+                f"{args.multimodal_latent_concept_cluster_temperature} "
+                f"--latent-concept-cluster-margin "
+                f"{args.multimodal_latent_concept_cluster_margin} "
+                f"--latent-concept-cluster-min-size "
+                f"{args.multimodal_latent_concept_cluster_min_size} "
                 f"--view-tokens {args.multimodal_view_tokens} "
                 f"--txt-tokens {args.multimodal_txt_tokens} "
                 f"--trunk-arch {args.multimodal_trunk_arch} "
@@ -1115,10 +1218,25 @@ def payload(args):
                 f"--text-layers {args.multimodal_text_layers} "
                 f"--modality-dropout {args.multimodal_dropout} "
                 f"--eval-n {args.multimodal_eval_n} "
+                f"--selection-rounds {args.multimodal_selection_rounds} "
+                f"--selection-score-metric "
+                f"{args.multimodal_selection_score_metric} "
+                f"--selection-score-margin-w "
+                f"{args.multimodal_selection_score_margin_w} "
+                f"--selection-score-min-delta "
+                f"{args.multimodal_selection_score_min_delta} "
+                f"--selection-score-patience "
+                f"{args.multimodal_selection_score_patience} "
+                f"--selection-eval-n {args.multimodal_selection_eval_n} "
                 f"--out runs/m0_multimodal.json --checkpoint runs/m0_multimodal.pt"
             )
             if args.multimodal_root:
                 mm_cmd += f" --root {shlex_quote(args.multimodal_root)}"
+            if args.multimodal_text_checkpoint:
+                mm_cmd += (
+                    f" --text-checkpoint "
+                    f"{shlex_quote(args.multimodal_text_checkpoint)}")
+            mm_cmd += " --select-best" if args.multimodal_select_best else " --no-select-best"
             cmds.append(mm_cmd)
         return " && ".join(cmds)
     if args.eval_only_run:
@@ -2315,6 +2433,150 @@ def main():
     ap.add_argument("--multimodal-latent-concept-variance-target", type=float, default=1.0,
                     dest="multimodal_latent_concept_variance_target",
                     help="minimum M-0 latent concept per-dimension std target")
+    ap.add_argument("--multimodal-latent-concept-factorization-w", type=float,
+                    default=0.0, dest="multimodal_latent_concept_factorization_w")
+    ap.add_argument("--multimodal-latent-concept-factorization-variance", type=float,
+                    default=0.05,
+                    dest="multimodal_latent_concept_factorization_variance")
+    ap.add_argument("--multimodal-latent-concept-factorization-margin", type=float,
+                    default=0.2,
+                    dest="multimodal_latent_concept_factorization_margin")
+    ap.add_argument("--multimodal-latent-concept-factorization-covariance-w",
+                    type=float, default=0.05,
+                    dest="multimodal_latent_concept_factorization_covariance_w")
+    ap.add_argument("--multimodal-latent-concept-fer-w", type=float, default=0.0,
+                    dest="multimodal_latent_concept_fer_w")
+    ap.add_argument("--multimodal-latent-concept-fer-fragmentation-w", type=float,
+                    default=1.0, dest="multimodal_latent_concept_fer_fragmentation_w")
+    ap.add_argument("--multimodal-latent-concept-fer-correlation-w", type=float,
+                    default=1.0, dest="multimodal_latent_concept_fer_correlation_w")
+    ap.add_argument("--multimodal-latent-concept-fer-balance-w", type=float,
+                    default=0.1, dest="multimodal_latent_concept_fer_balance_w")
+    ap.add_argument("--multimodal-latent-concept-fer-probe-n", type=int, default=0,
+                    dest="multimodal_latent_concept_fer_probe_n")
+    ap.add_argument("--multimodal-latent-concept-fer-hard-max", type=int, default=0,
+                    dest="multimodal_latent_concept_fer_hard_max")
+    ap.add_argument("--multimodal-latent-concept-fer-refresh-steps", type=int,
+                    default=0, dest="multimodal_latent_concept_fer_refresh_steps")
+    ap.add_argument("--multimodal-latent-concept-discovery-probe-n", type=int,
+                    default=0, dest="multimodal_latent_concept_discovery_probe_n")
+    ap.add_argument("--multimodal-latent-concept-discovery-hard-max", type=int,
+                    default=0, dest="multimodal_latent_concept_discovery_hard_max")
+    ap.add_argument("--multimodal-latent-concept-discovery-refresh-steps",
+                    type=int, default=0,
+                    dest="multimodal_latent_concept_discovery_refresh_steps")
+    ap.add_argument("--multimodal-latent-concept-memory-w", type=float, default=0.0,
+                    dest="multimodal_latent_concept_memory_w")
+    ap.add_argument("--multimodal-latent-concept-memory-size", type=int, default=0,
+                    dest="multimodal_latent_concept_memory_size")
+    ap.add_argument("--multimodal-latent-concept-memory-temperature", type=float,
+                    default=0.1, dest="multimodal_latent_concept_memory_temperature")
+    ap.add_argument("--multimodal-latent-concept-memory-momentum", type=float,
+                    default=0.95, dest="multimodal_latent_concept_memory_momentum")
+    ap.add_argument("--multimodal-latent-concept-memory-balance-w", type=float,
+                    default=0.01, dest="multimodal_latent_concept_memory_balance_w")
+    ap.add_argument("--multimodal-latent-concept-association-w", type=float,
+                    default=0.0, dest="multimodal_latent_concept_association_w")
+    ap.add_argument("--multimodal-latent-concept-association-temperature",
+                    type=float, default=0.1,
+                    dest="multimodal_latent_concept_association_temperature")
+    ap.add_argument("--multimodal-latent-concept-association-decay", type=float,
+                    default=0.99, dest="multimodal_latent_concept_association_decay")
+    ap.add_argument("--multimodal-latent-concept-association-target-power",
+                    type=float, default=1.0,
+                    dest="multimodal_latent_concept_association_target_power")
+    ap.add_argument("--multimodal-latent-concept-association-self-loop-w",
+                    type=float, default=0.05,
+                    dest="multimodal_latent_concept_association_self_loop_w")
+    ap.add_argument("--multimodal-latent-concept-association-transitive-steps",
+                    type=int, default=2,
+                    dest="multimodal_latent_concept_association_transitive_steps")
+    ap.add_argument("--multimodal-latent-concept-association-transitive-w",
+                    type=float, default=0.1,
+                    dest="multimodal_latent_concept_association_transitive_w")
+    ap.add_argument("--multimodal-latent-concept-composition-w", type=float,
+                    default=0.0, dest="multimodal_latent_concept_composition_w")
+    ap.add_argument("--multimodal-latent-concept-composition-temperature",
+                    type=float, default=0.1,
+                    dest="multimodal_latent_concept_composition_temperature")
+    ap.add_argument("--multimodal-latent-concept-composition-self-loop-w",
+                    type=float, default=0.0,
+                    dest="multimodal_latent_concept_composition_self_loop_w")
+    ap.add_argument("--multimodal-latent-concept-composition-transitive-steps",
+                    type=int, default=2,
+                    dest="multimodal_latent_concept_composition_transitive_steps")
+    ap.add_argument("--multimodal-latent-concept-composition-transitive-w",
+                    type=float, default=0.1,
+                    dest="multimodal_latent_concept_composition_transitive_w")
+    ap.add_argument("--multimodal-latent-concept-composition-margin", type=float,
+                    default=0.0, dest="multimodal_latent_concept_composition_margin")
+    ap.add_argument("--multimodal-latent-concept-graph-predict-w", type=float,
+                    default=0.0, dest="multimodal_latent_concept_graph_predict_w")
+    ap.add_argument("--multimodal-latent-concept-graph-predict-temperature",
+                    type=float, default=0.1,
+                    dest="multimodal_latent_concept_graph_predict_temperature")
+    ap.add_argument("--multimodal-latent-concept-graph-predict-self-loop-w",
+                    type=float, default=0.05,
+                    dest="multimodal_latent_concept_graph_predict_self_loop_w")
+    ap.add_argument("--multimodal-latent-concept-graph-predict-transitive-steps",
+                    type=int, default=2,
+                    dest="multimodal_latent_concept_graph_predict_transitive_steps")
+    ap.add_argument("--multimodal-latent-concept-graph-predict-transitive-w",
+                    type=float, default=0.1,
+                    dest="multimodal_latent_concept_graph_predict_transitive_w")
+    ap.add_argument("--multimodal-latent-concept-graph-predict-target-power",
+                    type=float, default=1.0,
+                    dest="multimodal_latent_concept_graph_predict_target_power")
+    ap.add_argument("--multimodal-latent-concept-bridge-w", type=float, default=0.0,
+                    dest="multimodal_latent_concept_bridge_w")
+    ap.add_argument("--multimodal-latent-concept-sequence-w", type=float, default=0.0,
+                    dest="multimodal_latent_concept_sequence_w")
+    ap.add_argument("--multimodal-latent-concept-sequence-batch", type=int,
+                    default=0, dest="multimodal_latent_concept_sequence_batch")
+    ap.add_argument("--multimodal-latent-concept-sequence-temperature", type=float,
+                    default=0.1, dest="multimodal_latent_concept_sequence_temperature")
+    ap.add_argument("--multimodal-latent-concept-neighborhood-w", type=float,
+                    default=0.0, dest="multimodal_latent_concept_neighborhood_w")
+    ap.add_argument("--multimodal-latent-concept-neighborhood-temperature",
+                    type=float, default=0.1,
+                    dest="multimodal_latent_concept_neighborhood_temperature")
+    ap.add_argument("--multimodal-latent-concept-neighborhood-margin", type=float,
+                    default=0.0, dest="multimodal_latent_concept_neighborhood_margin")
+    ap.add_argument("--multimodal-latent-concept-transition-w", type=float,
+                    default=0.0, dest="multimodal_latent_concept_transition_w")
+    ap.add_argument("--multimodal-latent-concept-transition-temperature",
+                    type=float, default=0.1,
+                    dest="multimodal_latent_concept_transition_temperature")
+    ap.add_argument("--multimodal-latent-concept-transition-margin", type=float,
+                    default=0.0, dest="multimodal_latent_concept_transition_margin")
+    ap.add_argument("--multimodal-latent-concept-cluster-w", type=float,
+                    default=0.0, dest="multimodal_latent_concept_cluster_w")
+    ap.add_argument("--multimodal-latent-concept-cluster-temperature", type=float,
+                    default=0.1, dest="multimodal_latent_concept_cluster_temperature")
+    ap.add_argument("--multimodal-latent-concept-cluster-margin", type=float,
+                    default=0.0, dest="multimodal_latent_concept_cluster_margin")
+    ap.add_argument("--multimodal-latent-concept-cluster-min-size", type=int,
+                    default=2, dest="multimodal_latent_concept_cluster_min_size")
+    ap.add_argument("--multimodal-text-checkpoint", default="",
+                    dest="multimodal_text_checkpoint",
+                    help="optional thinking.text checkpoint for multimodal warm start")
+    ap.add_argument("--multimodal-select-best", action=argparse.BooleanOptionalAction,
+                    default=False, dest="multimodal_select_best",
+                    help="keep the best self-scored multimodal study round")
+    ap.add_argument("--multimodal-selection-rounds", type=int, default=1,
+                    dest="multimodal_selection_rounds")
+    ap.add_argument("--multimodal-selection-score-metric",
+                    choices=("token", "exact", "fer", "bridge", "sequence",
+                             "all", "balanced", "mastery"),
+                    default="mastery", dest="multimodal_selection_score_metric")
+    ap.add_argument("--multimodal-selection-score-margin-w", type=float,
+                    default=0.1, dest="multimodal_selection_score_margin_w")
+    ap.add_argument("--multimodal-selection-score-min-delta", type=float,
+                    default=0.0, dest="multimodal_selection_score_min_delta")
+    ap.add_argument("--multimodal-selection-score-patience", type=int,
+                    default=0, dest="multimodal_selection_score_patience")
+    ap.add_argument("--multimodal-selection-eval-n", type=int, default=200,
+                    dest="multimodal_selection_eval_n")
     ap.add_argument("--multimodal-view-tokens", type=int, default=4,
                     dest="multimodal_view_tokens")
     ap.add_argument("--multimodal-txt-tokens", type=int, default=8,
@@ -2816,6 +3078,15 @@ def main():
             "--multimodal-fusion-layers": args.multimodal_fusion_layers,
             "--multimodal-latent-concept-layers": (
                 args.multimodal_latent_concept_layers),
+            "--multimodal-latent-concept-association-transitive-steps": (
+                args.multimodal_latent_concept_association_transitive_steps),
+            "--multimodal-latent-concept-composition-transitive-steps": (
+                args.multimodal_latent_concept_composition_transitive_steps),
+            "--multimodal-latent-concept-graph-predict-transitive-steps": (
+                args.multimodal_latent_concept_graph_predict_transitive_steps),
+            "--multimodal-latent-concept-cluster-min-size": (
+                args.multimodal_latent_concept_cluster_min_size),
+            "--multimodal-selection-rounds": args.multimodal_selection_rounds,
             "--multimodal-eval-n": args.multimodal_eval_n,
         }
         for name, value in positive.items():
@@ -2832,18 +3103,125 @@ def main():
             sys.exit("ERROR: multimodal head dimension must be even for rope attention")
         if args.multimodal_lr <= 0.0:
             sys.exit("ERROR: --multimodal-lr must be positive")
-        if (args.multimodal_agreement_w < 0.0
-                or args.multimodal_latent_concept_w < 0.0
-                or args.multimodal_latent_concept_invariance_w < 0.0
-                or args.multimodal_latent_concept_variance_w < 0.0
-                or args.multimodal_latent_concept_covariance_w < 0.0):
-            sys.exit("ERROR: multimodal loss weights must be non-negative")
+        multimodal_nonnegative = {
+            "--multimodal-agreement-w": args.multimodal_agreement_w,
+            "--multimodal-latent-concept-w": args.multimodal_latent_concept_w,
+            "--multimodal-latent-concept-invariance-w": (
+                args.multimodal_latent_concept_invariance_w),
+            "--multimodal-latent-concept-variance-w": (
+                args.multimodal_latent_concept_variance_w),
+            "--multimodal-latent-concept-covariance-w": (
+                args.multimodal_latent_concept_covariance_w),
+            "--multimodal-latent-concept-factorization-w": (
+                args.multimodal_latent_concept_factorization_w),
+            "--multimodal-latent-concept-factorization-variance": (
+                args.multimodal_latent_concept_factorization_variance),
+            "--multimodal-latent-concept-factorization-margin": (
+                args.multimodal_latent_concept_factorization_margin),
+            "--multimodal-latent-concept-factorization-covariance-w": (
+                args.multimodal_latent_concept_factorization_covariance_w),
+            "--multimodal-latent-concept-fer-w": (
+                args.multimodal_latent_concept_fer_w),
+            "--multimodal-latent-concept-fer-fragmentation-w": (
+                args.multimodal_latent_concept_fer_fragmentation_w),
+            "--multimodal-latent-concept-fer-correlation-w": (
+                args.multimodal_latent_concept_fer_correlation_w),
+            "--multimodal-latent-concept-fer-balance-w": (
+                args.multimodal_latent_concept_fer_balance_w),
+            "--multimodal-latent-concept-fer-probe-n": (
+                args.multimodal_latent_concept_fer_probe_n),
+            "--multimodal-latent-concept-fer-hard-max": (
+                args.multimodal_latent_concept_fer_hard_max),
+            "--multimodal-latent-concept-fer-refresh-steps": (
+                args.multimodal_latent_concept_fer_refresh_steps),
+            "--multimodal-latent-concept-discovery-probe-n": (
+                args.multimodal_latent_concept_discovery_probe_n),
+            "--multimodal-latent-concept-discovery-hard-max": (
+                args.multimodal_latent_concept_discovery_hard_max),
+            "--multimodal-latent-concept-discovery-refresh-steps": (
+                args.multimodal_latent_concept_discovery_refresh_steps),
+            "--multimodal-latent-concept-memory-w": (
+                args.multimodal_latent_concept_memory_w),
+            "--multimodal-latent-concept-memory-size": (
+                args.multimodal_latent_concept_memory_size),
+            "--multimodal-latent-concept-memory-balance-w": (
+                args.multimodal_latent_concept_memory_balance_w),
+            "--multimodal-latent-concept-association-w": (
+                args.multimodal_latent_concept_association_w),
+            "--multimodal-latent-concept-association-self-loop-w": (
+                args.multimodal_latent_concept_association_self_loop_w),
+            "--multimodal-latent-concept-association-transitive-w": (
+                args.multimodal_latent_concept_association_transitive_w),
+            "--multimodal-latent-concept-composition-w": (
+                args.multimodal_latent_concept_composition_w),
+            "--multimodal-latent-concept-composition-self-loop-w": (
+                args.multimodal_latent_concept_composition_self_loop_w),
+            "--multimodal-latent-concept-composition-transitive-w": (
+                args.multimodal_latent_concept_composition_transitive_w),
+            "--multimodal-latent-concept-composition-margin": (
+                args.multimodal_latent_concept_composition_margin),
+            "--multimodal-latent-concept-graph-predict-w": (
+                args.multimodal_latent_concept_graph_predict_w),
+            "--multimodal-latent-concept-graph-predict-self-loop-w": (
+                args.multimodal_latent_concept_graph_predict_self_loop_w),
+            "--multimodal-latent-concept-graph-predict-transitive-w": (
+                args.multimodal_latent_concept_graph_predict_transitive_w),
+            "--multimodal-latent-concept-bridge-w": (
+                args.multimodal_latent_concept_bridge_w),
+            "--multimodal-latent-concept-sequence-w": (
+                args.multimodal_latent_concept_sequence_w),
+            "--multimodal-latent-concept-sequence-batch": (
+                args.multimodal_latent_concept_sequence_batch),
+            "--multimodal-latent-concept-neighborhood-w": (
+                args.multimodal_latent_concept_neighborhood_w),
+            "--multimodal-latent-concept-neighborhood-margin": (
+                args.multimodal_latent_concept_neighborhood_margin),
+            "--multimodal-latent-concept-transition-w": (
+                args.multimodal_latent_concept_transition_w),
+            "--multimodal-latent-concept-transition-margin": (
+                args.multimodal_latent_concept_transition_margin),
+            "--multimodal-latent-concept-cluster-w": (
+                args.multimodal_latent_concept_cluster_w),
+            "--multimodal-latent-concept-cluster-margin": (
+                args.multimodal_latent_concept_cluster_margin),
+            "--multimodal-selection-score-margin-w": (
+                args.multimodal_selection_score_margin_w),
+            "--multimodal-selection-score-min-delta": (
+                args.multimodal_selection_score_min_delta),
+            "--multimodal-selection-score-patience": (
+                args.multimodal_selection_score_patience),
+            "--multimodal-selection-eval-n": args.multimodal_selection_eval_n,
+        }
+        bad_nonnegative = [
+            name for name, value in multimodal_nonnegative.items()
+            if value < 0.0
+        ]
+        if bad_nonnegative:
+            bad_flags = ", ".join(bad_nonnegative)
+            sys.exit(f"ERROR: multimodal controls must be non-negative: {bad_flags}")
         if args.multimodal_latent_concept_slots < 0:
             sys.exit("ERROR: --multimodal-latent-concept-slots must be non-negative")
-        if (args.multimodal_latent_concept_w > 0.0
+        multimodal_latent_weights = [
+            args.multimodal_latent_concept_w,
+            args.multimodal_latent_concept_factorization_w,
+            args.multimodal_latent_concept_fer_w,
+            args.multimodal_latent_concept_memory_w,
+            args.multimodal_latent_concept_association_w,
+            args.multimodal_latent_concept_composition_w,
+            args.multimodal_latent_concept_graph_predict_w,
+            args.multimodal_latent_concept_bridge_w,
+            args.multimodal_latent_concept_sequence_w,
+            args.multimodal_latent_concept_neighborhood_w,
+            args.multimodal_latent_concept_transition_w,
+            args.multimodal_latent_concept_cluster_w,
+        ]
+        if ((any(w > 0.0 for w in multimodal_latent_weights)
+             or args.multimodal_latent_concept_memory_size > 0
+             or args.multimodal_latent_concept_fer_hard_max > 0
+             or args.multimodal_latent_concept_discovery_hard_max > 0)
                 and args.multimodal_latent_concept_slots <= 0):
             sys.exit(
-                "ERROR: --multimodal-latent-concept-w requires "
+                "ERROR: multimodal latent concept options require "
                 "--multimodal-latent-concept-slots > 0")
         if (args.multimodal_latent_concept_view_dropout < 0.0
                 or args.multimodal_latent_concept_view_dropout >= 1.0):
@@ -2851,6 +3229,49 @@ def main():
         if args.multimodal_latent_concept_variance_target < 0.0:
             sys.exit(
                 "ERROR: --multimodal-latent-concept-variance-target must be non-negative")
+        if args.multimodal_latent_concept_sequence_batch == 1:
+            sys.exit(
+                "ERROR: --multimodal-latent-concept-sequence-batch must be 0 or at least 2")
+        if (args.multimodal_latent_concept_discovery_hard_max > 0
+                and args.multimodal_latent_concept_memory_size <= 0):
+            sys.exit(
+                "ERROR: multimodal discovery hard study requires "
+                "--multimodal-latent-concept-memory-size > 0")
+        multimodal_temperatures = {
+            "--multimodal-latent-concept-memory-temperature": (
+                args.multimodal_latent_concept_memory_temperature),
+            "--multimodal-latent-concept-association-temperature": (
+                args.multimodal_latent_concept_association_temperature),
+            "--multimodal-latent-concept-composition-temperature": (
+                args.multimodal_latent_concept_composition_temperature),
+            "--multimodal-latent-concept-graph-predict-temperature": (
+                args.multimodal_latent_concept_graph_predict_temperature),
+            "--multimodal-latent-concept-sequence-temperature": (
+                args.multimodal_latent_concept_sequence_temperature),
+            "--multimodal-latent-concept-neighborhood-temperature": (
+                args.multimodal_latent_concept_neighborhood_temperature),
+            "--multimodal-latent-concept-transition-temperature": (
+                args.multimodal_latent_concept_transition_temperature),
+            "--multimodal-latent-concept-cluster-temperature": (
+                args.multimodal_latent_concept_cluster_temperature),
+        }
+        bad_temperature = [
+            name for name, value in multimodal_temperatures.items()
+            if value <= 0.0
+        ]
+        if bad_temperature:
+            sys.exit("ERROR: multimodal temperatures must be positive")
+        if (args.multimodal_latent_concept_memory_momentum < 0.0
+                or args.multimodal_latent_concept_memory_momentum >= 1.0):
+            sys.exit(
+                "ERROR: --multimodal-latent-concept-memory-momentum must be in [0, 1)")
+        if (args.multimodal_latent_concept_association_decay < 0.0
+                or args.multimodal_latent_concept_association_decay >= 1.0):
+            sys.exit(
+                "ERROR: --multimodal-latent-concept-association-decay must be in [0, 1)")
+        if (args.multimodal_latent_concept_association_target_power <= 0.0
+                or args.multimodal_latent_concept_graph_predict_target_power <= 0.0):
+            sys.exit("ERROR: multimodal graph target powers must be positive")
         if args.multimodal_dropout < 0.0 or args.multimodal_dropout > 1.0:
             sys.exit("ERROR: --multimodal-dropout must be in [0, 1]")
     if args.upload_image_data:
