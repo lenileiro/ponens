@@ -65,7 +65,7 @@ class ContentEncoder(nn.Module):
 class Decoder(nn.Module):
     """content code + speaker embedding -> reconstructed mel."""
 
-    def __init__(self, n_mels=N_MELS, content_dim=8, spk_dim=128, down=2):
+    def __init__(self, n_mels=N_MELS, content_dim=4, spk_dim=128, down=4):
         super().__init__()
         self.down = down
         self.spk = nn.Linear(spk_dim, 64)
