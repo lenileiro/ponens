@@ -8,10 +8,10 @@ multimodal bridge.
 ## Why
 
 The current bet is that language mastery should come from reading, latent structure, replay,
-reanalysis, self-generated memory gaps, graph-closure insight, and cross-modal concept pressure,
-not from hand-authored task harnesses or templated phrasing rules. The code keeps model inputs manifest-driven: datasets
-provide text, feature views, image records, and optional target tokens; model code learns the
-representations.
+reanalysis, self-generated memory gaps, graph-closure insight, partial-context closure surprise,
+and cross-modal concept pressure, not from hand-authored task harnesses or templated phrasing
+rules. The code keeps model inputs manifest-driven: datasets provide text, feature views, image
+records, and optional target tokens; model code learns the representations.
 
 ## What's here
 
@@ -21,7 +21,7 @@ representations.
 | `scratchpad_model.py` | the model: small transformer with a **pointer/copy head**, learnable attention temperature, optional recurrence (looped / HRM / TRM / mHC) and Ouro-style learned halting |
 | `runpod/` | H100 launchers (tar-over-ssh, timeout-bounded, always-terminate) |
 | `thinking/vision_understanding.py`, `thinking/image_data.py`, `thinking/image_caption.py`, `thinking/image_embed.py`, `thinking/image_score.py`, `thinking/image_preferences.py`, `thinking/image_curate.py`, `thinking/image_eval.py`, `thinking/image_latent.py` | Image stack: manifest-driven visual concept learning, captioned image data, recaptioning, embedding/quality/preference sidecars, curation, offline image-quality eval, and text-conditioned latent flow |
-| `thinking/text.py` | raw-reading and semantic text learning with latent concept memory, replay, discovery, reanalysis, graph-closure insight, and memory-gap training |
+| `thinking/text.py` | raw-reading and semantic text learning with latent concept memory, replay, discovery, context closure, reanalysis, graph-closure insight, and memory-gap training |
 | `thinking/multimodal.py` | Generic manifest-driven multimodal prefix bridge with named feature views, text tokens, targets, latent slots, concept memory, graph-closure insight, and memory-gap training |
 | `*.md` | research notes and plans; historical synthetic-language docs are no longer package APIs |
 
@@ -203,7 +203,7 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --steps 4 --batch 16 --d 96 --layers 2 --heads 4 \
     --latent-concept-slots 6 --latent-concept-layers 1 \
     --reading-max-tokens 96 --reading-min-tokens 8 --reading-eval-n 32 \
-    --reading-study-strategy gap --reading-study-probe-n 48 \
+    --reading-study-strategy auto --reading-study-probe-n 48 \
     --reading-study-hard-max 24 --reading-study-refresh-steps 1 \
     --reading-memory-size 64 --reading-memory-w 0.05 \
     --reading-association-w 0.05 --reading-association-transitive-steps 3 \
@@ -221,15 +221,15 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --reading-transition-w 0.05 --reading-transition-batch 8 \
     --reading-cluster-w 0.05 --reading-cluster-batch 16 \
     --reading-cluster-probe-n 32 \
-    --out runs/text_raw_reading_gap_study_smoke.json \
-    --checkpoint runs/text_raw_reading_gap_study_smoke.pt
+    --out runs/text_raw_reading_discovery_study_smoke.json \
+    --checkpoint runs/text_raw_reading_discovery_study_smoke.pt
 .venv/bin/python -m thinking.text --reading-data README.md \
-    --reading-checkpoint runs/text_raw_reading_gap_study_smoke.pt \
-    --reading-out-checkpoint runs/text_raw_reading_gap_study_continued.pt \
-    --steps 4 --batch 16 --reading-study-strategy gap \
+    --reading-checkpoint runs/text_raw_reading_discovery_study_smoke.pt \
+    --reading-out-checkpoint runs/text_raw_reading_discovery_study_continued.pt \
+    --steps 4 --batch 16 --reading-study-strategy auto \
     --reading-memory-size 64 --reading-memory-w 0.05 \
     --reading-association-w 0.05 --reading-gap-w 0.05 \
-    --out runs/text_raw_reading_gap_study_continued.json
+    --out runs/text_raw_reading_discovery_study_continued.json
 .venv/bin/python -m thinking.multimodal --manifest data/multimodal_manifest.jsonl \
     --steps 3 --batch 4 --dim 96 --layers 1 --heads 4 --eval-n 20 \
     --latent-concept-slots 6 \
@@ -248,9 +248,9 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --latent-concept-gap-transitive-w 0.25 \
     --latent-concept-neighborhood-w 0.05 \
     --latent-concept-transition-w 0.05 --latent-concept-cluster-w 0.05 \
-    --text-checkpoint runs/text_raw_reading_gap_study_smoke.pt \
-    --out runs/m0_multimodal_gap_study_smoke.json \
-    --checkpoint runs/m0_multimodal_gap_study_smoke.pt
+    --text-checkpoint runs/text_raw_reading_discovery_study_smoke.pt \
+    --out runs/m0_multimodal_discovery_study_smoke.json \
+    --checkpoint runs/m0_multimodal_discovery_study_smoke.pt
 ```
 
 GPU runs: `runpod/launch_thinking.py` (see the package docs).

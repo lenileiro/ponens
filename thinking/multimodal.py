@@ -2184,7 +2184,7 @@ def latent_multimodal_discovery_examples(
         graph_target_power=1.0, cycle_temperature=0.1,
         cycle_self_loop_w=0.05, cycle_transitive_steps=2,
         cycle_transitive_w=0.1, cycle_target_power=1.0, cycle_w=0.5,
-        sequence_temperature=0.1):
+        sequence_temperature=0.1, completion_temperature=0.1):
     memory = getattr(model, "latent_concept_memory", None)
     if getattr(model, "latent_concepts", None) is None or memory is None:
         return [], {"n_records": 0, "n_selected": 0,
@@ -2230,6 +2230,9 @@ def latent_multimodal_discovery_examples(
                 for mode in MODES
             }
             full_slots = views["full"]
+            completion, completion_parts = latent_concept_completion_scores(
+                model.concept_sequence_predictor, views,
+                temperature=completion_temperature, full_key="full")
             curiosity, curiosity_parts = latent_concept_graph_curiosity_scores(
                 full_slots, active_memory, active_relations,
                 temperature=curiosity_temperature,
@@ -2315,10 +2318,25 @@ def latent_multimodal_discovery_examples(
                 "novelty", curiosity.new_zeros(curiosity.shape))
             association = curiosity_parts.get(
                 "association", curiosity.new_zeros(curiosity.shape))
+            completion_ce = completion_parts.get(
+                "cross_entropy", completion.new_zeros(completion.shape))
+            completion_cosine = completion_parts.get(
+                "positive_cosine", completion.new_zeros(completion.shape))
+            completion_gap = completion_parts.get(
+                "closure_gap", completion.new_zeros(completion.shape))
+            completion_rank = completion_parts.get(
+                "rank", completion.new_zeros(completion.shape))
             for i, rec in enumerate(batch_records):
                 seq = sequence_by_id.get(rec.rec_id, {})
                 rows.append({
                     "record": rec,
+                    "completion_surprise": float(completion[i].detach().cpu()),
+                    "completion_cross_entropy": float(
+                        completion_ce[i].detach().cpu()),
+                    "completion_cosine": float(
+                        completion_cosine[i].detach().cpu()),
+                    "completion_gap": float(completion_gap[i].detach().cpu()),
+                    "completion_rank": float(completion_rank[i].detach().cpu()),
                     "curiosity": float(curiosity[i].detach().cpu()),
                     "novelty": float(novelty[i].detach().cpu()),
                     "association": float(association[i].detach().cpu()),
@@ -2376,8 +2394,8 @@ def latent_multimodal_discovery_examples(
                     "sequence_rank": float(seq.get("sequence_rank", 0.0)),
                 })
     components = (
-        "curiosity", "gap", "insight", "graph", "cycle", "fer_score", "bridge",
-        "sequence_surprise")
+        "curiosity", "gap", "insight", "completion_surprise", "graph", "cycle",
+        "fer_score", "bridge", "sequence_surprise")
     for name in components:
         scaled = _minmax_scale([row[name] for row in rows])
         for row, value in zip(rows, scaled):
@@ -2400,6 +2418,15 @@ def latent_multimodal_discovery_examples(
                       "mean_curiosity": mean_field("curiosity"),
                       "mean_novelty": mean_field("novelty"),
                       "mean_association": mean_field("association"),
+                      "mean_completion_surprise": mean_field(
+                          "completion_surprise"),
+                      "max_completion_surprise": max_field(
+                          "completion_surprise"),
+                      "mean_completion_cross_entropy": mean_field(
+                          "completion_cross_entropy"),
+                      "mean_completion_cosine": mean_field("completion_cosine"),
+                      "mean_completion_gap": mean_field("completion_gap"),
+                      "mean_completion_rank": mean_field("completion_rank"),
                       "mean_graph_score": mean_field("graph"),
                       "mean_graph_kl": mean_field("graph_kl"),
                       "mean_graph_cosine": mean_field("graph_cosine"),
@@ -2778,7 +2805,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 cycle_transitive_steps=latent_concept_graph_predict_transitive_steps,
                 cycle_transitive_w=latent_concept_graph_predict_transitive_w,
                 cycle_target_power=latent_concept_graph_predict_target_power,
-                sequence_temperature=latent_concept_sequence_temperature)
+                sequence_temperature=latent_concept_sequence_temperature,
+                completion_temperature=latent_concept_completion_temperature)
         elif hard_study_strategy == "completion":
             probe_n = (int(latent_concept_completion_probe_n)
                        if int(latent_concept_completion_probe_n) > 0
@@ -3773,6 +3801,7 @@ def selftest():
         assert "mean_gap_score" in discovery_report
         assert "mean_insight_score" in discovery_report
         assert "mean_cycle_score" in discovery_report
+        assert "mean_completion_surprise" in discovery_report
         assert "mean_sequence_surprise" in discovery_report
         discovery_loss, discovery_metrics = (
             latent_multimodal_discovery_loss_from_views(
@@ -3931,6 +3960,9 @@ def selftest():
                    for r in discovery_model.train_metrics["latent_study_reports"]
                    if r.get("strategy") == "discovery")
         assert any("mean_insight_score" in r
+                   for r in discovery_model.train_metrics["latent_study_reports"]
+                   if r.get("strategy") == "discovery")
+        assert any("mean_completion_surprise" in r
                    for r in discovery_model.train_metrics["latent_study_reports"]
                    if r.get("strategy") == "discovery")
         selected_model, *_ = train(
