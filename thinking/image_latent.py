@@ -61,6 +61,8 @@ FLOW_NOISE_COUPLINGS = ("random", "sliced_ot")
 FLOW_REPA_MODES = ("pooled", "token", "both", "auto")
 FLOW_BOUNDARY_MODES = ("none", "right-linear", "double-linear", "double-cosine")
 FLOW_PREFERENCE_LOSSES = ("margin", "dpo", "gap")
+FLOW_EQUIVARIANCE_TRANSFORMS = ("hflip", "vflip", "rot180", "roll")
+DEFAULT_FLOW_EQUIVARIANCE_TRANSFORMS = ("hflip", "roll")
 TIME_SAMPLINGS = ("uniform", "logit-normal", "mode", "u-shaped", "adaptive")
 TIME_ADAPTIVE_PRIORS = ("uniform", "logit-normal", "mode", "u-shaped")
 DEFAULT_TIME_MODE_SCALE = 1.29
@@ -5005,6 +5007,78 @@ def frequency_recon_loss(pred, target, eps=1.0e-8):
     return (pred_mag - target_mag).abs().mul(weight[None, None]).mean()
 
 
+def normalize_flow_equivariance_transforms(transforms):
+    if transforms is None:
+        return DEFAULT_FLOW_EQUIVARIANCE_TRANSFORMS
+    if isinstance(transforms, str):
+        if not transforms.strip():
+            return ()
+        raw = _parse_string_list(transforms)
+    else:
+        raw = tuple(str(item).strip() for item in transforms if str(item).strip())
+    out = []
+    for item in raw:
+        item = str(item).strip().lower()
+        if item in ("none", "off", "false", "0"):
+            continue
+        if item == "default":
+            expanded = DEFAULT_FLOW_EQUIVARIANCE_TRANSFORMS
+        elif item == "all":
+            expanded = FLOW_EQUIVARIANCE_TRANSFORMS
+        else:
+            expanded = (item,)
+        for name in expanded:
+            if name not in FLOW_EQUIVARIANCE_TRANSFORMS:
+                raise ValueError(f"unknown flow equivariance transform {name!r}")
+            if name not in out:
+                out.append(name)
+    return tuple(out)
+
+
+def flow_equivariance_transform_id(name):
+    name = str(name)
+    if name not in FLOW_EQUIVARIANCE_TRANSFORMS:
+        return -1.0
+    return float(FLOW_EQUIVARIANCE_TRANSFORMS.index(name))
+
+
+def sample_flow_equivariance_transform(z, transforms, shift_frac=0.125):
+    transforms = normalize_flow_equivariance_transforms(transforms)
+    if not transforms:
+        return None
+    shift_frac = float(shift_frac)
+    if shift_frac < 0.0:
+        raise ValueError("equivariance_shift_frac must be non-negative")
+    idx = int(torch.randint(len(transforms), (1,), device="cpu").item())
+    name = transforms[idx]
+    h, w = int(z.shape[-2]), int(z.shape[-1])
+    aux = {"dy": 0.0, "dx": 0.0}
+    if name == "hflip":
+        return name, lambda x: x.flip(-1), lambda x: x.flip(-1), aux
+    if name == "vflip":
+        return name, lambda x: x.flip(-2), lambda x: x.flip(-2), aux
+    if name == "rot180":
+        return name, lambda x: x.flip(-1).flip(-2), lambda x: x.flip(-1).flip(-2), aux
+    if name == "roll":
+        max_dy = int(round(max(0.0, min(0.5, shift_frac)) * h)) if h > 1 else 0
+        max_dx = int(round(max(0.0, min(0.5, shift_frac)) * w)) if w > 1 else 0
+        dy = int(torch.randint(-max_dy, max_dy + 1, (1,), device="cpu").item()) if max_dy else 0
+        dx = int(torch.randint(-max_dx, max_dx + 1, (1,), device="cpu").item()) if max_dx else 0
+        if dy == 0 and dx == 0:
+            if max_dx:
+                dx = 1
+            elif max_dy:
+                dy = 1
+        aux = {"dy": float(dy), "dx": float(dx)}
+        return (
+            name,
+            lambda x: torch.roll(x, shifts=(dy, dx), dims=(-2, -1)),
+            lambda x: torch.roll(x, shifts=(-dy, -dx), dims=(-2, -1)),
+            aux,
+        )
+    raise ValueError(f"unknown flow equivariance transform {name!r}")
+
+
 def normalize_flow_multiscale_scales(scales):
     if scales is None:
         return ()
@@ -6022,6 +6096,9 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        decoded_endpoint_grad_w=0.0,
                        decoded_endpoint_ms_w=0.0,
                        decoded_endpoint_fft_w=0.0,
+                       equivariance_w=0.0, equivariance_p=1.0,
+                       equivariance_transforms=DEFAULT_FLOW_EQUIVARIANCE_TRANSFORMS,
+                       equivariance_shift_frac=0.125,
                        self_condition_p=0.0, reference_condition_p=0.0,
                        flow_noise_coupling="random", flow_noise_coupling_projections=1,
                        flow_loss_weight="none", flow_loss_weight_gamma=5.0,
@@ -6075,6 +6152,17 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         raise ValueError("decoded endpoint structure weights must be non-negative")
     if decoded_endpoint_w > 0.0 and ae is None:
         raise ValueError("decoded_endpoint_w requires an autoencoder")
+    equivariance_w = float(equivariance_w)
+    equivariance_p = float(equivariance_p)
+    if equivariance_w < 0.0:
+        raise ValueError("equivariance_w must be non-negative")
+    if equivariance_p < 0.0 or equivariance_p > 1.0:
+        raise ValueError("equivariance_p must be in [0, 1]")
+    equivariance_transforms = normalize_flow_equivariance_transforms(
+        equivariance_transforms)
+    equivariance_shift_frac = float(equivariance_shift_frac)
+    if equivariance_shift_frac < 0.0:
+        raise ValueError("equivariance_shift_frac must be non-negative")
     factorization_w = float(factorization_w)
     if factorization_w < 0.0:
         raise ValueError("factorization_w must be non-negative")
@@ -6185,6 +6273,16 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         "flow_decoded_endpoint_fft_w": torch.tensor(
             float(decoded_endpoint_fft_w), device=z1.device),
         "flow_decoded_endpoint_active": torch.tensor(0.0, device=z1.device),
+        "flow_equivariance_w": torch.tensor(float(equivariance_w), device=z1.device),
+        "flow_equivariance_p": torch.tensor(float(equivariance_p), device=z1.device),
+        "flow_equivariance_transform_count": torch.tensor(
+            float(len(equivariance_transforms)), device=z1.device),
+        "flow_equivariance_shift_frac": torch.tensor(
+            float(equivariance_shift_frac), device=z1.device),
+        "flow_equivariance_active": torch.tensor(0.0, device=z1.device),
+        "flow_equivariance_transform_id": torch.tensor(-1.0, device=z1.device),
+        "flow_equivariance_shift_dy": torch.tensor(0.0, device=z1.device),
+        "flow_equivariance_shift_dx": torch.tensor(0.0, device=z1.device),
         "flow_self_condition": torch.tensor(
             float(flow_uses_self_condition(flow)), device=z1.device),
         "flow_self_condition_p": torch.tensor(float(self_condition_p), device=z1.device),
@@ -6206,6 +6304,43 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     parts.update(coupling_parts)
     if endpoint_w > 0.0:
         total = total + float(endpoint_w) * endpoint_weighted
+    if (equivariance_w > 0.0 and equivariance_p > 0.0
+            and equivariance_transforms
+            and (equivariance_p >= 1.0
+                 or bool(torch.rand((), device=z1.device) < equivariance_p))):
+        transform = sample_flow_equivariance_transform(
+            zt, equivariance_transforms, shift_frac=equivariance_shift_frac)
+        transform_name, apply_transform, invert_transform, transform_aux = transform
+        zt_transformed = apply_transform(zt)
+        pred_target = apply_transform(pred)
+        endpoint_target = apply_transform(endpoint_pred)
+        cond_transformed = cond_model
+        if flow_uses_self_condition(flow):
+            cond_transformed = attach_flow_self_condition(
+                cond_model,
+                apply_transform(condition_self_condition(cond_model, z1_model)))
+        pred_transformed = flow_velocity(flow, zt_transformed, t, cond_transformed)
+        endpoint_transformed = zt_transformed + (1.0 - t) * pred_transformed
+        velocity_equiv = 0.5 * (
+            F.mse_loss(pred_transformed, pred_target.detach())
+            + F.mse_loss(pred, invert_transform(pred_transformed.detach()))
+        )
+        endpoint_equiv = 0.5 * (
+            F.mse_loss(endpoint_transformed, endpoint_target.detach())
+            + F.mse_loss(endpoint_pred, invert_transform(endpoint_transformed.detach()))
+        )
+        equivariance = 0.5 * (velocity_equiv + endpoint_equiv)
+        total = total + float(equivariance_w) * equivariance
+        parts["flow_equivariance_loss"] = equivariance.detach()
+        parts["flow_equivariance_velocity_mse"] = velocity_equiv.detach()
+        parts["flow_equivariance_endpoint_mse"] = endpoint_equiv.detach()
+        parts["flow_equivariance_active"] = torch.tensor(1.0, device=z1.device)
+        parts["flow_equivariance_transform_id"] = torch.tensor(
+            flow_equivariance_transform_id(transform_name), device=z1.device)
+        parts["flow_equivariance_shift_dy"] = torch.tensor(
+            float(transform_aux.get("dy", 0.0)), device=z1.device)
+        parts["flow_equivariance_shift_dx"] = torch.tensor(
+            float(transform_aux.get("dx", 0.0)), device=z1.device)
     if multiscale_w > 0.0 and multiscale_scales:
         multiscale, multiscale_unweighted, active_scales, max_scale = (
             multiscale_flow_velocity_loss(
@@ -9769,6 +9904,16 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
             report.get("flow_endpoint_stats_std_w", 1.0)) or 1.0),
         "flow_straightness_w": float(ckpt.get(
             "flow_straightness_w", report.get("flow_straightness_w", 0.0)) or 0.0),
+        "flow_equivariance_w": float(ckpt.get(
+            "flow_equivariance_w", report.get("flow_equivariance_w", 0.0)) or 0.0),
+        "flow_equivariance_p": float(ckpt.get(
+            "flow_equivariance_p", report.get("flow_equivariance_p", 0.0)) or 0.0),
+        "flow_equivariance_transforms": list(ckpt.get(
+            "flow_equivariance_transforms",
+            report.get("flow_equivariance_transforms", [])) or []),
+        "flow_equivariance_shift_frac": float(ckpt.get(
+            "flow_equivariance_shift_frac",
+            report.get("flow_equivariance_shift_frac", 0.0)) or 0.0),
         "flow_multiscale_w": float(ckpt.get(
             "flow_multiscale_w", report.get("flow_multiscale_w", 0.0)) or 0.0),
         "flow_multiscale_scales": list(ckpt.get(
@@ -10700,6 +10845,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       flow_decoded_endpoint_grad_w=0.0,
                       flow_decoded_endpoint_ms_w=0.0,
                       flow_decoded_endpoint_fft_w=0.0,
+                      flow_equivariance_w=0.0, flow_equivariance_p=1.0,
+                      flow_equivariance_transforms=DEFAULT_FLOW_EQUIVARIANCE_TRANSFORMS,
+                      flow_equivariance_shift_frac=0.125,
                       flow_distill_steps=0, flow_distill_w=1.0,
                       flow_distill_time_gap=0.25, flow_distill_teacher="auto",
                       flow_guidance_distill_w=0.0,
@@ -11030,6 +11178,17 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     if (flow_decoded_endpoint_grad_w < 0.0 or flow_decoded_endpoint_ms_w < 0.0
             or flow_decoded_endpoint_fft_w < 0.0):
         raise ValueError("flow decoded endpoint component weights must be non-negative")
+    flow_equivariance_w = float(flow_equivariance_w)
+    flow_equivariance_p = float(flow_equivariance_p)
+    if flow_equivariance_w < 0.0:
+        raise ValueError("flow_equivariance_w must be non-negative")
+    if flow_equivariance_p < 0.0 or flow_equivariance_p > 1.0:
+        raise ValueError("flow_equivariance_p must be in [0, 1]")
+    flow_equivariance_transforms = normalize_flow_equivariance_transforms(
+        flow_equivariance_transforms)
+    flow_equivariance_shift_frac = float(flow_equivariance_shift_frac)
+    if flow_equivariance_shift_frac < 0.0:
+        raise ValueError("flow_equivariance_shift_frac must be non-negative")
     flow_multiscale_w = float(flow_multiscale_w)
     if flow_multiscale_w < 0.0:
         raise ValueError("flow_multiscale_w must be non-negative")
@@ -11902,6 +12061,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     decoded_endpoint_grad_w=flow_decoded_endpoint_grad_w,
                     decoded_endpoint_ms_w=flow_decoded_endpoint_ms_w,
                     decoded_endpoint_fft_w=flow_decoded_endpoint_fft_w,
+                    equivariance_w=flow_equivariance_w,
+                    equivariance_p=flow_equivariance_p,
+                    equivariance_transforms=flow_equivariance_transforms,
+                    equivariance_shift_frac=flow_equivariance_shift_frac,
                     multiscale_w=flow_multiscale_w,
                     multiscale_scales=flow_multiscale_scales,
                     self_condition_p=flow_self_condition_p,
@@ -12370,6 +12533,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_decoded_endpoint_grad_w": float(flow_decoded_endpoint_grad_w),
         "flow_decoded_endpoint_ms_w": float(flow_decoded_endpoint_ms_w),
         "flow_decoded_endpoint_fft_w": float(flow_decoded_endpoint_fft_w),
+        "flow_equivariance_w": float(flow_equivariance_w),
+        "flow_equivariance_p": float(flow_equivariance_p),
+        "flow_equivariance_transforms": list(flow_equivariance_transforms),
+        "flow_equivariance_shift_frac": float(flow_equivariance_shift_frac),
         "flow_multiscale_w": float(flow_multiscale_w),
         "flow_multiscale_scales": list(flow_multiscale_scales),
         "flow_distill_steps": int(flow_distill_steps),
@@ -12858,6 +13025,10 @@ def selftest():
             flow_decoded_endpoint_grad_w=0.1,
             flow_decoded_endpoint_ms_w=0.1,
             flow_decoded_endpoint_fft_w=0.1,
+            flow_equivariance_w=0.01,
+            flow_equivariance_p=1.0,
+            flow_equivariance_transforms=("roll",),
+            flow_equivariance_shift_frac=0.25,
             dit_mlp="swiglu", dit_register_tokens=1,
             time_sampling="adaptive", time_adaptive_bins=4,
             time_stratified=True,
@@ -12897,6 +13068,14 @@ def selftest():
         assert "flow_decoded_endpoint_recon_grad_l1" in report["last_flow"]
         assert "flow_decoded_endpoint_recon_multiscale_l1" in report["last_flow"]
         assert "flow_decoded_endpoint_recon_fft_l1" in report["last_flow"]
+        assert math.isclose(report["flow_equivariance_w"], 0.01)
+        assert report["last_flow"]["flow_equivariance_active"] == 1.0
+        assert "flow_equivariance_velocity_mse" in report["last_flow"]
+        assert "flow_equivariance_endpoint_mse" in report["last_flow"]
+        assert report["flow_equivariance_transforms"] == ["roll"]
+        assert math.isclose(report["flow_equivariance_shift_frac"], 0.25)
+        assert report["last_flow"]["flow_equivariance_transform_id"] == (
+            flow_equivariance_transform_id("roll"))
         assert report["time_adaptive_prior"] == "mode"
         assert math.isclose(report["time_adaptive_prior_mix"], 0.25)
         assert report["time_adaptive_prior_prob_max"] > report["time_adaptive_prior_prob_min"]
@@ -13468,6 +13647,21 @@ def main(argv=None):
     ap.add_argument("--flow-decoded-endpoint-fft-w", type=float, default=0.0,
                     dest="flow_decoded_endpoint_fft_w",
                     help="frequency component weight inside decoded endpoint loss")
+    ap.add_argument("--flow-equivariance-w", type=float, default=0.0,
+                    dest="flow_equivariance_w",
+                    help=("spatial equivariance loss weight for latent flow "
+                          "velocity and clean endpoint"))
+    ap.add_argument("--flow-equivariance-p", type=float, default=1.0,
+                    dest="flow_equivariance_p",
+                    help="probability of applying flow spatial-equivariance supervision")
+    ap.add_argument("--flow-equivariance-transforms",
+                    default="default", dest="flow_equivariance_transforms",
+                    help=("comma-separated spatial transforms for flow equivariance "
+                          f"({', '.join(FLOW_EQUIVARIANCE_TRANSFORMS)}), "
+                          "or default/all/none"))
+    ap.add_argument("--flow-equivariance-shift-frac", type=float, default=0.125,
+                    dest="flow_equivariance_shift_frac",
+                    help="maximum latent roll shift as a fraction of spatial size")
     ap.add_argument("--flow-multiscale-w", type=float, default=0.0,
                     dest="flow_multiscale_w",
                     help="coarse-to-fine downsampled velocity loss weight for latent flow")
@@ -13950,6 +14144,17 @@ def main(argv=None):
             or args.flow_decoded_endpoint_ms_w < 0.0
             or args.flow_decoded_endpoint_fft_w < 0.0):
         ap.error("flow decoded endpoint component weights must be non-negative")
+    if args.flow_equivariance_w < 0.0:
+        ap.error("--flow-equivariance-w must be non-negative")
+    if args.flow_equivariance_p < 0.0 or args.flow_equivariance_p > 1.0:
+        ap.error("--flow-equivariance-p must be in [0, 1]")
+    try:
+        flow_equivariance_transforms = normalize_flow_equivariance_transforms(
+            args.flow_equivariance_transforms)
+    except ValueError as exc:
+        ap.error(str(exc))
+    if args.flow_equivariance_shift_frac < 0.0:
+        ap.error("--flow-equivariance-shift-frac must be non-negative")
     if args.flow_multiscale_w < 0.0:
         ap.error("--flow-multiscale-w must be non-negative")
     try:
@@ -14440,6 +14645,10 @@ def main(argv=None):
         flow_decoded_endpoint_grad_w=args.flow_decoded_endpoint_grad_w,
         flow_decoded_endpoint_ms_w=args.flow_decoded_endpoint_ms_w,
         flow_decoded_endpoint_fft_w=args.flow_decoded_endpoint_fft_w,
+        flow_equivariance_w=args.flow_equivariance_w,
+        flow_equivariance_p=args.flow_equivariance_p,
+        flow_equivariance_transforms=flow_equivariance_transforms,
+        flow_equivariance_shift_frac=args.flow_equivariance_shift_frac,
         flow_multiscale_w=args.flow_multiscale_w,
         flow_multiscale_scales=flow_multiscale_scales,
         flow_noise_coupling=args.flow_noise_coupling,
@@ -14948,6 +15157,14 @@ def main(argv=None):
             "flow_decoded_endpoint_ms_w", args.flow_decoded_endpoint_ms_w),
         "flow_decoded_endpoint_fft_w": report.get(
             "flow_decoded_endpoint_fft_w", args.flow_decoded_endpoint_fft_w),
+        "flow_equivariance_w": report.get(
+            "flow_equivariance_w", args.flow_equivariance_w),
+        "flow_equivariance_p": report.get(
+            "flow_equivariance_p", args.flow_equivariance_p),
+        "flow_equivariance_transforms": report.get(
+            "flow_equivariance_transforms", list(flow_equivariance_transforms)),
+        "flow_equivariance_shift_frac": report.get(
+            "flow_equivariance_shift_frac", args.flow_equivariance_shift_frac),
         "flow_multiscale_w": args.flow_multiscale_w,
         "flow_multiscale_scales": report.get("flow_multiscale_scales", []),
         "flow_distill_steps": report.get("flow_distill_steps", args.flow_distill_steps),

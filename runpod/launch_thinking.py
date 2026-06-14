@@ -580,6 +580,18 @@ def apply_image_quality_preset(args):
         float(args.image_flow_decoded_endpoint_ms_w), 0.25 if hq else 0.1)
     args.image_flow_decoded_endpoint_fft_w = max(
         float(args.image_flow_decoded_endpoint_fft_w), 0.1 if hq else 0.05)
+    args.image_flow_equivariance_w = max(
+        float(args.image_flow_equivariance_w), 0.02 if hq else 0.01)
+    image_flow_equivariance_p = (
+        0.0 if args.image_flow_equivariance_p is None
+        else float(args.image_flow_equivariance_p)
+    )
+    args.image_flow_equivariance_p = max(
+        image_flow_equivariance_p, 0.25 if hq else 0.1)
+    if not str(args.image_flow_equivariance_transforms or "").strip():
+        args.image_flow_equivariance_transforms = "default"
+    args.image_flow_equivariance_shift_frac = max(
+        float(args.image_flow_equivariance_shift_frac), 0.125)
     args.image_flow_multiscale_w = max(float(args.image_flow_multiscale_w), 0.03 if hq else 0.01)
     if not str(args.image_flow_multiscale_scales or "").strip():
         args.image_flow_multiscale_scales = "2,4"
@@ -1160,6 +1172,12 @@ def payload(args):
                      f"{args.image_flow_decoded_endpoint_ms_w} "
                      f"--flow-decoded-endpoint-fft-w "
                      f"{args.image_flow_decoded_endpoint_fft_w} "
+                     f"--flow-equivariance-w {args.image_flow_equivariance_w} "
+                     f"--flow-equivariance-p {args.image_flow_equivariance_p} "
+                     f"--flow-equivariance-transforms "
+                     f"{shlex_quote(args.image_flow_equivariance_transforms)} "
+                     f"--flow-equivariance-shift-frac "
+                     f"{args.image_flow_equivariance_shift_frac} "
                      f"--flow-multiscale-w {args.image_flow_multiscale_w} "
                      f"--flow-multiscale-scales {shlex_quote(args.image_flow_multiscale_scales)} "
                      f"--flow-noise-coupling {args.image_flow_noise_coupling} "
@@ -3111,6 +3129,21 @@ def main():
     ap.add_argument("--image-flow-decoded-endpoint-fft-w", type=float, default=0.0,
                     dest="image_flow_decoded_endpoint_fft_w",
                     help="frequency component weight inside decoded endpoint loss")
+    ap.add_argument("--image-flow-equivariance-w", type=float, default=0.0,
+                    dest="image_flow_equivariance_w",
+                    help=("spatial equivariance loss weight for image flow "
+                          "velocity and clean endpoint"))
+    ap.add_argument("--image-flow-equivariance-p", type=float, default=None,
+                    dest="image_flow_equivariance_p",
+                    help="probability of applying image flow spatial-equivariance supervision")
+    ap.add_argument("--image-flow-equivariance-transforms", default="default",
+                    dest="image_flow_equivariance_transforms",
+                    help=("comma-separated spatial transforms for image flow "
+                          "equivariance: hflip,vflip,rot180,roll, or "
+                          "default/all/none"))
+    ap.add_argument("--image-flow-equivariance-shift-frac", type=float, default=0.125,
+                    dest="image_flow_equivariance_shift_frac",
+                    help="maximum latent roll shift as a fraction of spatial size")
     ap.add_argument("--image-flow-multiscale-w", type=float, default=0.0,
                     dest="image_flow_multiscale_w",
                     help="coarse-to-fine downsampled velocity loss weight for image flow")
@@ -3564,6 +3597,8 @@ def main():
         apply_image_quality_preset(args)
     except ValueError as exc:
         sys.exit(f"ERROR: {exc}")
+    if args.image_flow_equivariance_p is None:
+        args.image_flow_equivariance_p = 1.0
     if args.text_reading:
         if not args.reading_data:
             sys.exit("ERROR: --text-reading requires --reading-data")
@@ -3979,6 +4014,21 @@ def main():
             or args.image_flow_decoded_endpoint_ms_w < 0.0
             or args.image_flow_decoded_endpoint_fft_w < 0.0):
         sys.exit("ERROR: image decoded endpoint component weights must be non-negative")
+    if args.image_flow_equivariance_w < 0.0:
+        sys.exit("ERROR: --image-flow-equivariance-w must be non-negative")
+    if args.image_flow_equivariance_p < 0.0 or args.image_flow_equivariance_p > 1.0:
+        sys.exit("ERROR: --image-flow-equivariance-p must be in [0, 1]")
+    valid_equivariance_transforms = {
+        "hflip", "vflip", "rot180", "roll", "default", "all", "none", "off", "false", "0"
+    }
+    for transform in str(args.image_flow_equivariance_transforms or "").split(","):
+        transform = transform.strip().lower()
+        if transform and transform not in valid_equivariance_transforms:
+            sys.exit(
+                "ERROR: --image-flow-equivariance-transforms contains unknown "
+                f"transform {transform!r}")
+    if args.image_flow_equivariance_shift_frac < 0.0:
+        sys.exit("ERROR: --image-flow-equivariance-shift-frac must be non-negative")
     if args.image_flow_multiscale_w < 0.0:
         sys.exit("ERROR: --image-flow-multiscale-w must be non-negative")
     for raw_scale in str(args.image_flow_multiscale_scales or "").split(","):
