@@ -3541,6 +3541,7 @@ def autoencoder_cache_identity(ae):
 def image_latent_cache_fingerprint(ae, rows, size=32, caption_max_len=64,
                                    cond_source="tokens", include_image_embeddings=False,
                                    include_image_embedding_sequences=False,
+                                   image_embedding_sequence_max_len=0,
                                    include_image_geometry=False,
                                    include_quality_targets=False, quality_stats=None,
                                    crop_mode="center", hflip_prob=0.0, seed=0,
@@ -3581,6 +3582,7 @@ def image_latent_cache_fingerprint(ae, rows, size=32, caption_max_len=64,
         "cond_source": str(cond_source),
         "include_image_embeddings": bool(include_image_embeddings),
         "include_image_embedding_sequences": bool(include_image_embedding_sequences),
+        "image_embedding_sequence_max_len": int(image_embedding_sequence_max_len),
         "include_image_geometry": bool(include_image_geometry),
         "image_geometry_feature_dim": int(GEOMETRY_FEATURE_DIM),
         "include_quality_targets": bool(include_quality_targets),
@@ -3656,6 +3658,8 @@ def load_disk_image_latent_cache(cache_dir, expected_fingerprint=None):
             "has_image_embeddings": bool(meta.get("has_image_embeddings", False)),
             "has_image_embedding_sequences": bool(meta.get(
                 "has_image_embedding_sequences", False)),
+            "image_embedding_sequence_max_len": int(
+                meta.get("image_embedding_sequence_max_len", 0) or 0),
             "has_image_geometry": bool(meta.get("has_image_geometry", False)),
             "has_quality_targets": bool(meta.get("has_quality_targets", False)),
             "latent_dtype": str(meta.get("latent_dtype", "")),
@@ -3696,6 +3700,8 @@ def load_disk_image_latent_cache(cache_dir, expected_fingerprint=None):
         "has_image_embeddings": bool(meta.get("has_image_embeddings", False)),
         "has_image_embedding_sequences": bool(meta.get(
             "has_image_embedding_sequences", False)),
+        "image_embedding_sequence_max_len": int(
+            meta.get("image_embedding_sequence_max_len", 0) or 0),
         "has_image_geometry": bool(meta.get("has_image_geometry", False)),
         "has_quality_targets": bool(meta.get("has_quality_targets", False)),
         "latent_dtype": str(meta.get("latent_dtype", "")),
@@ -3717,6 +3723,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                              cond_source="tokens", cache_dir="", shard_size=1024,
                              include_image_embeddings=False, crop_mode="center",
                              include_image_embedding_sequences=False,
+                             image_embedding_sequence_token_cap=0,
                              include_image_geometry=False,
                              include_quality_targets=False, quality_stats=None,
                              hflip_prob=0.0, size_buckets=(), bucket_records=None,
@@ -3726,6 +3733,9 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         raise ValueError("cannot build latent cache from empty records")
     cache_dtype = str(cache_dtype)
     latent_cache_torch_dtype(cache_dtype)
+    image_embedding_sequence_token_cap = int(image_embedding_sequence_token_cap or 0)
+    if image_embedding_sequence_token_cap < 0:
+        raise ValueError("image_embedding_sequence_token_cap must be non-negative")
     rng = np.random.default_rng(seed)
     if max_records and int(max_records) < len(rows):
         probs = normalized_sampling_weights(weights_for_records(rows, record_weights), len(rows))
@@ -3736,6 +3746,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         ae, rows, size=size, caption_max_len=caption_max_len,
         cond_source=cond_source, include_image_embeddings=include_image_embeddings,
         include_image_embedding_sequences=include_image_embedding_sequences,
+        image_embedding_sequence_max_len=image_embedding_sequence_token_cap,
         include_image_geometry=include_image_geometry,
         include_quality_targets=include_quality_targets,
         quality_stats=quality_stats,
@@ -3766,6 +3777,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                 cache_dir=bucket_dir, shard_size=shard_size,
                 include_image_embeddings=include_image_embeddings,
                 include_image_embedding_sequences=include_image_embedding_sequences,
+                image_embedding_sequence_token_cap=image_embedding_sequence_token_cap,
                 include_image_geometry=include_image_geometry,
                 include_quality_targets=include_quality_targets,
                 quality_stats=quality_stats,
@@ -3805,6 +3817,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             "cond_source": cond_source,
             "has_image_embeddings": bool(include_image_embeddings),
             "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+            "image_embedding_sequence_max_len": int(image_embedding_sequence_token_cap),
             "has_image_geometry": bool(include_image_geometry),
             "has_quality_targets": bool(include_quality_targets),
             "latent_dtype": cache_dtype,
@@ -3838,6 +3851,8 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                     "has_image_embeddings": bool(include_image_embeddings),
                     "has_image_embedding_sequences": bool(
                         include_image_embedding_sequences),
+                    "image_embedding_sequence_max_len": int(
+                        image_embedding_sequence_token_cap),
                     "has_image_geometry": bool(include_image_geometry),
                     "has_quality_targets": bool(include_quality_targets),
                     "latent_dtype": cache_dtype,
@@ -3863,6 +3878,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             cond_source=cond_source, cache_dir=cache_dir, shard_size=shard_size,
             include_image_embeddings=include_image_embeddings,
             include_image_embedding_sequences=include_image_embedding_sequences,
+            image_embedding_sequence_token_cap=image_embedding_sequence_token_cap,
             include_image_geometry=include_image_geometry,
             include_quality_targets=include_quality_targets,
             quality_stats=cache_quality_stats,
@@ -3872,7 +3888,8 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
     latents, captions, embeddings, pooled_embeddings, pooled_masks = [], [], [], [], []
     image_embeddings, image_embedding_sequences, image_geometry_features = [], [], []
     quality_targets, quality_masks = [], []
-    sequence_max_len = image_embedding_sequence_max_len(rows)
+    sequence_max_len = image_embedding_sequence_max_len(
+        rows, cap=image_embedding_sequence_token_cap)
     weights = weights_for_records(rows, record_weights)
     ae.eval()
     crop_rng = np.random.default_rng(seed + 17)
@@ -3905,7 +3922,8 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             image_embeddings.append(record_image_embedding_tensor(chunk, device="cpu"))
         if include_image_embedding_sequences:
             image_embedding_sequences.append(record_image_embedding_sequence_tensor(
-                chunk, device="cpu", max_len=sequence_max_len))
+                chunk, device="cpu", max_len=sequence_max_len,
+                token_cap=image_embedding_sequence_token_cap))
         if include_image_geometry:
             image_geometry_features.append(image_geometry_feature_tensor(
                 chunk, target_size=size, device="cpu",
@@ -3951,6 +3969,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         "cond_source": cond_source,
         "has_image_embeddings": bool(image_embeddings),
         "has_image_embedding_sequences": bool(image_embedding_sequences),
+        "image_embedding_sequence_max_len": int(image_embedding_sequence_token_cap),
         "has_image_geometry": bool(image_geometry_features),
         "has_quality_targets": bool(quality_targets),
         "latent_dtype": cache_dtype,
@@ -4019,6 +4038,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
                                   cond_source="tokens", cache_dir="", shard_size=1024,
                                   include_image_embeddings=False, seed=0,
                                   include_image_embedding_sequences=False,
+                                  image_embedding_sequence_token_cap=0,
                                   include_image_geometry=False,
                                   include_quality_targets=False, quality_stats=None,
                                   crop_mode="center", hflip_prob=0.0,
@@ -4028,6 +4048,9 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         raise ValueError("cache_dir is required for disk latent cache")
     cache_dtype = str(cache_dtype)
     latent_cache_torch_dtype(cache_dtype)
+    image_embedding_sequence_token_cap = int(image_embedding_sequence_token_cap or 0)
+    if image_embedding_sequence_token_cap < 0:
+        raise ValueError("image_embedding_sequence_token_cap must be non-negative")
     shard_size = int(shard_size)
     if shard_size <= 0:
         raise ValueError("flow cache shard size must be positive")
@@ -4040,7 +4063,8 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
     total_bytes = 0
     total_weight = 0.0
     latent_shape = None
-    sequence_max_len = image_embedding_sequence_max_len(rows)
+    sequence_max_len = image_embedding_sequence_max_len(
+        rows, cap=image_embedding_sequence_token_cap)
     cache_quality_stats = quality_stats or quality_score_stats(rows)
     ae.eval()
     crop_rng = np.random.default_rng(seed + 17)
@@ -4104,7 +4128,8 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
             ),
             "image_embedding_sequences": (
                 record_image_embedding_sequence_tensor(
-                    chunk_rows, device="cpu", max_len=sequence_max_len)
+                    chunk_rows, device="cpu", max_len=sequence_max_len,
+                    token_cap=image_embedding_sequence_token_cap)
                 if include_image_embedding_sequences else None
             ),
             "image_geometry_features": (
@@ -4118,6 +4143,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
             "cond_source": cond_source,
             "has_image_embeddings": bool(include_image_embeddings),
             "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+            "image_embedding_sequence_max_len": int(image_embedding_sequence_token_cap),
             "has_image_geometry": bool(include_image_geometry),
             "has_quality_targets": bool(include_quality_targets),
             "latent_dtype": cache_dtype,
@@ -4171,6 +4197,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         "cond_source": cond_source,
         "has_image_embeddings": bool(include_image_embeddings),
         "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+        "image_embedding_sequence_max_len": int(image_embedding_sequence_token_cap),
         "has_image_geometry": bool(include_image_geometry),
         "has_quality_targets": bool(include_quality_targets),
         "latent_dtype": cache_dtype,
@@ -4210,6 +4237,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         "cond_source": cond_source,
         "has_image_embeddings": bool(include_image_embeddings),
         "has_image_embedding_sequences": bool(include_image_embedding_sequences),
+        "image_embedding_sequence_max_len": int(image_embedding_sequence_token_cap),
         "has_image_geometry": bool(include_image_geometry),
         "has_quality_targets": bool(include_quality_targets),
         "latent_dtype": cache_dtype,
@@ -6538,11 +6566,15 @@ def records_have_image_embedding_sequences(records):
     return any(rec.image_embedding_sequence is not None for rec in records)
 
 
-def image_embedding_sequence_max_len(records):
-    return max(
+def image_embedding_sequence_max_len(records, cap=0):
+    length = max(
         (len(rec.image_embedding_sequence)
          for rec in records if rec.image_embedding_sequence is not None),
         default=0)
+    cap = int(cap or 0)
+    if cap > 0 and length > cap:
+        return cap
+    return length
 
 
 def resolve_caption_cond_source(source, records):
@@ -6627,24 +6659,29 @@ def record_image_embedding_tensor(records, device=DEV):
     return torch.tensor(rows, dtype=torch.float32, device=device)
 
 
-def record_image_embedding_sequence_tensor(records, device=DEV, max_len=0):
+def record_image_embedding_sequence_tensor(records, device=DEV, max_len=0, token_cap=0):
     dim = infer_image_embedding_dim(records)
     if dim <= 0:
         raise ValueError("records do not have image embeddings")
     rows = []
     max_len = int(max_len or 0)
+    token_cap = int(token_cap or 0)
+    if token_cap < 0:
+        raise ValueError("image embedding sequence token cap must be non-negative")
     for rec in records:
         if rec.image_embedding_sequence is not None:
-            row = [list(x) for x in rec.image_embedding_sequence]
+            row = torch.tensor(rec.image_embedding_sequence, dtype=torch.float32, device=device)
+            if token_cap > 0 and int(row.shape[0]) > token_cap:
+                row = _resize_token_sequence(row, token_cap)
         elif rec.image_embedding is not None:
-            row = [list(rec.image_embedding)]
+            row = torch.tensor([rec.image_embedding], dtype=torch.float32, device=device)
         else:
             raise ValueError("record is missing image embedding")
         rows.append(row)
-        max_len = max(max_len, len(row))
+        max_len = max(max_len, int(row.shape[0]))
     out = torch.zeros((len(rows), max(1, max_len), dim), dtype=torch.float32, device=device)
     for i, row in enumerate(rows):
-        out[i, :len(row)] = torch.tensor(row, dtype=torch.float32, device=device)
+        out[i, :int(row.shape[0])] = row.to(device=device, dtype=torch.float32)
     return out
 
 
@@ -9943,6 +9980,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       image_text_align_w=0.0, flow_text_align_w=0.0, text_embed_dim=128,
                       image_feature_align_w=0.0, flow_feature_align_w=0.0,
                       image_feature_embed_dim=128,
+                      image_embedding_sequence_max_len=0,
                       flow_repa_w=0.0, flow_repa_steps=0, flow_repa_embed_dim=128,
                       flow_repa_mode="pooled", flow_repa_structure_w=0.0,
                       flow_repa_frac=0.0,
@@ -10191,6 +10229,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("image/text alignment weights must be non-negative")
     if image_feature_align_w < 0.0 or flow_feature_align_w < 0.0:
         raise ValueError("image feature alignment weights must be non-negative")
+    image_embedding_sequence_max_len = int(image_embedding_sequence_max_len or 0)
+    if image_embedding_sequence_max_len < 0:
+        raise ValueError("image_embedding_sequence_max_len must be non-negative")
     if flow_repa_w < 0.0:
         raise ValueError("flow_repa_w must be non-negative")
     flow_repa_structure_w = float(flow_repa_structure_w)
@@ -10660,6 +10701,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 flow_feature_align_w > 0.0 or flow_repa_w > 0.0
                 or flow_repa_structure_w > 0.0),
             include_image_embedding_sequences=flow_repa_cache_sequences,
+            image_embedding_sequence_token_cap=image_embedding_sequence_max_len,
             include_image_geometry=image_geometry_cond,
             include_quality_targets=(
                 flow_quality_score_w > 0.0 or flow_quality_rank_w > 0.0
@@ -11027,7 +11069,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                         or active_flow_repa_structure_w > 0.0) else None
                 )
                 image_feature_tokens = (
-                    record_image_embedding_sequence_tensor(chosen_records, device=device)
+                    record_image_embedding_sequence_tensor(
+                        chosen_records, device=device,
+                        token_cap=image_embedding_sequence_max_len)
                     if (
                         active_flow_repa_structure_w > 0.0
                         or (
@@ -11377,6 +11421,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_cache_has_image_geometry": bool(
             flow_cache.get("has_image_geometry", False) if flow_cache is not None else False
         ),
+        "flow_cache_image_embedding_sequence_max_len": int(
+            flow_cache.get("image_embedding_sequence_max_len", 0)
+            if flow_cache is not None else 0
+        ),
         **latent_cache_runtime_report(flow_cache),
         **latent_cache_text_embedding_report(flow_cache),
         **latent_cache_text_pooled_embedding_report(flow_cache),
@@ -11470,6 +11518,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_feature_align_w": float(flow_feature_align_w),
         "image_feature_embed_dim": int(image_feature_embed_dim),
         "image_feature_aligner": image_feature_aligner is not None,
+        "image_embedding_sequence_max_len": int(image_embedding_sequence_max_len),
         "flow_repa_w": float(flow_repa_w),
         "flow_repa_structure_w": float(flow_repa_structure_w),
         "flow_repa_frac": float(flow_repa_frac),
@@ -11834,6 +11883,10 @@ def selftest():
         assert abs(float(geom_features[0, 8]) - 0.2) < 1.0e-6
         assert abs(float(geom_features[0, 9]) - 0.2) < 1.0e-6
         assert float(geom_features[0, -1]) == 1.0
+        capped_image_tokens = record_image_embedding_sequence_tensor(
+            manifest_records[:2], device="cpu", token_cap=2)
+        assert tuple(capped_image_tokens.shape) == (2, 2, 3)
+        assert image_embedding_sequence_max_len(manifest_records, cap=2) == 2
         candidate_settings = prompt_candidate_sampler_settings(
             3, seed=11, cfg_scale=1.0, cfg_rescale=0.0,
             cfg_scales=(1.0, 2.0), cfg_rescales=(0.0, 0.5),
@@ -11911,6 +11964,7 @@ def selftest():
             flow_repa_w=0.01, flow_repa_structure_w=0.01,
             flow_repa_frac=1.0,
             flow_repa_mode="auto",
+            image_embedding_sequence_max_len=2,
             flow_factorization_w=0.01,
             flow_multiscale_w=0.01, flow_multiscale_scales=(2,),
             flow_boundary_mode="double-cosine",
@@ -11942,6 +11996,7 @@ def selftest():
         assert report["flow_repa_steps"] == 1
         assert "flow_repa_structure_loss" in report["last_flow"]
         assert report["flow_repa_token_sequences"] is True
+        assert report["image_embedding_sequence_max_len"] == 2
         assert math.isclose(report["flow_straightness_w"], 0.01)
         assert "flow_straightness_velocity_mse" in report["last_flow"]
         assert math.isclose(report["flow_factorization_w"], 0.01)
@@ -12211,6 +12266,10 @@ def main(argv=None):
     ap.add_argument("--image-feature-embed-dim", type=int, default=128,
                     dest="image_feature_embed_dim",
                     help="shared embedding width for latent/image-feature alignment")
+    ap.add_argument("--image-embedding-sequence-max-len", type=int, default=0,
+                    dest="image_embedding_sequence_max_len",
+                    help=("cap image_embedding_sequence rows by linear downsampling before "
+                          "REPA cache/training; 0 keeps full sidecar sequences"))
     ap.add_argument("--flow-repa-w", type=float, default=0.0, dest="flow_repa_w",
                     help="REPA-style hidden-state/image-feature alignment weight")
     ap.add_argument("--flow-repa-steps", type=int, default=0, dest="flow_repa_steps",
@@ -12807,6 +12866,8 @@ def main(argv=None):
             args.flow_multiscale_scales)
     except ValueError as exc:
         ap.error(str(exc))
+    if args.image_embedding_sequence_max_len < 0:
+        ap.error("--image-embedding-sequence-max-len must be non-negative")
     if args.flow_repa_w < 0.0:
         ap.error("--flow-repa-w must be non-negative")
     if args.flow_repa_structure_w < 0.0:
@@ -13145,6 +13206,7 @@ def main(argv=None):
         image_feature_align_w=args.image_feature_align_w,
         flow_feature_align_w=args.flow_feature_align_w,
         image_feature_embed_dim=args.image_feature_embed_dim,
+        image_embedding_sequence_max_len=args.image_embedding_sequence_max_len,
         flow_repa_w=args.flow_repa_w,
         flow_repa_steps=args.flow_repa_steps,
         flow_repa_embed_dim=args.flow_repa_embed_dim,
@@ -13414,6 +13476,7 @@ def main(argv=None):
         "image_feature_align_w": args.image_feature_align_w,
         "flow_feature_align_w": args.flow_feature_align_w,
         "image_feature_embed_dim": args.image_feature_embed_dim,
+        "image_embedding_sequence_max_len": args.image_embedding_sequence_max_len,
         "flow_repa_w": args.flow_repa_w,
         "flow_repa_structure_w": args.flow_repa_structure_w,
         "flow_repa_frac": report.get("flow_repa_frac", args.flow_repa_frac),

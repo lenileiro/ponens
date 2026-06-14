@@ -109,7 +109,7 @@ installs those when this path is active.
     --ae-recon-loss hybrid --ae-grad-w 0.1 --ae-ms-w 0.1 --ae-fft-w 0.05 \
     --image-text-align-w 0.1 --flow-text-align-w 0.05 --text-embed-dim 128 \
     --image-feature-align-w 0.1 --flow-feature-align-w 0.05 \
-    --image-feature-embed-dim 128 \
+    --image-feature-embed-dim 128 --image-embedding-sequence-max-len 256 \
     --flow-repa-w 0.05 --flow-repa-mode auto \
     --flow-self-repa-w 0.05 --flow-self-repa-mode auto \
     --flow-sra-w 0.05 --flow-sra-mode both --flow-sra-time-gap 0.25 \
