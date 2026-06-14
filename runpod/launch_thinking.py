@@ -656,10 +656,18 @@ def apply_image_quality_preset(args):
         args.image_sample_selection_health_w = max(
             float(args.image_sample_selection_health_w), 1.0)
     args.image_sample_grid = True
+    args.image_sample_reference_grid = True
     if not args.image_sample_manifest_out:
         args.image_sample_manifest_out = (
             "runs/image_latent_web_hf_vae_hq_generated.jsonl" if hq
             else "runs/image_latent_web_hf_vae_generated.jsonl")
+    if not args.image_sample_reference_grid_out:
+        args.image_sample_reference_grid_out = (
+            "runs/image_latent_web_hf_vae_hq_reference_grid.ppm" if hq
+            else "runs/image_latent_web_hf_vae_reference_grid.ppm")
+    if not str(args.image_sample_reference_denoise_strengths or "").strip():
+        args.image_sample_reference_denoise_strengths = (
+            "1.0,0.75,0.5,0.25,0.0" if hq else "1.0,0.5,0.25,0.0")
     if hq and not args.image_sample_candidates_manifest_out:
         args.image_sample_candidates_manifest_out = path_with_suffix(
             args.image_sample_manifest_out, "_candidates.jsonl")
@@ -949,6 +957,9 @@ def payload(args):
             cond_suffix = f"_{args.image_cond_mode}"
             ckpt = f"runs/image_latent_{args.image_latent_arch}{cond_suffix}.pt"
             grid = f"runs/image_latent_{args.image_latent_arch}{cond_suffix}_grid.ppm"
+            reference_grid = (
+                args.image_sample_reference_grid_out
+                or f"runs/image_latent_{args.image_latent_arch}{cond_suffix}_reference_grid.ppm")
             sample_manifest_args = ""
             if args.image_sample_manifest_out:
                 sample_manifest_args += (
@@ -1028,6 +1039,26 @@ def payload(args):
                     prompt_grid_args += " --prompt-embed-no-normalize"
                 if args.image_prompt_embed_trust_remote_code:
                     prompt_grid_args += " --prompt-embed-trust-remote-code"
+            reference_grid_args = ""
+            if args.image_sample_reference_grid:
+                reference_manifest = (
+                    args.image_sample_reference_manifest or effective_image_manifest)
+                reference_root = args.image_sample_reference_root or args.image_root
+                reference_grid_args = (
+                    f" --sample-reference-grid-out {shlex_quote(reference_grid)} "
+                    f"--sample-reference-samples "
+                    f"{args.image_sample_reference_samples} "
+                    f"--sample-reference-denoise-strength "
+                    f"{args.image_sample_reference_denoise_strength} "
+                    f"--sample-reference-denoise-strengths "
+                    f"{shlex_quote(args.image_sample_reference_denoise_strengths)}")
+                if reference_manifest:
+                    reference_grid_args += (
+                        f" --sample-reference-manifest "
+                        f"{shlex_quote(reference_manifest)}")
+                    if reference_root:
+                        reference_grid_args += (
+                            f" --sample-reference-root {shlex_quote(reference_root)}")
             train = (f"{IL} --train --ae-steps {args.train_steps or 800} "
                      f"--flow-steps {args.train_steps or 800} --batch {args.batch} "
                      f"--ae-accum-steps {args.image_ae_accum_steps} "
@@ -1229,6 +1260,8 @@ def payload(args):
                 train += (f" --sample-grid-out {grid} "
                           f"--sample-grid-samples {args.image_sample_grid_samples}"
                           f"{sample_manifest_args}{prompt_grid_args}")
+            if args.image_sample_reference_grid:
+                train += reference_grid_args
             if args.image_no_ema_warmup:
                 train += " --no-ema-warmup"
             if args.image_dit_qk_norm:
@@ -1316,6 +1349,8 @@ def payload(args):
                     eval_cmd += (f" --sample-grid-out {grid} "
                                  f"--sample-grid-samples {args.image_sample_grid_samples}"
                                  f"{sample_manifest_args}{prompt_grid_args}")
+                if args.image_sample_reference_grid:
+                    eval_cmd += reference_grid_args
                 train += eval_cmd
             if args.image_eval_generated:
                 IEVAL = mod("thinking.image_eval")
@@ -2867,6 +2902,32 @@ def main():
     ap.add_argument("--image-sample-grid-samples", type=int, default=1,
                     dest="image_sample_grid_samples",
                     help="generated samples per color/shape condition in the image PPM grid")
+    ap.add_argument("--image-sample-reference-grid", action="store_true",
+                    dest="image_sample_reference_grid",
+                    help=("save reference/reconstruction/reproduction PPM rows for "
+                          "latent image jobs"))
+    ap.add_argument("--image-sample-reference-grid-out", default="",
+                    dest="image_sample_reference_grid_out",
+                    help="optional PPM path for latent image reference reproduction grid")
+    ap.add_argument("--image-sample-reference-manifest", default="",
+                    dest="image_sample_reference_manifest",
+                    help=("optional reference manifest for image reproduction grid; "
+                          "defaults to the effective image manifest"))
+    ap.add_argument("--image-sample-reference-root", default="",
+                    dest="image_sample_reference_root",
+                    help=("root for --image-sample-reference-manifest; defaults to "
+                          "--image-root"))
+    ap.add_argument("--image-sample-reference-samples", type=int, default=4,
+                    dest="image_sample_reference_samples",
+                    help="reference rows in the latent image reproduction grid")
+    ap.add_argument("--image-sample-reference-denoise-strength", type=float, default=1.0,
+                    dest="image_sample_reference_denoise_strength",
+                    help=("single reference reproduction denoise strength; used when "
+                          "no sweep is provided"))
+    ap.add_argument("--image-sample-reference-denoise-strengths", default="",
+                    dest="image_sample_reference_denoise_strengths",
+                    help=("comma-separated reference denoise sweep for image "
+                          "reproduction grids"))
     ap.add_argument("--image-sample-manifest-out", default="",
                     dest="image_sample_manifest_out",
                     help=("optional JSONL manifest path for individual generated image "
@@ -4168,6 +4229,34 @@ def main():
         sys.exit("ERROR: --image-sample-manifest-out requires --image-sample-grid")
     if args.image_sample_image_dir and not args.image_sample_manifest_out:
         sys.exit("ERROR: --image-sample-image-dir requires --image-sample-manifest-out")
+    if args.image_sample_reference_grid and not args.image_flow_self_condition:
+        sys.exit(
+            "ERROR: --image-sample-reference-grid requires "
+            "--image-flow-self-condition")
+    if args.image_sample_reference_samples <= 0:
+        sys.exit("ERROR: --image-sample-reference-samples must be positive")
+    if (args.image_sample_reference_denoise_strength < 0.0
+            or args.image_sample_reference_denoise_strength > 1.0):
+        sys.exit("ERROR: --image-sample-reference-denoise-strength must be in [0, 1]")
+    reference_strength_values = (
+        args.image_sample_reference_denoise_strengths
+        if str(args.image_sample_reference_denoise_strengths or "").strip()
+        else str(args.image_sample_reference_denoise_strength)
+    )
+    for raw_strength in str(reference_strength_values).split(","):
+        raw_strength = raw_strength.strip()
+        if not raw_strength:
+            continue
+        try:
+            strength = float(raw_strength)
+        except ValueError:
+            sys.exit(
+                "ERROR: --image-sample-reference-denoise-strengths must be "
+                "comma-separated floats")
+        if strength < 0.0 or strength > 1.0:
+            sys.exit(
+                "ERROR: --image-sample-reference-denoise-strengths values must be "
+                "in [0, 1]")
     if args.image_sample_candidates_manifest_out and not args.image_sample_grid:
         sys.exit(
             "ERROR: --image-sample-candidates-manifest-out requires --image-sample-grid")
