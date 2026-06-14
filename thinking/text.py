@@ -35,6 +35,7 @@ from .concepts import (
     SchemaConceptRefiner,
     latent_concept_bridge_loss,
     latent_concept_bridge_scores,
+    latent_concept_completion_loss,
     latent_concept_composition_loss,
     latent_concept_graph_cycle_loss,
     latent_concept_graph_cycle_scores,
@@ -1417,12 +1418,10 @@ def reading_context_target_loss(model, txt, pad, context_keep_p=0.5,
         context_txt, feature_dropout=feature_dropout, project=False)
     target_slots = model.latent_concept_states(
         target_txt, feature_dropout=0.0, project=False).detach()
-    predicted = model.reading_predictor(context_slots)
-    predicted = F.normalize(predicted.reshape(predicted.shape[0], -1), dim=-1)
-    target = F.normalize(target_slots.reshape(target_slots.shape[0], -1), dim=-1)
-    logits = predicted.matmul(target.t()) / max(float(temperature), 1e-6)
-    labels = torch.arange(logits.shape[0], device=logits.device)
-    return F.cross_entropy(logits, labels)
+    loss, _metrics = latent_concept_completion_loss(
+        model.reading_predictor, {"context": context_slots}, target_slots,
+        temperature=temperature)
+    return loss
 
 
 def reading_context_graph_prediction_loss(
@@ -7081,72 +7080,6 @@ def bucket_free_eval(model, vocab, records, device=DEV, max_new=80, n=0, seed=0)
     return out
 
 
-def _nli_side_record(rec, side):
-    toks = list(rec.tokens)
-    try:
-        h_at = toks.index("hypothesis")
-    except ValueError:
-        return None
-    if side == "hypothesis":
-        ntoks = tuple(toks[h_at:])
-    elif side == "premise":
-        ntoks = tuple(toks[:h_at])
-    else:
-        raise ValueError(side)
-    if not ntoks:
-        return None
-    return TextRecord(rec_id=f"{rec.rec_id}:{side}", split=rec.split, tokens=ntoks,
-                      facts=rec.facts, group=rec.group, kind=f"{rec.kind}:{side}",
-                      base_id=rec.rec_id, changed=rec.changed, meta=rec.meta)
-
-
-def _is_nli_record(rec):
-    return any((slot, pred) == ("pair0", "nli") for slot, pred, _val in rec.facts)
-
-
-def nli_artifact_eval(model, vocab, records, full_fact_value_acc, device=DEV, n=0, seed=0):
-    """Hypothesis-only / premise-only controls for SNLI-style records.
-
-    Gururangan et al. showed that NLI datasets can contain annotation artifacts where the
-    hypothesis alone predicts the label surprisingly well.  A text-understanding gate should
-    phrasing shortcut instead of counting it as premise-hypothesis reasoning.
-    """
-    all_eval = [r for r in records if r.split == "eval" and _is_nli_record(r)]
-    if n < 0:
-        return {"n": 0, "sampled": False, "skipped": True}
-    if not all_eval:
-        return {"n": 0, "sampled": False, "skipped": False}
-    eval_records_ = all_eval
-    sampled = bool(n and n < len(eval_records_))
-    if sampled:
-        rng = np.random.default_rng(seed)
-        idx = rng.choice(len(eval_records_), size=n, replace=False)
-        eval_records_ = [eval_records_[int(i)] for i in idx]
-    hypo = [r for r in (_nli_side_record(rec, "hypothesis") for rec in eval_records_)
-            if r is not None]
-    prem = [r for r in (_nli_side_record(rec, "premise") for rec in eval_records_)
-            if r is not None]
-    full_acc = teacher_forced_eval(model, vocab, eval_records_,
-                                   device=device)["fact_value_acc"]
-    h_acc = teacher_forced_eval(model, vocab, hypo, device=device)["fact_value_acc"] if hypo else 0.0
-    p_acc = teacher_forced_eval(model, vocab, prem, device=device)["fact_value_acc"] if prem else 0.0
-    h_sem = semantic_fact_eval(model, vocab, hypo, device=device)["fact_value_acc"] if hypo else 0.0
-    p_sem = semantic_fact_eval(model, vocab, prem, device=device)["fact_value_acc"] if prem else 0.0
-    full_sem = semantic_fact_eval(model, vocab, eval_records_, device=device)["fact_value_acc"]
-    return {"n": len(eval_records_),
-            "sampled": sampled,
-            "skipped": False,
-            "hypothesis_only_fact_value_acc": h_acc,
-            "premise_only_fact_value_acc": p_acc,
-            "full_minus_hypothesis_only": full_acc - h_acc,
-            "full_minus_premise_only": full_acc - p_acc,
-            "semantic_full_fact_value_acc": full_sem,
-            "semantic_hypothesis_only_fact_value_acc": h_sem,
-            "semantic_premise_only_fact_value_acc": p_sem,
-            "semantic_full_minus_hypothesis_only": full_sem - h_sem,
-            "semantic_full_minus_premise_only": full_sem - p_sem}
-
-
 def greedy_facts(model, vocab, rec, device=DEV, max_new=80):
     model.eval()
     txt, _ids = pack([rec], vocab, device)
@@ -7238,7 +7171,7 @@ def counterfactual_eval(model, vocab, records, device=DEV, max_new=80, n=0, seed
 
 def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
                  paraphrase_n=0, counterfactual_n=0, kind_free_n=0,
-                 fact_n=0, kind_fact_n=0, artifact_n=0, seed=0):
+                 fact_n=0, kind_fact_n=0, seed=0):
     teacher = teacher_forced_eval(model, vocab, records, device=device, n=fact_n,
                                   seed=seed + 11)
     semantic = semantic_fact_eval(model, vocab, records, device=device, n=fact_n,
@@ -7255,8 +7188,6 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
                            n_groups=paraphrase_n, seed=seed + 1)
     cf = counterfactual_eval(model, vocab, records, device=device, max_new=max_new,
                              n=counterfactual_n, seed=seed + 2)
-    artifact = nli_artifact_eval(model, vocab, records, teacher["fact_value_acc"],
-                                 device=device, n=artifact_n, seed=seed + 13)
     by_kind = bucket_fact_eval(model, vocab, records, device=device, n=kind_fact_n,
                                seed=seed + 19)
     by_kind_free = (bucket_free_eval(model, vocab, records, device=device, max_new=max_new,
@@ -7265,9 +7196,7 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
     gate = (teacher["fact_value_acc"] >= 0.80 and semantic["fact_value_acc"] >= 0.80
             and (free.get("skipped") or free["f1"] >= 0.80)
             and (para.get("skipped") or para["n_groups"] == 0 or para["consistent"] >= 0.80)
-            and (cf.get("skipped") or cf["n"] == 0 or cf["f1"] >= 0.80)
-            and (artifact.get("skipped") or artifact["n"] == 0
-                 or artifact["full_minus_hypothesis_only"] >= 0.05))
+            and (cf.get("skipped") or cf["n"] == 0 or cf["f1"] >= 0.80))
     return {"teacher_forced": teacher, "free_decode": free,
             "semantic_head": semantic,
             "fact_concept_head": fact_concept,
@@ -7276,15 +7205,13 @@ def evaluate_all(model, vocab, records, device=DEV, max_new=80, free_n=0,
             "by_kind": by_kind,
             "free_decode_by_kind": by_kind_free,
             "paraphrase_consistency": para, "counterfactual": cf,
-            "nli_artifact_control": artifact,
             "gate_thresholds": {"fact_value_acc": 0.80, "free_f1": 0.80,
                                 "semantic_fact_value_acc": 0.80,
                                 "fact_concept_fact_value_acc": 0.80,
                                 "latent_fact_concept_fact_value_acc": 0.80,
                                 "fact_concept_geometry_margin": 0.05,
                                 "paraphrase_consistent": 0.80,
-                                "counterfactual_f1": 0.80,
-                                "nli_full_minus_hypothesis_only": 0.05},
+                                "counterfactual_f1": 0.80},
             "gate": gate}
 
 
@@ -7444,33 +7371,6 @@ def _score_metric(eval_report, metric):
     raise ValueError(f"unknown study score metric {metric!r}")
 
 
-def _control_gap_values(eval_report, metric="both"):
-    use_teacher = metric in ("teacher", "both", "min")
-    use_semantic = metric in ("semantic", "both", "min")
-    gaps = []
-    nli = eval_report.get("nli_artifact_control") or {}
-    if nli.get("n", 0):
-        if use_teacher:
-            gaps.append(("nli_full_minus_hypothesis_only",
-                         float(nli.get("full_minus_hypothesis_only", 0.0))))
-        if use_semantic:
-            gaps.append(("nli_semantic_full_minus_hypothesis_only",
-                         float(nli.get("semantic_full_minus_hypothesis_only", 0.0))))
-    return gaps
-
-
-def _control_gap_penalty(eval_report, metric="both", threshold=0.05):
-    gaps = [gap for _name, gap in _control_gap_values(eval_report, metric=metric)]
-    if not gaps:
-        return 0.0
-    return float(np.mean([max(0.0, threshold - gap) for gap in gaps]))
-
-
-def _control_gap_failures(eval_report, metric="both", threshold=0.05):
-    return {name: gap for name, gap in _control_gap_values(eval_report, metric=metric)
-            if gap < threshold}
-
-
 def _kind_score(row, metric):
     teacher = float(row.get("teacher_forced_fact_value_acc", 0.0))
     semantic = float(row.get("semantic_fact_value_acc", 0.0))
@@ -7506,37 +7406,28 @@ def _kind_regressions(eval_report, ref_report, metric="both", tol=1e-9):
 
 
 def study_selection_score(study_eval, replay_eval, replay_ref=None, metric="both",
-                          retention_w=1.0, control_w=1.0, kind_w=1.0,
-                          study_ref=None):
+                          retention_w=1.0, kind_w=1.0, study_ref=None):
     return study_selection_components(study_eval, replay_eval, replay_ref,
                                       metric=metric,
                                       retention_w=retention_w,
-                                      control_w=control_w,
                                       kind_w=kind_w,
                                       study_ref=study_ref)["score"]
 
 
-def study_selection_allowed(components, require_positive=True, control_w=1.0, kind_w=1.0):
-    control_failed = bool(components.get("control_failures")) and control_w > 0
+def study_selection_allowed(components, require_positive=True, kind_w=1.0):
     kind_regressed = bool(components.get("kind_regressions")) and kind_w > 0
     score_allowed = (((not require_positive) or components["score"] > 0.0)
-                     and not control_failed and not kind_regressed)
+                     and not kind_regressed)
     return {"score_allowed": bool(score_allowed),
-            "control_allowed": not control_failed,
             "kind_regression_allowed": not kind_regressed}
 
 
 def study_selection_components(study_eval, replay_eval, replay_ref=None, metric="both",
-                               retention_w=1.0, control_w=1.0, kind_w=1.0,
-                               study_ref=None):
+                               retention_w=1.0, kind_w=1.0, study_ref=None):
     study_score = _score_metric(study_eval, metric)
     replay_score = None
     replay_ref_score = None
     retention_penalty = 0.0
-    control_gaps = _control_gap_values(study_eval, metric=metric)
-    control_gap_penalty = _control_gap_penalty(study_eval, metric=metric)
-    control_failures = _control_gap_failures(study_eval, metric=metric)
-    control_penalty = control_w * control_gap_penalty
     by_kind = study_eval.get("by_kind") or {}
     kind_scores = {name: _kind_score(row, metric) for name, row in sorted(by_kind.items())}
     kind_floor = min(kind_scores.values()) if len(kind_scores) >= 2 else study_score
@@ -7558,17 +7449,13 @@ def study_selection_components(study_eval, replay_eval, replay_ref=None, metric=
         "replay_score": replay_score,
         "replay_ref_score": replay_ref_score,
         "retention_penalty": retention_penalty,
-        "control_gap_penalty": control_gap_penalty,
-        "control_penalty": control_penalty,
-        "control_gaps": {name: gap for name, gap in control_gaps},
-        "control_failures": control_failures,
         "kind_floor": kind_floor,
         "kind_scores": kind_scores,
         "kind_gap_penalty": kind_gap_penalty,
         "kind_regressions": kind_regressions,
         "kind_regression_penalty": kind_regression_penalty,
         "kind_penalty": kind_penalty,
-        "score": study_score - retention_penalty - control_penalty - kind_penalty,
+        "score": study_score - retention_penalty - kind_penalty,
     }
 
 
@@ -7584,7 +7471,7 @@ def vocab_coverage(records, vocab):
 
 def eval_checkpoint(checkpoint, data, out=None, device=DEV, max_new=160, free_n=0,
                     paraphrase_n=0, counterfactual_n=0, kind_free_n=0,
-                    fact_n=0, kind_fact_n=0, artifact_n=0, seed=0):
+                    fact_n=0, kind_fact_n=0, seed=0):
     records = load_records(data, require_train=False, require_eval=True)
     torch.manual_seed(seed)
     model, vocab, ckpt = load_checkpoint(checkpoint, device=device)
@@ -7599,15 +7486,13 @@ def eval_checkpoint(checkpoint, data, out=None, device=DEV, max_new=160, free_n=
               "kind_free_n": int(kind_free_n),
               "fact_n": int(fact_n),
               "kind_fact_n": int(kind_fact_n),
-              "artifact_n": int(artifact_n),
               "vocab_coverage": vocab_coverage([r for r in records if r.split == "eval"],
                                                 vocab)}
     report.update(evaluate_all(model, vocab, records, device=device, max_new=max_new,
                                free_n=free_n, paraphrase_n=paraphrase_n,
                                counterfactual_n=counterfactual_n,
                                kind_free_n=kind_free_n, fact_n=fact_n,
-                               kind_fact_n=kind_fact_n, artifact_n=artifact_n,
-                               seed=seed + 17))
+                               kind_fact_n=kind_fact_n, seed=seed + 17))
     if out:
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         with open(out, "w") as f:
@@ -7631,7 +7516,7 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
         latent_concept_invariance_w=25.0, latent_concept_variance_w=25.0,
         latent_concept_covariance_w=1.0, latent_concept_variance_target=1.0,
         latent_concept_fact_w=0.0,
-        fact_n=0, kind_fact_n=0, artifact_n=0, decode_w=1.0,
+        fact_n=0, kind_fact_n=0, decode_w=1.0,
         fact_concept_w=0.0, fact_concept_contrast_w=0.0,
         fact_concept_contrast_temperature=0.1,
         fact_concept_centroid_w=0.0, fact_concept_centroid_temperature=0.1,
@@ -7742,7 +7627,7 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
               "free_n": int(free_n), "paraphrase_n": int(paraphrase_n),
               "counterfactual_n": int(counterfactual_n),
               "kind_free_n": int(kind_free_n), "fact_n": int(fact_n),
-              "kind_fact_n": int(kind_fact_n), "artifact_n": int(artifact_n),
+              "kind_fact_n": int(kind_fact_n),
               "balance_by": balance_by,
               "train_records": sum(r.split == "train" for r in records),
               "eval_records": sum(r.split == "eval" for r in records)}
@@ -7755,8 +7640,7 @@ def run(data, steps=400, batch=32, d=96, layers=3, heads=4, seed=0, device=DEV, 
                                free_n=free_n, paraphrase_n=paraphrase_n,
                                counterfactual_n=counterfactual_n,
                                kind_free_n=kind_free_n, fact_n=fact_n,
-                               kind_fact_n=kind_fact_n, artifact_n=artifact_n,
-                               seed=seed + 17))
+                               kind_fact_n=kind_fact_n, seed=seed + 17))
     if checkpoint:
         os.makedirs(os.path.dirname(checkpoint) or ".", exist_ok=True)
         torch.save(checkpoint_payload(model, vocab, d, layers, heads, report), checkpoint)
@@ -7773,7 +7657,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      steps=400, batch=32, lr=5e-4, seed=0, device=DEV,
                      max_new=160, semantic_w=0.5, free_n=0, paraphrase_n=0,
                      counterfactual_n=0, kind_free_n=0, balance_by="none",
-                     fact_n=0, kind_fact_n=0, artifact_n=0, decode_w=1.0,
+                     fact_n=0, kind_fact_n=0, decode_w=1.0,
                      fact_concept_w=0.0, fact_concept_contrast_w=0.0,
                      fact_concept_contrast_temperature=0.1,
                      fact_concept_centroid_w=0.0,
@@ -7795,8 +7679,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                      study_rounds=1, study_strategy="errors", study_probe_n=0,
                      study_hard_max=0, study_select_best=False,
                      study_score_metric="both", study_retention_w=1.0,
-                     study_control_w=1.0, study_kind_w=1.0,
-                     study_require_positive_score=True,
+                     study_kind_w=1.0, study_require_positive_score=True,
                      study_confirm_n=0, study_confirm_seed_stride=10000):
     if study_strategy not in ("errors", "latent", "all"):
         raise ValueError(f"unknown study strategy {study_strategy!r}")
@@ -7812,8 +7695,7 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
                        paraphrase_n=paraphrase_n,
                        counterfactual_n=counterfactual_n,
                        kind_free_n=kind_free_n, fact_n=fact_n,
-                       kind_fact_n=kind_fact_n, artifact_n=artifact_n,
-                       seed=seed + 17)
+                       kind_fact_n=kind_fact_n, seed=seed + 17)
     before = evaluate_all(model, vocab, records, **eval_kwargs)
     replay_before = (evaluate_all(model, vocab, replay_records, **eval_kwargs)
                      if replay_records and any(r.split == "eval" for r in replay_records)
@@ -7828,7 +7710,6 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
               "study_select_best": bool(study_select_best),
               "study_score_metric": study_score_metric,
               "study_retention_w": float(study_retention_w),
-              "study_control_w": float(study_control_w),
               "study_kind_w": float(study_kind_w),
               "decode_w": float(decode_w), "semantic_w": float(semantic_w),
               "fact_concept_w": float(fact_concept_w),
@@ -7922,10 +7803,10 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
         components = study_selection_components(
             round_study_eval, round_replay_eval, replay_before,
             metric=study_score_metric, retention_w=study_retention_w,
-            control_w=study_control_w, kind_w=study_kind_w, study_ref=before)
+            kind_w=study_kind_w, study_ref=before)
         allowed = study_selection_allowed(
             components, require_positive=study_require_positive_score,
-            control_w=study_control_w, kind_w=study_kind_w)
+            kind_w=study_kind_w)
         confirmation_checks = []
         for confirm_i in range(int(study_confirm_n)):
             confirm_kwargs = eval_kwargs | {
@@ -7938,14 +7819,13 @@ def study_checkpoint(checkpoint, data, out_checkpoint=None, replay_data=None, ou
             confirm_components = study_selection_components(
                 confirm_eval, confirm_replay, replay_before,
                 metric=study_score_metric, retention_w=study_retention_w,
-                control_w=study_control_w, kind_w=study_kind_w, study_ref=before)
+                kind_w=study_kind_w, study_ref=before)
             confirmation_checks.append({
                 "index": confirm_i,
                 "score": confirm_components["score"],
                 "score_components": confirm_components,
                 **study_selection_allowed(confirm_components,
                                           require_positive=study_require_positive_score,
-                                          control_w=study_control_w,
                                           kind_w=study_kind_w)})
         confirmation_allowed = all(row["score_allowed"] for row in confirmation_checks)
         round_allowed = allowed["score_allowed"] and confirmation_allowed

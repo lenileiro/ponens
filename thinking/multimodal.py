@@ -38,6 +38,7 @@ from .concepts import (
     latent_concept_bridge_loss,
     latent_concept_bridge_scores,
     latent_concept_cluster_prototype_loss,
+    latent_concept_completion_loss,
     latent_concept_composition_loss,
     latent_concept_fer_loss,
     latent_concept_fer_metrics,
@@ -1282,31 +1283,12 @@ def latent_multimodal_completion_loss_from_views(model, views, temperature=0.1):
 
     This is a self-supervised completion objective: the target is the model's own
     full-view latent concept state, and each partial view must learn to recover
-    that state without task labels, answer choices, or modality-specific rules.
+    that state without task labels or modality-specific rules.
     """
     views = {mode: slots for mode, slots in views.items() if slots is not None}
-    zero = (next(iter(views.values())).sum() * 0.0
-            if views else torch.tensor(0.0))
-    metrics = {"completion_loss": zero, "view_count": 0, "skipped": True}
-    predictor = getattr(model, "concept_sequence_predictor", None)
-    target = views.get("full")
-    if predictor is None or target is None:
-        return zero, metrics
-    losses = []
-    by_mode = {}
-    for mode, source in views.items():
-        if mode == "full":
-            continue
-        loss = latent_concept_sequence_prediction_loss(
-            predictor, source, target.detach(), temperature=temperature)
-        losses.append(loss)
-        by_mode[mode] = loss.detach()
-    if not losses:
-        return zero, metrics
-    loss = torch.stack(losses).mean()
-    metrics = {"completion_loss": loss, "view_count": len(losses),
-               "skipped": False, "modes": by_mode}
-    return loss, metrics
+    return latent_concept_completion_loss(
+        getattr(model, "concept_sequence_predictor", None), views,
+        temperature=temperature, full_key="full")
 
 
 def latent_multimodal_sequence_prediction_loss(

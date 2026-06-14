@@ -50,7 +50,7 @@ python -m thinking.text --reading-data data/new_reading.jsonl \
 
 `thinking.multimodal` receives JSONL rows with optional text, named feature views, and optional
 target tokens. The model learns to fuse views into continuous prefixes for one decoder, and can
-train partial views to recover the full shared concept state with
+train partial views with the shared concept-completion objective via
 `--latent-concept-completion-w`. If a dataset wants captions, extraction facts, actions, or no
 decoder target at all, that target choice lives in the manifest rather than in module code.
 

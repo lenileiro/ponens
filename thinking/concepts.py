@@ -913,6 +913,53 @@ def latent_concept_sequence_prediction_loss(predictor, source_slots, target_slot
     return F.cross_entropy(logits, labels)
 
 
+def latent_concept_completion_loss(predictor, partial_slots, full_slots=None,
+                                   temperature=0.1, full_key="full"):
+    """Train partial concept views to recover a fuller concept state.
+
+    ``partial_slots`` can be a dict of named views or a single slot tensor. The
+    target is either ``full_slots`` or the ``full_key`` entry from the dict. The
+    objective remains label-free: it reuses the model's own fuller latent state
+    as the supervision signal for incomplete views.
+    """
+    if isinstance(partial_slots, dict):
+        views = {key: slots for key, slots in partial_slots.items()
+                 if slots is not None}
+        target = full_slots if full_slots is not None else views.get(full_key)
+        zero_ref = target if target is not None else (
+            next(iter(views.values())) if views else None)
+        zero = (zero_ref.sum() * 0.0 if zero_ref is not None else torch.tensor(0.0))
+        metrics = {"completion_loss": zero, "view_count": 0, "skipped": True,
+                   "modes": {}}
+        if predictor is None or target is None:
+            return zero, metrics
+        losses = []
+        by_mode = {}
+        for key, slots in views.items():
+            if key == full_key:
+                continue
+            loss = latent_concept_sequence_prediction_loss(
+                predictor, slots, target.detach(), temperature=temperature)
+            losses.append(loss)
+            by_mode[key] = loss.detach()
+        if not losses:
+            return zero, metrics
+        loss = torch.stack(losses).mean()
+        return loss, {"completion_loss": loss, "view_count": len(losses),
+                      "skipped": False, "modes": by_mode}
+    target = full_slots
+    source = partial_slots
+    zero_ref = source if source is not None else target
+    zero = zero_ref.sum() * 0.0 if zero_ref is not None else torch.tensor(0.0)
+    if predictor is None or source is None or target is None:
+        return zero, {"completion_loss": zero, "view_count": 0,
+                      "skipped": True, "modes": {}}
+    loss = latent_concept_sequence_prediction_loss(
+        predictor, source, target.detach(), temperature=temperature)
+    return loss, {"completion_loss": loss, "view_count": 1,
+                  "skipped": False, "modes": {"partial": loss.detach()}}
+
+
 def latent_concept_sequence_prediction_scores(predictor, source_slots, target_slots,
                                               temperature=0.1):
     """Score how surprising each source->target latent concept transition is."""
