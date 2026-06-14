@@ -1391,14 +1391,16 @@ class TextFactLM(nn.Module):
             slots, temperature=temperature, balance_w=balance_w)
 
     def latent_concept_association_loss(self, slots, temperature=0.1,
-                                        target_power=1.0, self_loop_w=0.05):
+                                        target_power=1.0, self_loop_w=0.05,
+                                        transitive_steps=1, transitive_w=0.0):
         if self.latent_concept_memory is None:
             if slots is not None:
                 return slots.sum() * 0.0
             return torch.tensor(0.0, device=next(self.parameters()).device)
         return self.latent_concept_memory.association_loss(
             slots, temperature=temperature, target_power=target_power,
-            self_loop_w=self_loop_w)
+            self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+            transitive_w=transitive_w)
 
     @torch.no_grad()
     def update_latent_concept_memory(self, slots, momentum=0.95,
@@ -1999,7 +2001,8 @@ def reading_latent_memory_loss(model, txt, feature_dropout=0.1,
 
 def reading_latent_association_loss(model, txt, feature_dropout=0.1,
                                     temperature=0.1, target_power=1.0,
-                                    self_loop_w=0.05):
+                                    self_loop_w=0.05, transitive_steps=1,
+                                    transitive_w=0.0):
     if (getattr(model, "latent_concepts", None) is None
             or getattr(model, "latent_concept_memory", None) is None):
         return torch.tensor(0.0, device=txt.device)
@@ -2007,7 +2010,8 @@ def reading_latent_association_loss(model, txt, feature_dropout=0.1,
         txt, feature_dropout=feature_dropout, project=True)
     return model.latent_concept_association_loss(
         slots, temperature=temperature, target_power=target_power,
-        self_loop_w=self_loop_w)
+        self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+        transitive_w=transitive_w)
 
 
 @torch.no_grad()
@@ -5007,6 +5011,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          association_w=0.05, association_temperature=0.1,
                          association_decay=0.99, association_target_power=1.0,
                          association_self_loop_w=0.05,
+                         association_transitive_steps=2,
+                         association_transitive_w=0.1,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
@@ -5057,6 +5063,10 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading association target power must be positive")
     if float(association_self_loop_w) < 0.0:
         raise ValueError("reading association self-loop weight must be non-negative")
+    if int(association_transitive_steps) < 1:
+        raise ValueError("reading association transitive steps must be positive")
+    if float(association_transitive_w) < 0.0:
+        raise ValueError("reading association transitive weight must be non-negative")
     if float(neighborhood_w) < 0.0:
         raise ValueError("reading neighborhood loss weight must be non-negative")
     if int(neighborhood_batch) < 0:
@@ -5228,7 +5238,9 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 model, txt, feature_dropout=feature_dropout,
                 temperature=association_temperature,
                 target_power=association_target_power,
-                self_loop_w=association_self_loop_w)
+                self_loop_w=association_self_loop_w,
+                transitive_steps=association_transitive_steps,
+                transitive_w=association_transitive_w)
             if association_w else view_loss * 0.0)
         context_target = (
             reading_context_target_loss(
@@ -5340,6 +5352,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "association_decay": float(association_decay),
         "association_target_power": float(association_target_power),
         "association_self_loop_w": float(association_self_loop_w),
+        "association_transitive_steps": int(association_transitive_steps),
+        "association_transitive_w": float(association_transitive_w),
         "association_relation_updates": int(
             getattr(getattr(model, "latent_concept_memory", None),
                     "relation_updates", torch.zeros((), dtype=torch.long)).item()),
@@ -5413,7 +5427,8 @@ def fit_reading_concepts_select_best(
         memory_balance_w=0.01,
         association_w=0.05, association_temperature=0.1,
         association_decay=0.99, association_target_power=1.0,
-        association_self_loop_w=0.05,
+        association_self_loop_w=0.05, association_transitive_steps=2,
+        association_transitive_w=0.1,
         context_target_w=0.1, context_keep_p=0.5,
         context_target_temperature=0.1,
         neighborhood_w=0.0, neighborhood_batch=0,
@@ -5507,6 +5522,8 @@ def fit_reading_concepts_select_best(
             association_decay=association_decay,
             association_target_power=association_target_power,
             association_self_loop_w=association_self_loop_w,
+            association_transitive_steps=association_transitive_steps,
+            association_transitive_w=association_transitive_w,
             context_target_w=context_target_w,
             context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
@@ -5612,6 +5629,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            association_w=0.05, association_temperature=0.1,
                            association_decay=0.99, association_target_power=1.0,
                            association_self_loop_w=0.05,
+                           association_transitive_steps=2,
+                           association_transitive_w=0.1,
                            context_target_w=0.1, context_keep_p=0.5,
                            context_target_temperature=0.1,
                            neighborhood_w=0.0, neighborhood_batch=0,
@@ -5661,6 +5680,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         association_decay=association_decay,
         association_target_power=association_target_power,
         association_self_loop_w=association_self_loop_w,
+        association_transitive_steps=association_transitive_steps,
+        association_transitive_w=association_transitive_w,
         context_target_w=context_target_w, context_keep_p=context_keep_p,
         context_target_temperature=context_target_temperature,
         neighborhood_w=neighborhood_w,
@@ -5703,6 +5724,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          association_w=0.05, association_temperature=0.1,
                          association_decay=0.99, association_target_power=1.0,
                          association_self_loop_w=0.05,
+                         association_transitive_steps=2,
+                         association_transitive_w=0.1,
                          context_target_w=0.1, context_keep_p=0.5,
                          context_target_temperature=0.1,
                          neighborhood_w=0.0, neighborhood_batch=0,
@@ -5764,6 +5787,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             association_decay=association_decay,
             association_target_power=association_target_power,
             association_self_loop_w=association_self_loop_w,
+            association_transitive_steps=association_transitive_steps,
+            association_transitive_w=association_transitive_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -5810,6 +5835,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             association_decay=association_decay,
             association_target_power=association_target_power,
             association_self_loop_w=association_self_loop_w,
+            association_transitive_steps=association_transitive_steps,
+            association_transitive_w=association_transitive_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -5877,6 +5904,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "association_decay": float(association_decay),
               "association_target_power": float(association_target_power),
               "association_self_loop_w": float(association_self_loop_w),
+              "association_transitive_steps": int(association_transitive_steps),
+              "association_transitive_w": float(association_transitive_w),
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
@@ -6029,6 +6058,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              association_w=0.05, association_temperature=0.1,
                              association_decay=0.99, association_target_power=1.0,
                              association_self_loop_w=0.05,
+                             association_transitive_steps=2,
+                             association_transitive_w=0.1,
                              context_target_w=0.1, context_keep_p=0.5,
                              context_target_temperature=0.1,
                              neighborhood_w=0.0, neighborhood_batch=0,
@@ -6111,6 +6142,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             association_decay=association_decay,
             association_target_power=association_target_power,
             association_self_loop_w=association_self_loop_w,
+            association_transitive_steps=association_transitive_steps,
+            association_transitive_w=association_transitive_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -6162,6 +6195,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             association_decay=association_decay,
             association_target_power=association_target_power,
             association_self_loop_w=association_self_loop_w,
+            association_transitive_steps=association_transitive_steps,
+            association_transitive_w=association_transitive_w,
             context_target_w=context_target_w, context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
             neighborhood_w=neighborhood_w,
@@ -6247,6 +6282,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "association_decay": float(association_decay),
               "association_target_power": float(association_target_power),
               "association_self_loop_w": float(association_self_loop_w),
+              "association_transitive_steps": int(association_transitive_steps),
+              "association_transitive_w": float(association_transitive_w),
               "context_target_w": float(context_target_w),
               "context_keep_p": float(context_keep_p),
               "context_target_temperature": float(context_target_temperature),
@@ -9787,6 +9824,10 @@ def selftest():
     reading_association_loss = reading_latent_association_loss(
         reading_model, reading_txt, feature_dropout=0.1)
     assert torch.isfinite(reading_association_loss)
+    reading_transitive_association_loss = reading_latent_association_loss(
+        reading_model, reading_txt, feature_dropout=0.1,
+        transitive_steps=2, transitive_w=0.1)
+    assert torch.isfinite(reading_transitive_association_loss)
     context_txt, target_txt = split_reading_context_target(
         reading_txt, reading_vocab.pad, context_keep_p=0.5)
     assert context_txt.ne(reading_vocab.pad).any(1).all()
@@ -9892,6 +9933,8 @@ def selftest():
     assert reading_model.reading_train_metrics["memory_w"] == 0.05
     assert reading_model.reading_train_metrics["memory_active"] > 0
     assert reading_model.reading_train_metrics["association_w"] == 0.05
+    assert reading_model.reading_train_metrics["association_transitive_steps"] == 2
+    assert reading_model.reading_train_metrics["association_transitive_w"] == 0.1
     assert reading_model.reading_train_metrics["association_relation_updates"] > 0
     assert reading_model.reading_train_metrics["neighborhood_w"] == 0.1
     assert reading_model.reading_train_metrics["transition_w"] == 0.1
@@ -10183,6 +10226,10 @@ def main(argv=None):
                     help="sharpening power for association graph target distribution")
     ap.add_argument("--reading-association-self-loop-w", type=float, default=0.05,
                     help="self-loop weight in latent association graph targets")
+    ap.add_argument("--reading-association-transitive-steps", type=int, default=2,
+                    help="graph walk depth for inferred latent concept associations")
+    ap.add_argument("--reading-association-transitive-w", type=float, default=0.1,
+                    help="weight for multi-hop inferred latent concept associations")
     ap.add_argument("--reading-neighborhood-w", type=float, default=0.0,
                     help=("weight for self-mined latent neighborhood discovery loss "
                           "on raw reading chunks"))
@@ -10730,6 +10777,10 @@ def main(argv=None):
         ap.error("--reading-association-target-power must be positive")
     if args.reading_association_self_loop_w < 0.0:
         ap.error("--reading-association-self-loop-w must be non-negative")
+    if args.reading_association_transitive_steps < 1:
+        ap.error("--reading-association-transitive-steps must be positive")
+    if args.reading_association_transitive_w < 0.0:
+        ap.error("--reading-association-transitive-w must be non-negative")
     if args.reading_neighborhood_w < 0.0:
         ap.error("--reading-neighborhood-w must be non-negative")
     if args.reading_neighborhood_batch < 0:
@@ -10854,6 +10905,9 @@ def main(argv=None):
                 association_decay=args.reading_association_decay,
                 association_target_power=args.reading_association_target_power,
                 association_self_loop_w=args.reading_association_self_loop_w,
+                association_transitive_steps=(
+                    args.reading_association_transitive_steps),
+                association_transitive_w=args.reading_association_transitive_w,
                 context_target_w=args.reading_context_target_w,
                 context_keep_p=args.reading_context_keep_p,
                 context_target_temperature=(
@@ -10939,6 +10993,9 @@ def main(argv=None):
                 association_decay=args.reading_association_decay,
                 association_target_power=args.reading_association_target_power,
                 association_self_loop_w=args.reading_association_self_loop_w,
+                association_transitive_steps=(
+                    args.reading_association_transitive_steps),
+                association_transitive_w=args.reading_association_transitive_w,
                 context_target_w=args.reading_context_target_w,
                 context_keep_p=args.reading_context_keep_p,
                 context_target_temperature=(

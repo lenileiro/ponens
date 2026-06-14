@@ -664,14 +664,16 @@ class MultimodalLM(nn.Module):
             slots, temperature=temperature, balance_w=balance_w)
 
     def latent_concept_association_loss(self, slots, temperature=0.1,
-                                        target_power=1.0, self_loop_w=0.05):
+                                        target_power=1.0, self_loop_w=0.05,
+                                        transitive_steps=1, transitive_w=0.0):
         if self.latent_concept_memory is None:
             if slots is not None:
                 return slots.sum() * 0.0
             return torch.tensor(0.0, device=next(self.parameters()).device)
         return self.latent_concept_memory.association_loss(
             slots, temperature=temperature, target_power=target_power,
-            self_loop_w=self_loop_w)
+            self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+            transitive_w=transitive_w)
 
     @torch.no_grad()
     def update_latent_concept_memory(self, slots, momentum=0.95,
@@ -1493,7 +1495,8 @@ def latent_multimodal_memory_loss_from_views(model, views, temperature=0.1,
 
 
 def latent_multimodal_association_loss_from_views(
-        model, views, temperature=0.1, target_power=1.0, self_loop_w=0.05):
+        model, views, temperature=0.1, target_power=1.0, self_loop_w=0.05,
+        transitive_steps=1, transitive_w=0.0):
     views = {mode: slots for mode, slots in views.items() if slots is not None}
     if not views:
         return torch.tensor(0.0)
@@ -1502,7 +1505,8 @@ def latent_multimodal_association_loss_from_views(
     losses = [
         model.latent_concept_association_loss(
             slots, temperature=temperature, target_power=target_power,
-            self_loop_w=self_loop_w)
+            self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+            transitive_w=transitive_w)
         for slots in views.values()
     ]
     return torch.stack(losses).mean() if losses else next(iter(views.values())).sum() * 0.0
@@ -1798,6 +1802,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           latent_concept_association_decay=0.99,
           latent_concept_association_target_power=1.0,
           latent_concept_association_self_loop_w=0.05,
+          latent_concept_association_transitive_steps=2,
+          latent_concept_association_transitive_w=0.1,
           latent_concept_neighborhood_w=0.0,
           latent_concept_neighborhood_temperature=0.1,
           latent_concept_neighborhood_margin=0.0,
@@ -1878,6 +1884,12 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     if latent_concept_association_self_loop_w < 0.0:
         raise ValueError(
             "latent concept association self-loop weight must be non-negative")
+    if int(latent_concept_association_transitive_steps) < 1:
+        raise ValueError(
+            "latent concept association transitive steps must be positive")
+    if latent_concept_association_transitive_w < 0.0:
+        raise ValueError(
+            "latent concept association transitive weight must be non-negative")
     if latent_concept_neighborhood_temperature <= 0.0:
         raise ValueError("latent concept neighborhood temperature must be positive")
     if latent_concept_neighborhood_margin < 0.0:
@@ -2110,7 +2122,9 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                  for mode, bundle in bundles_by_mode.items()},
                 temperature=latent_concept_association_temperature,
                 target_power=latent_concept_association_target_power,
-                self_loop_w=latent_concept_association_self_loop_w)
+                self_loop_w=latent_concept_association_self_loop_w,
+                transitive_steps=latent_concept_association_transitive_steps,
+                transitive_w=latent_concept_association_transitive_w)
             if latent_concept_association_w else base_loss * 0.0)
         latent_neighborhood = (
             latent_multimodal_neighborhood_loss_from_views(
@@ -2241,6 +2255,10 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                                latent_concept_association_target_power),
                            "latent_association_self_loop_w": float(
                                latent_concept_association_self_loop_w),
+                           "latent_association_transitive_steps": int(
+                               latent_concept_association_transitive_steps),
+                           "latent_association_transitive_w": float(
+                               latent_concept_association_transitive_w),
                            "latent_association_relation_updates": int(
                                getattr(getattr(model, "latent_concept_memory", None),
                                        "relation_updates",
@@ -2310,6 +2328,8 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         latent_concept_association_decay=0.99,
         latent_concept_association_target_power=1.0,
         latent_concept_association_self_loop_w=0.05,
+        latent_concept_association_transitive_steps=2,
+        latent_concept_association_transitive_w=0.1,
         latent_concept_neighborhood_w=0.0,
         latent_concept_neighborhood_temperature=0.1,
         latent_concept_neighborhood_margin=0.0,
@@ -2395,6 +2415,10 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                        latent_concept_association_target_power),
                                    latent_concept_association_self_loop_w=(
                                        latent_concept_association_self_loop_w),
+                                   latent_concept_association_transitive_steps=(
+                                       latent_concept_association_transitive_steps),
+                                   latent_concept_association_transitive_w=(
+                                       latent_concept_association_transitive_w),
                                    latent_concept_neighborhood_w=(
                                        latent_concept_neighborhood_w),
                                    latent_concept_neighborhood_temperature=(
@@ -2541,6 +2565,10 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                   latent_concept_association_target_power),
               "latent_concept_association_self_loop_w": float(
                   latent_concept_association_self_loop_w),
+              "latent_concept_association_transitive_steps": int(
+                  latent_concept_association_transitive_steps),
+              "latent_concept_association_transitive_w": float(
+                  latent_concept_association_transitive_w),
               "latent_concept_neighborhood_w": float(latent_concept_neighborhood_w),
               "latent_concept_neighborhood_temperature": float(
                   latent_concept_neighborhood_temperature),
@@ -2742,6 +2770,9 @@ def selftest():
         latent_model, latent_views, temperature=0.2))
     assert torch.isfinite(latent_multimodal_association_loss_from_views(
         latent_model, latent_views, temperature=0.2))
+    assert torch.isfinite(latent_multimodal_association_loss_from_views(
+        latent_model, latent_views, temperature=0.2,
+        transitive_steps=2, transitive_w=0.1))
     assert torch.isfinite(latent_multimodal_neighborhood_loss_from_views(
         latent_views, temperature=0.2))
     assert torch.isfinite(latent_multimodal_transition_loss_from_views(
@@ -2842,6 +2873,8 @@ def selftest():
         assert auto_model.train_metrics["latent_memory_loss"] >= 0.0
         assert auto_model.train_metrics["latent_memory_active"] > 0
         assert auto_model.train_metrics["latent_association_loss"] >= 0.0
+        assert auto_model.train_metrics["latent_association_transitive_steps"] == 2
+        assert auto_model.train_metrics["latent_association_transitive_w"] == 0.1
         assert auto_model.train_metrics["latent_association_relation_updates"] > 0
         assert auto_model.train_metrics["latent_neighborhood_loss"] >= 0.0
         assert auto_model.train_metrics["latent_transition_loss"] >= 0.0
@@ -3040,6 +3073,12 @@ def main(argv=None):
     ap.add_argument("--latent-concept-association-self-loop-w", type=float,
                     default=0.05, dest="latent_concept_association_self_loop_w",
                     help="self-loop weight in latent association graph targets")
+    ap.add_argument("--latent-concept-association-transitive-steps", type=int,
+                    default=2, dest="latent_concept_association_transitive_steps",
+                    help="graph walk depth for inferred latent concept associations")
+    ap.add_argument("--latent-concept-association-transitive-w", type=float,
+                    default=0.1, dest="latent_concept_association_transitive_w",
+                    help="weight for multi-hop inferred latent concept associations")
     ap.add_argument("--latent-concept-neighborhood-w", type=float, default=0.0,
                     dest="latent_concept_neighborhood_w",
                     help=("weight for self-mined latent neighborhood alignment "
@@ -3283,6 +3322,10 @@ def main(argv=None):
         ap.error("--latent-concept-association-target-power must be positive")
     if args.latent_concept_association_self_loop_w < 0.0:
         ap.error("--latent-concept-association-self-loop-w must be non-negative")
+    if args.latent_concept_association_transitive_steps < 1:
+        ap.error("--latent-concept-association-transitive-steps must be positive")
+    if args.latent_concept_association_transitive_w < 0.0:
+        ap.error("--latent-concept-association-transitive-w must be non-negative")
     if args.latent_concept_neighborhood_w < 0.0:
         ap.error("--latent-concept-neighborhood-w must be non-negative")
     if args.latent_concept_neighborhood_w > 0.0 and effective_latent_slots <= 0:
@@ -3398,6 +3441,10 @@ def main(argv=None):
                      args.latent_concept_association_target_power),
                  latent_concept_association_self_loop_w=(
                      args.latent_concept_association_self_loop_w),
+                 latent_concept_association_transitive_steps=(
+                     args.latent_concept_association_transitive_steps),
+                 latent_concept_association_transitive_w=(
+                     args.latent_concept_association_transitive_w),
                  latent_concept_neighborhood_w=args.latent_concept_neighborhood_w,
                  latent_concept_neighborhood_temperature=(
                      args.latent_concept_neighborhood_temperature),

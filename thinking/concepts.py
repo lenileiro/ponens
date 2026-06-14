@@ -143,11 +143,13 @@ class LatentConceptMemory(nn.Module):
             slots, self.active(), temperature=temperature, balance_w=balance_w)
 
     def association_loss(self, slots, temperature=0.1, target_power=1.0,
-                         self_loop_w=0.05):
+                         self_loop_w=0.05, transitive_steps=1,
+                         transitive_w=0.0):
         return latent_concept_association_loss(
             slots, self.active(), self.active_relations(),
             temperature=temperature, target_power=target_power,
-            self_loop_w=self_loop_w)
+            self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+            transitive_w=transitive_w)
 
     @torch.no_grad()
     def update(self, slots, momentum=0.95, relation_decay=None):
@@ -257,7 +259,8 @@ def latent_concept_memory_loss(slots, memory, temperature=0.1, balance_w=0.0):
 
 
 def latent_concept_association_loss(slots, memory, relations, temperature=0.1,
-                                    target_power=1.0, self_loop_w=0.05):
+                                    target_power=1.0, self_loop_w=0.05,
+                                    transitive_steps=1, transitive_w=0.0):
     """Train current slots against a self-mined concept association graph.
 
     Memory rows are persistent latent concepts; relation rows are discovered
@@ -288,6 +291,21 @@ def latent_concept_association_loss(slots, memory, relations, temperature=0.1,
     if not bool(active_rows.any()):
         return slots.sum() * 0.0
     rel = rel / row_sum.clamp_min(1e-8)
+    steps = int(transitive_steps)
+    if steps < 1:
+        raise ValueError("latent concept association transitive steps must be positive")
+    trans_w = float(transitive_w)
+    if trans_w < 0.0:
+        raise ValueError("latent concept association transitive weight must be non-negative")
+    if steps > 1 and trans_w:
+        walk = rel
+        inferred = torch.zeros_like(rel)
+        for _hop in range(2, steps + 1):
+            walk = walk.matmul(rel)
+            inferred = inferred + walk
+        inferred = inferred / max(1, steps - 1)
+        rel = rel + trans_w * inferred
+        rel = rel / rel.sum(-1, keepdim=True).clamp_min(1e-8)
     rows = F.normalize(slots, dim=-1)
     mem = F.normalize(memory.to(device=slots.device, dtype=slots.dtype), dim=-1)
     temp = max(float(temperature), 1e-6)
