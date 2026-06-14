@@ -124,7 +124,7 @@ def _pad_to(mels, T):
     return np.stack(out)
 
 
-def train(steps=8000, seed=0, device=DEV, batch=32, lr=1e-3, T=98, content_dim=6, down=2, spk_w=1.0):
+def train(steps=8000, seed=0, device=DEV, batch=32, lr=1e-3, T=98, content_dim=6, down=2, spk_w=1.0, content_w=1.0):
     torch.manual_seed(seed); rng = np.random.default_rng(seed)
     by_spk = load_with_words()
     train_spk, _ = split_speakers(by_spk, seed=seed)
@@ -134,16 +134,19 @@ def train(steps=8000, seed=0, device=DEV, batch=32, lr=1e-3, T=98, content_dim=6
     for p in spk_enc.parameters():
         p.requires_grad_(False)
     model = VoiceConverter(spk_enc, content_dim=content_dim, down=down).to(device)
+    wclf = _word_classifier(train_spk, device)            # frozen content probe -> protects the word
+    for p_ in wclf.parameters():
+        p_.requires_grad_(False)
     opt = torch.optim.AdamW(list(model.content.parameters()) + list(model.decoder.parameters()), lr=lr)
     spks = [s for s in train_spk if len(train_spk[s]) >= 2]
     for st in range(1, steps + 1):
         model.train()
-        src, ref, xref = [], [], []
+        src, ref, xref, src_words = [], [], [], []
         for _ in range(batch):
             s = spks[int(rng.integers(len(spks)))]
             utts = train_spk[s]
             i, j = rng.choice(len(utts), 2, replace=False)   # source + same-spk ref (recon)
-            src.append(utts[i][1]); ref.append(utts[j][1])
+            src.append(utts[i][1]); ref.append(utts[j][1]); src_words.append(utts[i][0])
             o = spks[int(rng.integers(len(spks)))]           # a DIFFERENT speaker (conversion)
             while o == s:
                 o = spks[int(rng.integers(len(spks)))]
@@ -151,18 +154,21 @@ def train(steps=8000, seed=0, device=DEV, batch=32, lr=1e-3, T=98, content_dim=6
         src = torch.tensor(_pad_to(src, T), dtype=torch.float32, device=device)
         ref = torch.tensor(_pad_to(ref, T), dtype=torch.float32, device=device)
         xref = torch.tensor(_pad_to(xref, T), dtype=torch.float32, device=device)
+        src_words = torch.tensor(src_words, device=device)
         # 1) RECON: content(X) + same-speaker ref -> reconstruct X
         recon = F.l1_loss(model.convert(src, ref), src)
-        # 2) SPEAKER-CONSISTENCY: content(X) + DIFFERENT-speaker ref -> output must take that voice
+        # 2) SPEAKER-CONSISTENCY: content(X)+DIFFERENT-speaker ref -> output takes that voice
         conv = model.convert(src, xref)
         with torch.no_grad():
             tgt_emb = F.normalize(model.spk_enc(xref), dim=-1)
         gen_emb = F.normalize(model.spk_enc(conv), dim=-1)
-        spk_consist = (1 - (gen_emb * tgt_emb).sum(-1)).mean()   # cosine: gen voice == target voice
-        loss = recon + spk_w * spk_consist
+        spk_consist = (1 - (gen_emb * tgt_emb).sum(-1)).mean()   # gen voice == target voice
+        # 3) CONTENT-CONSISTENCY: the frozen word classifier must read the SOURCE word off conv
+        content_consist = F.cross_entropy(wclf(conv.unsqueeze(1)), src_words)
+        loss = recon + spk_w * spk_consist + content_w * content_consist
         opt.zero_grad(); loss.backward(); opt.step()
         if st % max(1, steps // 8) == 0 or st == steps:
-            print(f"  vcv {st}/{steps} recon {recon.item():.4f} spk-consist {spk_consist.item():.4f}",
+            print(f"  vcv {st}/{steps} recon {recon.item():.4f} spk {spk_consist.item():.3f} content {content_consist.item():.3f}",
                   flush=True)
     return model, by_spk
 
@@ -204,8 +210,8 @@ def evaluate(model, by_spk, device=DEV, n=400, seed=1, T=98):
             "n_holdout_speakers": len(hold), "voice_chance": 1 / len(hold), "n": total}
 
 
-def run(steps=8000, seed=0, device=DEV, content_dim=6, down=2, spk_w=1.0):
-    model, by_spk = train(steps=steps, seed=seed, device=device, content_dim=content_dim, down=down, spk_w=spk_w)
+def run(steps=8000, seed=0, device=DEV, content_dim=6, down=2, spk_w=1.0, content_w=1.0):
+    model, by_spk = train(steps=steps, seed=seed, device=device, content_dim=content_dim, down=down, spk_w=spk_w, content_w=content_w)
     ev = evaluate(model, by_spk, device=device)
     report = {"experiment": "voiceconvert_zeroshot", "steps": steps, **ev,
               "zero_shot_clone_works": ev["voice_match"] > 5 * ev["voice_chance"] and ev["content_acc"] > 0.4}
@@ -239,6 +245,7 @@ def main(argv=None):
     ap.add_argument("--content-dim", type=int, default=6, dest="content_dim")
     ap.add_argument("--down", type=int, default=2)
     ap.add_argument("--spk-w", type=float, default=1.0, dest="spk_w")
+    ap.add_argument("--content-w", type=float, default=1.0, dest="content_w")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="runs/voiceconvert.json")
     ap.add_argument("--checkpoint", default="runs/voiceconvert.pt")
@@ -246,7 +253,7 @@ def main(argv=None):
     if args.selftest:
         selftest(); return
     if args.train:
-        report, model = run(steps=args.steps, seed=args.seed, content_dim=args.content_dim, down=args.down, spk_w=args.spk_w)
+        report, model = run(steps=args.steps, seed=args.seed, content_dim=args.content_dim, down=args.down, spk_w=args.spk_w, content_w=args.content_w)
         os.makedirs(os.path.dirname(args.checkpoint) or ".", exist_ok=True)
         torch.save({"state_dict": model.state_dict()}, args.checkpoint)
         json.dump(report, open(args.out, "w"), indent=1)
