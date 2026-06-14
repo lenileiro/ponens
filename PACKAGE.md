@@ -79,7 +79,9 @@ python -m thinking.multimodal --manifest data/multimodal.jsonl \
 ## Image
 
 The image stack is manifest-first: fetch/caption/score/curate records, embed them, train latent
-flows, then run offline image-quality and alignment evals.
+flows, then run offline image-quality and alignment evals. Embedding sidecars can carry pooled
+text/image vectors plus token-level text and image sequences, so REPA-style visual alignment can
+learn from patch-token targets instead of only global image descriptors.
 
 ```bash
 python -m thinking.image_fetch --source text-to-image-2m-512-2m \

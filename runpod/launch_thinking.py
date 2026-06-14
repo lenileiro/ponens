@@ -443,6 +443,7 @@ def apply_image_quality_preset(args):
     if not args.image_embed_model or args.image_embed_model == "google/siglip-base-patch16-224":
         args.image_embed_model = "google/siglip-so400m-patch14-384"
     args.image_embed_text_mode = "both"
+    args.image_embed_image_mode = "both"
     if (not args.image_embed_text_sequence_model
             or args.image_embed_text_sequence_model == "google-t5/t5-base"):
         args.image_embed_text_sequence_model = "google-t5/t5-large"
@@ -790,6 +791,7 @@ def payload(args):
                      f"--backend {args.image_embed_backend} "
                      f"--features {args.image_embed_features} "
                      f"--text-embed-mode {args.image_embed_text_mode} "
+                     f"--image-embed-mode {args.image_embed_image_mode} "
                      f"--batch {args.image_embed_batch} "
                      f"--device {args.image_embed_device} "
                      f"--dtype {args.image_embed_dtype} "
@@ -2116,6 +2118,10 @@ def main():
                     choices=("pooled", "tokens", "both"), dest="image_embed_text_mode",
                     help=("write pooled text embeddings, token-level text embedding sequences, "
                           "or both"))
+    ap.add_argument("--image-embed-image-mode", default="pooled",
+                    choices=("pooled", "tokens", "both"), dest="image_embed_image_mode",
+                    help=("write pooled image embeddings, token-level image embedding "
+                          "sequences, or both"))
     ap.add_argument("--image-embed-batch", type=int, default=64,
                     dest="image_embed_batch",
                     help="batch size for image embedding preprocessing")

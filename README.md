@@ -84,7 +84,7 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --report-out runs/image_fetch_diffusiondb_report.json
 .venv/bin/python -m thinking.image_embed --manifest data/images/train_web_scored.jsonl \
     --root data/images --backend hf --model google/siglip-base-patch16-224 \
-    --features both --text-embed-mode both \
+    --features both --text-embed-mode both --image-embed-mode both \
     --text-sequence-model google-t5/t5-base \
     --batch 64 --device cuda \
     --out data/images/embeddings.jsonl \

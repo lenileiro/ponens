@@ -34,6 +34,7 @@ from .image_data import (ImageTextRecord, caption_tokens, load_image_tensor,
 
 FEATURE_CHOICES = ("both", "image", "text")
 TEXT_MODE_CHOICES = ("pooled", "tokens", "both")
+IMAGE_MODE_CHOICES = ("pooled", "tokens", "both")
 
 
 def _manifest_image_path(path, root=""):
@@ -122,6 +123,25 @@ def _stats_image_embedding(path, dim=64, size=32):
     return vec[:dim]
 
 
+def _stats_image_token_embeddings(path, dim=64, size=32, grid=4):
+    dim = max(1, int(dim))
+    grid = max(1, int(grid))
+    x = load_image_tensor(path, size=max(1, int(size)), device="cpu", center_crop=True)
+    mean = F.adaptive_avg_pool2d(x[None], (grid, grid))[0]
+    mean_sq = F.adaptive_avg_pool2d(x.square()[None], (grid, grid))[0]
+    std = (mean_sq - mean.square()).clamp_min(0.0).sqrt()
+    coords = torch.stack(torch.meshgrid(
+        torch.linspace(-1.0, 1.0, grid),
+        torch.linspace(-1.0, 1.0, grid),
+        indexing="ij",
+    ), dim=0)
+    base = torch.cat([mean, std, coords], dim=0)
+    rows = base.permute(1, 2, 0).reshape(grid * grid, -1)
+    if rows.shape[1] < dim:
+        rows = F.pad(rows, (0, dim - int(rows.shape[1])))
+    return rows[:, :dim]
+
+
 def _image_array_for_processor(path):
     x = load_image_tensor(path, size=0, device="cpu", center_crop=False)
     arr = ((x.clamp(-1.0, 1.0) + 1.0) * 127.5).round()
@@ -179,6 +199,36 @@ def _token_output(outputs):
     raise RuntimeError("could not find token embeddings in model output")
 
 
+def _image_token_output(outputs):
+    vision_out = getattr(outputs, "vision_model_output", None)
+    if vision_out is not None and getattr(vision_out, "last_hidden_state", None) is not None:
+        return vision_out.last_hidden_state
+    for name in ("image_hidden_states", "vision_hidden_states", "hidden_states"):
+        states = getattr(outputs, name, None)
+        if states is not None:
+            if isinstance(states, (tuple, list)) and states:
+                return states[-1]
+            return states
+    last = getattr(outputs, "last_hidden_state", None)
+    if last is not None and last.ndim == 3:
+        return last
+    if isinstance(outputs, (tuple, list)) and outputs:
+        first = outputs[0]
+        if getattr(first, "ndim", 0) == 3:
+            return first
+    raise RuntimeError("could not find image token embeddings in model output")
+
+
+def _drop_square_cls_token(tokens):
+    if tokens.ndim != 3 or tokens.shape[1] <= 1:
+        return tokens
+    n = int(tokens.shape[1])
+    side = int(math.isqrt(n - 1))
+    if side * side == n - 1:
+        return tokens[:, 1:]
+    return tokens
+
+
 def _masked_mean(tokens, mask=None):
     if mask is None:
         return tokens.mean(dim=1)
@@ -192,14 +242,30 @@ class StatsEmbedder:
     image_size: int = 32
     normalize: bool = True
     text_mode: str = "pooled"
+    image_mode: str = "pooled"
 
     backend_name: str = "stats"
     model_name: str = "deterministic-stats"
 
     def encode_images(self, records: Sequence[ImageTextRecord]):
-        rows = [_stats_image_embedding(rec.path, dim=self.dim, size=self.image_size)
-                for rec in records]
-        return _normalize_rows(torch.stack(rows, dim=0), self.normalize)
+        pooled = None
+        tokens = None
+        if self.image_mode in ("pooled", "both"):
+            rows = [_stats_image_embedding(rec.path, dim=self.dim, size=self.image_size)
+                    for rec in records]
+            pooled = _normalize_rows(torch.stack(rows, dim=0), self.normalize)
+        if self.image_mode in ("tokens", "both"):
+            token_rows = [
+                _stats_image_token_embeddings(
+                    rec.path, dim=self.dim, size=self.image_size)
+                for rec in records
+            ]
+            tokens = _normalize_sequence_rows(token_rows, self.normalize)
+        if self.image_mode == "tokens":
+            return tokens
+        if self.image_mode == "both":
+            return {"pooled": pooled, "tokens": tokens}
+        return pooled
 
     def encode_texts(self, records: Sequence[ImageTextRecord]):
         if self.text_mode in ("tokens", "both"):
@@ -297,7 +363,7 @@ class HFTextEncoder:
 
 class HFEmbedder:
     def __init__(self, model_name, device="cpu", dtype="auto", normalize=True,
-                 text_mode="pooled", trust_remote_code=False,
+                 text_mode="pooled", image_mode="pooled", trust_remote_code=False,
                  text_sequence_model="", text_sequence_max_length=0):
         if not model_name:
             raise ValueError("--model is required for --backend hf")
@@ -313,9 +379,12 @@ class HFEmbedder:
         self.device = torch.device(device)
         self.normalize = bool(normalize)
         self.text_mode = str(text_mode)
+        self.image_mode = str(image_mode)
         self.text_sequence_model_name = str(text_sequence_model or "")
         if self.text_mode not in TEXT_MODE_CHOICES:
             raise ValueError(f"text_mode must be one of {TEXT_MODE_CHOICES}")
+        if self.image_mode not in IMAGE_MODE_CHOICES:
+            raise ValueError(f"image_mode must be one of {IMAGE_MODE_CHOICES}")
         torch_dtype = _dtype_from_name(dtype)
         kwargs = {"trust_remote_code": bool(trust_remote_code)}
         if torch_dtype is not None:
@@ -335,11 +404,29 @@ class HFEmbedder:
         inputs = self.processor(images=images, return_tensors="pt")
         inputs = _to_device(inputs, self.device)
         with torch.inference_mode():
+            outputs = None
+            pooled = None
+            token_rows = None
+            if self.image_mode in ("tokens", "both"):
+                outputs = self.model(**inputs)
+                token_feats = _drop_square_cls_token(_image_token_output(outputs))
+                token_rows = [
+                    token_feats[i].detach()
+                    for i in range(int(token_feats.shape[0]))
+                ]
+                token_rows = _normalize_sequence_rows(token_rows, self.normalize)
+                if self.image_mode == "tokens":
+                    return token_rows
             if hasattr(self.model, "get_image_features"):
-                feats = self.model.get_image_features(**inputs)
+                pooled = self.model.get_image_features(**inputs)
             else:
-                feats = _pooled_output(self.model(**inputs))
-        return _normalize_rows(feats, self.normalize)
+                if outputs is None:
+                    outputs = self.model(**inputs)
+                pooled = _pooled_output(outputs)
+        pooled = _normalize_rows(pooled, self.normalize)
+        if self.image_mode == "both":
+            return {"pooled": pooled, "tokens": token_rows}
+        return pooled
 
     @torch.no_grad()
     def encode_texts(self, records: Sequence[ImageTextRecord]):
@@ -394,17 +481,22 @@ class HFEmbedder:
 
 def make_embedder(backend="stats", model="", device="cpu", dtype="auto", normalize=True,
                   stats_dim=64, stats_image_size=32, text_mode="pooled",
+                  image_mode="pooled",
                   trust_remote_code=False, text_sequence_model="",
                   text_sequence_max_length=0):
     if text_mode not in TEXT_MODE_CHOICES:
         raise ValueError(f"text_mode must be one of {TEXT_MODE_CHOICES}")
+    if image_mode not in IMAGE_MODE_CHOICES:
+        raise ValueError(f"image_mode must be one of {IMAGE_MODE_CHOICES}")
     backend = str(backend)
     if backend == "stats":
         return StatsEmbedder(dim=stats_dim, image_size=stats_image_size,
-                             normalize=normalize, text_mode=text_mode)
+                             normalize=normalize, text_mode=text_mode,
+                             image_mode=image_mode)
     if backend == "hf":
         return HFEmbedder(model, device=device, dtype=dtype, normalize=normalize,
-                          text_mode=text_mode, trust_remote_code=trust_remote_code,
+                          text_mode=text_mode, image_mode=image_mode,
+                          trust_remote_code=trust_remote_code,
                           text_sequence_model=text_sequence_model,
                           text_sequence_max_length=text_sequence_max_length)
     raise ValueError(f"unknown embedding backend {backend!r}")
@@ -419,7 +511,8 @@ def write_embedding_sidecar(records, out_path, root="", embedder=None, features=
         embedder = StatsEmbedder()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     rows_written = 0
-    text_dims, text_sequence_dims, text_sequence_lens, image_dims = set(), set(), [], set()
+    text_dims, text_sequence_dims, text_sequence_lens = set(), set(), []
+    image_dims, image_sequence_dims, image_sequence_lens = set(), set(), []
     with open(out_path, "w", encoding="utf-8") as f:
         for chunk in _batched(list(records), batch):
             image_feats = None
@@ -436,6 +529,7 @@ def write_embedding_sidecar(records, out_path, root="", embedder=None, features=
                     "embedding_backend": getattr(embedder, "backend_name", "unknown"),
                     "embedding_model": getattr(embedder, "model_name", ""),
                     "text_embed_mode": getattr(embedder, "text_mode", "pooled"),
+                    "image_embed_mode": getattr(embedder, "image_mode", "pooled"),
                 }
                 text_sequence_model = getattr(embedder, "text_sequence_model_name", "")
                 if text_sequence_model:
@@ -465,9 +559,25 @@ def write_embedding_sidecar(records, out_path, root="", embedder=None, features=
                         row["text_embedding"] = vals
                         text_dims.add(len(vals))
                 if image_feats is not None:
-                    vals = _float_list(image_feats[i])
-                    row["image_embedding"] = vals
-                    image_dims.add(len(vals))
+                    image_pooled = None
+                    image_tokens = None
+                    if isinstance(image_feats, dict):
+                        image_pooled = image_feats.get("pooled")
+                        image_tokens = image_feats.get("tokens")
+                    elif isinstance(image_feats, list):
+                        image_tokens = image_feats
+                    else:
+                        image_pooled = image_feats
+                    if image_tokens is not None:
+                        vals = _float_matrix(image_tokens[i])
+                        row["image_embedding_sequence"] = vals
+                        image_sequence_lens.append(len(vals))
+                        if vals:
+                            image_sequence_dims.add(len(vals[0]))
+                    if image_pooled is not None:
+                        vals = _float_list(image_pooled[i])
+                        row["image_embedding"] = vals
+                        image_dims.add(len(vals))
                 f.write(json.dumps(row, sort_keys=True) + "\n")
                 rows_written += 1
     report = {
@@ -479,13 +589,19 @@ def write_embedding_sidecar(records, out_path, root="", embedder=None, features=
         "text_sequence_model": getattr(embedder, "text_sequence_model_name", ""),
         "batch": int(batch),
         "text_embed_mode": getattr(embedder, "text_mode", "pooled"),
+        "image_embed_mode": getattr(embedder, "image_mode", "pooled"),
         "text_embedding_records": (
             int(rows_written if _needs_text(features) and text_dims else 0)
         ),
         "text_embedding_sequence_records": (
             int(rows_written if _needs_text(features) and text_sequence_dims else 0)
         ),
-        "image_embedding_records": int(rows_written if _needs_image(features) else 0),
+        "image_embedding_records": (
+            int(rows_written if _needs_image(features) and image_dims else 0)
+        ),
+        "image_embedding_sequence_records": (
+            int(rows_written if _needs_image(features) and image_sequence_dims else 0)
+        ),
     }
     if text_dims:
         report["text_embedding_dims"] = sorted(text_dims)
@@ -496,6 +612,11 @@ def write_embedding_sidecar(records, out_path, root="", embedder=None, features=
         report["text_embedding_sequence_len_mean"] = float(np.mean(text_sequence_lens))
     if image_dims:
         report["image_embedding_dims"] = sorted(image_dims)
+    if image_sequence_dims:
+        report["image_embedding_sequence_dims"] = sorted(image_sequence_dims)
+        report["image_embedding_sequence_len_min"] = int(min(image_sequence_lens))
+        report["image_embedding_sequence_len_max"] = int(max(image_sequence_lens))
+        report["image_embedding_sequence_len_mean"] = float(np.mean(image_sequence_lens))
     return report
 
 
@@ -551,6 +672,25 @@ def selftest():
         with open(image_only, "r", encoding="utf-8") as f:
             row = json.loads(f.readline())
         assert "image_embedding" in row and "text_embedding" not in row
+        image_tokens = os.path.join(td, "image_tokens.jsonl")
+        with contextlib.redirect_stdout(io.StringIO()):
+            image_token_report = main([
+                "--manifest", manifest,
+                "--root", td,
+                "--features", "image",
+                "--image-embed-mode", "tokens",
+                "--stats-dim", "14",
+                "--out", image_tokens,
+            ])
+        assert image_token_report["image_embedding_records"] == 0
+        assert image_token_report["image_embedding_sequence_records"] == 2
+        assert image_token_report["image_embedding_sequence_dims"] == [14]
+        with open(image_tokens, "r", encoding="utf-8") as f:
+            image_token_row = json.loads(f.readline())
+        assert "image_embedding_sequence" in image_token_row
+        assert "image_embedding" not in image_token_row
+        assert len(image_token_row["image_embedding_sequence"]) == 16
+        assert len(image_token_row["image_embedding_sequence"][0]) == 14
         seq_out = os.path.join(td, "token_embeddings.jsonl")
         with contextlib.redirect_stdout(io.StringIO()):
             seq_report = main([
@@ -578,17 +718,20 @@ def selftest():
                 "--backend", "stats",
                 "--features", "both",
                 "--text-embed-mode", "both",
+                "--image-embed-mode", "both",
                 "--stats-dim", "10",
                 "--out", both_out,
             ])
         assert both_report["text_embedding_records"] == 2
         assert both_report["text_embedding_sequence_records"] == 2
         assert both_report["image_embedding_records"] == 2
+        assert both_report["image_embedding_sequence_records"] == 2
         with open(both_out, "r", encoding="utf-8") as f:
             both_row = json.loads(f.readline())
         assert len(both_row["text_embedding"]) == 10
         assert len(both_row["text_embedding_sequence"][0]) == 10
         assert len(both_row["image_embedding"]) == 10
+        assert len(both_row["image_embedding_sequence"][0]) == 10
     print("image_embed selftest OK")
 
 
@@ -620,6 +763,9 @@ def main(argv=None):
     ap.add_argument("--text-embed-mode", default="pooled", choices=TEXT_MODE_CHOICES,
                     help=("write pooled text_embedding vectors, token-level "
                           "text_embedding_sequence rows, or both"))
+    ap.add_argument("--image-embed-mode", default="pooled", choices=IMAGE_MODE_CHOICES,
+                    help=("write pooled image_embedding vectors, token-level "
+                          "image_embedding_sequence rows, or both"))
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", default="auto", choices=("auto", "fp32", "fp16", "bf16"))
@@ -653,6 +799,7 @@ def main(argv=None):
         dtype=args.dtype, normalize=not args.no_normalize,
         stats_dim=args.stats_dim, stats_image_size=args.stats_image_size,
         text_mode=args.text_embed_mode,
+        image_mode=args.image_embed_mode,
         trust_remote_code=args.trust_remote_code,
         text_sequence_model=args.text_sequence_model,
         text_sequence_max_length=args.text_sequence_max_length)
@@ -667,6 +814,7 @@ def main(argv=None):
         "max_records": int(args.max_records),
         "normalize": not args.no_normalize,
         "text_embed_mode": args.text_embed_mode,
+        "image_embed_mode": args.image_embed_mode,
         "text_sequence_model": args.text_sequence_model,
         "text_sequence_max_length": int(args.text_sequence_max_length),
     })
