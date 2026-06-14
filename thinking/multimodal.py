@@ -662,15 +662,19 @@ def sample_example(rng, surfaces, text_split="train"):
     return img, aud, txt, toks, gold
 
 
-def _batch(n, rng, vocab, device, surfaces, text_split="train"):
+def _sample_examples(n, rng, surfaces, text_split="train"):
+    return [sample_example(rng, surfaces, text_split=text_split) for _ in range(n)]
+
+
+def _batch_from_examples(examples, vocab, device):
     imgs, auds, txts, seqs, golds = [], [], [], [], []
-    for _ in range(n):
-        img, aud, txt, toks, gold = sample_example(rng, surfaces, text_split=text_split)
+    for img, aud, txt, toks, gold in examples:
         imgs.append(img)
         auds.append(aud)
         txts.append(vocab.enc(txt))
         seqs.append(vocab.enc(toks))
         golds.append(gold)
+    n = len(examples)
     x = torch.tensor(np.stack(imgs), dtype=torch.float32, device=device)
     a = torch.tensor(np.stack(auds), dtype=torch.float32, device=device)
     max_txt = max(len(t) for t in txts)
@@ -679,6 +683,17 @@ def _batch(n, rng, vocab, device, surfaces, text_split="train"):
         t[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
     ids = torch.tensor(seqs, dtype=torch.long, device=device)   # fixed grammar = fixed length
     return x, a, t, ids, golds
+
+
+def _batch(n, rng, vocab, device, surfaces, text_split="train"):
+    return _batch_from_examples(_sample_examples(n, rng, surfaces, text_split=text_split),
+                                vocab, device)
+
+
+def _sample_from_pool(pool, n, rng):
+    if not pool:
+        return []
+    return [pool[int(rng.integers(len(pool)))] for _ in range(n)]
 
 
 def evaluate(model, vocab, surfaces, n=200, seed=1, device=DEV, text_split="eval", mode="full"):
@@ -740,6 +755,90 @@ def latent_factor_evaluate(model, vocab, surfaces, n=200, seed=12, device=DEV,
                 for r in range(b):
                     hits[factor] += int(values[int(pred[r])] == golds[r][factor])
     return {k: v / n for k, v in hits.items()} | {"n_records": int(n), "skipped": False}
+
+
+def multimodal_factor_record_outcomes(model, vocab, surfaces, n=0, seed=0, device=DEV,
+                                      text_split="train", metric="latent", modes=MODES,
+                                      examples=None):
+    """Return examples currently wrong/right under an upstream factor metric."""
+    metric = str(metric)
+    if metric not in ("latent", "concept", "decoder"):
+        raise ValueError(f"unknown multimodal study score metric {metric!r}")
+    if metric == "latent" and getattr(model, "latent_concepts", None) is None:
+        return [], [], {"n_records": 0, "sampled": False, "n_error_records": 0,
+                        "n_correct_records": 0, "n_factor_checks": 0,
+                        "n_errors": 0, "factor_error_rate": 0.0,
+                        "metric": metric, "modes": list(modes), "by_mode": {},
+                        "by_factor": {}, "skipped": True}
+    if examples is None:
+        rng = np.random.default_rng(seed)
+        count = int(n)
+        if count <= 0:
+            count = 1
+        examples = _sample_examples(count, rng, surfaces, text_split=text_split)
+        sampled = True
+    else:
+        examples = list(examples)
+        sampled = False
+        if n and n < len(examples):
+            rng = np.random.default_rng(seed)
+            idx = rng.choice(len(examples), size=int(n), replace=False)
+            examples = [examples[int(i)] for i in idx]
+            sampled = True
+    errors = []
+    correct = []
+    by_mode = {mode: {"checks": 0, "errors": 0} for mode in modes}
+    by_factor = {factor: {"checks": 0, "errors": 0} for factor in VALUE_POS}
+    n_checks = 0
+    n_errors = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(examples), 64):
+            batch_examples = examples[off:off + 64]
+            img, aud, txt, ids, golds = _batch_from_examples(batch_examples, vocab, device)
+            wrong_rows = torch.zeros(len(batch_examples), dtype=torch.bool, device=device)
+            for mode in modes:
+                if metric == "latent":
+                    logits_by_factor = model.latent_factor_logits(img, aud, txt, mode=mode)
+                elif metric == "concept":
+                    logits_by_factor = model.factor_logits(img, aud, txt, mode=mode)
+                else:
+                    logits = model(img, aud, txt, ids, mode=mode)
+                    logits_by_factor = {
+                        factor: logits[:, pos - 1].index_select(
+                            -1, _candidate_ids(vocab, factor, device))
+                        for factor, pos in VALUE_POS.items()
+                    }
+                for factor in VALUE_POS:
+                    targets = concept_factor_targets(golds, factor, device)
+                    pred = logits_by_factor[factor].argmax(-1)
+                    misses = pred.ne(targets)
+                    wrong_rows |= misses
+                    err_count = int(misses.sum())
+                    check_count = int(misses.numel())
+                    by_mode[mode]["checks"] += check_count
+                    by_mode[mode]["errors"] += err_count
+                    by_factor[factor]["checks"] += check_count
+                    by_factor[factor]["errors"] += err_count
+                    n_checks += check_count
+                    n_errors += err_count
+            for i, ex in enumerate(batch_examples):
+                if bool(wrong_rows[i]):
+                    errors.append(ex)
+                else:
+                    correct.append(ex)
+    return errors, correct, {"n_records": len(examples),
+                             "sampled": sampled,
+                             "n_error_records": len(errors),
+                             "n_correct_records": len(correct),
+                             "n_factor_checks": n_checks,
+                             "n_errors": n_errors,
+                             "factor_error_rate": n_errors / max(1, n_checks),
+                             "metric": metric,
+                             "modes": list(modes),
+                             "by_mode": by_mode,
+                             "by_factor": by_factor,
+                             "skipped": False}
 
 
 def concept_geometry_evaluate(model, vocab, surfaces, n=200, seed=13, device=DEV,
@@ -1290,6 +1389,8 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
           latent_concept_invariance_w=25.0, latent_concept_variance_w=25.0,
           latent_concept_covariance_w=1.0, latent_concept_variance_target=1.0,
           latent_concept_factor_w=0.0,
+          study_strategy="random", study_score_metric="latent",
+          study_probe_n=0, study_hard_max=0, study_refresh_steps=0,
           concept_w=0.0, concept_agreement_w=0.0,
           concept_distill_w=0.0, concept_distill_temperature=1.0,
           concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
@@ -1307,6 +1408,14 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     if ((latent_concept_w > 0.0 or latent_concept_factor_w > 0.0)
             and latent_concept_slots <= 0):
         raise ValueError("latent concept losses require latent_concept_slots > 0")
+    study_strategy = str(study_strategy)
+    study_score_metric = str(study_score_metric)
+    if study_strategy not in ("random", "errors"):
+        raise ValueError(f"unknown multimodal study strategy {study_strategy!r}")
+    if study_score_metric not in ("latent", "concept", "decoder"):
+        raise ValueError(f"unknown multimodal study score metric {study_score_metric!r}")
+    if study_strategy == "errors" and study_score_metric == "latent" and latent_concept_slots <= 0:
+        raise ValueError("latent multimodal study requires latent_concept_slots > 0")
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     surfaces = load_text_surfaces(surfaces_path)
@@ -1331,6 +1440,32 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                          latent_concept_refine_gate_init=(
                              latent_concept_refine_gate_init)).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    study_reports = []
+    study_pool = []
+
+    def refresh_study_pool(step):
+        nonlocal study_pool
+        probe_n = int(study_probe_n) if int(study_probe_n) > 0 else max(batch * 4, 1)
+        errors, _correct, hard_report = multimodal_factor_record_outcomes(
+            model, vocab, surfaces, n=probe_n, seed=seed + 1009 + int(step),
+            device=device, text_split="train", metric=study_score_metric)
+        selected = list(errors)
+        if study_hard_max and len(selected) > int(study_hard_max):
+            cap_rng = np.random.default_rng(seed + 2003 + int(step))
+            idx = cap_rng.choice(len(selected), size=int(study_hard_max), replace=False)
+            selected = [selected[int(i)] for i in idx]
+            hard_report = hard_report | {"capped": True,
+                                         "n_error_records_used": len(selected)}
+        else:
+            hard_report = hard_report | {"capped": False,
+                                         "n_error_records_used": len(selected)}
+        if selected:
+            study_pool = selected
+        hard_report = hard_report | {"step": int(step),
+                                     "pool_active": bool(study_pool),
+                                     "pool_size": len(study_pool)}
+        study_reports.append(hard_report)
+
     last_base = last_agreement = last_concept = 0.0
     last_concept_agreement = last_concept_distill = last_concept_rank_distill = 0.0
     last_concept_transfer = last_concept_contrast = 0.0
@@ -1341,8 +1476,16 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
     last_latent_factor = 0.0
     for st in range(1, steps + 1):
         model.train()
-        img, aud, txt, ids, golds = _batch(batch, rng, vocab, device, surfaces,
-                                           text_split="train")
+        if study_strategy == "errors" and (st == 1 or (
+                study_refresh_steps and (st - 1) % int(study_refresh_steps) == 0)):
+            refresh_study_pool(st)
+            model.train()
+        if study_strategy == "errors" and study_pool:
+            img, aud, txt, ids, golds = _batch_from_examples(
+                _sample_from_pool(study_pool, batch, rng), vocab, device)
+        else:
+            img, aud, txt, ids, golds = _batch(batch, rng, vocab, device, surfaces,
+                                               text_split="train")
         needs_factor_batch = (
             concept_w or concept_agreement_w or concept_distill_w
             or concept_rank_distill_w or concept_transfer_w
@@ -1511,6 +1654,7 @@ def train(steps=400, batch=32, d=96, lr=1e-3, seed=0, device=DEV, log_every=100,
                            "concept_state_spread_loss": last_concept_state_spread,
                            "latent_concept_loss": last_latent_concept,
                            "latent_factor_loss": last_latent_factor}
+    model.study_reports = study_reports
     return model, vocab, surfaces
 
 
@@ -1544,6 +1688,8 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
         latent_concept_invariance_w=25.0, latent_concept_variance_w=25.0,
         latent_concept_covariance_w=1.0, latent_concept_variance_target=1.0,
         latent_concept_factor_w=0.0,
+        study_strategy="random", study_score_metric="latent",
+        study_probe_n=0, study_hard_max=0, study_refresh_steps=0,
         concept_w=0.0, concept_agreement_w=0.0,
         concept_distill_w=0.0, concept_distill_temperature=1.0,
         concept_rank_distill_w=0.0, concept_rank_distill_margin=0.0,
@@ -1588,6 +1734,11 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                                    latent_concept_variance_target=(
                                        latent_concept_variance_target),
                                    latent_concept_factor_w=latent_concept_factor_w,
+                                   study_strategy=study_strategy,
+                                   study_score_metric=study_score_metric,
+                                   study_probe_n=study_probe_n,
+                                   study_hard_max=study_hard_max,
+                                   study_refresh_steps=study_refresh_steps,
                                    concept_w=concept_w,
                                    concept_agreement_w=concept_agreement_w,
                                    concept_distill_w=concept_distill_w,
@@ -1683,6 +1834,11 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
               "latent_concept_covariance_w": float(latent_concept_covariance_w),
               "latent_concept_variance_target": float(latent_concept_variance_target),
               "latent_concept_factor_w": float(latent_concept_factor_w),
+              "study_strategy": study_strategy,
+              "study_score_metric": study_score_metric,
+              "study_probe_n": int(study_probe_n),
+              "study_hard_max": int(study_hard_max),
+              "study_refresh_steps": int(study_refresh_steps),
               "concept_w": float(concept_w),
               "concept_agreement_w": float(concept_agreement_w),
               "concept_distill_w": float(concept_distill_w),
@@ -1707,6 +1863,7 @@ def run(steps=400, seed=0, device=DEV, value_w=6.0, eval_n=200, free_n=40,
                   concept_state_spread_covariance_w),
               "concept_transfer_variant": "full_correct_detached_vector",
               "train_metrics": getattr(model, "train_metrics", {}),
+              "study_hard_examples": getattr(model, "study_reports", []),
               "architecture": architecture,
               "eval_n": int(eval_n), "free_n": int(free_n),
               "counterfactual_n": int(counterfactual_n),
@@ -1866,6 +2023,17 @@ def selftest():
     assert set(VALUE_POS).issubset(latent_factor_eval)
     assert latent_factor_eval["n_records"] == 4
     assert latent_factor_eval["skipped"] is False
+    latent_errors, latent_correct, latent_report = multimodal_factor_record_outcomes(
+        latent_prefix_model, vocab, surfaces, n=4, seed=7, device="cpu",
+        metric="latent")
+    assert latent_report["n_records"] == 4
+    assert latent_report["n_error_records"] + latent_report["n_correct_records"] == 4
+    assert len(latent_errors) + len(latent_correct) == 4
+    decoder_errors, decoder_correct, decoder_report = multimodal_factor_record_outcomes(
+        latent_prefix_model, vocab, surfaces, n=4, seed=8, device="cpu",
+        metric="decoder", modes=("text_only",))
+    assert decoder_report["metric"] == "decoder"
+    assert len(decoder_errors) + len(decoder_correct) == 4
     rel_txt_model = MultimodalLM(len(vocab), d=32, layers=2, heads=4, pad=vocab.pad,
                                  text_arch="relational", text_layers=1).to("cpu")
     assert rel_txt_model.txt.arch == "relational"
@@ -1998,6 +2166,19 @@ def main(argv=None):
                     dest="latent_concept_factor_w",
                     help=("weight for predicting data-defined multimodal factors "
                           "from schema-free latent slots"))
+    ap.add_argument("--study-strategy", choices=("random", "errors"), default="random",
+                    dest="study_strategy",
+                    help="sample normal batches or train on mined current model errors")
+    ap.add_argument("--study-score-metric", choices=("latent", "concept", "decoder"),
+                    default="latent", dest="study_score_metric",
+                    help="metric used to mine multimodal hard examples")
+    ap.add_argument("--study-probe-n", type=int, default=0, dest="study_probe_n",
+                    help="number of generated train examples to probe for current errors")
+    ap.add_argument("--study-hard-max", type=int, default=0, dest="study_hard_max",
+                    help="cap mined hard examples kept in the active study pool")
+    ap.add_argument("--study-refresh-steps", type=int, default=0,
+                    dest="study_refresh_steps",
+                    help="refresh mined hard examples every N steps; 0 means once")
     ap.add_argument("--concept-w", type=float, default=0.0, dest="concept_w",
                     help="supervised upstream concept-token factor loss weight")
     ap.add_argument("--concept-agreement-w", type=float, default=0.0,
@@ -2163,6 +2344,15 @@ def main(argv=None):
         ap.error("latent concept loss weights must be non-negative")
     if args.latent_concept_variance_target < 0.0:
         ap.error("--latent-concept-variance-target must be non-negative")
+    if args.study_probe_n < 0:
+        ap.error("--study-probe-n must be non-negative")
+    if args.study_hard_max < 0:
+        ap.error("--study-hard-max must be non-negative")
+    if args.study_refresh_steps < 0:
+        ap.error("--study-refresh-steps must be non-negative")
+    if (args.study_strategy == "errors" and args.study_score_metric == "latent"
+            and args.latent_concept_slots <= 0):
+        ap.error("--study-score-metric latent requires --latent-concept-slots > 0")
     if args.modality_dropout < 0.0 or args.modality_dropout > 1.0:
         ap.error("--modality-dropout must be in [0, 1]")
     if args.eval_n <= 0:
@@ -2199,6 +2389,11 @@ def main(argv=None):
                  latent_concept_covariance_w=args.latent_concept_covariance_w,
                  latent_concept_variance_target=args.latent_concept_variance_target,
                  latent_concept_factor_w=args.latent_concept_factor_w,
+                 study_strategy=args.study_strategy,
+                 study_score_metric=args.study_score_metric,
+                 study_probe_n=args.study_probe_n,
+                 study_hard_max=args.study_hard_max,
+                 study_refresh_steps=args.study_refresh_steps,
                  concept_w=args.concept_w,
                  concept_agreement_w=args.concept_agreement_w,
                  concept_distill_w=args.concept_distill_w,
