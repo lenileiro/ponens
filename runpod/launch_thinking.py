@@ -523,6 +523,8 @@ def apply_image_quality_preset(args):
     args.image_flow_text_align_w = max(float(args.image_flow_text_align_w), 0.05)
     args.image_feature_align_w = max(float(args.image_feature_align_w), 0.05)
     args.image_flow_feature_align_w = max(float(args.image_flow_feature_align_w), 0.05)
+    if int(args.image_embedding_sequence_max_len) <= 0:
+        args.image_embedding_sequence_max_len = 256 if hq else 128
     args.image_flow_repa_w = max(float(args.image_flow_repa_w), 0.05)
     args.image_flow_repa_structure_w = max(
         float(args.image_flow_repa_structure_w), 0.02 if hq else 0.01)
@@ -998,6 +1000,8 @@ def payload(args):
                      f"--image-feature-align-w {args.image_feature_align_w} "
                      f"--flow-feature-align-w {args.image_flow_feature_align_w} "
                      f"--image-feature-embed-dim {args.image_feature_embed_dim} "
+                     f"--image-embedding-sequence-max-len "
+                     f"{args.image_embedding_sequence_max_len} "
                      f"--flow-repa-w {args.image_flow_repa_w} "
                      f"--flow-repa-steps {args.image_flow_repa_steps} "
                      f"--flow-repa-embed-dim {args.image_flow_repa_embed_dim} "
@@ -2349,6 +2353,10 @@ def main():
     ap.add_argument("--image-feature-embed-dim", type=int, default=128,
                     dest="image_feature_embed_dim",
                     help="shared embedding width for latent/image-feature alignment")
+    ap.add_argument("--image-embedding-sequence-max-len", type=int, default=0,
+                    dest="image_embedding_sequence_max_len",
+                    help=("cap image_embedding_sequence token rows before image REPA "
+                          "cache/training; 0 keeps full sidecar sequences"))
     ap.add_argument("--image-flow-repa-w", type=float, default=0.0,
                     dest="image_flow_repa_w",
                     help="REPA-style hidden-state/image-feature alignment weight")
@@ -3808,6 +3816,8 @@ def main():
         sys.exit("ERROR: --image-sample-quality-guidance-w must be non-negative")
     if args.image_sample_quality_guidance_w > 0.0 and not args.image_sample_prompts:
         sys.exit("ERROR: --image-sample-quality-guidance-w requires --image-sample-prompts")
+    if args.image_embedding_sequence_max_len < 0:
+        sys.exit("ERROR: --image-embedding-sequence-max-len must be non-negative")
     if args.image_quality_score_w < 0.0 or args.image_flow_quality_score_w < 0.0:
         sys.exit("ERROR: image quality score weights must be non-negative")
     if args.image_quality_score_steps < 0:

@@ -81,7 +81,9 @@ python -m thinking.multimodal --manifest data/multimodal.jsonl \
 The image stack is manifest-first: fetch/caption/score/curate records, embed them, train latent
 flows, then run offline image-quality and alignment evals. Embedding sidecars can carry pooled
 text/image vectors plus token-level text and image sequences, so REPA-style visual alignment can
-learn from patch-token targets instead of only global image descriptors.
+learn from patch-token targets instead of only global image descriptors. High-res runs can cap
+`image_embedding_sequence` tokens before REPA caching/training to keep that richer supervision
+linear in the selected token budget instead of the source encoder patch count.
 
 ```bash
 python -m thinking.image_fetch --source text-to-image-2m-512-2m \
