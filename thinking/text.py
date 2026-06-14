@@ -2598,6 +2598,35 @@ def _latent_slot_disorder_scores(slots):
     return 0.5 * (correlation + imbalance)
 
 
+def _latent_bridge_scores(slots, memory, eps=1e-8):
+    if slots is None or slots.ndim != 3:
+        empty = torch.zeros(0)
+        return empty, empty, empty
+    active = memory.active() if memory is not None else None
+    batch = slots.shape[0]
+    if active is None or active.shape[0] <= 1:
+        zero = slots.reshape(batch, -1).sum(-1) * 0.0
+        return zero, zero, torch.ones_like(zero)
+    z = F.normalize(slots, dim=-1)
+    active = F.normalize(active.to(z), dim=-1)
+    probs = F.softmax(z.matmul(active.t()), dim=-1)
+    concept_mass = probs.mean(1)
+    entropy = -(concept_mass.clamp_min(eps).log() * concept_mass).sum(-1)
+    entropy = entropy / math.log(float(active.shape[0]))
+    relations = memory.active_relations().to(concept_mass).clamp_min(0.0)
+    transitions = memory.active_transitions().to(concept_mass).clamp_min(0.0)
+    graph = relations + transitions + transitions.t()
+    if graph.numel():
+        graph = graph / graph.max().clamp_min(eps)
+        graph = graph.clone()
+        graph.fill_diagonal_(1.0)
+    connected = (
+        concept_mass[:, :, None] * graph[None] * concept_mass[:, None, :]
+    ).sum((1, 2)).clamp(0.0, 1.0)
+    bridge = entropy * (1.0 - connected)
+    return bridge, entropy, connected
+
+
 def reading_latent_discovery_records(
         model, vocab, records, device=DEV, n=0, seed=0, context_keep_p=0.5,
         feature_dropout=0.0, curiosity_temperature=0.1,
@@ -2671,6 +2700,8 @@ def reading_latent_discovery_records(
                     target_power=cycle_target_power,
                     cycle_w=cycle_w)
             disorder = _latent_slot_disorder_scores(full_slots)
+            bridge, bridge_entropy, bridge_connectivity = _latent_bridge_scores(
+                full_slots, memory)
             novelty = curiosity_parts.get("novelty", curiosity.new_zeros(curiosity.shape))
             association = curiosity_parts.get(
                 "association", curiosity.new_zeros(curiosity.shape))
@@ -2697,8 +2728,12 @@ def reading_latent_discovery_records(
                     "source_cycle_kl": float(source_cycle[i].detach().cpu()),
                     "target_cycle_kl": float(target_cycle[i].detach().cpu()),
                     "slot_disorder": float(disorder[i].detach().cpu()),
+                    "bridge": float(bridge[i].detach().cpu()),
+                    "bridge_entropy": float(bridge_entropy[i].detach().cpu()),
+                    "bridge_connectivity": float(
+                        bridge_connectivity[i].detach().cpu()),
                 })
-    components = ("curiosity", "graph", "cycle", "slot_disorder")
+    components = ("curiosity", "graph", "cycle", "slot_disorder", "bridge")
     for name in components:
         scaled = _minmax_scale([row[name] for row in rows])
         for row, value in zip(rows, scaled):
@@ -2731,6 +2766,10 @@ def reading_latent_discovery_records(
                       "mean_source_cycle_kl": mean_field("source_cycle_kl"),
                       "mean_target_cycle_kl": mean_field("target_cycle_kl"),
                       "mean_slot_disorder": mean_field("slot_disorder"),
+                      "mean_bridge_score": mean_field("bridge"),
+                      "max_bridge_score": max_field("bridge"),
+                      "mean_bridge_entropy": mean_field("bridge_entropy"),
+                      "mean_bridge_connectivity": mean_field("bridge_connectivity"),
                       "skipped": False}
 
 
@@ -6407,6 +6446,7 @@ def selftest():
     assert discovery_records and discovery_report["skipped"] is False
     assert math.isfinite(discovery_report["mean_score"])
     assert "mean_slot_disorder" in discovery_report
+    assert "mean_bridge_score" in discovery_report
     pairs, pair_report = mine_reading_latent_neighbors(
         reading_model, reading_vocab, reading_records, device="cpu", n=0, seed=0)
     assert pair_report["n_pairs"] == 2 and pairs
@@ -6457,6 +6497,8 @@ def selftest():
               if r.get("strategy") == "discovery" and not r.get("skipped")]
     assert scored and max(scored) > 0.0
     assert any("mean_reverse_kl" in r for r in reading_model.reading_study_reports
+               if r.get("strategy") == "discovery")
+    assert any("mean_bridge_score" in r for r in reading_model.reading_study_reports
                if r.get("strategy") == "discovery")
     patience_model = TextFactLM(
         len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
