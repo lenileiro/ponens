@@ -2201,6 +2201,35 @@ def reading_self_teach_weight_plan(score_components, budget=0.0):
     }
 
 
+def reading_self_teach_weight_maps(score_components=None, budget=0.0,
+                                   **base_weights):
+    budget = float(budget)
+    if budget < 0.0:
+        raise ValueError("reading self-teach budget must be non-negative")
+    missing = [
+        key for key in READING_SELF_TEACH_WEIGHT_KEYS
+        if key not in base_weights]
+    if missing:
+        raise ValueError(
+            "missing reading self-teach base weights: "
+            + ", ".join(sorted(missing)))
+    base = {
+        key: float(base_weights[key])
+        for key in READING_SELF_TEACH_WEIGHT_KEYS}
+    effective = dict(base)
+    if budget == 0.0:
+        return None, base, effective
+    if score_components is None:
+        raise ValueError(
+            "reading self-teach needs score components when budget is positive")
+    plan = reading_self_teach_weight_plan(score_components, budget=budget)
+    extras = plan["weight_extras"]
+    effective = {
+        key: float(base[key]) + float(extras.get(key, 0.0))
+        for key in READING_SELF_TEACH_WEIGHT_KEYS}
+    return plan, base, effective
+
+
 def reading_discovery_score_components(view_eval, context_eval, metric="both",
                                        margin_w=0.1, neighborhood_eval=None,
                                        cluster_eval=None, fer_eval=None,
@@ -5394,17 +5423,42 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             study_self_teach_w=study_self_teach_w,
             rounds=study_rounds)
         return model, vocab
-    return fit_reading_concepts(
+    self_teach_before_bundle = None
+    if float(study_self_teach_w) > 0.0:
+        self_teach_before_bundle = reading_eval_bundle(
+            model, vocab, records, device=device, eval_n=eval_n, seed=seed,
+            token_drop_p=token_drop_p, token_replace_p=token_replace_p,
+            context_keep_p=context_keep_p, score_metric=study_score_metric,
+            score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac,
+            context_closure_split_frac=context_closure_split_frac)
+    self_teach_plan, self_teach_base_weights, train_weights = (
+        reading_self_teach_weight_maps(
+            (self_teach_before_bundle["score_components"]
+             if self_teach_before_bundle is not None else None),
+            budget=study_self_teach_w,
+            factorization_w=factorization_w,
+            fer_w=fer_w,
+            discovery_w=discovery_w,
+            gap_w=gap_w,
+            bridge_w=bridge_w,
+            context_target_w=context_target_w,
+            span_completion_w=span_completion_w,
+            context_closure_w=context_closure_w,
+            sequence_w=sequence_w,
+            neighborhood_w=neighborhood_w,
+            transition_w=transition_w,
+            cluster_w=cluster_w))
+    model, vocab = fit_reading_concepts(
         model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
         device=device, log_every=log_every, token_drop_p=token_drop_p,
         token_replace_p=token_replace_p, feature_dropout=feature_dropout,
         invariance_w=invariance_w, variance_w=variance_w,
         covariance_w=covariance_w, variance_target=variance_target,
-        factorization_w=factorization_w,
+        factorization_w=train_weights["factorization_w"],
         factorization_variance=factorization_variance,
         factorization_margin=factorization_margin,
         factorization_covariance_w=factorization_covariance_w,
-        fer_w=fer_w,
+        fer_w=train_weights["fer_w"],
         fer_fragmentation_w=fer_fragmentation_w,
         fer_correlation_w=fer_correlation_w,
         fer_balance_w=fer_balance_w,
@@ -5418,7 +5472,7 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         consolidation_balance_w=consolidation_balance_w,
         consolidation_anchor_w=consolidation_anchor_w,
         consolidation_fer_w=consolidation_fer_w,
-        discovery_w=discovery_w,
+        discovery_w=train_weights["discovery_w"],
         discovery_curiosity_w=discovery_curiosity_w,
         discovery_graph_w=discovery_graph_w,
         discovery_cycle_w=discovery_cycle_w,
@@ -5429,7 +5483,7 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         reanalysis_cycle_w=reanalysis_cycle_w,
         reanalysis_bridge_w=reanalysis_bridge_w,
         reanalysis_fer_w=reanalysis_fer_w,
-        gap_w=gap_w,
+        gap_w=train_weights["gap_w"],
         gap_temperature=gap_temperature,
         gap_self_loop_w=gap_self_loop_w,
         gap_transitive_steps=gap_transitive_steps,
@@ -5461,28 +5515,29 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         graph_cycle_transitive_w=graph_cycle_transitive_w,
         graph_cycle_target_power=graph_cycle_target_power,
         graph_cycle_consistency_w=graph_cycle_consistency_w,
-        bridge_w=bridge_w,
-        context_target_w=context_target_w, context_keep_p=context_keep_p,
+        bridge_w=train_weights["bridge_w"],
+        context_target_w=train_weights["context_target_w"],
+        context_keep_p=context_keep_p,
         context_target_temperature=context_target_temperature,
-        span_completion_w=span_completion_w,
+        span_completion_w=train_weights["span_completion_w"],
         span_mask_frac=span_mask_frac,
         span_completion_temperature=span_completion_temperature,
-        context_closure_w=context_closure_w,
+        context_closure_w=train_weights["context_closure_w"],
         context_closure_split_frac=context_closure_split_frac,
         context_closure_temperature=context_closure_temperature,
-        sequence_w=sequence_w, sequence_batch=sequence_batch,
+        sequence_w=train_weights["sequence_w"], sequence_batch=sequence_batch,
         sequence_temperature=sequence_temperature,
-        neighborhood_w=neighborhood_w,
+        neighborhood_w=train_weights["neighborhood_w"],
         neighborhood_batch=neighborhood_batch,
         neighborhood_probe_n=neighborhood_probe_n,
         neighborhood_refresh_steps=neighborhood_refresh_steps,
         neighborhood_temperature=neighborhood_temperature,
         neighborhood_margin=neighborhood_margin,
-        transition_w=transition_w,
+        transition_w=train_weights["transition_w"],
         transition_batch=transition_batch,
         transition_temperature=transition_temperature,
         transition_margin=transition_margin,
-        cluster_w=cluster_w,
+        cluster_w=train_weights["cluster_w"],
         cluster_batch=cluster_batch,
         cluster_probe_n=cluster_probe_n,
         cluster_refresh_steps=cluster_refresh_steps,
@@ -5491,6 +5546,22 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         cluster_min_size=cluster_min_size,
         study_strategy=study_strategy, study_probe_n=study_probe_n,
         study_hard_max=study_hard_max, study_refresh_steps=study_refresh_steps)
+    if self_teach_plan is not None:
+        model.reading_train_metrics = dict(
+            getattr(model, "reading_train_metrics", {})) | {
+                "self_teach_w": float(study_self_teach_w),
+                "self_teach_plan": self_teach_plan,
+                "self_teach_base_weights": self_teach_base_weights,
+                "self_teach_effective_weights": train_weights,
+                "selection": {
+                    "enabled": False,
+                    "self_teach_w": float(study_self_teach_w),
+                    "self_teach_reports": [
+                        self_teach_plan | {"round": 1}],
+                    "self_teach_plan": self_teach_plan,
+                },
+            }
+    return model, vocab
 
 
 def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
@@ -5710,17 +5781,32 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             rounds=study_rounds,
             before_bundle=before_bundle)
     else:
+        self_teach_plan, self_teach_base_weights, train_weights = (
+            reading_self_teach_weight_maps(
+                before_bundle["score_components"], budget=study_self_teach_w,
+                factorization_w=factorization_w,
+                fer_w=fer_w,
+                discovery_w=discovery_w,
+                gap_w=gap_w,
+                bridge_w=bridge_w,
+                context_target_w=context_target_w,
+                span_completion_w=span_completion_w,
+                context_closure_w=context_closure_w,
+                sequence_w=sequence_w,
+                neighborhood_w=neighborhood_w,
+                transition_w=transition_w,
+                cluster_w=cluster_w))
         fit_reading_concepts(
             model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
             device=device, log_every=log_every, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
-            factorization_w=factorization_w,
+            factorization_w=train_weights["factorization_w"],
             factorization_variance=factorization_variance,
             factorization_margin=factorization_margin,
             factorization_covariance_w=factorization_covariance_w,
-            fer_w=fer_w,
+            fer_w=train_weights["fer_w"],
             fer_fragmentation_w=fer_fragmentation_w,
             fer_correlation_w=fer_correlation_w,
             fer_balance_w=fer_balance_w,
@@ -5734,7 +5820,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             consolidation_balance_w=consolidation_balance_w,
             consolidation_anchor_w=consolidation_anchor_w,
             consolidation_fer_w=consolidation_fer_w,
-            discovery_w=discovery_w,
+            discovery_w=train_weights["discovery_w"],
             discovery_curiosity_w=discovery_curiosity_w,
             discovery_graph_w=discovery_graph_w,
             discovery_cycle_w=discovery_cycle_w,
@@ -5745,7 +5831,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             reanalysis_cycle_w=reanalysis_cycle_w,
             reanalysis_bridge_w=reanalysis_bridge_w,
             reanalysis_fer_w=reanalysis_fer_w,
-            gap_w=gap_w,
+            gap_w=train_weights["gap_w"],
             gap_temperature=gap_temperature,
             gap_self_loop_w=gap_self_loop_w,
             gap_transitive_steps=gap_transitive_steps,
@@ -5777,28 +5863,29 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             graph_cycle_transitive_w=graph_cycle_transitive_w,
             graph_cycle_target_power=graph_cycle_target_power,
             graph_cycle_consistency_w=graph_cycle_consistency_w,
-            bridge_w=bridge_w,
-            context_target_w=context_target_w, context_keep_p=context_keep_p,
+            bridge_w=train_weights["bridge_w"],
+            context_target_w=train_weights["context_target_w"],
+            context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
-            span_completion_w=span_completion_w,
+            span_completion_w=train_weights["span_completion_w"],
             span_mask_frac=span_mask_frac,
             span_completion_temperature=span_completion_temperature,
-            context_closure_w=context_closure_w,
+            context_closure_w=train_weights["context_closure_w"],
             context_closure_split_frac=context_closure_split_frac,
             context_closure_temperature=context_closure_temperature,
-            sequence_w=sequence_w, sequence_batch=sequence_batch,
+            sequence_w=train_weights["sequence_w"], sequence_batch=sequence_batch,
             sequence_temperature=sequence_temperature,
-            neighborhood_w=neighborhood_w,
+            neighborhood_w=train_weights["neighborhood_w"],
             neighborhood_batch=neighborhood_batch,
             neighborhood_probe_n=neighborhood_probe_n,
             neighborhood_refresh_steps=neighborhood_refresh_steps,
             neighborhood_temperature=neighborhood_temperature,
             neighborhood_margin=neighborhood_margin,
-            transition_w=transition_w,
+            transition_w=train_weights["transition_w"],
             transition_batch=transition_batch,
             transition_temperature=transition_temperature,
             transition_margin=transition_margin,
-            cluster_w=cluster_w,
+            cluster_w=train_weights["cluster_w"],
             cluster_batch=cluster_batch,
             cluster_probe_n=cluster_probe_n,
             cluster_refresh_steps=cluster_refresh_steps,
@@ -5808,6 +5895,20 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             study_strategy=study_strategy, study_probe_n=study_probe_n,
             study_hard_max=study_hard_max,
             study_refresh_steps=study_refresh_steps)
+        if self_teach_plan is not None:
+            model.reading_train_metrics = dict(
+                getattr(model, "reading_train_metrics", {})) | {
+                    "self_teach_w": float(study_self_teach_w),
+                    "self_teach_plan": self_teach_plan,
+                    "self_teach_base_weights": self_teach_base_weights,
+                    "self_teach_effective_weights": train_weights,
+                }
+            selection = {
+                "enabled": False,
+                "self_teach_w": float(study_self_teach_w),
+                "self_teach_reports": [self_teach_plan | {"round": 1}],
+                "self_teach_plan": self_teach_plan,
+            }
     after_bundle = reading_eval_bundle(
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
@@ -6352,17 +6453,32 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             replay_retention_w=replay_retention_w, rounds=study_rounds,
             before_bundle=before_bundle)
     else:
+        self_teach_plan, self_teach_base_weights, train_weights = (
+            reading_self_teach_weight_maps(
+                before_bundle["score_components"], budget=study_self_teach_w,
+                factorization_w=factorization_w,
+                fer_w=fer_w,
+                discovery_w=discovery_w,
+                gap_w=gap_w,
+                bridge_w=bridge_w,
+                context_target_w=context_target_w,
+                span_completion_w=span_completion_w,
+                context_closure_w=context_closure_w,
+                sequence_w=sequence_w,
+                neighborhood_w=neighborhood_w,
+                transition_w=transition_w,
+                cluster_w=cluster_w))
         fit_reading_concepts(
             model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
             device=device, log_every=log_every, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
-            factorization_w=factorization_w,
+            factorization_w=train_weights["factorization_w"],
             factorization_variance=factorization_variance,
             factorization_margin=factorization_margin,
             factorization_covariance_w=factorization_covariance_w,
-            fer_w=fer_w,
+            fer_w=train_weights["fer_w"],
             fer_fragmentation_w=fer_fragmentation_w,
             fer_correlation_w=fer_correlation_w,
             fer_balance_w=fer_balance_w,
@@ -6376,7 +6492,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             consolidation_balance_w=consolidation_balance_w,
             consolidation_anchor_w=consolidation_anchor_w,
             consolidation_fer_w=consolidation_fer_w,
-            discovery_w=discovery_w,
+            discovery_w=train_weights["discovery_w"],
             discovery_curiosity_w=discovery_curiosity_w,
             discovery_graph_w=discovery_graph_w,
             discovery_cycle_w=discovery_cycle_w,
@@ -6387,7 +6503,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             reanalysis_cycle_w=reanalysis_cycle_w,
             reanalysis_bridge_w=reanalysis_bridge_w,
             reanalysis_fer_w=reanalysis_fer_w,
-            gap_w=gap_w,
+            gap_w=train_weights["gap_w"],
             gap_temperature=gap_temperature,
             gap_self_loop_w=gap_self_loop_w,
             gap_transitive_steps=gap_transitive_steps,
@@ -6419,28 +6535,29 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             graph_cycle_transitive_w=graph_cycle_transitive_w,
             graph_cycle_target_power=graph_cycle_target_power,
             graph_cycle_consistency_w=graph_cycle_consistency_w,
-            bridge_w=bridge_w,
-            context_target_w=context_target_w, context_keep_p=context_keep_p,
+            bridge_w=train_weights["bridge_w"],
+            context_target_w=train_weights["context_target_w"],
+            context_keep_p=context_keep_p,
             context_target_temperature=context_target_temperature,
-            span_completion_w=span_completion_w,
+            span_completion_w=train_weights["span_completion_w"],
             span_mask_frac=span_mask_frac,
             span_completion_temperature=span_completion_temperature,
-            context_closure_w=context_closure_w,
+            context_closure_w=train_weights["context_closure_w"],
             context_closure_split_frac=context_closure_split_frac,
             context_closure_temperature=context_closure_temperature,
-            sequence_w=sequence_w, sequence_batch=sequence_batch,
+            sequence_w=train_weights["sequence_w"], sequence_batch=sequence_batch,
             sequence_temperature=sequence_temperature,
-            neighborhood_w=neighborhood_w,
+            neighborhood_w=train_weights["neighborhood_w"],
             neighborhood_batch=neighborhood_batch,
             neighborhood_probe_n=neighborhood_probe_n,
             neighborhood_refresh_steps=neighborhood_refresh_steps,
             neighborhood_temperature=neighborhood_temperature,
             neighborhood_margin=neighborhood_margin,
-            transition_w=transition_w,
+            transition_w=train_weights["transition_w"],
             transition_batch=transition_batch,
             transition_temperature=transition_temperature,
             transition_margin=transition_margin,
-            cluster_w=cluster_w,
+            cluster_w=train_weights["cluster_w"],
             cluster_batch=cluster_batch,
             cluster_probe_n=cluster_probe_n,
             cluster_refresh_steps=cluster_refresh_steps,
@@ -6454,6 +6571,20 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             replay_teacher_model=replay_teacher_model,
             replay_teacher_vocab=replay_teacher_vocab,
             replay_w=replay_w, replay_batch=replay_batch)
+        if self_teach_plan is not None:
+            model.reading_train_metrics = dict(
+                getattr(model, "reading_train_metrics", {})) | {
+                    "self_teach_w": float(study_self_teach_w),
+                    "self_teach_plan": self_teach_plan,
+                    "self_teach_base_weights": self_teach_base_weights,
+                    "self_teach_effective_weights": train_weights,
+                }
+            selection = {
+                "enabled": False,
+                "self_teach_w": float(study_self_teach_w),
+                "self_teach_reports": [self_teach_plan | {"round": 1}],
+                "self_teach_plan": self_teach_plan,
+            }
     after_bundle = reading_eval_bundle(
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
@@ -7237,6 +7368,29 @@ def selftest():
     assert helper_selection["accepted_update"] is False
     assert helper_selection["selected_round"] == 0
     assert helper_model.reading_study_reports == []
+    plain_self_teach_model, _plain_vocab = train_reading_concepts(
+        reading_records, steps=1, batch=2, d=32, layers=1, heads=4, lr=1e-4,
+        seed=12, device="cpu", log_every=10,
+        token_drop_p=0.1, token_replace_p=0.0,
+        latent_concept_slots=2, memory_size=8,
+        bridge_w=0.0, study_strategy="auto",
+        study_probe_n=2, study_hard_max=1, study_refresh_steps=1,
+        study_select_best=False, study_self_teach_w=0.05,
+        eval_n=0)
+    plain_self_teach_metrics = plain_self_teach_model.reading_train_metrics
+    assert plain_self_teach_metrics["self_teach_w"] == 0.05
+    assert plain_self_teach_metrics["self_teach_plan"]["enabled"] is True
+    assert plain_self_teach_metrics["selection"]["enabled"] is False
+    assert plain_self_teach_metrics["selection"]["self_teach_reports"]
+    plain_extra_sum = sum(
+        plain_self_teach_metrics["self_teach_plan"]["weight_extras"].values())
+    assert plain_extra_sum > 0.0
+    plain_weight_delta = sum(
+        plain_self_teach_metrics["self_teach_effective_weights"][key]
+        - plain_self_teach_metrics["self_teach_base_weights"][key]
+        for key in READING_SELF_TEACH_WEIGHT_KEYS)
+    assert math.isclose(
+        plain_weight_delta, plain_extra_sum, rel_tol=1e-6, abs_tol=1e-6)
     reading_replay_bank = build_reading_replay_bank(
         reading_records, study_reports=getattr(reading_model, "reading_study_reports", []),
         max_records=4)
@@ -7274,6 +7428,7 @@ def selftest():
             study_hard_max=1, study_refresh_steps=1,
             study_select_best=False, context_target_w=0.0,
             sequence_w=0.0, transition_w=0.0, replay_w=0.05,
+            study_self_teach_w=0.05,
             print_report=False)
         assert study_report["experiment"] == "text_raw_reading_checkpoint_study"
         assert study_report["checkpoint_experiment"] == "reading-selftest"
@@ -7290,10 +7445,16 @@ def selftest():
         assert study_report["before_replay"] is not None
         assert study_report["train_metrics"]["study_strategy"] == "gap"
         assert study_report["train_metrics"]["memory_active"] > 0
-        assert study_report["train_metrics"]["discovery_w"] == 0.05
+        assert study_report["train_metrics"]["discovery_w"] >= 0.05
         assert study_report["train_metrics"]["reanalysis_w"] == 0.05
-        assert study_report["train_metrics"]["gap_w"] == 0.05
+        assert study_report["train_metrics"]["gap_w"] >= 0.05
         assert study_report["train_metrics"]["replay_w"] == 0.05
+        assert study_report["selection"]["enabled"] is False
+        assert study_report["selection"]["self_teach_w"] == 0.05
+        assert study_report["train_metrics"]["self_teach_w"] == 0.05
+        assert study_report["train_metrics"]["self_teach_plan"]["enabled"] is True
+        assert sum(study_report["train_metrics"]["self_teach_plan"][
+            "weight_extras"].values()) > 0.0
         assert study_report["train_metrics"]["replay_records"] > 0
         assert math.isfinite(study_report["train_metrics"]["gap_loss"])
         _studied_model, studied_vocab, studied_payload = load_checkpoint(
