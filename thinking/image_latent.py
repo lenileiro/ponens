@@ -497,6 +497,16 @@ def size_curriculum_switch_step(flow_steps, frac=0.0):
     return min(steps, max(1, int(math.ceil(float(steps) * frac))))
 
 
+def fractional_active_steps(total_steps, frac=0.0, name="frac"):
+    frac = float(frac)
+    if frac < 0.0 or frac > 1.0:
+        raise ValueError(f"{name} must be in [0, 1]")
+    steps = int(total_steps)
+    if frac <= 0.0 or steps <= 0:
+        return 0
+    return min(steps, max(1, int(math.ceil(float(steps) * frac))))
+
+
 def size_curriculum_bucket_order(size_buckets):
     buckets = tuple(size_buckets)
     return tuple(sorted(
@@ -8965,6 +8975,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "flow_feature_align_w": float(ckpt.get(
             "flow_feature_align_w", report.get("flow_feature_align_w", 0.0))),
         "flow_repa_w": float(ckpt.get("flow_repa_w", report.get("flow_repa_w", 0.0))),
+        "flow_repa_frac": float(ckpt.get(
+            "flow_repa_frac", report.get("flow_repa_frac", 0.0)) or 0.0),
         "flow_repa_steps": int(ckpt.get(
             "flow_repa_steps", report.get("flow_repa_steps", 0)) or 0),
         "flow_self_repa_w": float(ckpt.get(
@@ -9748,6 +9760,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       image_feature_embed_dim=128,
                       flow_repa_w=0.0, flow_repa_steps=0, flow_repa_embed_dim=128,
                       flow_repa_mode="pooled", flow_repa_structure_w=0.0,
+                      flow_repa_frac=0.0,
                       flow_self_repa_w=0.0, flow_self_repa_steps=0,
                       flow_self_repa_embed_dim=128, flow_self_repa_mode="pooled",
                       flow_factorization_w=0.0,
@@ -9997,8 +10010,16 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_repa_structure_w = float(flow_repa_structure_w)
     if flow_repa_structure_w < 0.0:
         raise ValueError("flow_repa_structure_w must be non-negative")
+    flow_repa_steps = int(flow_repa_steps)
+    flow_repa_requested_steps = int(flow_repa_steps)
+    flow_repa_frac = float(flow_repa_frac)
+    if flow_repa_frac < 0.0 or flow_repa_frac > 1.0:
+        raise ValueError("flow_repa_frac must be in [0, 1]")
     if flow_repa_steps < 0:
         raise ValueError("flow_repa_steps must be non-negative")
+    if flow_repa_steps <= 0:
+        flow_repa_steps = fractional_active_steps(
+            flow_steps, flow_repa_frac, name="flow_repa_frac")
     if flow_self_repa_w < 0.0:
         raise ValueError("flow_self_repa_w must be non-negative")
     if flow_self_repa_steps < 0:
@@ -11229,6 +11250,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "image_feature_aligner": image_feature_aligner is not None,
         "flow_repa_w": float(flow_repa_w),
         "flow_repa_structure_w": float(flow_repa_structure_w),
+        "flow_repa_frac": float(flow_repa_frac),
+        "flow_repa_requested_steps": int(flow_repa_requested_steps),
         "flow_repa_structure_active_steps": (
             int(flow_steps)
             if flow_repa_structure_w > 0.0 and int(flow_repa_steps) == 0
@@ -11646,6 +11669,7 @@ def selftest():
             flow_frequency_w=0.01, flow_straightness_w=0.01,
             flow_endpoint_stats_w=0.01,
             flow_repa_w=0.01, flow_repa_structure_w=0.01,
+            flow_repa_frac=1.0,
             flow_repa_mode="auto",
             flow_factorization_w=0.01,
             flow_multiscale_w=0.01, flow_multiscale_scales=(2,),
@@ -11674,6 +11698,8 @@ def selftest():
         assert math.isclose(report["flow_endpoint_stats_w"], 0.01)
         assert "flow_endpoint_stats_loss" in report["last_flow"]
         assert math.isclose(report["flow_repa_structure_w"], 0.01)
+        assert math.isclose(report["flow_repa_frac"], 1.0)
+        assert report["flow_repa_steps"] == 1
         assert "flow_repa_structure_loss" in report["last_flow"]
         assert report["flow_repa_token_sequences"] is True
         assert math.isclose(report["flow_straightness_w"], 0.01)
@@ -11887,6 +11913,10 @@ def main(argv=None):
                     dest="flow_repa_structure_w",
                     help=("pairwise image-token structure alignment weight for "
                           "REPA hidden states"))
+    ap.add_argument("--flow-repa-frac", type=float, default=0.0,
+                    dest="flow_repa_frac",
+                    help=("fraction of flow steps to keep external REPA active; "
+                          "--flow-repa-steps overrides when positive"))
     ap.add_argument("--flow-self-repa-w", type=float, default=0.0,
                     dest="flow_self_repa_w",
                     help=("no-extra-data REPA-style hidden/clean-latent alignment "
@@ -12467,6 +12497,8 @@ def main(argv=None):
         ap.error("--flow-repa-w must be non-negative")
     if args.flow_repa_structure_w < 0.0:
         ap.error("--flow-repa-structure-w must be non-negative")
+    if args.flow_repa_frac < 0.0 or args.flow_repa_frac > 1.0:
+        ap.error("--flow-repa-frac must be in [0, 1]")
     if args.flow_self_repa_w < 0.0:
         ap.error("--flow-self-repa-w must be non-negative")
     if args.flow_self_repa_steps < 0:
@@ -12804,6 +12836,7 @@ def main(argv=None):
         flow_repa_embed_dim=args.flow_repa_embed_dim,
         flow_repa_mode=args.flow_repa_mode,
         flow_repa_structure_w=args.flow_repa_structure_w,
+        flow_repa_frac=args.flow_repa_frac,
         flow_self_repa_w=args.flow_self_repa_w,
         flow_self_repa_steps=args.flow_self_repa_steps,
         flow_self_repa_embed_dim=args.flow_self_repa_embed_dim,
@@ -13068,7 +13101,10 @@ def main(argv=None):
         "image_feature_embed_dim": args.image_feature_embed_dim,
         "flow_repa_w": args.flow_repa_w,
         "flow_repa_structure_w": args.flow_repa_structure_w,
-        "flow_repa_steps": args.flow_repa_steps,
+        "flow_repa_frac": report.get("flow_repa_frac", args.flow_repa_frac),
+        "flow_repa_requested_steps": report.get(
+            "flow_repa_requested_steps", args.flow_repa_steps),
+        "flow_repa_steps": report.get("flow_repa_steps", args.flow_repa_steps),
         "flow_repa_embed_dim": args.flow_repa_embed_dim,
         "flow_repa_mode": args.flow_repa_mode,
         "flow_self_repa_w": args.flow_self_repa_w,

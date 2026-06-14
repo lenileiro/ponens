@@ -10,6 +10,7 @@ Auth: export RUNPOD_API_KEY.  Example: RUNPOD_API_KEY=... python runpod/launch_t
 """
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -512,6 +513,7 @@ def apply_image_quality_preset(args):
     args.image_flow_repa_w = max(float(args.image_flow_repa_w), 0.05)
     args.image_flow_repa_structure_w = max(
         float(args.image_flow_repa_structure_w), 0.02 if hq else 0.01)
+    args.image_flow_repa_frac = max(float(args.image_flow_repa_frac), 0.6 if hq else 0.5)
     args.image_flow_repa_mode = "auto"
     args.image_flow_self_repa_w = max(float(args.image_flow_self_repa_w), 0.05)
     args.image_flow_self_repa_mode = "auto"
@@ -987,6 +989,7 @@ def payload(args):
                      f"--flow-repa-embed-dim {args.image_flow_repa_embed_dim} "
                      f"--flow-repa-mode {args.image_flow_repa_mode} "
                      f"--flow-repa-structure-w {args.image_flow_repa_structure_w} "
+                     f"--flow-repa-frac {args.image_flow_repa_frac} "
                      f"--flow-self-repa-w {args.image_flow_self_repa_w} "
                      f"--flow-self-repa-steps {args.image_flow_self_repa_steps} "
                      f"--flow-self-repa-embed-dim {args.image_flow_self_repa_embed_dim} "
@@ -2334,6 +2337,10 @@ def main():
                     dest="image_flow_repa_structure_w",
                     help=("pairwise image-token structure alignment weight for image "
                           "flow REPA hidden states"))
+    ap.add_argument("--image-flow-repa-frac", type=float, default=0.0,
+                    dest="image_flow_repa_frac",
+                    help=("fraction of image flow steps to keep external REPA active; "
+                          "--image-flow-repa-steps overrides when positive"))
     ap.add_argument("--image-flow-self-repa-w", type=float, default=0.0,
                     dest="image_flow_self_repa_w",
                     help=("no-extra-data hidden/clean-latent self-REPA weight "
@@ -3382,6 +3389,12 @@ def main():
         base_steps = int(args.train_steps or 800)
         distill_steps = max(1, int(float(base_steps) * float(args.image_flow_distill_frac)))
         args.image_flow_distill_steps = max(int(args.image_flow_distill_steps), distill_steps)
+    if args.image_flow_repa_frac < 0.0 or args.image_flow_repa_frac > 1.0:
+        sys.exit("ERROR: --image-flow-repa-frac must be in [0, 1]")
+    if args.image_flow_repa_frac > 0.0 and int(args.image_flow_repa_steps) <= 0:
+        base_steps = int(args.train_steps or 800)
+        repa_steps = max(1, int(math.ceil(float(base_steps) * float(args.image_flow_repa_frac))))
+        args.image_flow_repa_steps = repa_steps
     if args.vision_understanding and not (args.image_manifest or args.image_fetch):
         sys.exit("ERROR: --vision-understanding requires --image-manifest or --image-fetch")
     if args.image_latent and not (args.image_manifest or args.image_fetch):
