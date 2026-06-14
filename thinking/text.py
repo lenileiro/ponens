@@ -1447,6 +1447,50 @@ def reading_latent_memory_loss(model, txt, feature_dropout=0.1,
         slots, temperature=temperature, balance_w=balance_w)
 
 
+def reading_latent_memory_consolidation_loss(
+        model, txt, pad, unk, token_drop_p=0.15, token_replace_p=0.05,
+        feature_dropout=0.1, temperature=0.1, balance_w=0.0,
+        anchor_w=1.0, fer_w=0.0, fer_fragmentation_w=1.0,
+        fer_correlation_w=1.0, fer_balance_w=0.1):
+    zero = torch.tensor(0.0, device=txt.device)
+    metrics = {"memory_loss": zero, "anchor_loss": zero, "fer_loss": zero,
+               "nearest_cosine": zero, "memory_active": 0, "skipped": True}
+    memory = getattr(model, "latent_concept_memory", None)
+    if getattr(model, "latent_concepts", None) is None or memory is None:
+        return zero, metrics
+    active = memory.active()
+    active_n = int(active.shape[0])
+    metrics["memory_active"] = active_n
+    if active_n <= 0:
+        return zero, metrics
+    view = corrupt_reading_tokens(
+        txt, pad, unk, token_drop_p=token_drop_p,
+        token_replace_p=token_replace_p)
+    slots = model.latent_concept_states(
+        view, feature_dropout=feature_dropout, project=True)
+    memory_loss = model.latent_concept_memory_loss(
+        slots, temperature=temperature, balance_w=balance_w)
+    rows = F.normalize(slots.reshape(-1, slots.shape[-1]), dim=-1)
+    prototypes = F.normalize(
+        active.detach().to(device=rows.device, dtype=rows.dtype), dim=-1)
+    sims = rows.matmul(prototypes.t())
+    nearest = prototypes[sims.detach().argmax(-1)]
+    nearest_cosine = (rows * nearest).sum(-1)
+    anchor_loss = (1.0 - nearest_cosine).mean()
+    if fer_w:
+        fer_loss = latent_concept_fer_loss(
+            slots, fragmentation_w=fer_fragmentation_w,
+            correlation_w=fer_correlation_w, balance_w=fer_balance_w)
+    else:
+        fer_loss = memory_loss * 0.0
+    loss = memory_loss + float(anchor_w) * anchor_loss + float(fer_w) * fer_loss
+    metrics = {"memory_loss": memory_loss, "anchor_loss": anchor_loss,
+               "fer_loss": fer_loss,
+               "nearest_cosine": nearest_cosine.detach().mean(),
+               "memory_active": active_n, "skipped": False}
+    return loss, metrics
+
+
 def reading_latent_association_loss(model, txt, feature_dropout=0.1,
                                     temperature=0.1, target_power=1.0,
                                     self_loop_w=0.05, transitive_steps=1,
@@ -3448,6 +3492,10 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          memory_w=0.05, memory_size=64,
                          memory_temperature=0.1, memory_momentum=0.95,
                          memory_balance_w=0.01,
+                         consolidation_w=0.0, consolidation_temperature=0.1,
+                         consolidation_balance_w=0.01,
+                         consolidation_anchor_w=1.0,
+                         consolidation_fer_w=0.0,
                          association_w=0.05, association_temperature=0.1,
                          association_decay=0.99, association_target_power=1.0,
                          association_self_loop_w=0.05,
@@ -3521,6 +3569,16 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading memory momentum must be in [0, 1)")
     if float(memory_balance_w) < 0.0:
         raise ValueError("reading memory balance weight must be non-negative")
+    if float(consolidation_w) < 0.0:
+        raise ValueError("reading consolidation weight must be non-negative")
+    if float(consolidation_temperature) <= 0.0:
+        raise ValueError("reading consolidation temperature must be positive")
+    if float(consolidation_balance_w) < 0.0:
+        raise ValueError("reading consolidation balance weight must be non-negative")
+    if float(consolidation_anchor_w) < 0.0:
+        raise ValueError("reading consolidation anchor weight must be non-negative")
+    if float(consolidation_fer_w) < 0.0:
+        raise ValueError("reading consolidation FER weight must be non-negative")
     if float(association_w) < 0.0:
         raise ValueError("reading association loss weight must be non-negative")
     if float(association_temperature) <= 0.0:
@@ -3642,6 +3700,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading graph cycle requires latent concept memory")
     if bridge_w and getattr(model, "latent_concept_memory", None) is None:
         raise ValueError("reading bridge loss requires latent concept memory")
+    if consolidation_w and getattr(model, "latent_concept_memory", None) is None:
+        raise ValueError("reading consolidation requires latent concept memory")
     if (study_strategy in READING_MEMORY_STUDY_STRATEGIES
             and getattr(model, "latent_concept_memory", None) is None):
         raise ValueError(
@@ -3681,6 +3741,13 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_memory = 0.0
     last_memory_updates = 0
     last_transition_updates = 0
+    last_consolidation = 0.0
+    last_consolidation_memory = 0.0
+    last_consolidation_anchor = 0.0
+    last_consolidation_fer = 0.0
+    last_consolidation_nearest = 0.0
+    last_consolidation_memory_active = 0
+    last_consolidation_skipped = True
     last_association = 0.0
     last_composition = 0.0
     last_graph_predict = 0.0
@@ -3896,6 +3963,34 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 temperature=memory_temperature,
                 balance_w=memory_balance_w)
             if memory_w else view_loss * 0.0)
+        if consolidation_w:
+            consolidation_loss, consolidation_metrics = (
+                reading_latent_memory_consolidation_loss(
+                    model, txt, vocab.pad, vocab.unk,
+                    token_drop_p=token_drop_p,
+                    token_replace_p=token_replace_p,
+                    feature_dropout=feature_dropout,
+                    temperature=consolidation_temperature,
+                    balance_w=consolidation_balance_w,
+                    anchor_w=consolidation_anchor_w,
+                    fer_w=consolidation_fer_w,
+                    fer_fragmentation_w=fer_fragmentation_w,
+                    fer_correlation_w=fer_correlation_w,
+                    fer_balance_w=fer_balance_w))
+        else:
+            consolidation_loss = view_loss * 0.0
+            zero_metric = view_loss.detach() * 0.0
+            memory = getattr(model, "latent_concept_memory", None)
+            consolidation_metrics = {
+                "memory_loss": zero_metric,
+                "anchor_loss": zero_metric,
+                "fer_loss": zero_metric,
+                "nearest_cosine": zero_metric,
+                "memory_active": int(
+                    getattr(memory, "filled", torch.zeros((), dtype=torch.long)).item())
+                if memory is not None else 0,
+                "skipped": True,
+            }
         association_loss = (
             reading_latent_association_loss(
                 model, txt, feature_dropout=feature_dropout,
@@ -3999,6 +4094,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         loss = (view_loss + float(factorization_w) * factorization_loss
                 + float(fer_w) * fer_loss
                 + float(memory_w) * memory_loss
+                + float(consolidation_w) * consolidation_loss
                 + float(association_w) * association_loss
                 + float(composition_w) * composition_loss
                 + float(graph_predict_w) * graph_predict_loss
@@ -4045,6 +4141,18 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_fer_slot_correlation = float(fer_metrics["slot_correlation"].detach())
         last_fer_slot_imbalance = float(fer_metrics["slot_imbalance"].detach())
         last_memory = float(memory_loss.detach())
+        last_consolidation = float(consolidation_loss.detach())
+        last_consolidation_memory = float(
+            consolidation_metrics["memory_loss"].detach())
+        last_consolidation_anchor = float(
+            consolidation_metrics["anchor_loss"].detach())
+        last_consolidation_fer = float(
+            consolidation_metrics["fer_loss"].detach())
+        last_consolidation_nearest = float(
+            consolidation_metrics["nearest_cosine"].detach())
+        last_consolidation_memory_active = int(
+            consolidation_metrics["memory_active"])
+        last_consolidation_skipped = bool(consolidation_metrics["skipped"])
         last_association = float(association_loss.detach())
         last_composition = float(composition_loss.detach())
         last_graph_predict = float(graph_predict_loss.detach())
@@ -4062,6 +4170,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                   f"factor {last_factorization:.3f} "
                   f"fer {last_fer:.3f} "
                   f"memory {last_memory:.3f} "
+                  f"consolidate {last_consolidation:.3f} "
                   f"assoc {last_association:.3f} "
                   f"compose {last_composition:.3f} "
                   f"graph-predict {last_graph_predict:.3f} "
@@ -4155,6 +4264,18 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "memory_temperature": float(memory_temperature),
         "memory_momentum": float(memory_momentum),
         "memory_balance_w": float(memory_balance_w),
+        "consolidation_loss": last_consolidation,
+        "consolidation_w": float(consolidation_w),
+        "consolidation_temperature": float(consolidation_temperature),
+        "consolidation_balance_w": float(consolidation_balance_w),
+        "consolidation_anchor_w": float(consolidation_anchor_w),
+        "consolidation_fer_w": float(consolidation_fer_w),
+        "consolidation_memory_loss": last_consolidation_memory,
+        "consolidation_anchor_loss": last_consolidation_anchor,
+        "consolidation_fer_loss": last_consolidation_fer,
+        "consolidation_nearest_cosine": last_consolidation_nearest,
+        "consolidation_memory_active": int(last_consolidation_memory_active),
+        "consolidation_skipped": bool(last_consolidation_skipped),
         "association_loss": last_association,
         "association_w": float(association_w),
         "association_temperature": float(association_temperature),
@@ -4291,6 +4412,9 @@ def fit_reading_concepts_select_best(
         memory_w=0.05, memory_size=64,
         memory_temperature=0.1, memory_momentum=0.95,
         memory_balance_w=0.01,
+        consolidation_w=0.0, consolidation_temperature=0.1,
+        consolidation_balance_w=0.01, consolidation_anchor_w=1.0,
+        consolidation_fer_w=0.0,
         association_w=0.05, association_temperature=0.1,
         association_decay=0.99, association_target_power=1.0,
         association_self_loop_w=0.05, association_transitive_steps=2,
@@ -4436,6 +4560,11 @@ def fit_reading_concepts_select_best(
             memory_temperature=memory_temperature,
             memory_momentum=memory_momentum,
             memory_balance_w=memory_balance_w,
+            consolidation_w=consolidation_w,
+            consolidation_temperature=consolidation_temperature,
+            consolidation_balance_w=consolidation_balance_w,
+            consolidation_anchor_w=consolidation_anchor_w,
+            consolidation_fer_w=consolidation_fer_w,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -4635,6 +4764,10 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            memory_w=0.05, memory_size=64,
                            memory_temperature=0.1, memory_momentum=0.95,
                            memory_balance_w=0.01,
+                           consolidation_w=0.0, consolidation_temperature=0.1,
+                           consolidation_balance_w=0.01,
+                           consolidation_anchor_w=1.0,
+                           consolidation_fer_w=0.0,
                            association_w=0.05, association_temperature=0.1,
                            association_decay=0.99, association_target_power=1.0,
                            association_self_loop_w=0.05,
@@ -4716,6 +4849,11 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             memory_temperature=memory_temperature,
             memory_momentum=memory_momentum,
             memory_balance_w=memory_balance_w,
+            consolidation_w=consolidation_w,
+            consolidation_temperature=consolidation_temperature,
+            consolidation_balance_w=consolidation_balance_w,
+            consolidation_anchor_w=consolidation_anchor_w,
+            consolidation_fer_w=consolidation_fer_w,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -4794,6 +4932,11 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         memory_temperature=memory_temperature,
         memory_momentum=memory_momentum,
         memory_balance_w=memory_balance_w,
+        consolidation_w=consolidation_w,
+        consolidation_temperature=consolidation_temperature,
+        consolidation_balance_w=consolidation_balance_w,
+        consolidation_anchor_w=consolidation_anchor_w,
+        consolidation_fer_w=consolidation_fer_w,
         association_w=association_w,
         association_temperature=association_temperature,
         association_decay=association_decay,
@@ -4865,6 +5008,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          memory_w=0.05, memory_size=64,
                          memory_temperature=0.1, memory_momentum=0.95,
                          memory_balance_w=0.01,
+                         consolidation_w=0.0, consolidation_temperature=0.1,
+                         consolidation_balance_w=0.01,
+                         consolidation_anchor_w=1.0,
+                         consolidation_fer_w=0.0,
                          association_w=0.05, association_temperature=0.1,
                          association_decay=0.99, association_target_power=1.0,
                          association_self_loop_w=0.05,
@@ -4952,6 +5099,11 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             memory_temperature=memory_temperature,
             memory_momentum=memory_momentum,
             memory_balance_w=memory_balance_w,
+            consolidation_w=consolidation_w,
+            consolidation_temperature=consolidation_temperature,
+            consolidation_balance_w=consolidation_balance_w,
+            consolidation_anchor_w=consolidation_anchor_w,
+            consolidation_fer_w=consolidation_fer_w,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -5031,6 +5183,11 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             memory_temperature=memory_temperature,
             memory_momentum=memory_momentum,
             memory_balance_w=memory_balance_w,
+            consolidation_w=consolidation_w,
+            consolidation_temperature=consolidation_temperature,
+            consolidation_balance_w=consolidation_balance_w,
+            consolidation_anchor_w=consolidation_anchor_w,
+            consolidation_fer_w=consolidation_fer_w,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -5136,6 +5293,11 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "memory_temperature": float(memory_temperature),
               "memory_momentum": float(memory_momentum),
               "memory_balance_w": float(memory_balance_w),
+              "consolidation_w": float(consolidation_w),
+              "consolidation_temperature": float(consolidation_temperature),
+              "consolidation_balance_w": float(consolidation_balance_w),
+              "consolidation_anchor_w": float(consolidation_anchor_w),
+              "consolidation_fer_w": float(consolidation_fer_w),
               "association_w": float(association_w),
               "association_temperature": float(association_temperature),
               "association_decay": float(association_decay),
@@ -5366,6 +5528,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              memory_w=0.05, memory_size=64,
                              memory_temperature=0.1, memory_momentum=0.95,
                              memory_balance_w=0.01,
+                             consolidation_w=0.0, consolidation_temperature=0.1,
+                             consolidation_balance_w=0.01,
+                             consolidation_anchor_w=1.0,
+                             consolidation_fer_w=0.0,
                              association_w=0.05, association_temperature=0.1,
                              association_decay=0.99, association_target_power=1.0,
                              association_self_loop_w=0.05,
@@ -5475,6 +5641,11 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             memory_temperature=memory_temperature,
             memory_momentum=memory_momentum,
             memory_balance_w=memory_balance_w,
+            consolidation_w=consolidation_w,
+            consolidation_temperature=consolidation_temperature,
+            consolidation_balance_w=consolidation_balance_w,
+            consolidation_anchor_w=consolidation_anchor_w,
+            consolidation_fer_w=consolidation_fer_w,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -5558,6 +5729,11 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             memory_temperature=memory_temperature,
             memory_momentum=memory_momentum,
             memory_balance_w=memory_balance_w,
+            consolidation_w=consolidation_w,
+            consolidation_temperature=consolidation_temperature,
+            consolidation_balance_w=consolidation_balance_w,
+            consolidation_anchor_w=consolidation_anchor_w,
+            consolidation_fer_w=consolidation_fer_w,
             association_w=association_w,
             association_temperature=association_temperature,
             association_decay=association_decay,
@@ -5681,6 +5857,11 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "memory_temperature": float(memory_temperature),
               "memory_momentum": float(memory_momentum),
               "memory_balance_w": float(memory_balance_w),
+              "consolidation_w": float(consolidation_w),
+              "consolidation_temperature": float(consolidation_temperature),
+              "consolidation_balance_w": float(consolidation_balance_w),
+              "consolidation_anchor_w": float(consolidation_anchor_w),
+              "consolidation_fer_w": float(consolidation_fer_w),
               "association_w": float(association_w),
               "association_temperature": float(association_temperature),
               "association_decay": float(association_decay),
@@ -7314,6 +7495,15 @@ def selftest():
     assert math.isfinite(seq_study_report["mean_sequence_surprise"])
     assert torch.isfinite(reading_latent_memory_loss(
         reading_model, reading_txt, feature_dropout=0.1))
+    consolidation_loss, consolidation_metrics = (
+        reading_latent_memory_consolidation_loss(
+            reading_model, reading_txt, reading_vocab.pad, reading_vocab.unk,
+            token_drop_p=0.1, token_replace_p=0.0, feature_dropout=0.1,
+            anchor_w=1.0, fer_w=0.1))
+    assert torch.isfinite(consolidation_loss)
+    assert consolidation_metrics["skipped"] is False
+    assert consolidation_metrics["memory_active"] > 0
+    assert torch.isfinite(consolidation_metrics["anchor_loss"])
     assert torch.isfinite(reading_latent_association_loss(
         reading_model, reading_txt, feature_dropout=0.1,
         transitive_steps=2, transitive_w=0.1))
@@ -7400,11 +7590,17 @@ def selftest():
         study_hard_max=2, study_refresh_steps=1, context_target_w=0.1,
         context_keep_p=0.5, memory_size=8, composition_w=0.1, graph_predict_w=0.1,
         graph_cycle_w=0.1, bridge_w=0.1, fer_w=0.1,
+        consolidation_w=0.1, consolidation_fer_w=0.1,
         sequence_w=0.1, sequence_batch=2, sequence_temperature=0.1,
         neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2,
         transition_w=0.1, transition_batch=2,
         cluster_w=0.1, cluster_batch=4, cluster_probe_n=4)
     assert reading_model.reading_train_metrics["memory_active"] > 0
+    assert reading_model.reading_train_metrics["consolidation_w"] == 0.1
+    assert reading_model.reading_train_metrics["consolidation_fer_w"] == 0.1
+    assert reading_model.reading_train_metrics["consolidation_skipped"] is False
+    assert math.isfinite(reading_model.reading_train_metrics[
+        "consolidation_anchor_loss"])
     assert (reading_model.reading_train_metrics["study_strategy_requested"]
             == "discovery")
     assert reading_model.reading_train_metrics["study_strategy"] == "discovery"
@@ -7544,6 +7740,11 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-memory-temperature", type=float, default=0.1)
     ap.add_argument("--reading-memory-momentum", type=float, default=0.95)
     ap.add_argument("--reading-memory-balance-w", type=float, default=0.01)
+    ap.add_argument("--reading-consolidation-w", type=float, default=0.0)
+    ap.add_argument("--reading-consolidation-temperature", type=float, default=0.1)
+    ap.add_argument("--reading-consolidation-balance-w", type=float, default=0.01)
+    ap.add_argument("--reading-consolidation-anchor-w", type=float, default=1.0)
+    ap.add_argument("--reading-consolidation-fer-w", type=float, default=0.0)
     ap.add_argument("--reading-association-w", type=float, default=0.05)
     ap.add_argument("--reading-association-temperature", type=float, default=0.1)
     ap.add_argument("--reading-association-decay", type=float, default=0.99)
@@ -7624,6 +7825,11 @@ def _reading_kwargs(args):
                 memory_temperature=args.reading_memory_temperature,
                 memory_momentum=args.reading_memory_momentum,
                 memory_balance_w=args.reading_memory_balance_w,
+                consolidation_w=args.reading_consolidation_w,
+                consolidation_temperature=args.reading_consolidation_temperature,
+                consolidation_balance_w=args.reading_consolidation_balance_w,
+                consolidation_anchor_w=args.reading_consolidation_anchor_w,
+                consolidation_fer_w=args.reading_consolidation_fer_w,
                 association_w=args.reading_association_w,
                 association_temperature=args.reading_association_temperature,
                 association_decay=args.reading_association_decay,

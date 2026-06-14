@@ -267,6 +267,14 @@ def text_reading_cmd(args, PY):
         f"--reading-memory-temperature {args.reading_memory_temperature} "
         f"--reading-memory-momentum {args.reading_memory_momentum} "
         f"--reading-memory-balance-w {args.reading_memory_balance_w} "
+        f"--reading-consolidation-w {args.reading_consolidation_w} "
+        f"--reading-consolidation-temperature "
+        f"{args.reading_consolidation_temperature} "
+        f"--reading-consolidation-balance-w "
+        f"{args.reading_consolidation_balance_w} "
+        f"--reading-consolidation-anchor-w "
+        f"{args.reading_consolidation_anchor_w} "
+        f"--reading-consolidation-fer-w {args.reading_consolidation_fer_w} "
         f"--reading-association-w {args.reading_association_w} "
         f"--reading-association-temperature {args.reading_association_temperature} "
         f"--reading-association-decay {args.reading_association_decay} "
@@ -1724,6 +1732,16 @@ def main():
                     dest="reading_memory_momentum")
     ap.add_argument("--reading-memory-balance-w", type=float, default=0.01,
                     dest="reading_memory_balance_w")
+    ap.add_argument("--reading-consolidation-w", type=float, default=0.0,
+                    dest="reading_consolidation_w")
+    ap.add_argument("--reading-consolidation-temperature", type=float, default=0.1,
+                    dest="reading_consolidation_temperature")
+    ap.add_argument("--reading-consolidation-balance-w", type=float, default=0.01,
+                    dest="reading_consolidation_balance_w")
+    ap.add_argument("--reading-consolidation-anchor-w", type=float, default=1.0,
+                    dest="reading_consolidation_anchor_w")
+    ap.add_argument("--reading-consolidation-fer-w", type=float, default=0.0,
+                    dest="reading_consolidation_fer_w")
     ap.add_argument("--reading-association-w", type=float, default=0.05,
                     dest="reading_association_w")
     ap.add_argument("--reading-association-temperature", type=float,
@@ -3125,6 +3143,11 @@ def main():
             "--reading-memory-w": args.reading_memory_w,
             "--reading-memory-size": args.reading_memory_size,
             "--reading-memory-balance-w": args.reading_memory_balance_w,
+            "--reading-consolidation-w": args.reading_consolidation_w,
+            "--reading-consolidation-balance-w": (
+                args.reading_consolidation_balance_w),
+            "--reading-consolidation-anchor-w": args.reading_consolidation_anchor_w,
+            "--reading-consolidation-fer-w": args.reading_consolidation_fer_w,
             "--reading-association-w": args.reading_association_w,
             "--reading-association-self-loop-w": (
                 args.reading_association_self_loop_w),
@@ -3200,6 +3223,8 @@ def main():
                 args.reading_context_target_temperature),
             "--reading-sequence-temperature": args.reading_sequence_temperature,
             "--reading-memory-temperature": args.reading_memory_temperature,
+            "--reading-consolidation-temperature": (
+                args.reading_consolidation_temperature),
             "--reading-association-temperature": args.reading_association_temperature,
             "--reading-composition-temperature": args.reading_composition_temperature,
             "--reading-graph-predict-temperature": (
