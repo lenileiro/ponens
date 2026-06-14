@@ -10,8 +10,10 @@ multimodal bridge.
 The current bet is that language mastery should come from reading, latent structure, replay,
 reanalysis, self-generated memory gaps, graph-closure insight, partial-context closure surprise,
 and cross-modal concept pressure, not from hand-authored task harnesses or templated phrasing
-rules. The code keeps model inputs manifest-driven: datasets provide text, feature views, image
-records, and optional target tokens; model code learns the representations.
+rules. Raw-reading checkpoint continuation reuses the model's own replay bank under the mastery
+profile, so new reading can update weights without discarding earlier concepts. The code keeps
+model inputs manifest-driven: datasets provide text, feature views, image records, and optional
+target tokens; model code learns the representations.
 
 ## What's here
 
@@ -219,9 +221,9 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --steps 4 --batch 16 --d 96 --layers 2 --heads 4 \
     --latent-concept-slots 6 --latent-concept-layers 1 \
     --reading-max-tokens 96 --reading-min-tokens 8 --reading-eval-n 32 \
+    --reading-objective-profile mastery \
     --reading-study-strategy auto --reading-study-probe-n 48 \
     --reading-study-hard-max 24 --reading-study-refresh-steps 1 \
-    --reading-study-self-teach-w 0.05 \
     --reading-memory-size 64 --reading-memory-w 0.05 \
     --reading-association-w 0.05 --reading-association-transitive-steps 3 \
     --reading-association-transitive-w 0.25 \
@@ -244,7 +246,7 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --reading-checkpoint runs/text_raw_reading_discovery_study_smoke.pt \
     --reading-out-checkpoint runs/text_raw_reading_discovery_study_continued.pt \
     --steps 4 --batch 16 --reading-study-strategy auto \
-    --reading-study-self-teach-w 0.05 \
+    --reading-objective-profile mastery \
     --reading-memory-size 64 --reading-memory-w 0.05 \
     --reading-association-w 0.05 --reading-gap-w 0.05 \
     --out runs/text_raw_reading_discovery_study_continued.json

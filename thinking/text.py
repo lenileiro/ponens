@@ -2111,6 +2111,40 @@ READING_SCORE_METRICS = (
 READING_DISCOVERY_SIGNALS = (
     "view", "context", "span", "closure", "sequence", "neighborhood", "cluster",
     "fer", "bridge")
+READING_OBJECTIVE_PROFILES = ("manual", "mastery")
+READING_MASTERY_OBJECTIVE_FLOORS = {
+    "factorization_w": 0.05,
+    "fer_w": 0.05,
+    "memory_w": 0.05,
+    "discovery_w": 0.05,
+    "reanalysis_w": 0.05,
+    "gap_w": 0.05,
+    "association_w": 0.05,
+    "composition_w": 0.05,
+    "graph_predict_w": 0.10,
+    "graph_cycle_w": 0.05,
+    "bridge_w": 0.05,
+    "context_target_w": 0.10,
+    "span_completion_w": 0.05,
+    "context_closure_w": 0.05,
+    "sequence_w": 0.05,
+    "neighborhood_w": 0.05,
+    "transition_w": 0.05,
+    "cluster_w": 0.05,
+    "study_self_teach_w": 0.05,
+}
+READING_MASTERY_STUDY_FLOORS = {
+    "study_rounds": 3,
+    "study_score_patience": 2,
+    "study_score_target": 0.85,
+}
+READING_MASTERY_CHECKPOINT_FLOORS = {
+    "replay_w": 0.05,
+    "replay_retention_w": 0.25,
+}
+READING_MASTERY_PROFILE_FLOORS = (
+    dict(READING_MASTERY_OBJECTIVE_FLOORS)
+    | dict(READING_MASTERY_STUDY_FLOORS))
 READING_STUDY_STRATEGIES = (
     "random", "errors", "fer", "curiosity", "sequence", "closure", "graph",
     "cycle", "gap", "discovery", "auto")
@@ -2121,6 +2155,8 @@ READING_POOL_STUDY_STRATEGIES = (
 READING_TRANSITION_STUDY_STRATEGIES = (
     "sequence", "graph", "cycle", "gap", "discovery")
 READING_GRAPH_READY_STUDY_STRATEGIES = ("graph", "cycle", "gap")
+READING_BRIDGE_INSIGHT_STUDY_STRATEGIES = (
+    "curiosity", "graph", "cycle", "gap", "discovery")
 READING_SELF_TEACH_SCORE_KEYS = {
     "view": "view_score",
     "context": "context_score",
@@ -2143,6 +2179,17 @@ READING_SELF_TEACH_SIGNAL_OBJECTIVES = {
     "fer": ("fer_w",),
     "bridge": ("bridge_w", "discovery_w", "gap_w"),
 }
+READING_SELF_TEACH_SIGNAL_STUDY_STRATEGIES = {
+    "view": "errors",
+    "context": "closure",
+    "span": "closure",
+    "closure": "closure",
+    "sequence": "sequence",
+    "neighborhood": "discovery",
+    "cluster": "discovery",
+    "fer": "fer",
+    "bridge": "discovery",
+}
 READING_SELF_TEACH_WEIGHT_KEYS = tuple(dict.fromkeys(
     key
     for keys in READING_SELF_TEACH_SIGNAL_OBJECTIVES.values()
@@ -2160,6 +2207,113 @@ def resolve_reading_study_strategy(study_strategy, model):
                 if getattr(model, "latent_concept_memory", None) is not None
                 else "closure")
     return requested
+
+
+def reading_self_teach_study_strategy(self_teach_plan, requested_strategy,
+                                      resolved_strategy, model):
+    """Route auto-study rounds to the weakest evaluated learning signal."""
+    if str(requested_strategy) != "auto":
+        return resolved_strategy
+    signal = (self_teach_plan or {}).get("top_signal")
+    candidate = READING_SELF_TEACH_SIGNAL_STUDY_STRATEGIES.get(signal)
+    if candidate is None:
+        return resolved_strategy
+    if (candidate in READING_MEMORY_STUDY_STRATEGIES
+            and getattr(model, "latent_concept_memory", None) is None):
+        return resolved_strategy
+    return candidate
+
+
+def reading_objective_profile_kwargs(objective_profile="manual", **kwargs):
+    """Apply schema-free reading objective floors for a training posture."""
+    objective_profile = str(objective_profile)
+    if objective_profile not in READING_OBJECTIVE_PROFILES:
+        raise ValueError(f"unknown reading objective profile {objective_profile!r}")
+    effective = dict(kwargs)
+    updates = {}
+    if objective_profile == "mastery":
+        missing = [
+            key for key in READING_MASTERY_PROFILE_FLOORS
+            if key not in effective]
+        if missing:
+            raise ValueError(
+                "missing reading objective profile weights: "
+                + ", ".join(sorted(missing)))
+        for key, floor in READING_MASTERY_PROFILE_FLOORS.items():
+            before_raw = effective[key]
+            before = float(before_raw)
+            after_raw = max(before, float(floor))
+            after = (int(after_raw)
+                     if isinstance(before_raw, int)
+                     and isinstance(floor, int)
+                     else float(after_raw))
+            effective[key] = after
+            if float(after) != before:
+                updates[key] = {"from": before_raw, "to": after}
+    report = {
+        "profile": objective_profile,
+        "enabled": objective_profile != "manual",
+        "floors": dict(READING_MASTERY_PROFILE_FLOORS)
+        if objective_profile == "mastery" else {},
+        "objective_floors": dict(READING_MASTERY_OBJECTIVE_FLOORS)
+        if objective_profile == "mastery" else {},
+        "study_floors": dict(READING_MASTERY_STUDY_FLOORS)
+        if objective_profile == "mastery" else {},
+        "updates": updates,
+        "applied": bool(updates),
+    }
+    effective["reading_objective_profile"] = objective_profile
+    effective["reading_objective_profile_report"] = report
+    return effective
+
+
+def reading_checkpoint_profile_kwargs(objective_profile="manual",
+                                      replay_records=None, **kwargs):
+    """Apply checkpoint-study replay floors when prior reading exists."""
+    objective_profile = str(objective_profile)
+    if objective_profile not in READING_OBJECTIVE_PROFILES:
+        raise ValueError(f"unknown reading objective profile {objective_profile!r}")
+    effective = dict(kwargs)
+    updates = {}
+    replay_records = list(replay_records or [])
+    if objective_profile == "mastery" and replay_records:
+        missing = [
+            key for key in READING_MASTERY_CHECKPOINT_FLOORS
+            if key not in effective]
+        if missing:
+            raise ValueError(
+                "missing reading checkpoint profile controls: "
+                + ", ".join(sorted(missing)))
+        for key, floor in READING_MASTERY_CHECKPOINT_FLOORS.items():
+            before = float(effective[key])
+            after = max(before, float(floor))
+            effective[key] = after
+            if after != before:
+                updates[key] = {"from": before, "to": after}
+    report = {
+        "profile": objective_profile,
+        "enabled": objective_profile != "manual",
+        "replay_records": len(replay_records),
+        "floors": dict(READING_MASTERY_CHECKPOINT_FLOORS)
+        if objective_profile == "mastery" else {},
+        "updates": updates,
+        "applied": bool(updates),
+    }
+    effective["reading_checkpoint_profile_report"] = report
+    return effective
+
+
+def reading_profile_report_with_checkpoint(base_report, checkpoint_report):
+    report = dict(base_report or {})
+    report["checkpoint_replay"] = checkpoint_report
+    if checkpoint_report and checkpoint_report.get("updates"):
+        updates = dict(report.get("updates", {}))
+        updates.update({
+            f"checkpoint_{key}": value
+            for key, value in checkpoint_report["updates"].items()})
+        report["updates"] = updates
+        report["applied"] = bool(updates)
+    return report
 
 
 def reading_self_teach_weight_plan(score_components, budget=0.0):
@@ -4856,7 +5010,7 @@ def fit_reading_concepts_select_best(
         replay_retention_w=0.0,
         study_self_teach_w=0.0,
         eval_n=64, score_metric="mastery", score_margin_w=0.1,
-        score_min_delta=0.0, score_patience=0,
+        score_min_delta=0.0, score_patience=0, score_target=0.0,
         insight_accept_w=0.25, insight_min_delta=0.0,
         rounds=1, before_bundle=None):
     schedule = _step_schedule(steps, rounds)
@@ -4868,6 +5022,9 @@ def fit_reading_concepts_select_best(
     score_patience = int(score_patience)
     if score_patience < 0:
         raise ValueError("reading study score patience must be non-negative")
+    score_target = float(score_target)
+    if score_target < 0.0:
+        raise ValueError("reading study score target must be non-negative")
     insight_accept_w = float(insight_accept_w)
     if insight_accept_w < 0.0:
         raise ValueError("reading study insight accept weight must be non-negative")
@@ -4925,8 +5082,8 @@ def fit_reading_concepts_select_best(
                 replay_bundle["score_components"] if replay_bundle is not None else None),
         }
 
-    def bridge_insight_delta(insight):
-        if (not bridge_insight_gate or not insight
+    def bridge_insight_delta(insight, round_bridge_insight_gate):
+        if (not round_bridge_insight_gate or not insight
                 or bool(insight.get("skipped", True))):
             return 0.0, True
         reduction = float(insight.get("bridge_score_reduction", 0.0))
@@ -4938,6 +5095,10 @@ def fit_reading_concepts_select_best(
     initial_replay_bundle = before_replay_bundle
     initial_row = selection_row(0, 0, before_bundle, initial_replay_bundle)
     best_score = float(initial_row["score"])
+    initial_row["target_met"] = bool(
+        float(score_target) > 0.0 and best_score >= float(score_target))
+    best_bundle = before_bundle
+    best_replay_bundle = initial_replay_bundle
     best_round = 0
     best_metrics = {
         "study_strategy_requested": str(study_strategy),
@@ -4953,13 +5114,33 @@ def fit_reading_concepts_select_best(
     no_improve_rounds = 0
     stopped_early = False
     stop_round = 0
+    target_round = None
     current_bundle = before_bundle
     self_teach_reports = []
+    if score_target > 0.0 and best_score >= score_target:
+        stopped_early = True
+        target_round = 0
     for round_i, round_steps in enumerate(schedule, start=1):
+        if target_round is not None:
+            break
+        model.load_state_dict(best_state, strict=False)
+        current_bundle = best_bundle
+        branch_from_round = int(best_round)
         self_teach_plan = reading_self_teach_weight_plan(
             current_bundle["score_components"], budget=study_self_teach_w)
-        self_teach_reports.append(self_teach_plan | {"round": int(round_i)})
+        round_study_strategy = reading_self_teach_study_strategy(
+            self_teach_plan, study_strategy, initial_study_strategy, model)
+        self_teach_reports.append(
+            self_teach_plan | {
+                "round": int(round_i),
+                "branch_from_round": branch_from_round,
+                "study_strategy": round_study_strategy,
+                "study_strategy_requested": str(study_strategy),
+            })
         weight_extras = self_teach_plan["weight_extras"]
+        round_bridge_insight_gate = bool(
+            bridge_w and round_study_strategy in (
+                READING_BRIDGE_INSIGHT_STUDY_STRATEGIES))
         fit_reading_concepts(
             model, vocab, records, steps=round_steps, batch=batch, lr=lr,
             seed=seed + round_i * 1009, device=device, log_every=log_every,
@@ -5062,7 +5243,7 @@ def fit_reading_concepts_select_best(
             cluster_temperature=cluster_temperature,
             cluster_margin=cluster_margin,
             cluster_min_size=cluster_min_size,
-            study_strategy=study_strategy, study_probe_n=study_probe_n,
+            study_strategy=round_study_strategy, study_probe_n=study_probe_n,
             study_hard_max=study_hard_max,
             study_refresh_steps=study_refresh_steps,
             replay_records=replay_records,
@@ -5071,6 +5252,9 @@ def fit_reading_concepts_select_best(
             replay_w=replay_w, replay_batch=replay_batch)
         round_train_metrics = dict(getattr(model, "reading_train_metrics", {}))
         round_train_metrics["self_teach_plan"] = self_teach_plan
+        round_train_metrics["self_teach_study_strategy"] = round_study_strategy
+        round_train_metrics["self_teach_study_signal"] = (
+            self_teach_plan.get("top_signal"))
         round_train_metrics["self_teach_base_weights"] = {
             "factorization_w": float(factorization_w),
             "fer_w": float(fer_w),
@@ -5114,20 +5298,27 @@ def fit_reading_concepts_select_best(
                 context_closure_split_frac=context_closure_split_frac)
         row = selection_row(round_i, round_steps, bundle, replay_bundle)
         score = float(row["score"])
+        row["target_met"] = bool(score_target > 0.0 and score >= score_target)
         score_delta_from_best = float(score - best_score)
         insight = round_train_metrics.get("study_pool_insight")
-        insight_delta, insight_allowed = bridge_insight_delta(insight)
+        insight_delta, insight_allowed = bridge_insight_delta(
+            insight, round_bridge_insight_gate)
         decision = reading_round_selection_decision(
             score_delta_from_best, score_min_delta,
             insight_delta=insight_delta, insight_allowed=insight_allowed,
-            bridge_insight_gate=bridge_insight_gate,
+            bridge_insight_gate=round_bridge_insight_gate,
             insight_accept_w=insight_accept_w,
             insight_min_delta=insight_min_delta)
         selected = decision["selected"]
         rounds_report.append(row | {
             "selected": bool(selected),
+            "branch_from_round": branch_from_round,
             "score_delta_from_best": score_delta_from_best,
             "self_teach_plan": self_teach_plan,
+            "self_teach_top_signal": self_teach_plan.get("top_signal"),
+            "study_strategy_used": round_study_strategy,
+            "study_strategy_requested": str(study_strategy),
+            "bridge_insight_gate": bool(round_bridge_insight_gate),
             "bridge_insight_delta": float(insight_delta),
             "bridge_insight_allowed": bool(insight_allowed),
             "selected_by_score": bool(decision["selected_by_score"]),
@@ -5145,18 +5336,26 @@ def fit_reading_concepts_select_best(
             best_score = score
             best_round = round_i
             best_state = _model_state_copy(model)
+            best_bundle = bundle
+            best_replay_bundle = replay_bundle
             best_metrics = round_train_metrics
             best_study_reports = list(round_study_reports)
             best_neighborhood_reports = list(round_neighborhood_reports)
             best_cluster_reports = list(round_cluster_reports)
             no_improve_rounds = 0
+            if score_target > 0.0 and best_score >= score_target:
+                stopped_early = True
+                stop_round = round_i
+                target_round = round_i
+                break
         else:
             no_improve_rounds += 1
+            model.load_state_dict(best_state, strict=False)
             if score_patience and no_improve_rounds >= score_patience:
                 stopped_early = True
                 stop_round = round_i
                 break
-        current_bundle = bundle
+        current_bundle = best_bundle
     model.load_state_dict(best_state, strict=False)
     for row in rounds_report:
         row["selected"] = row["round"] == best_round
@@ -5169,6 +5368,14 @@ def fit_reading_concepts_select_best(
         "score_margin_w": float(score_margin_w),
         "score_min_delta": float(score_min_delta),
         "score_patience": int(score_patience),
+        "score_target": float(score_target),
+        "target_enabled": bool(score_target > 0.0),
+        "target_met": bool(
+            score_target > 0.0 and float(best_score) >= score_target),
+        "target_round": (
+            int(target_round) if target_round is not None else None),
+        "adaptive_study_strategy": str(study_strategy) == "auto",
+        "branch_from_best": True,
         "bridge_insight_gate": bool(bridge_insight_gate),
         "insight_accept_w": float(insight_accept_w),
         "insight_min_delta": float(insight_min_delta),
@@ -5187,6 +5394,9 @@ def fit_reading_concepts_select_best(
         "before_replay_score": (
             float(before_replay_bundle["score_components"]["score"])
             if before_replay_bundle is not None else None),
+        "selected_replay_score": (
+            float(best_replay_bundle["score_components"]["score"])
+            if best_replay_bundle is not None else None),
         "rounds": rounds_report,
     }
     selected_rows = [row for row in rounds_report if row["round"] == best_round]
@@ -5297,6 +5507,7 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            study_score_margin_w=0.1,
                            study_score_min_delta=0.0,
                            study_score_patience=0,
+                           study_score_target=0.0,
                            study_insight_accept_w=0.25,
                            study_insight_min_delta=0.0,
                            study_self_teach_w=0.0,
@@ -5418,6 +5629,7 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             score_margin_w=study_score_margin_w,
             score_min_delta=study_score_min_delta,
             score_patience=study_score_patience,
+            score_target=study_score_target,
             insight_accept_w=study_insight_accept_w,
             insight_min_delta=study_insight_min_delta,
             study_self_teach_w=study_self_teach_w,
@@ -5645,9 +5857,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          study_select_best=True, study_rounds=1,
                          study_score_metric="mastery", study_score_margin_w=0.1,
                          study_score_min_delta=0.0, study_score_patience=0,
+                         study_score_target=0.0,
                          study_insight_accept_w=0.25,
                          study_insight_min_delta=0.0,
                          study_self_teach_w=0.0,
+                         reading_objective_profile="manual",
+                         reading_objective_profile_report=None,
                          text_field="text", max_tokens=128, min_tokens=8,
                          eval_frac=0.10, eval_n=64, out=None, checkpoint=None):
     records = load_reading_records(
@@ -5775,6 +5990,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             score_margin_w=study_score_margin_w,
             score_min_delta=study_score_min_delta,
             score_patience=study_score_patience,
+            score_target=study_score_target,
             insight_accept_w=study_insight_accept_w,
             insight_min_delta=study_insight_min_delta,
             study_self_teach_w=study_self_teach_w,
@@ -5906,6 +6122,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             selection = {
                 "enabled": False,
                 "self_teach_w": float(study_self_teach_w),
+                "replay_w": float(replay_w),
+                "replay_retention_w": float(replay_retention_w),
                 "self_teach_reports": [self_teach_plan | {"round": 1}],
                 "self_teach_plan": self_teach_plan,
             }
@@ -6042,9 +6260,19 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "study_score_margin_w": float(study_score_margin_w),
               "study_score_min_delta": float(study_score_min_delta),
               "study_score_patience": int(study_score_patience),
+              "study_score_target": float(study_score_target),
               "study_insight_accept_w": float(study_insight_accept_w),
               "study_insight_min_delta": float(study_insight_min_delta),
               "study_self_teach_w": float(study_self_teach_w),
+              "reading_objective_profile": str(reading_objective_profile),
+              "reading_objective_profile_report": (
+                  reading_objective_profile_report or {
+                      "profile": str(reading_objective_profile),
+                      "enabled": str(reading_objective_profile) != "manual",
+                      "floors": {},
+                      "updates": {},
+                      "applied": False,
+                  }),
               "reading_replay_bank": reading_replay_bank,
               "train_records": sum(r.split == "train" for r in records),
               "eval_records": sum(r.split == "eval" for r in records),
@@ -6284,9 +6512,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              study_select_best=True, study_rounds=1,
                              study_score_metric="mastery", study_score_margin_w=0.1,
                              study_score_min_delta=0.0, study_score_patience=0,
+                             study_score_target=0.0,
                              study_insight_accept_w=0.25,
                              study_insight_min_delta=0.0,
                              study_self_teach_w=0.0,
+                             reading_objective_profile="manual",
+                             reading_objective_profile_report=None,
                              replay_w=0.0, replay_batch=0,
                              replay_retention_w=0.0,
                              text_field="text", max_tokens=128, min_tokens=8,
@@ -6307,6 +6538,15 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         checkpoint, device="cpu")
     replay_records = unique_reading_records_by_id(
         external_replay_records, checkpoint_replay_records)
+    checkpoint_profile = reading_checkpoint_profile_kwargs(
+        reading_objective_profile, replay_records=replay_records,
+        replay_w=replay_w, replay_retention_w=replay_retention_w)
+    replay_w = checkpoint_profile["replay_w"]
+    replay_retention_w = checkpoint_profile["replay_retention_w"]
+    reading_objective_profile_report = (
+        reading_profile_report_with_checkpoint(
+            reading_objective_profile_report,
+            checkpoint_profile["reading_checkpoint_profile_report"]))
     torch.manual_seed(seed)
     model, vocab, ckpt = expanded_reading_checkpoint_model(
         checkpoint, records + replay_records, device=device,
@@ -6443,6 +6683,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             score_margin_w=study_score_margin_w,
             score_min_delta=study_score_min_delta,
             score_patience=study_score_patience,
+            score_target=study_score_target,
             insight_accept_w=study_insight_accept_w,
             insight_min_delta=study_insight_min_delta,
             study_self_teach_w=study_self_teach_w,
@@ -6582,6 +6823,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             selection = {
                 "enabled": False,
                 "self_teach_w": float(study_self_teach_w),
+                "replay_w": float(replay_w),
+                "replay_retention_w": float(replay_retention_w),
                 "self_teach_reports": [self_teach_plan | {"round": 1}],
                 "self_teach_plan": self_teach_plan,
             }
@@ -6755,9 +6998,19 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "study_score_margin_w": float(study_score_margin_w),
               "study_score_min_delta": float(study_score_min_delta),
               "study_score_patience": int(study_score_patience),
+              "study_score_target": float(study_score_target),
               "study_insight_accept_w": float(study_insight_accept_w),
               "study_insight_min_delta": float(study_insight_min_delta),
               "study_self_teach_w": float(study_self_teach_w),
+              "reading_objective_profile": str(reading_objective_profile),
+              "reading_objective_profile_report": (
+                  reading_objective_profile_report or {
+                      "profile": str(reading_objective_profile),
+                      "enabled": str(reading_objective_profile) != "manual",
+                      "floors": {},
+                      "updates": {},
+                      "applied": False,
+                  }),
               "replay_w": float(replay_w),
               "replay_batch": int(replay_batch),
               "replay_retention_w": float(replay_retention_w),
@@ -7188,6 +7441,60 @@ def selftest():
     assert self_teach_plan["weight_extras"]["bridge_w"] > 0.0
     assert math.isclose(sum(self_teach_plan["weight_extras"].values()),
                         0.12, rel_tol=1e-6, abs_tol=1e-6)
+    mastery_kwargs = reading_objective_profile_kwargs(
+        "mastery",
+        factorization_w=0.0, fer_w=0.0, memory_w=0.0,
+        discovery_w=0.0, reanalysis_w=0.0, gap_w=0.0,
+        association_w=0.0, composition_w=0.0, graph_predict_w=0.0,
+        graph_cycle_w=0.0, bridge_w=0.0, context_target_w=0.0,
+        span_completion_w=0.0, context_closure_w=0.0,
+        sequence_w=0.0, neighborhood_w=0.0, transition_w=0.0,
+        cluster_w=0.0, study_self_teach_w=0.0, study_rounds=1,
+        study_score_patience=0, study_score_target=0.0, passthrough="kept")
+    assert mastery_kwargs["reading_objective_profile"] == "mastery"
+    assert mastery_kwargs["reading_objective_profile_report"]["applied"] is True
+    assert mastery_kwargs["graph_predict_w"] == 0.10
+    assert mastery_kwargs["study_self_teach_w"] == 0.05
+    assert mastery_kwargs["study_rounds"] == 3
+    assert mastery_kwargs["study_score_patience"] == 2
+    assert mastery_kwargs["study_score_target"] == 0.85
+    assert mastery_kwargs["passthrough"] == "kept"
+    assert (reading_self_teach_study_strategy(
+        {"top_signal": "sequence"}, "auto", "discovery", reading_model)
+        == "sequence")
+    assert (reading_self_teach_study_strategy(
+        {"top_signal": "bridge"}, "auto", "closure", object())
+        == "closure")
+    assert (reading_self_teach_study_strategy(
+        {"top_signal": "context"}, "gap", "gap", reading_model)
+        == "gap")
+    manual_kwargs = reading_objective_profile_kwargs(
+        "manual",
+        factorization_w=0.0, fer_w=0.0, memory_w=0.0,
+        discovery_w=0.0, reanalysis_w=0.0, gap_w=0.0,
+        association_w=0.0, composition_w=0.0, graph_predict_w=0.0,
+        graph_cycle_w=0.0, bridge_w=0.0, context_target_w=0.0,
+        span_completion_w=0.0, context_closure_w=0.0,
+        sequence_w=0.0, neighborhood_w=0.0, transition_w=0.0,
+        cluster_w=0.0, study_self_teach_w=0.0, study_rounds=1,
+        study_score_patience=0, study_score_target=0.0)
+    assert manual_kwargs["study_self_teach_w"] == 0.0
+    assert manual_kwargs["study_rounds"] == 1
+    assert manual_kwargs["study_score_target"] == 0.0
+    assert manual_kwargs["reading_objective_profile_report"]["applied"] is False
+    checkpoint_kwargs = reading_checkpoint_profile_kwargs(
+        "mastery", replay_records=reading_records,
+        replay_w=0.0, replay_retention_w=0.0)
+    assert checkpoint_kwargs["replay_w"] == 0.05
+    assert checkpoint_kwargs["replay_retention_w"] == 0.25
+    assert (checkpoint_kwargs["reading_checkpoint_profile_report"]["applied"]
+            is True)
+    checkpoint_manual = reading_checkpoint_profile_kwargs(
+        "manual", replay_records=reading_records,
+        replay_w=0.0, replay_retention_w=0.0)
+    assert checkpoint_manual["replay_w"] == 0.0
+    assert (checkpoint_manual["reading_checkpoint_profile_report"]["applied"]
+            is False)
     fit_reading_concepts(
         reading_model, reading_vocab, reading_records, steps=3, batch=2, lr=1e-4,
         seed=5, device="cpu", log_every=1, token_drop_p=0.1,
@@ -7321,6 +7628,10 @@ def selftest():
         0.2, 0.0, insight_delta=-1.0, insight_allowed=True,
         bridge_insight_gate=True, insight_accept_w=1.0)
     assert score_decision["selected_by_score"] is True
+    non_bridge_score_decision = reading_round_selection_decision(
+        0.2, 0.0, insight_delta=-1.0, insight_allowed=True,
+        bridge_insight_gate=False, insight_accept_w=1.0)
+    assert non_bridge_score_decision["selected_by_score"] is True
     insight_decision = reading_round_selection_decision(
         -0.01, 0.0, insight_delta=0.2, insight_allowed=True,
         bridge_insight_gate=True, insight_accept_w=1.0)
@@ -7348,6 +7659,8 @@ def selftest():
     assert patience_selection["stop_round"] == 1
     assert patience_selection["accepted_update"] is False
     assert "score_delta_from_best" in patience_selection["rounds"][1]
+    assert patience_selection["branch_from_best"] is True
+    assert patience_selection["rounds"][1]["branch_from_round"] == 0
     assert "selected_insight" in patience_selection
     helper_model, _helper_vocab = train_reading_concepts(
         reading_records, steps=2, batch=2, d=32, layers=1, heads=4, lr=1e-4,
@@ -7362,9 +7675,20 @@ def selftest():
         eval_n=0)
     helper_selection = helper_model.reading_train_metrics["selection"]
     assert helper_selection["enabled"] is True
+    assert helper_selection["adaptive_study_strategy"] is True
+    assert helper_selection["branch_from_best"] is True
     assert helper_selection["self_teach_w"] == 0.05
     assert helper_selection["self_teach_reports"]
+    assert helper_selection["self_teach_reports"][0]["branch_from_round"] == 0
+    assert helper_selection["self_teach_reports"][0]["study_strategy"] in (
+        READING_STUDY_STRATEGIES)
     assert helper_selection["rounds"][1]["self_teach_plan"]["enabled"] is True
+    assert helper_selection["rounds"][1]["study_strategy_used"] in (
+        READING_STUDY_STRATEGIES)
+    if (helper_selection["rounds"][1]["study_strategy_used"]
+            not in READING_BRIDGE_INSIGHT_STUDY_STRATEGIES):
+        assert helper_selection["rounds"][1]["bridge_insight_gate"] is False
+    assert "self_teach_top_signal" in helper_selection["rounds"][1]
     assert helper_selection["accepted_update"] is False
     assert helper_selection["selected_round"] == 0
     assert helper_model.reading_study_reports == []
@@ -7427,8 +7751,8 @@ def selftest():
             gap_w=0.05, study_strategy="gap", study_probe_n=2,
             study_hard_max=1, study_refresh_steps=1,
             study_select_best=False, context_target_w=0.0,
-            sequence_w=0.0, transition_w=0.0, replay_w=0.05,
-            study_self_teach_w=0.05,
+            sequence_w=0.0, transition_w=0.0,
+            study_self_teach_w=0.05, reading_objective_profile="mastery",
             print_report=False)
         assert study_report["experiment"] == "text_raw_reading_checkpoint_study"
         assert study_report["checkpoint_experiment"] == "reading-selftest"
@@ -7443,12 +7767,19 @@ def selftest():
         assert study_report["replay_bank_records"] > 0
         assert study_report["replay_train_records"] > 0
         assert study_report["before_replay"] is not None
+        checkpoint_profile_report = study_report[
+            "reading_objective_profile_report"]["checkpoint_replay"]
+        assert checkpoint_profile_report["applied"] is True
+        assert checkpoint_profile_report["updates"]["replay_w"]["to"] == 0.05
+        assert (checkpoint_profile_report["updates"]["replay_retention_w"]["to"]
+                == 0.25)
         assert study_report["train_metrics"]["study_strategy"] == "gap"
         assert study_report["train_metrics"]["memory_active"] > 0
         assert study_report["train_metrics"]["discovery_w"] >= 0.05
         assert study_report["train_metrics"]["reanalysis_w"] == 0.05
         assert study_report["train_metrics"]["gap_w"] >= 0.05
         assert study_report["train_metrics"]["replay_w"] == 0.05
+        assert study_report["selection"]["replay_retention_w"] == 0.25
         assert study_report["selection"]["enabled"] is False
         assert study_report["selection"]["self_teach_w"] == 0.05
         assert study_report["train_metrics"]["self_teach_w"] == 0.05
@@ -7479,6 +7810,10 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-replay-w", type=float, default=0.0)
     ap.add_argument("--reading-replay-batch", type=int, default=0)
     ap.add_argument("--reading-replay-retention-w", type=float, default=0.0)
+    ap.add_argument("--reading-objective-profile",
+                    choices=READING_OBJECTIVE_PROFILES, default="mastery",
+                    help=("generic reading objective posture; mastery enables "
+                          "schema-free concept/self-teach floors"))
     ap.add_argument("--reading-text-field", default="text")
     ap.add_argument("--reading-max-tokens", type=int, default=128)
     ap.add_argument("--reading-min-tokens", type=int, default=8)
@@ -7592,6 +7927,7 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-study-score-margin-w", type=float, default=0.1)
     ap.add_argument("--reading-study-score-min-delta", type=float, default=0.0)
     ap.add_argument("--reading-study-score-patience", type=int, default=0)
+    ap.add_argument("--reading-study-score-target", type=float, default=0.0)
     ap.add_argument("--reading-study-insight-accept-w", "--reading-study-insight-w",
                     type=float, default=0.25, dest="reading_study_insight_accept_w")
     ap.add_argument("--reading-study-insight-min-delta", type=float, default=0.0)
@@ -7599,121 +7935,124 @@ def _add_reading_args(ap):
 
 
 def _reading_kwargs(args):
-    return dict(lr=args.reading_lr,
-                token_drop_p=args.reading_token_drop,
-                token_replace_p=args.reading_token_replace,
-                feature_dropout=args.reading_feature_dropout,
-                factorization_w=args.reading_factorization_w,
-                factorization_variance=args.reading_factorization_variance,
-                factorization_margin=args.reading_factorization_margin,
-                factorization_covariance_w=args.reading_factorization_covariance_w,
-                fer_w=args.reading_fer_w,
-                fer_fragmentation_w=args.reading_fer_fragmentation_w,
-                fer_correlation_w=args.reading_fer_correlation_w,
-                fer_balance_w=args.reading_fer_balance_w,
-                memory_w=args.reading_memory_w,
-                memory_size=args.reading_memory_size,
-                memory_temperature=args.reading_memory_temperature,
-                memory_momentum=args.reading_memory_momentum,
-                memory_balance_w=args.reading_memory_balance_w,
-                consolidation_w=args.reading_consolidation_w,
-                consolidation_temperature=args.reading_consolidation_temperature,
-                consolidation_balance_w=args.reading_consolidation_balance_w,
-                consolidation_anchor_w=args.reading_consolidation_anchor_w,
-                consolidation_fer_w=args.reading_consolidation_fer_w,
-                discovery_w=args.reading_discovery_w,
-                discovery_curiosity_w=args.reading_discovery_curiosity_w,
-                discovery_graph_w=args.reading_discovery_graph_w,
-                discovery_cycle_w=args.reading_discovery_cycle_w,
-                discovery_bridge_w=args.reading_discovery_bridge_w,
-                discovery_fer_w=args.reading_discovery_fer_w,
-                reanalysis_w=args.reading_reanalysis_w,
-                reanalysis_graph_w=args.reading_reanalysis_graph_w,
-                reanalysis_cycle_w=args.reading_reanalysis_cycle_w,
-                reanalysis_bridge_w=args.reading_reanalysis_bridge_w,
-                reanalysis_fer_w=args.reading_reanalysis_fer_w,
-                gap_w=args.reading_gap_w,
-                gap_temperature=args.reading_gap_temperature,
-                gap_self_loop_w=args.reading_gap_self_loop_w,
-                gap_transitive_steps=args.reading_gap_transitive_steps,
-                gap_transitive_w=args.reading_gap_transitive_w,
-                gap_target_power=args.reading_gap_target_power,
-                association_w=args.reading_association_w,
-                association_temperature=args.reading_association_temperature,
-                association_decay=args.reading_association_decay,
-                association_target_power=args.reading_association_target_power,
-                association_self_loop_w=args.reading_association_self_loop_w,
-                association_transitive_steps=args.reading_association_transitive_steps,
-                association_transitive_w=args.reading_association_transitive_w,
-                composition_w=args.reading_composition_w,
-                composition_temperature=args.reading_composition_temperature,
-                composition_self_loop_w=args.reading_composition_self_loop_w,
-                composition_transitive_steps=args.reading_composition_transitive_steps,
-                composition_transitive_w=args.reading_composition_transitive_w,
-                composition_margin=args.reading_composition_margin,
-                graph_predict_w=args.reading_graph_predict_w,
-                graph_predict_temperature=args.reading_graph_predict_temperature,
-                graph_predict_self_loop_w=args.reading_graph_predict_self_loop_w,
-                graph_predict_transitive_steps=args.reading_graph_predict_transitive_steps,
-                graph_predict_transitive_w=args.reading_graph_predict_transitive_w,
-                graph_predict_target_power=args.reading_graph_predict_target_power,
-                graph_cycle_w=args.reading_graph_cycle_w,
-                graph_cycle_temperature=args.reading_graph_cycle_temperature,
-                graph_cycle_self_loop_w=args.reading_graph_cycle_self_loop_w,
-                graph_cycle_transitive_steps=args.reading_graph_cycle_transitive_steps,
-                graph_cycle_transitive_w=args.reading_graph_cycle_transitive_w,
-                graph_cycle_target_power=args.reading_graph_cycle_target_power,
-                graph_cycle_consistency_w=args.reading_graph_cycle_consistency_w,
-                bridge_w=args.reading_bridge_w,
-                context_target_w=args.reading_context_target_w,
-                context_keep_p=args.reading_context_keep_p,
-                context_target_temperature=args.reading_context_target_temperature,
-                span_completion_w=args.reading_span_completion_w,
-                span_mask_frac=args.reading_span_mask_frac,
-                span_completion_temperature=(
-                    args.reading_span_completion_temperature),
-                context_closure_w=args.reading_context_closure_w,
-                context_closure_split_frac=args.reading_context_closure_split_frac,
-                context_closure_temperature=(
-                    args.reading_context_closure_temperature),
-                sequence_w=args.reading_sequence_w,
-                sequence_batch=args.reading_sequence_batch,
-                sequence_temperature=args.reading_sequence_temperature,
-                neighborhood_w=args.reading_neighborhood_w,
-                neighborhood_batch=args.reading_neighborhood_batch,
-                neighborhood_probe_n=args.reading_neighborhood_probe_n,
-                neighborhood_refresh_steps=args.reading_neighborhood_refresh_steps,
-                neighborhood_temperature=args.reading_neighborhood_temperature,
-                neighborhood_margin=args.reading_neighborhood_margin,
-                transition_w=args.reading_transition_w,
-                transition_batch=args.reading_transition_batch,
-                transition_temperature=args.reading_transition_temperature,
-                transition_margin=args.reading_transition_margin,
-                cluster_w=args.reading_cluster_w,
-                cluster_batch=args.reading_cluster_batch,
-                cluster_probe_n=args.reading_cluster_probe_n,
-                cluster_refresh_steps=args.reading_cluster_refresh_steps,
-                cluster_temperature=args.reading_cluster_temperature,
-                cluster_margin=args.reading_cluster_margin,
-                cluster_min_size=args.reading_cluster_min_size,
-                study_strategy=args.reading_study_strategy,
-                study_probe_n=args.reading_study_probe_n,
-                study_hard_max=args.reading_study_hard_max,
-                study_refresh_steps=args.reading_study_refresh_steps,
-                study_select_best=args.reading_study_select_best,
-                study_rounds=args.reading_study_rounds,
-                study_score_metric=args.reading_study_score_metric,
-                study_score_margin_w=args.reading_study_score_margin_w,
-                study_score_min_delta=args.reading_study_score_min_delta,
-                study_score_patience=args.reading_study_score_patience,
-                study_insight_accept_w=args.reading_study_insight_accept_w,
-                study_insight_min_delta=args.reading_study_insight_min_delta,
-                study_self_teach_w=args.reading_study_self_teach_w,
-                text_field=args.reading_text_field,
-                max_tokens=args.reading_max_tokens,
-                min_tokens=args.reading_min_tokens,
-                eval_frac=args.reading_eval_frac,
-                eval_n=args.reading_eval_n)
+    kwargs = dict(lr=args.reading_lr,
+                  token_drop_p=args.reading_token_drop,
+                  token_replace_p=args.reading_token_replace,
+                  feature_dropout=args.reading_feature_dropout,
+                  factorization_w=args.reading_factorization_w,
+                  factorization_variance=args.reading_factorization_variance,
+                  factorization_margin=args.reading_factorization_margin,
+                  factorization_covariance_w=args.reading_factorization_covariance_w,
+                  fer_w=args.reading_fer_w,
+                  fer_fragmentation_w=args.reading_fer_fragmentation_w,
+                  fer_correlation_w=args.reading_fer_correlation_w,
+                  fer_balance_w=args.reading_fer_balance_w,
+                  memory_w=args.reading_memory_w,
+                  memory_size=args.reading_memory_size,
+                  memory_temperature=args.reading_memory_temperature,
+                  memory_momentum=args.reading_memory_momentum,
+                  memory_balance_w=args.reading_memory_balance_w,
+                  consolidation_w=args.reading_consolidation_w,
+                  consolidation_temperature=args.reading_consolidation_temperature,
+                  consolidation_balance_w=args.reading_consolidation_balance_w,
+                  consolidation_anchor_w=args.reading_consolidation_anchor_w,
+                  consolidation_fer_w=args.reading_consolidation_fer_w,
+                  discovery_w=args.reading_discovery_w,
+                  discovery_curiosity_w=args.reading_discovery_curiosity_w,
+                  discovery_graph_w=args.reading_discovery_graph_w,
+                  discovery_cycle_w=args.reading_discovery_cycle_w,
+                  discovery_bridge_w=args.reading_discovery_bridge_w,
+                  discovery_fer_w=args.reading_discovery_fer_w,
+                  reanalysis_w=args.reading_reanalysis_w,
+                  reanalysis_graph_w=args.reading_reanalysis_graph_w,
+                  reanalysis_cycle_w=args.reading_reanalysis_cycle_w,
+                  reanalysis_bridge_w=args.reading_reanalysis_bridge_w,
+                  reanalysis_fer_w=args.reading_reanalysis_fer_w,
+                  gap_w=args.reading_gap_w,
+                  gap_temperature=args.reading_gap_temperature,
+                  gap_self_loop_w=args.reading_gap_self_loop_w,
+                  gap_transitive_steps=args.reading_gap_transitive_steps,
+                  gap_transitive_w=args.reading_gap_transitive_w,
+                  gap_target_power=args.reading_gap_target_power,
+                  association_w=args.reading_association_w,
+                  association_temperature=args.reading_association_temperature,
+                  association_decay=args.reading_association_decay,
+                  association_target_power=args.reading_association_target_power,
+                  association_self_loop_w=args.reading_association_self_loop_w,
+                  association_transitive_steps=args.reading_association_transitive_steps,
+                  association_transitive_w=args.reading_association_transitive_w,
+                  composition_w=args.reading_composition_w,
+                  composition_temperature=args.reading_composition_temperature,
+                  composition_self_loop_w=args.reading_composition_self_loop_w,
+                  composition_transitive_steps=args.reading_composition_transitive_steps,
+                  composition_transitive_w=args.reading_composition_transitive_w,
+                  composition_margin=args.reading_composition_margin,
+                  graph_predict_w=args.reading_graph_predict_w,
+                  graph_predict_temperature=args.reading_graph_predict_temperature,
+                  graph_predict_self_loop_w=args.reading_graph_predict_self_loop_w,
+                  graph_predict_transitive_steps=args.reading_graph_predict_transitive_steps,
+                  graph_predict_transitive_w=args.reading_graph_predict_transitive_w,
+                  graph_predict_target_power=args.reading_graph_predict_target_power,
+                  graph_cycle_w=args.reading_graph_cycle_w,
+                  graph_cycle_temperature=args.reading_graph_cycle_temperature,
+                  graph_cycle_self_loop_w=args.reading_graph_cycle_self_loop_w,
+                  graph_cycle_transitive_steps=args.reading_graph_cycle_transitive_steps,
+                  graph_cycle_transitive_w=args.reading_graph_cycle_transitive_w,
+                  graph_cycle_target_power=args.reading_graph_cycle_target_power,
+                  graph_cycle_consistency_w=args.reading_graph_cycle_consistency_w,
+                  bridge_w=args.reading_bridge_w,
+                  context_target_w=args.reading_context_target_w,
+                  context_keep_p=args.reading_context_keep_p,
+                  context_target_temperature=args.reading_context_target_temperature,
+                  span_completion_w=args.reading_span_completion_w,
+                  span_mask_frac=args.reading_span_mask_frac,
+                  span_completion_temperature=(
+                      args.reading_span_completion_temperature),
+                  context_closure_w=args.reading_context_closure_w,
+                  context_closure_split_frac=args.reading_context_closure_split_frac,
+                  context_closure_temperature=(
+                      args.reading_context_closure_temperature),
+                  sequence_w=args.reading_sequence_w,
+                  sequence_batch=args.reading_sequence_batch,
+                  sequence_temperature=args.reading_sequence_temperature,
+                  neighborhood_w=args.reading_neighborhood_w,
+                  neighborhood_batch=args.reading_neighborhood_batch,
+                  neighborhood_probe_n=args.reading_neighborhood_probe_n,
+                  neighborhood_refresh_steps=args.reading_neighborhood_refresh_steps,
+                  neighborhood_temperature=args.reading_neighborhood_temperature,
+                  neighborhood_margin=args.reading_neighborhood_margin,
+                  transition_w=args.reading_transition_w,
+                  transition_batch=args.reading_transition_batch,
+                  transition_temperature=args.reading_transition_temperature,
+                  transition_margin=args.reading_transition_margin,
+                  cluster_w=args.reading_cluster_w,
+                  cluster_batch=args.reading_cluster_batch,
+                  cluster_probe_n=args.reading_cluster_probe_n,
+                  cluster_refresh_steps=args.reading_cluster_refresh_steps,
+                  cluster_temperature=args.reading_cluster_temperature,
+                  cluster_margin=args.reading_cluster_margin,
+                  cluster_min_size=args.reading_cluster_min_size,
+                  study_strategy=args.reading_study_strategy,
+                  study_probe_n=args.reading_study_probe_n,
+                  study_hard_max=args.reading_study_hard_max,
+                  study_refresh_steps=args.reading_study_refresh_steps,
+                  study_select_best=args.reading_study_select_best,
+                  study_rounds=args.reading_study_rounds,
+                  study_score_metric=args.reading_study_score_metric,
+                  study_score_margin_w=args.reading_study_score_margin_w,
+                  study_score_min_delta=args.reading_study_score_min_delta,
+                  study_score_patience=args.reading_study_score_patience,
+                  study_score_target=args.reading_study_score_target,
+                  study_insight_accept_w=args.reading_study_insight_accept_w,
+                  study_insight_min_delta=args.reading_study_insight_min_delta,
+                  study_self_teach_w=args.reading_study_self_teach_w,
+                  text_field=args.reading_text_field,
+                  max_tokens=args.reading_max_tokens,
+                  min_tokens=args.reading_min_tokens,
+                  eval_frac=args.reading_eval_frac,
+                  eval_n=args.reading_eval_n)
+    return reading_objective_profile_kwargs(
+        args.reading_objective_profile, **kwargs)
 
 
 def _new_reading_latent_slots(args):

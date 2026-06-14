@@ -26,6 +26,15 @@ Checkpoints carry a bounded raw-reading replay bank selected from the model's ow
 so continuation can retain earlier concepts without a separate task-specific harness. Optional
 `--reading-study-self-teach-w` allocates extra training weight from the model's own eval deficits
 across view, context, span, closure, sequence, neighborhood, cluster, FER, and bridge signals.
+`--reading-objective-profile mastery` is the default raw-reading posture: it raises only these
+schema-free objective weights to practical floors, including self-teach, discovery, gap,
+graph, bridge, cluster, and reanalysis losses, then runs a selected-round study loop with
+patience and a mastery-score target. In `auto` study mode, each round routes to the
+weakest evaluated signal, such as sequence, closure, FER, or discovery, and each
+round branches from the best accepted state so rejected self-teaching attempts do not
+poison the next attempt. Checkpoint continuation also turns on replay and retention
+from the checkpoint's own reading replay bank when available. Use `manual` for exact
+low-level ablations.
 
 ```bash
 python -m thinking.text --selftest
@@ -33,8 +42,8 @@ python -m thinking.text --selftest
 python -m thinking.text --reading-data data/reading.jsonl \
     --steps 40000 --batch 16 --d 256 --layers 4 --heads 8 \
     --latent-concept-slots 4 --reading-memory-size 256 \
+    --reading-objective-profile mastery \
     --reading-study-strategy auto --reading-study-probe-n 256 \
-    --reading-study-self-teach-w 0.05 \
     --reading-discovery-w 0.05 --reading-reanalysis-w 0.05 \
     --reading-gap-w 0.05 --reading-span-completion-w 0.05 \
     --out runs/text_raw_reading.json \
@@ -44,8 +53,8 @@ python -m thinking.text --reading-data data/new_reading.jsonl \
     --reading-checkpoint runs/text_raw_reading.pt \
     --reading-out-checkpoint runs/text_raw_reading_studied.pt \
     --steps 4000 --batch 16 \
+    --reading-objective-profile mastery \
     --reading-study-strategy auto --reading-study-probe-n 256 \
-    --reading-study-self-teach-w 0.05 \
     --reading-discovery-w 0.05 --reading-reanalysis-w 0.05 \
     --reading-gap-w 0.05 --reading-span-completion-w 0.05 \
     --reading-replay-w 0.05 \

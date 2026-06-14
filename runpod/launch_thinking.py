@@ -256,6 +256,7 @@ def text_reading_cmd(args, py):
         f"--reading-min-tokens {args.reading_min_tokens} "
         f"--reading-eval-frac {args.reading_eval_frac} "
         f"--reading-eval-n {args.reading_eval_n} "
+        f"--reading-objective-profile {args.reading_objective_profile} "
         f"--reading-lr {args.reading_lr} "
         f"--reading-token-drop {args.reading_token_drop} "
         f"--reading-token-replace {args.reading_token_replace} "
@@ -387,6 +388,7 @@ def text_reading_cmd(args, py):
         f"--reading-study-score-margin-w {args.reading_study_score_margin_w} "
         f"--reading-study-score-min-delta {args.reading_study_score_min_delta} "
         f"--reading-study-score-patience {args.reading_study_score_patience} "
+        f"--reading-study-score-target {args.reading_study_score_target} "
         f"--reading-study-insight-accept-w "
         f"{args.reading_study_insight_accept_w} "
         f"--reading-study-insight-min-delta "
@@ -1799,6 +1801,11 @@ def main():
                     dest="reading_replay_batch")
     ap.add_argument("--reading-replay-retention-w", type=float, default=0.0,
                     dest="reading_replay_retention_w")
+    ap.add_argument("--reading-objective-profile", default="mastery",
+                    choices=("manual", "mastery"),
+                    dest="reading_objective_profile",
+                    help=("generic reading objective posture; mastery enables "
+                          "schema-free concept/self-teach floors"))
     ap.add_argument("--reading-text-field", default="text", dest="reading_text_field")
     ap.add_argument("--reading-max-tokens", type=int, default=128,
                     dest="reading_max_tokens")
@@ -2024,6 +2031,8 @@ def main():
                     dest="reading_study_score_min_delta")
     ap.add_argument("--reading-study-score-patience", type=int, default=0,
                     dest="reading_study_score_patience")
+    ap.add_argument("--reading-study-score-target", type=float, default=0.0,
+                    dest="reading_study_score_target")
     ap.add_argument("--reading-study-insight-accept-w", "--reading-study-insight-w",
                     type=float, default=0.25,
                     dest="reading_study_insight_accept_w")
@@ -3589,6 +3598,7 @@ def main():
             "--reading-study-score-margin-w": args.reading_study_score_margin_w,
             "--reading-study-score-min-delta": args.reading_study_score_min_delta,
             "--reading-study-score-patience": args.reading_study_score_patience,
+            "--reading-study-score-target": args.reading_study_score_target,
             "--reading-study-insight-accept-w": (
                 args.reading_study_insight_accept_w),
             "--reading-study-insight-min-delta": (
