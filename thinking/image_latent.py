@@ -5242,6 +5242,66 @@ def flow_hidden_feature_token_alignment_loss(aligner, hidden_tokens, feature_tok
     }
 
 
+def _resize_token_sequence(tokens, target_len):
+    target_len = int(target_len)
+    if int(tokens.shape[0]) == target_len:
+        return tokens
+    if target_len <= 0:
+        raise ValueError("target token length must be positive")
+    return F.interpolate(
+        tokens.t()[None], size=target_len, mode="linear", align_corners=False
+    )[0].t()
+
+
+def flow_hidden_feature_structure_loss(aligner, hidden_tokens, feature_tokens,
+                                       prefix="flow_repa_structure", eps=1.0e-6):
+    if aligner is None:
+        zero = hidden_tokens.sum() * 0.0
+        return zero, {}
+    feature_tokens = feature_tokens.to(device=hidden_tokens.device)
+    hidden_emb = aligner.encode_hidden_tokens(hidden_tokens)
+    feat_emb = aligner.encode_feature_tokens(feature_tokens)
+    valid = feature_tokens.float().abs().sum(dim=-1).gt(0)
+    bsz, hidden_n, _dim = hidden_emb.shape
+    losses = []
+    hidden_offdiag_means = []
+    feature_offdiag_means = []
+    for i in range(int(bsz)):
+        feat_i = feat_emb[i, valid[i]]
+        if int(feat_i.shape[0]) <= 1 or hidden_n <= 1:
+            continue
+        hidden_i = F.normalize(hidden_emb[i].float(), dim=-1, eps=float(eps))
+        feat_i = _resize_token_sequence(feat_i.float(), hidden_n)
+        feat_i = F.normalize(feat_i.detach(), dim=-1, eps=float(eps))
+        hidden_sim = hidden_i.matmul(hidden_i.t())
+        feat_sim = feat_i.matmul(feat_i.t())
+        eye = torch.eye(hidden_n, dtype=torch.bool, device=hidden_sim.device)
+        hidden_rel = hidden_sim.masked_select(~eye)
+        feat_rel = feat_sim.masked_select(~eye)
+        losses.append(F.mse_loss(hidden_rel, feat_rel))
+        hidden_offdiag_means.append(hidden_rel.detach().mean())
+        feature_offdiag_means.append(feat_rel.detach().mean())
+    if not losses:
+        zero = hidden_tokens.sum() * 0.0 + feature_tokens.sum() * 0.0
+        return zero, {
+            f"{prefix}_loss": zero.detach(),
+            f"{prefix}_hidden_offdiag_mean": zero.detach(),
+            f"{prefix}_feature_offdiag_mean": zero.detach(),
+            f"{prefix}_n": torch.tensor(0.0, device=hidden_tokens.device),
+            f"{prefix}_hidden_tokens": torch.tensor(float(hidden_n), device=hidden_tokens.device),
+            f"{prefix}_feature_tokens": valid.float().sum(dim=1).mean().detach(),
+        }
+    loss = torch.stack(losses).mean()
+    return loss, {
+        f"{prefix}_loss": loss.detach(),
+        f"{prefix}_hidden_offdiag_mean": torch.stack(hidden_offdiag_means).mean(),
+        f"{prefix}_feature_offdiag_mean": torch.stack(feature_offdiag_means).mean(),
+        f"{prefix}_n": torch.tensor(float(len(losses)), device=hidden_tokens.device),
+        f"{prefix}_hidden_tokens": torch.tensor(float(hidden_n), device=hidden_tokens.device),
+        f"{prefix}_feature_tokens": valid.float().sum(dim=1).mean().detach(),
+    }
+
+
 def flow_hidden_latent_alignment_loss(aligner, hidden_tokens, clean_latent,
                                       prefix="flow_self_repa", mask=None):
     if aligner is None:
@@ -5734,7 +5794,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        text_aligner=None, text_align_w=0.0,
                        feature_aligner=None, image_features=None, feature_align_w=0.0,
                        repa_aligner=None, repa_w=0.0, image_feature_tokens=None,
-                       repa_mode="pooled",
+                       repa_mode="pooled", repa_structure_w=0.0,
                        self_repa_aligner=None, self_repa_w=0.0,
                        self_repa_mode="pooled",
                        factorization_w=0.0, factorization_variance_target=0.05,
@@ -5776,6 +5836,9 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     factorization_token_correlation_w = float(factorization_token_correlation_w)
     if factorization_covariance_w < 0.0 or factorization_token_correlation_w < 0.0:
         raise ValueError("flow factorization component weights must be non-negative")
+    repa_structure_w = float(repa_structure_w)
+    if repa_structure_w < 0.0:
+        raise ValueError("repa_structure_w must be non-negative")
     self_condition_p = float(self_condition_p)
     if self_condition_p < 0.0 or self_condition_p > 1.0:
         raise ValueError("self_condition_p must be in [0, 1]")
@@ -5807,6 +5870,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     flow_features = None
     need_flow_features = (
         (repa_aligner is not None and repa_w > 0.0)
+        or (repa_aligner is not None and repa_structure_w > 0.0)
         or (self_repa_aligner is not None and self_repa_w > 0.0)
         or factorization_w > 0.0
         or sra_w > 0.0
@@ -5995,6 +6059,17 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         parts["flow_repa_mode_id"] = torch.tensor(
             flow_repa_mode_id(active_repa_mode), device=z1.device)
         parts["flow_repa_components"] = torch.tensor(float(len(repa_losses)), device=z1.device)
+    if repa_aligner is not None and repa_structure_w > 0.0:
+        if flow_features is None or "image_tokens" not in flow_features:
+            raise ValueError("flow REPA structure alignment requires transformer image-token features")
+        if image_feature_tokens is None:
+            raise ValueError("flow REPA structure alignment requires image_embedding_sequence rows")
+        structure, structure_parts = flow_hidden_feature_structure_loss(
+            repa_aligner, flow_features["image_tokens"], image_feature_tokens)
+        total = total + float(repa_structure_w) * structure
+        parts.update(structure_parts)
+        parts["flow_repa_structure_w"] = torch.tensor(
+            float(repa_structure_w), device=z1.device)
     if self_repa_aligner is not None and self_repa_w > 0.0:
         if flow_features is None or "image_tokens" not in flow_features:
             raise ValueError("flow self-REPA alignment requires transformer image-token features")
@@ -8875,6 +8950,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "flow_repa_aligner": flow_repa_aligner is not None,
         "flow_repa_embed_dim": int(flow_repa_embed_dim),
         "flow_repa_mode": str(flow_repa_mode),
+        "flow_repa_structure_w": float(ckpt.get(
+            "flow_repa_structure_w", report.get("flow_repa_structure_w", 0.0)) or 0.0),
         "flow_self_repa_aligner": flow_self_repa_aligner is not None,
         "flow_self_repa_embed_dim": int(flow_self_repa_embed_dim),
         "flow_self_repa_mode": str(flow_self_repa_mode),
@@ -9670,7 +9747,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       image_feature_align_w=0.0, flow_feature_align_w=0.0,
                       image_feature_embed_dim=128,
                       flow_repa_w=0.0, flow_repa_steps=0, flow_repa_embed_dim=128,
-                      flow_repa_mode="pooled",
+                      flow_repa_mode="pooled", flow_repa_structure_w=0.0,
                       flow_self_repa_w=0.0, flow_self_repa_steps=0,
                       flow_self_repa_embed_dim=128, flow_self_repa_mode="pooled",
                       flow_factorization_w=0.0,
@@ -9767,12 +9844,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     if flow_boundary_mode not in FLOW_BOUNDARY_MODES:
         raise ValueError(f"unknown flow boundary mode {flow_boundary_mode!r}")
     image_records = None
+    has_image_embedding_sequences = False
     if image_manifest:
         if cond_mode != "text":
             raise ValueError("image manifests require cond_mode='text'")
         image_records = read_image_manifest(
             image_manifest, root=image_root, split=image_split,
             min_aesthetic=image_min_aesthetic, max_records=image_max_records)
+        has_image_embedding_sequences = records_have_image_embedding_sequences(image_records)
         flow_repa_mode = str(flow_repa_mode)
         if flow_repa_mode not in FLOW_REPA_MODES:
             raise ValueError(f"unknown flow_repa_mode {flow_repa_mode!r}")
@@ -9785,15 +9864,18 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         image_embedding_in_dim = (
             infer_image_embedding_dim(image_records)
             if (image_feature_align_w > 0.0 or flow_feature_align_w > 0.0
-                or flow_repa_w > 0.0) else 0
+                or flow_repa_w > 0.0 or flow_repa_structure_w > 0.0) else 0
         )
-        if (image_feature_align_w > 0.0 or flow_feature_align_w > 0.0 or flow_repa_w > 0.0
+        if (image_feature_align_w > 0.0 or flow_feature_align_w > 0.0
+                or flow_repa_w > 0.0 or flow_repa_structure_w > 0.0
                 ) and image_embedding_in_dim <= 0:
             raise ValueError("image feature/REPA alignment requires image_embedding rows")
-        if flow_repa_w > 0.0 and flow_repa_mode in ("token", "both"):
-            if not records_have_image_embedding_sequences(image_records):
+        if (flow_repa_structure_w > 0.0
+                or (flow_repa_w > 0.0 and flow_repa_mode in ("token", "both"))):
+            if not has_image_embedding_sequences:
                 raise ValueError(
-                    f"flow_repa_mode={flow_repa_mode!r} requires image_embedding_sequence rows")
+                    "flow REPA token/structure alignment requires "
+                    "image_embedding_sequence rows")
     else:
         raise ValueError("image_latent training requires image_manifest data")
     flow_self_repa_mode = str(flow_self_repa_mode or "pooled")
@@ -9912,6 +9994,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("image feature alignment weights must be non-negative")
     if flow_repa_w < 0.0:
         raise ValueError("flow_repa_w must be non-negative")
+    flow_repa_structure_w = float(flow_repa_structure_w)
+    if flow_repa_structure_w < 0.0:
+        raise ValueError("flow_repa_structure_w must be non-negative")
     if flow_repa_steps < 0:
         raise ValueError("flow_repa_steps must be non-negative")
     if flow_self_repa_w < 0.0:
@@ -10201,7 +10286,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                      flow_self_condition=flow_self_condition).to(device)
     attach_image_geometry_mode(flow, image_geometry_cond)
     flow_repa_aligner = None
-    if flow_repa_w > 0.0:
+    if flow_repa_w > 0.0 or flow_repa_structure_w > 0.0:
         hidden_feature_dim = flow_hidden_feature_dim(flow)
         if hidden_feature_dim <= 0:
             raise ValueError("flow REPA alignment requires DiT/CrossDiT/MM-DiT flow architecture")
@@ -10315,7 +10400,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         flow_params += list(text_aligner.parameters())
     if image_feature_aligner is not None and flow_feature_align_w > 0.0:
         flow_params += list(image_feature_aligner.parameters())
-    if flow_repa_aligner is not None and flow_repa_w > 0.0:
+    if flow_repa_aligner is not None and (
+            flow_repa_w > 0.0 or flow_repa_structure_w > 0.0):
         flow_params += list(flow_repa_aligner.parameters())
     if flow_self_repa_aligner is not None and flow_self_repa_w > 0.0:
         flow_params += list(flow_self_repa_aligner.parameters())
@@ -10326,13 +10412,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_cache = None
     quality_score_steps_run = 0
     last_quality_score = {}
-    has_image_embedding_sequences = (
-        records_have_image_embedding_sequences(image_records)
-        if image_records is not None else False)
     flow_repa_cache_sequences = (
-        flow_repa_w > 0.0
-        and (flow_repa_mode in ("token", "both")
-             or (flow_repa_mode == "auto" and has_image_embedding_sequences))
+        flow_repa_structure_w > 0.0
+        or (
+            flow_repa_w > 0.0
+            and (flow_repa_mode in ("token", "both")
+                 or (flow_repa_mode == "auto" and has_image_embedding_sequences))
+        )
     )
     if flow_cache_latents:
         flow_cache = build_image_latent_cache(
@@ -10341,7 +10427,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             size=size, device=device, precision=train_precision,
             cond_source=caption_cond_source, cache_dir=flow_cache_dir,
             shard_size=flow_cache_shard_size,
-            include_image_embeddings=flow_feature_align_w > 0.0 or flow_repa_w > 0.0,
+            include_image_embeddings=(
+                flow_feature_align_w > 0.0 or flow_repa_w > 0.0
+                or flow_repa_structure_w > 0.0),
             include_image_embedding_sequences=flow_repa_cache_sequences,
             include_image_geometry=image_geometry_cond,
             include_quality_targets=(
@@ -10628,6 +10716,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         active_flow_repa_w = float(flow_repa_w)
         if flow_repa_steps > 0 and flow_step >= int(flow_repa_steps):
             active_flow_repa_w = 0.0
+        active_flow_repa_structure_w = float(flow_repa_structure_w)
+        if flow_repa_steps > 0 and flow_step >= int(flow_repa_steps):
+            active_flow_repa_structure_w = 0.0
         active_flow_self_repa_w = float(flow_self_repa_w)
         if flow_self_repa_steps > 0 and flow_step >= int(flow_self_repa_steps):
             active_flow_self_repa_w = 0.0
@@ -10690,13 +10781,20 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     enabled=image_geometry_cond, transform_metadata=transform_metadata)
                 image_features = (
                     record_image_embedding_tensor(chosen_records, device=device)
-                    if flow_feature_align_w > 0.0 or active_flow_repa_w > 0.0 else None
+                    if (flow_feature_align_w > 0.0 or active_flow_repa_w > 0.0
+                        or active_flow_repa_structure_w > 0.0) else None
                 )
                 image_feature_tokens = (
                     record_image_embedding_sequence_tensor(chosen_records, device=device)
-                    if active_flow_repa_w > 0.0
-                    and (flow_repa_mode in ("token", "both")
-                         or (flow_repa_mode == "auto" and has_image_embedding_sequences))
+                    if (
+                        active_flow_repa_structure_w > 0.0
+                        or (
+                            active_flow_repa_w > 0.0
+                            and (flow_repa_mode in ("token", "both")
+                                 or (flow_repa_mode == "auto"
+                                     and has_image_embedding_sequences))
+                        )
+                    )
                     else None
                 )
                 quality_targets = None
@@ -10763,6 +10861,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     repa_aligner=flow_repa_aligner, repa_w=active_flow_repa_w,
                     image_feature_tokens=image_feature_tokens,
                     repa_mode=flow_repa_mode,
+                    repa_structure_w=active_flow_repa_structure_w,
                     self_repa_aligner=flow_self_repa_aligner,
                     self_repa_w=active_flow_self_repa_w,
                     self_repa_mode=flow_self_repa_mode,
@@ -11129,6 +11228,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "image_feature_embed_dim": int(image_feature_embed_dim),
         "image_feature_aligner": image_feature_aligner is not None,
         "flow_repa_w": float(flow_repa_w),
+        "flow_repa_structure_w": float(flow_repa_structure_w),
+        "flow_repa_structure_active_steps": (
+            int(flow_steps)
+            if flow_repa_structure_w > 0.0 and int(flow_repa_steps) == 0
+            else min(int(flow_steps), int(flow_repa_steps))
+            if flow_repa_structure_w > 0.0 else 0
+        ),
         "flow_repa_steps": int(flow_repa_steps),
         "flow_repa_active_steps": (
             int(flow_steps) if flow_repa_w > 0.0 and int(flow_repa_steps) == 0
@@ -11432,6 +11538,11 @@ def selftest():
                     [0.5 if j == ((i + 1) % 2) else 0.0 for j in range(2)],
                 ],
                 "image_embedding": [1.0 if j == (2 - i) else 0.0 for j in range(3)],
+                "image_embedding_sequence": [
+                    [1.0 if j == ((2 - i) % 3) else 0.0 for j in range(3)],
+                    [0.5 if j == ((i + 1) % 3) else 0.0 for j in range(3)],
+                    [0.25 if j == (i % 3) else 0.0 for j in range(3)],
+                ],
             })
         manifest = os.path.join(td, "manifest.jsonl")
         with open(manifest, "w", encoding="utf-8") as f:
@@ -11501,6 +11612,12 @@ def selftest():
         assert float(dyn_out.abs().max()) <= 1.0 + 1.0e-6
         dyn_same, dyn_same_events = dynamic_threshold_tensor(dyn, percentile=0.0)
         assert dyn_same_events == 0 and torch.allclose(dyn_same, dyn)
+        structure_aligner = FlowFeatureAligner(
+            hidden_dim=6, feature_dim=3, hidden=8, embed_dim=4)
+        structure_loss, structure_parts = flow_hidden_feature_structure_loss(
+            structure_aligner, torch.randn(2, 4, 6), torch.randn(2, 3, 3))
+        assert torch.isfinite(structure_loss)
+        assert "flow_repa_structure_loss" in structure_parts
         pref_manifest = os.path.join(td, "preferences.jsonl")
         with open(pref_manifest, "w", encoding="utf-8") as f:
             f.write(json.dumps({
@@ -11528,6 +11645,8 @@ def selftest():
             flow_guidance_distill_w=0.01, flow_ema_decay=0.9,
             flow_frequency_w=0.01, flow_straightness_w=0.01,
             flow_endpoint_stats_w=0.01,
+            flow_repa_w=0.01, flow_repa_structure_w=0.01,
+            flow_repa_mode="auto",
             flow_factorization_w=0.01,
             flow_multiscale_w=0.01, flow_multiscale_scales=(2,),
             flow_boundary_mode="double-cosine",
@@ -11554,6 +11673,9 @@ def selftest():
         assert math.isclose(report["flow_frequency_w"], 0.01)
         assert math.isclose(report["flow_endpoint_stats_w"], 0.01)
         assert "flow_endpoint_stats_loss" in report["last_flow"]
+        assert math.isclose(report["flow_repa_structure_w"], 0.01)
+        assert "flow_repa_structure_loss" in report["last_flow"]
+        assert report["flow_repa_token_sequences"] is True
         assert math.isclose(report["flow_straightness_w"], 0.01)
         assert "flow_straightness_velocity_mse" in report["last_flow"]
         assert math.isclose(report["flow_factorization_w"], 0.01)
@@ -11761,6 +11883,10 @@ def main(argv=None):
     ap.add_argument("--flow-repa-mode", default="pooled", choices=FLOW_REPA_MODES,
                     dest="flow_repa_mode",
                     help="REPA target: pooled image feature, token sequence, both, or auto")
+    ap.add_argument("--flow-repa-structure-w", type=float, default=0.0,
+                    dest="flow_repa_structure_w",
+                    help=("pairwise image-token structure alignment weight for "
+                          "REPA hidden states"))
     ap.add_argument("--flow-self-repa-w", type=float, default=0.0,
                     dest="flow_self_repa_w",
                     help=("no-extra-data REPA-style hidden/clean-latent alignment "
@@ -12337,6 +12463,10 @@ def main(argv=None):
             args.flow_multiscale_scales)
     except ValueError as exc:
         ap.error(str(exc))
+    if args.flow_repa_w < 0.0:
+        ap.error("--flow-repa-w must be non-negative")
+    if args.flow_repa_structure_w < 0.0:
+        ap.error("--flow-repa-structure-w must be non-negative")
     if args.flow_self_repa_w < 0.0:
         ap.error("--flow-self-repa-w must be non-negative")
     if args.flow_self_repa_steps < 0:
@@ -12673,6 +12803,7 @@ def main(argv=None):
         flow_repa_steps=args.flow_repa_steps,
         flow_repa_embed_dim=args.flow_repa_embed_dim,
         flow_repa_mode=args.flow_repa_mode,
+        flow_repa_structure_w=args.flow_repa_structure_w,
         flow_self_repa_w=args.flow_self_repa_w,
         flow_self_repa_steps=args.flow_self_repa_steps,
         flow_self_repa_embed_dim=args.flow_self_repa_embed_dim,
@@ -12936,6 +13067,7 @@ def main(argv=None):
         "flow_feature_align_w": args.flow_feature_align_w,
         "image_feature_embed_dim": args.image_feature_embed_dim,
         "flow_repa_w": args.flow_repa_w,
+        "flow_repa_structure_w": args.flow_repa_structure_w,
         "flow_repa_steps": args.flow_repa_steps,
         "flow_repa_embed_dim": args.flow_repa_embed_dim,
         "flow_repa_mode": args.flow_repa_mode,

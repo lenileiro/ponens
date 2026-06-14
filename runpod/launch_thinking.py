@@ -510,6 +510,8 @@ def apply_image_quality_preset(args):
     args.image_feature_align_w = max(float(args.image_feature_align_w), 0.05)
     args.image_flow_feature_align_w = max(float(args.image_flow_feature_align_w), 0.05)
     args.image_flow_repa_w = max(float(args.image_flow_repa_w), 0.05)
+    args.image_flow_repa_structure_w = max(
+        float(args.image_flow_repa_structure_w), 0.02 if hq else 0.01)
     args.image_flow_repa_mode = "auto"
     args.image_flow_self_repa_w = max(float(args.image_flow_self_repa_w), 0.05)
     args.image_flow_self_repa_mode = "auto"
@@ -984,6 +986,7 @@ def payload(args):
                      f"--flow-repa-steps {args.image_flow_repa_steps} "
                      f"--flow-repa-embed-dim {args.image_flow_repa_embed_dim} "
                      f"--flow-repa-mode {args.image_flow_repa_mode} "
+                     f"--flow-repa-structure-w {args.image_flow_repa_structure_w} "
                      f"--flow-self-repa-w {args.image_flow_self_repa_w} "
                      f"--flow-self-repa-steps {args.image_flow_self_repa_steps} "
                      f"--flow-self-repa-embed-dim {args.image_flow_self_repa_embed_dim} "
@@ -2327,6 +2330,10 @@ def main():
                     choices=("pooled", "token", "both", "auto"),
                     dest="image_flow_repa_mode",
                     help="image REPA target: pooled feature, token sequence, both, or auto")
+    ap.add_argument("--image-flow-repa-structure-w", type=float, default=0.0,
+                    dest="image_flow_repa_structure_w",
+                    help=("pairwise image-token structure alignment weight for image "
+                          "flow REPA hidden states"))
     ap.add_argument("--image-flow-self-repa-w", type=float, default=0.0,
                     dest="image_flow_self_repa_w",
                     help=("no-extra-data hidden/clean-latent self-REPA weight "
@@ -3552,6 +3559,14 @@ def main():
             sys.exit("ERROR: --image-flow-multiscale-scales must contain integers")
         if scale <= 1:
             sys.exit("ERROR: --image-flow-multiscale-scales entries must be > 1")
+    if args.image_flow_repa_w < 0.0:
+        sys.exit("ERROR: --image-flow-repa-w must be non-negative")
+    if args.image_flow_repa_steps < 0:
+        sys.exit("ERROR: --image-flow-repa-steps must be non-negative")
+    if args.image_flow_repa_embed_dim <= 0:
+        sys.exit("ERROR: --image-flow-repa-embed-dim must be positive")
+    if args.image_flow_repa_structure_w < 0.0:
+        sys.exit("ERROR: --image-flow-repa-structure-w must be non-negative")
     if args.image_flow_self_repa_w < 0.0:
         sys.exit("ERROR: --image-flow-self-repa-w must be non-negative")
     if args.image_flow_self_repa_steps < 0:
