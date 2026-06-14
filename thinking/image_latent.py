@@ -12114,7 +12114,7 @@ def selftest():
             flow_boundary_mode="double-cosine",
             flow_time_embed="fourier", flow_time_embed_dim=8,
             flow_self_condition=True, flow_self_condition_p=1.0,
-            dit_mlp="swiglu",
+            dit_mlp="swiglu", dit_register_tokens=1,
             time_sampling="adaptive", time_adaptive_bins=4,
             time_stratified=True,
             time_adaptive_uniform_mix=0.1,
@@ -12159,6 +12159,7 @@ def selftest():
         assert report["flow_self_condition"] is True
         assert math.isclose(report["flow_self_condition_p"], 1.0)
         assert report["dit_mlp"] == "swiglu"
+        assert report["dit_register_tokens"] == 1
         assert report["uses_swiglu_mlp"] is True
         assert report["adaptive_modulation"] is True
         assert report["residual_gating"] is True
@@ -12221,6 +12222,7 @@ def selftest():
             "dit_head_width_mult": report["dit_head_width_mult"],
             "dit_pos_embed": report["dit_pos_embed"],
             "dit_mlp": report["dit_mlp"],
+            "dit_register_tokens": report["dit_register_tokens"],
             "flow_time_embed": report["flow_time_embed"],
             "flow_time_embed_dim": report["flow_time_embed_dim"],
             "flow_self_condition": report["flow_self_condition"],
@@ -12250,38 +12252,43 @@ def selftest():
             flow_repa_frac=1.0, flow_repa_mode="auto",
             flow_time_embed="fourier", flow_time_embed_dim=8,
             flow_self_condition=True, flow_self_condition_p=1.0,
-            dit_mlp="swiglu", resume_checkpoint=resume_path,
+            dit_mlp="swiglu", dit_register_tokens=1, resume_checkpoint=resume_path,
             return_conditioner=True)
         assert resumed["resume_checkpoint_loaded"] is True
         assert resumed["resume_ae_state"] == "loaded"
         assert resumed["resume_module_state"]["flow_repa_aligner"] == "loaded"
     crossdit = make_flow(
         flow_arch="crossdit", latent_ch=4, hidden=16, dit_depth=1, dit_heads=2,
-        cond_dim=8, dit_mlp="swiglu", latent_max_tokens=16,
+        cond_dim=8, dit_mlp="swiglu", latent_max_tokens=16, dit_register_tokens=1,
         flow_time_embed="fourier", flow_time_embed_dim=8)
     crossdit_cond = {
         "vec": torch.randn(2, 8),
         "tokens": torch.randn(2, 3, 8),
         "mask": torch.zeros(2, 3, dtype=torch.bool),
     }
-    crossdit_out = crossdit(
-        torch.randn(2, 4, 4, 4), torch.rand(2, 1, 1, 1), crossdit_cond)
+    crossdit_out, crossdit_features = crossdit(
+        torch.randn(2, 4, 4, 4), torch.rand(2, 1, 1, 1), crossdit_cond,
+        return_features=True)
     assert tuple(crossdit_out.shape) == (2, 4, 4, 4)
+    assert tuple(crossdit_features["register_tokens"].shape) == (2, 1, 16)
     assert getattr(crossdit, "uses_adaptive_modulation", False) is True
     assert getattr(crossdit, "uses_zero_residual_gating", False) is True
     assert getattr(crossdit, "uses_swiglu_mlp", False) is True
     mmdit = make_flow(
         flow_arch="mmdit", latent_ch=4, hidden=16, dit_depth=1, dit_heads=2,
         cond_dim=8, dit_qk_norm=True, dit_attn_impl="auto", dit_pos_embed="rope2d",
-        dit_mlp="swiglu", latent_max_tokens=16,
+        dit_mlp="swiglu", latent_max_tokens=16, dit_register_tokens=2,
         flow_time_embed="fourier", flow_time_embed_dim=8)
     mmdit_cond = {
         "vec": torch.randn(2, 8),
         "tokens": torch.randn(2, 3, 8),
         "mask": torch.zeros(2, 3, dtype=torch.bool),
     }
-    mmdit_out = mmdit(torch.randn(2, 4, 4, 4), torch.rand(2, 1, 1, 1), mmdit_cond)
+    mmdit_out, mmdit_features = mmdit(
+        torch.randn(2, 4, 4, 4), torch.rand(2, 1, 1, 1), mmdit_cond,
+        return_features=True)
     assert tuple(mmdit_out.shape) == (2, 4, 4, 4)
+    assert tuple(mmdit_features["register_tokens"].shape) == (2, 2, 16)
     assert getattr(mmdit, "attn_impl", "") == "auto"
     assert getattr(mmdit, "flow_time_embed", "") == "fourier"
     assert getattr(mmdit, "flow_time_embed_dim", 0) == 8

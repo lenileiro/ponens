@@ -507,6 +507,8 @@ def apply_image_quality_preset(args):
     args.image_dit_attn_impl = "auto"
     args.image_dit_pos_embed = "rope2d"
     args.image_dit_mlp = "swiglu"
+    args.image_dit_register_tokens = max(
+        int(args.image_dit_register_tokens), 1 if hq else 0)
     args.image_flow_time_embed = "fourier"
     args.image_flow_time_embed_dim = max(int(args.image_flow_time_embed_dim), int(args.dim or 0))
     args.image_flow_checkpoint_blocks = True
@@ -981,6 +983,7 @@ def payload(args):
                      f"--dit-attn-impl {args.image_dit_attn_impl} "
                      f"--dit-pos-embed {args.image_dit_pos_embed} "
                      f"--dit-mlp {args.image_dit_mlp} "
+                     f"--dit-register-tokens {args.image_dit_register_tokens} "
                      f"--ae-arch {args.image_ae_arch} "
                      f"--ae-hf-model {shlex_quote(args.image_ae_hf_model)} "
                      f"--ae-hf-subfolder {shlex_quote(args.image_ae_hf_subfolder)} "
@@ -2281,6 +2284,10 @@ def main():
     ap.add_argument("--image-dit-mlp", default="gelu",
                     choices=("gelu", "swiglu"), dest="image_dit_mlp",
                     help="latent image CrossDiT/MM-DiT feed-forward block")
+    ap.add_argument("--image-dit-register-tokens", type=int, default=0,
+                    dest="image_dit_register_tokens",
+                    help=("learned global image-stream register tokens for latent "
+                          "image DiT/CrossDiT/MM-DiT"))
     ap.add_argument("--image-flow-time-embed", default="scalar",
                     choices=("scalar", "fourier"), dest="image_flow_time_embed",
                     help=("latent image DiT/MM-DiT timestep embedding; scalar keeps "
@@ -3869,6 +3876,10 @@ def main():
         sys.exit("ERROR: --image-dit-depth must be positive")
     if args.image_dit_heads <= 0:
         sys.exit("ERROR: --image-dit-heads must be positive")
+    if args.image_dit_register_tokens < 0:
+        sys.exit("ERROR: --image-dit-register-tokens must be non-negative")
+    if args.image_dit_register_tokens > 0 and args.image_latent_arch == "conv":
+        sys.exit("ERROR: --image-dit-register-tokens requires --image-latent-arch dit/crossdit/mmdit")
     if args.image_flow_time_embed_dim < 0:
         sys.exit("ERROR: --image-flow-time-embed-dim must be non-negative")
     if args.image_flow_self_condition and args.image_latent_arch == "conv":
