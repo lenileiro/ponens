@@ -65,6 +65,8 @@ TEXT_TRUNK_ARCHES = ("transformer", "standard", "relational", "abstractor")
 FEATURE_VIEW_KEYS = ("views", "features", "feature_views")
 TEXT_KEYS = ("text_tokens", "tokens", "text", "caption")
 TARGET_KEYS = ("target_tokens", "target", "trace_tokens", "trace")
+MULTIMODAL_SCORE_METRICS = (
+    "token", "exact", "fer", "bridge", "sequence", "all", "balanced", "mastery")
 
 
 @dataclass(frozen=True)
@@ -1515,6 +1517,167 @@ def latent_multimodal_sequence_eval(model, records, vocab, view_dims, n=200,
             "mining": mine_report}
 
 
+def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
+                                sequence_eval=None, metric="mastery",
+                                margin_w=0.1):
+    metric = str(metric)
+    if metric not in MULTIMODAL_SCORE_METRICS:
+        raise ValueError(f"unknown multimodal score metric {metric!r}")
+    margin_w = float(margin_w)
+    mode_metrics = dict(mode_metrics or {})
+    active_modes = [
+        row for row in mode_metrics.values()
+        if int(row.get("n_records", 0)) > 0
+    ]
+    token_values = [float(row.get("token_acc", 0.0)) for row in active_modes]
+    exact_values = [float(row.get("exact", 0.0)) for row in active_modes]
+    token_score = float(np.mean(token_values)) if token_values else 0.0
+    exact_score = float(np.mean(exact_values)) if exact_values else 0.0
+    mode_floor = float(min(token_values)) if token_values else 0.0
+    mode_gap = float(token_score - mode_floor) if token_values else 0.0
+    fer_eval = fer_eval or {"skipped": True}
+    bridge_eval = bridge_eval or {"skipped": True}
+    sequence_eval = sequence_eval or {"skipped": True}
+    fer_raw_score = max(0.0, float(fer_eval.get("fer_score", 0.0)))
+    fer_score = (0.0 if bool(fer_eval.get("skipped", False))
+                 else 1.0 / (1.0 + fer_raw_score))
+    bridge_raw_score = max(0.0, float(bridge_eval.get("bridge_score", 0.0)))
+    bridge_resolution = 1.0 / (1.0 + bridge_raw_score)
+    bridge_connectivity = min(1.0, max(0.0, float(
+        bridge_eval.get("bridge_connectivity", 1.0))))
+    bridge_score = (0.0 if bool(bridge_eval.get("skipped", False))
+                    else 0.5 * (bridge_resolution + bridge_connectivity))
+    sequence_acc = float(sequence_eval.get("sequence_acc", 0.0))
+    sequence_margin = float(sequence_eval.get("margin", 0.0))
+    sequence_score = (0.0 if bool(sequence_eval.get("skipped", False))
+                      else sequence_acc + margin_w * sequence_margin)
+    scores = {"token": token_score, "exact": exact_score,
+              "fer": fer_score, "bridge": bridge_score,
+              "sequence": sequence_score}
+    skipped = {"token": not token_values, "exact": not exact_values,
+               "fer": bool(fer_eval.get("skipped", False)),
+               "bridge": bool(bridge_eval.get("skipped", False)),
+               "sequence": bool(sequence_eval.get("skipped", False))}
+    active_scores = [scores[name] for name in scores if not skipped[name]]
+    if not active_scores:
+        active_scores = [0.0]
+    active_mean_score = float(np.mean(active_scores))
+    floor_score = float(min(active_scores))
+    balanced_score = 0.5 * (active_mean_score + floor_score)
+    all_score = float(np.mean(list(scores.values())))
+    signal_coverage = sum(0 if skipped[name] else 1 for name in scores) / float(
+        len(scores))
+    mastery_score = (
+        0.4 * active_mean_score
+        + 0.2 * balanced_score
+        + 0.2 * mode_floor
+        + 0.2 * signal_coverage)
+    if metric == "token":
+        score = token_score
+    elif metric == "exact":
+        score = exact_score
+    elif metric == "fer":
+        score = fer_score
+    elif metric == "bridge":
+        score = bridge_score
+    elif metric == "sequence":
+        score = sequence_score
+    elif metric == "all":
+        score = all_score
+    elif metric == "balanced":
+        score = balanced_score
+    else:
+        score = mastery_score
+    return {"metric": metric,
+            "margin_w": margin_w,
+            "score": float(score),
+            "all_score": float(all_score),
+            "active_mean_score": float(active_mean_score),
+            "floor_score": float(floor_score),
+            "balanced_score": float(balanced_score),
+            "mastery_score": float(mastery_score),
+            "signal_coverage": float(signal_coverage),
+            "token_score": float(token_score),
+            "exact_score": float(exact_score),
+            "mode_floor": float(mode_floor),
+            "mode_gap": float(mode_gap),
+            "fer_score": float(fer_score),
+            "fer_raw_score": float(fer_raw_score),
+            "fer_fragmentation": float(fer_eval.get("fragmentation", 0.0)),
+            "fer_slot_correlation": float(fer_eval.get("slot_correlation", 0.0)),
+            "fer_slot_imbalance": float(fer_eval.get("slot_imbalance", 0.0)),
+            "bridge_score": float(bridge_score),
+            "bridge_raw_score": float(bridge_raw_score),
+            "bridge_resolution": float(bridge_resolution),
+            "bridge_connectivity": float(bridge_connectivity),
+            "bridge_entropy": float(bridge_eval.get("bridge_entropy", 0.0)),
+            "sequence_score": float(sequence_score),
+            "sequence_acc": sequence_acc,
+            "sequence_margin": sequence_margin,
+            "token_skipped": skipped["token"],
+            "exact_skipped": skipped["exact"],
+            "fer_skipped": skipped["fer"],
+            "bridge_skipped": skipped["bridge"],
+            "sequence_skipped": skipped["sequence"],
+            "mode_scores": {
+                mode: {
+                    "token_acc": float(row.get("token_acc", 0.0)),
+                    "exact": float(row.get("exact", 0.0)),
+                    "loss": float(row.get("loss", 0.0)),
+                }
+                for mode, row in sorted(mode_metrics.items())
+            }}
+
+
+def multimodal_eval_bundle(model, records, vocab, view_dims, n=200, seed=1,
+                           device=DEV, score_metric="mastery",
+                           score_margin_w=0.1):
+    metrics = {
+        mode: evaluate(model, records, vocab, view_dims, n=n,
+                       seed=seed + 17 + i * 997, device=device, mode=mode)
+        for i, mode in enumerate(MODES)
+    }
+    fer = latent_multimodal_fer_eval(
+        model, records, vocab, view_dims, n=n, seed=seed + 29, device=device)
+    bridge = latent_multimodal_bridge_eval(
+        model, records, vocab, view_dims, n=n, seed=seed + 31, device=device)
+    sequence = latent_multimodal_sequence_eval(
+        model, records, vocab, view_dims, n=n, seed=seed + 37, device=device)
+    return {"teacher_forced": metrics,
+            "latent_fer": fer,
+            "latent_bridge": bridge,
+            "latent_sequence": sequence,
+            "score_components": multimodal_score_components(
+                metrics, fer_eval=fer, bridge_eval=bridge,
+                sequence_eval=sequence, metric=score_metric,
+                margin_w=score_margin_w)}
+
+
+def _model_state_copy(model):
+    return {name: tensor.detach().cpu().clone()
+            for name, tensor in model.state_dict().items()}
+
+
+def _step_schedule(steps, rounds):
+    rounds = max(1, int(rounds))
+    steps = max(0, int(steps))
+    base = steps // rounds
+    rem = steps % rounds
+    return [base + (1 if i < rem else 0) for i in range(rounds)
+            if base + (1 if i < rem else 0) > 0]
+
+
+def _compact_multimodal_train_metrics(metrics):
+    omitted = {
+        "latent_fer_study_reports",
+        "latent_discovery_study_reports",
+        "latent_study_reports",
+        "selection",
+    }
+    return {key: value for key, value in dict(metrics).items()
+            if key not in omitted}
+
+
 def _multimodal_sequence_surprise_rows(
         model, pairs, vocab, view_dims, device=DEV, temperature=0.1):
     rows = []
@@ -1829,7 +1992,13 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           latent_concept_cluster_w=0.0,
           latent_concept_cluster_temperature=0.1,
           latent_concept_cluster_margin=0.0,
-          latent_concept_cluster_min_size=2):
+          latent_concept_cluster_min_size=2,
+          select_best=False, selection_rounds=1,
+          selection_score_metric="mastery",
+          selection_score_margin_w=0.1,
+          selection_score_min_delta=0.0,
+          selection_score_patience=0,
+          selection_eval_n=200):
     ckpt_latents = text_checkpoint_latent_config(
         text_checkpoint, device="cpu") if text_checkpoint else {}
     if text_checkpoint and latent_concept_slots <= 0:
@@ -1876,6 +2045,17 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         raise ValueError("latent concept sequence batch must be 0 or at least 2")
     if float(latent_concept_sequence_temperature) <= 0.0:
         raise ValueError("latent concept sequence temperature must be positive")
+    if selection_score_metric not in MULTIMODAL_SCORE_METRICS:
+        raise ValueError(
+            f"unknown multimodal selection score metric {selection_score_metric!r}")
+    if int(selection_rounds) <= 0:
+        raise ValueError("multimodal selection rounds must be positive")
+    if float(selection_score_min_delta) < 0.0:
+        raise ValueError("multimodal selection score min delta must be non-negative")
+    if int(selection_score_patience) < 0:
+        raise ValueError("multimodal selection score patience must be non-negative")
+    if int(selection_eval_n) < 0:
+        raise ValueError("multimodal selection eval count must be non-negative")
     records = load_manifest(manifest, root=root)
     train_records, eval_records = split_records(records)
     sequence_batch = int(latent_concept_sequence_batch) or max(2, batch // 2)
@@ -1904,6 +2084,48 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     study_pool = []
     study_reports = []
     last = {}
+    selection = {"enabled": False}
+    selection_boundaries = {}
+    best_state = None
+    best_score = 0.0
+    best_round = 0
+    best_metrics = {}
+    rounds_report = []
+    no_improve_rounds = 0
+    stopped_early = False
+    stop_round = 0
+
+    def selection_row(round_id, round_steps, bundle):
+        score = float(bundle["score_components"]["score"])
+        return {
+            "round": int(round_id),
+            "steps": int(round_steps),
+            "selected": False,
+            "score": score,
+            "score_components": bundle["score_components"],
+            "teacher_forced": bundle["teacher_forced"],
+            "latent_fer": bundle["latent_fer"],
+            "latent_bridge": bundle["latent_bridge"],
+            "latent_sequence": bundle["latent_sequence"],
+        }
+
+    if select_best:
+        schedule = _step_schedule(steps, selection_rounds)
+        if not schedule:
+            raise ValueError("multimodal selected training requires at least one step")
+        cursor = 0
+        for round_id, round_steps in enumerate(schedule, start=1):
+            cursor += int(round_steps)
+            selection_boundaries[cursor] = (round_id, int(round_steps))
+        before_bundle = multimodal_eval_bundle(
+            model, eval_records, vocab, view_dims, n=selection_eval_n,
+            seed=seed, device=device, score_metric=selection_score_metric,
+            score_margin_w=selection_score_margin_w)
+        initial_row = selection_row(0, 0, before_bundle)
+        best_state = _model_state_copy(model)
+        best_score = float(initial_row["score"])
+        best_metrics = {"selection_initial": True}
+        rounds_report = [initial_row]
 
     def selected_id_sample(selected, limit=16):
         return [rec.rec_id for rec in selected[:int(limit)]]
@@ -2200,6 +2422,63 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                   f"memory {last['latent_memory_loss']:.3f} "
                   f"sequence {last['latent_sequence_loss']:.3f}",
                   flush=True)
+        if select_best and st in selection_boundaries:
+            round_id, round_steps = selection_boundaries[st]
+            bundle = multimodal_eval_bundle(
+                model, eval_records, vocab, view_dims, n=selection_eval_n,
+                seed=seed, device=device, score_metric=selection_score_metric,
+                score_margin_w=selection_score_margin_w)
+            row = selection_row(round_id, round_steps, bundle)
+            score_delta_from_best = float(row["score"] - best_score)
+            selected = score_delta_from_best > float(selection_score_min_delta)
+            row = row | {
+                "selected": bool(selected),
+                "score_delta_from_best": score_delta_from_best,
+                "train_metrics": _compact_multimodal_train_metrics(last),
+            }
+            rounds_report.append(row)
+            if selected:
+                best_score = float(row["score"])
+                best_round = int(round_id)
+                best_state = _model_state_copy(model)
+                best_metrics = dict(last)
+                no_improve_rounds = 0
+            else:
+                no_improve_rounds += 1
+                if (selection_score_patience
+                        and no_improve_rounds >= int(selection_score_patience)):
+                    stopped_early = True
+                    stop_round = int(round_id)
+                    break
+    if select_best and best_state is not None:
+        model.load_state_dict(best_state, strict=False)
+        for row in rounds_report:
+            row["selected"] = row["round"] == best_round
+        selection = {
+            "enabled": True,
+            "rounds_requested": int(selection_rounds),
+            "rounds_planned": len(selection_boundaries),
+            "rounds_run": len(rounds_report) - 1,
+            "score_metric": selection_score_metric,
+            "score_margin_w": float(selection_score_margin_w),
+            "score_min_delta": float(selection_score_min_delta),
+            "score_patience": int(selection_score_patience),
+            "selection_eval_n": int(selection_eval_n),
+            "stopped_early": bool(stopped_early),
+            "stop_round": int(stop_round),
+            "no_improve_rounds": int(no_improve_rounds),
+            "selected_round": int(best_round),
+            "accepted_update": bool(best_round > 0),
+            "selected_score": float(best_score),
+            "before_score": float(rounds_report[0]["score"]),
+            "selected_score_delta": float(best_score - rounds_report[0]["score"]),
+            "rounds": rounds_report,
+        }
+        best_metrics = best_metrics | {"selection": selection}
+        last = best_metrics
+    else:
+        selection = {"enabled": False}
+        last = dict(last) | {"selection": selection}
     model.train_metrics = last
     model.latent_fer_study_reports = (
         study_reports if hard_study_strategy == "fer" else [])
@@ -2270,6 +2549,8 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         "manifest": model.manifest_info,
         "architecture": architecture,
         "train_metrics": getattr(model, "train_metrics", {}),
+        "selection": getattr(model, "train_metrics", {}).get(
+            "selection", {"enabled": False}),
         "teacher_forced": metrics,
         "latent_graph_probe": latent_probe,
         "latent_fer_probe": latent_fer_probe,
@@ -2456,6 +2737,28 @@ def selftest():
             "latent_discovery_hard_record_ids"])) == 2
         assert any(r.get("strategy") == "discovery"
                    for r in discovery_model.train_metrics["latent_study_reports"])
+        selected_model, *_ = train(
+            manifest, steps=2, batch=2, d=32, layers=1, heads=4, device="cpu",
+            log_every=10, view_tokens=2, txt_tokens=4,
+            concept_tokens=2, latent_concept_slots=3,
+            latent_concept_memory_size=8,
+            latent_concept_discovery_probe_n=4,
+            latent_concept_discovery_hard_max=2,
+            latent_concept_discovery_refresh_steps=1,
+            latent_concept_graph_predict_w=0.01,
+            latent_concept_bridge_w=0.01,
+            latent_concept_sequence_w=0.01,
+            latent_concept_sequence_batch=2,
+            select_best=True, selection_rounds=2, selection_eval_n=4,
+            selection_score_min_delta=999.0, selection_score_patience=1)
+        selection = selected_model.train_metrics["selection"]
+        assert selection["enabled"] is True
+        assert selection["stopped_early"] is True
+        assert selection["rounds_run"] == 1
+        assert selection["stop_round"] == 1
+        assert selection["accepted_update"] is False
+        assert selection["selected_round"] == 0
+        assert "score_delta_from_best" in selection["rounds"][1]
     print("multimodal selftest OK")
 
 
@@ -2619,6 +2922,21 @@ def main(argv=None):
                     dest="text_arch")
     ap.add_argument("--modality-dropout", type=float, default=0.0, dest="modality_dropout")
     ap.add_argument("--eval-n", type=int, default=200, dest="eval_n")
+    ap.add_argument("--select-best", action=argparse.BooleanOptionalAction,
+                    default=False, dest="select_best",
+                    help="reload the best self-scored multimodal checkpoint")
+    ap.add_argument("--selection-rounds", type=int, default=1,
+                    dest="selection_rounds")
+    ap.add_argument("--selection-score-metric", choices=MULTIMODAL_SCORE_METRICS,
+                    default="mastery", dest="selection_score_metric")
+    ap.add_argument("--selection-score-margin-w", type=float, default=0.1,
+                    dest="selection_score_margin_w")
+    ap.add_argument("--selection-score-min-delta", type=float, default=0.0,
+                    dest="selection_score_min_delta")
+    ap.add_argument("--selection-score-patience", type=int, default=0,
+                    dest="selection_score_patience")
+    ap.add_argument("--selection-eval-n", type=int, default=200,
+                    dest="selection_eval_n")
     ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--out", default="runs/multimodal.json")
     args = ap.parse_args(argv)
@@ -2711,6 +3029,14 @@ def main(argv=None):
         ap.error("--latent-concept-transition-temperature must be positive")
     if args.latent_concept_cluster_temperature <= 0.0:
         ap.error("--latent-concept-cluster-temperature must be positive")
+    if args.selection_rounds <= 0:
+        ap.error("--selection-rounds must be positive")
+    if args.selection_score_min_delta < 0.0:
+        ap.error("--selection-score-min-delta must be non-negative")
+    if args.selection_score_patience < 0:
+        ap.error("--selection-score-patience must be non-negative")
+    if args.selection_eval_n < 0:
+        ap.error("--selection-eval-n must be non-negative")
     report = run(
         args.manifest, root=args.root, steps=args.steps, seed=args.seed,
         device=args.device, eval_n=args.eval_n, checkpoint=args.checkpoint,
@@ -2805,6 +3131,13 @@ def main(argv=None):
         latent_concept_cluster_temperature=args.latent_concept_cluster_temperature,
         latent_concept_cluster_margin=args.latent_concept_cluster_margin,
         latent_concept_cluster_min_size=args.latent_concept_cluster_min_size,
+        select_best=args.select_best,
+        selection_rounds=args.selection_rounds,
+        selection_score_metric=args.selection_score_metric,
+        selection_score_margin_w=args.selection_score_margin_w,
+        selection_score_min_delta=args.selection_score_min_delta,
+        selection_score_patience=args.selection_score_patience,
+        selection_eval_n=args.selection_eval_n,
         log_every=args.log_every)
     return report
 
