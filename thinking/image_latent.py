@@ -5026,6 +5026,44 @@ def image_gradient_loss(pred, target):
     return F.l1_loss(dx_pred, dx_target) + F.l1_loss(dy_pred, dy_target)
 
 
+def local_structure_loss(pred, target, window=7, data_range=2.0, eps=1.0e-6):
+    """SSIM-style local structure loss over image/latent channels."""
+    if pred.shape != target.shape:
+        raise ValueError(
+            f"structure loss shapes must match, got "
+            f"{tuple(pred.shape)} and {tuple(target.shape)}")
+    pred_f = torch.nan_to_num(pred.float(), nan=0.0, posinf=1.0, neginf=-1.0)
+    target_f = torch.nan_to_num(target.float(), nan=0.0, posinf=1.0, neginf=-1.0)
+    k = max(1, int(window))
+    if k % 2 == 0:
+        k += 1
+    pad = k // 2
+    mu_pred = F.avg_pool2d(
+        pred_f, kernel_size=k, stride=1, padding=pad, count_include_pad=False)
+    mu_target = F.avg_pool2d(
+        target_f, kernel_size=k, stride=1, padding=pad, count_include_pad=False)
+    pred_sq = F.avg_pool2d(
+        pred_f * pred_f, kernel_size=k, stride=1, padding=pad,
+        count_include_pad=False)
+    target_sq = F.avg_pool2d(
+        target_f * target_f, kernel_size=k, stride=1, padding=pad,
+        count_include_pad=False)
+    pred_target = F.avg_pool2d(
+        pred_f * target_f, kernel_size=k, stride=1, padding=pad,
+        count_include_pad=False)
+    var_pred = (pred_sq - mu_pred.pow(2)).clamp_min(0.0)
+    var_target = (target_sq - mu_target.pow(2)).clamp_min(0.0)
+    cov = pred_target - mu_pred * mu_target
+    c1 = (0.01 * float(data_range)) ** 2
+    c2 = (0.03 * float(data_range)) ** 2
+    luminance = (2.0 * mu_pred * mu_target + c1) / (
+        mu_pred.pow(2) + mu_target.pow(2) + c1 + float(eps))
+    contrast_structure = (2.0 * cov + c2) / (
+        var_pred + var_target + c2 + float(eps))
+    ssim = (luminance * contrast_structure).clamp(-1.0, 1.0)
+    return (1.0 - ssim).mul(0.5).mean()
+
+
 def multiscale_recon_loss(pred, target, levels=3):
     losses = []
     cur_pred, cur_target = pred, target
@@ -5179,7 +5217,8 @@ def multiscale_flow_velocity_loss(pred, target, scales=(2, 4), weights=None):
 
 
 def reconstruction_loss_parts(pred, target, mode="mse", grad_w=0.0, ms_w=0.0,
-                              fft_w=0.0, latent=None, latent_reg_w=0.0):
+                              fft_w=0.0, structure_w=0.0, latent=None,
+                              latent_reg_w=0.0):
     if mode not in AE_RECON_LOSSES:
         raise ValueError(f"unknown AE reconstruction loss {mode!r}")
     mse = F.mse_loss(pred, target)
@@ -5208,6 +5247,10 @@ def reconstruction_loss_parts(pred, target, mode="mse", grad_w=0.0, ms_w=0.0,
         fft = frequency_recon_loss(pred, target)
         loss = loss + float(fft_w) * fft
         parts["recon_fft_l1"] = fft.detach()
+    if structure_w > 0.0:
+        structure = local_structure_loss(pred, target)
+        loss = loss + float(structure_w) * structure
+        parts["recon_structure_ssim"] = structure.detach()
     if latent is not None and latent_reg_w > 0.0:
         lat = latent.float().pow(2).mean()
         loss = loss + float(latent_reg_w) * lat
@@ -6179,6 +6222,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        decoded_endpoint_grad_w=0.0,
                        decoded_endpoint_ms_w=0.0,
                        decoded_endpoint_fft_w=0.0,
+                       decoded_endpoint_structure_w=0.0,
                        equivariance_w=0.0, equivariance_p=1.0,
                        equivariance_transforms=DEFAULT_FLOW_EQUIVARIANCE_TRANSFORMS,
                        equivariance_shift_frac=0.125,
@@ -6226,12 +6270,14 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     decoded_endpoint_grad_w = float(decoded_endpoint_grad_w)
     decoded_endpoint_ms_w = float(decoded_endpoint_ms_w)
     decoded_endpoint_fft_w = float(decoded_endpoint_fft_w)
+    decoded_endpoint_structure_w = float(decoded_endpoint_structure_w)
     if decoded_endpoint_w < 0.0:
         raise ValueError("decoded_endpoint_w must be non-negative")
     if decoded_endpoint_p < 0.0 or decoded_endpoint_p > 1.0:
         raise ValueError("decoded_endpoint_p must be in [0, 1]")
     if (decoded_endpoint_grad_w < 0.0 or decoded_endpoint_ms_w < 0.0
-            or decoded_endpoint_fft_w < 0.0):
+            or decoded_endpoint_fft_w < 0.0
+            or decoded_endpoint_structure_w < 0.0):
         raise ValueError("decoded endpoint structure weights must be non-negative")
     if decoded_endpoint_w > 0.0 and ae is None:
         raise ValueError("decoded_endpoint_w requires an autoencoder")
@@ -6355,6 +6401,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
             float(decoded_endpoint_ms_w), device=z1.device),
         "flow_decoded_endpoint_fft_w": torch.tensor(
             float(decoded_endpoint_fft_w), device=z1.device),
+        "flow_decoded_endpoint_structure_w": torch.tensor(
+            float(decoded_endpoint_structure_w), device=z1.device),
         "flow_decoded_endpoint_active": torch.tensor(0.0, device=z1.device),
         "flow_equivariance_w": torch.tensor(float(equivariance_w), device=z1.device),
         "flow_equivariance_p": torch.tensor(float(equivariance_p), device=z1.device),
@@ -6453,7 +6501,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
             pred_img, target_img, mode="mse",
             grad_w=decoded_endpoint_grad_w,
             ms_w=decoded_endpoint_ms_w,
-            fft_w=decoded_endpoint_fft_w)
+            fft_w=decoded_endpoint_fft_w,
+            structure_w=decoded_endpoint_structure_w)
         total = total + float(decoded_endpoint_w) * decoded_loss
         parts["flow_decoded_endpoint_loss"] = decoded_loss.detach()
         parts["flow_decoded_endpoint_active"] = torch.tensor(1.0, device=z1.device)
@@ -8178,6 +8227,8 @@ def image_reproduction_metrics(reference, candidate, prefix="reference"):
             multiscale_recon_loss(cand, ref).detach().cpu()),
         f"{prefix}_structure_frequency_l1": float(
             frequency_recon_loss(cand, ref).detach().cpu()),
+        f"{prefix}_structure_ssim_loss": float(
+            local_structure_loss(cand, ref).detach().cpu()),
     }
 
 
@@ -8723,6 +8774,7 @@ def save_reference_reproduction_grid(ae, flow, records, path, size=32, device=DE
             + metrics_i["reference_flow_structure_edge_l1"]
             + metrics_i["reference_flow_structure_multiscale_l1"]
             + metrics_i["reference_flow_structure_frequency_l1"]
+            + metrics_i["reference_flow_structure_ssim_loss"]
         )
         row_i = {
             "index": int(sweep_idx),
@@ -10968,7 +11020,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       ae_arch="semantic", latent_downsample=4, ae_res_blocks=1,
                       ae_hf_model="", ae_hf_subfolder="", ae_hf_scaling_factor=0.0,
                       ae_recon_loss="mse", ae_grad_w=0.0, ae_ms_w=0.0, ae_fft_w=0.0,
-                      ae_latent_reg_w=0.0,
+                      ae_structure_w=0.0, ae_latent_reg_w=0.0,
                       image_text_align_w=0.0, flow_text_align_w=0.0, text_embed_dim=128,
                       image_feature_align_w=0.0, flow_feature_align_w=0.0,
                       image_feature_embed_dim=128,
@@ -10996,6 +11048,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       flow_decoded_endpoint_grad_w=0.0,
                       flow_decoded_endpoint_ms_w=0.0,
                       flow_decoded_endpoint_fft_w=0.0,
+                      flow_decoded_endpoint_structure_w=0.0,
                       flow_equivariance_w=0.0, flow_equivariance_p=1.0,
                       flow_equivariance_transforms=DEFAULT_FLOW_EQUIVARIANCE_TRANSFORMS,
                       flow_equivariance_shift_frac=0.125,
@@ -11240,7 +11293,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("image_hflip_prob must be in [0, 1]")
     if ae_recon_loss not in AE_RECON_LOSSES:
         raise ValueError(f"unknown AE reconstruction loss {ae_recon_loss!r}")
-    if ae_grad_w < 0.0 or ae_ms_w < 0.0 or ae_fft_w < 0.0 or ae_latent_reg_w < 0.0:
+    ae_structure_w = float(ae_structure_w)
+    if (ae_grad_w < 0.0 or ae_ms_w < 0.0 or ae_fft_w < 0.0
+            or ae_structure_w < 0.0 or ae_latent_reg_w < 0.0):
         raise ValueError("AE reconstruction weights must be non-negative")
     if image_text_align_w < 0.0 or flow_text_align_w < 0.0:
         raise ValueError("image/text alignment weights must be non-negative")
@@ -11322,12 +11377,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_decoded_endpoint_grad_w = float(flow_decoded_endpoint_grad_w)
     flow_decoded_endpoint_ms_w = float(flow_decoded_endpoint_ms_w)
     flow_decoded_endpoint_fft_w = float(flow_decoded_endpoint_fft_w)
+    flow_decoded_endpoint_structure_w = float(flow_decoded_endpoint_structure_w)
     if flow_decoded_endpoint_w < 0.0:
         raise ValueError("flow_decoded_endpoint_w must be non-negative")
     if flow_decoded_endpoint_p < 0.0 or flow_decoded_endpoint_p > 1.0:
         raise ValueError("flow_decoded_endpoint_p must be in [0, 1]")
     if (flow_decoded_endpoint_grad_w < 0.0 or flow_decoded_endpoint_ms_w < 0.0
-            or flow_decoded_endpoint_fft_w < 0.0):
+            or flow_decoded_endpoint_fft_w < 0.0
+            or flow_decoded_endpoint_structure_w < 0.0):
         raise ValueError("flow decoded endpoint component weights must be non-negative")
     flow_equivariance_w = float(flow_equivariance_w)
     flow_equivariance_p = float(flow_equivariance_p)
@@ -11687,7 +11744,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 out = ae(x)
                 loss, parts = reconstruction_loss_parts(
                     out["recon"], x, mode=ae_recon_loss, grad_w=ae_grad_w,
-                    ms_w=ae_ms_w, fft_w=ae_fft_w, latent=out.get("latent"),
+                    ms_w=ae_ms_w, fft_w=ae_fft_w, structure_w=ae_structure_w,
+                    latent=out.get("latent"),
                     latent_reg_w=ae_latent_reg_w)
                 if text_aligner is not None and image_text_align_w > 0.0:
                     cond_vec = caption_record_condition(
@@ -12233,6 +12291,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     decoded_endpoint_grad_w=flow_decoded_endpoint_grad_w,
                     decoded_endpoint_ms_w=flow_decoded_endpoint_ms_w,
                     decoded_endpoint_fft_w=flow_decoded_endpoint_fft_w,
+                    decoded_endpoint_structure_w=(
+                        flow_decoded_endpoint_structure_w),
                     equivariance_w=flow_equivariance_w,
                     equivariance_p=flow_equivariance_p,
                     equivariance_transforms=flow_equivariance_transforms,
@@ -12623,6 +12683,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "ae_grad_w": float(ae_grad_w),
         "ae_ms_w": float(ae_ms_w),
         "ae_fft_w": float(ae_fft_w),
+        "ae_structure_w": float(ae_structure_w),
         "ae_latent_reg_w": float(ae_latent_reg_w),
         "image_text_align_w": float(image_text_align_w),
         "flow_text_align_w": float(flow_text_align_w),
@@ -12705,6 +12766,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_decoded_endpoint_grad_w": float(flow_decoded_endpoint_grad_w),
         "flow_decoded_endpoint_ms_w": float(flow_decoded_endpoint_ms_w),
         "flow_decoded_endpoint_fft_w": float(flow_decoded_endpoint_fft_w),
+        "flow_decoded_endpoint_structure_w": float(
+            flow_decoded_endpoint_structure_w),
         "flow_equivariance_w": float(flow_equivariance_w),
         "flow_equivariance_p": float(flow_equivariance_p),
         "flow_equivariance_transforms": list(flow_equivariance_transforms),
@@ -13085,6 +13148,11 @@ def selftest():
             yy,
             torch.sin(xx * math.pi * 4.0) * torch.cos(yy * math.pi * 4.0),
         ], dim=0).unsqueeze(0)
+        same_structure = local_structure_loss(textured_sample, textured_sample)
+        shifted_structure = local_structure_loss(
+            textured_sample, torch.roll(textured_sample, shifts=3, dims=-1))
+        assert float(same_structure) < 1.0e-3
+        assert float(shifted_structure) > float(same_structure)
         health_scores = sample_candidate_health_scores(torch.cat([
             flat_sample, clipped_sample, textured_sample], dim=0))
         assert torch.isfinite(health_scores).all()
@@ -13195,6 +13263,7 @@ def selftest():
             flow_guidance_distill_w=0.01, flow_ema_decay=0.9,
             flow_frequency_w=0.01, flow_straightness_w=0.01,
             flow_endpoint_stats_w=0.01,
+            ae_structure_w=0.1,
             image_feature_align_w=0.01, flow_feature_align_w=0.01,
             flow_repa_w=0.01, flow_repa_structure_w=0.01,
             flow_repa_frac=1.0,
@@ -13211,6 +13280,7 @@ def selftest():
             flow_decoded_endpoint_grad_w=0.1,
             flow_decoded_endpoint_ms_w=0.1,
             flow_decoded_endpoint_fft_w=0.1,
+            flow_decoded_endpoint_structure_w=0.1,
             flow_equivariance_w=0.01,
             flow_equivariance_p=1.0,
             flow_equivariance_transforms=("roll",),
@@ -13233,6 +13303,8 @@ def selftest():
         assert report["last_flow"]["time_stratified"] == 1.0
         assert math.isclose(report["time_mode_scale"], DEFAULT_TIME_MODE_SCALE)
         assert report["time_adaptive_enabled"] is True
+        assert math.isclose(report["ae_structure_w"], 0.1)
+        assert "recon_structure_ssim" in report["last_ae"]
         assert math.isclose(report["flow_frequency_w"], 0.01)
         assert math.isclose(report["flow_endpoint_stats_w"], 0.01)
         assert "flow_endpoint_stats_loss" in report["last_flow"]
@@ -13263,6 +13335,8 @@ def selftest():
         assert "flow_decoded_endpoint_recon_grad_l1" in report["last_flow"]
         assert "flow_decoded_endpoint_recon_multiscale_l1" in report["last_flow"]
         assert "flow_decoded_endpoint_recon_fft_l1" in report["last_flow"]
+        assert "flow_decoded_endpoint_recon_structure_ssim" in report["last_flow"]
+        assert math.isclose(report["flow_decoded_endpoint_structure_w"], 0.1)
         assert math.isclose(report["flow_equivariance_w"], 0.01)
         assert report["last_flow"]["flow_equivariance_active"] == 1.0
         assert "flow_equivariance_velocity_mse" in report["last_flow"]
@@ -13358,6 +13432,8 @@ def selftest():
             1.0 - selected_strength)
         assert reference_meta["reference_flow_sample_trace_self_condition_updates"] == 0
         assert "reference_flow_structure_edge_l1" in reference_meta
+        assert "reference_flow_structure_ssim_loss" in reference_meta
+        assert "reference_recon_structure_ssim_loss" in reference_meta
         assert os.path.exists(reference_sample_path)
         resume_path = os.path.join(td, "resume.pt")
         torch.save({
@@ -13607,6 +13683,9 @@ def main(argv=None):
                     help="multi-scale reconstruction loss weight")
     ap.add_argument("--ae-fft-w", type=float, default=0.0, dest="ae_fft_w",
                     help="frequency-spectrum reconstruction loss weight")
+    ap.add_argument("--ae-structure-w", type=float, default=0.0,
+                    dest="ae_structure_w",
+                    help="SSIM-style local structure reconstruction loss weight")
     ap.add_argument("--ae-latent-reg-w", type=float, default=0.0, dest="ae_latent_reg_w",
                     help="latent L2 regularization weight during AE training")
     ap.add_argument("--image-text-align-w", type=float, default=0.0,
@@ -13854,6 +13933,9 @@ def main(argv=None):
     ap.add_argument("--flow-decoded-endpoint-fft-w", type=float, default=0.0,
                     dest="flow_decoded_endpoint_fft_w",
                     help="frequency component weight inside decoded endpoint loss")
+    ap.add_argument("--flow-decoded-endpoint-structure-w", type=float, default=0.0,
+                    dest="flow_decoded_endpoint_structure_w",
+                    help="SSIM-style local structure weight inside decoded endpoint loss")
     ap.add_argument("--flow-equivariance-w", type=float, default=0.0,
                     dest="flow_equivariance_w",
                     help=("spatial equivariance loss weight for latent flow "
@@ -14325,6 +14407,10 @@ def main(argv=None):
         ap.error("--sample-pixel-dynamic-threshold-percentile must be <= 1")
     if args.sample_pixel_dynamic_threshold_max <= 0.0:
         ap.error("--sample-pixel-dynamic-threshold-max must be positive")
+    if (args.ae_grad_w < 0.0 or args.ae_ms_w < 0.0
+            or args.ae_fft_w < 0.0 or args.ae_structure_w < 0.0
+            or args.ae_latent_reg_w < 0.0):
+        ap.error("AE reconstruction weights must be non-negative")
     if args.flow_time_embed_dim < 0:
         ap.error("--flow-time-embed-dim must be non-negative")
     if args.flow_self_condition and args.flow_arch == "conv":
@@ -14366,7 +14452,8 @@ def main(argv=None):
         ap.error("--flow-decoded-endpoint-p must be in [0, 1]")
     if (args.flow_decoded_endpoint_grad_w < 0.0
             or args.flow_decoded_endpoint_ms_w < 0.0
-            or args.flow_decoded_endpoint_fft_w < 0.0):
+            or args.flow_decoded_endpoint_fft_w < 0.0
+            or args.flow_decoded_endpoint_structure_w < 0.0):
         ap.error("flow decoded endpoint component weights must be non-negative")
     if args.flow_equivariance_w < 0.0:
         ap.error("--flow-equivariance-w must be non-negative")
@@ -14830,6 +14917,7 @@ def main(argv=None):
         ae_hf_scaling_factor=args.ae_hf_scaling_factor,
         ae_recon_loss=args.ae_recon_loss, ae_grad_w=args.ae_grad_w,
         ae_ms_w=args.ae_ms_w, ae_fft_w=args.ae_fft_w,
+        ae_structure_w=args.ae_structure_w,
         ae_latent_reg_w=args.ae_latent_reg_w,
         image_text_align_w=args.image_text_align_w,
         flow_text_align_w=args.flow_text_align_w,
@@ -14871,6 +14959,8 @@ def main(argv=None):
         flow_decoded_endpoint_grad_w=args.flow_decoded_endpoint_grad_w,
         flow_decoded_endpoint_ms_w=args.flow_decoded_endpoint_ms_w,
         flow_decoded_endpoint_fft_w=args.flow_decoded_endpoint_fft_w,
+        flow_decoded_endpoint_structure_w=(
+            args.flow_decoded_endpoint_structure_w),
         flow_equivariance_w=args.flow_equivariance_w,
         flow_equivariance_p=args.flow_equivariance_p,
         flow_equivariance_transforms=flow_equivariance_transforms,
@@ -15190,6 +15280,7 @@ def main(argv=None):
         "ae_grad_w": args.ae_grad_w,
         "ae_ms_w": args.ae_ms_w,
         "ae_fft_w": args.ae_fft_w,
+        "ae_structure_w": args.ae_structure_w,
         "ae_latent_reg_w": args.ae_latent_reg_w,
         "image_text_align_w": args.image_text_align_w,
         "flow_text_align_w": args.flow_text_align_w,
@@ -15385,6 +15476,9 @@ def main(argv=None):
             "flow_decoded_endpoint_ms_w", args.flow_decoded_endpoint_ms_w),
         "flow_decoded_endpoint_fft_w": report.get(
             "flow_decoded_endpoint_fft_w", args.flow_decoded_endpoint_fft_w),
+        "flow_decoded_endpoint_structure_w": report.get(
+            "flow_decoded_endpoint_structure_w",
+            args.flow_decoded_endpoint_structure_w),
         "flow_equivariance_w": report.get(
             "flow_equivariance_w", args.flow_equivariance_w),
         "flow_equivariance_p": report.get(

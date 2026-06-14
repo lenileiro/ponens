@@ -535,6 +535,8 @@ def apply_image_quality_preset(args):
     args.image_flow_cache_max_loaded_shards = max(int(args.image_flow_cache_max_loaded_shards), 4)
     args.image_text_align_w = max(float(args.image_text_align_w), 0.05)
     args.image_flow_text_align_w = max(float(args.image_flow_text_align_w), 0.05)
+    args.image_ae_structure_w = max(
+        float(args.image_ae_structure_w), 0.1 if hq else 0.05)
     args.image_feature_align_w = max(float(args.image_feature_align_w), 0.05)
     args.image_flow_feature_align_w = max(float(args.image_flow_feature_align_w), 0.05)
     if int(args.image_embedding_sequence_max_len) <= 0:
@@ -580,6 +582,8 @@ def apply_image_quality_preset(args):
         float(args.image_flow_decoded_endpoint_ms_w), 0.25 if hq else 0.1)
     args.image_flow_decoded_endpoint_fft_w = max(
         float(args.image_flow_decoded_endpoint_fft_w), 0.1 if hq else 0.05)
+    args.image_flow_decoded_endpoint_structure_w = max(
+        float(args.image_flow_decoded_endpoint_structure_w), 0.25 if hq else 0.1)
     args.image_flow_equivariance_w = max(
         float(args.image_flow_equivariance_w), 0.02 if hq else 0.01)
     image_flow_equivariance_p = (
@@ -1093,6 +1097,7 @@ def payload(args):
                      f"--ae-grad-w {args.image_ae_grad_w} "
                      f"--ae-ms-w {args.image_ae_ms_w} "
                      f"--ae-fft-w {args.image_ae_fft_w} "
+                     f"--ae-structure-w {args.image_ae_structure_w} "
                      f"--ae-latent-reg-w {args.image_ae_latent_reg_w} "
                      f"--image-text-align-w {args.image_text_align_w} "
                      f"--flow-text-align-w {args.image_flow_text_align_w} "
@@ -1203,6 +1208,8 @@ def payload(args):
                      f"{args.image_flow_decoded_endpoint_ms_w} "
                      f"--flow-decoded-endpoint-fft-w "
                      f"{args.image_flow_decoded_endpoint_fft_w} "
+                     f"--flow-decoded-endpoint-structure-w "
+                     f"{args.image_flow_decoded_endpoint_structure_w} "
                      f"--flow-equivariance-w {args.image_flow_equivariance_w} "
                      f"--flow-equivariance-p {args.image_flow_equivariance_p} "
                      f"--flow-equivariance-transforms "
@@ -2623,6 +2630,9 @@ def main():
                     help="multi-scale reconstruction loss weight")
     ap.add_argument("--image-ae-fft-w", type=float, default=0.0, dest="image_ae_fft_w",
                     help="frequency-spectrum reconstruction loss weight")
+    ap.add_argument("--image-ae-structure-w", type=float, default=0.0,
+                    dest="image_ae_structure_w",
+                    help="SSIM-style local structure reconstruction loss weight")
     ap.add_argument("--image-ae-latent-reg-w", type=float, default=0.0,
                     dest="image_ae_latent_reg_w",
                     help="latent L2 regularization weight during AE training")
@@ -3190,6 +3200,9 @@ def main():
     ap.add_argument("--image-flow-decoded-endpoint-fft-w", type=float, default=0.0,
                     dest="image_flow_decoded_endpoint_fft_w",
                     help="frequency component weight inside decoded endpoint loss")
+    ap.add_argument("--image-flow-decoded-endpoint-structure-w", type=float, default=0.0,
+                    dest="image_flow_decoded_endpoint_structure_w",
+                    help="SSIM-style local structure weight inside decoded endpoint loss")
     ap.add_argument("--image-flow-equivariance-w", type=float, default=0.0,
                     dest="image_flow_equivariance_w",
                     help=("spatial equivariance loss weight for image flow "
@@ -4022,6 +4035,10 @@ def main():
         )
     if args.image_time_shift <= 0.0:
         sys.exit("ERROR: --image-time-shift must be positive")
+    if (args.image_ae_grad_w < 0.0 or args.image_ae_ms_w < 0.0
+            or args.image_ae_fft_w < 0.0 or args.image_ae_structure_w < 0.0
+            or args.image_ae_latent_reg_w < 0.0):
+        sys.exit("ERROR: image AE reconstruction weights must be non-negative")
     if (args.image_time_mode_scale < 0.0
             or args.image_time_mode_scale >= IMAGE_MAX_TIME_MODE_SCALE):
         sys.exit(
@@ -4073,7 +4090,8 @@ def main():
         sys.exit("ERROR: --image-flow-decoded-endpoint-p must be in [0, 1]")
     if (args.image_flow_decoded_endpoint_grad_w < 0.0
             or args.image_flow_decoded_endpoint_ms_w < 0.0
-            or args.image_flow_decoded_endpoint_fft_w < 0.0):
+            or args.image_flow_decoded_endpoint_fft_w < 0.0
+            or args.image_flow_decoded_endpoint_structure_w < 0.0):
         sys.exit("ERROR: image decoded endpoint component weights must be non-negative")
     if args.image_flow_equivariance_w < 0.0:
         sys.exit("ERROR: --image-flow-equivariance-w must be non-negative")
