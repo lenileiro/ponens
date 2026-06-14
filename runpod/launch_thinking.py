@@ -550,6 +550,7 @@ def apply_image_quality_preset(args):
     args.image_flow_guidance_distill_cfg_rescale = max(
         float(args.image_flow_guidance_distill_cfg_rescale), float(args.image_cfg_rescale))
     args.image_time_sampling = "adaptive" if hq else "logit-normal"
+    args.image_time_stratified = True
     if hq:
         args.image_time_adaptive_bins = max(int(args.image_time_adaptive_bins), 32)
         if str(args.image_time_adaptive_prior or "uniform") == "uniform":
@@ -1071,6 +1072,7 @@ def payload(args):
                      f"--flow-time-embed-dim {args.image_flow_time_embed_dim} "
                      f"--flow-self-condition-p {args.image_flow_self_condition_p} "
                      f"--time-sampling {args.image_time_sampling} "
+                     f"{'--time-stratified ' if args.image_time_stratified else ''}"
                      f"--time-logit-mean {args.image_time_logit_mean} "
                      f"--time-logit-std {args.image_time_logit_std} "
                      f"--time-mode-scale {args.image_time_mode_scale} "
@@ -2759,6 +2761,9 @@ def main():
                     choices=IMAGE_TIME_SAMPLINGS,
                     dest="image_time_sampling",
                     help="latent image flow timestep distribution")
+    ap.add_argument("--image-time-stratified", action="store_true",
+                    dest="image_time_stratified",
+                    help="sample jittered latent image flow timestep strata")
     ap.add_argument("--image-time-logit-mean", type=float, default=0.0,
                     dest="image_time_logit_mean",
                     help="mean for --image-time-sampling logit-normal")

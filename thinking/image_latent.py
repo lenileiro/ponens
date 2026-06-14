@@ -1217,7 +1217,8 @@ def latent_flow_preference_pair_loss(flow, z_chosen, z_rejected, cond, score_gap
                                      cond_drop=0.0, time_sampling="uniform",
                                      time_logit_mean=0.0, time_logit_std=1.0,
                                      time_mode_scale=DEFAULT_TIME_MODE_SCALE,
-                                     time_shift=1.0, latent_stats=None,
+                                     time_shift=1.0, time_stratified=False,
+                                     latent_stats=None,
                                      flow_loss_weight="none",
                                      flow_loss_weight_gamma=5.0,
                                      flow_loss_weight_normalize=True,
@@ -1235,7 +1236,8 @@ def latent_flow_preference_pair_loss(flow, z_chosen, z_rejected, cond, score_gap
     t = sample_flow_times(zc.shape[0], device=zc.device, mode=time_sampling,
                           logit_mean=time_logit_mean, logit_std=time_logit_std,
                           mode_scale=time_mode_scale, time_shift=time_shift,
-                          adaptive_sampler=adaptive_sampler)
+                          adaptive_sampler=adaptive_sampler,
+                          stratified=time_stratified)
     cond_model = condition_dropout(cond, cond_drop)
     ztc = (1.0 - t) * x0 + t * zc
     ztr = (1.0 - t) * x0 + t * zr
@@ -1263,6 +1265,8 @@ def latent_flow_preference_pair_loss(flow, z_chosen, z_rejected, cond, score_gap
         f"{prefix}_rejected_velocity_mse": loss_r.mean().detach(),
         f"{prefix}_loss_gap": (loss_r - loss_c).mean().detach(),
         f"{prefix}_acc": loss_c.lt(loss_r).float().mean().detach(),
+        f"{prefix}_time_stratified": torch.tensor(
+            float(bool(time_stratified)), device=zc.device),
         f"{prefix}_margin": torch.tensor(float(margin), device=loss_c.device),
         f"{prefix}_gap_weight_mean": gap_weight.mean().detach(),
         f"{prefix}_pairs": torch.tensor(float(loss_c.numel()), device=loss_c.device),
@@ -3024,13 +3028,28 @@ class AdaptiveTimestepSampler:
             probs = probs / probs.sum().clamp_min(1.0e-12)
         return probs
 
-    def sample(self, batch, device=DEV, time_shift=1.0):
+    def sample(self, batch, device=DEV, time_shift=1.0, stratified=False):
+        batch = int(batch)
+        if batch <= 0:
+            raise ValueError("batch must be positive")
         probs = self.probabilities()
-        idx = torch.multinomial(probs, int(batch), replacement=True)
+        if stratified:
+            q = stratified_unit_samples(batch, device=probs.device, dtype=probs.dtype)
+            cdf = probs.cumsum(dim=0).clamp(max=1.0)
+            idx = torch.searchsorted(cdf, q, right=False).clamp(max=self.bins - 1)
+            prev = torch.zeros_like(q)
+            has_prev = idx > 0
+            if bool(has_prev.any()):
+                prev[has_prev] = cdf[idx[has_prev] - 1]
+            bin_prob = probs[idx].clamp_min(1.0e-12)
+            within = ((q - prev) / bin_prob).clamp(0.0, 1.0 - 1.0e-6)
+        else:
+            idx = torch.multinomial(probs, batch, replacement=True)
+            within = torch.rand(batch, device=probs.device, dtype=probs.dtype)
         self.samples += torch.bincount(idx, minlength=self.bins).to(self.samples.dtype)
         u = (
-            idx.to(device=device, dtype=torch.float32) + torch.rand(
-                int(batch), device=device)
+            idx.to(device=device, dtype=torch.float32)
+            + within.to(device=device, dtype=torch.float32)
         ) / float(self.bins)
         while u.ndim < 4:
             u = u.unsqueeze(-1)
@@ -3145,6 +3164,17 @@ def resolve_time_shift(time_shift=1.0, mode="manual", latent_shape=None,
     }
 
 
+def stratified_unit_samples(batch, device=DEV, dtype=torch.float32):
+    """Jittered [0, 1] strata for lower-variance per-batch timestep coverage."""
+    batch = int(batch)
+    if batch <= 0:
+        raise ValueError("batch must be positive")
+    jitter = torch.rand(batch, device=device, dtype=dtype)
+    u = (torch.arange(batch, device=device, dtype=dtype) + jitter) / float(batch)
+    order = torch.randperm(batch, device=device)
+    return u.index_select(0, order).clamp(1.0e-6, 1.0 - 1.0e-6)
+
+
 def karras_flow_time_base(u, rho=KARRAS_SCHEDULE_RHO,
                           sigma_min=KARRAS_SCHEDULE_SIGMA_MIN,
                           sigma_max=KARRAS_SCHEDULE_SIGMA_MAX):
@@ -3192,24 +3222,41 @@ def flow_time_schedule(steps, device=DEV, shift=1.0, schedule="linear"):
 
 def sample_flow_times(batch, device=DEV, mode="uniform", logit_mean=0.0, logit_std=1.0,
                       mode_scale=DEFAULT_TIME_MODE_SCALE, time_shift=1.0,
-                      adaptive_sampler=None):
+                      adaptive_sampler=None, stratified=False):
     """Sample rectified-flow interpolation times.
 
     Uniform is the original rectified-flow baseline.  Logit-normal follows the SD3-style
     direction of spending more training mass on perceptually useful intermediate noise scales.
     """
+    batch = int(batch)
+    if batch <= 0:
+        raise ValueError("batch must be positive")
+    u = None
+    if stratified:
+        u = stratified_unit_samples(batch, device=device).view(batch, 1, 1, 1)
     if mode == "uniform":
-        t = torch.rand(batch, 1, 1, 1, device=device)
+        t = u if u is not None else torch.rand(batch, 1, 1, 1, device=device)
     elif mode == "logit-normal":
-        eps = torch.randn(batch, 1, 1, 1, device=device) * float(logit_std) + float(logit_mean)
+        if u is None:
+            eps = torch.randn(batch, 1, 1, 1, device=device)
+        else:
+            eps = math.sqrt(2.0) * torch.erfinv((2.0 * u - 1.0).clamp(
+                -1.0 + 1.0e-6, 1.0 - 1.0e-6))
+        eps = eps * float(logit_std) + float(logit_mean)
         t = torch.sigmoid(eps)
     elif mode == "mode":
-        u = torch.rand(batch, 1, 1, 1, device=device)
+        u = u if u is not None else torch.rand(batch, 1, 1, 1, device=device)
         t = mode_flow_time_base(u, mode_scale=mode_scale)
     elif mode == "adaptive":
         if adaptive_sampler is not None:
-            return adaptive_sampler.sample(batch, device=device, time_shift=time_shift)
-        eps = torch.randn(batch, 1, 1, 1, device=device) * float(logit_std) + float(logit_mean)
+            return adaptive_sampler.sample(
+                batch, device=device, time_shift=time_shift, stratified=stratified)
+        if u is None:
+            eps = torch.randn(batch, 1, 1, 1, device=device)
+        else:
+            eps = math.sqrt(2.0) * torch.erfinv((2.0 * u - 1.0).clamp(
+                -1.0 + 1.0e-6, 1.0 - 1.0e-6))
+        eps = eps * float(logit_std) + float(logit_mean)
         t = torch.sigmoid(eps)
     else:
         raise ValueError(f"unknown time sampling mode {mode!r}")
@@ -5625,6 +5672,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        time_sampling="uniform", time_logit_mean=0.0,
                        time_logit_std=1.0,
                        time_mode_scale=DEFAULT_TIME_MODE_SCALE, time_shift=1.0,
+                       time_stratified=False,
                        latent_stats=None, consistency_w=0.0,
                        endpoint_w=0.0, frequency_w=0.0,
                        straightness_w=0.0,
@@ -5682,7 +5730,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     t = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                           logit_mean=time_logit_mean, logit_std=time_logit_std,
                           mode_scale=time_mode_scale, time_shift=time_shift,
-                          adaptive_sampler=adaptive_sampler)
+                          adaptive_sampler=adaptive_sampler,
+                          stratified=time_stratified)
     zt = (1.0 - t) * x0 + t * z1_model
     target = z1_model - x0
     cond_model = condition_dropout(cond, cond_drop)
@@ -5748,6 +5797,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         "velocity_weight_gamma": torch.tensor(float(flow_loss_weight_gamma), device=z1.device),
         "time_mean": t.detach().mean(),
         "time_std": t.detach().std(unbiased=False),
+        "time_stratified": torch.tensor(float(bool(time_stratified)), device=z1.device),
         "time_shift": torch.tensor(float(time_shift), device=z1.device),
     }
     parts.update(coupling_parts)
@@ -5774,7 +5824,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         t2 = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                                logit_mean=time_logit_mean, logit_std=time_logit_std,
                                mode_scale=time_mode_scale, time_shift=time_shift,
-                               adaptive_sampler=adaptive_sampler)
+                               adaptive_sampler=adaptive_sampler,
+                               stratified=time_stratified)
         zt2 = (1.0 - t2) * x0 + t2 * z1_model
         pred2 = flow_velocity(flow, zt2, t2, cond_model)
         if straightness_w > 0.0:
@@ -5973,7 +6024,7 @@ def latent_flow_self_distill_losses(flow, teacher_flow, z1, cond, teacher_cond=N
                                     time_sampling="uniform", time_logit_mean=0.0,
                                     time_logit_std=1.0,
                                     time_mode_scale=DEFAULT_TIME_MODE_SCALE,
-                                    time_shift=1.0,
+                                    time_shift=1.0, time_stratified=False,
                                     latent_stats=None, time_gap=0.25,
                                     guidance_w=0.0, guidance_cfg_scale=1.0,
                                     guidance_cfg_rescale=0.0):
@@ -5991,7 +6042,8 @@ def latent_flow_self_distill_losses(flow, teacher_flow, z1, cond, teacher_cond=N
     x0 = torch.randn_like(z1_model)
     t = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                           logit_mean=time_logit_mean, logit_std=time_logit_std,
-                          mode_scale=time_mode_scale, time_shift=time_shift)
+                          mode_scale=time_mode_scale, time_shift=time_shift,
+                          stratified=time_stratified)
     t_teacher = (t + gap * (1.0 - t)).clamp(max=1.0 - 1.0e-4)
     zt = (1.0 - t) * x0 + t * z1_model
     zt_teacher = (1.0 - t_teacher) * x0 + t_teacher * z1_model
@@ -6044,6 +6096,8 @@ def latent_flow_self_distill_losses(flow, teacher_flow, z1, cond, teacher_cond=N
         "distill_teacher_time_mean": t_teacher.detach().mean(),
         "distill_time_gap": (t_teacher - t).detach().mean(),
         "distill_requested_time_gap": torch.tensor(gap, device=z1.device),
+        "distill_time_stratified": torch.tensor(
+            float(bool(time_stratified)), device=z1.device),
         "time_shift": torch.tensor(float(time_shift), device=z1.device),
     }
     return total, parts
@@ -6053,17 +6107,19 @@ def latent_flow_self_distill_losses(flow, teacher_flow, z1, cond, teacher_cond=N
 def flow_endpoint_metrics(flow, z1, cond, time_sampling="uniform", time_logit_mean=0.0,
                           time_logit_std=1.0,
                           time_mode_scale=DEFAULT_TIME_MODE_SCALE,
-                          time_shift=1.0, latent_stats=None):
+                          time_shift=1.0, time_stratified=False, latent_stats=None):
     """Measure whether different times on the same path predict the same clean endpoint."""
     latent_stats = flow_latent_stats(flow) if latent_stats is None else latent_stats
     z1_model = normalize_latent(z1, latent_stats)
     x0 = torch.randn_like(z1_model)
     t1 = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                            logit_mean=time_logit_mean, logit_std=time_logit_std,
-                           mode_scale=time_mode_scale, time_shift=time_shift)
+                           mode_scale=time_mode_scale, time_shift=time_shift,
+                           stratified=time_stratified)
     t2 = sample_flow_times(z1.shape[0], device=z1.device, mode=time_sampling,
                            logit_mean=time_logit_mean, logit_std=time_logit_std,
-                           mode_scale=time_mode_scale, time_shift=time_shift)
+                           mode_scale=time_mode_scale, time_shift=time_shift,
+                           stratified=time_stratified)
 
     def endpoint_at(t):
         zt = (1.0 - t) * x0 + t * z1_model
@@ -6084,7 +6140,7 @@ def flow_endpoint_metrics(flow, z1, cond, time_sampling="uniform", time_logit_me
 def latent_flow_loss(flow, z1, cond, cond_drop=0.0, time_sampling="uniform",
                      time_logit_mean=0.0, time_logit_std=1.0,
                      time_mode_scale=DEFAULT_TIME_MODE_SCALE, time_shift=1.0,
-                     latent_stats=None, flow_loss_weight="none",
+                     time_stratified=False, latent_stats=None, flow_loss_weight="none",
                      flow_loss_weight_gamma=5.0, flow_loss_weight_normalize=True):
     loss, _parts = latent_flow_losses(flow, z1, cond, cond_drop=cond_drop,
                                       time_sampling=time_sampling,
@@ -6092,6 +6148,7 @@ def latent_flow_loss(flow, z1, cond, cond_drop=0.0, time_sampling="uniform",
                                       time_logit_std=time_logit_std,
                                       time_mode_scale=time_mode_scale,
                                       time_shift=time_shift,
+                                      time_stratified=time_stratified,
                                       latent_stats=latent_stats,
                                       flow_loss_weight=flow_loss_weight,
                                       flow_loss_weight_gamma=flow_loss_weight_gamma,
@@ -8630,6 +8687,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
         "flow_consistency_w": float(ckpt.get(
             "flow_consistency_w", report.get("flow_consistency_w", 0.0))),
         "time_sampling": str(ckpt.get("time_sampling", report.get("time_sampling", "uniform"))),
+        "time_stratified": bool(ckpt.get(
+            "time_stratified", report.get("time_stratified", False))),
         "time_curriculum_frac": float(ckpt.get(
             "time_curriculum_frac", report.get("time_curriculum_frac", 0.0))),
         "time_curriculum_switch_step": int(ckpt.get(
@@ -9575,7 +9634,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       time_sampling="uniform",
                       time_logit_mean=0.0, time_logit_std=1.0,
                       time_mode_scale=DEFAULT_TIME_MODE_SCALE, time_shift=1.0,
-                      time_curriculum_frac=0.0,
+                      time_stratified=False, time_curriculum_frac=0.0,
                       time_adaptive_bins=32, time_adaptive_momentum=0.95,
                       time_adaptive_uniform_mix=0.05,
                       time_adaptive_min_prob=0.001,
@@ -9668,6 +9727,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         image_records, train_size_buckets)
     if time_sampling not in TIME_SAMPLINGS:
         raise ValueError(f"unknown time sampling mode {time_sampling!r}")
+    time_stratified = bool(time_stratified)
     time_mode_scale = float(time_mode_scale)
     if time_mode_scale < 0.0 or time_mode_scale >= MAX_TIME_MODE_SCALE:
         raise ValueError(f"time_mode_scale must be in [0, {MAX_TIME_MODE_SCALE})")
@@ -10594,6 +10654,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     time_sampling=active_time_sampling, time_logit_mean=time_logit_mean,
                     time_logit_std=time_logit_std,
                     time_mode_scale=time_mode_scale, time_shift=effective_time_shift,
+                    time_stratified=time_stratified,
                     flow_noise_coupling=flow_noise_coupling,
                     flow_noise_coupling_projections=flow_noise_coupling_projections,
                     flow_loss_weight=flow_loss_weight,
@@ -10643,6 +10704,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                         time_logit_std=time_logit_std,
                         time_mode_scale=time_mode_scale,
                         time_shift=effective_time_shift,
+                        time_stratified=time_stratified,
                         flow_loss_weight=flow_loss_weight,
                         flow_loss_weight_gamma=flow_loss_weight_gamma,
                         flow_loss_weight_normalize=flow_loss_weight_normalize,
@@ -10741,6 +10803,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                         time_logit_mean=time_logit_mean, time_logit_std=time_logit_std,
                         time_mode_scale=time_mode_scale,
                         time_shift=effective_time_shift, latent_stats=latent_stats,
+                        time_stratified=time_stratified,
                         time_gap=flow_distill_time_gap,
                         guidance_w=flow_guidance_distill_w,
                         guidance_cfg_scale=flow_guidance_distill_cfg_scale,
@@ -11053,6 +11116,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             for mode, candidate in candidate_reports.items()
         },
         "time_sampling": time_sampling,
+        "time_stratified": bool(time_stratified),
         "time_curriculum_frac": float(time_curriculum_frac),
         "time_curriculum_switch_step": int(curriculum_switch_step),
         "time_curriculum_final_sampling": (
@@ -11200,6 +11264,11 @@ def selftest():
     mode_times = sample_flow_times(8, device="cpu", mode="mode", mode_scale=1.29)
     assert tuple(mode_times.shape) == (8, 1, 1, 1)
     assert float(mode_times.min()) >= 0.0 and float(mode_times.max()) <= 1.0
+    stratified_times = sample_flow_times(
+        8, device="cpu", mode="logit-normal", stratified=True)
+    assert tuple(stratified_times.shape) == (8, 1, 1, 1)
+    assert float(stratified_times.min()) >= 0.0
+    assert float(stratified_times.max()) <= 1.0
     prior_probs = timestep_prior_bin_probs(8, prior="mode", mode_scale=1.29)
     assert tuple(prior_probs.shape) == (8,)
     assert torch.allclose(prior_probs.sum(), torch.ones((), dtype=torch.float64))
@@ -11366,6 +11435,7 @@ def selftest():
             flow_self_condition=True, flow_self_condition_p=1.0,
             dit_mlp="swiglu",
             time_sampling="adaptive", time_adaptive_bins=4,
+            time_stratified=True,
             time_adaptive_uniform_mix=0.1,
             time_adaptive_prior="mode", time_adaptive_prior_mix=0.25,
             image_geometry_cond=True,
@@ -11377,6 +11447,8 @@ def selftest():
         assert report["time_shift_mode"] == "auto"
         assert report["time_shift_effective_mode"] == "manual"
         assert report["time_sampling"] == "adaptive"
+        assert report["time_stratified"] is True
+        assert report["last_flow"]["time_stratified"] == 1.0
         assert math.isclose(report["time_mode_scale"], DEFAULT_TIME_MODE_SCALE)
         assert report["time_adaptive_enabled"] is True
         assert math.isclose(report["flow_frequency_w"], 0.01)
@@ -11802,6 +11874,8 @@ def main(argv=None):
     ap.add_argument("--time-sampling", default="uniform", choices=TIME_SAMPLINGS,
                     dest="time_sampling",
                     help="rectified-flow training timestep distribution")
+    ap.add_argument("--time-stratified", action="store_true", dest="time_stratified",
+                    help="sample jittered timestep strata inside each flow batch")
     ap.add_argument("--time-logit-mean", type=float, default=0.0, dest="time_logit_mean",
                     help="mean for --time-sampling logit-normal")
     ap.add_argument("--time-logit-std", type=float, default=1.0, dest="time_logit_std",
@@ -12543,6 +12617,7 @@ def main(argv=None):
         time_sampling=args.time_sampling, time_logit_mean=args.time_logit_mean,
         time_logit_std=args.time_logit_std,
         time_mode_scale=args.time_mode_scale,
+        time_stratified=args.time_stratified,
         time_curriculum_frac=args.time_curriculum_frac,
         time_adaptive_bins=args.time_adaptive_bins,
         time_adaptive_momentum=args.time_adaptive_momentum,
@@ -12910,6 +12985,7 @@ def main(argv=None):
         "eval_weight_mode": report.get("eval_weight_mode", "raw"),
         "selected_eval_weights": report.get("selected_eval_weights", "raw"),
         "time_sampling": args.time_sampling,
+        "time_stratified": args.time_stratified,
         "time_curriculum_frac": report.get("time_curriculum_frac", args.time_curriculum_frac),
         "time_curriculum_switch_step": report.get("time_curriculum_switch_step", 0),
         "time_curriculum_final_sampling": report.get(
