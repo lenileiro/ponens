@@ -2,7 +2,7 @@
 
 Current text and multimodal training data supplies its own inputs and targets. This module only
 owns token/id conversion and the minimal extraction punctuation used by the text rung; it does
-not render synthetic questions, proof traces, or surface templates.
+not render synthetic questions, proof traces, or templates.
 """
 
 PAD, UNK = "<pad>", "<unk>"

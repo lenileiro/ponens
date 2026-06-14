@@ -71,6 +71,7 @@ from .concepts import (
     latent_concept_graph_ready,
     latent_concept_graph_snapshot,
     latent_concept_memory_gap_loss,
+    latent_concept_memory_gap_scores,
     latent_concept_memory_consolidation_loss,
     latent_concept_neighborhood_loss,
     latent_concept_reanalysis_loss,
@@ -2543,12 +2544,14 @@ READING_DISCOVERY_SIGNALS = (
     "view", "context", "sequence", "neighborhood", "cluster", "fer", "bridge")
 READING_STUDY_STRATEGIES = (
     "random", "errors", "fer", "curiosity", "sequence", "graph", "cycle",
-    "discovery", "auto")
-READING_MEMORY_STUDY_STRATEGIES = ("curiosity", "graph", "discovery")
+    "gap", "discovery", "auto")
+READING_MEMORY_STUDY_STRATEGIES = ("curiosity", "graph", "gap", "discovery")
 READING_POOL_STUDY_STRATEGIES = (
-    "errors", "fer", "curiosity", "sequence", "graph", "cycle", "discovery")
-READING_TRANSITION_STUDY_STRATEGIES = ("sequence", "graph", "cycle", "discovery")
-READING_GRAPH_READY_STUDY_STRATEGIES = ("graph", "cycle")
+    "errors", "fer", "curiosity", "sequence", "graph", "cycle", "gap",
+    "discovery")
+READING_TRANSITION_STUDY_STRATEGIES = (
+    "sequence", "graph", "cycle", "gap", "discovery")
+READING_GRAPH_READY_STUDY_STRATEGIES = ("graph", "cycle", "gap")
 
 
 def resolve_reading_study_strategy(study_strategy, model):
@@ -3213,6 +3216,104 @@ def reading_latent_graph_cycle_records(
                       "skipped": False}
 
 
+def reading_latent_gap_records(
+        model, vocab, records, device=DEV, n=0, seed=0, feature_dropout=0.0,
+        temperature=0.1, self_loop_w=0.0, transitive_steps=2,
+        transitive_w=0.1, target_power=1.0):
+    memory = getattr(model, "latent_concept_memory", None)
+    if getattr(model, "latent_concepts", None) is None or memory is None:
+        return [], {"n_records": 0, "sampled": False, "n_selected": 0,
+                    "mean_gap_score": 0.0, "max_gap_score": 0.0,
+                    "mean_gap_kl": 0.0, "mean_gap_cosine": 0.0,
+                    "mean_gap_entropy": 0.0, "mean_gap_target_mass": 0.0,
+                    "mean_gap_present_overlap": 0.0,
+                    "memory_filled": 0, "graph_ready": False,
+                    "skipped": True}
+    candidates = [r for r in records if r.split == "train"]
+    sampled = bool(n and n < len(candidates))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=n, replace=False)
+        candidates = [candidates[int(i)] for i in idx]
+    scored = []
+    values = {
+        "gap_score": [],
+        "gap_kl": [],
+        "gap_cosine": [],
+        "gap_entropy": [],
+        "gap_target_mass": [],
+        "gap_present_overlap": [],
+    }
+    graph_ready = False
+    usable_count = 0
+    model.eval()
+    with torch.no_grad():
+        active = memory.active()
+        active_relations = memory.active_relations()
+        active_transitions = memory.active_transitions()
+        for off in range(0, len(candidates), 64):
+            batch = candidates[off:off + 64]
+            txt = pack_reading(batch, vocab, device)
+            slots = model.latent_concept_states(
+                txt, feature_dropout=feature_dropout, project=True)
+            if hasattr(memory, "gap_scores"):
+                scores, parts = memory.gap_scores(
+                    slots, temperature=temperature, self_loop_w=self_loop_w,
+                    transitive_steps=transitive_steps, transitive_w=transitive_w,
+                    target_power=target_power)
+            else:
+                scores, parts = latent_concept_memory_gap_scores(
+                    slots, active, relations=active_relations,
+                    transitions=active_transitions, temperature=temperature,
+                    self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+                    transitive_w=transitive_w, target_power=target_power)
+            graph_ready = bool(graph_ready or parts.get("graph_ready", False))
+            usable = parts.get("usable")
+            if usable is not None:
+                usable_count += int(usable.detach().sum().item())
+            kl = parts.get("kl", scores.new_zeros(scores.shape))
+            cosine = parts.get("cosine", scores.new_zeros(scores.shape))
+            entropy = parts.get("entropy", scores.new_zeros(scores.shape))
+            target_mass = parts.get("target_mass", scores.new_zeros(scores.shape))
+            overlap = parts.get("present_overlap", scores.new_zeros(scores.shape))
+            for i, rec in enumerate(batch):
+                score = float(scores[i].detach().cpu())
+                scored.append((score, rec))
+                values["gap_score"].append(score)
+                values["gap_kl"].append(float(kl[i].detach().cpu()))
+                values["gap_cosine"].append(float(cosine[i].detach().cpu()))
+                values["gap_entropy"].append(float(entropy[i].detach().cpu()))
+                values["gap_target_mass"].append(float(target_mass[i].detach().cpu()))
+                values["gap_present_overlap"].append(float(overlap[i].detach().cpu()))
+    scored.sort(key=lambda row: row[0], reverse=True)
+    selected = [rec for score, rec in scored if score > 0.0]
+
+    def mean_value(name):
+        rows = values[name]
+        return float(np.mean(rows)) if rows else 0.0
+
+    def max_value(name):
+        rows = values[name]
+        return float(max(rows)) if rows else 0.0
+
+    return selected, {"n_records": len(candidates),
+                      "sampled": sampled,
+                      "n_selected": len(selected),
+                      "mean_gap_score": mean_value("gap_score"),
+                      "max_gap_score": max_value("gap_score"),
+                      "mean_gap_kl": mean_value("gap_kl"),
+                      "mean_gap_cosine": mean_value("gap_cosine"),
+                      "mean_gap_entropy": mean_value("gap_entropy"),
+                      "mean_gap_target_mass": mean_value("gap_target_mass"),
+                      "mean_gap_present_overlap": mean_value("gap_present_overlap"),
+                      "memory_filled": int(
+                          getattr(memory, "filled",
+                                  torch.zeros((), dtype=torch.long)).item()),
+                      "graph_ready": bool(graph_ready),
+                      "usable_gap_records": int(usable_count),
+                      "skipped": not (graph_ready and usable_count > 0)}
+
+
 def _minmax_scale(values):
     arr = np.asarray(values, dtype=np.float64)
     if arr.size == 0:
@@ -3283,6 +3384,13 @@ def reading_latent_discovery_records(
                 self_loop_w=curiosity_self_loop_w,
                 transitive_steps=curiosity_transitive_steps,
                 transitive_w=curiosity_transitive_w)
+            gap, gap_parts = latent_concept_memory_gap_scores(
+                full_slots, memory.active(), relations=memory.active_relations(),
+                transitions=memory.active_transitions(),
+                temperature=graph_temperature, self_loop_w=0.0,
+                transitive_steps=graph_transitive_steps,
+                transitive_w=graph_transitive_w,
+                target_power=graph_target_power)
             context_txt, heldout_txt = split_reading_context_target(
                 txt, vocab.pad, context_keep_p=context_keep_p)
             source_slots = model.latent_concept_states(
@@ -3329,6 +3437,13 @@ def reading_latent_discovery_records(
             bridge, bridge_entropy, bridge_connectivity = latent_concept_bridge_scores(
                 full_slots, memory.active(), memory.active_relations(),
                 memory.active_transitions())
+            gap_kl = gap_parts.get("kl", gap.new_zeros(gap.shape))
+            gap_cosine = gap_parts.get("cosine", gap.new_zeros(gap.shape))
+            gap_entropy = gap_parts.get("entropy", gap.new_zeros(gap.shape))
+            gap_target_mass = gap_parts.get(
+                "target_mass", gap.new_zeros(gap.shape))
+            gap_present_overlap = gap_parts.get(
+                "present_overlap", gap.new_zeros(gap.shape))
             novelty = curiosity_parts.get("novelty", curiosity.new_zeros(curiosity.shape))
             association = curiosity_parts.get(
                 "association", curiosity.new_zeros(curiosity.shape))
@@ -3362,6 +3477,13 @@ def reading_latent_discovery_records(
                         fer_correlation[i].detach().cpu()),
                     "fer_slot_imbalance": float(fer_imbalance[i].detach().cpu()),
                     "slot_disorder": float(disorder[i].detach().cpu()),
+                    "gap": float(gap[i].detach().cpu()),
+                    "gap_kl": float(gap_kl[i].detach().cpu()),
+                    "gap_cosine": float(gap_cosine[i].detach().cpu()),
+                    "gap_entropy": float(gap_entropy[i].detach().cpu()),
+                    "gap_target_mass": float(gap_target_mass[i].detach().cpu()),
+                    "gap_present_overlap": float(
+                        gap_present_overlap[i].detach().cpu()),
                     "bridge": float(bridge[i].detach().cpu()),
                     "bridge_entropy": float(bridge_entropy[i].detach().cpu()),
                     "bridge_connectivity": float(
@@ -3377,7 +3499,7 @@ def reading_latent_discovery_records(
                     "sequence_rank": float(seq.get("sequence_rank", 0.0)),
                 })
     components = (
-        "curiosity", "graph", "cycle", "fer_score", "bridge",
+        "curiosity", "gap", "graph", "cycle", "fer_score", "bridge",
         "sequence_surprise")
     for name in components:
         scaled = _minmax_scale([row[name] for row in rows])
@@ -3417,6 +3539,14 @@ def reading_latent_discovery_records(
                           "fer_slot_correlation"),
                       "mean_fer_slot_imbalance": mean_field("fer_slot_imbalance"),
                       "mean_slot_disorder": mean_field("slot_disorder"),
+                      "mean_gap_score": mean_field("gap"),
+                      "max_gap_score": max_field("gap"),
+                      "mean_gap_kl": mean_field("gap_kl"),
+                      "mean_gap_cosine": mean_field("gap_cosine"),
+                      "mean_gap_entropy": mean_field("gap_entropy"),
+                      "mean_gap_target_mass": mean_field("gap_target_mass"),
+                      "mean_gap_present_overlap": mean_field(
+                          "gap_present_overlap"),
                       "mean_bridge_score": mean_field("bridge"),
                       "max_bridge_score": max_field("bridge"),
                       "mean_bridge_entropy": mean_field("bridge_entropy"),
@@ -4057,6 +4187,17 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 target_power=graph_cycle_target_power,
                 cycle_w=graph_cycle_consistency_w)
             report = report | {"strategy": "cycle"}
+        elif study_strategy == "gap":
+            selected, report = reading_latent_gap_records(
+                model, vocab, records, device=device, n=probe_n,
+                seed=seed + 1301 + int(step),
+                feature_dropout=0.0,
+                temperature=graph_predict_temperature,
+                self_loop_w=0.0,
+                transitive_steps=graph_predict_transitive_steps,
+                transitive_w=graph_predict_transitive_w,
+                target_power=graph_predict_target_power)
+            report = report | {"strategy": "gap"}
         elif study_strategy == "discovery":
             selected, report = reading_latent_discovery_records(
                 model, vocab, records, device=device, n=probe_n,
@@ -6992,7 +7133,7 @@ def nli_artifact_eval(model, vocab, records, full_fact_value_acc, device=DEV, n=
 
     Gururangan et al. showed that NLI datasets can contain annotation artifacts where the
     hypothesis alone predicts the label surprisingly well.  A text-understanding gate should
-    surface that shortcut instead of counting it as premise-hypothesis reasoning.
+    phrasing shortcut instead of counting it as premise-hypothesis reasoning.
     """
     all_eval = [r for r in records if r.split == "eval" and _is_nli_record(r)]
     if n < 0:
@@ -8093,6 +8234,11 @@ def selftest():
         reading_model, reading_vocab, reading_records, device="cpu", n=0,
         context_keep_p=0.5, transitive_steps=2, transitive_w=0.1)
     assert cycle_records and cycle_report["skipped"] is False
+    gap_records, gap_report = reading_latent_gap_records(
+        reading_model, reading_vocab, reading_records, device="cpu", n=0,
+        transitive_steps=2, transitive_w=0.1)
+    assert gap_records and gap_report["skipped"] is False
+    assert math.isfinite(gap_report["mean_gap_score"])
     discovery_records, discovery_report = reading_latent_discovery_records(
         reading_model, reading_vocab, reading_records, device="cpu", n=0,
         context_keep_p=0.5, curiosity_transitive_steps=2,
@@ -8103,6 +8249,7 @@ def selftest():
     assert math.isfinite(discovery_report["mean_score"])
     assert "mean_fer_score" in discovery_report
     assert "mean_slot_disorder" in discovery_report
+    assert "mean_gap_score" in discovery_report
     assert "mean_bridge_score" in discovery_report
     assert "mean_sequence_surprise" in discovery_report
     assert discovery_report["n_sequence_pairs"] == 2
@@ -8219,6 +8366,17 @@ def selftest():
                if r.get("strategy") == "discovery")
     assert any("pool_bridge_before" in r for r in reading_model.reading_study_reports
                if r.get("strategy") == "discovery")
+    assert any("mean_gap_score" in r for r in reading_model.reading_study_reports
+               if r.get("strategy") == "discovery")
+    fit_reading_concepts(
+        reading_model, reading_vocab, reading_records, steps=1, batch=2, lr=1e-4,
+        seed=7, device="cpu", log_every=1, token_drop_p=0.1,
+        token_replace_p=0.0, study_strategy="gap", study_probe_n=4,
+        study_hard_max=2, study_refresh_steps=1, context_target_w=0.0,
+        memory_size=8, gap_w=0.1, sequence_w=0.0, transition_w=0.0)
+    assert reading_model.reading_train_metrics["study_strategy"] == "gap"
+    assert any(r.get("strategy") == "gap" and "mean_gap_score" in r
+               for r in reading_model.reading_study_reports)
     insight = reading_model.reading_train_metrics["study_pool_insight"]
     assert "bridge_score_reduction" in insight
     assert math.isfinite(insight["bridge_connectivity_gain"])

@@ -50,6 +50,7 @@ from .concepts import (
     latent_concept_graph_ready,
     latent_concept_graph_snapshot,
     latent_concept_memory_gap_loss,
+    latent_concept_memory_gap_scores,
     latent_concept_memory_consolidation_loss,
     latent_concept_memory_loss,
     latent_concept_neighborhood_loss,
@@ -2112,6 +2113,12 @@ def latent_multimodal_discovery_examples(
                 self_loop_w=curiosity_self_loop_w,
                 transitive_steps=curiosity_transitive_steps,
                 transitive_w=curiosity_transitive_w)
+            gap, gap_parts = latent_concept_memory_gap_scores(
+                full_slots, active_memory, relations=active_relations,
+                transitions=active_transitions, temperature=graph_temperature,
+                self_loop_w=0.0, transitive_steps=graph_transitive_steps,
+                transitive_w=graph_transitive_w,
+                target_power=graph_target_power)
             graph_rows = []
             cycle_rows = []
             graph_parts_rows = {
@@ -2155,6 +2162,12 @@ def latent_multimodal_discovery_examples(
             fer_scores, fer_parts = latent_multimodal_fer_scores_from_views(views)
             bridge, bridge_entropy, bridge_connectivity = latent_concept_bridge_scores(
                 full_slots, active_memory, active_relations, active_transitions)
+            gap_kl = gap_parts.get("kl", gap.new_zeros(gap.shape))
+            gap_cosine = gap_parts.get("cosine", gap.new_zeros(gap.shape))
+            gap_entropy = gap_parts.get("entropy", gap.new_zeros(gap.shape))
+            gap_target_mass = gap_parts.get("target_mass", gap.new_zeros(gap.shape))
+            gap_present_overlap = gap_parts.get(
+                "present_overlap", gap.new_zeros(gap.shape))
             novelty = curiosity_parts.get(
                 "novelty", curiosity.new_zeros(curiosity.shape))
             association = curiosity_parts.get(
@@ -2185,6 +2198,13 @@ def latent_multimodal_discovery_examples(
                         fer_parts["slot_correlation"][i].detach().cpu()),
                     "fer_slot_imbalance": float(
                         fer_parts["slot_imbalance"][i].detach().cpu()),
+                    "gap": float(gap[i].detach().cpu()),
+                    "gap_kl": float(gap_kl[i].detach().cpu()),
+                    "gap_cosine": float(gap_cosine[i].detach().cpu()),
+                    "gap_entropy": float(gap_entropy[i].detach().cpu()),
+                    "gap_target_mass": float(gap_target_mass[i].detach().cpu()),
+                    "gap_present_overlap": float(
+                        gap_present_overlap[i].detach().cpu()),
                     "bridge": float(bridge[i].detach().cpu()),
                     "bridge_entropy": float(bridge_entropy[i].detach().cpu()),
                     "bridge_connectivity": float(
@@ -2200,7 +2220,7 @@ def latent_multimodal_discovery_examples(
                     "sequence_rank": float(seq.get("sequence_rank", 0.0)),
                 })
     components = (
-        "curiosity", "graph", "cycle", "fer_score", "bridge",
+        "curiosity", "gap", "graph", "cycle", "fer_score", "bridge",
         "sequence_surprise")
     for name in components:
         scaled = _minmax_scale([row[name] for row in rows])
@@ -2238,6 +2258,14 @@ def latent_multimodal_discovery_examples(
                       "mean_fer_slot_correlation": mean_field(
                           "fer_slot_correlation"),
                       "mean_fer_slot_imbalance": mean_field("fer_slot_imbalance"),
+                      "mean_gap_score": mean_field("gap"),
+                      "max_gap_score": max_field("gap"),
+                      "mean_gap_kl": mean_field("gap_kl"),
+                      "mean_gap_cosine": mean_field("gap_cosine"),
+                      "mean_gap_entropy": mean_field("gap_entropy"),
+                      "mean_gap_target_mass": mean_field("gap_target_mass"),
+                      "mean_gap_present_overlap": mean_field(
+                          "gap_present_overlap"),
                       "mean_bridge_score": mean_field("bridge"),
                       "max_bridge_score": max_field("bridge"),
                       "mean_bridge_entropy": mean_field("bridge_entropy"),
@@ -3432,6 +3460,7 @@ def selftest():
             model, records, vocab, view_dims, n=4, device="cpu")
         assert discovery_selected and discovery_report["skipped"] is False
         assert math.isfinite(discovery_report["mean_score"])
+        assert "mean_gap_score" in discovery_report
         assert "mean_cycle_score" in discovery_report
         assert "mean_sequence_surprise" in discovery_report
         discovery_loss, discovery_metrics = (
@@ -3564,6 +3593,9 @@ def selftest():
             "latent_discovery_hard_record_ids"])) == 2
         assert any(r.get("strategy") == "discovery"
                    for r in discovery_model.train_metrics["latent_study_reports"])
+        assert any("mean_gap_score" in r
+                   for r in discovery_model.train_metrics["latent_study_reports"]
+                   if r.get("strategy") == "discovery")
         selected_model, *_ = train(
             manifest, steps=2, batch=2, d=32, layers=1, heads=4, device="cpu",
             log_every=10, view_tokens=2, txt_tokens=4,

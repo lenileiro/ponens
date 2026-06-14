@@ -248,6 +248,16 @@ class LatentConceptMemory(nn.Module):
             transitive_w=transitive_w, target_power=target_power,
             relation_w=relation_w, transition_w=transition_w)
 
+    def gap_scores(self, slots, temperature=0.1, self_loop_w=0.0,
+                   transitive_steps=2, transitive_w=0.1, target_power=1.0,
+                   relation_w=1.0, transition_w=1.0):
+        return latent_concept_memory_gap_scores(
+            slots, self.active(), relations=self.active_relations(),
+            transitions=self.active_transitions(), temperature=temperature,
+            self_loop_w=self_loop_w, transitive_steps=transitive_steps,
+            transitive_w=transitive_w, target_power=target_power,
+            relation_w=relation_w, transition_w=transition_w)
+
     def association_loss(self, slots, temperature=0.1, target_power=1.0,
                          self_loop_w=0.05, transitive_steps=1,
                          transitive_w=0.0):
@@ -1010,6 +1020,117 @@ def _latent_gap_zero(slots):
     return slots.reshape(slots.shape[0], -1).sum() * 0.0
 
 
+def _latent_gap_zero_scores(slots, memory_active=0, graph_ready=False):
+    if slots is None:
+        zero = torch.zeros(0)
+    else:
+        zero = slots.reshape(slots.shape[0], -1).sum(-1) * 0.0
+    return zero, {
+        "kl": zero,
+        "cosine": zero,
+        "entropy": zero,
+        "target_mass": zero,
+        "present_overlap": zero,
+        "usable": torch.zeros_like(zero, dtype=torch.bool),
+        "graph_ready": bool(graph_ready),
+        "memory_active": int(memory_active),
+    }
+
+
+def latent_concept_memory_gap_scores(
+        slots, memory, relations=None, transitions=None, temperature=0.1,
+        self_loop_w=0.0, transitive_steps=2, transitive_w=0.1,
+        target_power=1.0, relation_w=1.0, transition_w=1.0):
+    """Score examples by graph-predicted concepts missing from current slots."""
+    if slots is None or memory is None or memory.numel() == 0:
+        return _latent_gap_zero_scores(slots)
+    if slots.ndim != 3:
+        raise ValueError("latent memory gap expects [batch, slots, dim]")
+    if slots.shape[-1] != memory.shape[-1]:
+        raise ValueError("latent memory gap dimension mismatch")
+    if float(temperature) <= 0.0:
+        raise ValueError("latent memory gap temperature must be positive")
+    if float(self_loop_w) < 0.0:
+        raise ValueError("latent memory gap self-loop weight must be non-negative")
+    if int(transitive_steps) < 1:
+        raise ValueError("latent memory gap transitive steps must be positive")
+    if float(transitive_w) < 0.0:
+        raise ValueError("latent memory gap transitive weight must be non-negative")
+    if float(target_power) <= 0.0:
+        raise ValueError("latent memory gap target power must be positive")
+    if float(relation_w) < 0.0 or float(transition_w) < 0.0:
+        raise ValueError("latent memory gap graph weights must be non-negative")
+    n = int(memory.shape[0])
+    if n <= 1:
+        return _latent_gap_zero_scores(slots, memory_active=n)
+    graph = torch.zeros(n, n, dtype=slots.dtype, device=slots.device)
+    if relations is not None and relations.numel() and float(relation_w):
+        rel = relations[:n, :n].to(device=slots.device, dtype=slots.dtype)
+        if rel.shape != (n, n):
+            raise ValueError("latent memory gap relation shape mismatch")
+        graph = graph + float(relation_w) * rel.clamp_min(0.0)
+    if transitions is not None and transitions.numel() and float(transition_w):
+        trans = transitions[:n, :n].to(device=slots.device, dtype=slots.dtype)
+        if trans.shape != (n, n):
+            raise ValueError("latent memory gap transition shape mismatch")
+        trans = trans.clamp_min(0.0)
+        graph = graph + float(transition_w) * (trans + trans.t())
+    if not _has_offdiag_edges(graph):
+        return _latent_gap_zero_scores(slots, memory_active=n)
+    rel = _latent_relation_targets(
+        graph, n, slots.device, slots.dtype, self_loop_w=self_loop_w,
+        transitive_steps=transitive_steps, transitive_w=transitive_w)
+    if rel is None:
+        return _latent_gap_zero_scores(slots, memory_active=n)
+    temp = max(float(temperature), 1e-6)
+    mem = F.normalize(memory.to(device=slots.device, dtype=slots.dtype), dim=-1)
+    slot_rows = F.normalize(slots, dim=-1)
+    slot_dist = (slot_rows.matmul(mem.t()) / temp).softmax(-1)
+    present = slot_dist.mean(1)
+    neighbor = present.detach().matmul(rel)
+    missing = neighbor * (1.0 - present.detach()).clamp_min(0.0)
+    target_mass = missing.sum(-1)
+    usable = target_mass.gt(1e-8)
+    zero = slots.reshape(slots.shape[0], -1).sum(-1) * 0.0
+    parts = {
+        "kl": zero,
+        "cosine": zero,
+        "entropy": zero,
+        "target_mass": target_mass.detach(),
+        "present_overlap": zero,
+        "usable": usable,
+        "graph_ready": True,
+        "memory_active": n,
+    }
+    if not bool(usable.any()):
+        return zero, parts
+    target = missing[usable] / target_mass[usable, None].clamp_min(1e-8)
+    power = float(target_power)
+    if power != 1.0:
+        target = target.clamp_min(1e-8).pow(power)
+        target = target / target.sum(-1, keepdim=True).clamp_min(1e-8)
+    pred = present[usable]
+    target = target.detach()
+    target_center = F.normalize(target.matmul(mem).detach(), dim=-1)
+    pred_center = F.normalize(pred.matmul(mem), dim=-1)
+    kl = F.kl_div(pred.clamp_min(1e-8).log(), target, reduction="none").sum(-1)
+    cosine = 1.0 - (pred_center * target_center).sum(-1)
+    score = zero.clone()
+    score[usable] = 0.5 * (kl + cosine)
+    entropy = -(target.clamp_min(1e-8).log() * target).sum(-1)
+    entropy = entropy / math.log(float(n))
+    parts["kl"] = zero.clone()
+    parts["kl"][usable] = kl
+    parts["cosine"] = zero.clone()
+    parts["cosine"][usable] = cosine
+    parts["entropy"] = zero.clone()
+    parts["entropy"][usable] = entropy
+    parts["present_overlap"] = zero.clone()
+    parts["present_overlap"][usable] = (
+        present.detach()[usable] * target).sum(-1)
+    return score, parts
+
+
 def latent_concept_memory_gap_loss(
         slots, memory, relations=None, transitions=None, temperature=0.1,
         self_loop_w=0.0, transitive_steps=2, transitive_w=0.1,
@@ -1034,80 +1155,25 @@ def latent_concept_memory_gap_loss(
         "graph_ready": False,
         "skipped": True,
     }
-    if slots is None or memory is None or memory.numel() == 0:
+    scores, parts = latent_concept_memory_gap_scores(
+        slots, memory, relations=relations, transitions=transitions,
+        temperature=temperature, self_loop_w=self_loop_w,
+        transitive_steps=transitive_steps, transitive_w=transitive_w,
+        target_power=target_power, relation_w=relation_w,
+        transition_w=transition_w)
+    metrics["memory_active"] = int(parts.get("memory_active", 0))
+    metrics["graph_ready"] = bool(parts.get("graph_ready", False))
+    usable = parts.get("usable")
+    if scores.numel() == 0 or usable is None or not bool(usable.any()):
         return zero, metrics
-    if slots.ndim != 3:
-        raise ValueError("latent memory gap expects [batch, slots, dim]")
-    if slots.shape[-1] != memory.shape[-1]:
-        raise ValueError("latent memory gap dimension mismatch")
-    if float(temperature) <= 0.0:
-        raise ValueError("latent memory gap temperature must be positive")
-    if float(self_loop_w) < 0.0:
-        raise ValueError("latent memory gap self-loop weight must be non-negative")
-    if int(transitive_steps) < 1:
-        raise ValueError("latent memory gap transitive steps must be positive")
-    if float(transitive_w) < 0.0:
-        raise ValueError("latent memory gap transitive weight must be non-negative")
-    if float(target_power) <= 0.0:
-        raise ValueError("latent memory gap target power must be positive")
-    if float(relation_w) < 0.0 or float(transition_w) < 0.0:
-        raise ValueError("latent memory gap graph weights must be non-negative")
-    n = int(memory.shape[0])
-    metrics["memory_active"] = n
-    if n <= 1:
-        return zero, metrics
-    graph = torch.zeros(n, n, dtype=slots.dtype, device=slots.device)
-    if relations is not None and relations.numel() and float(relation_w):
-        rel = relations[:n, :n].to(device=slots.device, dtype=slots.dtype)
-        if rel.shape != (n, n):
-            raise ValueError("latent memory gap relation shape mismatch")
-        graph = graph + float(relation_w) * rel.clamp_min(0.0)
-    if transitions is not None and transitions.numel() and float(transition_w):
-        trans = transitions[:n, :n].to(device=slots.device, dtype=slots.dtype)
-        if trans.shape != (n, n):
-            raise ValueError("latent memory gap transition shape mismatch")
-        trans = trans.clamp_min(0.0)
-        graph = graph + float(transition_w) * (trans + trans.t())
-    if not _has_offdiag_edges(graph):
-        return zero, metrics
-    rel = _latent_relation_targets(
-        graph, n, slots.device, slots.dtype, self_loop_w=self_loop_w,
-        transitive_steps=transitive_steps, transitive_w=transitive_w)
-    if rel is None:
-        return zero, metrics
-    metrics["graph_ready"] = True
-    temp = max(float(temperature), 1e-6)
-    mem = F.normalize(memory.to(device=slots.device, dtype=slots.dtype), dim=-1)
-    slot_rows = F.normalize(slots, dim=-1)
-    slot_dist = (slot_rows.matmul(mem.t()) / temp).softmax(-1)
-    present = slot_dist.mean(1)
-    neighbor = present.detach().matmul(rel)
-    missing = neighbor * (1.0 - present.detach()).clamp_min(0.0)
-    target_mass = missing.sum(-1)
-    usable = target_mass.gt(1e-8)
-    if not bool(usable.any()):
-        return zero, metrics
-    target = missing[usable] / target_mass[usable, None].clamp_min(1e-8)
-    power = float(target_power)
-    if power != 1.0:
-        target = target.clamp_min(1e-8).pow(power)
-        target = target / target.sum(-1, keepdim=True).clamp_min(1e-8)
-    pred = present[usable]
-    target = target.detach()
-    target_center = F.normalize(target.matmul(mem).detach(), dim=-1)
-    pred_center = F.normalize(pred.matmul(mem), dim=-1)
-    kl = F.kl_div(pred.clamp_min(1e-8).log(), target, reduction="none").sum(-1)
-    cosine = 1.0 - (pred_center * target_center).sum(-1)
-    loss = 0.5 * (kl.mean() + cosine.mean())
-    entropy = -(target.clamp_min(1e-8).log() * target).sum(-1)
-    entropy = entropy / math.log(float(n))
+    loss = scores[usable].mean()
     metrics.update({
         "gap_loss": loss,
-        "gap_kl": kl.mean(),
-        "gap_cosine": cosine.mean(),
-        "gap_entropy": entropy.mean(),
-        "gap_target_mass": target_mass[usable].mean(),
-        "gap_present_overlap": (present.detach()[usable] * target).sum(-1).mean(),
+        "gap_kl": parts["kl"][usable].mean(),
+        "gap_cosine": parts["cosine"][usable].mean(),
+        "gap_entropy": parts["entropy"][usable].mean(),
+        "gap_target_mass": parts["target_mass"][usable].mean(),
+        "gap_present_overlap": parts["present_overlap"][usable].mean(),
         "skipped": False,
     })
     return loss, metrics

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """RunPod H100 runner for the current thinking package.
 
-The launcher runs the manifest/raw-data training surfaces that are still supported: raw reading,
-image preprocessing/generation/eval, vision understanding, and the generic multimodal bridge.
+The launcher runs the manifest/raw-data training entry points that are still supported: raw
+reading, image preprocessing/generation/eval, vision understanding, and the generic multimodal
+bridge.
 Pod-side `timeout` bounds the run and cleanup always terminates the pod. Defaults to dry-run.
 
 Auth: export RUNPOD_API_KEY.  Example: RUNPOD_API_KEY=... python runpod/launch_thinking.py --go

@@ -1,8 +1,8 @@
 # Ponens Package Reference
 
-The supported `thinking` package is manifest-driven. It no longer ships the old synthetic
-surface bank, kinship QA worlds, proof-checking CLI, rule-induction harness, or verbalizer. Keep
-new work on the current surfaces:
+The supported `thinking` package is manifest-driven. It no longer ships the legacy synthetic
+English bank, kinship QA worlds, proof-checking CLI, rule-induction harness, or verbalizer. Keep
+new work on the current entry points:
 
 - `thinking.text`: raw reading and semantic text learning with latent concept discovery,
   replay, self-study, reanalysis, and memory-gap training.
@@ -28,6 +28,7 @@ python -m thinking.text --selftest
 python -m thinking.text --reading-data data/reading.jsonl \
     --steps 40000 --batch 16 --d 256 --layers 4 --heads 8 \
     --latent-concept-slots 4 --latent-concept-memory-size 256 \
+    --reading-study-strategy gap --reading-study-probe-n 256 \
     --reading-discovery-w 0.05 --reading-reanalysis-w 0.05 \
     --reading-gap-w 0.05 \
     --out runs/text_raw_reading.json \
@@ -114,11 +115,11 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py \
 Operationally, the launcher still tar-syncs the repo, runs under pod-side `timeout`, tees logs to
 local pod disk, copies logs back, and terminates the pod in cleanup.
 
-## Removed Legacy Surfaces
+## Removed Legacy Modules
 
-The old synthetic surfaces were removed from the active package:
+The old synthetic-language modules were removed from the active package:
 
-- `surfaces.json`
+- legacy JSON language bank
 - `thinking.cli`
 - `thinking.config`
 - `thinking.distill`
@@ -136,4 +137,6 @@ The old synthetic surfaces were removed from the active package:
 - `datalog.py`
 
 Do not add replacements for these as hard-coded QA/rule/template layers. New data handling should
-be expressed through manifests, corpora, feature views, targets, and learned objectives.
+be expressed through manifests, corpora, feature views, targets, and learned objectives. For text
+self-study, prefer `--reading-study-strategy gap` when latent memory is enabled; it ranks raw
+chunks by the model's own graph-predicted missing-concept score.
