@@ -5963,6 +5963,10 @@ def selftest():
         token_drop_p=0.1, token_replace_p=0.0))
     assert torch.isfinite(reading_latent_factorization_loss(
         reading_model, reading_txt, feature_dropout=0.1))
+    fer_loss, fer_metrics = reading_latent_fer_loss(
+        reading_model, reading_txt, feature_dropout=0.1)
+    assert torch.isfinite(fer_loss)
+    assert torch.isfinite(fer_metrics["fer_score"])
     updates = update_reading_latent_memory(reading_model, reading_txt,
                                            relation_decay=0.5)
     assert updates > 0
@@ -6003,13 +6007,15 @@ def selftest():
         token_replace_p=0.0, study_strategy="cycle", study_probe_n=4,
         study_hard_max=2, study_refresh_steps=1, context_target_w=0.1,
         context_keep_p=0.5, memory_size=8, composition_w=0.1, graph_predict_w=0.1,
-        graph_cycle_w=0.1,
+        graph_cycle_w=0.1, fer_w=0.1,
         neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2,
         transition_w=0.1, transition_batch=2,
         cluster_w=0.1, cluster_batch=4, cluster_probe_n=4)
     assert reading_model.reading_train_metrics["memory_active"] > 0
     assert reading_model.reading_train_metrics["graph_predict_w"] == 0.1
     assert reading_model.reading_train_metrics["graph_cycle_w"] == 0.1
+    assert reading_model.reading_train_metrics["fer_w"] == 0.1
+    assert math.isfinite(reading_model.reading_train_metrics["fer_score"])
     assert math.isfinite(reading_model.reading_train_metrics["graph_cycle_loss"])
     assert reading_model.reading_train_metrics["graph_transition_updates"] > 0
     assert any(r.get("strategy") == "cycle" for r in reading_model.reading_study_reports)
@@ -6054,6 +6060,10 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-factorization-variance", type=float, default=0.05)
     ap.add_argument("--reading-factorization-margin", type=float, default=0.2)
     ap.add_argument("--reading-factorization-covariance-w", type=float, default=0.05)
+    ap.add_argument("--reading-fer-w", type=float, default=0.0)
+    ap.add_argument("--reading-fer-fragmentation-w", type=float, default=1.0)
+    ap.add_argument("--reading-fer-correlation-w", type=float, default=1.0)
+    ap.add_argument("--reading-fer-balance-w", type=float, default=0.1)
     ap.add_argument("--reading-memory-w", type=float, default=0.05)
     ap.add_argument("--reading-memory-size", type=int, default=64)
     ap.add_argument("--reading-memory-temperature", type=float, default=0.1)
@@ -6124,6 +6134,10 @@ def _reading_kwargs(args):
                 factorization_variance=args.reading_factorization_variance,
                 factorization_margin=args.reading_factorization_margin,
                 factorization_covariance_w=args.reading_factorization_covariance_w,
+                fer_w=args.reading_fer_w,
+                fer_fragmentation_w=args.reading_fer_fragmentation_w,
+                fer_correlation_w=args.reading_fer_correlation_w,
+                fer_balance_w=args.reading_fer_balance_w,
                 memory_w=args.reading_memory_w,
                 memory_size=args.reading_memory_size,
                 memory_temperature=args.reading_memory_temperature,

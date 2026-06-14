@@ -1181,7 +1181,7 @@ def latent_concept_fer_metrics(slots, eps=1e-8):
         else:
             fragmentation = energy.sum() * 0.0
         slot_total = energy.sum(-1)
-        if float(slot_total.sum()) > eps_t:
+        if bool(slot_total.detach().sum().gt(eps_t)):
             usage = slot_total / slot_total.sum().clamp_min(eps_t)
             uniform = torch.full_like(usage, 1.0 / usage.numel())
             slot_imbalance = F.kl_div(
