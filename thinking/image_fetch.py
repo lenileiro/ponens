@@ -48,16 +48,24 @@ HF_DATASET_SOURCES = {
         "prefix": "data_512_2M/",
     },
 }
+MIXED_SOURCES = {
+    "text-to-image-2m-hq-mix": (
+        "text-to-image-2m-1024-10k",
+        "text-to-image-2m-512-2m",
+    ),
+}
 ZIP_SOURCES = {
     "diffusiondb-2m": {
         "parts": DIFFUSIONDB_2M_PARTS,
         "url": DIFFUSIONDB_PART_URL,
     },
 }
-SOURCES = tuple(sorted(set(STATIC_SOURCES) | set(HF_DATASET_SOURCES) | set(ZIP_SOURCES)))
+SOURCES = tuple(sorted(
+    set(STATIC_SOURCES) | set(HF_DATASET_SOURCES) | set(MIXED_SOURCES) | set(ZIP_SOURCES)))
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".ppm", ".pnm", ".bmp"}
-META_EXTS = {".json"}
+TEXT_META_EXTS = {".txt", ".text", ".caption"}
+META_EXTS = {".json"} | TEXT_META_EXTS
 SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 
 
@@ -143,6 +151,36 @@ def shard_urls(source="", urls=(), timeout=60):
     return tuple(out)
 
 
+def webdataset_source_groups(source="", urls=(), timeout=60):
+    groups = []
+    if source in MIXED_SOURCES:
+        for part in MIXED_SOURCES[source]:
+            if part in ZIP_SOURCES:
+                raise ValueError(f"mixed source {source!r} cannot include zip source {part!r}")
+            groups.append((part, shard_urls(part, (), timeout=timeout)))
+    elif source:
+        if source in ZIP_SOURCES:
+            raise ValueError(f"zip source {source!r} is not a webdataset source")
+        groups.append((source, shard_urls(source, (), timeout=timeout)))
+    if urls:
+        groups.append((source or "webdataset", tuple(urls)))
+    if not groups:
+        raise ValueError("provide --source or one or more --url shards")
+    return tuple(groups)
+
+
+def source_group_limits(groups, max_records=0):
+    n = len(groups)
+    total = int(max_records or 0)
+    if n <= 0:
+        return ()
+    if total <= 0:
+        return tuple(0 for _ in groups)
+    base = total // n
+    rem = total % n
+    return tuple(base + (1 if i < rem else 0) for i in range(n))
+
+
 def load_diffusiondb_metadata(path_or_url, parts=(), timeout=60):
     if not path_or_url:
         return {}
@@ -183,6 +221,20 @@ def caption_from_meta(meta):
         if val not in ("", None):
             return str(val)
     return ""
+
+
+def parse_sidecar_metadata(data, ext):
+    ext = str(ext).lower()
+    if ext == ".json":
+        meta = json.loads(data.decode("utf-8"))
+        if isinstance(meta, dict):
+            return meta
+        if isinstance(meta, str):
+            return {"caption": meta}
+        return {"caption": str(meta)}
+    if ext in TEXT_META_EXTS:
+        return {"caption": data.decode("utf-8", errors="replace").strip()}
+    raise ValueError(f"unknown metadata sidecar extension {ext!r}")
 
 
 def meta_float(meta, *keys, mode="first"):
@@ -319,6 +371,11 @@ def finalize_rows(rows, manifest, stats, args):
     stats["aesthetic_records"] = sum(1 for r in rows if r.get("aesthetic") is not None)
     stats["nsfw_records"] = sum(1 for r in rows if r.get("nsfw") is not None)
     stats["watermark_records"] = sum(1 for r in rows if r.get("watermark") is not None)
+    by_source = {}
+    for row in rows:
+        source = str(row.get("source") or "")
+        by_source[source] = by_source.get(source, 0) + 1
+    stats["records_written_by_source"] = dict(sorted(by_source.items()))
     if args.report_out:
         os.makedirs(os.path.dirname(args.report_out) or ".", exist_ok=True)
         with open(args.report_out, "w", encoding="utf-8") as f:
@@ -327,7 +384,7 @@ def finalize_rows(rows, manifest, stats, args):
 
 
 def fetch_webdataset_manifest(args):
-    urls = shard_urls(args.source, args.url, timeout=args.timeout)
+    groups = webdataset_source_groups(args.source, args.url, timeout=args.timeout)
     image_dir = os.path.abspath(args.image_dir)
     manifest = os.path.abspath(args.manifest)
     root = os.path.abspath(args.root) if args.root else os.path.dirname(manifest)
@@ -335,42 +392,68 @@ def fetch_webdataset_manifest(args):
     os.makedirs(os.path.dirname(manifest) or ".", exist_ok=True)
     max_records = int(args.max_records or 0)
     rows = []
+    limits = source_group_limits(groups, max_records=max_records)
     stats = {
         "source": args.source,
-        "urls": list(urls),
+        "source_groups": [
+            {
+                "source": source_name,
+                "urls": list(urls),
+                "max_records": int(limit),
+            }
+            for (source_name, urls), limit in zip(groups, limits)
+        ],
         "image_dir": image_dir,
         "manifest": manifest,
         "root": root,
         "max_records": max_records,
         "images_seen": 0,
         "meta_seen": 0,
+        "json_meta_seen": 0,
+        "text_meta_seen": 0,
         "records_written": 0,
     }
-    for url in urls:
-        pending = defaultdict(dict)
-        with open_stream(url, timeout=args.timeout) as stream:
-            with tarfile.open(fileobj=stream, mode="r|*") as tf:
-                for member in tf:
-                    if max_records and len(rows) >= max_records:
-                        break
-                    if not member.isfile():
-                        continue
-                    base, ext = image_base(member.name)
-                    if ext not in IMAGE_EXTS and ext not in META_EXTS:
-                        continue
-                    f = tf.extractfile(member)
-                    if f is None:
-                        continue
-                    data = f.read()
-                    if ext in IMAGE_EXTS:
-                        pending[base]["image"] = data
-                        pending[base]["image_name"] = member.name
-                        stats["images_seen"] += 1
-                    else:
-                        pending[base]["meta"] = json.loads(data.decode("utf-8"))
-                        stats["meta_seen"] += 1
-                    maybe_emit_pair(base, pending, image_dir, root, args.source or "webdataset",
-                                    rows, args)
+    for (source_name, urls), group_limit in zip(groups, limits):
+        group_rows_before = len(rows)
+        for url in urls:
+            pending = defaultdict(dict)
+            with open_stream(url, timeout=args.timeout) as stream:
+                with tarfile.open(fileobj=stream, mode="r|*") as tf:
+                    for member in tf:
+                        group_count = len(rows) - group_rows_before
+                        if max_records and len(rows) >= max_records:
+                            break
+                        if group_limit and group_count >= int(group_limit):
+                            break
+                        if not member.isfile():
+                            continue
+                        base, ext = image_base(member.name)
+                        if ext not in IMAGE_EXTS and ext not in META_EXTS:
+                            continue
+                        f = tf.extractfile(member)
+                        if f is None:
+                            continue
+                        data = f.read()
+                        if ext in IMAGE_EXTS:
+                            pending[base]["image"] = data
+                            pending[base]["image_name"] = member.name
+                            stats["images_seen"] += 1
+                        else:
+                            pending[base]["meta"] = parse_sidecar_metadata(data, ext)
+                            stats["meta_seen"] += 1
+                            if ext == ".json":
+                                stats["json_meta_seen"] = int(
+                                    stats.get("json_meta_seen", 0)) + 1
+                            else:
+                                stats["text_meta_seen"] = int(
+                                    stats.get("text_meta_seen", 0)) + 1
+                        maybe_emit_pair(
+                            base, pending, image_dir, root, source_name or "webdataset",
+                            rows, args)
+            if max_records and len(rows) >= max_records:
+                break
+            if group_limit and len(rows) - group_rows_before >= int(group_limit):
+                break
         if max_records and len(rows) >= max_records:
             break
     return finalize_rows(rows, manifest, stats, args)
@@ -522,6 +605,53 @@ def selftest():
         assert row["width"] == 2 and row["height"] == 2
         assert row["aesthetic"] == 6.5 and row["nsfw"] == 0.1
         assert os.path.exists(os.path.join(args.root, row["image"]))
+        tar_path_b = os.path.join(td, "mini_b.tar")
+        img_b = os.path.join(td, "sample_b.ppm")
+        _write_ppm(img_b)
+        meta_b = os.path.join(td, "sample_b.json")
+        with open(meta_b, "w", encoding="utf-8") as f:
+            json.dump({
+                "prompt": "second mixed source caption",
+                "width": 2,
+                "height": 2,
+            }, f)
+        with tarfile.open(tar_path_b, "w") as tf:
+            tf.add(img_b, arcname="sample_b.ppm")
+            tf.add(meta_b, arcname="sample_b.json")
+        STATIC_SOURCES["selftest-a"] = (tar_path,)
+        STATIC_SOURCES["selftest-b"] = (tar_path_b,)
+        MIXED_SOURCES["selftest-mix"] = ("selftest-a", "selftest-b")
+        args.source = "selftest-mix"
+        args.url = []
+        args.format = "auto"
+        args.max_records = 2
+        args.manifest = os.path.join(td, "mixed.jsonl")
+        args.image_dir = os.path.join(td, "mixed_images")
+        stats = fetch_manifest(args)
+        assert stats["records_written"] == 2
+        assert stats["records_written_by_source"] == {"selftest-a": 1, "selftest-b": 1}
+        rows = [json.loads(line) for line in open(args.manifest, encoding="utf-8")]
+        assert {row["source"] for row in rows} == {"selftest-a", "selftest-b"}
+        txt_tar_path = os.path.join(td, "txt_sidecar.tar")
+        txt_img = os.path.join(td, "txt_sample.ppm")
+        _write_ppm(txt_img)
+        txt_meta = os.path.join(td, "txt_sample.txt")
+        with open(txt_meta, "w", encoding="utf-8") as f:
+            f.write("caption from plain text sidecar")
+        with tarfile.open(txt_tar_path, "w") as tf:
+            tf.add(txt_img, arcname="txt_sample.ppm")
+            tf.add(txt_meta, arcname="txt_sample.txt")
+        args.source = ""
+        args.url = [txt_tar_path]
+        args.format = "webdataset"
+        args.max_records = 1
+        args.manifest = os.path.join(td, "txt_manifest.jsonl")
+        args.image_dir = os.path.join(td, "txt_images")
+        stats = fetch_manifest(args)
+        assert stats["records_written"] == 1
+        assert stats["text_meta_seen"] == 1
+        row = json.loads(open(args.manifest, encoding="utf-8").readline())
+        assert row["caption"] == "caption from plain text sidecar"
         zip_path = os.path.join(td, "diffusiondb.zip")
         with zipfile.ZipFile(zip_path, "w") as zf:
             zf.write(img, arcname="part-000001/sample.ppm")

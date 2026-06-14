@@ -1,0 +1,16 @@
+{
+ "experiment": "a4_pronounce",
+ "steps": 20000,
+ "n_words": 161,
+ "n_holdout": 23,
+ "chance_top1": 0.006211180124223602,
+ "seen_retrieval": {
+  "top1": 0.9927536231884058,
+  "top3": 1.0
+ },
+ "holdout_retrieval": {
+  "top1": 0.08695652173913043,
+  "top3": 0.21739130434782608
+ },
+ "gate": false
+}

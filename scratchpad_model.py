@@ -380,7 +380,7 @@ class ScratchpadLM(nn.Module):
         return auto and bool((torch.sigmoid(q) > 0.5).all())
 
     def forward(self, ids, loops=None, return_per_loop=False, loop_noise=0.0, prefix=None):
-        """prefix: optional (B, P, d) continuous embeddings (image patches, audio frames)
+        """prefix: optional (B, P, d) continuous embeddings (image patches or feature views)
         prepended BEFORE the token stream -- the multimodal bridge. Logits are returned for
         ALL positions; callers slice [:, P:] for the token part. Incompatible with the
         pointer head (no token ids to scatter onto) -- use pointer=False models."""

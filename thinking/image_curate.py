@@ -21,6 +21,7 @@ import numpy as np
 
 from .image_data import (
     ImageTextRecord,
+    caption_quality_metrics,
     caption_tokens,
     filter_records_by_image_near_duplicates,
     filter_records_by_image_text_cosine,
@@ -124,6 +125,10 @@ def _record_quality(rec):
 def _basic_filter(records, min_caption_tokens=1, max_caption_tokens=0,
                   min_width=0, min_height=0, min_pixels=0,
                   min_aspect=0.0, max_aspect=0.0,
+                  min_caption_unique_ratio=0.0,
+                  max_caption_token_frequency=0.0,
+                  max_caption_token_run=0.0,
+                  max_caption_char_run=0.0,
                   min_aesthetic=None, max_nsfw=None, max_watermark=None,
                   require_text_embedding=False, require_text_embedding_sequence=False,
                   require_image_embedding=False, require_image_embedding_sequence=False,
@@ -132,16 +137,41 @@ def _basic_filter(records, min_caption_tokens=1, max_caption_tokens=0,
     rejected = []
     causes = Counter()
     caption_lens = []
+    caption_unique_ratios = []
+    caption_max_token_frequencies = []
+    caption_max_token_runs = []
+    caption_max_char_runs = []
     aspect_ratios = []
     pixel_counts = []
     for idx, rec in enumerate(records):
         reasons = []
+        quality = caption_quality_metrics(rec.caption)
         toks = caption_tokens(rec.caption)
         caption_lens.append(len(toks))
+        caption_unique_ratios.append(quality["caption_unique_ratio"])
+        caption_max_token_frequencies.append(quality["caption_max_token_frequency"])
+        caption_max_token_runs.append(quality["caption_max_token_run"])
+        caption_max_char_runs.append(quality["caption_max_char_run"])
         if len(toks) < int(min_caption_tokens):
             reasons.append("caption_too_short")
         if int(max_caption_tokens or 0) > 0 and len(toks) > int(max_caption_tokens):
             reasons.append("caption_too_long")
+        if (min_caption_unique_ratio
+                and quality["caption_unique_ratio"] < float(min_caption_unique_ratio)):
+            reasons.append("caption_unique_ratio_below_threshold")
+        if (max_caption_token_frequency
+                and quality["caption_tokens"] > 1
+                and quality["caption_max_token_frequency"]
+                > float(max_caption_token_frequency)):
+            reasons.append("caption_token_frequency_above_threshold")
+        if (max_caption_token_run
+                and quality["caption_tokens"] > 1
+                and quality["caption_max_token_run"] > float(max_caption_token_run)):
+            reasons.append("caption_token_run_above_threshold")
+        if (max_caption_char_run
+                and quality["caption_chars"] > 1
+                and quality["caption_max_char_run"] > float(max_caption_char_run)):
+            reasons.append("caption_char_run_above_threshold")
         if int(min_width or 0) > 0 and (not rec.width or rec.width < int(min_width)):
             reasons.append("width_too_small")
         if int(min_height or 0) > 0 and (not rec.height or rec.height < int(min_height)):
@@ -195,6 +225,10 @@ def _basic_filter(records, min_caption_tokens=1, max_caption_tokens=0,
         "basic_filter_reject_causes": dict(sorted(causes.items())),
         "basic_filter_error_examples": rejected[:max(0, int(sample_errors))],
         "caption_token_stats": _stats(caption_lens),
+        "caption_unique_ratio_stats": _stats(caption_unique_ratios),
+        "caption_max_token_frequency_stats": _stats(caption_max_token_frequencies),
+        "caption_max_token_run_stats": _stats(caption_max_token_runs),
+        "caption_max_char_run_stats": _stats(caption_max_char_runs),
         "aspect_ratio_stats": _stats(aspect_ratios),
         "pixel_count_stats": _stats(pixel_counts),
     }
@@ -294,6 +328,10 @@ def curate_manifest(
         min_pixels=0,
         min_aspect=0.0,
         max_aspect=0.0,
+        min_caption_unique_ratio=0.0,
+        max_caption_token_frequency=0.0,
+        max_caption_token_run=0.0,
+        max_caption_char_run=0.0,
         min_aesthetic=None,
         max_nsfw=None,
         max_watermark=None,
@@ -322,6 +360,10 @@ def curate_manifest(
         "split": split,
         "max_records": int(max_records),
         "records_in": int(original_count),
+        "min_caption_unique_ratio": float(min_caption_unique_ratio),
+        "max_caption_token_frequency": float(max_caption_token_frequency),
+        "max_caption_token_run": float(max_caption_token_run),
+        "max_caption_char_run": float(max_caption_char_run),
         "input_summary": summarize_records(records),
     }
     records, basic_report, basic_rejected = _basic_filter(
@@ -333,6 +375,10 @@ def curate_manifest(
         min_pixels=min_pixels,
         min_aspect=min_aspect,
         max_aspect=max_aspect,
+        min_caption_unique_ratio=min_caption_unique_ratio,
+        max_caption_token_frequency=max_caption_token_frequency,
+        max_caption_token_run=max_caption_token_run,
+        max_caption_char_run=max_caption_char_run,
         min_aesthetic=min_aesthetic,
         max_nsfw=max_nsfw,
         max_watermark=max_watermark,
@@ -444,6 +490,18 @@ def selftest():
                 "text_embedding": [1.0, 0.0, 0.0],
                 "image_embedding": [0.0, 1.0, 0.0],
             },
+            {
+                "image": "blue.ppm",
+                "caption": "echo echo echo echo",
+                "split": "train",
+                "aesthetic": 0.9,
+                "nsfw": 0.0,
+                "watermark": 0.0,
+                "width": 12,
+                "height": 12,
+                "text_embedding": [0.0, 1.0, 0.0],
+                "image_embedding": [0.0, 1.0, 0.0],
+            },
         ]
         with open(manifest, "w", encoding="utf-8") as f:
             for row in rows:
@@ -459,12 +517,20 @@ def selftest():
                 "--max-nsfw", "0.2",
                 "--min-image-text-cosine", "0.5",
                 "--exact-dedupe-by", "image",
+                "--min-caption-unique-ratio", "0.5",
+                "--max-caption-token-frequency", "0.6",
+                "--max-caption-token-run", "0.6",
                 "--eval-frac", "0.5",
                 "--seed", "3",
             ])
-        assert report["records_in"] == 4
+        assert report["records_in"] == 5
         assert report["records_out"] == 2
-        assert report["basic_filter_records_rejected"] == 2
+        assert report["basic_filter_records_rejected"] == 3
+        assert (report["basic_filter_reject_causes"][
+            "caption_unique_ratio_below_threshold"] == 1)
+        assert (report["basic_filter_reject_causes"][
+            "caption_token_frequency_above_threshold"] == 1)
+        assert report["basic_filter_reject_causes"]["caption_token_run_above_threshold"] == 1
         assert report["image_text_cosine_records_rejected"] == 0
         assert report["exact_dedupe_records_rejected"] == 0
         with open(out, "r", encoding="utf-8") as f:
@@ -501,6 +567,14 @@ def main(argv=None):
     ap.add_argument("--min-pixels", type=int, default=0)
     ap.add_argument("--min-aspect", type=float, default=0.0)
     ap.add_argument("--max-aspect", type=float, default=0.0)
+    ap.add_argument("--min-caption-unique-ratio", type=float, default=0.0,
+                    help="reject captions below this unique-token ratio; 0 disables")
+    ap.add_argument("--max-caption-token-frequency", type=float, default=0.0,
+                    help="reject captions dominated by one token above this fraction; 0 disables")
+    ap.add_argument("--max-caption-token-run", type=float, default=0.0,
+                    help="reject captions with consecutive repeated-token runs above this fraction")
+    ap.add_argument("--max-caption-char-run", type=float, default=0.0,
+                    help="reject captions with repeated-character runs above this fraction")
     ap.add_argument("--min-aesthetic", type=float, default=None)
     ap.add_argument("--max-nsfw", type=float, default=None)
     ap.add_argument("--max-watermark", type=float, default=None)
@@ -543,6 +617,14 @@ def main(argv=None):
         ap.error("aspect filters must be non-negative")
     if args.max_aspect and args.min_aspect and args.max_aspect < args.min_aspect:
         ap.error("--max-aspect must be >= --min-aspect")
+    for name in (
+            "min_caption_unique_ratio",
+            "max_caption_token_frequency",
+            "max_caption_token_run",
+            "max_caption_char_run"):
+        val = float(getattr(args, name))
+        if val < 0.0 or val > 1.0:
+            ap.error(f"--{name.replace('_', '-')} must be in [0, 1]")
     if args.min_image_text_cosine is not None and not -1.0 <= args.min_image_text_cosine <= 1.0:
         ap.error("--min-image-text-cosine must be in [-1, 1]")
     if (args.max_image_duplicate_cosine is not None
@@ -569,6 +651,10 @@ def main(argv=None):
         min_pixels=args.min_pixels,
         min_aspect=args.min_aspect,
         max_aspect=args.max_aspect,
+        min_caption_unique_ratio=args.min_caption_unique_ratio,
+        max_caption_token_frequency=args.max_caption_token_frequency,
+        max_caption_token_run=args.max_caption_token_run,
+        max_caption_char_run=args.max_caption_char_run,
         min_aesthetic=args.min_aesthetic,
         max_nsfw=args.max_nsfw,
         max_watermark=args.max_watermark,

@@ -38,8 +38,7 @@ memorization, and curriculum.
 | `runpod/` | H100 launchers (tar-over-ssh, timeout-bounded, always-terminate) |
 | `thinking/vision_understanding.py`, `thinking/image_data.py`, `thinking/image_caption.py`, `thinking/image_embed.py`, `thinking/image_score.py`, `thinking/image_preferences.py`, `thinking/image_curate.py`, `thinking/image_eval.py`, `thinking/image_latent.py` | Image stack: manifest-driven visual concept learning, captioned image data, recaptioning, embedding/quality/preference sidecars, curation, offline image-quality eval, and text-conditioned latent flow |
 | `thinking/text.py` | Text-0 semantic understanding rung: web-imported English records → canonical facts, with artifact controls |
-| `thinking/audio.py`, `thinking/multimodal.py` | Speech experiments and a generic manifest-driven multimodal prefix bridge |
-| `thinking/listen.py`, `thinking/speak.py` | speech: **listen** (transcribe real synthesized speech, speaker-invariant), **speak** (emit audio tokens *verified by round-trip* through the frozen listener — the checker, applied to generation) |
+| `thinking/multimodal.py` | Generic manifest-driven multimodal prefix bridge with named feature views, text tokens, targets, latent slots, and concept memory |
 | `*.md` | research plans and theses (FER bet, reasoning design, training data, validated plan) |
 
 ## Headline results (staircase-validated, 2026-06)
@@ -96,6 +95,7 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --max-records 1024 --image-dir data/images/web_fetch \
     --manifest data/images/train_web.jsonl --root data/images \
     --report-out runs/image_fetch_report.json
+# image_fetch accepts WebDataset JSON metadata sidecars and plain .txt caption sidecars.
 .venv/bin/python -m thinking.image_caption --manifest data/images/train_web.jsonl \
     --root data/images --backend hf --model Salesforce/blip-image-captioning-large \
     --mode replace --batch 16 --device cuda \
@@ -108,6 +108,8 @@ uv venv && uv pip install torch numpy tokenizers pandas pyarrow
     --report-out runs/image_score_report.json
 .venv/bin/python -m thinking.image_curate --manifest data/images/train_web_scored.jsonl \
     --root data/images --min-caption-tokens 4 --min-width 256 --min-height 256 \
+    --min-caption-unique-ratio 0.25 --max-caption-token-frequency 0.5 \
+    --max-caption-token-run 0.5 --max-caption-char-run 0.35 \
     --max-nsfw 0.2 --max-watermark 0.2 --min-image-text-cosine 0.2 \
     --max-image-duplicate-cosine 0.985 --eval-frac 0.02 \
     --out data/images/train_web_curated.jsonl \
@@ -141,7 +143,9 @@ installs those when this path is active.
     --max-nsfw 0.2 --max-watermark 0.5 --min-image-text-cosine 0.15 \
     --max-image-duplicate-cosine 0.985 \
     --embedding-manifest data/images/embeddings.jsonl --embedding-key image \
-    --min-caption-tokens 3 --write-filtered data/images/train_clean.jsonl \
+    --min-caption-tokens 3 --min-caption-unique-ratio 0.25 \
+    --max-caption-token-frequency 0.5 --max-caption-token-run 0.5 \
+    --max-caption-char-run 0.35 --write-filtered data/images/train_clean.jsonl \
     --report-out runs/image_manifest_report.json
 .venv/bin/python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
     --image-manifest data/images/train_clean.jsonl --image-root data/images \
@@ -187,7 +191,7 @@ installs those when this path is active.
     --embedding-key image --max-records 2048 --min-score 0.25 \
     --report-out runs/image_eval_report.json
 # Preference-loop artifact: score multiple generated candidates per prompt, then emit
-# chosen/rejected pairs for DPO-style tuning or quality-scorer training.
+# chosen/rejected pairs for direct flow preference tuning and quality-scorer training.
 .venv/bin/python -m thinking.image_score --manifest data/images/generated_captioned.jsonl \
     --root data/images --backend ensemble --technical-w 0.3 \
     --external-sidecar data/images/generated_reward_scores.jsonl \
@@ -200,12 +204,30 @@ installs those when this path is active.
     --report-out runs/generated_preferences_report.json
 RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --image-quality-preset web-hf-vae
+RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
+    --image-quality-preset web-hf-vae-hq
 # The preset also writes a generated sample manifest, embeds it, and runs image_eval; add
 # --image-generated-eval-fail-on-gate plus threshold flags to make quality gates hard. It also
 # runs image_score before embedding/cleaning so quality_score metadata reaches sampling,
-# duplicate selection, quality-head training, and quality-guided prompt sampling. MM-DiT
-# attention defaults to exact auto SDPA on modern PyTorch; use linear only as an explicit
-# memory/speed approximation.
+# duplicate selection, quality-head training, quality-guided prompt sampling, and direct
+# chosen/rejected latent-flow preference updates. The `web-hf-vae` preset is the broad
+# 512/768 data path; `web-hf-vae-hq` switches to a mixed 1024+512 source manifest with
+# high-res source upweighting, PickScore + technical-health quality scoring,
+# stricter cleaning, longer text sequence conditioning, 1024/multi-aspect buckets, latent patching
+# that keeps MM-DiT token count bounded, a 12-block/12-head 768-wide MM-DiT, more sampling steps,
+# larger candidate reranking, and a generated-candidate feedback artifact:
+# `*_candidates.jsonl` -> PickScore-scored candidates -> `*_preferences.jsonl` chosen/rejected
+# pairs, including sampler/CFG provenance, for the next quality-scorer and direct-flow preference pass. If that portable preference
+# artifact and its candidate images exist locally, the next `web-hf-vae-hq` launch auto-uploads
+# and consumes it; add
+# `--image-no-auto-preferences` to force a first-run/no-feedback profile. Both use SigLIP So400m
+# plus T5-large text-sequence conditioning, progressive bucket curriculum, CFG dropout,
+# boundary-enforced double-cosine rectified-flow velocity, logit-normal flow times with soft
+# Min-SNR velocity weighting, adaptive loss-tracked timestep sampling, EMA-teacher guided
+# self-distillation, triangular middle-window CFG scheduling, Heun/adaptive-Heun/RK4 sampling
+# sweeps, and standard CFG plus CFG++ sweeps.
+# MM-DiT attention defaults to exact auto SDPA on modern PyTorch; use linear only as an
+# explicit memory/speed approximation.
 .venv/bin/python -m thinking.image_latent --eval-checkpoint runs/image_latent_dit.pt \
     --cfg-scales 1.0,1.5 --sample-steps-list 4,8 --eval-seeds 1,2,3 \
     --eval-out runs/image_latent_dit_sweep.json

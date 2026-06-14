@@ -36,10 +36,12 @@ from .image_data import (
 )
 
 
-BACKENDS = ("stats", "embedding", "external", "ensemble")
+BACKENDS = ("stats", "embedding", "external", "pickscore", "ensemble")
 KEYS = ("image", "basename", "caption")
 NORMALIZE_MODES = ("auto", "minmax", "none")
 EPS = 1.0e-12
+DEFAULT_PICKSCORE_MODEL = "yuvalkirstain/PickScore_v1"
+DEFAULT_PICKSCORE_PROCESSOR = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
 DEFAULT_EXTERNAL_FIELDS = (
     "quality_score",
     "preference_score",
@@ -358,11 +360,172 @@ def normalize_external_scores(index: dict, mode: str = "auto") -> dict:
     }
 
 
+def _normalize_score_values(raw_values: Sequence[float | None], mode: str = "auto"):
+    vals = np.asarray([
+        float(v) if v is not None and math.isfinite(float(v)) else np.nan
+        for v in raw_values
+    ], dtype=np.float64)
+    finite = np.isfinite(vals)
+    out = [None for _ in raw_values]
+    if not finite.any():
+        return out, {
+            "normalized": False,
+            "min": None,
+            "max": None,
+        }
+    lo = float(np.min(vals[finite]))
+    hi = float(np.max(vals[finite]))
+    use_minmax = mode == "minmax" or (mode == "auto" and (lo < 0.0 or hi > 1.0))
+    for i, raw in enumerate(vals):
+        if not math.isfinite(float(raw)):
+            continue
+        if use_minmax:
+            out[i] = 0.5 if hi <= lo else _clamp01((float(raw) - lo) / max(hi - lo, EPS))
+        else:
+            out[i] = _clamp01(float(raw))
+    return out, {
+        "normalized": bool(use_minmax),
+        "min": lo,
+        "max": hi,
+    }
+
+
+def _pickscore_device(device: str):
+    device = str(device or "auto")
+    if device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return device
+
+
+def _pickscore_dtype(dtype: str, device: str):
+    dtype = str(dtype or "auto")
+    if dtype == "auto":
+        return torch.float16 if str(device).startswith("cuda") else torch.float32
+    if dtype == "fp16":
+        return torch.float16
+    if dtype == "bf16":
+        return torch.bfloat16
+    return torch.float32
+
+
+def _to_device(batch, device):
+    if hasattr(batch, "to"):
+        return batch.to(device)
+    return {k: v.to(device) if hasattr(v, "to") else v for k, v in batch.items()}
+
+
+def pickscore_quality_index(rows: Sequence[ManifestRow], model_name: str = "",
+                            processor_name: str = "", device: str = "auto",
+                            dtype: str = "auto", batch_size: int = 8,
+                            max_length: int = 77, normalize: str = "auto"):
+    """Score prompt/image alignment with a CLIP-style PickScore reward model."""
+    if normalize not in NORMALIZE_MODES:
+        raise ValueError(f"unknown PickScore normalize mode {normalize!r}")
+    if int(batch_size) <= 0:
+        raise ValueError("PickScore batch size must be positive")
+    if int(max_length) <= 0:
+        raise ValueError("PickScore max length must be positive")
+    try:
+        from PIL import Image
+        from transformers import AutoModel, AutoProcessor
+    except ImportError as exc:
+        raise RuntimeError(
+            "PickScore backend requires pillow and transformers; install the image scoring "
+            "dependencies or use --backend stats/external") from exc
+
+    model_name = model_name or DEFAULT_PICKSCORE_MODEL
+    processor_name = processor_name or DEFAULT_PICKSCORE_PROCESSOR
+    device = _pickscore_device(device)
+    torch_dtype = _pickscore_dtype(dtype, device)
+    try:
+        model = AutoModel.from_pretrained(model_name, torch_dtype=torch_dtype)
+    except TypeError:
+        model = AutoModel.from_pretrained(model_name)
+    model = model.to(device).eval()
+    processor = AutoProcessor.from_pretrained(processor_name)
+
+    raw_by_index: dict[int, float | None] = {}
+    errors_by_index: dict[int, str] = {}
+    raw_vals = []
+    with torch.no_grad():
+        for off in range(0, len(rows), int(batch_size)):
+            batch = rows[off:off + int(batch_size)]
+            images, captions, row_ids = [], [], []
+            for row in batch:
+                try:
+                    with Image.open(row.record.path) as image:
+                        images.append(image.convert("RGB").copy())
+                    captions.append(row.record.caption)
+                    row_ids.append(row.index)
+                except Exception as exc:
+                    raw_by_index[row.index] = None
+                    errors_by_index[row.index] = str(exc)
+            if not images:
+                continue
+            try:
+                image_inputs = _to_device(
+                    processor(images=images, return_tensors="pt"), device)
+                text_inputs = _to_device(
+                    processor(text=captions, padding=True, truncation=True,
+                              max_length=int(max_length), return_tensors="pt"), device)
+                image_features = model.get_image_features(**image_inputs).float()
+                text_features = model.get_text_features(**text_inputs).float()
+                image_features = torch.nn.functional.normalize(image_features, dim=-1)
+                text_features = torch.nn.functional.normalize(text_features, dim=-1)
+                logit_scale = getattr(model, "logit_scale", None)
+                if logit_scale is not None:
+                    scale = logit_scale.detach().float().exp().clamp(max=100.0)
+                else:
+                    scale = torch.ones((), device=image_features.device)
+                raw = (image_features * text_features).sum(-1) * scale
+                for row_id, score in zip(row_ids, raw.detach().cpu().tolist()):
+                    raw_by_index[row_id] = float(score)
+                    raw_vals.append(float(score))
+            except Exception as exc:
+                for row_id in row_ids:
+                    raw_by_index[row_id] = None
+                    errors_by_index[row_id] = str(exc)
+
+    ordered_raw = [raw_by_index.get(row.index) for row in rows]
+    normalized, norm_report = _normalize_score_values(ordered_raw, mode=normalize)
+    index = {}
+    for row, raw, score in zip(rows, ordered_raw, normalized):
+        item = {
+            "raw": raw,
+            "score": score,
+        }
+        if row.index in errors_by_index:
+            item["error"] = errors_by_index[row.index]
+        index[row.index] = item
+    report = {
+        "pickscore_model": model_name,
+        "pickscore_processor": processor_name,
+        "pickscore_device": device,
+        "pickscore_dtype": str(dtype),
+        "pickscore_batch": int(batch_size),
+        "pickscore_max_length": int(max_length),
+        "pickscore_normalize": normalize,
+        "pickscore_normalized": bool(norm_report["normalized"]),
+        "pickscore_norm_min": norm_report["min"],
+        "pickscore_norm_max": norm_report["max"],
+        "pickscore_rows": int(len(rows)),
+        "pickscore_scored": int(sum(1 for v in raw_by_index.values() if v is not None)),
+        "pickscore_failed": int(sum(1 for v in raw_by_index.values() if v is None)),
+        "pickscore_raw_stats": _stats(raw_vals),
+        "pickscore_score_stats": _stats([
+            item["score"] for item in index.values() if item.get("score") is not None
+        ]),
+    }
+    return index, report
+
+
 def score_record(row: ManifestRow, backend: str = "stats", external_index: dict | None = None,
+                 pickscore_index: dict | None = None,
                  external_key: str = "image", image_size: int = 256,
                  technical_w: float = 1.0, alignment_w: float = 0.0,
-                 external_w: float = 0.0):
+                 external_w: float = 0.0, pickscore_w: float = 0.0):
     external_index = external_index or {}
+    pickscore_index = pickscore_index or {}
     components = {}
     parts = []
     reasons = []
@@ -390,6 +553,21 @@ def score_record(row: ManifestRow, backend: str = "stats", external_index: dict 
                 "external_quality_score_field": ext["field"],
             })
             parts.append(("external", score, external_w))
+    if backend in ("pickscore", "ensemble") and pickscore_w > 0.0:
+        ps = pickscore_index.get(row.index)
+        if ps is None or ps.get("score") is None:
+            reason = "missing_pickscore"
+            if ps is not None and ps.get("error"):
+                reason = "pickscore_error"
+                components["pickscore_quality_error"] = str(ps["error"])
+            reasons.append(reason)
+        else:
+            score = float(ps["score"])
+            components.update({
+                "pickscore_quality_score": score,
+                "pickscore_quality_score_raw": float(ps["raw"]),
+            })
+            parts.append(("pickscore", score, pickscore_w))
     final, final_parts = _weighted_geomean(parts)
     if final is None:
         return None, {
@@ -424,6 +602,10 @@ def score_manifest(manifest: str, root: str = "", split: str = "", max_records: 
                    external_score_field: str = "", external_normalize: str = "auto",
                    image_size: int = 256, technical_w: float = 1.0,
                    alignment_w: float = 0.0, external_w: float = 0.0,
+                   pickscore_w: float = 0.0, pickscore_model: str = "",
+                   pickscore_processor: str = "", pickscore_device: str = "auto",
+                   pickscore_dtype: str = "auto", pickscore_batch: int = 8,
+                   pickscore_max_length: int = 77, pickscore_normalize: str = "auto",
                    drop_failed: bool = False):
     if backend not in BACKENDS:
         raise ValueError(f"unknown backend {backend!r}")
@@ -435,6 +617,8 @@ def score_manifest(manifest: str, root: str = "", split: str = "", max_records: 
         alignment_w = 1.0
     if backend == "external" and external_w <= 0.0:
         external_w = 1.0
+    if backend == "pickscore" and pickscore_w <= 0.0:
+        pickscore_w = 1.0
     if backend == "stats" and technical_w <= 0.0:
         technical_w = 1.0
 
@@ -442,6 +626,20 @@ def score_manifest(manifest: str, root: str = "", split: str = "", max_records: 
         external_sidecar, root=external_root or root, key=external_key,
         score_field=external_score_field)
     external_report.update(normalize_external_scores(external_index, mode=external_normalize))
+    needs_pickscore = backend == "pickscore" or (
+        backend == "ensemble" and float(pickscore_w) > 0.0)
+    row_source = iter_manifest_rows(
+        manifest, root=root, split=split, max_records=max_records)
+    pickscore_index, pickscore_report = {}, {
+        "pickscore_enabled": bool(needs_pickscore),
+    }
+    if needs_pickscore:
+        row_source = list(row_source)
+        pickscore_index, pickscore_report = pickscore_quality_index(
+            row_source, model_name=pickscore_model, processor_name=pickscore_processor,
+            device=pickscore_device, dtype=pickscore_dtype, batch_size=pickscore_batch,
+            max_length=pickscore_max_length, normalize=pickscore_normalize)
+        pickscore_report["pickscore_enabled"] = True
 
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True) if out else None
     os.makedirs(os.path.dirname(sidecar_out) or ".", exist_ok=True) if sidecar_out else None
@@ -453,14 +651,15 @@ def score_manifest(manifest: str, root: str = "", split: str = "", max_records: 
     seen = written = side_written = scored = 0
     examples = []
     try:
-        for row in iter_manifest_rows(manifest, root=root, split=split, max_records=max_records):
+        for row in row_source:
             seen += 1
             try:
                 score, metrics = score_record(
                     row, backend=backend, external_index=external_index,
+                    pickscore_index=pickscore_index,
                     external_key=external_key, image_size=image_size,
                     technical_w=technical_w, alignment_w=alignment_w,
-                    external_w=external_w)
+                    external_w=external_w, pickscore_w=pickscore_w)
             except Exception as e:
                 score, metrics = None, {"quality_score_error": str(e)}
             output = _prepare_output_row(row.row, row.record, root=root)
@@ -492,6 +691,8 @@ def score_manifest(manifest: str, root: str = "", split: str = "", max_records: 
                     output["embedding_alignment_score"] = float(metrics["embedding_alignment_score"])
                 if "external_quality_score" in metrics:
                     output["external_quality_score"] = float(metrics["external_quality_score"])
+                if "pickscore_quality_score" in metrics:
+                    output["pickscore_quality_score"] = float(metrics["pickscore_quality_score"])
                 for name, data in metrics.get("quality_score_components", {}).items():
                     val = data.get("score")
                     if val is not None:
@@ -515,6 +716,8 @@ def score_manifest(manifest: str, root: str = "", split: str = "", max_records: 
                     "external_quality_score",
                     "external_quality_score_raw",
                     "external_quality_score_field",
+                    "pickscore_quality_score",
+                    "pickscore_quality_score_raw",
                     "image_text_cosine",
                 ):
                     if field in output:
@@ -540,6 +743,7 @@ def score_manifest(manifest: str, root: str = "", split: str = "", max_records: 
         "technical_w": float(technical_w),
         "alignment_w": float(alignment_w),
         "external_w": float(external_w),
+        "pickscore_w": float(pickscore_w),
         "records_seen": int(seen),
         "records_scored": int(scored),
         "records_written": int(written),
@@ -553,6 +757,7 @@ def score_manifest(manifest: str, root: str = "", split: str = "", max_records: 
         "quality_failure_examples": examples,
     }
     report.update(external_report)
+    report.update(pickscore_report)
     if report_out:
         os.makedirs(os.path.dirname(report_out) or ".", exist_ok=True)
         with open(report_out, "w", encoding="utf-8") as f:
@@ -636,6 +841,9 @@ def selftest():
         ens_rows = _read_jsonl(ensemble_out)
         assert ens_report["records_scored"] == 2
         assert "external" in ens_rows[1]["quality_score_components"]
+        norm, norm_report = _normalize_score_values([1.0, 9.0], mode="auto")
+        assert norm_report["normalized"] is True
+        assert norm[0] == 0.0 and norm[1] == 1.0
 
 
 def main(argv=None):
@@ -646,7 +854,8 @@ def main(argv=None):
     ap.add_argument("--split", default="", help="optional split to score; default scores all rows")
     ap.add_argument("--max-records", type=int, default=0, help="cap scored rows; 0 means all")
     ap.add_argument("--backend", default="stats", choices=BACKENDS,
-                    help="quality source: technical stats, image-text embedding, external, ensemble")
+                    help=("quality source: technical stats, image-text embedding, external, "
+                          "PickScore, or ensemble"))
     ap.add_argument("--out", default="", help="scored manifest JSONL")
     ap.add_argument("--sidecar-out", default="", help="optional score-only JSONL sidecar")
     ap.add_argument("--report-out", default="", help="optional JSON report")
@@ -668,6 +877,23 @@ def main(argv=None):
                     help="ensemble weight for existing image/text embedding cosine")
     ap.add_argument("--external-w", type=float, default=0.0,
                     help="ensemble weight for external preference/reward score")
+    ap.add_argument("--pickscore-w", type=float, default=0.0,
+                    help="ensemble weight for PickScore prompt-image reward")
+    ap.add_argument("--pickscore-model", default=DEFAULT_PICKSCORE_MODEL,
+                    help="Hugging Face model id for PickScore reward scoring")
+    ap.add_argument("--pickscore-processor", default=DEFAULT_PICKSCORE_PROCESSOR,
+                    help="Hugging Face processor id for PickScore reward scoring")
+    ap.add_argument("--pickscore-device", default="auto",
+                    help="device for PickScore reward scoring; auto uses CUDA when available")
+    ap.add_argument("--pickscore-dtype", default="auto",
+                    choices=("auto", "fp32", "fp16", "bf16"),
+                    help="dtype for PickScore reward scoring")
+    ap.add_argument("--pickscore-batch", type=int, default=8,
+                    help="batch size for PickScore reward scoring")
+    ap.add_argument("--pickscore-max-length", type=int, default=77,
+                    help="tokenizer max length for PickScore prompt text")
+    ap.add_argument("--pickscore-normalize", default="auto", choices=NORMALIZE_MODES,
+                    help="normalize raw PickScore rewards before writing quality_score")
     ap.add_argument("--drop-failed", action="store_true",
                     help="drop rows that cannot be scored instead of preserving them")
     ap.add_argument("--selftest", action="store_true")
@@ -684,9 +910,13 @@ def main(argv=None):
         ap.error("--max-records must be non-negative")
     if args.image_size <= 0:
         ap.error("--image-size must be positive")
-    for name in ("technical_w", "alignment_w", "external_w"):
+    for name in ("technical_w", "alignment_w", "external_w", "pickscore_w"):
         if getattr(args, name) < 0.0:
             ap.error(f"--{name.replace('_', '-')} must be non-negative")
+    if args.pickscore_batch <= 0:
+        ap.error("--pickscore-batch must be positive")
+    if args.pickscore_max_length <= 0:
+        ap.error("--pickscore-max-length must be positive")
     if args.backend in ("external", "ensemble") and args.external_w > 0.0:
         if not args.external_sidecar:
             ap.error("--external-sidecar is required when external scoring is enabled")
@@ -698,7 +928,15 @@ def main(argv=None):
         external_score_field=args.external_score_field,
         external_normalize=args.external_normalize, image_size=args.image_size,
         technical_w=args.technical_w, alignment_w=args.alignment_w,
-        external_w=args.external_w, drop_failed=args.drop_failed)
+        external_w=args.external_w, pickscore_w=args.pickscore_w,
+        pickscore_model=args.pickscore_model,
+        pickscore_processor=args.pickscore_processor,
+        pickscore_device=args.pickscore_device,
+        pickscore_dtype=args.pickscore_dtype,
+        pickscore_batch=args.pickscore_batch,
+        pickscore_max_length=args.pickscore_max_length,
+        pickscore_normalize=args.pickscore_normalize,
+        drop_failed=args.drop_failed)
     print(json.dumps(report, indent=1))
     return 0
 

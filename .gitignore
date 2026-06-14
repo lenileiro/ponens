@@ -21,7 +21,6 @@ corpus_*.jsonl
 nohup.out
 *.json
 !surfaces.json
-!data/multimodal_transcripts.json
 !**/config.json
 
 # legacy archive (pre-production experiments; on disk, not in the repo)
@@ -33,8 +32,3 @@ runpod/launch_beam.py
 runpod/launch_learn.py
 runpod/launch_solver.py
 runpod/launch_v6.py
-data/speech/
-data/speech16k/
-data/gsc/
-data/pronounce/
-data/mimic/

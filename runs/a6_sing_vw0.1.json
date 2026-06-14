@@ -1,0 +1,16 @@
+{
+ "experiment": "a6_sing",
+ "steps": 16000,
+ "n_notes_scale": 8,
+ "n_vowels": 4,
+ "pitch_chance": 0.125,
+ "vowel_chance": 0.25,
+ "vowel_w": 0.1,
+ "pitch_acc": 1.0,
+ "vowel_acc": 0.5520833333333334,
+ "holdout_pitch_acc": 1.0,
+ "holdout_vowel_acc": 0.29276315789473684,
+ "n_notes": 480,
+ "n_holdout_notes": 304,
+ "gate": false
+}

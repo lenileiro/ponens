@@ -21,6 +21,31 @@ from .image_score import DEFAULT_EXTERNAL_FIELDS, _optional_float, _stats, iter_
 
 PAIR_MODES = ("top-bottom", "top-k", "all", "adjacent", "hard")
 DEFAULT_GROUP_FIELDS = ("preference_group", "prompt_id", "prompt", "caption")
+PREFERENCE_METADATA_PREFIXES = (
+    "sample_",
+    "prompt_embed_",
+    "conditioning_",
+    "candidate_",
+    "selected_",
+    "candidates_",
+)
+PREFERENCE_METADATA_FIELDS = (
+    "prompt_id",
+    "preference_group",
+    "negative_prompt",
+    "width",
+    "height",
+)
+PREFERENCE_SETTING_FIELDS = (
+    "sample_method",
+    "sample_schedule",
+    "sample_cfg_mode",
+    "sample_cfg_schedule",
+    "sample_candidate_set",
+    "caption_cond_source",
+    "prompt_embed_backend",
+    "selected_by_internal_sampler",
+)
 
 
 def _score_from_row(row, rec, score_field=""):
@@ -80,6 +105,47 @@ def _manifest_image(path, root=""):
     return rel
 
 
+def _jsonable(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_jsonable(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _jsonable(val) for key, val in value.items())
+    return False
+
+
+def _is_preference_metadata_field(field):
+    field = str(field)
+    return (
+        field in PREFERENCE_METADATA_FIELDS
+        or any(field.startswith(prefix) for prefix in PREFERENCE_METADATA_PREFIXES)
+    )
+
+
+def _copy_preference_metadata(row, source_row, prefix):
+    for field, value in sorted(source_row.items()):
+        if not _is_preference_metadata_field(field):
+            continue
+        if not _jsonable(value):
+            continue
+        row[f"{prefix}_{field}"] = value
+
+
+def _setting_counts(rows, prefix):
+    out = {}
+    for field in PREFERENCE_SETTING_FIELDS:
+        key = f"{prefix}_{field}"
+        vals = Counter(
+            str(row.get(key))
+            for row in rows
+            if row.get(key) not in ("", None)
+        )
+        if vals:
+            out[field] = dict(sorted(vals.items()))
+    return out
+
+
 def _pair_row(group_key, chosen, rejected, score_field, root=""):
     chosen_row, rejected_row = chosen["row"], rejected["row"]
     chosen_rec, rejected_rec = chosen["record"], rejected["record"]
@@ -91,7 +157,7 @@ def _pair_row(group_key, chosen, rejected, score_field, root=""):
         or chosen_rec.caption
     )
     score_gap = float(chosen["score"] - rejected["score"])
-    return {
+    row = {
         "prompt": str(prompt),
         "group_key": group_key,
         "chosen_image": _manifest_image(chosen_rec.path, root=root),
@@ -108,6 +174,17 @@ def _pair_row(group_key, chosen, rejected, score_field, root=""):
         "rejected_source": rejected_rec.source,
         "preference_source": "image_preferences_v1",
     }
+    for field in (
+            "text_embedding", "prompt_embedding", "caption_embedding",
+            "text_embedding_sequence", "prompt_embedding_sequence",
+            "caption_embedding_sequence"):
+        if field in chosen_row:
+            row[field] = chosen_row[field]
+        elif field in rejected_row:
+            row[field] = rejected_row[field]
+    _copy_preference_metadata(row, chosen_row, "chosen")
+    _copy_preference_metadata(row, rejected_row, "rejected")
+    return row
 
 
 def _candidate_pairs(rows, mode="top-bottom", min_gap=0.0):
@@ -222,6 +299,24 @@ def build_preference_pairs(manifest, root="", split="", score_field="", group_by
         "groups_skipped_min_gap": int(skipped_no_gap),
         "pairs_written": int(len(out_rows)),
         "score_gap_stats": _stats(gap_vals),
+        "pairs_with_prompt": int(sum(1 for row in out_rows if row.get("prompt"))),
+        "pairs_with_text_embedding": int(
+            sum(1 for row in out_rows if row.get("text_embedding") is not None
+                or row.get("prompt_embedding") is not None
+                or row.get("caption_embedding") is not None)),
+        "pairs_with_text_embedding_sequence": int(
+            sum(1 for row in out_rows if row.get("text_embedding_sequence") is not None
+                or row.get("prompt_embedding_sequence") is not None
+                or row.get("caption_embedding_sequence") is not None)),
+        "pairs_with_sample_metadata": int(sum(
+            1 for row in out_rows
+            if any(
+                key.startswith("chosen_sample_") or key.startswith("rejected_sample_")
+                for key in row
+            )
+        )),
+        "chosen_sample_setting_counts": _setting_counts(out_rows, "chosen"),
+        "rejected_sample_setting_counts": _setting_counts(out_rows, "rejected"),
     }
     if report_out:
         os.makedirs(os.path.dirname(report_out) or ".", exist_ok=True)
@@ -240,9 +335,14 @@ def selftest():
         manifest = os.path.join(td, "generated.jsonl")
         rows = [
             {"image": "p0_a.ppm", "caption": "red car", "prompt_id": "p0",
-             "quality_score": 0.2},
+             "quality_score": 0.2, "text_embedding": [0.1, 0.2],
+             "sample_method": "heun", "sample_cfg_schedule": "constant",
+             "sample_cfg_scale": 2.0, "candidate_index": 0},
             {"image": "p0_b.ppm", "caption": "red car", "prompt_id": "p0",
-             "quality_score": 0.9},
+             "quality_score": 0.9, "text_embedding": [0.9, 0.8],
+             "text_embedding_sequence": [[0.9, 0.8], [0.7, 0.6]],
+             "sample_method": "adaptive-heun", "sample_cfg_schedule": "triangular",
+             "sample_cfg_scale": 2.0, "candidate_index": 1},
             {"image": "p0_c.ppm", "caption": "red car", "prompt_id": "p0",
              "quality_score": 0.5},
             {"image": "p1_a.ppm", "caption": "blue boat", "prompt_id": "p1",
@@ -265,6 +365,24 @@ def selftest():
         assert pairs[0]["chosen_image"] == "p0_b.ppm"
         assert pairs[0]["rejected_image"] == "p0_a.ppm"
         assert pairs[0]["score_gap"] > 0.6
+        assert pairs[0]["text_embedding"] == [0.9, 0.8]
+        assert pairs[0]["text_embedding_sequence"] == [[0.9, 0.8], [0.7, 0.6]]
+        assert pairs[0]["chosen_sample_method"] == "adaptive-heun"
+        assert pairs[0]["rejected_sample_method"] == "heun"
+        assert pairs[0]["chosen_sample_cfg_schedule"] == "triangular"
+        assert pairs[0]["rejected_sample_cfg_schedule"] == "constant"
+        assert pairs[0]["chosen_candidate_index"] == 1
+        assert pairs[0]["rejected_candidate_index"] == 0
+        assert report["pairs_with_prompt"] == 1
+        assert report["pairs_with_text_embedding"] == 1
+        assert report["pairs_with_text_embedding_sequence"] == 1
+        assert report["pairs_with_sample_metadata"] == 1
+        assert report["chosen_sample_setting_counts"]["sample_method"] == {
+            "adaptive-heun": 1}
+        assert report["chosen_sample_setting_counts"]["sample_cfg_schedule"] == {
+            "triangular": 1}
+        assert report["rejected_sample_setting_counts"]["sample_cfg_schedule"] == {
+            "constant": 1}
         reread = _read_jsonl(out)
         assert reread == pairs
 

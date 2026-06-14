@@ -1,0 +1,10 @@
+{
+ "experiment": "a5_mimic",
+ "steps": 16000,
+ "holdout_cells": 48,
+ "word_acc": 0.6666666666666666,
+ "voice_match": 1.0,
+ "n_voices": 6,
+ "voice_chance": 0.16666666666666666,
+ "gate": true
+}

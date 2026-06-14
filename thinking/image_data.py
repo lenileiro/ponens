@@ -49,6 +49,45 @@ def caption_tokens(text: str) -> list[str]:
     return [m.group(0).lower() for m in TOKEN_RE.finditer(str(text))]
 
 
+def _longest_run(vals):
+    best = run = 0
+    prev = None
+    for val in vals:
+        if val == prev:
+            run += 1
+        else:
+            prev = val
+            run = 1
+        if run > best:
+            best = run
+    return best
+
+
+def caption_quality_metrics(text: str) -> dict[str, float | int]:
+    toks = caption_tokens(text)
+    token_count = len(toks)
+    if token_count:
+        counts = Counter(toks)
+        unique_ratio = len(counts) / float(token_count)
+        max_token_frequency = max(counts.values()) / float(token_count)
+        max_token_run = _longest_run(toks) / float(token_count)
+    else:
+        unique_ratio = 0.0
+        max_token_frequency = 0.0
+        max_token_run = 0.0
+    chars = [ch.lower() for ch in str(text) if not ch.isspace()]
+    char_count = len(chars)
+    max_char_run = (_longest_run(chars) / float(char_count)) if char_count else 0.0
+    return {
+        "caption_tokens": int(token_count),
+        "caption_chars": int(char_count),
+        "caption_unique_ratio": float(unique_ratio),
+        "caption_max_token_frequency": float(max_token_frequency),
+        "caption_max_token_run": float(max_token_run),
+        "caption_max_char_run": float(max_char_run),
+    }
+
+
 def _coerce_optional_float(raw):
     if raw in ("", None):
         return None
@@ -1111,7 +1150,11 @@ def inspect_image_manifest(path, root="", split="", min_aesthetic=None, max_reco
                            check_images=True, min_side=0, max_aspect=0.0,
                            min_caption_tokens=1, max_caption_tokens=0,
                            dedupe_paths=True, sample_errors=8,
-                           max_nsfw=None, max_watermark=None):
+                           max_nsfw=None, max_watermark=None,
+                           min_caption_unique_ratio=0.0,
+                           max_caption_token_frequency=0.0,
+                           max_caption_token_run=0.0,
+                           max_caption_char_run=0.0):
     """Validate and summarize a captioned-image manifest.
 
     This is data-plane tooling for real image generation: it catches missing files, corrupt
@@ -1159,11 +1202,31 @@ def inspect_image_manifest(path, root="", split="", min_aesthetic=None, max_reco
                 continue
         inspected += 1
         reasons = []
+        caption_quality = caption_quality_metrics(rec.caption)
         toks = caption_tokens(rec.caption)
         if min_caption_tokens and len(toks) < int(min_caption_tokens):
             reasons.append("caption_too_short")
         if max_caption_tokens and len(toks) > int(max_caption_tokens):
             reasons.append("caption_too_long")
+        if (min_caption_unique_ratio
+                and caption_quality["caption_unique_ratio"]
+                < float(min_caption_unique_ratio)):
+            reasons.append("caption_unique_ratio_below_threshold")
+        if (max_caption_token_frequency
+                and caption_quality["caption_tokens"] > 1
+                and caption_quality["caption_max_token_frequency"]
+                > float(max_caption_token_frequency)):
+            reasons.append("caption_token_frequency_above_threshold")
+        if (max_caption_token_run
+                and caption_quality["caption_tokens"] > 1
+                and caption_quality["caption_max_token_run"]
+                > float(max_caption_token_run)):
+            reasons.append("caption_token_run_above_threshold")
+        if (max_caption_char_run
+                and caption_quality["caption_chars"] > 1
+                and caption_quality["caption_max_char_run"]
+                > float(max_caption_char_run)):
+            reasons.append("caption_char_run_above_threshold")
 
         ext = os.path.splitext(rec.path)[1].lower() or "<none>"
         extension_counts[ext] += 1
@@ -1210,7 +1273,14 @@ def inspect_image_manifest(path, root="", split="", min_aesthetic=None, max_reco
         if max_records and inspected >= int(max_records):
             break
 
-    caption_lengths = [len(caption_tokens(rec.caption)) for rec in kept]
+    caption_quality = [caption_quality_metrics(rec.caption) for rec in kept]
+    caption_lengths = [q["caption_tokens"] for q in caption_quality]
+    caption_unique_ratios = [q["caption_unique_ratio"] for q in caption_quality]
+    caption_max_token_frequencies = [
+        q["caption_max_token_frequency"] for q in caption_quality
+    ]
+    caption_max_token_runs = [q["caption_max_token_run"] for q in caption_quality]
+    caption_max_char_runs = [q["caption_max_char_run"] for q in caption_quality]
     widths = [rec.width for rec in kept if rec.width]
     heights = [rec.height for rec in kept if rec.height]
     min_sides = [min(rec.width, rec.height) for rec in kept if rec.width and rec.height]
@@ -1235,6 +1305,10 @@ def inspect_image_manifest(path, root="", split="", min_aesthetic=None, max_reco
         "max_aspect": float(max_aspect),
         "min_caption_tokens": int(min_caption_tokens),
         "max_caption_tokens": int(max_caption_tokens),
+        "min_caption_unique_ratio": float(min_caption_unique_ratio),
+        "max_caption_token_frequency": float(max_caption_token_frequency),
+        "max_caption_token_run": float(max_caption_token_run),
+        "max_caption_char_run": float(max_caption_char_run),
         "dedupe_paths": bool(dedupe_paths),
         "rows_total": len(rows),
         "records_inspected": int(inspected),
@@ -1249,6 +1323,10 @@ def inspect_image_manifest(path, root="", split="", min_aesthetic=None, max_reco
         "extension_counts": dict(sorted(extension_counts.items())),
         "quality_pass_rate": float(len(kept) / inspected) if inspected else 0.0,
         "caption_token_stats": _stats(caption_lengths),
+        "caption_unique_ratio_stats": _stats(caption_unique_ratios),
+        "caption_max_token_frequency_stats": _stats(caption_max_token_frequencies),
+        "caption_max_token_run_stats": _stats(caption_max_token_runs),
+        "caption_max_char_run_stats": _stats(caption_max_char_runs),
         "width_stats": _stats(widths),
         "height_stats": _stats(heights),
         "min_side_stats": _stats(min_sides),
@@ -1357,6 +1435,11 @@ def selftest():
         vocab = build_caption_vocab(records)
         ids = caption_ids([records[0].caption], vocab, max_len=5)
         assert ids.shape == (1, 5) and int(ids[0, 0]) > 0
+        repeated_metrics = caption_quality_metrics("echo echo echo echo")
+        assert repeated_metrics["caption_unique_ratio"] == 0.25
+        assert repeated_metrics["caption_max_token_frequency"] == 1.0
+        assert repeated_metrics["caption_max_token_run"] == 1.0
+        assert caption_quality_metrics("aaaaaaaaaa")["caption_max_char_run"] == 1.0
         xb, captions = sample_image_text_batch(
             records, np.random.default_rng(0), batch=2, size=4,
             crop_mode="random", hflip_prob=0.5)
@@ -1390,16 +1473,28 @@ def selftest():
                      "nsfw": 0.0, "watermark": 0.0},
                     {"image": "sample.ppm", "caption": "duplicate patch", "split": "train"},
                     {"image": "missing.ppm", "caption": "x", "split": "train"},
+                    {"image": "sample.ppm", "caption": "echo echo echo echo",
+                     "split": "train"},
                     {"image": "sample.ppm", "caption": "held out patch", "split": "eval"}):
                 f.write(json.dumps(row) + "\n")
         report, kept, rejected = inspect_image_manifest(
             qa_manifest, split="train", min_caption_tokens=2, check_images=True)
         assert report["records_kept"] == 1 and len(kept) == 1
-        assert report["reject_causes"]["duplicate_path"] == 1
+        assert report["reject_causes"]["duplicate_path"] == 2
         assert report["reject_causes"]["missing_file"] == 1
         assert report["reject_causes"]["caption_too_short"] == 1
         assert report["records_skipped_split"] == 1 and rejected
         assert report["width_stats"]["min"] == 8.0 and report["height_stats"]["min"] == 6.0
+        quality_report, quality_kept, quality_rejected = inspect_image_manifest(
+            qa_manifest, split="train", min_caption_tokens=1, check_images=True,
+            dedupe_paths=False, min_caption_unique_ratio=0.5,
+            max_caption_token_frequency=0.6, max_caption_token_run=0.6)
+        assert len(quality_kept) == 2 and quality_rejected
+        assert (quality_report["reject_causes"][
+            "caption_unique_ratio_below_threshold"] == 1)
+        assert (quality_report["reject_causes"][
+            "caption_token_frequency_above_threshold"] == 1)
+        assert quality_report["reject_causes"]["caption_token_run_above_threshold"] == 1
         filtered = os.path.join(td, "filtered.jsonl")
         write_image_manifest(kept, filtered, root=td)
         with open(filtered, "r", encoding="utf-8") as f:
@@ -1524,6 +1619,18 @@ def main(argv=None):
                     help="reject captions shorter than this token count")
     ap.add_argument("--max-caption-tokens", type=int, default=0,
                     help="reject captions longer than this token count; 0 disables")
+    ap.add_argument("--min-caption-unique-ratio", type=float, default=0.0,
+                    help=("reject captions whose unique-token ratio is below this; "
+                          "0 disables"))
+    ap.add_argument("--max-caption-token-frequency", type=float, default=0.0,
+                    help=("reject captions dominated by one token above this fraction; "
+                          "0 disables"))
+    ap.add_argument("--max-caption-token-run", type=float, default=0.0,
+                    help=("reject captions with a consecutive repeated-token run above "
+                          "this fraction; 0 disables"))
+    ap.add_argument("--max-caption-char-run", type=float, default=0.0,
+                    help=("reject captions with a repeated-character run above this "
+                          "fraction; 0 disables"))
     ap.add_argument("--no-check-images", action="store_true",
                     help="skip image decode/header checks but still check paths and captions")
     ap.add_argument("--keep-duplicate-paths", action="store_true",
@@ -1570,6 +1677,14 @@ def main(argv=None):
             and (args.max_image_duplicate_cosine < -1.0
                  or args.max_image_duplicate_cosine > 1.0)):
         ap.error("--max-image-duplicate-cosine must be in [-1, 1]")
+    for name in (
+            "min_caption_unique_ratio",
+            "max_caption_token_frequency",
+            "max_caption_token_run",
+            "max_caption_char_run"):
+        val = float(getattr(args, name))
+        if val < 0.0 or val > 1.0:
+            ap.error(f"--{name.replace('_', '-')} must be in [0, 1]")
     if args.image_dedupe_lsh_bits <= 0:
         ap.error("--image-dedupe-lsh-bits must be positive")
     if args.image_dedupe_lsh_tables <= 0:
@@ -1582,7 +1697,11 @@ def main(argv=None):
         max_aspect=args.max_aspect, min_caption_tokens=args.min_caption_tokens,
         max_caption_tokens=args.max_caption_tokens,
         dedupe_paths=not args.keep_duplicate_paths,
-        sample_errors=args.sample_errors)
+        sample_errors=args.sample_errors,
+        min_caption_unique_ratio=args.min_caption_unique_ratio,
+        max_caption_token_frequency=args.max_caption_token_frequency,
+        max_caption_token_run=args.max_caption_token_run,
+        max_caption_char_run=args.max_caption_char_run)
     if args.embedding_manifest:
         kept, embedding_report = merge_embedding_sidecar(
             kept, args.embedding_manifest, root=args.embedding_root or args.root,

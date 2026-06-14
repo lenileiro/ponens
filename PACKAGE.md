@@ -323,7 +323,7 @@ anti-collapse margin.
 
 ## 3b. Image and vision understanding
 
-The old synthetic visual-factor harness has been removed. The active image path is manifest-driven: image rows, captions, embeddings, quality scores, and preference sidecars come from data files, and concept learning uses latent slots plus concept memory rather than a fixed visual grammar.
+The old synthetic visual-factor harness has been removed. The active image path is manifest-driven: image rows, captions, embeddings, quality scores, and preference sidecars come from data files, and concept learning uses latent slots plus concept memory rather than a fixed visual grammar. For image generation, `runpod/launch_thinking.py --image-quality-preset web-hf-vae-hq` is the current high-resolution path: it fetches a mixed 1024+512 web manifest with high-res source upweighting, including WebDataset shards with JSON metadata or plain `.txt` caption sidecars, scores prompt-image quality with PickScore plus technical image-health checks, applies stricter alignment/safety/dedupe/caption-hygiene cleaning, trains 1024/multi-aspect HF-VAE latent buckets with a progressive bucket curriculum, uses latent patching so higher-resolution training stays within a bounded MM-DiT token budget, and runs a 12-block/12-head 768-wide MM-DiT instead of the smoke-test transformer defaults. HQ also enables boundary-enforced double-cosine rectified-flow velocity so the model honors the normalized latent endpoint field at noise/data boundaries. HQ runs emit all generated prompt candidates, score those candidates, and mine chosen/rejected preference pairs with sampler/CFG provenance; when that portable preference artifact and its candidate images exist locally, the next HQ launch auto-uploads and consumes them for latent quality-scorer pretraining plus direct latent-flow preference updates unless `--image-no-auto-preferences` is set.
 
 Use `thinking.vision_understanding` for visual concept learning:
 
@@ -342,6 +342,8 @@ with high-quality generation requirements before any GPU run:
 python -m thinking.image_curate --selftest
 python -m thinking.image_curate --manifest data/images/train_web_scored.jsonl \
     --root data/images --min-caption-tokens 4 --min-width 256 --min-height 256 \
+    --min-caption-unique-ratio 0.25 --max-caption-token-frequency 0.5 \
+    --max-caption-token-run 0.5 --max-caption-char-run 0.35 \
     --max-nsfw 0.2 --max-watermark 0.2 --min-image-text-cosine 0.2 \
     --max-image-duplicate-cosine 0.985 --eval-frac 0.02 \
     --out data/images/train_web_curated.jsonl \
@@ -378,7 +380,7 @@ RUNPOD_API_KEY=... python runpod/launch_thinking.py \
     --image-sample-steps 8 --image-eval-sweep --fast --go
 ```
 
-The modern image stack still keeps the efficient latent-flow techniques added earlier: DiT/MM-DiT backbones, exact auto SDPA attention by default with linear attention only as an explicit approximation, EMA evaluation, manifest latent caches, text/image feature alignment, quality ranking, REPA/self-REPA/SRA alignment, endpoint consistency, sliced-OT noise coupling, min-SNR velocity weighting, guidance distillation, aspect-ratio buckets, and finite-sampling guards. These are implemented against manifest captions and embeddings, not against the removed visual fact harness.
+The modern image stack still keeps the efficient latent-flow techniques added earlier: DiT/MM-DiT backbones, exact auto SDPA attention by default with linear attention only as an explicit approximation, EMA evaluation, manifest latent caches, text/image feature alignment, quality ranking, generated-pair scorer pretraining, direct flow preference tuning, REPA/self-REPA/SRA alignment, endpoint consistency, sliced-OT noise coupling, logit-normal plus adaptive loss-tracked timestep sampling, soft Min-SNR velocity weighting, guidance distillation, aspect-ratio buckets, triangular middle-window CFG scheduling, adaptive Heun sampling, and finite-sampling guards. The `web-hf-vae` RunPod preset now defaults to SigLIP So400m plus T5-large text-sequence conditioning, multi-aspect `512x512,768x512,512x768` HF-VAE latent buckets, progressive bucket unlocking during flow training, CFG dropout, an EMA-teacher guided self-distillation pass, Heun/adaptive-Heun/RK4 sampling sweeps, multi-candidate reranking, and standard CFG plus CFG++ sweeps. These are implemented against manifest captions and embeddings, not against the removed visual fact harness.
 
 ## 3c. Multimodal bridge: manifest features into the same trace language
 

@@ -122,52 +122,179 @@ def path_with_suffix(path, suffix, default_dir="runs"):
     return root + suffix
 
 
+def generated_preference_path_for_args(args):
+    candidates = str(getattr(args, "image_sample_candidates_manifest_out", "") or "").strip()
+    if not candidates:
+        return ""
+    return (
+        str(getattr(args, "image_generated_preference_out", "") or "").strip()
+        or path_with_suffix(candidates, "_preferences.jsonl")
+    )
+
+
+def _row_pair_paths(row):
+    chosen = (
+        row.get("chosen_image") or row.get("chosen") or row.get("winner_image")
+        or row.get("preferred_image")
+    )
+    rejected = (
+        row.get("rejected_image") or row.get("rejected") or row.get("loser_image")
+        or row.get("nonpreferred_image")
+    )
+    return str(chosen or ""), str(rejected or "")
+
+
+def local_preference_manifest_is_portable(path, max_rows=64):
+    local = local_path_for_arg(path)
+    if not local or not os.path.isfile(local):
+        return False
+    base = os.path.dirname(os.path.abspath(local))
+    rows = 0
+    with open(local, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                return False
+            chosen, rejected = _row_pair_paths(row)
+            if not chosen or not rejected:
+                return False
+            for rel in (chosen, rejected):
+                if os.path.isabs(rel):
+                    return False
+                resolved = os.path.abspath(os.path.join(base, rel))
+                if not resolved.startswith(base + os.sep) and resolved != base:
+                    return False
+                if not os.path.isfile(resolved):
+                    return False
+            rows += 1
+            if rows >= int(max_rows):
+                break
+    return rows > 0
+
+
+def local_path_remote_destination(local_path):
+    local_abs = os.path.abspath(local_path)
+    try:
+        rel = os.path.relpath(local_abs, HERE)
+    except ValueError:
+        return local_abs
+    if rel.startswith("..") or os.path.isabs(rel):
+        return local_abs
+    return os.path.join(REMOTE, rel)
+
+
+def preference_upload_paths(path):
+    local = local_path_for_arg(path)
+    if not local or not os.path.isfile(local):
+        return []
+    base = os.path.dirname(os.path.abspath(local))
+    uploads = {os.path.abspath(local)}
+    with open(local, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            for rel in _row_pair_paths(row):
+                if not rel or os.path.isabs(rel):
+                    continue
+                parts = [
+                    part for part in rel.replace("\\", "/").split("/")
+                    if part and part != "."
+                ]
+                if not parts or any(part == ".." for part in parts):
+                    continue
+                top = os.path.join(base, parts[0])
+                full = os.path.join(base, *parts)
+                uploads.add(os.path.abspath(top if os.path.isdir(top) else full))
+    return sorted(uploads)
+
+
 def apply_image_quality_preset(args):
     preset = str(getattr(args, "image_quality_preset", "none") or "none")
+    args.image_auto_preference_manifest = False
     if preset == "none":
         return
-    if preset != "web-hf-vae":
+    if preset not in ("web-hf-vae", "web-hf-vae-hq"):
         raise ValueError(f"unknown image quality preset {preset!r}")
+    hq = preset == "web-hf-vae-hq"
     args.image_fetch = True
-    args.image_fetch_source = "text-to-image-2m-512-2m"
+    args.image_fetch_source = (
+        "text-to-image-2m-hq-mix" if hq else "text-to-image-2m-512-2m")
     args.image_score = True
-    args.image_score_backend = "stats"
-    args.image_score_image_size = max(int(args.image_score_image_size), 512)
+    args.image_score_backend = "ensemble" if hq else "stats"
+    args.image_score_image_size = max(int(args.image_score_image_size), 768 if hq else 512)
+    if hq:
+        if float(args.image_score_technical_w) == 1.0:
+            args.image_score_technical_w = 0.25
+        args.image_score_pickscore_w = max(float(args.image_score_pickscore_w), 0.75)
+        args.image_score_pickscore_batch = max(int(args.image_score_pickscore_batch), 8)
+        args.image_score_pickscore_dtype = "auto"
     args.image_embed = True
     args.image_embed_backend = "hf"
+    if not args.image_embed_model or args.image_embed_model == "google/siglip-base-patch16-224":
+        args.image_embed_model = "google/siglip-so400m-patch14-384"
     args.image_embed_text_mode = "both"
-    if not args.image_embed_text_sequence_model:
-        args.image_embed_text_sequence_model = "google-t5/t5-base"
+    if (not args.image_embed_text_sequence_model
+            or args.image_embed_text_sequence_model == "google-t5/t5-base"):
+        args.image_embed_text_sequence_model = "google-t5/t5-large"
+    args.image_embed_text_sequence_max_length = max(
+        int(args.image_embed_text_sequence_max_length), 192 if hq else 128)
     args.image_latent = True
     args.image_cond_mode = "text"
     args.image_caption_cond_source = "auto"
-    args.image_fetch_max_records = max(int(args.image_fetch_max_records), 10000)
+    args.image_fetch_max_records = max(int(args.image_fetch_max_records), 20000 if hq else 10000)
+    args.image_clean_min_caption_tokens = max(
+        int(args.image_clean_min_caption_tokens), 4 if hq else 3)
+    if hq and float(args.image_clean_min_caption_unique_ratio) <= 0.0:
+        args.image_clean_min_caption_unique_ratio = 0.25
+    if hq and float(args.image_clean_max_caption_token_frequency) <= 0.0:
+        args.image_clean_max_caption_token_frequency = 0.50
+    if hq and float(args.image_clean_max_caption_token_run) <= 0.0:
+        args.image_clean_max_caption_token_run = 0.50
+    if hq and float(args.image_clean_max_caption_char_run) <= 0.0:
+        args.image_clean_max_caption_char_run = 0.35
     args.image_clean_min_side = max(int(args.image_clean_min_side), 512)
     args.image_clean_max_aspect = max(float(args.image_clean_max_aspect), 2.0)
     if args.image_clean_max_nsfw is None:
         args.image_clean_max_nsfw = 0.2
     if args.image_clean_max_watermark is None:
-        args.image_clean_max_watermark = 0.5
+        args.image_clean_max_watermark = 0.3 if hq else 0.5
     if args.image_clean_min_image_text_cosine is None:
-        args.image_clean_min_image_text_cosine = 0.15
+        args.image_clean_min_image_text_cosine = 0.20 if hq else 0.15
     if args.image_clean_max_image_duplicate_cosine is None:
-        args.image_clean_max_image_duplicate_cosine = 0.985
-    args.image_size = "512"
-    args.image_size_buckets = "512x512"
+        args.image_clean_max_image_duplicate_cosine = 0.98 if hq else 0.985
+    if str(args.image_size).strip() == "32":
+        args.image_size = "1024" if hq else "512"
+    if not str(args.image_size_buckets or "").strip():
+        args.image_size_buckets = (
+            "512x512,768x768,1024x768,768x1024,1024x1024,1344x768,768x1344"
+            if hq else "512x512,768x512,512x768")
+    if hq and not str(args.image_source_weights or "").strip():
+        args.image_source_weights = (
+            "text-to-image-2m-1024-10k=2.0,text-to-image-2m-512-2m=1.0,*=1.0")
+    args.image_size_curriculum_frac = max(
+        float(args.image_size_curriculum_frac), 0.6 if hq else 0.4)
     args.image_ae_arch = "hf-vae"
     args.image_latent_arch = "mmdit"
     if not args.image_ae_hf_model:
         args.image_ae_hf_model = "stabilityai/sdxl-vae"
     args.image_latent_downsample = 8
-    args.image_latent_patch_size = max(int(args.image_latent_patch_size), 2)
+    args.image_latent_patch_size = max(int(args.image_latent_patch_size), 4 if hq else 2)
     args.image_latent_max_tokens = max(int(args.image_latent_max_tokens), 2048)
     if int(args.dim or 0) <= 0:
-        args.dim = 512
+        args.dim = 768 if hq else 512
+    elif hq:
+        args.dim = max(int(args.dim), 768)
     if int(args.batch) == 16:
-        args.batch = 4
+        args.batch = 2 if hq else 4
     if int(args.train_steps or 0) <= 0:
-        args.train_steps = 20000
+        args.train_steps = 40000 if hq else 20000
     args.image_dit_head_width_mult = max(int(args.image_dit_head_width_mult), 2)
+    args.image_dit_depth = max(int(args.image_dit_depth), 12 if hq else 6)
+    args.image_dit_heads = max(int(args.image_dit_heads), 12 if hq else 8)
     args.image_dit_qk_norm = True
     args.image_dit_attn_impl = "auto"
     args.image_dit_pos_embed = "rope2d"
@@ -191,36 +318,100 @@ def apply_image_quality_preset(args):
     args.image_flow_sra_w = max(float(args.image_flow_sra_w), 0.05)
     args.image_flow_sra_mode = "both"
     args.image_flow_sra_time_gap = float(args.image_flow_sra_time_gap or 0.25)
+    args.image_cond_drop = max(float(args.image_cond_drop), 0.1)
+    args.image_cfg_scale = max(float(args.image_cfg_scale), 2.0 if hq else 1.5)
+    args.image_cfg_rescale = max(float(args.image_cfg_rescale), 0.7)
+    if hq and str(args.image_cfg_schedule or "constant") == "constant":
+        args.image_cfg_schedule = "triangular"
+    if hq and str(args.image_flow_boundary_mode or "none") == "none":
+        args.image_flow_boundary_mode = "double-cosine"
     args.image_quality_weight = max(float(args.image_quality_weight), 0.5)
     args.image_quality_score_w = max(float(args.image_quality_score_w), 0.02)
     args.image_flow_quality_score_w = max(float(args.image_flow_quality_score_w), 0.01)
     args.image_quality_rank_w = max(float(args.image_quality_rank_w), 0.01)
     args.image_flow_quality_rank_w = max(float(args.image_flow_quality_rank_w), 0.005)
     args.image_quality_rank_margin = max(float(args.image_quality_rank_margin), 0.05)
-    if args.image_preference_manifest:
-        args.image_quality_score_steps = max(int(args.image_quality_score_steps), 1000)
-        args.image_preference_w = max(float(args.image_preference_w), 0.5)
     args.image_flow_consistency_w = max(float(args.image_flow_consistency_w), 0.05)
     args.image_flow_endpoint_w = max(float(args.image_flow_endpoint_w), 0.1)
     args.image_flow_noise_coupling = "sliced_ot"
     args.image_flow_noise_coupling_projections = max(
         int(args.image_flow_noise_coupling_projections), 4)
     args.image_flow_ema_decay = max(float(args.image_flow_ema_decay), 0.999)
-    args.image_sample_steps = max(int(args.image_sample_steps), 8)
+    args.image_flow_distill_frac = max(float(args.image_flow_distill_frac), 0.1)
+    args.image_flow_distill_w = max(float(args.image_flow_distill_w), 1.0)
+    args.image_flow_guidance_distill_w = max(float(args.image_flow_guidance_distill_w), 0.1)
+    args.image_flow_guidance_distill_cfg_scale = max(
+        float(args.image_flow_guidance_distill_cfg_scale), float(args.image_cfg_scale))
+    args.image_flow_guidance_distill_cfg_rescale = max(
+        float(args.image_flow_guidance_distill_cfg_rescale), float(args.image_cfg_rescale))
+    args.image_time_sampling = "adaptive" if hq else "logit-normal"
+    if hq:
+        args.image_time_adaptive_bins = max(int(args.image_time_adaptive_bins), 32)
+        args.image_time_adaptive_uniform_mix = max(
+            float(args.image_time_adaptive_uniform_mix), 0.05)
+        args.image_time_adaptive_min_prob = max(
+            float(args.image_time_adaptive_min_prob), 0.001)
+    args.image_flow_loss_weight = "soft-min-snr-v"
+    args.image_sample_method = "heun"
+    if (not str(args.image_sample_methods or "").strip()
+            or str(args.image_sample_methods).strip() == "euler,heun,midpoint"):
+        args.image_sample_methods = "heun,adaptive-heun,rk4" if hq else "heun,midpoint,rk4"
+    if not str(args.image_sample_steps_sweep or "").strip() or str(
+            args.image_sample_steps_sweep).strip() == "4,8,16":
+        args.image_sample_steps_sweep = "16,24,32" if hq else "8,16,24"
+    if not str(args.image_cfg_modes or "").strip():
+        args.image_cfg_modes = "standard,cfgpp"
+    if not str(args.image_cfg_schedules or "").strip():
+        args.image_cfg_schedules = "triangular,constant" if hq else args.image_cfg_schedule
+    args.image_sample_steps = max(int(args.image_sample_steps), 24 if hq else 16)
+    args.image_eval_sweep = True
+    args.image_eval_generated_candidates_per_prompt = max(
+        int(args.image_eval_generated_candidates_per_prompt), 4 if hq else 2)
+    args.image_sample_candidates_per_prompt = max(
+        int(args.image_sample_candidates_per_prompt), 4 if hq else 2)
     args.image_sample_grid = True
     if not args.image_sample_manifest_out:
-        args.image_sample_manifest_out = "runs/image_latent_web_hf_vae_generated.jsonl"
+        args.image_sample_manifest_out = (
+            "runs/image_latent_web_hf_vae_hq_generated.jsonl" if hq
+            else "runs/image_latent_web_hf_vae_generated.jsonl")
+    if hq and not args.image_sample_candidates_manifest_out:
+        args.image_sample_candidates_manifest_out = path_with_suffix(
+            args.image_sample_manifest_out, "_candidates.jsonl")
+    if (hq and not args.image_preference_manifest
+            and not getattr(args, "image_no_auto_preferences", False)):
+        generated_preference = generated_preference_path_for_args(args)
+        if local_preference_manifest_is_portable(generated_preference):
+            args.image_preference_manifest = generated_preference
+            args.image_auto_preference_manifest = True
+    if args.image_preference_manifest:
+        args.image_quality_score_steps = max(int(args.image_quality_score_steps), 1000)
+        args.image_preference_w = max(float(args.image_preference_w), 0.5)
+        args.image_flow_preference_w = max(float(args.image_flow_preference_w), 0.05)
+        args.image_flow_preference_batch = max(int(args.image_flow_preference_batch), 1)
     args.image_eval_generated = True
     args.image_prompt_embed_backend = args.image_embed_backend
     args.image_prompt_embed_model = args.image_embed_model
     if not args.image_prompt_embed_text_sequence_model:
         args.image_prompt_embed_text_sequence_model = args.image_embed_text_sequence_model
+    args.image_prompt_embed_text_sequence_max_length = max(
+        int(args.image_prompt_embed_text_sequence_max_length),
+        int(args.image_embed_text_sequence_max_length))
     if not args.image_sample_prompts:
-        args.image_sample_prompts = (
-            "a cinematic photo of a hiker crossing snowy mountains; "
-            "a stack of pancakes with glossy maple syrup; "
-            "a detailed product photo of an orange blue outdoor storage bag"
-        )
+        if hq:
+            args.image_sample_prompts = (
+                "a high-resolution editorial photo of a glass greenhouse after rain, "
+                "with detailed plants, reflections, and natural morning light; "
+                "a sharp studio product photograph of a translucent running shoe on "
+                "matte graphite, with visible mesh texture and softbox shadows; "
+                "a cinematic wide-angle photograph of a mountain observatory under a "
+                "clear star field, with realistic stone, snow, and warm window light"
+            )
+        else:
+            args.image_sample_prompts = (
+                "a cinematic photo of a hiker crossing snowy mountains; "
+                "a stack of pancakes with glossy maple syrup; "
+                "a detailed product photo of an orange blue outdoor storage bag"
+            )
 
 
 def upload_path_cmd(local_path, remote_path, ssh):
@@ -274,7 +465,7 @@ def payload(args):
         #                                                    this return the default kinship
         #                                                    multi-seed run was appended after it
     if (args.vision_understanding or args.image_latent or args.image_embed
-            or args.image_fetch or args.image_caption or args.image_score or args.audio
+            or args.image_fetch or args.image_caption or args.image_score
             or args.multimodal):
         effective_image_manifest = args.image_manifest
         if args.image_fetch:
@@ -335,6 +526,17 @@ def payload(args):
                      f"--technical-w {args.image_score_technical_w} "
                      f"--alignment-w {args.image_score_alignment_w} "
                      f"--external-w {args.image_score_external_w} "
+                     f"--pickscore-w {args.image_score_pickscore_w} "
+                     f"--pickscore-model "
+                     f"{shlex_quote(args.image_score_pickscore_model)} "
+                     f"--pickscore-processor "
+                     f"{shlex_quote(args.image_score_pickscore_processor)} "
+                     f"--pickscore-device {args.image_score_pickscore_device} "
+                     f"--pickscore-dtype {args.image_score_pickscore_dtype} "
+                     f"--pickscore-batch {args.image_score_pickscore_batch} "
+                     f"--pickscore-max-length {args.image_score_pickscore_max_length} "
+                     f"--pickscore-normalize "
+                     f"{args.image_score_pickscore_normalize} "
                      f"--out {shlex_quote(args.image_score_out)} "
                      f"--report-out {shlex_quote(args.image_score_report_out)}")
             if args.image_score_split:
@@ -393,6 +595,14 @@ def payload(args):
                      f"--max-aspect {args.image_clean_max_aspect} "
                      f"--min-caption-tokens {args.image_clean_min_caption_tokens} "
                      f"--max-caption-tokens {args.image_clean_max_caption_tokens} "
+                     f"--min-caption-unique-ratio "
+                     f"{args.image_clean_min_caption_unique_ratio} "
+                     f"--max-caption-token-frequency "
+                     f"{args.image_clean_max_caption_token_frequency} "
+                     f"--max-caption-token-run "
+                     f"{args.image_clean_max_caption_token_run} "
+                     f"--max-caption-char-run "
+                     f"{args.image_clean_max_caption_char_run} "
                      f"--embedding-manifest {shlex_quote(args.image_embed_out)} "
                      f"--embedding-root {shlex_quote(args.image_root)} "
                      f"--embedding-key image "
@@ -464,6 +674,14 @@ def payload(args):
                     sample_manifest_args += (
                         f" --sample-image-dir "
                         f"{shlex_quote(args.image_sample_image_dir)}")
+            if args.image_sample_candidates_manifest_out:
+                sample_manifest_args += (
+                    f" --sample-candidates-manifest-out "
+                    f"{shlex_quote(args.image_sample_candidates_manifest_out)}")
+                if args.image_sample_candidates_image_dir:
+                    sample_manifest_args += (
+                        f" --sample-candidates-image-dir "
+                        f"{shlex_quote(args.image_sample_candidates_image_dir)}")
             prompt_grid_args = ""
             if args.image_sample_prompts:
                 prompt_grid_args += f" --sample-prompts {shlex_quote(args.image_sample_prompts)}"
@@ -516,7 +734,10 @@ def payload(args):
                      f"--grad-clip {args.image_grad_clip} "
                      f"--size {args.image_size} "
                      f"--size-buckets {shlex_quote(args.image_size_buckets)} "
+                     f"--size-curriculum-frac {args.image_size_curriculum_frac} "
                      f"--hidden {args.dim or 64} --flow-arch {args.image_latent_arch} "
+                     f"--dit-depth {args.image_dit_depth} "
+                     f"--dit-heads {args.image_dit_heads} "
                      f"--dit-head-width-mult {args.image_dit_head_width_mult} "
                      f"--dit-attn-impl {args.image_dit_attn_impl} "
                      f"--dit-pos-embed {args.image_dit_pos_embed} "
@@ -574,6 +795,9 @@ def payload(args):
                      f"--image-preference-max-pairs "
                      f"{args.image_preference_max_pairs} "
                      f"--image-preference-w {args.image_preference_w} "
+                     f"--flow-preference-w {args.image_flow_preference_w} "
+                     f"--flow-preference-margin {args.image_flow_preference_margin} "
+                     f"--flow-preference-batch {args.image_flow_preference_batch} "
                      f"--caption-vocab-max {args.image_caption_vocab_max} "
                      f"--caption-max-len {args.image_caption_max_len} "
                      f"--caption-cond-source {args.image_caption_cond_source} "
@@ -583,6 +807,8 @@ def payload(args):
                      f"--cfg-scale {args.image_cfg_scale} "
                      f"--cfg-rescale {args.image_cfg_rescale} "
                      f"--cfg-mode {args.image_cfg_mode} "
+                     f"--cfg-schedule {args.image_cfg_schedule} "
+                     f"--flow-boundary-mode {args.image_flow_boundary_mode} "
                      f"--cfg-interval {shlex_quote(args.image_cfg_interval)} "
                      f"--sample-steps {args.image_sample_steps} "
                      f"--sample-method {args.image_sample_method} "
@@ -614,6 +840,13 @@ def payload(args):
                      f"--time-logit-mean {args.image_time_logit_mean} "
                      f"--time-logit-std {args.image_time_logit_std} "
                      f"--time-curriculum-frac {args.image_time_curriculum_frac} "
+                     f"--time-adaptive-bins {args.image_time_adaptive_bins} "
+                     f"--time-adaptive-momentum {args.image_time_adaptive_momentum} "
+                     f"--time-adaptive-uniform-mix "
+                     f"{args.image_time_adaptive_uniform_mix} "
+                     f"--time-adaptive-min-prob {args.image_time_adaptive_min_prob} "
+                     f"--time-adaptive-loss-power "
+                     f"{args.image_time_adaptive_loss_power} "
                      f"--time-shift {args.image_time_shift} "
                      f"--time-shift-mode {args.image_time_shift_mode} "
                      f"--time-shift-ref-dim {args.image_time_shift_ref_dim} "
@@ -652,6 +885,9 @@ def payload(args):
                           f"--cfg-mode {args.image_cfg_mode} "
                           f"--cfg-modes "
                           f"{shlex_quote(args.image_cfg_modes or args.image_cfg_mode)} "
+                          f"--cfg-schedule {args.image_cfg_schedule} "
+                          f"--cfg-schedules "
+                          f"{shlex_quote(args.image_cfg_schedules or args.image_cfg_schedule)} "
                           f"--sample-steps-list {shlex_quote(args.image_sample_steps_sweep)} "
                           f"--cfg-interval {shlex_quote(args.image_cfg_interval)} "
                           f"--sample-method {args.image_sample_method} "
@@ -710,6 +946,31 @@ def payload(args):
                     args.image_generated_eval_report_out
                     or path_with_suffix(generated_manifest, "_eval_report.json")
                 )
+                generated_candidates_manifest = args.image_sample_candidates_manifest_out
+                generated_candidates_score_out = (
+                    args.image_generated_candidates_score_out
+                    or path_with_suffix(
+                        generated_candidates_manifest, "_pickscore.jsonl")
+                    if generated_candidates_manifest else ""
+                )
+                generated_candidates_score_report = (
+                    args.image_generated_candidates_score_report_out
+                    or path_with_suffix(
+                        generated_candidates_manifest, "_pickscore_report.json")
+                    if generated_candidates_manifest else ""
+                )
+                generated_preference_out = (
+                    args.image_generated_preference_out
+                    or path_with_suffix(
+                        generated_candidates_manifest, "_preferences.jsonl")
+                    if generated_candidates_manifest else ""
+                )
+                generated_preference_report = (
+                    args.image_generated_preference_report_out
+                    or path_with_suffix(
+                        generated_candidates_manifest, "_preferences_report.json")
+                    if generated_candidates_manifest else ""
+                )
                 real_eval_manifest = (
                     args.image_eval_generated_real_manifest or effective_image_manifest
                 )
@@ -756,11 +1017,71 @@ def payload(args):
                 if args.image_generated_eval_fail_on_gate:
                     generated_eval += " --fail-on-gate"
                 train += generated_embed + generated_eval
+                if generated_candidates_manifest:
+                    IGEN_SCORE = PY.replace("thinking.cli", "thinking.image_score")
+                    IPREF = PY.replace("thinking.cli", "thinking.image_preferences")
+                    generated_candidates_root = (
+                        os.path.dirname(generated_candidates_manifest) or ".")
+                    generated_score = (
+                        f" && {IGEN_SCORE} "
+                        f"--manifest {shlex_quote(generated_candidates_manifest)} "
+                        f"--root {shlex_quote(generated_candidates_root)} "
+                        f"--backend {args.image_score_backend} "
+                        f"--max-records {args.image_generated_eval_max_records} "
+                        f"--image-size {args.image_score_image_size} "
+                        f"--technical-w {args.image_score_technical_w} "
+                        f"--alignment-w {args.image_score_alignment_w} "
+                        f"--external-w {args.image_score_external_w} "
+                        f"--pickscore-w {args.image_score_pickscore_w} "
+                        f"--pickscore-model "
+                        f"{shlex_quote(args.image_score_pickscore_model)} "
+                        f"--pickscore-processor "
+                        f"{shlex_quote(args.image_score_pickscore_processor)} "
+                        f"--pickscore-device {args.image_score_pickscore_device} "
+                        f"--pickscore-dtype {args.image_score_pickscore_dtype} "
+                        f"--pickscore-batch {args.image_score_pickscore_batch} "
+                        f"--pickscore-max-length "
+                        f"{args.image_score_pickscore_max_length} "
+                        f"--pickscore-normalize "
+                        f"{args.image_score_pickscore_normalize} "
+                        f"--out {shlex_quote(generated_candidates_score_out)} "
+                        f"--report-out "
+                        f"{shlex_quote(generated_candidates_score_report)}"
+                    )
+                    if args.image_score_external_sidecar:
+                        generated_score += (
+                            f" --external-sidecar "
+                            f"{shlex_quote(args.image_score_external_sidecar)}")
+                    if args.image_score_external_root:
+                        generated_score += (
+                            f" --external-root "
+                            f"{shlex_quote(args.image_score_external_root)}")
+                    if args.image_score_external_key:
+                        generated_score += (
+                            f" --external-key {args.image_score_external_key}")
+                    if args.image_score_external_score_field:
+                        generated_score += (
+                            f" --external-score-field "
+                            f"{shlex_quote(args.image_score_external_score_field)}")
+                    if args.image_score_external_normalize:
+                        generated_score += (
+                            f" --external-normalize "
+                            f"{args.image_score_external_normalize}")
+                    generated_prefs = (
+                        f" && {IPREF} "
+                        f"--manifest {shlex_quote(generated_candidates_score_out)} "
+                        f"--root {shlex_quote(generated_candidates_root)} "
+                        f"--group-by prompt_id --mode top-bottom "
+                        f"--min-score-gap "
+                        f"{args.image_generated_preference_min_score_gap} "
+                        f"--max-pairs-per-group "
+                        f"{args.image_generated_preference_max_pairs_per_group} "
+                        f"--max-pairs {args.image_generated_preference_max_pairs} "
+                        f"--out {shlex_quote(generated_preference_out)} "
+                        f"--report-out {shlex_quote(generated_preference_report)}"
+                    )
+                    train += generated_score + generated_prefs
             cmds.append(train)
-        if args.audio:                                     # AUDIO-1: audio factors -> facts
-            AU = PY.replace("thinking.cli", "thinking.audio")
-            cmds.append(f"{AU} --steps {args.train_steps or 500} "
-                        f"--seeds {shlex_quote(args.seeds)} --out runs/audio1_fer.json")
         if args.multimodal:
             MM = PY.replace("thinking.cli", "thinking.multimodal")
             mm_dim = args.multimodal_dim or args.dim or 96
@@ -1049,14 +1370,20 @@ def main():
     ap.add_argument("--image-latent", action="store_true", dest="image_latent",
                     help="train manifest-conditioned autoencoder + latent image flow")
     ap.add_argument("--image-quality-preset", default="none",
-                    choices=("none", "web-hf-vae"),
+                    choices=("none", "web-hf-vae", "web-hf-vae-hq"),
                     dest="image_quality_preset",
                     help=("apply a coherent high-quality image training profile; "
-                          "web-hf-vae fetches web data and trains in a frozen SDXL VAE latent space"))
+                          "web-hf-vae trains a broad 512/768 web profile; "
+                          "web-hf-vae-hq trains a stricter 1024 multi-aspect profile"))
+    ap.add_argument("--image-no-auto-preferences", action="store_true",
+                    dest="image_no_auto_preferences",
+                    help=("do not auto-reuse previous generated candidate preferences "
+                          "in the high-quality image preset"))
     ap.add_argument("--image-fetch", action="store_true", dest="image_fetch",
                     help="stream a captioned web image shard into a local manifest on the pod")
     ap.add_argument("--image-fetch-source", default="text-to-image-2m-1024-10k",
-                    choices=("text-to-image-2m-1024-10k", "flux-1024-10k",
+                    choices=("text-to-image-2m-1024-10k", "text-to-image-2m-hq-mix",
+                             "flux-1024-10k",
                              "text-to-image-2m-512-2m", "diffusiondb-2m"),
                     dest="image_fetch_source",
                     help="known source for --image-fetch")
@@ -1138,10 +1465,11 @@ def main():
                     help=("annotate the active image manifest with generic quality_score "
                           "metadata before embedding/cleaning/training"))
     ap.add_argument("--image-score-backend", default="stats",
-                    choices=("stats", "embedding", "external", "ensemble"),
+                    choices=("stats", "embedding", "external", "pickscore", "ensemble"),
                     dest="image_score_backend",
                     help=("quality source for --image-score: technical stats, existing "
-                          "image/text embeddings, external reward sidecar, or ensemble"))
+                          "image/text embeddings, external reward sidecar, PickScore, "
+                          "or ensemble"))
     ap.add_argument("--image-score-split", default="", dest="image_score_split",
                     help="optional split to score; default scores all rows")
     ap.add_argument("--image-score-max-records", type=int, default=0,
@@ -1159,6 +1487,34 @@ def main():
     ap.add_argument("--image-score-external-w", type=float, default=0.0,
                     dest="image_score_external_w",
                     help="ensemble weight for an external preference/reward sidecar")
+    ap.add_argument("--image-score-pickscore-w", type=float, default=0.0,
+                    dest="image_score_pickscore_w",
+                    help="ensemble weight for PickScore prompt-image reward scoring")
+    ap.add_argument("--image-score-pickscore-model",
+                    default="yuvalkirstain/PickScore_v1",
+                    dest="image_score_pickscore_model",
+                    help="Hugging Face model id for PickScore reward scoring")
+    ap.add_argument("--image-score-pickscore-processor",
+                    default="laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+                    dest="image_score_pickscore_processor",
+                    help="Hugging Face processor id for PickScore reward scoring")
+    ap.add_argument("--image-score-pickscore-device", default="cuda",
+                    dest="image_score_pickscore_device",
+                    help="device used by PickScore reward scoring")
+    ap.add_argument("--image-score-pickscore-dtype", default="auto",
+                    choices=("auto", "fp32", "fp16", "bf16"),
+                    dest="image_score_pickscore_dtype",
+                    help="dtype used by PickScore reward scoring")
+    ap.add_argument("--image-score-pickscore-batch", type=int, default=8,
+                    dest="image_score_pickscore_batch",
+                    help="batch size for PickScore reward scoring")
+    ap.add_argument("--image-score-pickscore-max-length", type=int, default=77,
+                    dest="image_score_pickscore_max_length",
+                    help="tokenizer max length for PickScore prompt text")
+    ap.add_argument("--image-score-pickscore-normalize", default="auto",
+                    choices=("auto", "minmax", "none"),
+                    dest="image_score_pickscore_normalize",
+                    help="normalization for raw PickScore rewards before writing quality_score")
     ap.add_argument("--image-score-external-sidecar", default="",
                     dest="image_score_external_sidecar",
                     help="JSONL/CSV/TSV sidecar with external quality/preference scores")
@@ -1279,6 +1635,22 @@ def main():
     ap.add_argument("--image-clean-max-caption-tokens", type=int, default=0,
                     dest="image_clean_max_caption_tokens",
                     help="reject captions longer than this token count; 0 disables")
+    ap.add_argument("--image-clean-min-caption-unique-ratio", type=float, default=0.0,
+                    dest="image_clean_min_caption_unique_ratio",
+                    help=("reject cleaned captions below this unique-token ratio; "
+                          "0 disables"))
+    ap.add_argument("--image-clean-max-caption-token-frequency", type=float, default=0.0,
+                    dest="image_clean_max_caption_token_frequency",
+                    help=("reject cleaned captions dominated by one token above this "
+                          "fraction; 0 disables"))
+    ap.add_argument("--image-clean-max-caption-token-run", type=float, default=0.0,
+                    dest="image_clean_max_caption_token_run",
+                    help=("reject cleaned captions with repeated-token runs above this "
+                          "fraction; 0 disables"))
+    ap.add_argument("--image-clean-max-caption-char-run", type=float, default=0.0,
+                    dest="image_clean_max_caption_char_run",
+                    help=("reject cleaned captions with repeated-character runs above "
+                          "this fraction; 0 disables"))
     ap.add_argument("--image-clean-no-check-images", action="store_true",
                     dest="image_clean_no_check_images",
                     help="skip image header/decode checks during pod-side manifest cleaning")
@@ -1289,6 +1661,10 @@ def main():
                     help="image size as SIZE or HxW for latent image train/eval/sample grids")
     ap.add_argument("--image-size-buckets", default="", dest="image_size_buckets",
                     help="optional manifest train buckets, e.g. 128x128,128x192,192x128")
+    ap.add_argument("--image-size-curriculum-frac", type=float, default=0.0,
+                    dest="image_size_curriculum_frac",
+                    help=("fraction of image flow training that progressively unlocks "
+                          "larger size buckets; 0 disables"))
     ap.add_argument("--image-ae-accum-steps", type=int, default=1,
                     dest="image_ae_accum_steps",
                     help="AE gradient accumulation microsteps")
@@ -1327,6 +1703,12 @@ def main():
     ap.add_argument("--image-dit-head-width-mult", type=int, default=1,
                     dest="image_dit_head_width_mult",
                     help="width multiplier for the latent DiT/MM-DiT velocity head")
+    ap.add_argument("--image-dit-depth", type=int, default=3,
+                    dest="image_dit_depth",
+                    help="number of latent DiT/MM-DiT transformer blocks")
+    ap.add_argument("--image-dit-heads", type=int, default=4,
+                    dest="image_dit_heads",
+                    help="attention heads for latent DiT/MM-DiT transformer blocks")
     ap.add_argument("--image-dit-qk-norm", action="store_true",
                     dest="image_dit_qk_norm",
                     help="enable per-head QK RMSNorm in latent image MM-DiT attention")
@@ -1502,6 +1884,16 @@ def main():
                     dest="image_preference_w",
                     help=("chosen/rejected preference loss weight inside "
                           "--image-quality-score-steps"))
+    ap.add_argument("--image-flow-preference-w", type=float, default=0.0,
+                    dest="image_flow_preference_w",
+                    help=("direct chosen/rejected preference loss weight on the image "
+                          "latent-flow generator"))
+    ap.add_argument("--image-flow-preference-margin", type=float, default=0.0,
+                    dest="image_flow_preference_margin",
+                    help="minimum velocity-loss gap for image direct flow preference pairs")
+    ap.add_argument("--image-flow-preference-batch", type=int, default=0,
+                    dest="image_flow_preference_batch",
+                    help="preference pairs per image flow update; 0 reuses image batch")
     ap.add_argument("--image-max-records", type=int, default=0, dest="image_max_records",
                     help="cap image manifest records for GPU smoke tests; 0 means all")
     ap.add_argument("--image-eval-split", default="eval", dest="image_eval_split",
@@ -1543,12 +1935,24 @@ def main():
     ap.add_argument("--image-cfg-mode", default="standard",
                     choices=("standard", "cfgpp"), dest="image_cfg_mode",
                     help="latent image classifier-free guidance variant")
+    ap.add_argument("--image-cfg-schedule", default="constant",
+                    choices=("constant", "linear", "cosine", "triangular"),
+                    dest="image_cfg_schedule",
+                    help="latent image extra-CFG time schedule")
+    ap.add_argument("--image-cfg-schedules", default="",
+                    dest="image_cfg_schedules",
+                    help="comma-separated latent image CFG schedules for sweeps")
+    ap.add_argument("--image-flow-boundary-mode", default="none",
+                    choices=("none", "right-linear", "double-linear", "double-cosine"),
+                    dest="image_flow_boundary_mode",
+                    help=("boundary-conditioned rectified-flow velocity parameterization "
+                          "passed to thinking.image_latent"))
     ap.add_argument("--image-cfg-interval", default="0.0,1.0", dest="image_cfg_interval",
                     help="latent image CFG active interval formatted start,end")
     ap.add_argument("--image-sample-steps", type=int, default=4, dest="image_sample_steps",
                     help="ODE sampling steps for latent image evaluation")
     ap.add_argument("--image-sample-method", default="euler",
-                    choices=("euler", "heun", "midpoint", "rk4"),
+                    choices=("euler", "heun", "midpoint", "rk4", "adaptive-heun"),
                     dest="image_sample_method",
                     help="latent image ODE sampler method")
     ap.add_argument("--image-sample-methods", default="euler,heun,midpoint",
@@ -1593,6 +1997,14 @@ def main():
                     dest="image_sample_image_dir",
                     help=("optional directory for individual generated PPM samples; "
                           "default is derived from --image-sample-manifest-out"))
+    ap.add_argument("--image-sample-candidates-manifest-out", default="",
+                    dest="image_sample_candidates_manifest_out",
+                    help=("optional JSONL manifest path for all generated prompt candidates "
+                          "before internal selection"))
+    ap.add_argument("--image-sample-candidates-image-dir", default="",
+                    dest="image_sample_candidates_image_dir",
+                    help=("optional directory for all generated prompt candidate PPM samples; "
+                          "default is derived from --image-sample-candidates-manifest-out"))
     ap.add_argument("--image-eval-generated", action="store_true",
                     dest="image_eval_generated",
                     help=("after a latent image job writes --image-sample-manifest-out, "
@@ -1613,6 +2025,30 @@ def main():
                     dest="image_generated_eval_report_out",
                     help=("optional image_eval report for generated sample manifest; "
                           "default derives from --image-sample-manifest-out"))
+    ap.add_argument("--image-generated-candidates-score-out", default="",
+                    dest="image_generated_candidates_score_out",
+                    help=("optional scored manifest for generated prompt candidates; "
+                          "default derives from --image-sample-candidates-manifest-out"))
+    ap.add_argument("--image-generated-candidates-score-report-out", default="",
+                    dest="image_generated_candidates_score_report_out",
+                    help=("optional score report for generated prompt candidates; "
+                          "default derives from --image-sample-candidates-manifest-out"))
+    ap.add_argument("--image-generated-preference-out", default="",
+                    dest="image_generated_preference_out",
+                    help=("optional chosen/rejected preference pairs mined from generated "
+                          "prompt candidates"))
+    ap.add_argument("--image-generated-preference-report-out", default="",
+                    dest="image_generated_preference_report_out",
+                    help="optional report for generated candidate preference mining")
+    ap.add_argument("--image-generated-preference-min-score-gap", type=float, default=0.02,
+                    dest="image_generated_preference_min_score_gap",
+                    help="minimum PickScore/quality gap for generated candidate preferences")
+    ap.add_argument("--image-generated-preference-max-pairs-per-group", type=int, default=1,
+                    dest="image_generated_preference_max_pairs_per_group",
+                    help="maximum generated preference pairs per prompt group; 0 means all")
+    ap.add_argument("--image-generated-preference-max-pairs", type=int, default=0,
+                    dest="image_generated_preference_max_pairs",
+                    help="maximum generated preference pairs total; 0 means all")
     ap.add_argument("--image-generated-eval-max-records", type=int, default=2048,
                     dest="image_generated_eval_max_records",
                     help="maximum real/generated records for generated-sample image_eval")
@@ -1722,6 +2158,10 @@ def main():
     ap.add_argument("--image-flow-distill-steps", type=int, default=0,
                     dest="image_flow_distill_steps",
                     help="post-flow own-model endpoint distillation steps")
+    ap.add_argument("--image-flow-distill-frac", type=float, default=0.0,
+                    dest="image_flow_distill_frac",
+                    help=("post-flow distillation steps as a fraction of --train-steps; "
+                          "0 uses --image-flow-distill-steps directly"))
     ap.add_argument("--image-flow-distill-w", type=float, default=1.0,
                     dest="image_flow_distill_w",
                     help="loss weight for own-model endpoint distillation")
@@ -1750,7 +2190,8 @@ def main():
                     dest="image_no_ema_warmup",
                     help="use exact image EMA decay from the first update")
     ap.add_argument("--image-time-sampling", default="uniform",
-                    choices=("uniform", "logit-normal"), dest="image_time_sampling",
+                    choices=("uniform", "logit-normal", "adaptive"),
+                    dest="image_time_sampling",
                     help="latent image flow timestep distribution")
     ap.add_argument("--image-time-logit-mean", type=float, default=0.0,
                     dest="image_time_logit_mean",
@@ -1762,6 +2203,21 @@ def main():
                     dest="image_time_curriculum_frac",
                     help=("fraction of image flow training using --image-time-sampling before "
                           "switching timestep sampling to uniform; 0 disables"))
+    ap.add_argument("--image-time-adaptive-bins", type=int, default=32,
+                    dest="image_time_adaptive_bins",
+                    help="loss-tracked bins for adaptive image timestep sampling")
+    ap.add_argument("--image-time-adaptive-momentum", type=float, default=0.95,
+                    dest="image_time_adaptive_momentum",
+                    help="EMA momentum for adaptive image timestep losses")
+    ap.add_argument("--image-time-adaptive-uniform-mix", type=float, default=0.05,
+                    dest="image_time_adaptive_uniform_mix",
+                    help="uniform probability mixed into adaptive image timestep sampling")
+    ap.add_argument("--image-time-adaptive-min-prob", type=float, default=0.001,
+                    dest="image_time_adaptive_min_prob",
+                    help="minimum adaptive image timestep bin probability")
+    ap.add_argument("--image-time-adaptive-loss-power", type=float, default=1.0,
+                    dest="image_time_adaptive_loss_power",
+                    help="power applied to adaptive image timestep loss EMA")
     ap.add_argument("--image-time-shift", type=float, default=1.0,
                     dest="image_time_shift",
                     help="latent image RF data-time shift; >1 biases training toward noise")
@@ -1814,8 +2270,6 @@ def main():
                     help="comma-separated sampler step counts for --image-eval-sweep")
     ap.add_argument("--image-eval-seeds", default="1,2,3", dest="image_eval_seeds",
                     help="comma-separated eval seeds for --image-eval-sweep")
-    ap.add_argument("--audio", action="store_true",
-                    help="AUDIO-1: train synthetic audio factor FER experiment")
     ap.add_argument("--multimodal", action="store_true",
                     help="train generic manifest-driven multimodal prefix bridge")
     ap.add_argument("--multimodal-manifest", default="", dest="multimodal_manifest",
@@ -1926,6 +2380,12 @@ def main():
         apply_image_quality_preset(args)
     except ValueError as exc:
         sys.exit(f"ERROR: {exc}")
+    if args.image_flow_distill_frac < 0.0 or args.image_flow_distill_frac > 1.0:
+        sys.exit("ERROR: --image-flow-distill-frac must be in [0, 1]")
+    if args.image_flow_distill_frac > 0.0:
+        base_steps = int(args.train_steps or 800)
+        distill_steps = max(1, int(float(base_steps) * float(args.image_flow_distill_frac)))
+        args.image_flow_distill_steps = max(int(args.image_flow_distill_steps), distill_steps)
     bad_decodes = sorted(set(args.eval_decodes) - {"sample", "hybrid", "constrained", "ranker"})
     if bad_decodes:
         sys.exit(f"ERROR: unsupported --eval-decodes values: {','.join(bad_decodes)}")
@@ -1977,6 +2437,18 @@ def main():
         sys.exit(
             "ERROR: unsupported --image-cfg-modes values: "
             + ",".join(bad_cfg_modes)
+        )
+    valid_cfg_schedules = {"constant", "linear", "cosine", "triangular"}
+    cfg_schedules = {
+        raw.strip()
+        for raw in str(args.image_cfg_schedules or args.image_cfg_schedule).split(",")
+        if raw.strip()
+    }
+    bad_cfg_schedules = sorted(cfg_schedules - valid_cfg_schedules)
+    if bad_cfg_schedules:
+        sys.exit(
+            "ERROR: unsupported --image-cfg-schedules values: "
+            + ",".join(bad_cfg_schedules)
         )
     try:
         parse_unit_interval(args.image_cfg_interval, "--image-cfg-interval")
@@ -2038,8 +2510,23 @@ def main():
         )
     if args.image_time_shift <= 0.0:
         sys.exit("ERROR: --image-time-shift must be positive")
+    if args.image_size_curriculum_frac < 0.0 or args.image_size_curriculum_frac > 1.0:
+        sys.exit("ERROR: --image-size-curriculum-frac must be in [0, 1]")
     if args.image_time_curriculum_frac < 0.0 or args.image_time_curriculum_frac > 1.0:
         sys.exit("ERROR: --image-time-curriculum-frac must be in [0, 1]")
+    if args.image_time_adaptive_bins <= 1:
+        sys.exit("ERROR: --image-time-adaptive-bins must be > 1")
+    if (args.image_time_adaptive_momentum < 0.0
+            or args.image_time_adaptive_momentum >= 1.0):
+        sys.exit("ERROR: --image-time-adaptive-momentum must be in [0, 1)")
+    if (args.image_time_adaptive_uniform_mix < 0.0
+            or args.image_time_adaptive_uniform_mix > 1.0):
+        sys.exit("ERROR: --image-time-adaptive-uniform-mix must be in [0, 1]")
+    if (args.image_time_adaptive_min_prob < 0.0
+            or args.image_time_adaptive_min_prob >= 1.0):
+        sys.exit("ERROR: --image-time-adaptive-min-prob must be in [0, 1)")
+    if args.image_time_adaptive_loss_power <= 0.0:
+        sys.exit("ERROR: --image-time-adaptive-loss-power must be positive")
     if args.image_time_shift_ref_dim <= 0.0:
         sys.exit("ERROR: --image-time-shift-ref-dim must be positive")
     if args.image_flow_loss_weight_gamma <= 0.0:
@@ -2085,8 +2572,12 @@ def main():
     if args.image_score_image_size <= 0:
         sys.exit("ERROR: --image-score-image-size must be positive")
     if (args.image_score_technical_w < 0.0 or args.image_score_alignment_w < 0.0
-            or args.image_score_external_w < 0.0):
+            or args.image_score_external_w < 0.0 or args.image_score_pickscore_w < 0.0):
         sys.exit("ERROR: image score weights must be non-negative")
+    if args.image_score_pickscore_batch <= 0:
+        sys.exit("ERROR: --image-score-pickscore-batch must be positive")
+    if args.image_score_pickscore_max_length <= 0:
+        sys.exit("ERROR: --image-score-pickscore-max-length must be positive")
     if (args.image_score_backend == "external"
             or (args.image_score_backend == "ensemble" and args.image_score_external_w > 0.0)):
         if not args.image_score_external_sidecar:
@@ -2121,6 +2612,15 @@ def main():
         sys.exit("ERROR: --image-clean-dedupe-lsh-bits must be positive")
     if args.image_clean_dedupe_lsh_tables <= 0:
         sys.exit("ERROR: --image-clean-dedupe-lsh-tables must be positive")
+    for name in (
+            "image_clean_min_caption_unique_ratio",
+            "image_clean_max_caption_token_frequency",
+            "image_clean_max_caption_token_run",
+            "image_clean_max_caption_char_run"):
+        val = float(getattr(args, name))
+        if val < 0.0 or val > 1.0:
+            flag = "--" + name.replace("_", "-")
+            sys.exit(f"ERROR: {flag} must be in [0, 1]")
     if args.image_flow_distill_steps < 0:
         sys.exit("ERROR: --image-flow-distill-steps must be non-negative")
     if args.image_flow_distill_w < 0.0:
@@ -2144,6 +2644,21 @@ def main():
         sys.exit("ERROR: --image-sample-manifest-out requires --image-sample-grid")
     if args.image_sample_image_dir and not args.image_sample_manifest_out:
         sys.exit("ERROR: --image-sample-image-dir requires --image-sample-manifest-out")
+    if args.image_sample_candidates_manifest_out and not args.image_sample_grid:
+        sys.exit(
+            "ERROR: --image-sample-candidates-manifest-out requires --image-sample-grid")
+    if args.image_sample_candidates_manifest_out and not args.image_sample_prompts:
+        sys.exit(
+            "ERROR: --image-sample-candidates-manifest-out requires --image-sample-prompts")
+    if (args.image_sample_candidates_manifest_out
+            and args.image_sample_candidates_per_prompt <= 1):
+        sys.exit(
+            "ERROR: --image-sample-candidates-manifest-out requires "
+            "--image-sample-candidates-per-prompt > 1")
+    if args.image_sample_candidates_image_dir and not args.image_sample_candidates_manifest_out:
+        sys.exit(
+            "ERROR: --image-sample-candidates-image-dir requires "
+            "--image-sample-candidates-manifest-out")
     if args.image_eval_generated and not args.image_sample_manifest_out:
         sys.exit("ERROR: --image-eval-generated requires --image-sample-manifest-out")
     if args.image_eval_generated and not args.image_latent:
@@ -2173,6 +2688,13 @@ def main():
     if (args.image_generated_eval_max_mmd_rbf is not None
             and args.image_generated_eval_max_mmd_rbf < 0.0):
         sys.exit("ERROR: --image-generated-eval-max-mmd-rbf must be non-negative")
+    if args.image_generated_preference_min_score_gap < 0.0:
+        sys.exit("ERROR: --image-generated-preference-min-score-gap must be non-negative")
+    if args.image_generated_preference_max_pairs_per_group < 0:
+        sys.exit(
+            "ERROR: --image-generated-preference-max-pairs-per-group must be non-negative")
+    if args.image_generated_preference_max_pairs < 0:
+        sys.exit("ERROR: --image-generated-preference-max-pairs must be non-negative")
     if args.image_sample_negative_prompts and not args.image_sample_prompts:
         sys.exit("ERROR: --image-sample-negative-prompts requires --image-sample-prompts")
     if args.image_sample_candidates_per_prompt <= 0:
@@ -2210,6 +2732,14 @@ def main():
         sys.exit("ERROR: --image-preference-w requires --image-preference-manifest")
     if args.image_preference_w > 0.0 and args.image_quality_score_steps <= 0:
         sys.exit("ERROR: --image-preference-w requires --image-quality-score-steps > 0")
+    if args.image_flow_preference_w < 0.0:
+        sys.exit("ERROR: --image-flow-preference-w must be non-negative")
+    if args.image_flow_preference_margin < 0.0:
+        sys.exit("ERROR: --image-flow-preference-margin must be non-negative")
+    if args.image_flow_preference_batch < 0:
+        sys.exit("ERROR: --image-flow-preference-batch must be non-negative")
+    if args.image_flow_preference_w > 0.0 and not args.image_preference_manifest:
+        sys.exit("ERROR: --image-flow-preference-w requires --image-preference-manifest")
     if args.image_preference_manifest and not args.image_manifest and not args.image_fetch:
         sys.exit(
             "ERROR: --image-preference-manifest requires --image-manifest or --image-fetch")
@@ -2230,6 +2760,17 @@ def main():
         sys.exit("ERROR: --image-dit-pos-embed rope2d requires --image-latent-arch mmdit")
     if args.image_dit_mlp != "gelu" and args.image_latent_arch == "dit":
         sys.exit("ERROR: --image-dit-mlp swiglu requires --image-latent-arch crossdit or mmdit")
+    if args.image_dit_depth <= 0:
+        sys.exit("ERROR: --image-dit-depth must be positive")
+    if args.image_dit_heads <= 0:
+        sys.exit("ERROR: --image-dit-heads must be positive")
+    if args.image_latent_arch in ("dit", "crossdit", "mmdit"):
+        hidden = int(args.dim or 64)
+        actual_heads = max(1, min(int(args.image_dit_heads), hidden // 16))
+        if hidden % actual_heads != 0:
+            sys.exit(
+                "ERROR: image latent hidden width must be divisible by effective "
+                f"attention heads ({hidden} % {actual_heads} != 0)")
     if args.image_latent_patch_size <= 0:
         sys.exit("ERROR: --image-latent-patch-size must be positive")
     if args.image_latent_patch_size != 1 and args.image_latent_arch == "conv":
@@ -2345,6 +2886,9 @@ def main():
     image_embed_deps = bool(
         (args.image_embed or args.image_eval_generated)
         and args.image_embed_backend == "hf")
+    image_score_deps = bool(args.image_score and (
+        args.image_score_backend == "pickscore"
+        or (args.image_score_backend == "ensemble" and args.image_score_pickscore_w > 0.0)))
     image_caption_deps = bool(args.image_caption and args.image_caption_backend == "hf")
     image_hf_ae_deps = bool(args.image_latent and args.image_ae_arch == "hf-vae")
     image_prompt_embed_deps = bool(
@@ -2356,7 +2900,7 @@ def main():
             and args.image_prompt_embed_text_sequence_model))
     if args.fast:                                           # image torch; verbalizer
         fast_pkgs = "numpy tokenizers pandas pyarrow pillow"
-        if image_embed_deps or image_prompt_embed_deps or image_caption_deps:
+        if image_embed_deps or image_prompt_embed_deps or image_caption_deps or image_score_deps:
             fast_pkgs += " transformers accelerate"
         if image_text_sequence_deps or image_caption_deps:
             fast_pkgs += " sentencepiece"
@@ -2367,6 +2911,8 @@ def main():
         install_deps = ""
         if image_embed_deps or image_prompt_embed_deps:
             install_deps += "INSTALL_IMAGE_EMBED_DEPS=1 "
+        if image_score_deps:
+            install_deps += "INSTALL_IMAGE_SCORE_DEPS=1 "
         if image_caption_deps:
             install_deps += "INSTALL_IMAGE_CAPTION_DEPS=1 "
         if image_text_sequence_deps:
@@ -2389,7 +2935,6 @@ def main():
         (args.vision_understanding, "vision understanding concept memory"),
         (args.image_latent,
          f"latent {args.image_latent_arch} {args.image_cond_mode}-conditioned flow"),
-        (args.audio, "audio FER arms"),
         (args.multimodal, "multimodal bridge"),
     ) if enabled]
     job = " + ".join(image_jobs) if image_jobs else "kinship multi-seed"
@@ -2403,6 +2948,14 @@ def main():
               f"pod:{remote_path_for_arg(args.image_root)}")
         print(f"manifest  : {local_path_for_arg(args.image_manifest)} -> "
               f"pod:{remote_path_for_arg(args.image_manifest)}")
+    preference_uploads = (
+        preference_upload_paths(args.image_preference_manifest)
+        if getattr(args, "image_auto_preference_manifest", False) else []
+    )
+    if preference_uploads:
+        print("preferences:")
+        for local in preference_uploads:
+            print(f"  {local} -> pod:{local_path_remote_destination(local)}")
     print(f"fetch     : thinking.log + runs/ (models, config, results) -> {HERE}/")
     print(f"guard     : pod-side timeout {cap}s + always-terminate; SSH-wait cap {args.max_minutes}m")
     if not args.go:
@@ -2453,6 +3006,8 @@ def main():
             sh(upload_path_cmd(root_local, root_remote, ssh))
             if os.path.abspath(manifest_local) != os.path.abspath(root_local):
                 sh(upload_path_cmd(manifest_local, manifest_remote, ssh))
+        for local in preference_uploads:
+            sh(upload_path_cmd(local, local_path_remote_destination(local), ssh))
         if args.eval_only_run:
             local_run = os.path.join(HERE, args.eval_only_run)
             if not os.path.isdir(local_run):
