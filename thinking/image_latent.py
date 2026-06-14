@@ -7657,6 +7657,96 @@ def sample_health_metrics(samples, prefix="sample", eps=1.0e-8):
     }
 
 
+def _sample_gate_metric_value(report, key):
+    raw = report.get(key)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def sample_quality_gate_report(
+        report, prefix="sample_grid", min_finite_frac=None,
+        max_nonfinite_frac=None, max_collapsed_frac=None, min_health_score=None,
+        min_detail_energy=None, min_dynamic_range=None, min_luminance_std=None):
+    """Return pass/fail metadata for generated-sample quality thresholds."""
+    thresholds = {
+        "min_finite_frac": min_finite_frac,
+        "max_nonfinite_frac": max_nonfinite_frac,
+        "max_collapsed_frac": max_collapsed_frac,
+        "min_health_score": min_health_score,
+        "min_detail_energy": min_detail_energy,
+        "min_dynamic_range": min_dynamic_range,
+        "min_luminance_std": min_luminance_std,
+    }
+    thresholds = {
+        key: (None if value is None else float(value))
+        for key, value in thresholds.items()
+    }
+    enabled = any(value is not None for value in thresholds.values())
+    failures = []
+
+    def check_min(metric, gate_name):
+        threshold = thresholds[gate_name]
+        if threshold is None:
+            return
+        key = f"{prefix}_{metric}"
+        value = _sample_gate_metric_value(report, key)
+        if value is None:
+            failures.append(f"{key} is missing for {gate_name}={threshold:g}")
+        elif value < threshold:
+            failures.append(f"{key} {value:g} < {gate_name} {threshold:g}")
+
+    def check_max(metric, gate_name):
+        threshold = thresholds[gate_name]
+        if threshold is None:
+            return
+        key = f"{prefix}_{metric}"
+        value = _sample_gate_metric_value(report, key)
+        if value is None:
+            failures.append(f"{key} is missing for {gate_name}={threshold:g}")
+        elif value > threshold:
+            failures.append(f"{key} {value:g} > {gate_name} {threshold:g}")
+
+    check_min("finite_frac", "min_finite_frac")
+    check_max("nonfinite_frac", "max_nonfinite_frac")
+    check_max("collapsed_frac", "max_collapsed_frac")
+    check_min("health_score", "min_health_score")
+    check_min("detail_energy", "min_detail_energy")
+    check_min("dynamic_range", "min_dynamic_range")
+    check_min("luminance_std", "min_luminance_std")
+
+    meta = {
+        f"{prefix}_quality_gate_enabled": bool(enabled),
+        f"{prefix}_quality_gate_passed": bool(not failures),
+        f"{prefix}_quality_gate_failures": failures,
+    }
+    for name, value in thresholds.items():
+        meta[f"{prefix}_quality_gate_{name}"] = value
+    return meta
+
+
+def cli_sample_quality_gate_report(report, args, prefix="sample_grid"):
+    return sample_quality_gate_report(
+        report, prefix=prefix,
+        min_finite_frac=args.sample_min_finite_frac,
+        max_nonfinite_frac=args.sample_max_nonfinite_frac,
+        max_collapsed_frac=args.sample_max_collapsed_frac,
+        min_health_score=args.sample_min_health_score,
+        min_detail_energy=args.sample_min_detail_energy,
+        min_dynamic_range=args.sample_min_dynamic_range,
+        min_luminance_std=args.sample_min_luminance_std)
+
+
+def sample_quality_gate_failure_message(report, prefix="sample_grid"):
+    failures = report.get(f"{prefix}_quality_gate_failures", [])
+    if not failures:
+        return ""
+    return "sample quality gate failed: " + "; ".join(str(x) for x in failures)
+
+
 def sample_candidate_health_scores(samples, eps=1.0e-8):
     return sample_health_components(samples, eps=eps)["health_score"]
 
@@ -12121,6 +12211,16 @@ def selftest():
             torch.cat([flat_sample, textured_sample], dim=0), prefix="unit")
         assert "unit_detail_energy" in health_meta
         assert "unit_pixel_clip_frac" in health_meta
+        gate_pass = sample_quality_gate_report(
+            health_meta, prefix="unit", min_finite_frac=1.0,
+            max_nonfinite_frac=0.0, max_collapsed_frac=0.5,
+            min_detail_energy=0.001)
+        assert gate_pass["unit_quality_gate_enabled"] is True
+        assert gate_pass["unit_quality_gate_passed"] is True
+        gate_fail = sample_quality_gate_report(
+            health_meta, prefix="unit", min_detail_energy=1.0)
+        assert gate_fail["unit_quality_gate_passed"] is False
+        assert gate_fail["unit_quality_gate_failures"]
         structure_aligner = FlowFeatureAligner(
             hidden_dim=6, feature_dim=3, hidden=8, embed_dim=4)
         structure_loss, structure_parts = flow_hidden_feature_structure_loss(
@@ -12299,6 +12399,22 @@ def selftest():
             "data_mode": "image_manifest",
             "report": report,
         }, resume_path)
+        loaded_ae, loaded_flow, loaded_cond, loaded_vocab, _templates, loaded_meta = (
+            load_checkpoint(resume_path, device="cpu", prefer_ema=False)
+        )
+        assert loaded_meta["flow_arch"] == "dit"
+        assert loaded_meta["dit_register_tokens"] == 1
+        assert loaded_meta["flow_load"]["missing"] == []
+        assert loaded_meta["flow_load"]["unexpected"] == []
+        reload_sample_path = os.path.join(td, "reload_samples.ppm")
+        reload_meta = save_text_prompt_sample_grid(
+            loaded_ae, loaded_flow, ("manifest texture sample 1",),
+            reload_sample_path, size=16, device="cpu", conditioner=loaded_cond,
+            prompt_vocab=loaded_vocab, caption_max_len=8, cfg_scale=1.0,
+            sample_steps=1, sample_method="euler")
+        assert reload_meta["sample_grid_cond_mode"] == "prompt"
+        assert reload_meta["sample_grid_prompt_count"] == 1
+        assert os.path.exists(reload_sample_path)
         _ae2, _flow2, _cond2, _vocab2, resumed = train_latent_flow(
             ae_steps=0, flow_steps=1, batch=2, latent_ch=4, hidden=16,
             flow_arch="dit", dit_depth=1, dit_heads=2, seed=6, device="cpu",
@@ -12944,6 +13060,34 @@ def main(argv=None):
                     dest="sample_quality_guidance_interval",
                     help=("quality guidance active interval over flow time, "
                           "formatted start,end"))
+    ap.add_argument("--sample-min-finite-frac", type=float, default=None,
+                    dest="sample_min_finite_frac",
+                    help=("fail after --sample-grid-out if generated finite pixel "
+                          "fraction is below this threshold"))
+    ap.add_argument("--sample-max-nonfinite-frac", type=float, default=None,
+                    dest="sample_max_nonfinite_frac",
+                    help=("fail after --sample-grid-out if generated non-finite "
+                          "pixel fraction is above this threshold"))
+    ap.add_argument("--sample-max-collapsed-frac", type=float, default=None,
+                    dest="sample_max_collapsed_frac",
+                    help=("fail after --sample-grid-out if collapsed generated "
+                          "sample fraction is above this threshold"))
+    ap.add_argument("--sample-min-health-score", type=float, default=None,
+                    dest="sample_min_health_score",
+                    help=("fail after --sample-grid-out if generated sample health "
+                          "score is below this threshold"))
+    ap.add_argument("--sample-min-detail-energy", type=float, default=None,
+                    dest="sample_min_detail_energy",
+                    help=("fail after --sample-grid-out if generated sample detail "
+                          "energy is below this threshold"))
+    ap.add_argument("--sample-min-dynamic-range", type=float, default=None,
+                    dest="sample_min_dynamic_range",
+                    help=("fail after --sample-grid-out if generated luminance "
+                          "dynamic range is below this threshold"))
+    ap.add_argument("--sample-min-luminance-std", type=float, default=None,
+                    dest="sample_min_luminance_std",
+                    help=("fail after --sample-grid-out if generated luminance "
+                          "standard deviation is below this threshold"))
     ap.add_argument("--prompt-embed-backend", default="stats",
                     choices=("stats", "hf"), dest="prompt_embed_backend",
                     help="text embedding backend used by --sample-prompts with embedding conditioning")
@@ -13188,6 +13332,18 @@ def main(argv=None):
         ap.error("--sample-quality-guidance-w must be non-negative")
     if args.sample_quality_guidance_w > 0.0 and not sample_prompts:
         ap.error("--sample-quality-guidance-w requires --sample-prompts")
+    for gate_name in (
+            "sample_min_finite_frac", "sample_max_nonfinite_frac",
+            "sample_max_collapsed_frac"):
+        gate_value = getattr(args, gate_name)
+        if gate_value is not None and (gate_value < 0.0 or gate_value > 1.0):
+            ap.error(f"--{gate_name.replace('_', '-')} must be in [0, 1]")
+    for gate_name in (
+            "sample_min_health_score", "sample_min_detail_energy",
+            "sample_min_dynamic_range", "sample_min_luminance_std"):
+        gate_value = getattr(args, gate_name)
+        if gate_value is not None and gate_value < 0.0:
+            ap.error(f"--{gate_name.replace('_', '-')} must be non-negative")
     if args.prompt_embed_text_sequence_max_length < 0:
         ap.error("--prompt-embed-text-sequence-max-length must be non-negative")
     if args.prompt_embed_text_sequence_model and args.prompt_embed_backend != "hf":
@@ -13385,6 +13541,7 @@ def main(argv=None):
             grid_meta["sample_grid_checkpoint_weight_mode"] = (
                 "ema" if meta["ema_loaded"] else "raw")
             report.update(grid_meta)
+            report.update(cli_sample_quality_gate_report(report, args))
         if args.eval_out:
             os.makedirs(os.path.dirname(args.eval_out) or ".", exist_ok=True)
             with open(args.eval_out, "w") as f:
@@ -13393,6 +13550,9 @@ def main(argv=None):
             print(f"saved -> {args.eval_out}")
         else:
             print(json.dumps(report, indent=1))
+        gate_message = sample_quality_gate_failure_message(report)
+        if gate_message:
+            raise SystemExit(gate_message)
         return
     if not args.train:
         ap.error("use --selftest, --train, or --eval-checkpoint")
@@ -13663,6 +13823,7 @@ def main(argv=None):
             ap.error("--sample-grid-out requires --sample-prompts or --image-manifest")
         grid_meta["sample_grid_checkpoint_weight_mode"] = grid_weight_mode
         report.update(grid_meta)
+        report.update(cli_sample_quality_gate_report(report, args))
         load_flow_state(flow, raw_flow)
         if conditioner is not None and raw_conditioner is not None:
             conditioner.load_state_dict(raw_conditioner)
@@ -13982,6 +14143,9 @@ def main(argv=None):
     }, args.out)
     print(json.dumps(report, indent=1))
     print(f"saved -> {args.out}")
+    gate_message = sample_quality_gate_failure_message(report)
+    if gate_message:
+        raise SystemExit(gate_message)
 
 
 if __name__ == "__main__":
