@@ -960,6 +960,121 @@ def latent_concept_completion_loss(predictor, partial_slots, full_slots=None,
                   "skipped": False, "modes": {"partial": loss.detach()}}
 
 
+def _latent_concept_completion_single_scores(
+        predictor, source_slots, target_slots, temperature=0.1):
+    if source_slots is None or target_slots is None or predictor is None:
+        slots = source_slots if source_slots is not None else target_slots
+        if slots is None:
+            zero = torch.zeros(0)
+        else:
+            zero = slots.reshape(slots.shape[0], -1).sum(-1) * 0.0
+        return zero, {"cross_entropy": zero, "positive_cosine": zero,
+                      "hard_negative_cosine": zero, "rank": zero,
+                      "contrastive_surprise": zero, "closure_gap": zero}
+    if source_slots.ndim != 3 or target_slots.ndim != 3:
+        raise ValueError("latent completion scores expect [batch, slots, dim]")
+    if source_slots.shape[0] != target_slots.shape[0]:
+        raise ValueError("latent completion score batch mismatch")
+    if source_slots.shape[-1] != target_slots.shape[-1]:
+        raise ValueError("latent completion score dimension mismatch")
+    predicted = predictor(source_slots)
+    predicted = F.normalize(predicted.reshape(predicted.shape[0], -1), dim=-1)
+    target = F.normalize(
+        target_slots.detach().to(source_slots).reshape(target_slots.shape[0], -1),
+        dim=-1)
+    positive = (predicted * target).sum(-1)
+    if source_slots.shape[0] <= 1:
+        zero = positive * 0.0
+        contrastive = zero
+        cross_entropy = zero
+        hard_negative = zero
+        rank = zero
+    else:
+        sim = predicted.matmul(target.t())
+        labels = torch.arange(sim.shape[0], device=sim.device)
+        temp = max(float(temperature), 1e-6)
+        cross_entropy = F.cross_entropy(sim / temp, labels, reduction="none")
+        eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+        hard_negative = sim.masked_fill(eye, -float("inf")).max(-1).values
+        hard_negative = torch.where(
+            torch.isfinite(hard_negative), hard_negative,
+            torch.zeros_like(positive))
+        rank = sim.ge(positive[:, None]).sum(-1).to(dtype=sim.dtype) - 1.0
+        contrastive = cross_entropy + F.relu(hard_negative - positive)
+    closure_gap = F.relu(1.0 - positive)
+    surprise = contrastive + closure_gap
+    return surprise, {"cross_entropy": cross_entropy,
+                      "positive_cosine": positive,
+                      "hard_negative_cosine": hard_negative,
+                      "rank": rank,
+                      "contrastive_surprise": contrastive,
+                      "closure_gap": closure_gap}
+
+
+def latent_concept_completion_scores(predictor, partial_slots, full_slots=None,
+                                     temperature=0.1, full_key="full"):
+    """Score where partial concept views fail to recover the full concept state.
+
+    The score is label-free.  It combines contrastive surprise against other
+    examples in the batch with a same-example closure gap, so it still provides
+    a useful ranking signal for tiny batches.
+    """
+    if isinstance(partial_slots, dict):
+        views = {key: slots for key, slots in partial_slots.items()
+                 if slots is not None}
+        target = full_slots if full_slots is not None else views.get(full_key)
+        zero_ref = target if target is not None else (
+            next(iter(views.values())) if views else None)
+        if zero_ref is None:
+            zero = torch.zeros(0)
+        else:
+            zero = zero_ref.reshape(zero_ref.shape[0], -1).sum(-1) * 0.0
+        if predictor is None or target is None:
+            return zero, {"cross_entropy": zero, "positive_cosine": zero,
+                          "hard_negative_cosine": zero, "rank": zero,
+                          "contrastive_surprise": zero,
+                          "closure_gap": zero, "view_count": 0,
+                          "skipped": True, "modes": {}}
+        score_rows = []
+        part_rows = {
+            "cross_entropy": [],
+            "positive_cosine": [],
+            "hard_negative_cosine": [],
+            "rank": [],
+            "contrastive_surprise": [],
+            "closure_gap": [],
+        }
+        mode_parts = {}
+        for key, slots in views.items():
+            if key == full_key:
+                continue
+            score, parts = _latent_concept_completion_single_scores(
+                predictor, slots, target, temperature=temperature)
+            score_rows.append(score)
+            mode_parts[key] = {"surprise": score, **parts}
+            for part_key in part_rows:
+                part_rows[part_key].append(parts[part_key])
+        if not score_rows:
+            return zero, {"cross_entropy": zero, "positive_cosine": zero,
+                          "hard_negative_cosine": zero, "rank": zero,
+                          "contrastive_surprise": zero,
+                          "closure_gap": zero, "view_count": 0,
+                          "skipped": True, "modes": mode_parts}
+        score = torch.stack(score_rows).mean(0)
+        parts = {key: torch.stack(values).mean(0)
+                 for key, values in part_rows.items()}
+        return score, {**parts, "view_count": len(score_rows),
+                       "skipped": False, "modes": mode_parts}
+
+    score, parts = _latent_concept_completion_single_scores(
+        predictor, partial_slots, full_slots, temperature=temperature)
+    skipped = (predictor is None or partial_slots is None or full_slots is None)
+    return score, {**parts, "view_count": 0 if skipped else 1,
+                   "skipped": bool(skipped),
+                   "modes": {"partial": {"surprise": score, **parts}}
+                   if not skipped else {}}
+
+
 def latent_concept_sequence_prediction_scores(predictor, source_slots, target_slots,
                                               temperature=0.1):
     """Score how surprising each source->target latent concept transition is."""

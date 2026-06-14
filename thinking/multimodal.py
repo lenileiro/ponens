@@ -39,6 +39,7 @@ from .concepts import (
     latent_concept_bridge_scores,
     latent_concept_cluster_prototype_loss,
     latent_concept_completion_loss,
+    latent_concept_completion_scores,
     latent_concept_composition_loss,
     latent_concept_fer_loss,
     latent_concept_fer_metrics,
@@ -2019,6 +2020,7 @@ def _compact_multimodal_train_metrics(metrics):
     omitted = {
         "latent_fer_study_reports",
         "latent_discovery_study_reports",
+        "latent_completion_study_reports",
         "latent_study_reports",
         "selection",
     }
@@ -2067,6 +2069,110 @@ def _multimodal_sequence_surprise_rows(
                     "sequence_rank": float(rank[i].detach().cpu()),
                 })
     return rows
+
+
+def latent_multimodal_completion_examples(
+        model, records, vocab, view_dims, n=0, seed=0, device=DEV,
+        temperature=0.1):
+    if (getattr(model, "latent_concepts", None) is None
+            or getattr(model, "concept_sequence_predictor", None) is None):
+        return [], {"n_records": 0, "n_selected": 0,
+                    "mean_score": 0.0, "max_score": 0.0,
+                    "mean_completion_surprise": 0.0,
+                    "max_completion_surprise": 0.0, "skipped": True}
+    rng = np.random.default_rng(seed)
+    candidates = _sample_unique_records(
+        records, int(n) if int(n) > 0 else len(records), rng)
+    rows = []
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(candidates), 64):
+            batch_records = candidates[off:off + 64]
+            features, txt, _ids = _batch_from_records(
+                batch_records, vocab, device, view_dims)
+            views = {
+                mode: model.latent_concept_states(
+                    features, txt, mode=mode, project=False)
+                for mode in MODES
+            }
+            scores, parts = latent_concept_completion_scores(
+                model.concept_sequence_predictor, views,
+                temperature=temperature, full_key="full")
+            mode_parts = parts.get("modes", {})
+            sensor_parts = mode_parts.get("sensor_only", {})
+            text_parts = mode_parts.get("text_only", {})
+            zero = scores.new_zeros(scores.shape)
+            sensor_surprise = sensor_parts.get("surprise", zero)
+            text_surprise = text_parts.get("surprise", zero)
+            sensor_cosine = sensor_parts.get("positive_cosine", zero)
+            text_cosine = text_parts.get("positive_cosine", zero)
+            sensor_gap = sensor_parts.get("closure_gap", zero)
+            text_gap = text_parts.get("closure_gap", zero)
+            sensor_rank = sensor_parts.get("rank", zero)
+            text_rank = text_parts.get("rank", zero)
+            for i, rec in enumerate(batch_records):
+                rows.append({
+                    "record": rec,
+                    "completion_surprise": float(scores[i].detach().cpu()),
+                    "completion_cross_entropy": float(
+                        parts["cross_entropy"][i].detach().cpu()),
+                    "completion_cosine": float(
+                        parts["positive_cosine"][i].detach().cpu()),
+                    "completion_gap": float(parts["closure_gap"][i].detach().cpu()),
+                    "completion_rank": float(parts["rank"][i].detach().cpu()),
+                    "sensor_completion_surprise": float(
+                        sensor_surprise[i].detach().cpu()),
+                    "sensor_completion_cosine": float(
+                        sensor_cosine[i].detach().cpu()),
+                    "sensor_completion_gap": float(sensor_gap[i].detach().cpu()),
+                    "sensor_completion_rank": float(sensor_rank[i].detach().cpu()),
+                    "text_completion_surprise": float(
+                        text_surprise[i].detach().cpu()),
+                    "text_completion_cosine": float(text_cosine[i].detach().cpu()),
+                    "text_completion_gap": float(text_gap[i].detach().cpu()),
+                    "text_completion_rank": float(text_rank[i].detach().cpu()),
+                })
+    rows.sort(key=lambda row: row["completion_surprise"], reverse=True)
+    selected = [row["record"] for row in rows]
+
+    def mean_field(name):
+        return float(np.mean([row[name] for row in rows])) if rows else 0.0
+
+    def max_field(name):
+        return float(max([row[name] for row in rows])) if rows else 0.0
+
+    return selected, {"n_records": len(candidates),
+                      "n_selected": len(selected),
+                      "mean_score": mean_field("completion_surprise"),
+                      "max_score": max_field("completion_surprise"),
+                      "mean_completion_surprise": mean_field(
+                          "completion_surprise"),
+                      "max_completion_surprise": max_field(
+                          "completion_surprise"),
+                      "mean_completion_cross_entropy": mean_field(
+                          "completion_cross_entropy"),
+                      "mean_completion_cosine": mean_field(
+                          "completion_cosine"),
+                      "mean_completion_gap": mean_field("completion_gap"),
+                      "mean_completion_rank": mean_field("completion_rank"),
+                      "mean_sensor_completion_surprise": mean_field(
+                          "sensor_completion_surprise"),
+                      "mean_sensor_completion_cosine": mean_field(
+                          "sensor_completion_cosine"),
+                      "mean_sensor_completion_gap": mean_field(
+                          "sensor_completion_gap"),
+                      "mean_sensor_completion_rank": mean_field(
+                          "sensor_completion_rank"),
+                      "mean_text_completion_surprise": mean_field(
+                          "text_completion_surprise"),
+                      "mean_text_completion_cosine": mean_field(
+                          "text_completion_cosine"),
+                      "mean_text_completion_gap": mean_field(
+                          "text_completion_gap"),
+                      "mean_text_completion_rank": mean_field(
+                          "text_completion_rank"),
+                      "temperature": float(temperature),
+                      "skipped": not bool(rows)}
 
 
 def latent_multimodal_discovery_examples(
@@ -2374,6 +2480,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           latent_concept_discovery_probe_n=0,
           latent_concept_discovery_hard_max=0,
           latent_concept_discovery_refresh_steps=0,
+          latent_concept_completion_probe_n=0,
+          latent_concept_completion_hard_max=0,
+          latent_concept_completion_refresh_steps=0,
           latent_concept_memory_w=0.0,
           latent_concept_memory_size=0,
           latent_concept_memory_temperature=0.1,
@@ -2482,11 +2591,20 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         raise ValueError("latent concept discovery hard max must be non-negative")
     if int(latent_concept_discovery_refresh_steps) < 0:
         raise ValueError("latent concept discovery refresh steps must be non-negative")
+    if int(latent_concept_completion_probe_n) < 0:
+        raise ValueError("latent concept completion probe count must be non-negative")
+    if int(latent_concept_completion_hard_max) < 0:
+        raise ValueError("latent concept completion hard max must be non-negative")
+    if int(latent_concept_completion_refresh_steps) < 0:
+        raise ValueError("latent concept completion refresh steps must be non-negative")
     fer_hard_enabled = int(latent_concept_fer_hard_max) > 0
     discovery_hard_enabled = int(latent_concept_discovery_hard_max) > 0
-    hard_study_enabled = bool(fer_hard_enabled or discovery_hard_enabled)
+    completion_hard_enabled = int(latent_concept_completion_hard_max) > 0
+    hard_study_enabled = bool(
+        fer_hard_enabled or discovery_hard_enabled or completion_hard_enabled)
     hard_study_strategy = (
         "discovery" if discovery_hard_enabled
+        else "completion" if completion_hard_enabled
         else "fer" if fer_hard_enabled else "none")
     if discovery_hard_enabled and latent_concept_memory_size <= 0:
         raise ValueError("latent concept discovery hard study requires memory_size > 0")
@@ -2661,6 +2779,15 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 cycle_transitive_w=latent_concept_graph_predict_transitive_w,
                 cycle_target_power=latent_concept_graph_predict_target_power,
                 sequence_temperature=latent_concept_sequence_temperature)
+        elif hard_study_strategy == "completion":
+            probe_n = (int(latent_concept_completion_probe_n)
+                       if int(latent_concept_completion_probe_n) > 0
+                       else max(batch * 4, 1))
+            hard_max = int(latent_concept_completion_hard_max)
+            selected, report = latent_multimodal_completion_examples(
+                model, train_records, vocab, view_dims, n=probe_n,
+                seed=seed + 1301 + int(step), device=device,
+                temperature=latent_concept_completion_temperature)
         else:
             probe_n = (int(latent_concept_fer_probe_n)
                        if int(latent_concept_fer_probe_n) > 0
@@ -2689,6 +2816,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         refresh_steps = (
             int(latent_concept_discovery_refresh_steps)
             if hard_study_strategy == "discovery"
+            else int(latent_concept_completion_refresh_steps)
+            if hard_study_strategy == "completion"
             else int(latent_concept_fer_refresh_steps))
         refresh_due = (
             hard_study_enabled
@@ -3056,6 +3185,18 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "latent_discovery_study_reports": (
                 list(study_reports)
                 if hard_study_strategy == "discovery" else []),
+            "latent_completion_probe_n": int(latent_concept_completion_probe_n),
+            "latent_completion_hard_max": int(latent_concept_completion_hard_max),
+            "latent_completion_refresh_steps": int(
+                latent_concept_completion_refresh_steps),
+            "latent_completion_study_pool_size": (
+                len(study_pool) if hard_study_strategy == "completion" else 0),
+            "latent_completion_hard_record_ids": (
+                selected_id_sample(study_pool)
+                if hard_study_strategy == "completion" else []),
+            "latent_completion_study_reports": (
+                list(study_reports)
+                if hard_study_strategy == "completion" else []),
             "latent_study_strategy": hard_study_strategy,
             "latent_study_pool_size": len(study_pool),
             "latent_study_hard_record_ids": selected_id_sample(study_pool),
@@ -3317,6 +3458,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "latent_discovery_study_reports": (
                 active_study_reports
                 if hard_study_strategy == "discovery" else []),
+            "latent_completion_study_reports": (
+                active_study_reports
+                if hard_study_strategy == "completion" else []),
             "latent_study_reports": active_study_reports,
         }
         if best_round == 0:
@@ -3328,6 +3472,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 "latent_fer_hard_record_ids": [],
                 "latent_discovery_study_pool_size": 0,
                 "latent_discovery_hard_record_ids": [],
+                "latent_completion_study_pool_size": 0,
+                "latent_completion_hard_record_ids": [],
             }
         last = best_metrics
     else:
@@ -3338,6 +3484,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         last.get("latent_fer_study_reports", []))
     model.latent_discovery_study_reports = (
         last.get("latent_discovery_study_reports", []))
+    model.latent_completion_study_reports = (
+        last.get("latent_completion_study_reports", []))
     model.latent_study_reports = last.get("latent_study_reports", [])
     model.manifest_info = {
         "path": manifest,
@@ -3375,6 +3523,12 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         n=min(64, len(train_records)), seed=seed + 30, device=device)
     latent_fer_hard_probe["top_ids"] = [
         r.rec_id for r in latent_fer_hard_selected[:8]]
+    latent_completion_selected, latent_completion_probe = (
+        latent_multimodal_completion_examples(
+            model, train_records, vocab, view_dims,
+            n=min(64, len(train_records)), seed=seed + 33, device=device))
+    latent_completion_probe["top_ids"] = [
+        r.rec_id for r in latent_completion_selected[:8]]
     latent_discovery_selected, latent_discovery_probe = (
         latent_multimodal_discovery_examples(
             model, train_records, vocab, view_dims,
@@ -3409,6 +3563,7 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         "latent_graph_probe": latent_probe,
         "latent_fer_probe": latent_fer_probe,
         "latent_fer_hard_probe": latent_fer_hard_probe,
+        "latent_completion_hard_probe": latent_completion_probe,
         "latent_discovery_probe": latent_discovery_probe,
         "latent_bridge_probe": latent_bridge_probe,
         "latent_sequence_probe": latent_sequence_probe,
@@ -3571,6 +3726,11 @@ def selftest():
         assert torch.isfinite(completion_loss)
         assert completion_metrics["skipped"] is False
         assert completion_metrics["view_count"] >= 1
+        completion_selected, completion_report = (
+            latent_multimodal_completion_examples(
+                model, records, vocab, view_dims, n=4, device="cpu"))
+        assert completion_selected and completion_report["skipped"] is False
+        assert math.isfinite(completion_report["mean_completion_surprise"])
         gap_loss, gap_metrics = latent_multimodal_gap_loss_from_views(model, views)
         assert torch.isfinite(gap_loss)
         assert gap_metrics["skipped"] is False
@@ -3726,6 +3886,21 @@ def selftest():
         assert no_target_bundle["score_components"]["token_skipped"] is True
         assert no_target_bundle["score_components"]["exact_skipped"] is True
         assert no_target_bundle["score_components"]["bridge_skipped"] is False
+        completion_model, *_ = train(
+            manifest, steps=1, batch=2, d=32, layers=1, heads=4, device="cpu",
+            log_every=10, view_tokens=2, txt_tokens=4,
+            concept_tokens=2, latent_concept_slots=3,
+            latent_concept_completion_probe_n=4,
+            latent_concept_completion_hard_max=2,
+            latent_concept_completion_refresh_steps=1,
+            latent_concept_completion_w=0.01)
+        assert completion_model.train_metrics["latent_study_strategy"] == "completion"
+        assert completion_model.train_metrics["latent_completion_study_pool_size"] == 2
+        assert completion_model.train_metrics["latent_completion_study_reports"]
+        assert completion_model.train_metrics["latent_completion_skipped"] is False
+        assert any(r.get("strategy") == "completion"
+                   and "mean_completion_surprise" in r
+                   for r in completion_model.train_metrics["latent_study_reports"])
         discovery_model, *_ = train(
             manifest, steps=2, batch=2, d=32, layers=1, heads=4, device="cpu",
             log_every=2, view_tokens=2, txt_tokens=4,
@@ -3864,6 +4039,12 @@ def main(argv=None):
                     dest="latent_concept_discovery_hard_max")
     ap.add_argument("--latent-concept-discovery-refresh-steps", type=int, default=0,
                     dest="latent_concept_discovery_refresh_steps")
+    ap.add_argument("--latent-concept-completion-probe-n", type=int, default=0,
+                    dest="latent_concept_completion_probe_n")
+    ap.add_argument("--latent-concept-completion-hard-max", type=int, default=0,
+                    dest="latent_concept_completion_hard_max")
+    ap.add_argument("--latent-concept-completion-refresh-steps", type=int,
+                    default=0, dest="latent_concept_completion_refresh_steps")
     ap.add_argument("--latent-concept-memory-w", type=float, default=0.0,
                     dest="latent_concept_memory_w")
     ap.add_argument("--latent-concept-memory-size", type=int, default=0,
@@ -4095,12 +4276,19 @@ def main(argv=None):
         ap.error("--latent-concept-discovery-hard-max must be non-negative")
     if args.latent_concept_discovery_refresh_steps < 0:
         ap.error("--latent-concept-discovery-refresh-steps must be non-negative")
+    if args.latent_concept_completion_probe_n < 0:
+        ap.error("--latent-concept-completion-probe-n must be non-negative")
+    if args.latent_concept_completion_hard_max < 0:
+        ap.error("--latent-concept-completion-hard-max must be non-negative")
+    if args.latent_concept_completion_refresh_steps < 0:
+        ap.error("--latent-concept-completion-refresh-steps must be non-negative")
     latent_options_need_slots = (
         any(w > 0.0 for w in latent_weights)
         or args.latent_concept_memory_size > 0
         or args.latent_concept_prefix
         or args.latent_concept_fer_hard_max > 0
-        or args.latent_concept_discovery_hard_max > 0)
+        or args.latent_concept_discovery_hard_max > 0
+        or args.latent_concept_completion_hard_max > 0)
     if latent_options_need_slots and args.latent_concept_slots <= 0:
         ap.error("latent concept options require --latent-concept-slots > 0")
     if args.latent_concept_memory_temperature <= 0.0:
@@ -4216,6 +4404,10 @@ def main(argv=None):
         latent_concept_discovery_hard_max=args.latent_concept_discovery_hard_max,
         latent_concept_discovery_refresh_steps=(
             args.latent_concept_discovery_refresh_steps),
+        latent_concept_completion_probe_n=args.latent_concept_completion_probe_n,
+        latent_concept_completion_hard_max=args.latent_concept_completion_hard_max,
+        latent_concept_completion_refresh_steps=(
+            args.latent_concept_completion_refresh_steps),
         latent_concept_memory_w=args.latent_concept_memory_w,
         latent_concept_memory_size=args.latent_concept_memory_size,
         latent_concept_memory_temperature=args.latent_concept_memory_temperature,
