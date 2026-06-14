@@ -570,6 +570,16 @@ def apply_image_quality_preset(args):
         float(args.image_flow_endpoint_stats_w), 0.02 if hq else 0.01)
     args.image_flow_straightness_w = max(
         float(args.image_flow_straightness_w), 0.02 if hq else 0.01)
+    args.image_flow_decoded_endpoint_w = max(
+        float(args.image_flow_decoded_endpoint_w), 0.05 if hq else 0.02)
+    args.image_flow_decoded_endpoint_p = max(
+        float(args.image_flow_decoded_endpoint_p), 0.25 if hq else 0.1)
+    args.image_flow_decoded_endpoint_grad_w = max(
+        float(args.image_flow_decoded_endpoint_grad_w), 0.5 if hq else 0.25)
+    args.image_flow_decoded_endpoint_ms_w = max(
+        float(args.image_flow_decoded_endpoint_ms_w), 0.25 if hq else 0.1)
+    args.image_flow_decoded_endpoint_fft_w = max(
+        float(args.image_flow_decoded_endpoint_fft_w), 0.1 if hq else 0.05)
     args.image_flow_multiscale_w = max(float(args.image_flow_multiscale_w), 0.03 if hq else 0.01)
     if not str(args.image_flow_multiscale_scales or "").strip():
         args.image_flow_multiscale_scales = "2,4"
@@ -1140,6 +1150,16 @@ def payload(args):
                      f"--flow-endpoint-stats-std-w "
                      f"{args.image_flow_endpoint_stats_std_w} "
                      f"--flow-straightness-w {args.image_flow_straightness_w} "
+                     f"--flow-decoded-endpoint-w "
+                     f"{args.image_flow_decoded_endpoint_w} "
+                     f"--flow-decoded-endpoint-p "
+                     f"{args.image_flow_decoded_endpoint_p} "
+                     f"--flow-decoded-endpoint-grad-w "
+                     f"{args.image_flow_decoded_endpoint_grad_w} "
+                     f"--flow-decoded-endpoint-ms-w "
+                     f"{args.image_flow_decoded_endpoint_ms_w} "
+                     f"--flow-decoded-endpoint-fft-w "
+                     f"{args.image_flow_decoded_endpoint_fft_w} "
                      f"--flow-multiscale-w {args.image_flow_multiscale_w} "
                      f"--flow-multiscale-scales {shlex_quote(args.image_flow_multiscale_scales)} "
                      f"--flow-noise-coupling {args.image_flow_noise_coupling} "
@@ -3075,6 +3095,22 @@ def main():
     ap.add_argument("--image-flow-straightness-w", type=float, default=0.0,
                     dest="image_flow_straightness_w",
                     help="same-chord velocity straightness loss weight for image flow")
+    ap.add_argument("--image-flow-decoded-endpoint-w", type=float, default=0.0,
+                    dest="image_flow_decoded_endpoint_w",
+                    help=("decoded image-space clean-endpoint loss weight for image "
+                          "flow structure preservation"))
+    ap.add_argument("--image-flow-decoded-endpoint-p", type=float, default=0.0,
+                    dest="image_flow_decoded_endpoint_p",
+                    help="probability of applying decoded endpoint supervision")
+    ap.add_argument("--image-flow-decoded-endpoint-grad-w", type=float, default=0.0,
+                    dest="image_flow_decoded_endpoint_grad_w",
+                    help="edge component weight inside decoded endpoint loss")
+    ap.add_argument("--image-flow-decoded-endpoint-ms-w", type=float, default=0.0,
+                    dest="image_flow_decoded_endpoint_ms_w",
+                    help="multi-scale component weight inside decoded endpoint loss")
+    ap.add_argument("--image-flow-decoded-endpoint-fft-w", type=float, default=0.0,
+                    dest="image_flow_decoded_endpoint_fft_w",
+                    help="frequency component weight inside decoded endpoint loss")
     ap.add_argument("--image-flow-multiscale-w", type=float, default=0.0,
                     dest="image_flow_multiscale_w",
                     help="coarse-to-fine downsampled velocity loss weight for image flow")
@@ -3934,6 +3970,15 @@ def main():
         sys.exit("ERROR: image flow endpoint statistics component weights must be non-negative")
     if args.image_flow_straightness_w < 0.0:
         sys.exit("ERROR: --image-flow-straightness-w must be non-negative")
+    if args.image_flow_decoded_endpoint_w < 0.0:
+        sys.exit("ERROR: --image-flow-decoded-endpoint-w must be non-negative")
+    if (args.image_flow_decoded_endpoint_p < 0.0
+            or args.image_flow_decoded_endpoint_p > 1.0):
+        sys.exit("ERROR: --image-flow-decoded-endpoint-p must be in [0, 1]")
+    if (args.image_flow_decoded_endpoint_grad_w < 0.0
+            or args.image_flow_decoded_endpoint_ms_w < 0.0
+            or args.image_flow_decoded_endpoint_fft_w < 0.0):
+        sys.exit("ERROR: image decoded endpoint component weights must be non-negative")
     if args.image_flow_multiscale_w < 0.0:
         sys.exit("ERROR: --image-flow-multiscale-w must be non-negative")
     for raw_scale in str(args.image_flow_multiscale_scales or "").split(","):

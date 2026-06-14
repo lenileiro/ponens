@@ -6018,6 +6018,10 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        endpoint_stats_mean_w=1.0, endpoint_stats_std_w=1.0,
                        straightness_w=0.0,
                        multiscale_w=0.0, multiscale_scales=(2, 4),
+                       decoded_endpoint_w=0.0, decoded_endpoint_p=1.0,
+                       decoded_endpoint_grad_w=0.0,
+                       decoded_endpoint_ms_w=0.0,
+                       decoded_endpoint_fft_w=0.0,
                        self_condition_p=0.0, reference_condition_p=0.0,
                        flow_noise_coupling="random", flow_noise_coupling_projections=1,
                        flow_loss_weight="none", flow_loss_weight_gamma=5.0,
@@ -6057,6 +6061,20 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     if multiscale_w < 0.0:
         raise ValueError("multiscale_w must be non-negative")
     multiscale_scales = normalize_flow_multiscale_scales(multiscale_scales)
+    decoded_endpoint_w = float(decoded_endpoint_w)
+    decoded_endpoint_p = float(decoded_endpoint_p)
+    decoded_endpoint_grad_w = float(decoded_endpoint_grad_w)
+    decoded_endpoint_ms_w = float(decoded_endpoint_ms_w)
+    decoded_endpoint_fft_w = float(decoded_endpoint_fft_w)
+    if decoded_endpoint_w < 0.0:
+        raise ValueError("decoded_endpoint_w must be non-negative")
+    if decoded_endpoint_p < 0.0 or decoded_endpoint_p > 1.0:
+        raise ValueError("decoded_endpoint_p must be in [0, 1]")
+    if (decoded_endpoint_grad_w < 0.0 or decoded_endpoint_ms_w < 0.0
+            or decoded_endpoint_fft_w < 0.0):
+        raise ValueError("decoded endpoint structure weights must be non-negative")
+    if decoded_endpoint_w > 0.0 and ae is None:
+        raise ValueError("decoded_endpoint_w requires an autoencoder")
     factorization_w = float(factorization_w)
     if factorization_w < 0.0:
         raise ValueError("factorization_w must be non-negative")
@@ -6156,6 +6174,17 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         "flow_multiscale_w": torch.tensor(float(multiscale_w), device=z1.device),
         "flow_multiscale_scale_count": torch.tensor(
             float(len(multiscale_scales)), device=z1.device),
+        "flow_decoded_endpoint_w": torch.tensor(
+            float(decoded_endpoint_w), device=z1.device),
+        "flow_decoded_endpoint_p": torch.tensor(
+            float(decoded_endpoint_p), device=z1.device),
+        "flow_decoded_endpoint_grad_w": torch.tensor(
+            float(decoded_endpoint_grad_w), device=z1.device),
+        "flow_decoded_endpoint_ms_w": torch.tensor(
+            float(decoded_endpoint_ms_w), device=z1.device),
+        "flow_decoded_endpoint_fft_w": torch.tensor(
+            float(decoded_endpoint_fft_w), device=z1.device),
+        "flow_decoded_endpoint_active": torch.tensor(0.0, device=z1.device),
         "flow_self_condition": torch.tensor(
             float(flow_uses_self_condition(flow)), device=z1.device),
         "flow_self_condition_p": torch.tensor(float(self_condition_p), device=z1.device),
@@ -6194,6 +6223,24 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         frequency = frequency_recon_loss(endpoint_pred, z1_model)
         total = total + float(frequency_w) * frequency
         parts["flow_endpoint_frequency_l1"] = frequency.detach()
+    if (decoded_endpoint_w > 0.0 and decoded_endpoint_p > 0.0
+            and (decoded_endpoint_p >= 1.0
+                 or bool(torch.rand((), device=z1.device) < decoded_endpoint_p))):
+        endpoint_raw = denormalize_latent(endpoint_pred, latent_stats)
+        target_raw = denormalize_latent(z1_model, latent_stats)
+        pred_img = ae.decode(endpoint_raw)
+        with torch.no_grad():
+            target_img = ae.decode(target_raw.detach())
+        decoded_loss, decoded_parts = reconstruction_loss_parts(
+            pred_img, target_img, mode="mse",
+            grad_w=decoded_endpoint_grad_w,
+            ms_w=decoded_endpoint_ms_w,
+            fft_w=decoded_endpoint_fft_w)
+        total = total + float(decoded_endpoint_w) * decoded_loss
+        parts["flow_decoded_endpoint_loss"] = decoded_loss.detach()
+        parts["flow_decoded_endpoint_active"] = torch.tensor(1.0, device=z1.device)
+        for key, value in decoded_parts.items():
+            parts[f"flow_decoded_endpoint_{key}"] = value
     if endpoint_stats_w > 0.0:
         endpoint_stats, endpoint_stats_parts = flow_endpoint_statistics_loss(
             endpoint_pred, z1_model,
@@ -10648,6 +10695,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       flow_endpoint_stats_mean_w=1.0,
                       flow_endpoint_stats_std_w=1.0,
                       flow_straightness_w=0.0,
+                      flow_decoded_endpoint_w=0.0,
+                      flow_decoded_endpoint_p=1.0,
+                      flow_decoded_endpoint_grad_w=0.0,
+                      flow_decoded_endpoint_ms_w=0.0,
+                      flow_decoded_endpoint_fft_w=0.0,
                       flow_distill_steps=0, flow_distill_w=1.0,
                       flow_distill_time_gap=0.25, flow_distill_teacher="auto",
                       flow_guidance_distill_w=0.0,
@@ -10966,6 +11018,18 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_straightness_w = float(flow_straightness_w)
     if flow_straightness_w < 0.0:
         raise ValueError("flow_straightness_w must be non-negative")
+    flow_decoded_endpoint_w = float(flow_decoded_endpoint_w)
+    flow_decoded_endpoint_p = float(flow_decoded_endpoint_p)
+    flow_decoded_endpoint_grad_w = float(flow_decoded_endpoint_grad_w)
+    flow_decoded_endpoint_ms_w = float(flow_decoded_endpoint_ms_w)
+    flow_decoded_endpoint_fft_w = float(flow_decoded_endpoint_fft_w)
+    if flow_decoded_endpoint_w < 0.0:
+        raise ValueError("flow_decoded_endpoint_w must be non-negative")
+    if flow_decoded_endpoint_p < 0.0 or flow_decoded_endpoint_p > 1.0:
+        raise ValueError("flow_decoded_endpoint_p must be in [0, 1]")
+    if (flow_decoded_endpoint_grad_w < 0.0 or flow_decoded_endpoint_ms_w < 0.0
+            or flow_decoded_endpoint_fft_w < 0.0):
+        raise ValueError("flow decoded endpoint component weights must be non-negative")
     flow_multiscale_w = float(flow_multiscale_w)
     if flow_multiscale_w < 0.0:
         raise ValueError("flow_multiscale_w must be non-negative")
@@ -11833,6 +11897,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     endpoint_stats_mean_w=flow_endpoint_stats_mean_w,
                     endpoint_stats_std_w=flow_endpoint_stats_std_w,
                     straightness_w=flow_straightness_w,
+                    decoded_endpoint_w=flow_decoded_endpoint_w,
+                    decoded_endpoint_p=flow_decoded_endpoint_p,
+                    decoded_endpoint_grad_w=flow_decoded_endpoint_grad_w,
+                    decoded_endpoint_ms_w=flow_decoded_endpoint_ms_w,
+                    decoded_endpoint_fft_w=flow_decoded_endpoint_fft_w,
                     multiscale_w=flow_multiscale_w,
                     multiscale_scales=flow_multiscale_scales,
                     self_condition_p=flow_self_condition_p,
@@ -12296,6 +12365,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_endpoint_stats_mean_w": float(flow_endpoint_stats_mean_w),
         "flow_endpoint_stats_std_w": float(flow_endpoint_stats_std_w),
         "flow_straightness_w": float(flow_straightness_w),
+        "flow_decoded_endpoint_w": float(flow_decoded_endpoint_w),
+        "flow_decoded_endpoint_p": float(flow_decoded_endpoint_p),
+        "flow_decoded_endpoint_grad_w": float(flow_decoded_endpoint_grad_w),
+        "flow_decoded_endpoint_ms_w": float(flow_decoded_endpoint_ms_w),
+        "flow_decoded_endpoint_fft_w": float(flow_decoded_endpoint_fft_w),
         "flow_multiscale_w": float(flow_multiscale_w),
         "flow_multiscale_scales": list(flow_multiscale_scales),
         "flow_distill_steps": int(flow_distill_steps),
@@ -12779,6 +12853,11 @@ def selftest():
             flow_time_embed="fourier", flow_time_embed_dim=8,
             flow_self_condition=True, flow_self_condition_p=1.0,
             flow_reference_condition_p=1.0,
+            flow_decoded_endpoint_w=0.01,
+            flow_decoded_endpoint_p=1.0,
+            flow_decoded_endpoint_grad_w=0.1,
+            flow_decoded_endpoint_ms_w=0.1,
+            flow_decoded_endpoint_fft_w=0.1,
             dit_mlp="swiglu", dit_register_tokens=1,
             time_sampling="adaptive", time_adaptive_bins=4,
             time_stratified=True,
@@ -12813,6 +12892,11 @@ def selftest():
         assert math.isclose(report["flow_multiscale_w"], 0.01)
         assert report["flow_multiscale_scales"] == [2]
         assert report["last_flow"]["flow_multiscale_active_scales"] >= 1
+        assert math.isclose(report["flow_decoded_endpoint_w"], 0.01)
+        assert report["last_flow"]["flow_decoded_endpoint_active"] == 1.0
+        assert "flow_decoded_endpoint_recon_grad_l1" in report["last_flow"]
+        assert "flow_decoded_endpoint_recon_multiscale_l1" in report["last_flow"]
+        assert "flow_decoded_endpoint_recon_fft_l1" in report["last_flow"]
         assert report["time_adaptive_prior"] == "mode"
         assert math.isclose(report["time_adaptive_prior_mix"], 0.25)
         assert report["time_adaptive_prior_prob_max"] > report["time_adaptive_prior_prob_min"]
@@ -13367,6 +13451,23 @@ def main(argv=None):
     ap.add_argument("--flow-straightness-w", type=float, default=0.0,
                     dest="flow_straightness_w",
                     help="same-chord velocity straightness loss weight for latent flow")
+    ap.add_argument("--flow-decoded-endpoint-w", type=float, default=0.0,
+                    dest="flow_decoded_endpoint_w",
+                    help=("decoded image-space clean-endpoint loss weight for latent "
+                          "flow structure preservation"))
+    ap.add_argument("--flow-decoded-endpoint-p", type=float, default=1.0,
+                    dest="flow_decoded_endpoint_p",
+                    help=("probability of applying decoded endpoint supervision on a "
+                          "flow step"))
+    ap.add_argument("--flow-decoded-endpoint-grad-w", type=float, default=0.0,
+                    dest="flow_decoded_endpoint_grad_w",
+                    help="edge/gradient component weight inside decoded endpoint loss")
+    ap.add_argument("--flow-decoded-endpoint-ms-w", type=float, default=0.0,
+                    dest="flow_decoded_endpoint_ms_w",
+                    help="multi-scale component weight inside decoded endpoint loss")
+    ap.add_argument("--flow-decoded-endpoint-fft-w", type=float, default=0.0,
+                    dest="flow_decoded_endpoint_fft_w",
+                    help="frequency component weight inside decoded endpoint loss")
     ap.add_argument("--flow-multiscale-w", type=float, default=0.0,
                     dest="flow_multiscale_w",
                     help="coarse-to-fine downsampled velocity loss weight for latent flow")
@@ -13841,6 +13942,14 @@ def main(argv=None):
         ap.error("flow endpoint statistics component weights must be non-negative")
     if args.flow_straightness_w < 0.0:
         ap.error("--flow-straightness-w must be non-negative")
+    if args.flow_decoded_endpoint_w < 0.0:
+        ap.error("--flow-decoded-endpoint-w must be non-negative")
+    if args.flow_decoded_endpoint_p < 0.0 or args.flow_decoded_endpoint_p > 1.0:
+        ap.error("--flow-decoded-endpoint-p must be in [0, 1]")
+    if (args.flow_decoded_endpoint_grad_w < 0.0
+            or args.flow_decoded_endpoint_ms_w < 0.0
+            or args.flow_decoded_endpoint_fft_w < 0.0):
+        ap.error("flow decoded endpoint component weights must be non-negative")
     if args.flow_multiscale_w < 0.0:
         ap.error("--flow-multiscale-w must be non-negative")
     try:
@@ -14326,6 +14435,11 @@ def main(argv=None):
         flow_endpoint_stats_mean_w=args.flow_endpoint_stats_mean_w,
         flow_endpoint_stats_std_w=args.flow_endpoint_stats_std_w,
         flow_straightness_w=args.flow_straightness_w,
+        flow_decoded_endpoint_w=args.flow_decoded_endpoint_w,
+        flow_decoded_endpoint_p=args.flow_decoded_endpoint_p,
+        flow_decoded_endpoint_grad_w=args.flow_decoded_endpoint_grad_w,
+        flow_decoded_endpoint_ms_w=args.flow_decoded_endpoint_ms_w,
+        flow_decoded_endpoint_fft_w=args.flow_decoded_endpoint_fft_w,
         flow_multiscale_w=args.flow_multiscale_w,
         flow_multiscale_scales=flow_multiscale_scales,
         flow_noise_coupling=args.flow_noise_coupling,
@@ -14824,6 +14938,16 @@ def main(argv=None):
         "flow_endpoint_stats_mean_w": args.flow_endpoint_stats_mean_w,
         "flow_endpoint_stats_std_w": args.flow_endpoint_stats_std_w,
         "flow_straightness_w": args.flow_straightness_w,
+        "flow_decoded_endpoint_w": report.get(
+            "flow_decoded_endpoint_w", args.flow_decoded_endpoint_w),
+        "flow_decoded_endpoint_p": report.get(
+            "flow_decoded_endpoint_p", args.flow_decoded_endpoint_p),
+        "flow_decoded_endpoint_grad_w": report.get(
+            "flow_decoded_endpoint_grad_w", args.flow_decoded_endpoint_grad_w),
+        "flow_decoded_endpoint_ms_w": report.get(
+            "flow_decoded_endpoint_ms_w", args.flow_decoded_endpoint_ms_w),
+        "flow_decoded_endpoint_fft_w": report.get(
+            "flow_decoded_endpoint_fft_w", args.flow_decoded_endpoint_fft_w),
         "flow_multiscale_w": args.flow_multiscale_w,
         "flow_multiscale_scales": report.get("flow_multiscale_scales", []),
         "flow_distill_steps": report.get("flow_distill_steps", args.flow_distill_steps),
