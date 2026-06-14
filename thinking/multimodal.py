@@ -2090,6 +2090,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     best_score = 0.0
     best_round = 0
     best_metrics = {}
+    best_study_reports = []
     rounds_report = []
     no_improve_rounds = 0
     stopped_early = False
@@ -2355,7 +2356,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 selected_id_sample(study_pool) if hard_study_strategy == "fer"
                 else []),
             "latent_fer_study_reports": (
-                study_reports if hard_study_strategy == "fer" else []),
+                list(study_reports) if hard_study_strategy == "fer" else []),
             "latent_discovery_probe_n": int(latent_concept_discovery_probe_n),
             "latent_discovery_hard_max": int(latent_concept_discovery_hard_max),
             "latent_discovery_refresh_steps": int(
@@ -2366,11 +2367,12 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 selected_id_sample(study_pool)
                 if hard_study_strategy == "discovery" else []),
             "latent_discovery_study_reports": (
-                study_reports if hard_study_strategy == "discovery" else []),
+                list(study_reports)
+                if hard_study_strategy == "discovery" else []),
             "latent_study_strategy": hard_study_strategy,
             "latent_study_pool_size": len(study_pool),
             "latent_study_hard_record_ids": selected_id_sample(study_pool),
-            "latent_study_reports": study_reports,
+            "latent_study_reports": list(study_reports),
             "latent_memory_loss": float(latent_memory.detach()),
             "latent_association_loss": float(latent_association.detach()),
             "latent_composition_loss": float(latent_composition.detach()),
@@ -2442,6 +2444,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 best_round = int(round_id)
                 best_state = _model_state_copy(model)
                 best_metrics = dict(last)
+                best_study_reports = list(study_reports)
                 no_improve_rounds = 0
             else:
                 no_improve_rounds += 1
@@ -2474,17 +2477,36 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "selected_score_delta": float(best_score - rounds_report[0]["score"]),
             "rounds": rounds_report,
         }
-        best_metrics = best_metrics | {"selection": selection}
+        active_study_reports = list(best_study_reports)
+        best_metrics = best_metrics | {
+            "selection": selection,
+            "latent_fer_study_reports": (
+                active_study_reports if hard_study_strategy == "fer" else []),
+            "latent_discovery_study_reports": (
+                active_study_reports
+                if hard_study_strategy == "discovery" else []),
+            "latent_study_reports": active_study_reports,
+        }
+        if best_round == 0:
+            best_metrics = best_metrics | {
+                "latent_study_strategy": hard_study_strategy,
+                "latent_study_pool_size": 0,
+                "latent_study_hard_record_ids": [],
+                "latent_fer_study_pool_size": 0,
+                "latent_fer_hard_record_ids": [],
+                "latent_discovery_study_pool_size": 0,
+                "latent_discovery_hard_record_ids": [],
+            }
         last = best_metrics
     else:
         selection = {"enabled": False}
         last = dict(last) | {"selection": selection}
     model.train_metrics = last
     model.latent_fer_study_reports = (
-        study_reports if hard_study_strategy == "fer" else [])
+        last.get("latent_fer_study_reports", []))
     model.latent_discovery_study_reports = (
-        study_reports if hard_study_strategy == "discovery" else [])
-    model.latent_study_reports = study_reports
+        last.get("latent_discovery_study_reports", []))
+    model.latent_study_reports = last.get("latent_study_reports", [])
     model.manifest_info = {
         "path": manifest,
         "root": root,
@@ -2759,6 +2781,10 @@ def selftest():
         assert selection["accepted_update"] is False
         assert selection["selected_round"] == 0
         assert "score_delta_from_best" in selection["rounds"][1]
+        assert selected_model.train_metrics["latent_study_reports"] == []
+        assert selected_model.train_metrics["latent_discovery_study_reports"] == []
+        assert selected_model.train_metrics["latent_study_pool_size"] == 0
+        assert selected_model.latent_study_reports == []
     print("multimodal selftest OK")
 
 
