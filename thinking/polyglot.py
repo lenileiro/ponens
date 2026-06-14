@@ -2,11 +2,10 @@
 pronounce ANY word in that language. The user's target: "know how to pronounce anything given the
 speech rules for any language, and learn the rules from a few listening examples."
 
-This is the project's rule-induction thesis (kinship rules from observations at 0.99 held-out)
-applied to speech. Phonemes are universal (fixed audio units); a LANGUAGE is a grapheme->phoneme
-RULE SYSTEM (which letter sounds like which phoneme), random per language. The model never sees a
-language's rules stated -- it must INFER them by listening to K (word, audio) support pairs, then
-apply them to a held-out query word.
+This is the pronunciation-rule learning thesis applied to speech. Phonemes are universal (fixed
+audio units); a LANGUAGE is a grapheme->phoneme rule system (which letter sounds like which
+phoneme), random per language. The model never sees a language's rules stated -- it must infer
+them by listening to K (word, audio) support pairs, then apply them to a held-out query word.
 
 Meta-learning setup, evaluated on HELD-OUT LANGUAGES (rule systems never seen in training):
   support: K words + their audio (phoneme spectrograms) in language L

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""RunPod H100 runner for the thinking package (Datalog thinking flow, production pipeline).
+"""RunPod H100 runner for the current thinking package.
 
-Default payload: KINSHIP multi-seed (train + negatives + iid/holdout evals + demo) with the looped
-default model (mHC + pointer + learned halting). --sweep additionally runs the chain-world
-comparison grid (sup x arch x seed). tar-over-ssh; pod-side `timeout` bounds the run; ALWAYS
-terminates (try/finally). DEFAULTS to --dry-run.
+The launcher runs the manifest/raw-data training surfaces that are still supported: raw reading,
+image preprocessing/generation/eval, vision understanding, and the generic multimodal bridge.
+Pod-side `timeout` bounds the run and cleanup always terminates the pod. Defaults to dry-run.
 
 Auth: export RUNPOD_API_KEY.  Example: RUNPOD_API_KEY=... python runpod/launch_thinking.py --go
 """
@@ -230,8 +229,8 @@ def reading_upload_paths(args):
     return [path for path in paths if path and not is_url_arg(path)]
 
 
-def text_reading_cmd(args, PY):
-    TXT = PY.replace("thinking.cli", "thinking.text")
+def text_reading_cmd(args, py):
+    TXT = f"{py} -m thinking.text"
     d = args.text_reading_dim or args.dim or 256
     ckpt = args.reading_out_checkpoint or args.text_reading_checkpoint_out
     report = args.text_reading_out
@@ -640,39 +639,15 @@ def upload_path_cmd(local_path, remote_path, ssh):
 
 
 def payload(args):
-    """The pod-side run: kinship multi-seed (+ optional chain sweep), via the package CLI.
-    --fast: image-native python (torch preinstalled -- skips the ~5min venv build), 1000 steps,
-    3000 examples, trimmed eval (depth-50 verified decoding costs ~75s/example: ~1650 generated
-    tokens through the 8-loop model, so n is small there)."""
-    PY = ("python3 -u -m thinking.cli" if args.fast
-          else "/root/fer-venv/bin/python -u -m thinking.cli")
-    trace_rank = (
-        (f" --trace-rank-w {args.trace_rank_w}" if args.trace_rank_w else "") +
-        (f" --trace-rank-batch {args.trace_rank_batch}" if args.trace_rank_batch else "") +
-        (f" --trace-rank-candidates {args.trace_rank_candidates}"
-         if args.trace_rank_candidates else "") +
-        (f" --trace-rank-states {args.trace_rank_states}" if args.trace_rank_states else "") +
-        (f" --trace-dagger-frac {args.trace_dagger_frac}"
-         if args.trace_dagger_frac is not None else ""))
+    """Build the pod-side command for supported manifest/raw-data training jobs."""
+    py = "python3 -u" if args.fast else "/root/fer-venv/bin/python -u"
+
+    def mod(name):
+        return f"{py} -m {name}"
+
     cmds = []
-    if args.ablate:
-        cmds.append(f"{PY} ablate --steps 800")
-    if args.verbalize:
-        cmds.append(f"{PY.replace('thinking.cli', 'thinking.verbalize')} "
-                    f"--out runs/verbalizer.pt && "
-                    f"{PY.replace('thinking.cli', 'thinking.verbalize')} "
-                    f"--sample runs/verbalizer.pt")
-    if args.lang:                                          # LANG-1: hybrid-vocab fluency model
-        VB = PY.replace("thinking.cli", "thinking.verbalize")
-        cmds.append(f"{VB} --hybrid --dim {args.dim or 256} --corpus tinystories "
-                    f"--corpus-mb {args.lang_mb} --pre-steps {args.train_steps or 40000} "
-                    f"--steps {args.lang_ft} --out runs/lang1_fluency.pt && "
-                    f"{VB} --sample runs/lang1_fluency.pt")
-        return " && ".join(cmds)                           # lang is a COMPLETE payload: without
-        #                                                    this return the default kinship
-        #                                                    multi-seed run was appended after it
     if args.text_reading:
-        cmds.append(text_reading_cmd(args, PY))
+        cmds.append(text_reading_cmd(args, py))
     if args.text_reading and not (
             args.vision_understanding or args.image_latent or args.image_embed
             or args.image_fetch or args.image_caption or args.image_score
@@ -680,10 +655,10 @@ def payload(args):
         return " && ".join(cmds)
     if (args.vision_understanding or args.image_latent or args.image_embed
             or args.image_fetch or args.image_caption or args.image_score
-            or args.multimodal):
+        or args.multimodal):
         effective_image_manifest = args.image_manifest
         if args.image_fetch:
-            IFETCH = PY.replace("thinking.cli", "thinking.image_fetch")
+            IFETCH = mod("thinking.image_fetch")
             fetch = (f"{IFETCH} --source {args.image_fetch_source} "
                      f"--image-dir {shlex_quote(args.image_fetch_dir)} "
                      f"--manifest {shlex_quote(args.image_fetch_manifest)} "
@@ -707,7 +682,7 @@ def payload(args):
             cmds.append(fetch)
             effective_image_manifest = args.image_fetch_manifest
         if args.image_caption:
-            ICAP = PY.replace("thinking.cli", "thinking.image_caption")
+            ICAP = mod("thinking.image_caption")
             cap = (f"{ICAP} --manifest {shlex_quote(effective_image_manifest)} "
                    f"--root {shlex_quote(args.image_root)} "
                    f"--backend {args.image_caption_backend} "
@@ -731,7 +706,7 @@ def payload(args):
             cmds.append(cap)
             effective_image_manifest = args.image_caption_out
         if args.image_score:
-            ISCORE = PY.replace("thinking.cli", "thinking.image_score")
+            ISCORE = mod("thinking.image_score")
             score = (f"{ISCORE} --manifest {shlex_quote(effective_image_manifest)} "
                      f"--root {shlex_quote(args.image_root)} "
                      f"--backend {args.image_score_backend} "
@@ -776,8 +751,8 @@ def payload(args):
             cmds.append(score)
             effective_image_manifest = args.image_score_out
         if args.image_embed:
-            IE = PY.replace("thinking.cli", "thinking.image_embed")
-            ID = PY.replace("thinking.cli", "thinking.image_data")
+            IE = mod("thinking.image_embed")
+            ID = mod("thinking.image_data")
             embed = (f"{IE} --manifest {shlex_quote(effective_image_manifest)} "
                      f"--root {shlex_quote(args.image_root)} "
                      f"--backend {args.image_embed_backend} "
@@ -848,7 +823,7 @@ def payload(args):
             cmds.extend([embed, clean])
             effective_image_manifest = args.image_clean_manifest
         if args.vision_understanding:
-            VU = PY.replace("thinking.cli", "thinking.vision_understanding")
+            VU = mod("thinking.vision_understanding")
             vu_steps = args.vision_understanding_steps or args.train_steps or 2000
             vu_batch = args.vision_understanding_batch or args.batch
             vu_dim = args.vision_understanding_dim or args.dim or 128
@@ -875,7 +850,7 @@ def payload(args):
                   f"--report-out runs/vision_understanding_report.json")
             cmds.append(vu)
         if args.image_latent:
-            IL = PY.replace("thinking.cli", "thinking.image_latent")
+            IL = mod("thinking.image_latent")
             cond_suffix = f"_{args.image_cond_mode}"
             ckpt = f"runs/image_latent_{args.image_latent_arch}{cond_suffix}.pt"
             grid = f"runs/image_latent_{args.image_latent_arch}{cond_suffix}_grid.ppm"
@@ -1179,8 +1154,8 @@ def payload(args):
                                  f"{sample_manifest_args}{prompt_grid_args}")
                 train += eval_cmd
             if args.image_eval_generated:
-                IEVAL = PY.replace("thinking.cli", "thinking.image_eval")
-                IGEN_EMBED = PY.replace("thinking.cli", "thinking.image_embed")
+                IEVAL = mod("thinking.image_eval")
+                IGEN_EMBED = mod("thinking.image_embed")
                 generated_manifest = args.image_sample_manifest_out
                 generated_embed_out = (
                     args.image_generated_embed_out
@@ -1266,8 +1241,8 @@ def payload(args):
                     generated_eval += " --fail-on-gate"
                 train += generated_embed + generated_eval
                 if generated_candidates_manifest:
-                    IGEN_SCORE = PY.replace("thinking.cli", "thinking.image_score")
-                    IPREF = PY.replace("thinking.cli", "thinking.image_preferences")
+                    IGEN_SCORE = mod("thinking.image_score")
+                    IPREF = mod("thinking.image_preferences")
                     generated_candidates_root = (
                         os.path.dirname(generated_candidates_manifest) or ".")
                     generated_score = (
@@ -1331,7 +1306,7 @@ def payload(args):
                     train += generated_score + generated_prefs
             cmds.append(train)
         if args.multimodal:
-            MM = PY.replace("thinking.cli", "thinking.multimodal")
+            MM = mod("thinking.multimodal")
             mm_dim = args.multimodal_dim or args.dim or 96
             mm_cmd = (
                 f"{MM} --manifest {shlex_quote(args.multimodal_manifest)} "
@@ -1526,170 +1501,11 @@ def payload(args):
             mm_cmd += " --select-best" if args.multimodal_select_best else " --no-select-best"
             cmds.append(mm_cmd)
         return " && ".join(cmds)
-    if args.eval_only_run:
-        run = shlex_quote(args.eval_only_run)
-        depths = ",".join(str(d) for d in args.eval_depths)
-        eval_block = max(18432, 144 * max(args.eval_depths))
-        eval_cmds = []
-        for decode in args.eval_decodes:
-            out = os.path.join(args.eval_only_run, f"deep_eval_{decode}.json")
-            eval_cmds.append(
-                f"{PY} deep-eval {run} --depths {shlex_quote(depths)} "
-                f"--n {args.eval_n} --preds ancestor --block {eval_block} "
-                f"--decode {shlex_quote(decode)} --out {shlex_quote(out)}")
-        return " && ".join(eval_cmds)
-    if args.learning_curve:
-        eval_block = max(18432, 144 * max(args.eval_depths))
-        depths = ",".join(str(d) for d in args.eval_depths)
-        curve_cmds = ["rm -rf runs/learn_* runs/learning_curve_summary.json && mkdir -p runs"]
-        runs = []
-        for arm in args.curve_arms:
-            if arm == "aux":
-                rw, rcw = args.rule_w, args.rule_contrast_w
-            elif arm == "noaux":
-                rw, rcw = 0.0, 0.0
-            else:
-                raise ValueError(f"unknown learning-curve arm: {arm}")
-            for steps in args.curve_steps:
-                run = f"runs/learn_{arm}_{steps}"
-                runs.append(run)
-                train = (f"{PY} train --world kinship --simple --canon "
-                         f"--deep-depth {args.deep_depth} --deep-preds ancestor "
-                         f"--deep-frac {args.deep_frac} --dim {args.dim or 256} "
-                         f"--steps {steps} --examples {args.examples} --batch {args.batch} "
-                         f"--rule-w {rw} --rule-contrast-w {rcw}{trace_rank} --out {run}")
-                evals = []
-                for decode in args.eval_decodes:
-                    out = f"{run}/deep_eval_{decode}.json"
-                    evals.append(
-                        f"{PY} deep-eval {run} --depths {depths} --n {args.eval_n} "
-                        f"--preds ancestor --block {eval_block} --decode {decode} "
-                        f"--out {out}")
-                probe = (f"{PY} probe {run} --depths {depths} --n {args.probe_n} "
-                         f"--preds ancestor --block {eval_block} --out {run}/fer_probe.json")
-                curve_cmds.append(" && ".join([train] + evals + [probe]))
-        summary_code = (
-            "import json, pathlib\n"
-            "rows=[]\n"
-            f"runs={runs!r}\n"
-            "for run in runs:\n"
-            "    p=pathlib.Path(run)\n"
-            "    arm, steps = p.name.split('_')[1], int(p.name.split('_')[2])\n"
-            "    row={'run':run,'arm':arm,'steps':steps}\n"
-            "    for ep in p.glob('deep_eval_*.json'):\n"
-            "        data=json.loads(ep.read_text())\n"
-            "        dec=data.get('decode', ep.stem.replace('deep_eval_',''))\n"
-            "        row[f'{dec}_by_depth']=data.get('by_depth',{})\n"
-            "    fp=p/'fer_probe.json'\n"
-            "    if fp.exists():\n"
-            "        pr=json.loads(fp.read_text())\n"
-            "        keys=['same_rule_cos','different_rule_cos','rule_reuse_margin',"
-            "'same_rule_cross_depth_cos','cross_depth_reuse_margin','cross_depth_reuse_gap',"
-            "'depth_index_leakage','ufr_score','verdict','weak_rules','risk_flags','n_vectors']\n"
-            "        row['fer']={k:pr.get(k) for k in keys}\n"
-            "    rows.append(row)\n"
-            "out=pathlib.Path('runs/learning_curve_summary.json')\n"
-            "out.write_text(json.dumps(rows, indent=1))\n"
-            "print(out.read_text())\n")
-        summary = f"python3 -c {shlex_quote(summary_code)}"
-        return " && ".join(curve_cmds + [summary])
-    if args.lengen:                                        # RUNG L: train shallow-deep (<=6),
-        cmds2 = []                                         # eval FAR deeper -- length-gen arms
-        for pos in ("rope", "none"):
-            run = f"runs/lengen_{pos}"
-            evs = []
-            for hop, n in (("6", 10), ("10", 10), ("20", 6), ("40", 4)):
-                evs.append(f"{PY} eval {run} --mode verified --split iid --hops {hop} "
-                           f"--n {n} --block 6144 --preds ancestor")
-            cmds2.append(f"{PY} train --world kinship --simple --bank --no-curriculum "
-                         f"--deep-depth 6 --deep-frac 0.4 --pos {pos} --test-names 110 "
-                         f"--out {run} --seed 0 --batch 16 "
-                         f"--steps {args.train_steps or 15000} --dim 256 && "
-                         + " ; ".join(evs))                # evals NON-FATAL: one bad cell
-        return " && ".join(cmds2).replace(" && python3 -u -m thinking.cli eval", " ; python3 -u -m thinking.cli eval")
-    if args.deep_ancestor_rule_aux:
-        run = args.run_name
-        eval_block = max(18432, 144 * max(args.eval_depths))
-        train = (f"{PY} train --world kinship --simple --canon "
-                 f"--deep-depth {args.deep_depth} --deep-preds ancestor "
-                 f"--deep-frac {args.deep_frac} --dim {args.dim or 256} "
-                 f"--steps {args.train_steps or 8000} --examples {args.examples} "
-                 f"--batch {args.batch} --rule-w {args.rule_w} "
-                 f"--rule-contrast-w {args.rule_contrast_w}{trace_rank} --out {run}")
-        depths = ",".join(str(d) for d in args.eval_depths)
-        return " && ".join([
-            train,
-            f"{PY} deep-eval {run} --depths {depths} --n {args.eval_n} "
-            f"--preds ancestor --block {eval_block}",
-            f"{PY} probe {run} --depths {depths} --n {args.probe_n} "
-            f"--preds ancestor --block {eval_block}",
-        ])
-    if args.stair:                                         # staircase: minimal world, decisive evals
-        run = f"runs/stair_{args.stair_world}"
-        canon = ((" --canon" if args.canon else "") + (" --bank" if args.bank else "") + (" --no-curriculum" if args.no_curriculum else ""))
-        simple = " --simple" if args.stair_world == "kinship" else ""
-        if args.stair_world == "kinship" and args.deep_depth and args.stair:
-            stair_df = args.deep_frac if args.deep_frac != 0.6 else 0.3   # 0.6 = non-stair default
-            simple += f" --deep-depth {args.deep_depth} --deep-frac {stair_df} --contrastive 0.9"
-        sbatch = 8 if (args.deep_depth and args.stair_world == "kinship") else 32
-        hops = ("2,3" if not (args.deep_depth and args.stair_world == "kinship")
-                else f"2,3,{args.deep_depth // 2},{args.deep_depth}")
-        if args.stair_world == "chain":
-            hops = "2,4,6"
-        # training must succeed (&&); evals are non-fatal and CHEAP-FIRST (free before
-        # verified -- verified deep evals can run 14+ min/depth and hit the pod cap)
-        evals = "; ".join([
-            f"{PY} eval {run} --mode free --split iid --hops {hops} --n 20",
-            f"{PY} eval {run} --mode free --split iid --hops {hops} --n 20 --train-names",
-            f"{PY} eval {run} --mode free --split iid --hops {hops} --n 20 --phrasings eval",
-            f"{PY} eval {run} --mode verified --split iid --hops {hops} --n 20",
-            f"{PY} eval {run} --mode verified --split iid --hops {hops} --n 20 --train-names",
-            f"{PY} eval {run} --mode verified --split iid --hops {hops} --n 20 --phrasings eval",
-            f"{PY} demo {run} --k 2",
-        ])
-        return (f"{PY} train --world {args.stair_world}{simple}{canon} --out {run} --seed 0 "
-                f"--batch {sbatch} --steps {args.train_steps or 4000}"
-                + (f" --dim {args.dim}" if args.dim else "")
-                + trace_rank
-                + " && { " + evals + "; }")
-    neg = " --neg" if args.neg else ""
-    loops = f" --loops {args.loops}" if args.loops else ""
-    noloop = " --no-loop" if args.no_loop else ""
-    steps = f" --steps {args.train_steps}" if args.train_steps else (
-        " --steps 1000 --examples 3000" if args.fast else "")
-    for s in args.seeds.split(","):
-        run = f"runs/kin_s{s}"
-        cmds.append(f"{PY} train --world kinship --deep-depth {args.deep_depth} --out {run} "
-                    f"--seed {s} --batch {args.batch}{steps}{loops}{noloop}{neg}"
-                    f"{trace_rank}")
-        if args.fast:
-            d = args.deep_depth
-            cmds += [
-                f"{PY} eval {run} --mode verified --split iid --hops 3 --n 20",
-                f"{PY} eval {run} --mode free --split iid --hops 3 --n 20",
-                f"{PY} eval {run} --mode verified --split iid --hops {d // 2},{d} --n 4",
-                f"{PY} eval {run} --mode verified --split holdout --hops 3 --n 20",
-                f"{PY} eval {run} --mode extract --split iid --hops 3,{d // 2} --n 12",
-                f"{PY} eval {run} --mode self --split iid --hops 3 --n 12",
-                f"{PY} eval {run} --mode verified --split iid --hops {d // 2} --n 12 "
-                f"--preds older_by,who_older,who_younger",
-                f"{PY} eval {run} --mode write --split iid --hops 3 --n 24",
-                f"{PY} eval {run} --mode math --split iid --hops 3 --n 40",
-                f"{PY} eval {run} --mode verified --split iid --hops 3 --n 20 --phrasings eval",
-                f"{PY} eval {run} --mode extract --split iid --hops 3 --n 12 --phrasings eval",
-                f"{PY} eval {run} --mode verified --split novel --hops 2 --n 20",
-            ]
-        else:
-            cmds += [
-                f"{PY} eval {run} --mode verified --split iid",
-                f"{PY} eval {run} --mode free --split iid",
-                f"{PY} eval {run} --mode verified --split holdout",
-                f"{PY} eval {run} --mode free --split holdout",
-            ]
-    cmds.append(f"{PY} demo runs/kin_s{args.seeds.split(',')[0]} --k 3")
-    if args.sweep:
-        cmds.append(f"{PY} sweep --out runs/grid --seeds {args.seeds}")
-    return " && ".join(cmds)
+    if cmds:
+        return " && ".join(cmds)
+    raise ValueError(
+        "no supported job selected; use --text-reading, --image-fetch, --image-caption, "
+        "--image-score, --image-embed, --image-latent, --vision-understanding, or --multimodal")
 
 
 def main():
@@ -1698,33 +1514,13 @@ def main():
     ap.add_argument("--cloud", default="SECURE", choices=["COMMUNITY", "SECURE", "ALL"])
     ap.add_argument("--disk", type=int, default=40)
     ap.add_argument("--name", default="fer-thinking")
-    ap.add_argument("--seeds", default="0,1,2")
-    ap.add_argument("--deep-depth", type=int, default=50, help="kinship deep-tree depth")
     ap.add_argument("--batch", type=int, default=16,
                     help="H100 batch at block 3200 (8-loop backward graph holds 8 LxL attention "
                          "maps per head -- batch 64 OOMs 80GB)")
     ap.add_argument("--train-steps", type=int, default=0, help="override training steps")
-    ap.add_argument("--loops", type=int, default=0, help="latent recursion depth override")
-    ap.add_argument("--neg", action="store_true", help="include the negatives fine-tune pass")
-    ap.add_argument("--fast", action="store_true", help="<20min: image python, trimmed eval")
-    ap.add_argument("--stair", action="store_true",
-                    help="staircase rung A: minimal world, train-names + held-out evals")
-    ap.add_argument("--canon", action="store_true",
-                    help="rung A0: canonical fact surfaces (chain-world conditions)")
+    ap.add_argument("--fast", action="store_true",
+                    help="use image-native python instead of the managed venv")
     ap.add_argument("--dim", type=int, default=0, help="model width override")
-    ap.add_argument("--bank", action="store_true", help="rung B: surface bank + curriculum")
-    ap.add_argument("--no-curriculum", action="store_true", dest="no_curriculum")
-    ap.add_argument("--stair-world", default="kinship", dest="stair_world",
-                    choices=("kinship", "chain"),
-                    help="rung 0 = chain (the baseline-validated task on the production trainer)")
-    ap.add_argument("--no-loop", action="store_true", dest="no_loop",
-                    help="train non-looped (pending the loop-regression ablation verdict)")
-    ap.add_argument("--ablate", action="store_true", help="run the loop ablation first")
-    ap.add_argument("--verbalize", action="store_true", help="train+sample the verbalizer")
-    ap.add_argument("--lang", action="store_true",
-                    help="LANG-1: hybrid-vocab fluency pretraining (reasoning-compatible)")
-    ap.add_argument("--lang-mb", type=int, default=24, dest="lang_mb")
-    ap.add_argument("--lang-ft", type=int, default=6000, dest="lang_ft")
     ap.add_argument("--text-reading", action="store_true", dest="text_reading",
                     help="train thinking.text on raw reading corpora with latent discovery")
     ap.add_argument("--reading-data", action="append",
@@ -3249,50 +3045,9 @@ def main():
                     dest="multimodal_dropout",
                     help="drop full-mode modality prefixes during M-0 training")
     ap.add_argument("--multimodal-eval-n", type=int, default=200, dest="multimodal_eval_n")
-    ap.add_argument("--lengen", action="store_true", help="rung L: depth generalization")
-    ap.add_argument("--deep-ancestor-rule-aux", action="store_true",
-                    help="train the forward ancestor run with rule/action and contrastive losses")
-    ap.add_argument("--run-name", default="runs/deep_ancestor_rule_aux")
-    ap.add_argument("--eval-only-run", default="",
-                    help="skip training; upload this local run dir and run deep-eval only")
-    ap.add_argument("--eval-decodes", default="sample,hybrid",
-                    help="comma-separated deep-eval decoders for --eval-only-run")
-    ap.add_argument("--learning-curve", action="store_true",
-                    help="train fresh rule-aux/no-aux runs at several step budgets")
-    ap.add_argument("--curve-steps", default="1000,2000,4000",
-                    help="comma-separated train step budgets for --learning-curve")
-    ap.add_argument("--curve-arms", default="aux,noaux",
-                    help="comma-separated arms for --learning-curve: aux,noaux")
-    ap.add_argument("--examples", type=int, default=6000)
-    ap.add_argument("--deep-frac", type=float, default=0.6, dest="deep_frac")
-    ap.add_argument("--rule-w", type=float, default=0.1, dest="rule_w")
-    ap.add_argument("--rule-contrast-w", type=float, default=0.05, dest="rule_contrast_w")
-    ap.add_argument("--trace-rank-w", type=float, default=0.0, dest="trace_rank_w",
-                    help="next verifier-action ranking loss weight")
-    ap.add_argument("--trace-rank-batch", type=int, default=0, dest="trace_rank_batch",
-                    help="ranking states per optimizer step")
-    ap.add_argument("--trace-rank-candidates", type=int, default=0,
-                    dest="trace_rank_candidates", help="candidate cap for rank loss/decode")
-    ap.add_argument("--trace-rank-states", type=int, default=0, dest="trace_rank_states",
-                    help="max support/on-policy steps before a rank target")
-    ap.add_argument("--trace-dagger-frac", type=float, default=None, dest="trace_dagger_frac",
-                    help="fraction of rank states reached by model-ranked rollout")
-    ap.add_argument("--eval-depths", default="4,8,16,30,64",
-                    help="comma-separated depths for deep-eval/probe in rule-aux mode")
-    ap.add_argument("--eval-n", type=int, default=20)
-    ap.add_argument("--probe-n", type=int, default=4)
-    ap.add_argument("--sweep", action="store_true", help="also run the chain-world grid")
     ap.add_argument("--max-minutes", type=int, default=150)
     ap.add_argument("--go", action="store_true", help="actually create the pod (spends money)")
     args = ap.parse_args()
-    if isinstance(args.eval_depths, str):
-        args.eval_depths = [int(x.strip()) for x in args.eval_depths.split(",") if x.strip()]
-    if isinstance(args.eval_decodes, str):
-        args.eval_decodes = [x.strip() for x in args.eval_decodes.split(",") if x.strip()]
-    if isinstance(args.curve_steps, str):
-        args.curve_steps = [int(x.strip()) for x in args.curve_steps.split(",") if x.strip()]
-    if isinstance(args.curve_arms, str):
-        args.curve_arms = [x.strip() for x in args.curve_arms.split(",") if x.strip()]
     if args.reading_data and not args.text_reading:
         args.text_reading = True
     try:
@@ -3300,8 +3055,6 @@ def main():
     except ValueError as exc:
         sys.exit(f"ERROR: {exc}")
     if args.text_reading:
-        if args.lang:
-            sys.exit("ERROR: --text-reading cannot be combined with --lang")
         if not args.reading_data:
             sys.exit("ERROR: --text-reading requires --reading-data")
         if args.batch <= 0:
@@ -3506,12 +3259,6 @@ def main():
         base_steps = int(args.train_steps or 800)
         distill_steps = max(1, int(float(base_steps) * float(args.image_flow_distill_frac)))
         args.image_flow_distill_steps = max(int(args.image_flow_distill_steps), distill_steps)
-    bad_decodes = sorted(set(args.eval_decodes) - {"sample", "hybrid", "constrained", "ranker"})
-    if bad_decodes:
-        sys.exit(f"ERROR: unsupported --eval-decodes values: {','.join(bad_decodes)}")
-    bad_arms = sorted(set(args.curve_arms) - {"aux", "noaux"})
-    if bad_arms:
-        sys.exit(f"ERROR: unsupported --curve-arms values: {','.join(bad_arms)}")
     if args.vision_understanding and not (args.image_manifest or args.image_fetch):
         sys.exit("ERROR: --vision-understanding requires --image-manifest or --image-fetch")
     if args.image_latent and not (args.image_manifest or args.image_fetch):
@@ -4257,7 +4004,10 @@ def main():
             "cloudType": args.cloud, "containerDiskInGb": args.disk, "ports": ["22/tcp"],
             "env": {"PUBLIC_KEY": pubkey}}
     cap = args.max_minutes * 60
-    run = payload(args)
+    try:
+        run = payload(args)
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
     image_embed_deps = bool(
         (args.image_embed or args.image_eval_generated)
         and args.image_embed_backend == "hf")
@@ -4313,11 +4063,9 @@ def main():
          f"latent {args.image_latent_arch} {args.image_cond_mode}-conditioned flow"),
         (args.multimodal, "multimodal bridge"),
     ) if enabled]
-    job = " + ".join(image_jobs) if image_jobs else "kinship multi-seed"
-    print("=== PLAN === thinking package on H100: " + job
-          + (" + chain grid" if args.sweep and not args.vision_understanding else ""))
+    job = " + ".join(image_jobs) if image_jobs else "no supported job selected"
+    print("=== PLAN === thinking package on H100: " + job)
     print(f"gpu/cloud : {args.gpu} / {args.cloud}")
-    print(f"seeds     : {args.seeds}")
     print(f"sync up   : {HERE}/ -> pod:{REMOTE}")
     reading_uploads = reading_upload_paths(args) if args.upload_reading_data else []
     if reading_uploads:
@@ -4391,14 +4139,6 @@ def main():
             sh(upload_path_cmd(local_path_for_arg(local), remote_path_for_arg(local), ssh))
         for local in preference_uploads:
             sh(upload_path_cmd(local, local_path_remote_destination(local), ssh))
-        if args.eval_only_run:
-            local_run = os.path.join(HERE, args.eval_only_run)
-            if not os.path.isdir(local_run):
-                raise FileNotFoundError(f"--eval-only-run not found: {local_run}")
-            up_run = (f"COPYFILE_DISABLE=1 tar czf - -C {shlex_quote(HERE)} "
-                      f"{shlex_quote(args.eval_only_run)} "
-                      f"| {ssh} 'mkdir -p {REMOTE} && tar --no-same-owner -xzf - -C {REMOTE}'")
-            sh(up_run)
         # DETACHED execution: nohup on the pod + short-poll. A dropped SSH pipe killed three
         # healthy runs (B7/C6/L) when it took the cost-guard with it -- never hold a session.
         script = remote_cmd + "; touch /root/DONE\n"

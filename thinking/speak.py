@@ -1,9 +1,9 @@
 """A-3 SPEAK: emit a word as audio tokens, VERIFIED BY ROUND-TRIP through the A-2 listener.
 
 This is the thesis applied to generation: we never trust the model's claim that it 'said red'.
-A frozen A-2 Listener transcribes the produced audio and agreement is the checkable signal --
-the audio analog of the Datalog checker validating an emitted line. No human eval, no reference
-waveform distance; the only thing that counts is whether the listener hears the intended word.
+A frozen A-2 Listener transcribes the produced audio and agreement is the checkable signal.
+No human eval, no reference waveform distance; the only thing that counts is whether the listener
+hears the intended word.
 
   speaker: word id -> sequence of acoustic codes -> decoder -> waveform
   codec  : a tiny VQ over real `say` clips (the discrete acoustic-token space from the speech-LM
