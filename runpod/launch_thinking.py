@@ -1862,6 +1862,7 @@ def payload(args):
                 f"--steps {args.train_steps or 400} "
                 f"--batch {args.multimodal_batch} --dim {mm_dim} "
                 f"--layers {args.multimodal_layers} --heads {args.multimodal_heads} "
+                f"--max-vocab {args.multimodal_max_vocab} "
                 f"--lr {args.multimodal_lr} --log-every {args.multimodal_log_every} "
                 f"--decode-w {args.multimodal_decode_w} "
                 f"--agreement-w {args.multimodal_agreement_w} "
@@ -3803,6 +3804,9 @@ def main():
                     help="M-0 decoder width; default uses --dim or 96")
     ap.add_argument("--multimodal-layers", type=int, default=3, dest="multimodal_layers")
     ap.add_argument("--multimodal-heads", type=int, default=4, dest="multimodal_heads")
+    ap.add_argument("--multimodal-max-vocab", type=int, default=0,
+                    dest="multimodal_max_vocab",
+                    help="cap vocab to N most frequent tokens (0 = uncapped)")
     ap.add_argument("--multimodal-batch", type=int, default=32, dest="multimodal_batch")
     ap.add_argument("--multimodal-lr", type=float, default=1e-3, dest="multimodal_lr")
     ap.add_argument("--multimodal-log-every", type=int, default=100,
