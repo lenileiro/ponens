@@ -13428,6 +13428,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     if flow_self_repa_aligner is not None:
         flow_self_repa_aligner.train()
     last_flow = {}
+    flow_decoded_endpoint_microbatches = 0
+    flow_decoded_endpoint_active_microbatches = 0
+    flow_decoded_endpoint_real_target_microbatches = 0
+    flow_decoded_endpoint_codec_target_microbatches = 0
+    flow_decoded_endpoint_cache_target_misses = 0
     flow_preference_steps_run = 0
     flow_preference_skipped = 0
     flow_preference_skip_reason = ""
@@ -13494,6 +13499,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             train_size_buckets, image_bucket_probs, active_size_buckets)
         active_bucket_keys = image_size_bucket_keys(active_size_buckets)
         for _micro in range(flow_accum_steps):
+            decoded_endpoint_cache_target_miss = False
             if flow_cache is not None:
                 z1, cache_payload = sample_latent_cache(
                     flow_cache, rng, batch, device=device,
@@ -13522,6 +13528,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     if decoded_endpoint_active_override:
                         decoded_endpoint_target = cached_decoded_endpoint_target(
                             cache_payload, device=device)
+                        decoded_endpoint_cache_target_miss = (
+                            decoded_endpoint_target is None)
             else:
                 flow_batch = sample_bucketed_image_text_batch(
                     image_records, rng, batch=batch, size_buckets=active_size_buckets,
@@ -13712,6 +13720,24 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     parts["flow_preference_active"] = torch.tensor(0.0, device=z1.device)
                 scaled_loss = loss / float(flow_accum_steps)
             scaler.scale(scaled_loss).backward()
+            if flow_decoded_endpoint_w > 0.0 and flow_decoded_endpoint_p > 0.0:
+                flow_decoded_endpoint_microbatches += 1
+                active = float(
+                    parts.get(
+                        "flow_decoded_endpoint_active",
+                        torch.tensor(0.0, device=z1.device)).detach().cpu())
+                if active > 0.5:
+                    flow_decoded_endpoint_active_microbatches += 1
+                    target_source = float(
+                        parts.get(
+                            "flow_decoded_endpoint_target_source",
+                            torch.tensor(0.0, device=z1.device)).detach().cpu())
+                    if target_source > 0.5:
+                        flow_decoded_endpoint_real_target_microbatches += 1
+                    else:
+                        flow_decoded_endpoint_codec_target_microbatches += 1
+                if decoded_endpoint_cache_target_miss:
+                    flow_decoded_endpoint_cache_target_misses += 1
             last_flow = {"total_loss": float(loss.detach().cpu())}
             last_flow.update({k: float(v.detach().cpu()) for k, v in parts.items()})
             last_flow["time_sampling"] = active_time_sampling
@@ -14145,6 +14171,20 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             flow_decoded_endpoint_patch_structure_w),
         "flow_decoded_endpoint_patch_structure_size": int(
             flow_decoded_endpoint_patch_structure_size),
+        "flow_decoded_endpoint_microbatches": int(
+            flow_decoded_endpoint_microbatches),
+        "flow_decoded_endpoint_active_microbatches": int(
+            flow_decoded_endpoint_active_microbatches),
+        "flow_decoded_endpoint_real_target_microbatches": int(
+            flow_decoded_endpoint_real_target_microbatches),
+        "flow_decoded_endpoint_codec_target_microbatches": int(
+            flow_decoded_endpoint_codec_target_microbatches),
+        "flow_decoded_endpoint_real_target_frac": (
+            float(flow_decoded_endpoint_real_target_microbatches)
+            / float(max(1, flow_decoded_endpoint_active_microbatches))
+        ),
+        "flow_decoded_endpoint_cache_target_misses": int(
+            flow_decoded_endpoint_cache_target_misses),
         "flow_equivariance_w": float(flow_equivariance_w),
         "flow_equivariance_p": float(flow_equivariance_p),
         "flow_equivariance_transforms": list(flow_equivariance_transforms),
@@ -14856,6 +14896,12 @@ def selftest():
         assert math.isclose(report["flow_decoded_endpoint_w"], 0.01)
         assert report["last_flow"]["flow_decoded_endpoint_active"] == 1.0
         assert report["last_flow"]["flow_decoded_endpoint_target_source"] == 1.0
+        assert report["flow_decoded_endpoint_microbatches"] >= 1
+        assert report["flow_decoded_endpoint_active_microbatches"] >= 1
+        assert report["flow_decoded_endpoint_real_target_microbatches"] >= 1
+        assert report["flow_decoded_endpoint_codec_target_microbatches"] == 0
+        assert report["flow_decoded_endpoint_cache_target_misses"] == 0
+        assert report["flow_decoded_endpoint_real_target_frac"] == 1.0
         assert "flow_decoded_endpoint_recon_grad_l1" in report["last_flow"]
         assert "flow_decoded_endpoint_recon_multiscale_l1" in report["last_flow"]
         assert "flow_decoded_endpoint_recon_fft_l1" in report["last_flow"]
