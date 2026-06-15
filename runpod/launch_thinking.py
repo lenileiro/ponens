@@ -713,6 +713,10 @@ def apply_image_quality_preset(args):
             float(args.image_sample_selection_quality_w), 2.0)
         args.image_sample_selection_health_w = max(
             float(args.image_sample_selection_health_w), 1.0)
+        args.image_sample_selection_patch_structure_w = max(
+            float(args.image_sample_selection_patch_structure_w), 1.0)
+        args.image_sample_selection_patch_structure_patch = max(
+            int(args.image_sample_selection_patch_structure_patch), 8)
     args.image_sample_grid = True
     args.image_sample_reference_grid = True
     if not args.image_sample_manifest_out:
@@ -1100,7 +1104,11 @@ def payload(args):
                     f"--sample-selection-quality-w "
                     f"{args.image_sample_selection_quality_w} "
                     f"--sample-selection-health-w "
-                    f"{args.image_sample_selection_health_w}")
+                    f"{args.image_sample_selection_health_w} "
+                    f"--sample-selection-patch-structure-w "
+                    f"{args.image_sample_selection_patch_structure_w} "
+                    f"--sample-selection-patch-structure-patch "
+                    f"{args.image_sample_selection_patch_structure_patch}")
                 if int(args.image_sample_candidates_per_prompt) > 1:
                     prompt_grid_args += (
                         f" --cfg-scales {shlex_quote(args.image_cfg_sweep)} "
@@ -1326,6 +1334,10 @@ def payload(args):
                      f"{args.image_sample_selection_quality_w} "
                      f"--sample-selection-health-w "
                      f"{args.image_sample_selection_health_w} "
+                     f"--sample-selection-patch-structure-w "
+                     f"{args.image_sample_selection_patch_structure_w} "
+                     f"--sample-selection-patch-structure-patch "
+                     f"{args.image_sample_selection_patch_structure_patch} "
                      f"--flow-consistency-w {args.image_flow_consistency_w} "
                      f"--flow-endpoint-w {args.image_flow_endpoint_w} "
                      f"--flow-frequency-w {args.image_flow_frequency_w} "
@@ -1489,6 +1501,10 @@ def payload(args):
                                  f"{args.image_sample_selection_quality_w} "
                                  f"--sample-selection-health-w "
                                  f"{args.image_sample_selection_health_w} "
+                                 f"--sample-selection-patch-structure-w "
+                                 f"{args.image_sample_selection_patch_structure_w} "
+                                 f"--sample-selection-patch-structure-patch "
+                                 f"{args.image_sample_selection_patch_structure_patch} "
                                  f"--eval-text-guidance-weights "
                                  f"{shlex_quote(args.image_eval_text_guidance_sweep)} "
                                  f"--eval-feature-guidance-weights "
@@ -3667,6 +3683,13 @@ def main():
     ap.add_argument("--image-sample-selection-health-w", type=float, default=1.0,
                     dest="image_sample_selection_health_w",
                     help="latent prompt candidate-selection weight for sample health")
+    ap.add_argument("--image-sample-selection-patch-structure-w", type=float,
+                    default=0.0, dest="image_sample_selection_patch_structure_w",
+                    help=("latent prompt candidate-selection weight for generic "
+                          "local patch structure"))
+    ap.add_argument("--image-sample-selection-patch-structure-patch", type=int,
+                    default=8, dest="image_sample_selection_patch_structure_patch",
+                    help="patch size for latent prompt patch-structure selection")
     ap.add_argument("--image-sample-min-finite-frac", type=float, default=None,
                     dest="image_sample_min_finite_frac",
                     help="fail latent sample grid if finite-pixel fraction is below this")
@@ -5145,8 +5168,11 @@ def main():
     if (args.image_sample_selection_text_w < 0.0
             or args.image_sample_selection_feature_w < 0.0
             or args.image_sample_selection_quality_w < 0.0
-            or args.image_sample_selection_health_w < 0.0):
+            or args.image_sample_selection_health_w < 0.0
+            or args.image_sample_selection_patch_structure_w < 0.0):
         sys.exit("ERROR: image sample selection weights must be non-negative")
+    if args.image_sample_selection_patch_structure_patch <= 0:
+        sys.exit("ERROR: --image-sample-selection-patch-structure-patch must be positive")
     if args.image_sample_pixel_dynamic_threshold_percentile > 1.0:
         sys.exit(
             "ERROR: --image-sample-pixel-dynamic-threshold-percentile must be <= 1")

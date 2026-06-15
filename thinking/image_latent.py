@@ -8668,6 +8668,30 @@ def sample_candidate_health_scores(samples, eps=1.0e-8):
     return sample_health_components(samples, eps=eps)["health_score"]
 
 
+@torch.no_grad()
+def sample_candidate_patch_structure_scores(
+        samples, patch=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE):
+    """Return generic local-structure scores for candidate images."""
+    patch = int(patch)
+    if patch <= 0:
+        raise ValueError("patch structure patch size must be positive")
+    if samples.ndim != 4:
+        raise ValueError(
+            f"patch structure candidate scores expect BCHW tensors, got "
+            f"{tuple(samples.shape)}")
+    desc = visual_patch_structure_targets(samples, patch=patch)
+    channels = int(samples.shape[1])
+    color_end = channels * 2
+    edge = desc[..., color_end:color_end + 2].mean(dim=(-1, -2))
+    contrast = desc[..., color_end + 2].mean(dim=-1)
+    detail = desc[..., color_end + 3].mean(dim=-1)
+    variation = desc[..., color_end + 3].std(dim=-1, unbiased=False)
+    score = 0.35 * detail + 0.25 * contrast + 0.25 * edge + 0.15 * variation
+    finite = torch.isfinite(samples).flatten(1).all(dim=1)
+    return torch.where(
+        finite, score.float(), score.new_full(score.shape, -1.0e6).float())
+
+
 def image_reproduction_metrics(reference, candidate, prefix="reference"):
     if reference.shape != candidate.shape:
         raise ValueError(
@@ -8852,7 +8876,9 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
                              text_aligner=None, image_feature_aligner=None,
                              prompt_features=None, quality_scorer=None,
                              selection_text_w=1.0, selection_feature_w=1.0,
-                             selection_quality_w=1.0, selection_health_w=1.0):
+                             selection_quality_w=1.0, selection_health_w=1.0,
+                             selection_patch_structure_w=0.0,
+                             patch_structure_patch=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE):
     candidates_per_prompt = int(candidates_per_prompt)
     if candidates_per_prompt <= 0:
         raise ValueError("candidates_per_prompt must be positive")
@@ -8861,6 +8887,7 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
         "image_feature_aligner": "image_feature_aligner_cosine",
         "quality_scorer": "quality_scorer_score",
         "sample_health": "sample_health_v2",
+        "patch_structure": "patch_structure_prior",
     }
 
     def selection_weight(value, name):
@@ -8878,7 +8905,12 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
             selection_quality_w, "selection_quality_w"),
         "sample_health": selection_weight(
             selection_health_w, "selection_health_w"),
+        "patch_structure": selection_weight(
+            selection_patch_structure_w, "selection_patch_structure_w"),
     }
+    patch_structure_patch = int(patch_structure_patch)
+    if patch_structure_patch <= 0:
+        raise ValueError("patch_structure_patch must be positive")
 
     def label_weights(weights):
         return {
@@ -8917,6 +8949,7 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
     z = None
     health_scores = sample_candidate_health_scores(samples).reshape(
         n, candidates_per_prompt)
+    patch_scores = None
     if text_aligner is not None and selection_weights["text_aligner"] > 0.0:
         text_aligner.eval()
         z = ae.encode(samples)
@@ -8946,6 +8979,10 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
         if z is None:
             z = ae.encode(samples)
         scorers.append(("quality_scorer", quality_scorer.score(z).float()))
+    if selection_weights["patch_structure"] > 0.0:
+        patch_scores = sample_candidate_patch_structure_scores(
+            samples, patch=patch_structure_patch).reshape(n, candidates_per_prompt)
+        scorers.append(("patch_structure", patch_scores.reshape(-1)))
     if not scorers:
         health_weight = selection_weights["sample_health"]
         if health_weight <= 0.0:
@@ -9028,6 +9065,17 @@ def select_prompt_candidates(ae, samples, cond, prompts, candidates_per_prompt=1
         "sample_grid_selection_candidate_health_max": float(
             health_scores.max().detach().cpu()),
     }
+    if patch_scores is not None:
+        selection_meta.update({
+            "sample_grid_selection_patch_structure_scores": matrix_list(patch_scores),
+            "sample_grid_selection_patch_structure_patch": int(patch_structure_patch),
+            "sample_grid_selection_candidate_patch_structure_mean": float(
+                patch_scores.mean().detach().cpu()),
+            "sample_grid_selection_candidate_patch_structure_min": float(
+                patch_scores.min().detach().cpu()),
+            "sample_grid_selection_candidate_patch_structure_max": float(
+                patch_scores.max().detach().cpu()),
+        })
     for name, score, weight in component_scores:
         selected_scores = score.gather(1, best[:, None]).squeeze(1)
         selection_meta[f"sample_grid_selection_{name}_weight"] = float(weight)
@@ -9415,6 +9463,9 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                                  sample_selection_feature_w=1.0,
                                  sample_selection_quality_w=1.0,
                                  sample_selection_health_w=1.0,
+                                 sample_selection_patch_structure_w=0.0,
+                                 sample_selection_patch_structure_patch=(
+                                     DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE),
                                  text_guidance_w=0.0,
                                  text_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                                  feature_guidance_w=0.0,
@@ -9551,7 +9602,9 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         selection_text_w=sample_selection_text_w,
         selection_feature_w=sample_selection_feature_w,
         selection_quality_w=sample_selection_quality_w,
-        selection_health_w=sample_selection_health_w)
+        selection_health_w=sample_selection_health_w,
+        selection_patch_structure_w=sample_selection_patch_structure_w,
+        patch_structure_patch=sample_selection_patch_structure_patch)
     n = len(prompts)
     cols = int(np.ceil(np.sqrt(n)))
     rows = int(np.ceil(n / cols))
@@ -9624,6 +9677,10 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         "sample_grid_selection_feature_w": float(sample_selection_feature_w),
         "sample_grid_selection_quality_w": float(sample_selection_quality_w),
         "sample_grid_selection_health_w": float(sample_selection_health_w),
+        "sample_grid_selection_patch_structure_w": float(
+            sample_selection_patch_structure_w),
+        "sample_grid_selection_patch_structure_patch": int(
+            sample_selection_patch_structure_patch),
         "sample_grid_prompt_embed_backend": (
             prompt_embed_backend if caption_cond_source == "embedding" else ""
         ),
@@ -9653,6 +9710,8 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         selection_scores = selection_meta.get("sample_grid_selection_scores", [])
         selection_health_scores = selection_meta.get(
             "sample_grid_selection_health_scores", [])
+        selection_patch_scores = selection_meta.get(
+            "sample_grid_selection_patch_structure_scores", [])
         prompt_text_embeddings = None
         if caption_cond_source == "embedding" and torch.is_tensor(prompt_features):
             prompt_text_embeddings = (
@@ -9695,6 +9754,11 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                         float(selection_health_scores[prompt_idx][candidate_idx])
                         if prompt_idx < len(selection_health_scores)
                         and candidate_idx < len(selection_health_scores[prompt_idx])
+                        else 0.0),
+                    "sample_patch_structure_score": (
+                        float(selection_patch_scores[prompt_idx][candidate_idx])
+                        if prompt_idx < len(selection_patch_scores)
+                        and candidate_idx < len(selection_patch_scores[prompt_idx])
                         else 0.0),
                     "sample_selection_scorer": selection_meta.get(
                         "sample_grid_selection_scorer", "none"),
@@ -9748,6 +9812,8 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         selection_scores = selection_meta.get("sample_grid_selection_scores", [])
         selection_health_scores = selection_meta.get(
             "sample_grid_selection_health_scores", [])
+        selection_patch_scores = selection_meta.get(
+            "sample_grid_selection_patch_structure_scores", [])
         row_meta = []
         for idx, prompt in enumerate(prompts):
             selected_idx = int(selected[idx]) if idx < len(selected) else 0
@@ -9760,6 +9826,10 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                 float(selection_health_scores[idx][selected_idx])
                 if idx < len(selection_health_scores)
                 and selected_idx < len(selection_health_scores[idx]) else 0.0)
+            selected_patch_score = (
+                float(selection_patch_scores[idx][selected_idx])
+                if idx < len(selection_patch_scores)
+                and selected_idx < len(selection_patch_scores[idx]) else 0.0)
             row_meta.append({
                 "conditioning_mode": "prompt",
                 "conditioning_prompt": prompt,
@@ -9778,6 +9848,7 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                 "sample_candidate_sweep_mode": "cyclic",
                 "sample_selection_score": selected_score,
                 "sample_health_score": selected_health,
+                "sample_patch_structure_score": selected_patch_score,
                 "sample_selection_scorer": selection_meta.get(
                     "sample_grid_selection_scorer", "none"),
                 "sample_pixel_dynamic_threshold_percentile": float(
@@ -9836,6 +9907,9 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                            sample_selection_feature_w=1.0,
                            sample_selection_quality_w=1.0,
                            sample_selection_health_w=1.0,
+                           sample_selection_patch_structure_w=0.0,
+                           sample_selection_patch_structure_patch=(
+                               DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE),
                            sample_finite_guard=False, sample_velocity_clip=0.0,
                            sample_latent_clip=0.0, cfg_mode="standard"):
     rng = np.random.default_rng(seed)
@@ -9865,10 +9939,15 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
     sample_selection_feature_w = float(sample_selection_feature_w)
     sample_selection_quality_w = float(sample_selection_quality_w)
     sample_selection_health_w = float(sample_selection_health_w)
+    sample_selection_patch_structure_w = float(sample_selection_patch_structure_w)
+    sample_selection_patch_structure_patch = int(sample_selection_patch_structure_patch)
     if (sample_selection_text_w < 0.0 or sample_selection_feature_w < 0.0
             or sample_selection_quality_w < 0.0
-            or sample_selection_health_w < 0.0):
+            or sample_selection_health_w < 0.0
+            or sample_selection_patch_structure_w < 0.0):
         raise ValueError("sample selection weights must be non-negative")
+    if sample_selection_patch_structure_patch <= 0:
+        raise ValueError("sample_selection_patch_structure_patch must be positive")
     if text_guidance_w < 0.0:
         raise ValueError("text_guidance_w must be non-negative")
     if text_guidance_w > 0.0 and text_aligner is None:
@@ -10019,7 +10098,9 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
             selection_text_w=sample_selection_text_w,
             selection_feature_w=sample_selection_feature_w,
             selection_quality_w=sample_selection_quality_w,
-            selection_health_w=sample_selection_health_w)
+            selection_health_w=sample_selection_health_w,
+            selection_patch_structure_w=sample_selection_patch_structure_w,
+            patch_structure_patch=sample_selection_patch_structure_patch)
         sample_parts.append(chunk_sample)
         sample_trace = merge_sample_traces(sample_trace, chunk_trace)
         sample_x_parts.append(chunk_x)
@@ -10075,6 +10156,10 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         "generated_eval_selection_feature_w": float(sample_selection_feature_w),
         "generated_eval_selection_quality_w": float(sample_selection_quality_w),
         "generated_eval_selection_health_w": float(sample_selection_health_w),
+        "generated_eval_selection_patch_structure_w": float(
+            sample_selection_patch_structure_w),
+        "generated_eval_selection_patch_structure_patch": int(
+            sample_selection_patch_structure_patch),
         "generated_eval_selection_component_count": int(selection_component_count),
         "generated_eval_selected_candidate_indices": selected_candidate_indices,
         "generated_eval_selection_score_mean": (
@@ -10815,6 +10900,9 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                        sample_selection_feature_w=1.0,
                        sample_selection_quality_w=1.0,
                        sample_selection_health_w=1.0,
+                       sample_selection_patch_structure_w=0.0,
+                       sample_selection_patch_structure_patch=(
+                           DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE),
                        sample_finite_guard=False, sample_velocity_clip=0.0,
                        sample_latent_clip=0.0):
     if sample_methods is None:
@@ -10848,10 +10936,15 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
     sample_selection_feature_w = float(sample_selection_feature_w)
     sample_selection_quality_w = float(sample_selection_quality_w)
     sample_selection_health_w = float(sample_selection_health_w)
+    sample_selection_patch_structure_w = float(sample_selection_patch_structure_w)
+    sample_selection_patch_structure_patch = int(sample_selection_patch_structure_patch)
     if (sample_selection_text_w < 0.0 or sample_selection_feature_w < 0.0
             or sample_selection_quality_w < 0.0
-            or sample_selection_health_w < 0.0):
+            or sample_selection_health_w < 0.0
+            or sample_selection_patch_structure_w < 0.0):
         raise ValueError("sample selection weights must be non-negative")
+    if sample_selection_patch_structure_patch <= 0:
+        raise ValueError("sample_selection_patch_structure_patch must be positive")
     rows = []
     for cfg_scale in cfg_scales:
         for cfg_rescale in cfg_rescales:
@@ -10905,6 +10998,10 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                                                         sample_selection_quality_w),
                                                     sample_selection_health_w=(
                                                         sample_selection_health_w),
+                                                    sample_selection_patch_structure_w=(
+                                                        sample_selection_patch_structure_w),
+                                                    sample_selection_patch_structure_patch=(
+                                                        sample_selection_patch_structure_patch),
                                                     sample_finite_guard=sample_finite_guard,
                                                     sample_velocity_clip=sample_velocity_clip,
                                                     sample_latent_clip=sample_latent_clip)
@@ -10937,6 +11034,10 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                                                     f"{float(sample_selection_quality_w):g};"
                                                     f"select_health="
                                                     f"{float(sample_selection_health_w):g};"
+                                                    f"select_patch="
+                                                    f"{float(sample_selection_patch_structure_w):g};"
+                                                    f"patch="
+                                                    f"{int(sample_selection_patch_structure_patch)};"
                                                     f"cfgint={format_interval(cfg_interval)};"
                                                     f"textint="
                                                     f"{format_interval(text_guidance_interval)};"
@@ -10988,9 +11089,15 @@ SWEEP_METRICS = (
     "generated_eval_raw_candidates",
     "generated_eval_selection_component_count",
     "generated_eval_selection_score_mean",
+    "generated_eval_selection_patch_structure_w",
+    "generated_eval_selection_patch_structure_patch",
     "generated_eval_selection_text_aligner_mean",
     "generated_eval_selection_image_feature_aligner_mean",
     "generated_eval_selection_quality_scorer_mean",
+    "generated_eval_selection_patch_structure_mean",
+    "generated_eval_selection_candidate_patch_structure_mean",
+    "generated_eval_selection_candidate_patch_structure_min",
+    "generated_eval_selection_candidate_patch_structure_max",
     "sample_center_target_mse",
     "sample_finite_frac",
     "sample_nonfinite_frac",
@@ -11130,6 +11237,17 @@ def eval_report_summary(report):
         "generated_eval_candidates_per_prompt",
         "generated_eval_raw_candidates",
         "generated_eval_selection_component_count",
+        "generated_eval_selection_score_mean",
+        "generated_eval_selection_text_w",
+        "generated_eval_selection_feature_w",
+        "generated_eval_selection_quality_w",
+        "generated_eval_selection_health_w",
+        "generated_eval_selection_patch_structure_w",
+        "generated_eval_selection_patch_structure_patch",
+        "generated_eval_selection_patch_structure_mean",
+        "generated_eval_selection_candidate_patch_structure_mean",
+        "generated_eval_selection_candidate_patch_structure_min",
+        "generated_eval_selection_candidate_patch_structure_max",
         "sample_time_shift",
         "time_shift",
         "sample_method",
@@ -11245,6 +11363,13 @@ def aggregate_sweep_rows(rows):
                tuple(float(x) for x in row.get("quality_guidance_interval",
                                                 DEFAULT_GUIDANCE_INTERVAL)),
                int(row.get("generated_eval_candidates_per_prompt", 1)),
+               float(row.get("generated_eval_selection_text_w", 1.0)),
+               float(row.get("generated_eval_selection_feature_w", 1.0)),
+               float(row.get("generated_eval_selection_quality_w", 1.0)),
+               float(row.get("generated_eval_selection_health_w", 1.0)),
+               float(row.get("generated_eval_selection_patch_structure_w", 0.0)),
+               int(row.get("generated_eval_selection_patch_structure_patch",
+                           DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE)),
                bool(row.get("sample_finite_guard", False)),
                float(row.get("sample_velocity_clip", 0.0)),
                float(row.get("sample_latent_clip", 0.0)))
@@ -11258,6 +11383,9 @@ def aggregate_sweep_rows(rows):
          feature_guidance_w, feature_guidance_interval,
          quality_guidance_w, quality_guidance_interval,
          generated_eval_candidates_per_prompt,
+         selection_text_w, selection_feature_w, selection_quality_w,
+         selection_health_w, selection_patch_structure_w,
+         selection_patch_structure_patch,
          sample_finite_guard, sample_velocity_clip, sample_latent_clip), group in sorted(
              grouped.items()):
         agg = {
@@ -11271,6 +11399,12 @@ def aggregate_sweep_rows(rows):
                 f"feature={feature_guidance_w:g};"
                 f"quality={quality_guidance_w:g};"
                 f"candidates={int(generated_eval_candidates_per_prompt)};"
+                f"select_text={selection_text_w:g};"
+                f"select_feature={selection_feature_w:g};"
+                f"select_quality={selection_quality_w:g};"
+                f"select_health={selection_health_w:g};"
+                f"select_patch={selection_patch_structure_w:g};"
+                f"patch={int(selection_patch_structure_patch)};"
                 f"finiteguard={int(bool(sample_finite_guard))};"
                 f"vclip={sample_velocity_clip:g};"
                 f"zclip={sample_latent_clip:g};"
@@ -11298,6 +11432,14 @@ def aggregate_sweep_rows(rows):
             "quality_guidance_interval": list(quality_guidance_interval),
             "generated_eval_candidates_per_prompt": int(
                 generated_eval_candidates_per_prompt),
+            "generated_eval_selection_text_w": float(selection_text_w),
+            "generated_eval_selection_feature_w": float(selection_feature_w),
+            "generated_eval_selection_quality_w": float(selection_quality_w),
+            "generated_eval_selection_health_w": float(selection_health_w),
+            "generated_eval_selection_patch_structure_w": float(
+                selection_patch_structure_w),
+            "generated_eval_selection_patch_structure_patch": int(
+                selection_patch_structure_patch),
             "sample_finite_guard": bool(sample_finite_guard),
             "sample_velocity_clip": float(sample_velocity_clip),
             "sample_latent_clip": float(sample_latent_clip),
@@ -11342,6 +11484,9 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         sample_selection_feature_w=1.0,
                         sample_selection_quality_w=1.0,
                         sample_selection_health_w=1.0,
+                        sample_selection_patch_structure_w=0.0,
+                        sample_selection_patch_structure_patch=(
+                            DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE),
                         sample_finite_guard=False, sample_velocity_clip=0.0,
                         sample_latent_clip=0.0):
     if weight_mode is None:
@@ -11374,6 +11519,8 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
     sample_selection_feature_w = float(sample_selection_feature_w)
     sample_selection_quality_w = float(sample_selection_quality_w)
     sample_selection_health_w = float(sample_selection_health_w)
+    sample_selection_patch_structure_w = float(sample_selection_patch_structure_w)
+    sample_selection_patch_structure_patch = int(sample_selection_patch_structure_patch)
     if any(w < 0.0 for w in text_guidance_weights):
         raise ValueError("text guidance weights must be non-negative")
     if any(w < 0.0 for w in feature_guidance_weights):
@@ -11382,8 +11529,11 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
         raise ValueError("quality guidance weights must be non-negative")
     if (sample_selection_text_w < 0.0 or sample_selection_feature_w < 0.0
             or sample_selection_quality_w < 0.0
-            or sample_selection_health_w < 0.0):
+            or sample_selection_health_w < 0.0
+            or sample_selection_patch_structure_w < 0.0):
         raise ValueError("sample selection weights must be non-negative")
+    if sample_selection_patch_structure_patch <= 0:
+        raise ValueError("sample_selection_patch_structure_patch must be positive")
     if generated_eval_n < 0:
         raise ValueError("generated_eval_n must be non-negative")
     if generated_eval_candidates_per_prompt <= 0:
@@ -11453,6 +11603,10 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                     sample_selection_feature_w=sample_selection_feature_w,
                     sample_selection_quality_w=sample_selection_quality_w,
                     sample_selection_health_w=sample_selection_health_w,
+                    sample_selection_patch_structure_w=(
+                        sample_selection_patch_structure_w),
+                    sample_selection_patch_structure_patch=(
+                        sample_selection_patch_structure_patch),
                     sample_finite_guard=sample_finite_guard,
                     sample_velocity_clip=sample_velocity_clip,
                     sample_latent_clip=sample_latent_clip):
@@ -11497,6 +11651,10 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             "quality_guidance_weights": [float(x) for x in quality_guidance_weights],
             "quality_guidance_interval": list(validate_guidance_interval(
                 quality_guidance_interval, name="quality_guidance_interval")),
+            "sample_selection_patch_structure_w": float(
+                sample_selection_patch_structure_w),
+            "sample_selection_patch_structure_patch": int(
+                sample_selection_patch_structure_patch),
             "eval_seeds": [int(s) for s in eval_seeds],
             "eval_image_manifest": manifest_path,
             "eval_image_root": image_root,
@@ -11689,6 +11847,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       sample_selection_feature_w=1.0,
                       sample_selection_quality_w=1.0,
                       sample_selection_health_w=1.0,
+                      sample_selection_patch_structure_w=0.0,
+                      sample_selection_patch_structure_patch=(
+                          DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE),
                       train_precision="fp32", ae_accum_steps=1, flow_accum_steps=1,
                       grad_clip=0.0,
                       flow_cache_latents=False, flow_cache_records=0, flow_cache_batch=64,
@@ -12055,10 +12216,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     sample_selection_feature_w = float(sample_selection_feature_w)
     sample_selection_quality_w = float(sample_selection_quality_w)
     sample_selection_health_w = float(sample_selection_health_w)
+    sample_selection_patch_structure_w = float(sample_selection_patch_structure_w)
+    sample_selection_patch_structure_patch = int(sample_selection_patch_structure_patch)
     if (sample_selection_text_w < 0.0 or sample_selection_feature_w < 0.0
             or sample_selection_quality_w < 0.0
-            or sample_selection_health_w < 0.0):
+            or sample_selection_health_w < 0.0
+            or sample_selection_patch_structure_w < 0.0):
         raise ValueError("sample selection weights must be non-negative")
+    if sample_selection_patch_structure_patch <= 0:
+        raise ValueError("sample_selection_patch_structure_patch must be positive")
     cfg_interval = validate_guidance_interval(cfg_interval, name="cfg_interval")
     if dit_head_width_mult <= 0:
         raise ValueError("dit_head_width_mult must be positive")
@@ -13143,6 +13309,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             sample_selection_feature_w=sample_selection_feature_w,
             sample_selection_quality_w=sample_selection_quality_w,
             sample_selection_health_w=sample_selection_health_w,
+            sample_selection_patch_structure_w=sample_selection_patch_structure_w,
+            sample_selection_patch_structure_patch=sample_selection_patch_structure_patch,
             sample_finite_guard=sample_finite_guard,
             sample_velocity_clip=sample_velocity_clip,
             sample_latent_clip=sample_latent_clip)
@@ -13426,6 +13594,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "sample_selection_feature_w": float(sample_selection_feature_w),
         "sample_selection_quality_w": float(sample_selection_quality_w),
         "sample_selection_health_w": float(sample_selection_health_w),
+        "sample_selection_patch_structure_w": float(sample_selection_patch_structure_w),
+        "sample_selection_patch_structure_patch": int(sample_selection_patch_structure_patch),
         "weight_eval_candidates": {
             mode: eval_report_summary(candidate)
             for mode, candidate in candidate_reports.items()
@@ -13911,6 +14081,21 @@ def selftest():
         assert health_only_meta["sample_grid_selection_component_count"] == 1
         assert health_only_meta["sample_grid_selection_component_weights"][
             "sample_health_v2"] == 1.0
+        _patch_only_pixels, patch_only_meta = select_prompt_candidates(
+            _IdentityAE(), candidate_pixels, None, ("prompt a", "prompt b"),
+            candidates_per_prompt=2, quality_scorer=_FlatQualityScorer(),
+            selection_quality_w=0.0, selection_health_w=0.0,
+            selection_patch_structure_w=1.0, patch_structure_patch=4)
+        assert "patch_structure_prior" in patch_only_meta["sample_grid_selection_scorer"]
+        assert patch_only_meta["sample_grid_selection_component_count"] == 1
+        assert patch_only_meta["sample_grid_selection_component_weights"][
+            "patch_structure_prior"] == 1.0
+        assert len(patch_only_meta["sample_grid_selection_patch_structure_scores"]) == 2
+        for prompt_idx, chosen_idx in enumerate(
+                patch_only_meta["sample_grid_selected_candidate_indices"]):
+            patch_row = patch_only_meta[
+                "sample_grid_selection_patch_structure_scores"][prompt_idx]
+            assert patch_row[int(chosen_idx)] == max(patch_row)
         structure_aligner = FlowFeatureAligner(
             hidden_dim=6, feature_dim=3, hidden=8, embed_dim=4)
         structure_loss, structure_parts = flow_hidden_feature_structure_loss(
@@ -14254,12 +14439,14 @@ def selftest():
         assert len(candidate_rows) == 2
         assert "sample_selection_score" in candidate_rows[0]
         assert "sample_health_score" in candidate_rows[0]
+        assert "sample_patch_structure_score" in candidate_rows[0]
         assert "sample_selection_scorer" in candidate_rows[0]
         with open(reload_selected_path, encoding="utf-8") as f:
             selected_rows = [json.loads(line) for line in f if line.strip()]
         assert len(selected_rows) == 1
         assert "sample_selection_score" in selected_rows[0]
         assert "sample_health_score" in selected_rows[0]
+        assert "sample_patch_structure_score" in selected_rows[0]
         assert os.path.exists(reload_sample_path)
         _ae2, _flow2, _cond2, _vocab2, resumed = train_latent_flow(
             ae_steps=0, flow_steps=1, batch=2, latent_ch=4, hidden=16,
@@ -15050,6 +15237,14 @@ def main(argv=None):
     ap.add_argument("--sample-selection-health-w", type=float, default=1.0,
                     dest="sample_selection_health_w",
                     help="candidate-selection weight for sample health guardrail score")
+    ap.add_argument("--sample-selection-patch-structure-w", type=float, default=0.0,
+                    dest="sample_selection_patch_structure_w",
+                    help=("candidate-selection weight for generic local "
+                          "patch-structure prior score"))
+    ap.add_argument("--sample-selection-patch-structure-patch", type=int,
+                    default=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE,
+                    dest="sample_selection_patch_structure_patch",
+                    help="patch size for --sample-selection-patch-structure-w")
     ap.add_argument("--sample-text-guidance-w", type=float, default=0.0,
                     dest="sample_text_guidance_w",
                     help=("sampling-time text-image alignment guidance weight for "
@@ -15211,8 +15406,11 @@ def main(argv=None):
     if (args.sample_selection_text_w < 0.0
             or args.sample_selection_feature_w < 0.0
             or args.sample_selection_quality_w < 0.0
-            or args.sample_selection_health_w < 0.0):
+            or args.sample_selection_health_w < 0.0
+            or args.sample_selection_patch_structure_w < 0.0):
         ap.error("sample selection weights must be non-negative")
+    if args.sample_selection_patch_structure_patch <= 0:
+        ap.error("--sample-selection-patch-structure-patch must be positive")
     if args.eval_generated_samples < 0:
         ap.error("--eval-generated-samples must be non-negative")
     if args.eval_generated_candidates_per_prompt <= 0:
@@ -15518,6 +15716,9 @@ def main(argv=None):
             sample_selection_feature_w=args.sample_selection_feature_w,
             sample_selection_quality_w=args.sample_selection_quality_w,
             sample_selection_health_w=args.sample_selection_health_w,
+            sample_selection_patch_structure_w=args.sample_selection_patch_structure_w,
+            sample_selection_patch_structure_patch=(
+                args.sample_selection_patch_structure_patch),
             sample_finite_guard=args.sample_finite_guard,
             sample_velocity_clip=args.sample_velocity_clip,
             sample_latent_clip=args.sample_latent_clip,
@@ -15583,6 +15784,10 @@ def main(argv=None):
                     sample_selection_feature_w=args.sample_selection_feature_w,
                     sample_selection_quality_w=args.sample_selection_quality_w,
                     sample_selection_health_w=args.sample_selection_health_w,
+                    sample_selection_patch_structure_w=(
+                        args.sample_selection_patch_structure_w),
+                    sample_selection_patch_structure_patch=(
+                        args.sample_selection_patch_structure_patch),
                     text_guidance_w=args.sample_text_guidance_w,
                     text_guidance_interval=sample_text_guidance_interval,
                     feature_guidance_w=args.sample_feature_guidance_w,
@@ -15921,6 +16126,8 @@ def main(argv=None):
         sample_selection_feature_w=args.sample_selection_feature_w,
         sample_selection_quality_w=args.sample_selection_quality_w,
         sample_selection_health_w=args.sample_selection_health_w,
+        sample_selection_patch_structure_w=args.sample_selection_patch_structure_w,
+        sample_selection_patch_structure_patch=args.sample_selection_patch_structure_patch,
         train_precision=args.train_precision,
         ae_accum_steps=args.ae_accum_steps,
         flow_accum_steps=args.flow_accum_steps,
@@ -15994,6 +16201,10 @@ def main(argv=None):
                 sample_selection_feature_w=args.sample_selection_feature_w,
                 sample_selection_quality_w=args.sample_selection_quality_w,
                 sample_selection_health_w=args.sample_selection_health_w,
+                sample_selection_patch_structure_w=(
+                    args.sample_selection_patch_structure_w),
+                sample_selection_patch_structure_patch=(
+                    args.sample_selection_patch_structure_patch),
                 text_guidance_w=args.sample_text_guidance_w,
                 text_guidance_interval=sample_text_guidance_interval,
                 feature_guidance_w=args.sample_feature_guidance_w,
@@ -16338,6 +16549,8 @@ def main(argv=None):
         "sample_selection_feature_w": args.sample_selection_feature_w,
         "sample_selection_quality_w": args.sample_selection_quality_w,
         "sample_selection_health_w": args.sample_selection_health_w,
+        "sample_selection_patch_structure_w": args.sample_selection_patch_structure_w,
+        "sample_selection_patch_structure_patch": args.sample_selection_patch_structure_patch,
         "sample_finite_guard": args.sample_finite_guard,
         "sample_velocity_clip": args.sample_velocity_clip,
         "sample_latent_clip": args.sample_latent_clip,
