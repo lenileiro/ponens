@@ -649,6 +649,12 @@ def apply_image_quality_preset(args):
         0.25 if hq else 0.1)
     args.image_flow_decoded_endpoint_patch_structure_size = max(
         int(args.image_flow_decoded_endpoint_patch_structure_size), 8)
+    args.image_flow_decoded_endpoint_warmup_frac = max(
+        float(args.image_flow_decoded_endpoint_warmup_frac), 0.35 if hq else 0.2)
+    args.image_flow_decoded_endpoint_warmup_w_mult = max(
+        float(args.image_flow_decoded_endpoint_warmup_w_mult), 3.0 if hq else 2.0)
+    args.image_flow_decoded_endpoint_warmup_p = max(
+        float(args.image_flow_decoded_endpoint_warmup_p), 1.0 if hq else 0.5)
     args.image_flow_equivariance_w = max(
         float(args.image_flow_equivariance_w), 0.02 if hq else 0.01)
     image_flow_equivariance_p = (
@@ -1433,6 +1439,12 @@ def payload(args):
                      f"{args.image_flow_decoded_endpoint_patch_structure_w} "
                      f"--flow-decoded-endpoint-patch-structure-size "
                      f"{args.image_flow_decoded_endpoint_patch_structure_size} "
+                     f"--flow-decoded-endpoint-warmup-frac "
+                     f"{args.image_flow_decoded_endpoint_warmup_frac} "
+                     f"--flow-decoded-endpoint-warmup-w-mult "
+                     f"{args.image_flow_decoded_endpoint_warmup_w_mult} "
+                     f"--flow-decoded-endpoint-warmup-p "
+                     f"{args.image_flow_decoded_endpoint_warmup_p} "
                      f"--flow-equivariance-w {args.image_flow_equivariance_w} "
                      f"--flow-equivariance-p {args.image_flow_equivariance_p} "
                      f"--flow-equivariance-transforms "
@@ -3955,6 +3967,21 @@ def main():
                     dest="image_flow_decoded_endpoint_patch_structure_size",
                     help=("patch size for "
                           "--image-flow-decoded-endpoint-patch-structure-w"))
+    ap.add_argument("--image-flow-decoded-endpoint-warmup-frac",
+                    type=float, default=0.0,
+                    dest="image_flow_decoded_endpoint_warmup_frac",
+                    help=("fraction of image flow training that uses stronger "
+                          "decoded endpoint supervision"))
+    ap.add_argument("--image-flow-decoded-endpoint-warmup-w-mult",
+                    type=float, default=1.0,
+                    dest="image_flow_decoded_endpoint_warmup_w_mult",
+                    help=("initial decoded endpoint weight multiplier for the "
+                          "warmup curriculum"))
+    ap.add_argument("--image-flow-decoded-endpoint-warmup-p",
+                    type=float, default=-1.0,
+                    dest="image_flow_decoded_endpoint_warmup_p",
+                    help=("initial decoded endpoint supervision probability during "
+                          "warmup; negative uses base probability"))
     ap.add_argument("--image-flow-equivariance-w", type=float, default=0.0,
                     dest="image_flow_equivariance_w",
                     help=("spatial equivariance loss weight for image flow "
@@ -4963,6 +4990,16 @@ def main():
     if args.image_flow_decoded_endpoint_patch_structure_size <= 0:
         sys.exit(
             "ERROR: --image-flow-decoded-endpoint-patch-structure-size must be positive")
+    if (args.image_flow_decoded_endpoint_warmup_frac < 0.0
+            or args.image_flow_decoded_endpoint_warmup_frac > 1.0):
+        sys.exit(
+            "ERROR: --image-flow-decoded-endpoint-warmup-frac must be in [0, 1]")
+    if args.image_flow_decoded_endpoint_warmup_w_mult < 1.0:
+        sys.exit(
+            "ERROR: --image-flow-decoded-endpoint-warmup-w-mult must be >= 1")
+    if args.image_flow_decoded_endpoint_warmup_p > 1.0:
+        sys.exit(
+            "ERROR: --image-flow-decoded-endpoint-warmup-p must be <= 1")
     if args.image_flow_equivariance_w < 0.0:
         sys.exit("ERROR: --image-flow-equivariance-w must be non-negative")
     if args.image_flow_equivariance_p < 0.0 or args.image_flow_equivariance_p > 1.0:

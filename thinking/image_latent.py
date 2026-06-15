@@ -523,6 +523,36 @@ def fractional_active_steps(total_steps, frac=0.0, name="frac"):
     return min(steps, max(1, int(math.ceil(float(steps) * frac))))
 
 
+def decoded_endpoint_curriculum_values(base_w, base_p, flow_step=0, flow_steps=0,
+                                       warmup_frac=0.0, warmup_w_mult=1.0,
+                                       warmup_p=-1.0):
+    base_w = float(base_w)
+    base_p = float(base_p)
+    warmup_frac = float(warmup_frac)
+    warmup_w_mult = float(warmup_w_mult)
+    warmup_p = float(warmup_p)
+    if base_w < 0.0:
+        raise ValueError("base decoded endpoint weight must be non-negative")
+    if base_p < 0.0 or base_p > 1.0:
+        raise ValueError("base decoded endpoint probability must be in [0, 1]")
+    if warmup_frac < 0.0 or warmup_frac > 1.0:
+        raise ValueError("flow_decoded_endpoint_warmup_frac must be in [0, 1]")
+    if warmup_w_mult < 1.0:
+        raise ValueError("flow_decoded_endpoint_warmup_w_mult must be >= 1")
+    if warmup_p > 1.0:
+        raise ValueError("flow_decoded_endpoint_warmup_p must be <= 1")
+    if warmup_p < 0.0:
+        warmup_p = base_p
+    active_steps = fractional_active_steps(
+        flow_steps, warmup_frac, name="flow_decoded_endpoint_warmup_frac")
+    if base_w <= 0.0 or active_steps <= 0 or int(flow_step) >= active_steps:
+        return base_w, base_p, active_steps
+    remaining = float(active_steps - int(flow_step)) / float(max(1, active_steps))
+    active_w = base_w * (1.0 + (warmup_w_mult - 1.0) * remaining)
+    active_p = base_p + (max(base_p, warmup_p) - base_p) * remaining
+    return float(active_w), float(min(1.0, max(0.0, active_p))), active_steps
+
+
 def size_curriculum_bucket_order(size_buckets):
     buckets = tuple(size_buckets)
     return tuple(sorted(
@@ -12279,6 +12309,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       flow_decoded_endpoint_patch_structure_w=0.0,
                       flow_decoded_endpoint_patch_structure_size=(
                           DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE),
+                      flow_decoded_endpoint_warmup_frac=0.0,
+                      flow_decoded_endpoint_warmup_w_mult=1.0,
+                      flow_decoded_endpoint_warmup_p=-1.0,
                       flow_equivariance_w=0.0, flow_equivariance_p=1.0,
                       flow_equivariance_transforms=DEFAULT_FLOW_EQUIVARIANCE_TRANSFORMS,
                       flow_equivariance_shift_frac=0.125,
@@ -12654,6 +12687,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         flow_decoded_endpoint_patch_structure_w)
     flow_decoded_endpoint_patch_structure_size = int(
         flow_decoded_endpoint_patch_structure_size)
+    flow_decoded_endpoint_warmup_frac = float(flow_decoded_endpoint_warmup_frac)
+    flow_decoded_endpoint_warmup_w_mult = float(flow_decoded_endpoint_warmup_w_mult)
+    flow_decoded_endpoint_warmup_p = float(flow_decoded_endpoint_warmup_p)
     train_progress_out = str(train_progress_out or "")
     train_progress_interval = max(0, int(train_progress_interval or 0))
     if flow_decoded_endpoint_w < 0.0:
@@ -12669,6 +12705,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("flow decoded endpoint component weights must be non-negative")
     if flow_decoded_endpoint_patch_structure_size <= 0:
         raise ValueError("flow_decoded_endpoint_patch_structure_size must be positive")
+    if (flow_decoded_endpoint_warmup_frac < 0.0
+            or flow_decoded_endpoint_warmup_frac > 1.0):
+        raise ValueError("flow_decoded_endpoint_warmup_frac must be in [0, 1]")
+    if flow_decoded_endpoint_warmup_w_mult < 1.0:
+        raise ValueError("flow_decoded_endpoint_warmup_w_mult must be >= 1")
+    if flow_decoded_endpoint_warmup_p > 1.0:
+        raise ValueError("flow_decoded_endpoint_warmup_p must be <= 1")
     flow_equivariance_w = float(flow_equivariance_w)
     flow_equivariance_p = float(flow_equivariance_p)
     if flow_equivariance_w < 0.0:
@@ -13222,7 +13265,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     )
     if flow_cache_latents:
         flow_cache_requires_image_targets = (
-            flow_decoded_endpoint_w > 0.0 and flow_decoded_endpoint_p > 0.0)
+            flow_decoded_endpoint_w > 0.0
+            and (
+                flow_decoded_endpoint_p > 0.0
+                or (
+                    flow_decoded_endpoint_warmup_frac > 0.0
+                    and flow_decoded_endpoint_warmup_p > 0.0
+                )
+            ))
         flow_cache = build_image_latent_cache(
             ae, image_records, prompt_vocab, caption_max_len=caption_max_len,
             max_records=flow_cache_records, batch=flow_cache_batch, seed=seed + 211,
@@ -13555,6 +13605,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         active_flow_sra_w = float(flow_sra_w)
         if flow_sra_steps > 0 and flow_step >= int(flow_sra_steps):
             active_flow_sra_w = 0.0
+        active_flow_decoded_endpoint_w, active_flow_decoded_endpoint_p, _ = (
+            decoded_endpoint_curriculum_values(
+                flow_decoded_endpoint_w, flow_decoded_endpoint_p,
+                flow_step=flow_step, flow_steps=flow_steps,
+                warmup_frac=flow_decoded_endpoint_warmup_frac,
+                warmup_w_mult=flow_decoded_endpoint_warmup_w_mult,
+                warmup_p=flow_decoded_endpoint_warmup_p))
         active_time_sampling = active_time_sampling_mode(
             time_sampling, flow_step=flow_step, flow_steps=flow_steps,
             time_curriculum_frac=time_curriculum_frac)
@@ -13590,10 +13647,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 quality_masks = cache_payload.get("quality_masks")
                 decoded_endpoint_target = None
                 decoded_endpoint_active_override = None
-                if flow_decoded_endpoint_w > 0.0 and flow_decoded_endpoint_p > 0.0:
+                if (active_flow_decoded_endpoint_w > 0.0
+                        and active_flow_decoded_endpoint_p > 0.0):
                     decoded_endpoint_active_override = (
-                        flow_decoded_endpoint_p >= 1.0
-                        or float(rng.random()) < flow_decoded_endpoint_p)
+                        active_flow_decoded_endpoint_p >= 1.0
+                        or float(rng.random()) < active_flow_decoded_endpoint_p)
                     if decoded_endpoint_active_override:
                         decoded_endpoint_target = cached_decoded_endpoint_target(
                             cache_payload, device=device)
@@ -13710,8 +13768,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     straightness_w=flow_straightness_w,
                     spatial_relation_w=flow_spatial_relation_w,
                     physics_w=flow_physics_w,
-                    decoded_endpoint_w=flow_decoded_endpoint_w,
-                    decoded_endpoint_p=flow_decoded_endpoint_p,
+                    decoded_endpoint_w=active_flow_decoded_endpoint_w,
+                    decoded_endpoint_p=active_flow_decoded_endpoint_p,
                     decoded_endpoint_grad_w=flow_decoded_endpoint_grad_w,
                     decoded_endpoint_ms_w=flow_decoded_endpoint_ms_w,
                     decoded_endpoint_fft_w=flow_decoded_endpoint_fft_w,
@@ -13795,7 +13853,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     parts["flow_preference_active"] = torch.tensor(0.0, device=z1.device)
                 scaled_loss = loss / float(flow_accum_steps)
             scaler.scale(scaled_loss).backward()
-            if flow_decoded_endpoint_w > 0.0 and flow_decoded_endpoint_p > 0.0:
+            if (active_flow_decoded_endpoint_w > 0.0
+                    and active_flow_decoded_endpoint_p > 0.0):
                 flow_decoded_endpoint_microbatches += 1
                 active = float(
                     parts.get(
@@ -14279,6 +14338,16 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             flow_decoded_endpoint_patch_structure_w),
         "flow_decoded_endpoint_patch_structure_size": int(
             flow_decoded_endpoint_patch_structure_size),
+        "flow_decoded_endpoint_warmup_frac": float(
+            flow_decoded_endpoint_warmup_frac),
+        "flow_decoded_endpoint_warmup_w_mult": float(
+            flow_decoded_endpoint_warmup_w_mult),
+        "flow_decoded_endpoint_warmup_p": float(
+            flow_decoded_endpoint_warmup_p),
+        "flow_decoded_endpoint_warmup_steps": int(
+            fractional_active_steps(
+                flow_steps, flow_decoded_endpoint_warmup_frac,
+                name="flow_decoded_endpoint_warmup_frac")),
         "flow_decoded_endpoint_microbatches": int(
             flow_decoded_endpoint_microbatches),
         "flow_decoded_endpoint_active_microbatches": int(
@@ -14549,6 +14618,22 @@ def selftest():
         curriculum_buckets, np.asarray([0.2, 0.3, 0.5]),
         curriculum_buckets[:2])
     assert np.allclose(subset_probs, np.asarray([0.4, 0.6]))
+    warm_w0, warm_p0, warm_steps = decoded_endpoint_curriculum_values(
+        0.1, 0.25, flow_step=0, flow_steps=10,
+        warmup_frac=0.5, warmup_w_mult=3.0, warmup_p=1.0)
+    warm_w4, warm_p4, _warm_steps4 = decoded_endpoint_curriculum_values(
+        0.1, 0.25, flow_step=4, flow_steps=10,
+        warmup_frac=0.5, warmup_w_mult=3.0, warmup_p=1.0)
+    base_w5, base_p5, _warm_steps5 = decoded_endpoint_curriculum_values(
+        0.1, 0.25, flow_step=5, flow_steps=10,
+        warmup_frac=0.5, warmup_w_mult=3.0, warmup_p=1.0)
+    assert warm_steps == 5
+    assert math.isclose(warm_w0, 0.3)
+    assert math.isclose(warm_p0, 1.0)
+    assert warm_w4 > base_w5 and warm_w4 < warm_w0
+    assert warm_p4 > base_p5 and warm_p4 < warm_p0
+    assert math.isclose(base_w5, 0.1)
+    assert math.isclose(base_p5, 0.25)
     z = torch.randn(2, 3, 4, 4)
     raw = torch.randn_like(z)
     assert torch.allclose(
@@ -14948,6 +15033,9 @@ def selftest():
             flow_decoded_endpoint_physics_w=0.1,
             flow_decoded_endpoint_patch_structure_w=0.1,
             flow_decoded_endpoint_patch_structure_size=4,
+            flow_decoded_endpoint_warmup_frac=1.0,
+            flow_decoded_endpoint_warmup_w_mult=3.0,
+            flow_decoded_endpoint_warmup_p=1.0,
             flow_equivariance_w=0.01,
             flow_equivariance_p=1.0,
             flow_equivariance_transforms=("roll",),
@@ -15030,6 +15118,13 @@ def selftest():
         assert report["flow_multiscale_scales"] == [2]
         assert report["last_flow"]["flow_multiscale_active_scales"] >= 1
         assert math.isclose(report["flow_decoded_endpoint_w"], 0.01)
+        assert math.isclose(report["flow_decoded_endpoint_warmup_frac"], 1.0)
+        assert math.isclose(report["flow_decoded_endpoint_warmup_w_mult"], 3.0)
+        assert math.isclose(report["flow_decoded_endpoint_warmup_p"], 1.0)
+        assert report["flow_decoded_endpoint_warmup_steps"] == 1
+        assert math.isclose(
+            report["last_flow"]["flow_decoded_endpoint_w"], 0.03,
+            rel_tol=1.0e-5, abs_tol=1.0e-7)
         assert report["last_flow"]["flow_decoded_endpoint_active"] == 1.0
         assert report["last_flow"]["flow_decoded_endpoint_target_source"] == 1.0
         assert report["flow_decoded_endpoint_microbatches"] >= 1
@@ -15801,6 +15896,18 @@ def main(argv=None):
                     default=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE,
                     dest="flow_decoded_endpoint_patch_structure_size",
                     help=("patch size for --flow-decoded-endpoint-patch-structure-w"))
+    ap.add_argument("--flow-decoded-endpoint-warmup-frac", type=float, default=0.0,
+                    dest="flow_decoded_endpoint_warmup_frac",
+                    help=("fraction of flow training that uses denser/stronger decoded "
+                          "endpoint image supervision"))
+    ap.add_argument("--flow-decoded-endpoint-warmup-w-mult", type=float, default=1.0,
+                    dest="flow_decoded_endpoint_warmup_w_mult",
+                    help=("initial multiplier for decoded endpoint loss during the "
+                          "warmup curriculum; linearly tapers to base weight"))
+    ap.add_argument("--flow-decoded-endpoint-warmup-p", type=float, default=-1.0,
+                    dest="flow_decoded_endpoint_warmup_p",
+                    help=("initial decoded endpoint supervision probability during "
+                          "warmup; negative uses --flow-decoded-endpoint-p"))
     ap.add_argument("--flow-equivariance-w", type=float, default=0.0,
                     dest="flow_equivariance_w",
                     help=("spatial equivariance loss weight for latent flow "
@@ -16453,6 +16560,13 @@ def main(argv=None):
         ap.error("flow decoded endpoint component weights must be non-negative")
     if args.flow_decoded_endpoint_patch_structure_size <= 0:
         ap.error("--flow-decoded-endpoint-patch-structure-size must be positive")
+    if (args.flow_decoded_endpoint_warmup_frac < 0.0
+            or args.flow_decoded_endpoint_warmup_frac > 1.0):
+        ap.error("--flow-decoded-endpoint-warmup-frac must be in [0, 1]")
+    if args.flow_decoded_endpoint_warmup_w_mult < 1.0:
+        ap.error("--flow-decoded-endpoint-warmup-w-mult must be >= 1")
+    if args.flow_decoded_endpoint_warmup_p > 1.0:
+        ap.error("--flow-decoded-endpoint-warmup-p must be <= 1")
     if args.flow_equivariance_w < 0.0:
         ap.error("--flow-equivariance-w must be non-negative")
     if args.flow_equivariance_p < 0.0 or args.flow_equivariance_p > 1.0:
@@ -17007,6 +17121,11 @@ def main(argv=None):
             args.flow_decoded_endpoint_patch_structure_w),
         flow_decoded_endpoint_patch_structure_size=(
             args.flow_decoded_endpoint_patch_structure_size),
+        flow_decoded_endpoint_warmup_frac=(
+            args.flow_decoded_endpoint_warmup_frac),
+        flow_decoded_endpoint_warmup_w_mult=(
+            args.flow_decoded_endpoint_warmup_w_mult),
+        flow_decoded_endpoint_warmup_p=args.flow_decoded_endpoint_warmup_p,
         flow_equivariance_w=args.flow_equivariance_w,
         flow_equivariance_p=args.flow_equivariance_p,
         flow_equivariance_transforms=flow_equivariance_transforms,
@@ -17592,6 +17711,17 @@ def main(argv=None):
         "flow_decoded_endpoint_patch_structure_size": report.get(
             "flow_decoded_endpoint_patch_structure_size",
             args.flow_decoded_endpoint_patch_structure_size),
+        "flow_decoded_endpoint_warmup_frac": report.get(
+            "flow_decoded_endpoint_warmup_frac",
+            args.flow_decoded_endpoint_warmup_frac),
+        "flow_decoded_endpoint_warmup_w_mult": report.get(
+            "flow_decoded_endpoint_warmup_w_mult",
+            args.flow_decoded_endpoint_warmup_w_mult),
+        "flow_decoded_endpoint_warmup_p": report.get(
+            "flow_decoded_endpoint_warmup_p",
+            args.flow_decoded_endpoint_warmup_p),
+        "flow_decoded_endpoint_warmup_steps": report.get(
+            "flow_decoded_endpoint_warmup_steps", 0),
         "flow_equivariance_w": report.get(
             "flow_equivariance_w", args.flow_equivariance_w),
         "flow_equivariance_p": report.get(
