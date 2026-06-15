@@ -953,6 +953,81 @@ def quality_score_stats(records):
     }
 
 
+def image_training_requirement_report(
+        records, quality_stats=None, min_records=0,
+        require_text_embeddings=False,
+        require_text_embedding_sequences=False,
+        require_image_embeddings=False,
+        require_image_embedding_sequences=False,
+        require_quality_scores=False,
+        require_quality_score_range=False):
+    """Summarize generic data/representation prerequisites for serious image runs."""
+    rows = list(records)
+    n = len(rows)
+    quality_stats = quality_stats or quality_score_stats(rows)
+    text_embedding_records = sum(
+        1 for rec in rows
+        if rec.text_embedding is not None or rec.text_embedding_sequence is not None)
+    text_embedding_sequence_records = sum(
+        1 for rec in rows if rec.text_embedding_sequence is not None)
+    image_embedding_records = sum(
+        1 for rec in rows
+        if rec.image_embedding is not None or rec.image_embedding_sequence is not None)
+    image_embedding_sequence_records = sum(
+        1 for rec in rows if rec.image_embedding_sequence is not None)
+    min_records = int(min_records or 0)
+    failures = []
+    if min_records > 0 and n < min_records:
+        failures.append(f"image_records {n} < min_image_records {min_records}")
+    if require_text_embeddings and text_embedding_records < n:
+        failures.append(
+            "text embeddings required for every image record "
+            f"({text_embedding_records}/{n})")
+    if require_text_embedding_sequences and text_embedding_sequence_records < n:
+        failures.append(
+            "text embedding sequences required for every image record "
+            f"({text_embedding_sequence_records}/{n})")
+    if require_image_embeddings and image_embedding_records < n:
+        failures.append(
+            "image embeddings required for every image record "
+            f"({image_embedding_records}/{n})")
+    if require_image_embedding_sequences and image_embedding_sequence_records < n:
+        failures.append(
+            "image embedding sequences required for every image record "
+            f"({image_embedding_sequence_records}/{n})")
+    if require_quality_scores and int(quality_stats["n"]) < n:
+        failures.append(
+            "quality scores required for every image record "
+            f"({int(quality_stats['n'])}/{n})")
+    if require_quality_score_range and not bool(quality_stats["has_range"]):
+        failures.append("quality score range required but all available scores are tied/missing")
+    return {
+        "image_training_requirements_enabled": bool(
+            min_records > 0 or require_text_embeddings
+            or require_text_embedding_sequences or require_image_embeddings
+            or require_image_embedding_sequences or require_quality_scores
+            or require_quality_score_range),
+        "image_training_requirements_passed": not failures,
+        "image_training_requirement_failures": failures,
+        "min_image_records": int(min_records),
+        "require_text_embeddings": bool(require_text_embeddings),
+        "require_text_embedding_sequences": bool(require_text_embedding_sequences),
+        "require_image_embeddings": bool(require_image_embeddings),
+        "require_image_embedding_sequences": bool(require_image_embedding_sequences),
+        "require_quality_scores": bool(require_quality_scores),
+        "require_quality_score_range": bool(require_quality_score_range),
+        "requirement_image_records": int(n),
+        "requirement_text_embedding_records": int(text_embedding_records),
+        "requirement_text_embedding_sequence_records": int(
+            text_embedding_sequence_records),
+        "requirement_image_embedding_records": int(image_embedding_records),
+        "requirement_image_embedding_sequence_records": int(
+            image_embedding_sequence_records),
+        "requirement_quality_score_records": int(quality_stats["n"]),
+        "requirement_quality_score_has_range": bool(quality_stats["has_range"]),
+    }
+
+
 def quality_target_tensor(records, stats, device=DEV):
     vals = torch.tensor([
         float(rec.aesthetic) if rec.aesthetic is not None else float("nan")
@@ -12325,6 +12400,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       size_curriculum_frac=0.0,
                       image_manifest="", image_root="", image_split="train",
                       image_min_aesthetic=None, image_max_records=0,
+                      min_image_records=0,
+                      require_text_embeddings=False,
+                      require_text_embedding_sequences=False,
+                      require_image_embeddings=False,
+                      require_image_embedding_sequences=False,
+                      require_quality_scores=False,
+                      require_quality_score_range=False,
                       image_quality_weight=0.0,
                       image_source_weights="",
                       image_quality_score_w=0.0, flow_quality_score_w=0.0,
@@ -12423,6 +12505,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError(f"unknown flow boundary mode {flow_boundary_mode!r}")
     image_records = None
     has_image_embedding_sequences = False
+    image_quality_score_stats = None
+    image_training_requirements = {}
     if image_manifest:
         if cond_mode != "text":
             raise ValueError("image manifests require cond_mode='text'")
@@ -12430,6 +12514,21 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             image_manifest, root=image_root, split=image_split,
             min_aesthetic=image_min_aesthetic, max_records=image_max_records)
         has_image_embedding_sequences = records_have_image_embedding_sequences(image_records)
+        image_quality_score_stats = quality_score_stats(image_records)
+        image_training_requirements = image_training_requirement_report(
+            image_records, quality_stats=image_quality_score_stats,
+            min_records=min_image_records,
+            require_text_embeddings=require_text_embeddings,
+            require_text_embedding_sequences=require_text_embedding_sequences,
+            require_image_embeddings=require_image_embeddings,
+            require_image_embedding_sequences=require_image_embedding_sequences,
+            require_quality_scores=require_quality_scores,
+            require_quality_score_range=require_quality_score_range)
+        if image_training_requirements["image_training_requirement_failures"]:
+            raise ValueError(
+                "image training requirements not met: "
+                + "; ".join(image_training_requirements[
+                    "image_training_requirement_failures"]))
         flow_repa_mode = str(flow_repa_mode)
         if flow_repa_mode not in FLOW_REPA_MODES:
             raise ValueError(f"unknown flow_repa_mode {flow_repa_mode!r}")
@@ -12914,7 +13013,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             "flow_preference_w has no usable preference-pair conditions; embedding "
             "conditioning requires text_embedding or text_embedding_sequence in the "
             "preference manifest")
-    image_quality_score_stats = quality_score_stats(image_records)
+    if image_quality_score_stats is None:
+        image_quality_score_stats = quality_score_stats(image_records)
     scalar_quality_requested = (
         image_quality_score_w > 0.0 or flow_quality_score_w > 0.0
         or image_quality_rank_w > 0.0 or quality_score_rank_w > 0.0
@@ -14452,6 +14552,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "image_min_aesthetic": (
             float(image_min_aesthetic) if image_min_aesthetic is not None else None
         ),
+        **image_training_requirements,
         **image_quality_report,
         **image_source_report,
         "image_sampling_weighted": image_sample_weights is not None,
@@ -14687,6 +14788,19 @@ def selftest():
             for row in rows:
                 f.write(json.dumps(row) + "\n")
         manifest_records = read_image_manifest(manifest, root=td)
+        req_ok = image_training_requirement_report(
+            manifest_records, min_records=3,
+            require_text_embeddings=True,
+            require_text_embedding_sequences=True,
+            require_image_embeddings=True,
+            require_image_embedding_sequences=True,
+            require_quality_scores=True,
+            require_quality_score_range=True)
+        assert req_ok["image_training_requirements_passed"] is True
+        req_bad = image_training_requirement_report(
+            manifest_records[:1], min_records=2, require_quality_score_range=True)
+        assert req_bad["image_training_requirements_passed"] is False
+        assert len(req_bad["image_training_requirement_failures"]) == 2
         dual_payload = record_text_condition_payload(manifest_records[:2], device="cpu")
         assert isinstance(dual_payload, dict)
         assert tuple(dual_payload["sequence"].shape) == (2, 2, 2)
@@ -15002,6 +15116,13 @@ def selftest():
             cond_mode="text", text_cond_dim=8, image_manifest=manifest,
             image_root=td, image_split="train", caption_max_len=8,
             image_max_records=3, image_preference_manifest=pref_manifest,
+            min_image_records=3,
+            require_text_embeddings=True,
+            require_text_embedding_sequences=True,
+            require_image_embeddings=True,
+            require_image_embedding_sequences=True,
+            require_quality_scores=True,
+            require_quality_score_range=True,
             flow_preference_w=0.01, flow_preference_loss="dpo",
             flow_preference_beta=0.5, flow_preference_batch=1,
             sample_steps=1, flow_distill_steps=1,
@@ -15068,6 +15189,10 @@ def selftest():
         assert report["data_mode"] == "image_manifest"
         assert report["cond_mode"] == "text"
         assert report["image_records"] == 3
+        assert report["image_training_requirements_passed"] is True
+        assert report["requirement_text_embedding_sequence_records"] == 3
+        assert report["requirement_image_embedding_sequence_records"] == 3
+        assert report["requirement_quality_score_has_range"] is True
         assert report["time_shift_mode"] == "auto"
         assert report["time_shift_effective_mode"] == "manual"
         assert report["time_sampling"] == "adaptive"
@@ -16118,6 +16243,28 @@ def main(argv=None):
                     help="preference pairs per flow update; 0 reuses --batch")
     ap.add_argument("--image-max-records", type=int, default=0, dest="image_max_records",
                     help="cap manifest rows for smoke tests; 0 means all")
+    ap.add_argument("--min-image-records", type=int, default=0,
+                    dest="min_image_records",
+                    help=("minimum loaded training records required before image "
+                          "training starts; 0 disables"))
+    ap.add_argument("--require-text-embeddings", action="store_true",
+                    dest="require_text_embeddings",
+                    help="require every image training row to have text embeddings")
+    ap.add_argument("--require-text-embedding-sequences", action="store_true",
+                    dest="require_text_embedding_sequences",
+                    help="require every image training row to have text token embeddings")
+    ap.add_argument("--require-image-embeddings", action="store_true",
+                    dest="require_image_embeddings",
+                    help="require every image training row to have image embeddings")
+    ap.add_argument("--require-image-embedding-sequences", action="store_true",
+                    dest="require_image_embedding_sequences",
+                    help="require every image training row to have image token embeddings")
+    ap.add_argument("--require-quality-scores", action="store_true",
+                    dest="require_quality_scores",
+                    help="require every image training row to have a quality/aesthetic score")
+    ap.add_argument("--require-quality-score-range", action="store_true",
+                    dest="require_quality_score_range",
+                    help="require non-tied quality scores for ranking/quality learning")
     ap.add_argument("--caption-vocab-max", type=int, default=8192, dest="caption_vocab_max",
                     help="maximum caption vocabulary size for image manifests")
     ap.add_argument("--caption-max-len", type=int, default=64, dest="caption_max_len",
@@ -16729,6 +16876,8 @@ def main(argv=None):
         ap.error("--size-curriculum-frac must be in [0, 1]")
     if sample_prompts and args.prompt_embed_backend == "hf" and not args.prompt_embed_model:
         ap.error("--prompt-embed-backend hf requires --prompt-embed-model")
+    if args.min_image_records < 0:
+        ap.error("--min-image-records must be non-negative")
     if sample_schedules is not None:
         bad_schedules = sorted(set(sample_schedules) - set(SAMPLE_SCHEDULES))
         if bad_schedules:
@@ -17147,6 +17296,13 @@ def main(argv=None):
         image_manifest=args.image_manifest, image_root=args.image_root,
         image_split=args.image_split, image_min_aesthetic=args.image_min_aesthetic,
         image_max_records=args.image_max_records,
+        min_image_records=args.min_image_records,
+        require_text_embeddings=args.require_text_embeddings,
+        require_text_embedding_sequences=args.require_text_embedding_sequences,
+        require_image_embeddings=args.require_image_embeddings,
+        require_image_embedding_sequences=args.require_image_embedding_sequences,
+        require_quality_scores=args.require_quality_scores,
+        require_quality_score_range=args.require_quality_score_range,
         image_quality_weight=args.image_quality_weight,
         image_source_weights=args.image_source_weights,
         image_quality_score_w=args.image_quality_score_w,

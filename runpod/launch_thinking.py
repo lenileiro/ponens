@@ -502,8 +502,16 @@ def apply_image_quality_preset(args):
         float(args.vision_understanding_image_align_w), 0.05)
     args.image_latent = True
     args.image_cond_mode = "text"
-    args.image_caption_cond_source = "auto"
+    args.image_caption_cond_source = "embedding"
     args.image_fetch_max_records = max(int(args.image_fetch_max_records), 20000 if hq else 10000)
+    args.image_min_train_records = max(
+        int(args.image_min_train_records), 8192 if hq else 2048)
+    args.image_require_text_embeddings = True
+    args.image_require_text_embedding_sequences = True
+    args.image_require_image_embeddings = True
+    args.image_require_image_embedding_sequences = True
+    args.image_require_quality_scores = True
+    args.image_require_quality_score_range = True
     args.image_clean_min_caption_tokens = max(
         int(args.image_clean_min_caption_tokens), 4 if hq else 3)
     if hq and float(args.image_clean_min_caption_unique_ratio) <= 0.0:
@@ -1356,6 +1364,7 @@ def payload(args):
                      f"--image-root {shlex_quote(args.image_root)} "
                      f"--image-split {shlex_quote(args.image_split)} "
                      f"--image-max-records {args.image_max_records} "
+                     f"--min-image-records {args.image_min_train_records} "
                      f"--image-quality-weight {args.image_quality_weight} "
                      f"--image-source-weights {shlex_quote(args.image_source_weights)} "
                      f"--image-quality-score-w {args.image_quality_score_w} "
@@ -1526,6 +1535,18 @@ def payload(args):
                 train += f" --resume-checkpoint {shlex_quote(args.image_resume_checkpoint)}"
             if args.image_geometry_cond:
                 train += " --image-geometry-cond"
+            if args.image_require_text_embeddings:
+                train += " --require-text-embeddings"
+            if args.image_require_text_embedding_sequences:
+                train += " --require-text-embedding-sequences"
+            if args.image_require_image_embeddings:
+                train += " --require-image-embeddings"
+            if args.image_require_image_embedding_sequences:
+                train += " --require-image-embedding-sequences"
+            if args.image_require_quality_scores:
+                train += " --require-quality-scores"
+            if args.image_require_quality_score_range:
+                train += " --require-quality-score-range"
             if args.image_flow_cache_latents:
                 train += " --flow-cache-latents"
             if args.image_sample_finite_guard:
@@ -3371,6 +3392,28 @@ def main():
                     help="preference pairs per image flow update; 0 reuses image batch")
     ap.add_argument("--image-max-records", type=int, default=0, dest="image_max_records",
                     help="cap image manifest records for GPU smoke tests; 0 means all")
+    ap.add_argument("--image-min-train-records", type=int, default=0,
+                    dest="image_min_train_records",
+                    help=("minimum loaded image training rows required before latent "
+                          "training starts; 0 disables"))
+    ap.add_argument("--image-require-text-embeddings", action="store_true",
+                    dest="image_require_text_embeddings",
+                    help="require text embeddings on every latent image training row")
+    ap.add_argument("--image-require-text-embedding-sequences", action="store_true",
+                    dest="image_require_text_embedding_sequences",
+                    help="require text token embeddings on every latent image training row")
+    ap.add_argument("--image-require-image-embeddings", action="store_true",
+                    dest="image_require_image_embeddings",
+                    help="require image embeddings on every latent image training row")
+    ap.add_argument("--image-require-image-embedding-sequences", action="store_true",
+                    dest="image_require_image_embedding_sequences",
+                    help="require image token embeddings on every latent image training row")
+    ap.add_argument("--image-require-quality-scores", action="store_true",
+                    dest="image_require_quality_scores",
+                    help="require quality/aesthetic scores on every latent image training row")
+    ap.add_argument("--image-require-quality-score-range", action="store_true",
+                    dest="image_require_quality_score_range",
+                    help="require non-tied quality scores for quality/ranking objectives")
     ap.add_argument("--image-eval-split", default="eval", dest="image_eval_split",
                     help="manifest split used by --image-eval-sweep for real image eval")
     ap.add_argument("--image-eval-max-records", type=int, default=0,
@@ -4821,6 +4864,8 @@ def main():
         sys.exit("ERROR: --vision-understanding requires --image-manifest or --image-fetch")
     if args.image_latent and not (args.image_manifest or args.image_fetch):
         sys.exit("ERROR: --image-latent requires --image-manifest or --image-fetch")
+    if args.image_min_train_records < 0:
+        sys.exit("ERROR: --image-min-train-records must be non-negative")
     if args.image_caption and not (args.image_manifest or args.image_fetch):
         sys.exit("ERROR: --image-caption requires --image-manifest or --image-fetch")
     if args.image_embed and not (args.image_manifest or args.image_fetch):
