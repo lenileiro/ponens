@@ -29,19 +29,19 @@ VIRTUAL_ENV=$VENV uv pip install --quiet \
   "torch" --index-url "https://download.pytorch.org/whl/${CUDA_WHL}"
 BASE_DEPS=(numpy pandas scikit-learn tokenizers nltk pillow)
 if [ "${INSTALL_IMAGE_EMBED_DEPS:-0}" = "1" ]; then
-  BASE_DEPS+=(transformers accelerate)
+  BASE_DEPS+=(transformers accelerate protobuf)
 fi
 if [ "${INSTALL_IMAGE_SCORE_DEPS:-0}" = "1" ]; then
-  BASE_DEPS+=(transformers accelerate)
+  BASE_DEPS+=(transformers accelerate protobuf)
 fi
 if [ "${INSTALL_IMAGE_TEXT_SEQUENCE_DEPS:-0}" = "1" ]; then
-  BASE_DEPS+=(transformers accelerate sentencepiece)
+  BASE_DEPS+=(transformers accelerate sentencepiece protobuf)
 fi
 if [ "${INSTALL_IMAGE_CAPTION_DEPS:-0}" = "1" ]; then
-  BASE_DEPS+=(transformers accelerate sentencepiece)
+  BASE_DEPS+=(transformers accelerate sentencepiece protobuf)
 fi
 if [ "${INSTALL_IMAGE_HF_AE_DEPS:-0}" = "1" ]; then
-  BASE_DEPS+=(diffusers transformers accelerate safetensors)
+  BASE_DEPS+=(diffusers transformers accelerate safetensors protobuf)
 fi
 VIRTUAL_ENV=$VENV uv pip install --quiet "${BASE_DEPS[@]}"
 # WordNet for dictionary.py (genus-projected A1 dictionary)

@@ -485,6 +485,25 @@ def _to_device(batch, device):
     return {k: v.to(device) if hasattr(v, "to") else v for k, v in batch.items()}
 
 
+def _pooled_feature_tensor(output):
+    if torch.is_tensor(output):
+        return output
+    if isinstance(output, dict):
+        for key in ("image_embeds", "text_embeds", "pooler_output", "last_hidden_state"):
+            val = output.get(key)
+            if torch.is_tensor(val):
+                return val[:, 0] if key == "last_hidden_state" and val.ndim == 3 else val
+    for attr in ("image_embeds", "text_embeds", "pooler_output", "last_hidden_state"):
+        val = getattr(output, attr, None)
+        if torch.is_tensor(val):
+            return val[:, 0] if attr == "last_hidden_state" and val.ndim == 3 else val
+    if isinstance(output, (tuple, list)):
+        for val in output:
+            if torch.is_tensor(val):
+                return val[:, 0] if val.ndim == 3 else val
+    raise TypeError(f"unsupported pooled feature output type {type(output).__name__}")
+
+
 def pickscore_quality_index(rows: Sequence[ManifestRow], model_name: str = "",
                             processor_name: str = "", device: str = "auto",
                             dtype: str = "auto", batch_size: int = 8,
@@ -539,8 +558,10 @@ def pickscore_quality_index(rows: Sequence[ManifestRow], model_name: str = "",
                 text_inputs = _to_device(
                     processor(text=captions, padding=True, truncation=True,
                               max_length=int(max_length), return_tensors="pt"), device)
-                image_features = model.get_image_features(**image_inputs).float()
-                text_features = model.get_text_features(**text_inputs).float()
+                image_features = _pooled_feature_tensor(
+                    model.get_image_features(**image_inputs)).float()
+                text_features = _pooled_feature_tensor(
+                    model.get_text_features(**text_inputs)).float()
                 image_features = torch.nn.functional.normalize(image_features, dim=-1)
                 text_features = torch.nn.functional.normalize(text_features, dim=-1)
                 logit_scale = getattr(model, "logit_scale", None)
@@ -732,6 +753,16 @@ def score_manifest(manifest: str, root: str = "", split: str = "", max_records: 
             device=pickscore_device, dtype=pickscore_dtype, batch_size=pickscore_batch,
             max_length=pickscore_max_length, normalize=pickscore_normalize)
         pickscore_report["pickscore_enabled"] = True
+        if int(pickscore_report.get("pickscore_scored", 0)) <= 0:
+            examples = []
+            for idx in sorted(pickscore_index)[:5]:
+                err = pickscore_index[idx].get("error")
+                if err:
+                    examples.append(str(err))
+            detail = "; ".join(examples[:2])
+            raise RuntimeError(
+                "PickScore was enabled but produced zero scores"
+                + (f": {detail}" if detail else ""))
 
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True) if out else None
     os.makedirs(os.path.dirname(sidecar_out) or ".", exist_ok=True) if sidecar_out else None
@@ -875,6 +906,18 @@ def _read_jsonl(path: str):
 
 def selftest():
     with tempfile.TemporaryDirectory() as td:
+        class _Output:
+            def __init__(self, pooler_output):
+                self.pooler_output = pooler_output
+
+        pooled = torch.randn(2, 3)
+        assert torch.equal(_pooled_feature_tensor(pooled), pooled)
+        assert torch.equal(_pooled_feature_tensor({"pooler_output": pooled}), pooled)
+        assert torch.equal(_pooled_feature_tensor(_Output(pooled)), pooled)
+        hidden = torch.randn(2, 4, 3)
+        assert torch.equal(_pooled_feature_tensor({"last_hidden_state": hidden}),
+                           hidden[:, 0])
+
         flat = os.path.join(td, "flat.ppm")
         rich = os.path.join(td, "rich.ppm")
         x = np.linspace(0, 255, 32, dtype=np.uint8)
