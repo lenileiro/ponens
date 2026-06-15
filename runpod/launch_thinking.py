@@ -804,6 +804,11 @@ def apply_image_quality_preset(args):
         int(args.image_quality_loop_vision_read_heads), 4)
     args.image_quality_loop_vision_read_eval_n = max(
         int(args.image_quality_loop_vision_read_eval_n), 64 if hq else 32)
+    if hq:
+        args.image_quality_loop_min_sensor_token_acc = max(
+            float(args.image_quality_loop_min_sensor_token_acc), 0.01)
+        args.image_quality_loop_min_full_token_acc = max(
+            float(args.image_quality_loop_min_full_token_acc), 0.01)
     args.image_quality_loop_vision_read_raw_visual_size = max(
         int(args.image_quality_loop_vision_read_raw_visual_size), 64)
     args.image_quality_loop_vision_read_raw_visual_patch = max(
@@ -820,19 +825,19 @@ def apply_image_quality_preset(args):
         int(args.image_generated_eval_patch_structure_max_records),
         512 if hq else 256)
     if args.image_generated_eval_min_visual_detail_ratio is None:
-        args.image_generated_eval_min_visual_detail_ratio = 0.02
+        args.image_generated_eval_min_visual_detail_ratio = 0.20 if hq else 0.02
     if args.image_generated_eval_min_visual_dynamic_range_ratio is None:
-        args.image_generated_eval_min_visual_dynamic_range_ratio = 0.05
+        args.image_generated_eval_min_visual_dynamic_range_ratio = 0.20 if hq else 0.05
     if args.image_generated_eval_min_visual_luminance_std_ratio is None:
-        args.image_generated_eval_min_visual_luminance_std_ratio = 0.05
+        args.image_generated_eval_min_visual_luminance_std_ratio = 0.20 if hq else 0.05
     if args.image_generated_eval_min_patch_detail_ratio is None:
-        args.image_generated_eval_min_patch_detail_ratio = 0.05
+        args.image_generated_eval_min_patch_detail_ratio = 0.20 if hq else 0.05
     if args.image_generated_eval_min_patch_contrast_ratio is None:
-        args.image_generated_eval_min_patch_contrast_ratio = 0.05
+        args.image_generated_eval_min_patch_contrast_ratio = 0.20 if hq else 0.05
     if args.image_generated_eval_min_patch_edge_ratio is None:
-        args.image_generated_eval_min_patch_edge_ratio = 0.05
+        args.image_generated_eval_min_patch_edge_ratio = 0.20 if hq else 0.05
     if args.image_generated_eval_min_patch_variation_ratio is None:
-        args.image_generated_eval_min_patch_variation_ratio = 0.02
+        args.image_generated_eval_min_patch_variation_ratio = 0.10 if hq else 0.02
     args.image_prompt_embed_backend = args.image_embed_backend
     args.image_prompt_embed_model = args.image_embed_model
     if not args.image_prompt_embed_text_sequence_model:
