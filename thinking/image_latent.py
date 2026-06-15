@@ -9098,6 +9098,14 @@ def _cycle_values(values, default, cast):
     return vals
 
 
+def _candidate_seed(seed_vals, base_seed, idx):
+    if not seed_vals:
+        return int(base_seed) + 104729 * int(idx)
+    cycle_idx = int(idx) % len(seed_vals)
+    cycle_round = int(idx) // len(seed_vals)
+    return int(seed_vals[cycle_idx]) + 104729 * cycle_round
+
+
 def prompt_candidate_sampler_settings(candidates_per_prompt, seed=0, cfg_scale=1.0,
                                       cfg_rescale=0.0, cfg_mode="standard",
                                       cfg_schedule="constant", sample_steps=4,
@@ -9157,10 +9165,7 @@ def prompt_candidate_sampler_settings(candidates_per_prompt, seed=0, cfg_scale=1
             "sample_method": str(method_vals[idx % len(method_vals)]),
             "sample_schedule": str(schedule_vals[idx % len(schedule_vals)]),
             "sample_churn": float(churn_vals[idx % len(churn_vals)]),
-            "seed": (
-                int(seed_vals[idx % len(seed_vals)])
-                if seed_vals else base_seed + 104729 * int(idx)
-            ),
+            "seed": _candidate_seed(seed_vals, base_seed, idx),
         })
     return settings
 
@@ -13925,7 +13930,7 @@ def selftest():
         assert [row["cfg_scale"] for row in candidate_settings] == [1.0, 2.0, 1.0]
         assert [row["sample_method"] for row in candidate_settings] == [
             "euler", "heun", "euler"]
-        assert [row["seed"] for row in candidate_settings] == [101, 202, 101]
+        assert [row["seed"] for row in candidate_settings] == [101, 202, 104830]
         single_setting = prompt_candidate_sampler_settings(
             1, seed=7, cfg_scale=3.0, cfg_scales=(1.0, 2.0),
             sample_steps=9, sample_steps_list=(4, 8))[0]
@@ -14081,6 +14086,13 @@ def selftest():
         assert health_only_meta["sample_grid_selection_component_count"] == 1
         assert health_only_meta["sample_grid_selection_component_weights"][
             "sample_health_v2"] == 1.0
+        one_seed_settings = prompt_candidate_sampler_settings(
+            3, seed=7, seeds=(11,), cfg_scales=(1.0,))
+        assert [s["seed"] for s in one_seed_settings] == [11, 104740, 209469]
+        assert len({s["seed"] for s in one_seed_settings}) == 3
+        partial_seed_settings = prompt_candidate_sampler_settings(
+            4, seed=7, seeds=(11, 23))
+        assert [s["seed"] for s in partial_seed_settings] == [11, 23, 104740, 104752]
         _patch_only_pixels, patch_only_meta = select_prompt_candidates(
             _IdentityAE(), candidate_pixels, None, ("prompt a", "prompt b"),
             candidates_per_prompt=2, quality_scorer=_FlatQualityScorer(),
