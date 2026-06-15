@@ -98,7 +98,7 @@ MULTIMODAL_SELF_TEACH_SKIP_KEYS = {
 MULTIMODAL_SELF_TEACH_SIGNAL_OBJECTIVES = {
     "token": ("decode_w",),
     "mode_floor": (
-        "agreement_w", "latent_concept_w", "latent_concept_completion_w"),
+        "agreement_w", "latent_concept_completion_w"),
     "fer": ("latent_concept_fer_w", "latent_concept_factorization_w"),
     "bridge": (
         "latent_concept_bridge_w", "latent_concept_discovery_w",
@@ -108,10 +108,11 @@ MULTIMODAL_SELF_TEACH_SIGNAL_OBJECTIVES = {
         "latent_concept_gap_w", "latent_concept_graph_predict_w"),
     "sequence": ("latent_concept_sequence_w", "latent_concept_transition_w"),
 }
-MULTIMODAL_SELF_TEACH_WEIGHT_KEYS = tuple(dict.fromkeys(
+MULTIMODAL_SELF_TEACH_WEIGHT_KEYS = tuple(dict.fromkeys([
     key
     for keys in MULTIMODAL_SELF_TEACH_SIGNAL_OBJECTIVES.values()
-    for key in keys))
+    for key in keys
+] + ["latent_concept_w"]))
 MULTIMODAL_TEXT_HISTORY_SIGNAL_KEYS = {
     "mode_floor": ("signal_coverage", "balanced_score", "floor_score"),
     "fer": ("fer_score",),
@@ -141,6 +142,46 @@ DEFAULT_TEXT_TRANSFER_PROBE_N = 64
 DEFAULT_TEXT_TRANSFER_SCORE_MIN_DELTA = 0.1
 DEFAULT_TEXT_TRANSFER_INSIGHT_ACCEPT_W = 0.0
 MULTIMODAL_DEFAULT_SOURCE_BALANCE_W = 0.5
+MULTIMODAL_DEFAULT_LATENT_CONCEPT_SLOTS = 4
+MULTIMODAL_DEFAULT_LATENT_CONCEPT_MEMORY_SIZE = 64
+MULTIMODAL_OBJECTIVE_PROFILES = ("manual", "mastery")
+MULTIMODAL_MASTERY_OBJECTIVE_FLOORS = {
+    "latent_concept_slots": MULTIMODAL_DEFAULT_LATENT_CONCEPT_SLOTS,
+    "latent_concept_memory_size": MULTIMODAL_DEFAULT_LATENT_CONCEPT_MEMORY_SIZE,
+    "latent_concept_factorization_w": 0.05,
+    "latent_concept_fer_w": 0.05,
+    "latent_concept_memory_w": 0.05,
+    "latent_concept_consolidation_w": 0.05,
+    "latent_concept_discovery_w": 0.05,
+    "latent_concept_gap_w": 0.05,
+    "latent_concept_association_w": 0.05,
+    "latent_concept_composition_w": 0.05,
+    "latent_concept_graph_predict_w": 0.05,
+    "latent_concept_bridge_w": 0.05,
+    "latent_concept_completion_w": 0.10,
+    "latent_concept_sequence_w": 0.10,
+    "latent_concept_neighborhood_w": 0.05,
+    "latent_concept_transition_w": 0.05,
+    "latent_concept_cluster_w": 0.05,
+    "self_teach_w": 0.05,
+}
+MULTIMODAL_MASTERY_STUDY_FLOORS = {
+    "latent_concept_fer_probe_n": 128,
+    "latent_concept_fer_hard_max": 32,
+    "latent_concept_fer_refresh_steps": 100,
+    "latent_concept_discovery_probe_n": 128,
+    "latent_concept_discovery_hard_max": 32,
+    "latent_concept_discovery_refresh_steps": 100,
+    "latent_concept_completion_probe_n": 128,
+    "latent_concept_completion_hard_max": 32,
+    "latent_concept_completion_refresh_steps": 100,
+    "representation_probe_n": 64,
+    "selection_rounds": 2,
+    "selection_score_patience": 1,
+}
+MULTIMODAL_MASTERY_PROFILE_FLOORS = (
+    dict(MULTIMODAL_MASTERY_OBJECTIVE_FLOORS)
+    | dict(MULTIMODAL_MASTERY_STUDY_FLOORS))
 MULTIMODAL_LEARNING_HISTORY_VERSION = 1
 MULTIMODAL_LEARNING_HISTORY_SIZE = 32
 
@@ -1312,6 +1353,49 @@ def merge_multimodal_self_teach_priors(*priors):
         "concept_connection_signal": float(concept_connection_signal),
         "sources": sources,
     }
+
+
+def multimodal_objective_profile_kwargs(objective_profile="manual", **kwargs):
+    """Apply schema-free multimodal objective floors for a training posture."""
+    objective_profile = str(objective_profile)
+    if objective_profile not in MULTIMODAL_OBJECTIVE_PROFILES:
+        raise ValueError(f"unknown multimodal objective profile {objective_profile!r}")
+    effective = dict(kwargs)
+    updates = {}
+    if objective_profile == "mastery":
+        missing = [
+            key for key in MULTIMODAL_MASTERY_PROFILE_FLOORS
+            if key not in effective]
+        if missing:
+            raise ValueError(
+                "missing multimodal objective profile controls: "
+                + ", ".join(sorted(missing)))
+        for key, floor in MULTIMODAL_MASTERY_PROFILE_FLOORS.items():
+            before_raw = effective[key]
+            before = float(before_raw)
+            after_raw = max(before, float(floor))
+            after = (int(after_raw)
+                     if isinstance(before_raw, int)
+                     and isinstance(floor, int)
+                     else float(after_raw))
+            effective[key] = after
+            if float(after) != before:
+                updates[key] = {"from": before_raw, "to": after}
+    report = {
+        "profile": objective_profile,
+        "enabled": objective_profile != "manual",
+        "floors": dict(MULTIMODAL_MASTERY_PROFILE_FLOORS)
+        if objective_profile == "mastery" else {},
+        "objective_floors": dict(MULTIMODAL_MASTERY_OBJECTIVE_FLOORS)
+        if objective_profile == "mastery" else {},
+        "study_floors": dict(MULTIMODAL_MASTERY_STUDY_FLOORS)
+        if objective_profile == "mastery" else {},
+        "updates": updates,
+        "applied": bool(updates),
+    }
+    effective["objective_profile"] = objective_profile
+    effective["objective_profile_report"] = report
+    return effective
 
 
 def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
@@ -4427,6 +4511,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           device=DEV, log_every=100, layers=3, heads=4, max_len=128,
           max_vocab=0,
           source_balance_w=MULTIMODAL_DEFAULT_SOURCE_BALANCE_W,
+          objective_profile="mastery",
           view_tokens=4, txt_tokens=8, trunk_arch="mlp",
           trunk_width=128, trunk_depth=1, text_layers=1,
           text_arch="transformer", modality_dropout=0.0, decode_w=1.0,
@@ -4548,6 +4633,83 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     if (text_checkpoint and latent_concept_memory_size <= 0
             and ckpt_latents.get("latent_concept_memory_size", 0) > 0):
         latent_concept_memory_size = ckpt_latents["latent_concept_memory_size"]
+    profile_kwargs = multimodal_objective_profile_kwargs(
+        objective_profile,
+        latent_concept_slots=latent_concept_slots,
+        latent_concept_memory_size=latent_concept_memory_size,
+        latent_concept_factorization_w=latent_concept_factorization_w,
+        latent_concept_fer_w=latent_concept_fer_w,
+        latent_concept_memory_w=latent_concept_memory_w,
+        latent_concept_consolidation_w=latent_concept_consolidation_w,
+        latent_concept_discovery_w=latent_concept_discovery_w,
+        latent_concept_gap_w=latent_concept_gap_w,
+        latent_concept_association_w=latent_concept_association_w,
+        latent_concept_composition_w=latent_concept_composition_w,
+        latent_concept_graph_predict_w=latent_concept_graph_predict_w,
+        latent_concept_bridge_w=latent_concept_bridge_w,
+        latent_concept_completion_w=latent_concept_completion_w,
+        latent_concept_sequence_w=latent_concept_sequence_w,
+        latent_concept_neighborhood_w=latent_concept_neighborhood_w,
+        latent_concept_transition_w=latent_concept_transition_w,
+        latent_concept_cluster_w=latent_concept_cluster_w,
+        self_teach_w=self_teach_w,
+        latent_concept_fer_probe_n=latent_concept_fer_probe_n,
+        latent_concept_fer_hard_max=latent_concept_fer_hard_max,
+        latent_concept_fer_refresh_steps=latent_concept_fer_refresh_steps,
+        latent_concept_discovery_probe_n=latent_concept_discovery_probe_n,
+        latent_concept_discovery_hard_max=latent_concept_discovery_hard_max,
+        latent_concept_discovery_refresh_steps=(
+            latent_concept_discovery_refresh_steps),
+        latent_concept_completion_probe_n=latent_concept_completion_probe_n,
+        latent_concept_completion_hard_max=latent_concept_completion_hard_max,
+        latent_concept_completion_refresh_steps=(
+            latent_concept_completion_refresh_steps),
+        representation_probe_n=representation_probe_n,
+        selection_rounds=selection_rounds,
+        selection_score_patience=selection_score_patience)
+    objective_profile = profile_kwargs["objective_profile"]
+    objective_profile_report = profile_kwargs["objective_profile_report"]
+    latent_concept_slots = profile_kwargs["latent_concept_slots"]
+    latent_concept_memory_size = profile_kwargs["latent_concept_memory_size"]
+    latent_concept_factorization_w = profile_kwargs[
+        "latent_concept_factorization_w"]
+    latent_concept_fer_w = profile_kwargs["latent_concept_fer_w"]
+    latent_concept_memory_w = profile_kwargs["latent_concept_memory_w"]
+    latent_concept_consolidation_w = profile_kwargs[
+        "latent_concept_consolidation_w"]
+    latent_concept_discovery_w = profile_kwargs["latent_concept_discovery_w"]
+    latent_concept_gap_w = profile_kwargs["latent_concept_gap_w"]
+    latent_concept_association_w = profile_kwargs["latent_concept_association_w"]
+    latent_concept_composition_w = profile_kwargs["latent_concept_composition_w"]
+    latent_concept_graph_predict_w = profile_kwargs[
+        "latent_concept_graph_predict_w"]
+    latent_concept_bridge_w = profile_kwargs["latent_concept_bridge_w"]
+    latent_concept_completion_w = profile_kwargs["latent_concept_completion_w"]
+    latent_concept_sequence_w = profile_kwargs["latent_concept_sequence_w"]
+    latent_concept_neighborhood_w = profile_kwargs[
+        "latent_concept_neighborhood_w"]
+    latent_concept_transition_w = profile_kwargs["latent_concept_transition_w"]
+    latent_concept_cluster_w = profile_kwargs["latent_concept_cluster_w"]
+    self_teach_w = profile_kwargs["self_teach_w"]
+    latent_concept_fer_probe_n = profile_kwargs["latent_concept_fer_probe_n"]
+    latent_concept_fer_hard_max = profile_kwargs["latent_concept_fer_hard_max"]
+    latent_concept_fer_refresh_steps = profile_kwargs[
+        "latent_concept_fer_refresh_steps"]
+    latent_concept_discovery_probe_n = profile_kwargs[
+        "latent_concept_discovery_probe_n"]
+    latent_concept_discovery_hard_max = profile_kwargs[
+        "latent_concept_discovery_hard_max"]
+    latent_concept_discovery_refresh_steps = profile_kwargs[
+        "latent_concept_discovery_refresh_steps"]
+    latent_concept_completion_probe_n = profile_kwargs[
+        "latent_concept_completion_probe_n"]
+    latent_concept_completion_hard_max = profile_kwargs[
+        "latent_concept_completion_hard_max"]
+    latent_concept_completion_refresh_steps = profile_kwargs[
+        "latent_concept_completion_refresh_steps"]
+    representation_probe_n = profile_kwargs["representation_probe_n"]
+    selection_rounds = profile_kwargs["selection_rounds"]
+    selection_score_patience = profile_kwargs["selection_score_patience"]
     latent_weights = (
         latent_concept_w, latent_concept_factorization_w, latent_concept_memory_w,
         latent_concept_fer_w, latent_concept_consolidation_w,
@@ -5344,6 +5506,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         bridge_metrics = latent_multimodal_bridge_metrics_from_views(model, latent_views)
         last = {
             "loss": float(loss.detach()),
+            "objective_profile": objective_profile,
+            "objective_profile_report": objective_profile_report,
             "decode_w": float(decode_w),
             "token_loss": float(base_loss.detach()),
             "agreement_loss": float(agreement.detach()),
@@ -6572,6 +6736,7 @@ def selftest():
         assert torch.isfinite(latent_multimodal_cluster_loss_from_views(views))
         trained_model, *_ = train(
             manifest, steps=2, batch=2, d=32, layers=1, heads=4, device="cpu",
+            objective_profile="manual",
             log_every=1, view_tokens=2, txt_tokens=4,
             concept_tokens=2, latent_concept_slots=3,
             latent_concept_memory_size=8, latent_concept_memory_w=0.01,
@@ -6705,6 +6870,7 @@ def selftest():
             trained_model.lm.tok.weight[sample_idx])
         self_teach_model, *_ = train(
             manifest, steps=1, batch=2, d=32, layers=1, heads=4, device="cpu",
+            objective_profile="manual",
             log_every=10, view_tokens=2, txt_tokens=4,
             concept_tokens=2, latent_concept_slots=3,
             latent_concept_memory_size=8, text_checkpoint=text_ckpt,
@@ -6753,6 +6919,7 @@ def selftest():
             rel_tol=1e-6, abs_tol=1e-6)
         calibrated_transfer_model, *_ = train(
             manifest, steps=1, batch=2, d=32, layers=1, heads=4, device="cpu",
+            objective_profile="manual",
             log_every=10, view_tokens=2, txt_tokens=4,
             concept_tokens=2, latent_concept_slots=3,
             latent_concept_memory_size=8, text_checkpoint=text_ckpt,
@@ -6772,6 +6939,7 @@ def selftest():
                     "text_transfer_rejected_by_target_probe")
         continued_model, *_ = train(
             manifest, steps=1, batch=2, d=32, layers=1, heads=4, device="cpu",
+            objective_profile="manual",
             log_every=10, view_tokens=2, txt_tokens=4,
             concept_tokens=2, latent_concept_slots=3,
             latent_concept_memory_size=8, multimodal_checkpoint=mm_ckpt,
@@ -6807,13 +6975,35 @@ def selftest():
                 f.write(json.dumps(row) + "\n")
         balanced_model, *_ = train(
             imbalanced_manifest, steps=1, batch=2, d=32, layers=1, heads=4,
-            device="cpu", log_every=10, view_tokens=2, txt_tokens=4,
+            device="cpu", objective_profile="manual",
+            log_every=10, view_tokens=2, txt_tokens=4,
             source_balance_w=1.0)
         assert balanced_model.train_metrics[
             "training_source_balance_sampling"] is True
         assert balanced_model.train_metrics["training_source_balance_w"] == 1.0
         assert balanced_model.train_metrics["training_source_count"] == 2
         assert balanced_model.manifest_info["source_count"] == 2
+        default_profile_model, *_ = train(
+            manifest, steps=2, batch=2, d=32, layers=1, heads=4, device="cpu",
+            log_every=10, view_tokens=2, txt_tokens=4, concept_tokens=2)
+        default_profile = default_profile_model.train_metrics[
+            "objective_profile_report"]
+        assert default_profile_model.train_metrics["objective_profile"] == "mastery"
+        assert default_profile["applied"] is True
+        assert default_profile["updates"]["latent_concept_slots"]["to"] == (
+            MULTIMODAL_DEFAULT_LATENT_CONCEPT_SLOTS)
+        assert default_profile["updates"]["latent_concept_memory_size"]["to"] == (
+            MULTIMODAL_DEFAULT_LATENT_CONCEPT_MEMORY_SIZE)
+        assert (default_profile_model.latent_concept_slots
+                == MULTIMODAL_DEFAULT_LATENT_CONCEPT_SLOTS)
+        assert default_profile_model.train_metrics["latent_memory_active"] > 0
+        assert default_profile_model.train_metrics["latent_completion_w"] >= 0.10
+        assert default_profile_model.train_metrics["latent_completion_skipped"] is False
+        assert default_profile_model.train_metrics["latent_sequence_w"] >= 0.10
+        assert default_profile_model.train_metrics["latent_sequence_pairs"] > 0
+        assert default_profile_model.train_metrics["latent_gap_w"] >= 0.05
+        assert default_profile_model.train_metrics["latent_gap_skipped"] is False
+        assert default_profile_model.train_metrics["self_teach_plan"]["enabled"] is True
         no_target_manifest = os.path.join(tmpdir, "mm_no_target.jsonl")
         no_target_rows = []
         for i in range(6):
@@ -6833,7 +7023,8 @@ def selftest():
         assert no_target_records[0].target == ()
         no_target_model, no_target_vocab, _all, _trn, no_target_eval, no_target_dims = train(
             no_target_manifest, steps=1, batch=2, d=32, layers=1, heads=4,
-            device="cpu", log_every=10, view_tokens=2, txt_tokens=4,
+            device="cpu", objective_profile="manual",
+            log_every=10, view_tokens=2, txt_tokens=4,
             decode_w=0.0, concept_tokens=2, latent_concept_slots=3,
             latent_concept_memory_size=8, latent_concept_memory_w=0.01,
             latent_concept_bridge_w=0.01)
@@ -6846,6 +7037,7 @@ def selftest():
         assert no_target_bundle["score_components"]["bridge_skipped"] is False
         completion_model, *_ = train(
             manifest, steps=1, batch=2, d=32, layers=1, heads=4, device="cpu",
+            objective_profile="manual",
             log_every=10, view_tokens=2, txt_tokens=4,
             concept_tokens=2, latent_concept_slots=3,
             latent_concept_completion_probe_n=4,
@@ -6861,6 +7053,7 @@ def selftest():
                    for r in completion_model.train_metrics["latent_study_reports"])
         discovery_model, *_ = train(
             manifest, steps=2, batch=2, d=32, layers=1, heads=4, device="cpu",
+            objective_profile="manual",
             log_every=2, view_tokens=2, txt_tokens=4,
             concept_tokens=2, latent_concept_slots=3,
             latent_concept_memory_size=8,
@@ -6896,6 +7089,7 @@ def selftest():
                    if r.get("strategy") == "discovery")
         selected_model, *_ = train(
             manifest, steps=2, batch=2, d=32, layers=1, heads=4, device="cpu",
+            objective_profile="manual",
             log_every=10, view_tokens=2, txt_tokens=4,
             concept_tokens=2, latent_concept_slots=3,
             latent_concept_memory_size=8,
@@ -6963,6 +7157,10 @@ def main(argv=None):
                     dest="source_balance_w",
                     help=("smooth source-balanced minibatch sampling from "
                           "manifest metadata; 0 disables"))
+    ap.add_argument("--objective-profile", choices=MULTIMODAL_OBJECTIVE_PROFILES,
+                    default="mastery",
+                    help=("generic multimodal objective posture; mastery enables "
+                          "schema-free concept/self-teach floors"))
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--log-every", type=int, default=100, dest="log_every")
     ap.add_argument("--agreement-w", type=float, default=0.0, dest="agreement_w",
@@ -7410,6 +7608,7 @@ def main(argv=None):
         out=args.out, batch=args.batch, d=args.d, lr=args.lr, layers=args.layers,
         heads=args.heads, max_len=args.max_len, max_vocab=args.max_vocab,
         source_balance_w=args.source_balance_w,
+        objective_profile=args.objective_profile,
         view_tokens=args.view_tokens,
         txt_tokens=args.txt_tokens,
         trunk_arch=args.trunk_arch, trunk_width=args.trunk_width,
