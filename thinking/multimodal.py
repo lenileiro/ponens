@@ -2725,6 +2725,90 @@ def multimodal_generation_eval(
     }
 
 
+def multimodal_generation_error_examples(
+        model, records, vocab, view_dims, n=0, seed=1, device=DEV,
+        mode="full", decode_objective="causal", prompt_tokens=16,
+        max_new_tokens=32, temperature=0.0, top_k=0):
+    """Mine causal records where free continuation diverges from the window."""
+    generation = multimodal_generation_eval(
+        model, records, vocab, view_dims, n=n, seed=seed, device=device,
+        mode=mode, decode_objective=decode_objective,
+        prompt_tokens=prompt_tokens, max_new_tokens=max_new_tokens,
+        temperature=temperature, top_k=top_k)
+    if bool(generation.get("skipped", False)) or not bool(
+            generation.get("enabled", False)):
+        return [], {
+            "n_records": int(generation.get("n_records", 0) or 0),
+            "sampled": bool(int(n) > 0),
+            "n_selected": 0,
+            "mean_generation_error": 0.0,
+            "max_generation_error": 0.0,
+            "mean_generation_token_acc": 0.0,
+            "exact": 0.0,
+            "unique_generation_count": int(
+                generation.get("unique_generation_count", 0) or 0),
+            "all_generations_identical": bool(
+                generation.get("all_generations_identical", False)),
+            "skipped": True,
+            "skip_reason": str(
+                generation.get("skip_reason", "generation_not_run")),
+        }
+    by_id = {rec.rec_id: rec for rec in records or ()}
+    rows = []
+    for sample in generation.get("samples", ()) or ():
+        if not isinstance(sample, dict):
+            continue
+        rec_id = str(sample.get("id", ""))
+        rec = by_id.get(rec_id)
+        if rec is None:
+            continue
+        token_acc = min(1.0, max(0.0, _mm_float(
+            sample.get("token_acc", 0.0), 0.0)))
+        rows.append({
+            "record": rec,
+            "id": rec_id,
+            "token_acc": float(token_acc),
+            "generation_error": float(1.0 - token_acc),
+            "exact": bool(sample.get("exact", False)),
+        })
+    rows.sort(key=lambda row: (
+        row["generation_error"], not row["exact"], -row["token_acc"]),
+              reverse=True)
+    selected = []
+    seen = set()
+    for row in rows:
+        rec = row["record"]
+        if row["generation_error"] <= 0.0 and row["exact"]:
+            continue
+        if rec.rec_id in seen:
+            continue
+        seen.add(rec.rec_id)
+        selected.append(rec)
+
+    def mean_field(name):
+        return float(np.mean([row[name] for row in rows])) if rows else 0.0
+
+    def max_field(name):
+        return float(max([row[name] for row in rows])) if rows else 0.0
+
+    return selected, {
+        "n_records": int(generation.get("n_records", 0) or 0),
+        "sampled": bool(int(n) > 0),
+        "n_selected": int(len(selected)),
+        "mean_generation_error": mean_field("generation_error"),
+        "max_generation_error": max_field("generation_error"),
+        "mean_generation_token_acc": mean_field("token_acc"),
+        "exact": mean_field("exact"),
+        "unique_generation_count": int(
+            generation.get("unique_generation_count", 0) or 0),
+        "all_generations_identical": bool(
+            generation.get("all_generations_identical", False)),
+        "skipped": not bool(rows),
+        "skip_reason": "" if rows else "no_generation_targets",
+        "top_ids": [row["id"] for row in rows[:16]],
+    }
+
+
 def multimodal_generation_gate(generation, decode_objective="target"):
     """Gate causal language runs on actual free continuation, not teacher forcing."""
     generation = dict(generation or {})
@@ -5876,6 +5960,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     fer_hard_enabled = int(latent_concept_fer_hard_max) > 0
     discovery_hard_enabled = int(latent_concept_discovery_hard_max) > 0
     completion_hard_enabled = int(latent_concept_completion_hard_max) > 0
+    generation_hard_enabled = False
+    generation_hard_refresh_steps = 100
     hard_study_enabled = bool(
         fer_hard_enabled or discovery_hard_enabled or completion_hard_enabled)
     hard_study_strategy = (
@@ -6006,6 +6092,13 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         training_records, requested=requested_decode_objective)
     decode_objective_info = multimodal_decode_objective_report(
         training_records, requested_decode_objective, decode_objective)
+    generation_hard_enabled = bool(
+        decode_objective == "causal"
+        and int(selection_generation_n) > 0
+        and (objective_profile == "language" or not hard_study_enabled))
+    if generation_hard_enabled:
+        hard_study_enabled = True
+        hard_study_strategy = "generation"
     _new_train_records, eval_records = split_records(records)
     train_records, _training_eval_records = split_records(training_records)
     training_sampling_weights = multimodal_training_sampling_weights(
@@ -6290,7 +6383,19 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
 
     def refresh_study_pool(step):
         nonlocal study_pool
-        if hard_study_strategy == "discovery":
+        if hard_study_strategy == "generation":
+            probe_n = int(selection_generation_n) or max(batch * 4, 1)
+            hard_max = probe_n
+            generation_mode = "full" if "full" in active_modes else active_modes[0]
+            selected, report = multimodal_generation_error_examples(
+                model, train_records, vocab, view_dims, n=probe_n,
+                seed=seed + 1301 + int(step), device=device,
+                mode=generation_mode, decode_objective=decode_objective,
+                prompt_tokens=selection_generation_prompt_tokens,
+                max_new_tokens=selection_generation_max_new_tokens,
+                temperature=selection_generation_temperature,
+                top_k=selection_generation_top_k)
+        elif hard_study_strategy == "discovery":
             probe_n = (int(latent_concept_discovery_probe_n)
                        if int(latent_concept_discovery_probe_n) > 0
                        else max(batch * 4, 1))
@@ -6352,6 +6457,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     for st in range(1, int(steps) + 1):
         model.train()
         refresh_steps = (
+            int(generation_hard_refresh_steps)
+            if hard_study_strategy == "generation"
+            else
             int(latent_concept_discovery_refresh_steps)
             if hard_study_strategy == "discovery"
             else int(latent_concept_completion_refresh_steps)
@@ -6375,7 +6483,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             return_decode_text=True)
         needs_latent = bool(any(float(w) > 0.0 for w in current_latent_weights())
                             or latent_concept_memory_size > 0
-                            or hard_study_enabled)
+                            or (hard_study_enabled
+                                and hard_study_strategy != "generation"))
         needs_logits = bool(float(decode_w) > 0.0 or float(agreement_w) > 0.0
                             or float(continuation_repair_w) > 0.0
                             or float(repetition_unlikelihood_w) > 0.0)
@@ -6858,6 +6967,18 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "latent_completion_study_reports": (
                 list(study_reports)
                 if hard_study_strategy == "completion" else []),
+            "generation_hard_probe_n": int(selection_generation_n),
+            "generation_hard_max": (
+                int(selection_generation_n) if generation_hard_enabled else 0),
+            "generation_hard_refresh_steps": int(generation_hard_refresh_steps),
+            "generation_study_pool_size": (
+                len(study_pool) if hard_study_strategy == "generation" else 0),
+            "generation_hard_record_ids": (
+                selected_id_sample(study_pool)
+                if hard_study_strategy == "generation" else []),
+            "generation_study_reports": (
+                list(study_reports)
+                if hard_study_strategy == "generation" else []),
             "latent_study_strategy": hard_study_strategy,
             "latent_study_pool_size": len(study_pool),
             "latent_study_hard_record_ids": selected_id_sample(study_pool),
@@ -7220,6 +7341,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "latent_completion_study_reports": (
                 active_study_reports
                 if hard_study_strategy == "completion" else []),
+            "generation_study_reports": (
+                active_study_reports
+                if hard_study_strategy == "generation" else []),
             "latent_study_reports": active_study_reports,
         }
         if best_round == 0:
@@ -7233,6 +7357,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 "latent_discovery_hard_record_ids": [],
                 "latent_completion_study_pool_size": 0,
                 "latent_completion_hard_record_ids": [],
+                "generation_study_pool_size": 0,
+                "generation_hard_record_ids": [],
             }
         last = best_metrics
     else:
@@ -8814,6 +8940,10 @@ def selftest():
         assert causal_model.train_metrics["repetition_unlikelihood_w"] > 0.0
         assert causal_model.train_metrics["repetition_unlikelihood_enabled"] is True
         assert causal_model.train_metrics["repetition_unlikelihood_candidates"] > 0
+        assert causal_model.train_metrics["latent_study_strategy"] == "generation"
+        assert causal_model.train_metrics["generation_study_pool_size"] > 0
+        assert causal_model.train_metrics["generation_hard_record_ids"]
+        assert causal_model.train_metrics["generation_study_reports"]
         causal_self_teach_model, *_ = train(
             causal_manifest, steps=1, batch=2, d=32, layers=1, heads=4,
             device="cpu", objective_profile="language",
@@ -8858,6 +8988,16 @@ def selftest():
         assert isinstance(causal_generation["all_generations_identical"], bool)
         assert causal_generation["samples"]
         assert "generated" in causal_generation["samples"][0]
+        causal_generation_hard, causal_generation_hard_report = (
+            multimodal_generation_error_examples(
+                causal_model, causal_records, causal_vocab, causal_dims, n=2,
+                device="cpu", decode_objective="causal", prompt_tokens=3,
+                max_new_tokens=4))
+        assert causal_generation_hard_report["skipped"] is False
+        assert causal_generation_hard_report["n_selected"] == len(
+            causal_generation_hard)
+        assert math.isfinite(
+            causal_generation_hard_report["mean_generation_error"])
         assert multimodal_generation_gate(
             {"enabled": True, "skipped": False, "n_records": 1,
              "token_acc": 0.5, "exact": 0.0, "unique_generation_count": 1,

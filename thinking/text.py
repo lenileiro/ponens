@@ -2129,6 +2129,95 @@ def reading_generation_gate(generation):
     }
 
 
+def reading_generation_error_records(
+        model, vocab, records, device=DEV, n=0, seed=0,
+        prompt_tokens=16, max_new_tokens=32, temperature=0.0, top_k=0,
+        split="train"):
+    """Mine records where free continuation diverges from the gold window."""
+    candidates = [
+        rec for rec in records or ()
+        if rec.split == split and len(rec.tokens) >= 2
+    ]
+    if not candidates:
+        return [], {
+            "n_records": 0,
+            "sampled": False,
+            "n_selected": 0,
+            "mean_generation_error": 0.0,
+            "max_generation_error": 0.0,
+            "mean_generation_token_acc": 0.0,
+            "exact": 0.0,
+            "unique_generation_count": 0,
+            "all_generations_identical": False,
+            "skipped": True,
+            "skip_reason": "no_generation_records",
+        }
+    sampled = bool(n and int(n) < len(candidates))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=int(n), replace=False)
+        candidates = [candidates[int(i)] for i in idx]
+    rows = []
+    model.eval()
+    for rec in candidates:
+        sequence = tuple(rec.tokens)
+        prompt_len = min(max(1, int(prompt_tokens)), len(sequence) - 1)
+        gold = sequence[prompt_len:prompt_len + max(0, int(max_new_tokens))]
+        if not gold:
+            continue
+        generated = reading_generate_tokens(
+            model, vocab, sequence[:prompt_len], max_new_tokens=len(gold),
+            temperature=temperature, top_k=top_k, device=device)
+        matches = sum(1 for pred, target in zip(generated, gold)
+                      if pred == target)
+        token_acc = float(matches) / float(len(gold)) if gold else 0.0
+        rows.append({
+            "record": rec,
+            "id": str(rec.rec_id),
+            "token_acc": float(token_acc),
+            "generation_error": float(1.0 - token_acc),
+            "exact": bool(tuple(generated) == tuple(gold)),
+            "generated": tuple(generated),
+            "gold_len": int(len(gold)),
+        })
+    rows.sort(key=lambda row: (
+        row["generation_error"], not row["exact"], -row["token_acc"]),
+              reverse=True)
+    selected = []
+    seen = set()
+    for row in rows:
+        rec = row["record"]
+        if row["generation_error"] <= 0.0 and row["exact"]:
+            continue
+        if rec.rec_id in seen:
+            continue
+        seen.add(rec.rec_id)
+        selected.append(rec)
+    signatures = {row["generated"] for row in rows}
+
+    def mean_field(name):
+        return float(np.mean([row[name] for row in rows])) if rows else 0.0
+
+    def max_field(name):
+        return float(max([row[name] for row in rows])) if rows else 0.0
+
+    return selected, {
+        "n_records": int(len(candidates)),
+        "sampled": sampled,
+        "n_selected": int(len(selected)),
+        "mean_generation_error": mean_field("generation_error"),
+        "max_generation_error": max_field("generation_error"),
+        "mean_generation_token_acc": mean_field("token_acc"),
+        "exact": mean_field("exact"),
+        "unique_generation_count": int(len(signatures)),
+        "all_generations_identical": bool(
+            len(rows) > 1 and len(signatures) == 1),
+        "skipped": not bool(rows),
+        "skip_reason": "" if rows else "no_generation_targets",
+        "top_ids": [row["id"] for row in rows[:16]],
+    }
+
+
 def latent_text_concept_loss(model, txt, view_dropout=0.1,
                              invariance_w=25.0, variance_w=25.0,
                              covariance_w=1.0, variance_target=1.0):
@@ -3608,12 +3697,12 @@ READING_MASTERY_PROFILE_FLOORS = (
     | dict(READING_MASTERY_STUDY_FLOORS)
     | dict(READING_MASTERY_OPERATION_FLOORS))
 READING_STUDY_STRATEGIES = (
-    "random", "errors", "fer", "curiosity", "sequence", "closure", "graph",
-    "cycle", "gap", "discovery", "auto")
+    "random", "errors", "generation", "fer", "curiosity", "sequence",
+    "closure", "graph", "cycle", "gap", "discovery", "auto")
 READING_MEMORY_STUDY_STRATEGIES = ("curiosity", "graph", "gap", "discovery")
 READING_POOL_STUDY_STRATEGIES = (
-    "errors", "fer", "curiosity", "sequence", "closure", "graph", "cycle",
-    "gap", "discovery")
+    "errors", "generation", "fer", "curiosity", "sequence", "closure",
+    "graph", "cycle", "gap", "discovery")
 READING_TRANSITION_STUDY_STRATEGIES = (
     "sequence", "graph", "cycle", "gap", "discovery")
 READING_GRAPH_READY_STUDY_STRATEGIES = ("graph", "cycle", "gap")
@@ -3654,7 +3743,7 @@ READING_SELF_TEACH_SIGNAL_OBJECTIVES = {
 }
 READING_SELF_TEACH_SIGNAL_STUDY_STRATEGIES = {
     "language": "sequence",
-    "generation": "sequence",
+    "generation": "generation",
     "view": "errors",
     "context": "closure",
     "span": "closure",
@@ -6092,6 +6181,16 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 feature_dropout=0.0,
                 temperature=sequence_temperature)
             report = report | {"strategy": "sequence"}
+        elif study_strategy == "generation":
+            selected, report = reading_generation_error_records(
+                model, vocab, records, device=device, n=probe_n,
+                seed=seed + 1301 + int(step),
+                prompt_tokens=max(1, int(continuation_repair_steps) or 4),
+                max_new_tokens=max(1, int(continuation_repair_steps) or 4),
+                temperature=continuation_repair_temperature,
+                top_k=continuation_repair_top_k,
+                split="train")
+            report = report | {"strategy": "generation"}
         elif study_strategy == "closure":
             selected, report = reading_context_closure_surprise_records(
                 model, vocab, records, device=device, n=probe_n,
@@ -10115,6 +10214,13 @@ def selftest():
         token_drop_p=0.1, token_replace_p=0.0)
     assert seq_selected and seq_study_report["n_pairs"] == 2
     assert math.isfinite(seq_study_report["mean_sequence_surprise"])
+    gen_selected, gen_study_report = reading_generation_error_records(
+        reading_model, reading_vocab, reading_records, device="cpu", n=4,
+        prompt_tokens=2, max_new_tokens=2)
+    assert gen_study_report["skipped"] is False
+    assert gen_study_report["n_selected"] == len(gen_selected)
+    assert math.isfinite(gen_study_report["mean_generation_error"])
+    assert "top_ids" in gen_study_report
     assert torch.isfinite(reading_latent_memory_loss(
         reading_model, reading_txt, feature_dropout=0.1))
     gap_loss, gap_metrics = reading_latent_gap_loss(
@@ -10488,6 +10594,9 @@ def selftest():
     assert (reading_self_teach_study_strategy(
         {"top_signal": "sequence"}, "auto", "discovery", reading_model)
         == "sequence")
+    assert (reading_self_teach_study_strategy(
+        {"top_signal": "generation"}, "auto", "sequence", reading_model)
+        == "generation")
     assert (reading_self_teach_study_strategy(
         {"top_signal": "bridge"}, "auto", "closure", object())
         == "closure")
