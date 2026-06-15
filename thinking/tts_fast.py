@@ -114,6 +114,7 @@ def train(steps=30000, seed=0, device=DEV, batch=32, lr=3e-4, ckpt_path=None, sa
                                   "hello, this is a test of the speech system."], save_dir, device=device)
                 except Exception as e:
                     print(f"  (periodic synth skipped: {e})", flush=True)
+            model.train()   # synth()/save left LSTM in eval; cudnn RNN backward needs train mode
     return model, data
 
 
