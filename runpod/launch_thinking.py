@@ -539,6 +539,8 @@ def apply_image_quality_preset(args):
         float(args.image_ae_structure_w), 0.1 if hq else 0.05)
     args.image_ae_texture_w = max(
         float(args.image_ae_texture_w), 0.1 if hq else 0.05)
+    args.image_ae_physics_w = max(
+        float(args.image_ae_physics_w), 0.1 if hq else 0.05)
     args.image_feature_align_w = max(float(args.image_feature_align_w), 0.05)
     args.image_flow_feature_align_w = max(float(args.image_flow_feature_align_w), 0.05)
     if int(args.image_embedding_sequence_max_len) <= 0:
@@ -576,6 +578,8 @@ def apply_image_quality_preset(args):
         float(args.image_flow_straightness_w), 0.02 if hq else 0.01)
     args.image_flow_spatial_relation_w = max(
         float(args.image_flow_spatial_relation_w), 0.05 if hq else 0.02)
+    args.image_flow_physics_w = max(
+        float(args.image_flow_physics_w), 0.03 if hq else 0.01)
     args.image_flow_decoded_endpoint_w = max(
         float(args.image_flow_decoded_endpoint_w), 0.05 if hq else 0.02)
     args.image_flow_decoded_endpoint_p = max(
@@ -590,6 +594,8 @@ def apply_image_quality_preset(args):
         float(args.image_flow_decoded_endpoint_structure_w), 0.25 if hq else 0.1)
     args.image_flow_decoded_endpoint_texture_w = max(
         float(args.image_flow_decoded_endpoint_texture_w), 0.25 if hq else 0.1)
+    args.image_flow_decoded_endpoint_physics_w = max(
+        float(args.image_flow_decoded_endpoint_physics_w), 0.25 if hq else 0.1)
     args.image_flow_equivariance_w = max(
         float(args.image_flow_equivariance_w), 0.02 if hq else 0.01)
     image_flow_equivariance_p = (
@@ -1077,6 +1083,8 @@ def payload(args):
                          args.image_sample_reference_max_structure_ssim_loss),
                         ("sample-reference-max-texture-stats-l1",
                          args.image_sample_reference_max_texture_stats_l1),
+                        ("sample-reference-max-physics-l1",
+                         args.image_sample_reference_max_physics_l1),
                         ("sample-reference-max-selected-score",
                          args.image_sample_reference_max_selected_score)):
                     if value is not None:
@@ -1124,6 +1132,7 @@ def payload(args):
                      f"--ae-fft-w {args.image_ae_fft_w} "
                      f"--ae-structure-w {args.image_ae_structure_w} "
                      f"--ae-texture-w {args.image_ae_texture_w} "
+                     f"--ae-physics-w {args.image_ae_physics_w} "
                      f"--ae-latent-reg-w {args.image_ae_latent_reg_w} "
                      f"--image-text-align-w {args.image_text_align_w} "
                      f"--flow-text-align-w {args.image_flow_text_align_w} "
@@ -1226,6 +1235,7 @@ def payload(args):
                      f"--flow-straightness-w {args.image_flow_straightness_w} "
                      f"--flow-spatial-relation-w "
                      f"{args.image_flow_spatial_relation_w} "
+                     f"--flow-physics-w {args.image_flow_physics_w} "
                      f"--flow-decoded-endpoint-w "
                      f"{args.image_flow_decoded_endpoint_w} "
                      f"--flow-decoded-endpoint-p "
@@ -1240,6 +1250,8 @@ def payload(args):
                      f"{args.image_flow_decoded_endpoint_structure_w} "
                      f"--flow-decoded-endpoint-texture-w "
                      f"{args.image_flow_decoded_endpoint_texture_w} "
+                     f"--flow-decoded-endpoint-physics-w "
+                     f"{args.image_flow_decoded_endpoint_physics_w} "
                      f"--flow-equivariance-w {args.image_flow_equivariance_w} "
                      f"--flow-equivariance-p {args.image_flow_equivariance_p} "
                      f"--flow-equivariance-transforms "
@@ -2713,6 +2725,9 @@ def main():
     ap.add_argument("--image-ae-texture-w", type=float, default=0.0,
                     dest="image_ae_texture_w",
                     help="multi-scale local texture statistics reconstruction loss weight")
+    ap.add_argument("--image-ae-physics-w", type=float, default=0.0,
+                    dest="image_ae_physics_w",
+                    help="generic visual mass/edge moment reconstruction loss weight")
     ap.add_argument("--image-ae-latent-reg-w", type=float, default=0.0,
                     dest="image_ae_latent_reg_w",
                     help="latent L2 regularization weight during AE training")
@@ -3046,6 +3061,11 @@ def main():
                     dest="image_sample_reference_max_texture_stats_l1",
                     help=("fail image reference reproduction if texture-statistics "
                           "L1 exceeds this"))
+    ap.add_argument("--image-sample-reference-max-physics-l1", type=float,
+                    default=None,
+                    dest="image_sample_reference_max_physics_l1",
+                    help=("fail image reference reproduction if visual mass/edge "
+                          "moment L1 exceeds this"))
     ap.add_argument("--image-sample-reference-max-selected-score", type=float,
                     default=None,
                     dest="image_sample_reference_max_selected_score",
@@ -3309,6 +3329,9 @@ def main():
     ap.add_argument("--image-flow-spatial-relation-w", type=float, default=0.0,
                     dest="image_flow_spatial_relation_w",
                     help="local latent neighbor relation loss weight for image flow")
+    ap.add_argument("--image-flow-physics-w", type=float, default=0.0,
+                    dest="image_flow_physics_w",
+                    help="generic latent visual mass/edge moment loss weight")
     ap.add_argument("--image-flow-decoded-endpoint-w", type=float, default=0.0,
                     dest="image_flow_decoded_endpoint_w",
                     help=("decoded image-space clean-endpoint loss weight for image "
@@ -3331,6 +3354,9 @@ def main():
     ap.add_argument("--image-flow-decoded-endpoint-texture-w", type=float, default=0.0,
                     dest="image_flow_decoded_endpoint_texture_w",
                     help="local texture statistics weight inside decoded endpoint loss")
+    ap.add_argument("--image-flow-decoded-endpoint-physics-w", type=float, default=0.0,
+                    dest="image_flow_decoded_endpoint_physics_w",
+                    help="visual mass/edge moment weight inside decoded endpoint loss")
     ap.add_argument("--image-flow-equivariance-w", type=float, default=0.0,
                     dest="image_flow_equivariance_w",
                     help=("spatial equivariance loss weight for image flow "
@@ -4195,6 +4221,7 @@ def main():
     if (args.image_ae_grad_w < 0.0 or args.image_ae_ms_w < 0.0
             or args.image_ae_fft_w < 0.0 or args.image_ae_structure_w < 0.0
             or args.image_ae_texture_w < 0.0
+            or args.image_ae_physics_w < 0.0
             or args.image_ae_latent_reg_w < 0.0):
         sys.exit("ERROR: image AE reconstruction weights must be non-negative")
     if (args.image_time_mode_scale < 0.0
@@ -4243,6 +4270,8 @@ def main():
         sys.exit("ERROR: --image-flow-straightness-w must be non-negative")
     if args.image_flow_spatial_relation_w < 0.0:
         sys.exit("ERROR: --image-flow-spatial-relation-w must be non-negative")
+    if args.image_flow_physics_w < 0.0:
+        sys.exit("ERROR: --image-flow-physics-w must be non-negative")
     if args.image_flow_decoded_endpoint_w < 0.0:
         sys.exit("ERROR: --image-flow-decoded-endpoint-w must be non-negative")
     if (args.image_flow_decoded_endpoint_p < 0.0
@@ -4252,7 +4281,8 @@ def main():
             or args.image_flow_decoded_endpoint_ms_w < 0.0
             or args.image_flow_decoded_endpoint_fft_w < 0.0
             or args.image_flow_decoded_endpoint_structure_w < 0.0
-            or args.image_flow_decoded_endpoint_texture_w < 0.0):
+            or args.image_flow_decoded_endpoint_texture_w < 0.0
+            or args.image_flow_decoded_endpoint_physics_w < 0.0):
         sys.exit("ERROR: image decoded endpoint component weights must be non-negative")
     if args.image_flow_equivariance_w < 0.0:
         sys.exit("ERROR: --image-flow-equivariance-w must be non-negative")
@@ -4425,6 +4455,7 @@ def main():
         "image_sample_reference_max_structure_frequency_l1",
         "image_sample_reference_max_structure_ssim_loss",
         "image_sample_reference_max_texture_stats_l1",
+        "image_sample_reference_max_physics_l1",
         "image_sample_reference_max_selected_score",
     )
     image_reference_gate_enabled = any(
