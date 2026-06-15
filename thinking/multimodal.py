@@ -148,7 +148,7 @@ DEFAULT_TEXT_TRANSFER_INSIGHT_ACCEPT_W = 0.0
 MULTIMODAL_DEFAULT_SOURCE_BALANCE_W = 0.5
 MULTIMODAL_DEFAULT_LATENT_CONCEPT_SLOTS = 4
 MULTIMODAL_DEFAULT_LATENT_CONCEPT_MEMORY_SIZE = 64
-MULTIMODAL_OBJECTIVE_PROFILES = ("manual", "mastery")
+MULTIMODAL_OBJECTIVE_PROFILES = ("manual", "language", "mastery")
 MULTIMODAL_MASTERY_OBJECTIVE_FLOORS = {
     "latent_concept_slots": MULTIMODAL_DEFAULT_LATENT_CONCEPT_SLOTS,
     "latent_concept_memory_size": MULTIMODAL_DEFAULT_LATENT_CONCEPT_MEMORY_SIZE,
@@ -323,6 +323,58 @@ def feature_dims(records):
                 raise ValueError(
                     f"{rec.rec_id}: view {name!r} dim {dim} does not match {dims[name]}")
     return OrderedDict((name, int(dim)) for name, dim in dims.items())
+
+
+def _has_meaningful_text(rec):
+    return bool(rec.text) and tuple(rec.text) != EMPTY_TEXT_TOKENS
+
+
+def multimodal_active_modes(view_dims=None, records=None):
+    """Return only modes that have real conditioning signal for this manifest."""
+    has_views = bool(view_dims)
+    has_text = True if records is None else any(
+        _has_meaningful_text(rec) for rec in records)
+    if has_views and has_text:
+        return MODES
+    if has_views:
+        return ("full", "sensor_only")
+    return ("full",)
+
+
+def build_text_causal_lm_manifest(
+        paths, out, text_field="text", max_tokens=128, min_tokens=8,
+        stride=0, eval_frac=0.10, seed=0):
+    """Build a targetless causal LM manifest from raw text/code sources."""
+    from .text import load_reading_records, write_causal_lm_manifest
+
+    paths = list(paths or [])
+    if not paths:
+        raise ValueError("text causal LM manifest needs at least one source")
+    max_tokens = max(2, int(max_tokens))
+    min_tokens = max(2, int(min_tokens))
+    stride = int(stride)
+    if stride <= 0:
+        stride = max(1, max_tokens // 2)
+    records = []
+    for i, path in enumerate(paths):
+        records.extend(load_reading_records(
+            path, require_train=False, require_eval=False,
+            text_field=text_field, max_tokens=max_tokens,
+            min_tokens=min_tokens, eval_frac=eval_frac, seed=seed + i,
+            stride=stride))
+    if not any(rec.split == "train" for rec in records):
+        raise ValueError("text causal LM manifest has no train records")
+    report = write_causal_lm_manifest(records, out)
+    report.update({
+        "sources": [str(path) for path in paths],
+        "text_field": str(text_field),
+        "window_tokens": int(max_tokens),
+        "window_stride": int(stride),
+        "min_tokens": int(min_tokens),
+        "eval_frac": float(eval_frac),
+        "objective": "causal_lm",
+    })
+    return report
 
 
 def split_records(records):
@@ -1387,7 +1439,8 @@ def multimodal_objective_profile_kwargs(objective_profile="manual", **kwargs):
                 updates[key] = {"from": before_raw, "to": after}
     report = {
         "profile": objective_profile,
-        "enabled": objective_profile != "manual",
+        "enabled": objective_profile == "mastery",
+        "language_first": objective_profile == "language",
         "floors": dict(MULTIMODAL_MASTERY_PROFILE_FLOORS)
         if objective_profile == "mastery" else {},
         "objective_floors": dict(MULTIMODAL_MASTERY_OBJECTIVE_FLOORS)
@@ -3729,12 +3782,14 @@ def multimodal_self_teach_weight_maps(score_components=None, budget=0.0,
 
 def multimodal_eval_bundle(model, records, vocab, view_dims, n=200, seed=1,
                            device=DEV, score_metric="mastery",
-                           score_margin_w=0.1, decode_objective="target"):
+                           score_margin_w=0.1, decode_objective="target",
+                           modes=None):
+    modes = tuple(modes or multimodal_active_modes(view_dims, records))
     metrics = {
         mode: evaluate(model, records, vocab, view_dims, n=n,
                        seed=seed + 17 + i * 997, device=device, mode=mode,
                        decode_objective=decode_objective)
-        for i, mode in enumerate(MODES)
+        for i, mode in enumerate(modes)
     }
     fer = latent_multimodal_fer_eval(
         model, records, vocab, view_dims, n=n, seed=seed + 29, device=device,
@@ -4639,7 +4694,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           device=DEV, log_every=100, layers=3, heads=4, max_len=128,
           max_vocab=0,
           source_balance_w=MULTIMODAL_DEFAULT_SOURCE_BALANCE_W,
-          objective_profile="mastery",
+          objective_profile="language",
           decode_objective="auto",
           view_tokens=4, txt_tokens=8, trunk_arch="mlp",
           trunk_width=128, trunk_depth=1, text_layers=1,
@@ -4995,6 +5050,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     sequence_pairs, sequence_report = mine_multimodal_sequence_pairs(
         records, split="train")
     view_dims = feature_dims(records)
+    active_modes = multimodal_active_modes(view_dims, records)
     vocab = build_vocab(records, max_size=(int(max_vocab) or None))
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -5340,7 +5396,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                     latent_view_dropout=latent_concept_view_dropout,
                     latent_project=True,
                     need_logits=needs_logits)
-                for mode in MODES
+                for mode in active_modes
             }
             latent_bundles_by_mode = bundles_by_mode
             logit_bundles_by_mode = bundles_by_mode
@@ -5350,14 +5406,14 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                     features, txt, ids, mode=mode, need_latent=True,
                     latent_view_dropout=latent_concept_view_dropout,
                     latent_project=True, need_logits=False)
-                for mode in MODES
+                for mode in active_modes
             }
             logit_bundles_by_mode = {
                 mode: model.mode_bundle(
                     features, decode_txt, ids, mode=mode, need_latent=False,
                     latent_view_dropout=0.0, latent_project=False,
                     need_logits=needs_logits)
-                for mode in MODES
+                for mode in active_modes
             }
         logits_by_mode = {mode: bundle["logits"]
                           for mode, bundle in logit_bundles_by_mode.items()}
@@ -6084,6 +6140,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         **source_balance_train_report,
         "decode_objective": str(decode_objective),
         "decode_objective_report": decode_objective_info,
+        "active_modes": list(active_modes),
         "self_teach_history_prior_w": float(self_teach_history_prior_w),
         "text_checkpoint_history_prior": text_checkpoint_history_prior,
         "text_checkpoint_history_prior_raw": text_checkpoint_history_prior_raw,
@@ -6144,6 +6201,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         "view_dims": dict(view_dims),
         "view_names": list(view_dims.keys()),
         "view_count": len(view_dims),
+        "active_modes": list(active_modes),
         "decode_objective": str(decode_objective),
         "decode_objective_report": decode_objective_info,
         "source_balance_w": float(source_balance_w),
@@ -6164,11 +6222,14 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         manifest, root=root, steps=steps, seed=seed, device=device, **kwargs)
     decode_objective = str(
         getattr(model, "manifest_info", {}).get("decode_objective", "target"))
+    active_modes = tuple(
+        getattr(model, "manifest_info", {}).get("active_modes")
+        or multimodal_active_modes(view_dims, records))
     metrics = {
         mode: evaluate(model, eval_records, vocab, view_dims, n=eval_n,
                        seed=seed + 17, device=device, mode=mode,
                        decode_objective=decode_objective)
-        for mode in MODES
+        for mode in active_modes
     }
     latent_probe = {}
     if getattr(model, "latent_concept_memory", None) is not None:
@@ -7185,27 +7246,38 @@ def selftest():
         assert balanced_model.train_metrics["training_source_balance_w"] == 1.0
         assert balanced_model.train_metrics["training_source_count"] == 2
         assert balanced_model.manifest_info["source_count"] == 2
-        default_profile_model, *_ = train(
+        language_profile_model, *_ = train(
             manifest, steps=2, batch=2, d=32, layers=1, heads=4, device="cpu",
             log_every=10, view_tokens=2, txt_tokens=4, concept_tokens=2)
-        default_profile = default_profile_model.train_metrics[
+        language_profile = language_profile_model.train_metrics[
             "objective_profile_report"]
-        assert default_profile_model.train_metrics["objective_profile"] == "mastery"
-        assert default_profile["applied"] is True
-        assert default_profile["updates"]["latent_concept_slots"]["to"] == (
+        assert language_profile_model.train_metrics["objective_profile"] == "language"
+        assert language_profile["language_first"] is True
+        assert language_profile["applied"] is False
+        assert language_profile_model.latent_concept_slots == 0
+        assert language_profile_model.train_metrics["active_modes"] == list(MODES)
+        mastery_profile_model, *_ = train(
+            manifest, steps=2, batch=2, d=32, layers=1, heads=4, device="cpu",
+            objective_profile="mastery",
+            log_every=10, view_tokens=2, txt_tokens=4, concept_tokens=2)
+        mastery_profile = mastery_profile_model.train_metrics[
+            "objective_profile_report"]
+        assert mastery_profile_model.train_metrics["objective_profile"] == "mastery"
+        assert mastery_profile["applied"] is True
+        assert mastery_profile["updates"]["latent_concept_slots"]["to"] == (
             MULTIMODAL_DEFAULT_LATENT_CONCEPT_SLOTS)
-        assert default_profile["updates"]["latent_concept_memory_size"]["to"] == (
+        assert mastery_profile["updates"]["latent_concept_memory_size"]["to"] == (
             MULTIMODAL_DEFAULT_LATENT_CONCEPT_MEMORY_SIZE)
-        assert (default_profile_model.latent_concept_slots
+        assert (mastery_profile_model.latent_concept_slots
                 == MULTIMODAL_DEFAULT_LATENT_CONCEPT_SLOTS)
-        assert default_profile_model.train_metrics["latent_memory_active"] > 0
-        assert default_profile_model.train_metrics["latent_completion_w"] >= 0.10
-        assert default_profile_model.train_metrics["latent_completion_skipped"] is False
-        assert default_profile_model.train_metrics["latent_sequence_w"] >= 0.10
-        assert default_profile_model.train_metrics["latent_sequence_pairs"] > 0
-        assert default_profile_model.train_metrics["latent_gap_w"] >= 0.05
-        assert default_profile_model.train_metrics["latent_gap_skipped"] is False
-        assert default_profile_model.train_metrics["self_teach_plan"]["enabled"] is True
+        assert mastery_profile_model.train_metrics["latent_memory_active"] > 0
+        assert mastery_profile_model.train_metrics["latent_completion_w"] >= 0.10
+        assert mastery_profile_model.train_metrics["latent_completion_skipped"] is False
+        assert mastery_profile_model.train_metrics["latent_sequence_w"] >= 0.10
+        assert mastery_profile_model.train_metrics["latent_sequence_pairs"] > 0
+        assert mastery_profile_model.train_metrics["latent_gap_w"] >= 0.05
+        assert mastery_profile_model.train_metrics["latent_gap_skipped"] is False
+        assert mastery_profile_model.train_metrics["self_teach_plan"]["enabled"] is True
         no_target_manifest = os.path.join(tmpdir, "mm_no_target.jsonl")
         no_target_rows = []
         for i in range(6):
@@ -7243,6 +7315,44 @@ def selftest():
         assert no_target_bundle["score_components"]["token_skipped"] is False
         assert no_target_bundle["score_components"]["exact_skipped"] is False
         assert no_target_bundle["score_components"]["bridge_skipped"] is False
+        code_path = os.path.join(tmpdir, "toy_code.py")
+        with open(code_path, "w") as f:
+            f.write(
+                "def add(a, b):\n"
+                "    return a + b\n\n"
+                "def factorial(n):\n"
+                "    out = 1\n"
+                "    for i in range(2, n + 1):\n"
+                "        out *= i\n"
+                "    return out\n")
+        causal_manifest = os.path.join(tmpdir, "code_causal.jsonl")
+        causal_report = build_text_causal_lm_manifest(
+            [code_path], causal_manifest, max_tokens=10, min_tokens=4,
+            stride=5, eval_frac=0.25, seed=0)
+        assert causal_report["target_records"] == 0
+        assert causal_report["window_stride"] == 5
+        causal_records = load_manifest(causal_manifest)
+        assert len(causal_records) >= 2
+        assert all(not rec.target for rec in causal_records)
+        starts = [int(rec.meta["token_start"]) for rec in causal_records]
+        assert any((b - a) == 5 for a, b in zip(starts, starts[1:]))
+        assert infer_multimodal_decode_objective(
+            causal_records, requested="auto") == "causal"
+        assert multimodal_active_modes(feature_dims(causal_records),
+                                       causal_records) == ("full",)
+        causal_model, causal_vocab, _all, _trn, causal_eval, causal_dims = train(
+            causal_manifest, steps=2, batch=2, d=32, layers=1, heads=4,
+            device="cpu", objective_profile="language",
+            log_every=10, view_tokens=2, txt_tokens=4, concept_tokens=2)
+        assert causal_model.train_metrics["objective_profile"] == "language"
+        assert causal_model.train_metrics["active_modes"] == ["full"]
+        assert causal_model.train_metrics["decode_objective"] == "causal"
+        assert causal_model.train_metrics["token_loss"] > 0.1
+        causal_bundle = multimodal_eval_bundle(
+            causal_model, causal_eval, causal_vocab, causal_dims, n=0,
+            device="cpu", decode_objective="causal")
+        assert list(causal_bundle["teacher_forced"]) == ["full"]
+        assert causal_bundle["score_components"]["token_skipped"] is False
         completion_model, *_ = train(
             manifest, steps=1, batch=2, d=32, layers=1, heads=4, device="cpu",
             objective_profile="manual",
@@ -7349,6 +7459,22 @@ def main(argv=None):
                     help="JSONL manifest with text/features and optional target tokens")
     ap.add_argument("--root", default=None,
                     help="root for relative .npy feature paths inside the manifest")
+    ap.add_argument("--text-data", action="append", default=None,
+                    help=("raw text/code source to convert into targetless "
+                          "causal LM windows before multimodal training"))
+    ap.add_argument("--text-field", default="text",
+                    help="JSON/JSONL field to read when --text-data points at structured data")
+    ap.add_argument("--text-window", type=int, default=128,
+                    help="tokens per causal LM window built from --text-data")
+    ap.add_argument("--text-stride", type=int, default=0,
+                    help=("stride for causal LM windows; 0 uses half of "
+                          "--text-window for overlap"))
+    ap.add_argument("--text-min-tokens", type=int, default=8,
+                    help="minimum tokens required for a causal LM window")
+    ap.add_argument("--text-eval-frac", type=float, default=0.10,
+                    help="fraction of causal LM windows held out for eval")
+    ap.add_argument("--text-manifest-out", default=None,
+                    help="optional path to save the generated causal LM manifest")
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default=DEV)
@@ -7366,9 +7492,10 @@ def main(argv=None):
                     help=("smooth source-balanced minibatch sampling from "
                           "manifest metadata; 0 disables"))
     ap.add_argument("--objective-profile", choices=MULTIMODAL_OBJECTIVE_PROFILES,
-                    default="mastery",
+                    default="language",
                     help=("generic multimodal objective posture; mastery enables "
-                          "schema-free concept/self-teach floors"))
+                          "schema-free concept/self-teach floors; language keeps "
+                          "token modeling first"))
     ap.add_argument("--decode-objective", choices=DECODE_OBJECTIVES,
                     default="auto", dest="decode_objective",
                     help=("decoder target construction: target keeps manifest "
@@ -7647,8 +7774,18 @@ def main(argv=None):
     if args.selftest:
         selftest()
         return
-    if not args.manifest:
-        ap.error("--manifest is required")
+    if args.manifest and args.text_data:
+        ap.error("--manifest and --text-data are mutually exclusive")
+    if not args.manifest and not args.text_data:
+        ap.error("--manifest or --text-data is required")
+    if args.text_window <= 1:
+        ap.error("--text-window must be greater than one")
+    if args.text_stride < 0:
+        ap.error("--text-stride must be non-negative")
+    if args.text_min_tokens <= 1:
+        ap.error("--text-min-tokens must be greater than one")
+    if args.text_eval_frac < 0.0 or args.text_eval_frac >= 1.0:
+        ap.error("--text-eval-frac must be in [0, 1)")
     positive = {
         "--steps": args.steps, "--batch": args.batch, "--dim": args.d,
         "--layers": args.layers, "--heads": args.heads, "--max-len": args.max_len,
@@ -7815,8 +7952,28 @@ def main(argv=None):
         ap.error("--selection-insight-accept-w must be non-negative")
     if args.selection_insight_min_delta < 0.0:
         ap.error("--selection-insight-min-delta must be non-negative")
+    generated_manifest_tmp = None
+    generated_manifest_report = None
+    manifest = args.manifest
+    root = args.root
+    if args.text_data:
+        if args.text_manifest_out:
+            manifest = args.text_manifest_out
+        elif args.out:
+            stem, _ext = os.path.splitext(args.out)
+            manifest = stem + ".manifest.jsonl"
+        else:
+            generated_manifest_tmp = tempfile.TemporaryDirectory()
+            manifest = os.path.join(
+                generated_manifest_tmp.name, "causal_lm_manifest.jsonl")
+        generated_manifest_report = build_text_causal_lm_manifest(
+            args.text_data, manifest, text_field=args.text_field,
+            max_tokens=args.text_window, min_tokens=args.text_min_tokens,
+            stride=args.text_stride, eval_frac=args.text_eval_frac,
+            seed=args.seed)
+        root = None
     report = run(
-        args.manifest, root=args.root, steps=args.steps, seed=args.seed,
+        manifest, root=root, steps=args.steps, seed=args.seed,
         device=args.device, eval_n=args.eval_n, checkpoint=args.checkpoint,
         out=args.out, batch=args.batch, d=args.d, lr=args.lr, layers=args.layers,
         heads=args.heads, max_len=args.max_len, max_vocab=args.max_vocab,
@@ -7971,6 +8128,14 @@ def main(argv=None):
         selection_insight_accept_w=args.selection_insight_accept_w,
         selection_insight_min_delta=args.selection_insight_min_delta,
         log_every=args.log_every)
+    if generated_manifest_report is not None:
+        report["generated_text_manifest"] = generated_manifest_report
+        if args.out:
+            os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+            with open(args.out, "w") as f:
+                json.dump(report, f, indent=1)
+    if generated_manifest_tmp is not None:
+        generated_manifest_tmp.cleanup()
     return report
 
 

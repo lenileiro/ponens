@@ -929,23 +929,30 @@ def normalize_reading_record(raw, default_split=None, idx=0, text_field="text",
     )
 
 
-def _chunk_reading_tokens(tokens, max_tokens=128, min_tokens=8):
+def _chunk_reading_tokens(tokens, max_tokens=128, min_tokens=8, stride=None,
+                          with_offsets=False):
     max_tokens = max(1, int(max_tokens))
     min_tokens = max(1, int(min_tokens))
+    stride = max_tokens if stride is None else max(1, int(stride))
     chunks = []
-    for off in range(0, len(tokens), max_tokens):
+    for off in range(0, len(tokens), stride):
         chunk = tuple(tokens[off:off + max_tokens])
         if len(chunk) >= min_tokens:
-            chunks.append(chunk)
+            chunks.append((off, chunk) if with_offsets else chunk)
+        if off + max_tokens >= len(tokens):
+            break
     if not chunks and tokens:
-        chunks.append(tuple(tokens[:max_tokens]))
+        chunk = tuple(tokens[:max_tokens])
+        chunks.append((0, chunk) if with_offsets else chunk)
     return chunks
 
 
 def reading_records_from_text(text, source, max_tokens=128, min_tokens=8,
-                              eval_frac=0.10, seed=0):
+                              eval_frac=0.10, seed=0, stride=None):
     tokens = split_words(text)
-    chunks = _chunk_reading_tokens(tokens, max_tokens=max_tokens, min_tokens=min_tokens)
+    chunks = _chunk_reading_tokens(
+        tokens, max_tokens=max_tokens, min_tokens=min_tokens,
+        stride=stride, with_offsets=True)
     if not chunks:
         raise ValueError(f"{source} produced no reading chunks")
     rng = np.random.default_rng(seed)
@@ -958,10 +965,48 @@ def reading_records_from_text(text, source, max_tokens=128, min_tokens=8,
             split="eval" if i in eval_ids else "train",
             tokens=chunk,
             kind="raw_text",
-            meta={"source": str(source), "chunk_index": i},
+            meta={
+                "source": str(source),
+                "chunk_index": i,
+                "token_start": int(off),
+                "token_end": int(off + len(chunk)),
+                "window_tokens": int(max_tokens),
+                "window_stride": int(max_tokens if stride is None else stride),
+            },
         )
-        for i, chunk in enumerate(chunks)
+        for i, (off, chunk) in enumerate(chunks)
     ]
+
+
+def causal_lm_manifest_rows(records):
+    """Convert reading records into targetless causal LM manifest rows."""
+    rows = []
+    for rec in records:
+        meta = dict(rec.meta or {})
+        meta["causal_lm"] = True
+        meta["kind"] = str(rec.kind)
+        rows.append({
+            "id": str(rec.rec_id),
+            "split": str(rec.split),
+            "text": list(rec.tokens),
+            "meta": meta,
+        })
+    return rows
+
+
+def write_causal_lm_manifest(records, out):
+    rows = causal_lm_manifest_rows(records)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    with open(out, "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    return {
+        "path": str(out),
+        "records": len(rows),
+        "train_records": sum(1 for row in rows if row["split"] == "train"),
+        "eval_records": sum(1 for row in rows if row["split"] == "eval"),
+        "target_records": 0,
+    }
 
 
 def _json_reading_records(data, source, text_field="text"):
@@ -988,14 +1033,15 @@ def _json_reading_records(data, source, text_field="text"):
 
 def load_reading_records(path, require_train=True, require_eval=True,
                          text_field="text", max_tokens=128, min_tokens=8,
-                         eval_frac=0.10, seed=0):
+                         eval_frac=0.10, seed=0, stride=None):
     if isinstance(path, (list, tuple)):
         records = []
         for i, p in enumerate(path):
             records.extend(load_reading_records(
                 p, require_train=False, require_eval=False,
                 text_field=text_field, max_tokens=max_tokens,
-                min_tokens=min_tokens, eval_frac=eval_frac, seed=seed + i))
+                min_tokens=min_tokens, eval_frac=eval_frac, seed=seed + i,
+                stride=stride))
         if require_train and not any(r.split == "train" for r in records):
             raise ValueError(f"{path} has no train reading records")
         if require_eval and not any(r.split == "eval" for r in records):
@@ -1012,7 +1058,7 @@ def load_reading_records(path, require_train=True, require_eval=True,
     else:
         records = reading_records_from_text(
             txt, path, max_tokens=max_tokens, min_tokens=min_tokens,
-            eval_frac=eval_frac, seed=seed)
+            eval_frac=eval_frac, seed=seed, stride=stride)
     if require_train and not any(r.split == "train" for r in records):
         raise ValueError(f"{path} has no train reading records")
     if require_eval and not any(r.split == "eval" for r in records):
