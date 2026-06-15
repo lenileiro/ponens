@@ -442,6 +442,8 @@ def text_reading_cmd(args, py):
         f"--reading-study-score-min-delta {args.reading_study_score_min_delta} "
         f"--reading-study-score-patience {args.reading_study_score_patience} "
         f"--reading-study-score-target {args.reading_study_score_target} "
+        f"--reading-study-signal-regression-tolerance "
+        f"{args.reading_study_signal_regression_tolerance} "
         f"--reading-study-insight-accept-w "
         f"{args.reading_study_insight_accept_w} "
         f"--reading-study-insight-min-delta "
@@ -2338,6 +2340,8 @@ def payload(args):
                 f"{args.multimodal_selection_score_min_delta} "
                 f"--selection-score-patience "
                 f"{args.multimodal_selection_score_patience} "
+                f"--selection-signal-regression-tolerance "
+                f"{args.multimodal_selection_signal_regression_tolerance} "
                 f"--selection-eval-n {args.multimodal_selection_eval_n} "
                 f"--selection-generation-n "
                 f"{args.multimodal_selection_generation_n} "
@@ -2745,6 +2749,9 @@ def main():
                     dest="reading_study_score_patience")
     ap.add_argument("--reading-study-score-target", type=float, default=0.0,
                     dest="reading_study_score_target")
+    ap.add_argument("--reading-study-signal-regression-tolerance", type=float,
+                    default=0.02,
+                    dest="reading_study_signal_regression_tolerance")
     ap.add_argument("--reading-study-insight-accept-w", "--reading-study-insight-w",
                     type=float, default=0.25,
                     dest="reading_study_insight_accept_w")
@@ -4604,6 +4611,9 @@ def main():
                     default=0.0, dest="multimodal_selection_score_min_delta")
     ap.add_argument("--multimodal-selection-score-patience", type=int,
                     default=0, dest="multimodal_selection_score_patience")
+    ap.add_argument("--multimodal-selection-signal-regression-tolerance",
+                    type=float, default=0.02,
+                    dest="multimodal_selection_signal_regression_tolerance")
     ap.add_argument("--multimodal-selection-eval-n", type=int, default=200,
                     dest="multimodal_selection_eval_n")
     ap.add_argument("--multimodal-selection-generation-n", type=int, default=0,
@@ -4814,6 +4824,8 @@ def main():
             "--reading-study-score-min-delta": args.reading_study_score_min_delta,
             "--reading-study-score-patience": args.reading_study_score_patience,
             "--reading-study-score-target": args.reading_study_score_target,
+            "--reading-study-signal-regression-tolerance": (
+                args.reading_study_signal_regression_tolerance),
             "--reading-study-insight-accept-w": (
                 args.reading_study_insight_accept_w),
             "--reading-study-insight-min-delta": (
@@ -5867,6 +5879,8 @@ def main():
                 args.multimodal_selection_score_min_delta),
             "--multimodal-selection-score-patience": (
                 args.multimodal_selection_score_patience),
+            "--multimodal-selection-signal-regression-tolerance": (
+                args.multimodal_selection_signal_regression_tolerance),
             "--multimodal-selection-eval-n": args.multimodal_selection_eval_n,
             "--multimodal-selection-generation-n": (
                 args.multimodal_selection_generation_n),

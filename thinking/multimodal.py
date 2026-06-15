@@ -66,7 +66,7 @@ from .concepts import (
     latent_concept_transition_consistency_loss,
     latent_concept_vicreg_loss,
 )
-from .selection import concept_round_selection_decision
+from .selection import concept_round_selection_decision, signal_regression_report
 from .trace import Vocab
 
 DEV = get_device()
@@ -154,6 +154,7 @@ MULTIMODAL_REPRESENTATION_SIGNAL_KEYS = (
 DEFAULT_TEXT_TRANSFER_PROBE_N = 64
 DEFAULT_TEXT_TRANSFER_SCORE_MIN_DELTA = 0.1
 DEFAULT_TEXT_TRANSFER_INSIGHT_ACCEPT_W = 0.0
+MULTIMODAL_DEFAULT_SIGNAL_REGRESSION_TOLERANCE = 0.02
 MULTIMODAL_DEFAULT_SOURCE_BALANCE_W = 0.5
 MULTIMODAL_DEFAULT_LATENT_CONCEPT_SLOTS = 4
 MULTIMODAL_DEFAULT_LATENT_CONCEPT_MEMORY_SIZE = 64
@@ -5233,6 +5234,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           selection_score_margin_w=0.1,
           selection_score_min_delta=0.0,
           selection_score_patience=0,
+          selection_signal_regression_tolerance=(
+              MULTIMODAL_DEFAULT_SIGNAL_REGRESSION_TOLERANCE),
           selection_eval_n=200,
           selection_generation_n=0,
           selection_generation_prompt_tokens=16,
@@ -5495,6 +5498,11 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         raise ValueError("multimodal selection score min delta must be non-negative")
     if int(selection_score_patience) < 0:
         raise ValueError("multimodal selection score patience must be non-negative")
+    selection_signal_regression_tolerance = float(
+        selection_signal_regression_tolerance)
+    if selection_signal_regression_tolerance < 0.0:
+        raise ValueError(
+            "multimodal selection signal regression tolerance must be non-negative")
     if int(selection_eval_n) < 0:
         raise ValueError("multimodal selection eval count must be non-negative")
     selection_generation_n = int(selection_generation_n)
@@ -5663,6 +5671,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     best_state = None
     best_score = 0.0
     best_round = 0
+    best_bundle = None
     best_bridge_eval = None
     best_metrics = {}
     best_study_reports = []
@@ -5797,6 +5806,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         initial_row = selection_row(0, 0, before_bundle)
         best_state = _model_state_copy(model)
         best_score = float(initial_row["score"])
+        best_bundle = before_bundle
         best_bridge_eval = initial_row["latent_bridge"]
         best_metrics = {"selection_initial": True}
         rounds_report = [initial_row]
@@ -6550,6 +6560,13 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             insight = multimodal_bridge_selection_insight(
                 best_bridge_eval, row["latent_bridge"],
                 enabled=bridge_insight_gate)
+            signal_regression = signal_regression_report(
+                (best_bundle or before_bundle)["score_components"],
+                row["score_components"],
+                MULTIMODAL_SELF_TEACH_SCORE_KEYS,
+                skip_keys=MULTIMODAL_SELF_TEACH_SKIP_KEYS,
+                tolerance=selection_signal_regression_tolerance,
+                signals=MULTIMODAL_SELF_TEACH_SIGNALS)
             decision = concept_round_selection_decision(
                 score_delta_from_best, selection_score_min_delta,
                 insight_delta=insight["bridge_insight_delta"],
@@ -6557,17 +6574,43 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 insight_gate=bridge_insight_gate,
                 insight_accept_w=selection_insight_accept_w,
                 insight_min_delta=selection_insight_min_delta)
-            selected = decision["selected"]
+            pre_signal_selected = bool(decision["selected"])
+            selected = bool(
+                pre_signal_selected and signal_regression["allowed"])
+            blocked_by_signal_regression = bool(
+                pre_signal_selected and not signal_regression["allowed"])
             row = row | {
                 "selected": bool(selected),
                 "score_delta_from_best": score_delta_from_best,
+                "signal_regression_gate": True,
+                "signal_regression_allowed": bool(
+                    signal_regression["allowed"]),
+                "signal_regression": signal_regression,
+                "signal_regression_tolerance": float(
+                    selection_signal_regression_tolerance),
+                "signal_regression_max": float(
+                    signal_regression["max_regression"]),
+                "signal_regression_signals": list(
+                    signal_regression["regressed_signals"]),
                 "bridge_insight_gate": bool(bridge_insight_gate),
                 "bridge_insight_delta": float(insight["bridge_insight_delta"]),
                 "bridge_insight_allowed": bool(
                     insight["bridge_insight_allowed"]),
                 "bridge_insight": insight,
-                "selected_by_score": bool(decision["selected_by_score"]),
-                "selected_by_insight": bool(decision["selected_by_insight"]),
+                "selected_by_score": bool(
+                    selected and decision["selected_by_score"]),
+                "selected_by_insight": bool(
+                    selected and decision["selected_by_insight"]),
+                "pre_signal_selected": bool(pre_signal_selected),
+                "pre_signal_selected_by_score": bool(
+                    decision["selected_by_score"]),
+                "pre_signal_selected_by_insight": bool(
+                    decision["selected_by_insight"]),
+                "blocked_by_signal_regression": bool(
+                    blocked_by_signal_regression),
+                "blocked_reasons": (
+                    ["signal_regression"] if blocked_by_signal_regression
+                    else []),
                 "insight_score_boost": float(decision["insight_score_boost"]),
                 "insight_effective_delta": float(
                     decision["insight_effective_delta"]),
@@ -6589,6 +6632,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 best_score = float(row["score"])
                 best_round = int(round_id)
                 best_state = _model_state_copy(model)
+                best_bundle = bundle
                 best_bridge_eval = row["latent_bridge"]
                 best_metrics = dict(last)
                 best_study_reports = list(study_reports)
@@ -6616,6 +6660,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "score_margin_w": float(selection_score_margin_w),
             "score_min_delta": float(selection_score_min_delta),
             "score_patience": int(selection_score_patience),
+            "signal_regression_gate": True,
+            "signal_regression_tolerance": float(
+                selection_signal_regression_tolerance),
             "selection_eval_n": int(selection_eval_n),
             "selection_generation_n": int(selection_generation_n),
             "selection_generation_prompt_tokens": int(
@@ -6643,6 +6690,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 sum(1 for row in rounds_report
                     if int(row.get("round", 0)) > 0
                     and bool(row.get("weight_update_changed", False)))),
+            "signal_regression_blocked_round_count": int(
+                sum(1 for row in rounds_report
+                    if bool(row.get("blocked_by_signal_regression", False)))),
             "rounds": rounds_report,
         }
         selected_rows = [row for row in rounds_report if row["round"] == best_round]
@@ -6663,6 +6713,10 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 selected_row.get("insight_effective_delta", 0.0))
             selection["selected_bridge_insight"] = selected_row.get(
                 "bridge_insight")
+            selection["selected_signal_regression"] = selected_row.get(
+                "signal_regression")
+            selection["selected_signal_regression_allowed"] = bool(
+                selected_row.get("signal_regression_allowed", True))
             selection["selected_self_teach_plan"] = selected_self_teach_plan
             selection["selected_self_teach_effective_weights"] = (
                 selected_self_teach_effective_weights)
@@ -6746,6 +6800,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             selection_generation_max_new_tokens),
         "selection_generation_temperature": float(selection_generation_temperature),
         "selection_generation_top_k": int(selection_generation_top_k),
+        "selection_signal_regression_tolerance": float(
+            selection_signal_regression_tolerance),
         "decode_objective_report": decode_objective_info,
         "active_modes": list(active_modes),
         "self_teach_history_prior_w": float(self_teach_history_prior_w),
@@ -7485,6 +7541,32 @@ def selftest():
             insight_allowed=positive_insight["bridge_insight_allowed"],
             insight_gate=True, insight_accept_w=1.0)
         assert positive_decision["selected_by_insight"] is True
+        mm_regression = signal_regression_report(
+            {"generation_score": 0.30, "generation_skipped": False},
+            {"generation_score": 0.25, "generation_skipped": False},
+            MULTIMODAL_SELF_TEACH_SCORE_KEYS,
+            skip_keys=MULTIMODAL_SELF_TEACH_SKIP_KEYS,
+            tolerance=0.02,
+            signals=("generation",))
+        assert mm_regression["allowed"] is False
+        assert mm_regression["regressions"]["generation"] > 0.02
+        mm_tolerated_regression = signal_regression_report(
+            {"generation_score": 0.30, "generation_skipped": False},
+            {"generation_score": 0.29, "generation_skipped": False},
+            MULTIMODAL_SELF_TEACH_SCORE_KEYS,
+            skip_keys=MULTIMODAL_SELF_TEACH_SKIP_KEYS,
+            tolerance=0.02,
+            signals=("generation",))
+        assert mm_tolerated_regression["allowed"] is True
+        mm_nonfinite_regression = signal_regression_report(
+            {"sequence_score": 0.30, "sequence_skipped": False},
+            {"sequence_score": float("nan"), "sequence_skipped": False},
+            MULTIMODAL_SELF_TEACH_SCORE_KEYS,
+            skip_keys=MULTIMODAL_SELF_TEACH_SKIP_KEYS,
+            tolerance=0.02,
+            signals=("sequence",))
+        assert mm_nonfinite_regression["allowed"] is False
+        assert "sequence" in mm_nonfinite_regression["nonfinite_signals"]
         synthetic_learning_event = multimodal_learning_event_report({
             "weight_update_changed": True,
             "weight_update_changed_tensor_count": 2,
@@ -8164,6 +8246,8 @@ def selftest():
         assert selection["bridge_insight_gate"] is True
         assert selection["selected_by_score"] is False
         assert selection["selected_by_insight"] is False
+        assert selection["signal_regression_gate"] is True
+        assert selection["signal_regression_tolerance"] == 0.02
         assert selection["self_teach_w"] == 0.05
         assert selection["self_teach_reports"]
         assert selection["selected_self_teach_plan"]["enabled"] is True
@@ -8533,6 +8617,11 @@ def main(argv=None):
                     dest="selection_score_min_delta")
     ap.add_argument("--selection-score-patience", type=int, default=0,
                     dest="selection_score_patience")
+    ap.add_argument("--selection-signal-regression-tolerance", type=float,
+                    default=MULTIMODAL_DEFAULT_SIGNAL_REGRESSION_TOLERANCE,
+                    dest="selection_signal_regression_tolerance",
+                    help=("maximum tolerated active-signal regression when "
+                          "accepting a multimodal selection round"))
     ap.add_argument("--selection-eval-n", type=int, default=200,
                     dest="selection_eval_n")
     ap.add_argument("--selection-generation-n", type=int, default=0,
@@ -8767,6 +8856,8 @@ def main(argv=None):
         ap.error("--selection-score-min-delta must be non-negative")
     if args.selection_score_patience < 0:
         ap.error("--selection-score-patience must be non-negative")
+    if args.selection_signal_regression_tolerance < 0.0:
+        ap.error("--selection-signal-regression-tolerance must be non-negative")
     if args.selection_eval_n < 0:
         ap.error("--selection-eval-n must be non-negative")
     if args.selection_insight_accept_w < 0.0:
@@ -8958,6 +9049,8 @@ def main(argv=None):
         selection_score_margin_w=args.selection_score_margin_w,
         selection_score_min_delta=args.selection_score_min_delta,
         selection_score_patience=args.selection_score_patience,
+        selection_signal_regression_tolerance=(
+            args.selection_signal_regression_tolerance),
         selection_eval_n=args.selection_eval_n,
         selection_generation_n=args.selection_generation_n,
         selection_generation_prompt_tokens=args.selection_generation_prompt_tokens,

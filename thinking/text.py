@@ -10073,6 +10073,29 @@ def selftest():
         rel_tol=1e-6, abs_tol=1e-6)
     assert math.isclose(sum(generation_plan["weight_extras"].values()),
                         0.09, rel_tol=1e-6, abs_tol=1e-6)
+    regression_report = signal_regression_report(
+        {"generation_score": 0.30, "generation_skipped": False},
+        {"generation_score": 0.25, "generation_skipped": False},
+        READING_SELF_TEACH_SCORE_KEYS,
+        tolerance=0.02,
+        signals=("generation",))
+    assert regression_report["allowed"] is False
+    assert regression_report["regressions"]["generation"] > 0.02
+    tolerated_report = signal_regression_report(
+        {"generation_score": 0.30, "generation_skipped": False},
+        {"generation_score": 0.29, "generation_skipped": False},
+        READING_SELF_TEACH_SCORE_KEYS,
+        tolerance=0.02,
+        signals=("generation",))
+    assert tolerated_report["allowed"] is True
+    nonfinite_report = signal_regression_report(
+        {"generation_score": 0.30, "generation_skipped": False},
+        {"generation_score": float("nan"), "generation_skipped": False},
+        READING_SELF_TEACH_SCORE_KEYS,
+        tolerance=0.02,
+        signals=("generation",))
+    assert nonfinite_report["allowed"] is False
+    assert "generation" in nonfinite_report["nonfinite_signals"]
     prior_scores = {
         f"{name}_skipped": False for name in READING_DISCOVERY_SIGNALS}
     for name, score_key in READING_SELF_TEACH_SCORE_KEYS.items():
@@ -10439,6 +10462,24 @@ def selftest():
         representation_gate=True, representation_accept_w=1.0,
         representation_min_delta=0.05)
     assert no_representation_decision["selected"] is False
+    blocked_score_decision = reading_round_selection_decision(
+        0.2, 0.0, insight_delta=0.0, insight_allowed=True,
+        signal_regression_allowed=False)
+    assert blocked_score_decision["selected"] is False
+    assert blocked_score_decision["pre_signal_selected"] is True
+    assert blocked_score_decision["pre_signal_selected_by_score"] is True
+    assert blocked_score_decision["blocked_by_signal_regression"] is True
+    assert "signal_regression" in blocked_score_decision["blocked_reasons"]
+    blocked_representation_decision = reading_round_selection_decision(
+        -0.01, 0.0, insight_delta=0.0, insight_allowed=True,
+        bridge_insight_gate=False, insight_accept_w=0.0,
+        representation_delta=0.2, representation_allowed=True,
+        representation_gate=True, representation_accept_w=1.0,
+        representation_min_delta=0.05, signal_regression_allowed=False)
+    assert blocked_representation_decision["selected"] is False
+    assert (blocked_representation_decision[
+        "pre_signal_selected_by_representation"] is True)
+    assert blocked_representation_decision["blocked_by_signal_regression"] is True
     rep_delta, rep_allowed = reading_representation_insight_delta({
         "enabled": True,
         "representation_insight_event": True,
@@ -11061,6 +11102,10 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-study-score-min-delta", type=float, default=0.0)
     ap.add_argument("--reading-study-score-patience", type=int, default=0)
     ap.add_argument("--reading-study-score-target", type=float, default=0.0)
+    ap.add_argument("--reading-study-signal-regression-tolerance", type=float,
+                    default=READING_DEFAULT_SIGNAL_REGRESSION_TOLERANCE,
+                    help=("maximum tolerated active-signal regression when "
+                          "accepting a self-study round"))
     ap.add_argument("--reading-study-insight-accept-w", "--reading-study-insight-w",
                     type=float, default=0.25, dest="reading_study_insight_accept_w")
     ap.add_argument("--reading-study-insight-min-delta", type=float, default=0.0)
@@ -11197,6 +11242,8 @@ def _reading_kwargs(args):
                   study_score_min_delta=args.reading_study_score_min_delta,
                   study_score_patience=args.reading_study_score_patience,
                   study_score_target=args.reading_study_score_target,
+                  study_signal_regression_tolerance=(
+                      args.reading_study_signal_regression_tolerance),
                   study_insight_accept_w=args.reading_study_insight_accept_w,
                   study_insight_min_delta=args.reading_study_insight_min_delta,
                   study_representation_accept_w=(
@@ -11301,6 +11348,9 @@ def main(argv=None):
     if args.reading_study_representation_min_delta < 0.0:
         raise SystemExit(
             "--reading-study-representation-min-delta must be non-negative")
+    if args.reading_study_signal_regression_tolerance < 0.0:
+        raise SystemExit(
+            "--reading-study-signal-regression-tolerance must be non-negative")
     if not args.reading_data:
         raise SystemExit("--reading-data is required unless --selftest is set")
     reading_common = _reading_kwargs(args)

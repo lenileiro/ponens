@@ -1,5 +1,7 @@
 """Model-selection helpers for self-study loops."""
 
+import math
+
 
 def signal_regression_report(before_scores, after_scores, score_keys,
                              skip_keys=None, tolerance=0.0,
@@ -15,6 +17,7 @@ def signal_regression_report(before_scores, after_scores, score_keys,
     active = []
     deltas = {}
     regressions = {}
+    nonfinite = []
     for signal in signals:
         if signal not in score_keys:
             continue
@@ -28,6 +31,14 @@ def signal_regression_report(before_scores, after_scores, score_keys,
             continue
         before_value = float(before_scores.get(score_key, 0.0) or 0.0)
         after_value = float(after_scores.get(score_key, 0.0) or 0.0)
+        if not math.isfinite(after_value):
+            active.append(str(signal))
+            deltas[str(signal)] = -1.0
+            regressions[str(signal)] = max(1.0, tolerance + 1e-12)
+            nonfinite.append(str(signal))
+            continue
+        if not math.isfinite(before_value):
+            before_value = 0.0
         delta = after_value - before_value
         active.append(str(signal))
         deltas[str(signal)] = float(delta)
@@ -43,6 +54,7 @@ def signal_regression_report(before_scores, after_scores, score_keys,
         "signal_deltas": deltas,
         "regressions": regressions,
         "regressed_signals": list(regressions),
+        "nonfinite_signals": nonfinite,
         "max_regression": float(max_regression),
     }
 
