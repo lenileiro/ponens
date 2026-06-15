@@ -74,6 +74,8 @@ TEXT_TRUNK_ARCHES = ("transformer", "standard", "relational", "abstractor")
 FEATURE_VIEW_KEYS = ("views", "features", "feature_views")
 TEXT_KEYS = ("text_tokens", "tokens", "text", "caption")
 TARGET_KEYS = ("target_tokens", "target", "trace_tokens", "trace")
+DECODE_OBJECTIVES = ("auto", "target", "causal")
+EMPTY_TEXT_TOKENS = ("<empty_text>",)
 MULTIMODAL_SCORE_METRICS = (
     "token", "exact", "fer", "bridge", "connection", "sequence", "all",
     "balanced", "mastery")
@@ -2115,29 +2117,53 @@ class MultimodalLM(nn.Module):
         return logits[:, prefix.shape[1]:]
 
 
-def _batch_from_records(records, vocab, device, view_dims):
+def _decode_tokens_for_record(rec, decode_objective="target"):
+    decode_objective = str(decode_objective)
+    if decode_objective == "causal":
+        sequence = tuple(rec.text) + tuple(rec.target)
+        if not sequence:
+            sequence = EMPTY_TEXT_TOKENS
+        return sequence, EMPTY_TEXT_TOKENS, sequence
+    if decode_objective != "target":
+        raise ValueError(f"unknown multimodal decode objective {decode_objective!r}")
+    return tuple(rec.text), tuple(rec.text), tuple(rec.target)
+
+
+def _pack_token_rows(rows, vocab, device):
+    max_len = max((len(row) for row in rows), default=0)
+    out = torch.full(
+        (len(rows), max_len), vocab.pad, dtype=torch.long, device=device)
+    for i, row in enumerate(rows):
+        if row:
+            out[i, :len(row)] = torch.tensor(
+                vocab.enc(row), dtype=torch.long, device=device)
+    return out
+
+
+def _batch_from_records(records, vocab, device, view_dims,
+                        decode_objective="target", return_decode_text=False):
     feature_rows = {name: [] for name in view_dims}
-    texts, targets = [], []
+    texts, decode_texts, targets = [], [], []
     for rec in records:
         for name, dim in view_dims.items():
             feature_rows[name].append(
                 rec.views.get(name, np.zeros(int(dim), dtype=np.float32)))
-        texts.append(vocab.enc(rec.text))
-        targets.append(vocab.enc(rec.target))
-    batch = len(records)
+        latent_text, decode_text, target = _decode_tokens_for_record(
+            rec, decode_objective=decode_objective)
+        texts.append(latent_text)
+        decode_texts.append(decode_text)
+        targets.append(target)
     features = [
         torch.tensor(np.stack(feature_rows[name]), dtype=torch.float32, device=device)
         for name in view_dims
     ]
-    max_txt = max(len(t) for t in texts)
-    txt = torch.full((batch, max_txt), vocab.pad, dtype=torch.long, device=device)
-    for i, ids in enumerate(texts):
-        txt[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
-    max_target = max(len(t) for t in targets)
-    target = torch.full((batch, max_target), vocab.pad, dtype=torch.long, device=device)
-    for i, ids in enumerate(targets):
-        target[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
-    return features, txt, target
+    txt = _pack_token_rows(texts, vocab, device)
+    target = _pack_token_rows(targets, vocab, device)
+    if not return_decode_text:
+        return features, txt, target
+    decode_txt = txt if decode_objective == "target" else _pack_token_rows(
+        decode_texts, vocab, device)
+    return features, txt, target, decode_txt
 
 
 def _sample_records(records, n, rng, weights=None):
@@ -2177,6 +2203,65 @@ def _sequence_order(rec, fallback):
         return float(raw_order)
     except (TypeError, ValueError):
         return float(fallback)
+
+
+def _continuation_source(rec):
+    meta = rec.meta if isinstance(rec.meta, dict) else {}
+    return str(meta.get("source", meta.get("document", meta.get("dataset", ""))))
+
+
+def infer_multimodal_decode_objective(records, requested="auto"):
+    requested = str(requested)
+    if requested not in DECODE_OBJECTIVES:
+        raise ValueError(f"unknown multimodal decode objective {requested!r}")
+    if requested != "auto":
+        return requested
+    groups = {}
+    for pos, rec in enumerate(records or ()):
+        if rec.views or not rec.text or not rec.target:
+            continue
+        groups.setdefault(_continuation_source(rec), []).append(
+            (_sequence_order(rec, pos), pos, rec))
+    considered = matches = 0
+    for rows in groups.values():
+        rows = sorted(rows, key=lambda row: (row[0], row[1]))
+        for (_a_order, _a_pos, a), (_b_order, _b_pos, b) in zip(rows, rows[1:]):
+            considered += 1
+            if tuple(a.target) == tuple(b.text):
+                matches += 1
+    if considered and matches / float(considered) >= 0.5:
+        return "causal"
+    return "target"
+
+
+def multimodal_decode_objective_report(records, requested, resolved):
+    groups = {}
+    considered = matches = 0
+    for pos, rec in enumerate(records or ()):
+        if rec.views or not rec.text or not rec.target:
+            continue
+        groups.setdefault(_continuation_source(rec), []).append(
+            (_sequence_order(rec, pos), pos, rec))
+    for rows in groups.values():
+        rows = sorted(rows, key=lambda row: (row[0], row[1]))
+        for (_a_order, _a_pos, a), (_b_order, _b_pos, b) in zip(rows, rows[1:]):
+            considered += 1
+            if tuple(a.target) == tuple(b.text):
+                matches += 1
+    target_records = sum(1 for rec in records or () if rec.target)
+    text_records = sum(1 for rec in records or () if rec.text)
+    view_records = sum(1 for rec in records or () if rec.views)
+    return {
+        "requested": str(requested),
+        "resolved": str(resolved),
+        "text_records": int(text_records),
+        "target_records": int(target_records),
+        "view_records": int(view_records),
+        "continuation_candidates": int(considered),
+        "continuation_matches": int(matches),
+        "continuation_match_rate": (
+            float(matches) / float(considered) if considered else 0.0),
+    }
 
 
 def mine_multimodal_sequence_pairs(records, split="train", n=0, seed=0):
@@ -2774,7 +2859,7 @@ def _multimodal_completion_predictor(model):
 
 def latent_multimodal_sequence_prediction_loss(
         model, pair_batch, vocab, view_dims, device=DEV, temperature=0.1,
-        view_dropout=0.0):
+        view_dropout=0.0, decode_objective="target"):
     if (getattr(model, "latent_concepts", None) is None
             or getattr(model, "concept_sequence_predictor", None) is None
             or not pair_batch or len(pair_batch) <= 1):
@@ -2786,9 +2871,9 @@ def latent_multimodal_sequence_prediction_loss(
     anchors = [a for a, _b in pair_batch]
     positives = [b for _a, b in pair_batch]
     anchor_features, anchor_txt, _anchor_ids = _batch_from_records(
-        anchors, vocab, device, view_dims)
+        anchors, vocab, device, view_dims, decode_objective=decode_objective)
     positive_features, positive_txt, _positive_ids = _batch_from_records(
-        positives, vocab, device, view_dims)
+        positives, vocab, device, view_dims, decode_objective=decode_objective)
     source_slots = model.latent_concept_states(
         anchor_features, anchor_txt, mode="full",
         view_dropout=view_dropout, project=False)
@@ -2802,7 +2887,8 @@ def latent_multimodal_sequence_prediction_loss(
 
 @torch.no_grad()
 def update_multimodal_sequence_transitions(model, pair_batch, vocab, view_dims,
-                                           device=DEV, decay=0.99):
+                                           device=DEV, decay=0.99,
+                                           decode_objective="target"):
     memory = getattr(model, "latent_concept_memory", None)
     if (getattr(model, "latent_concepts", None) is None
             or memory is None or not pair_batch):
@@ -2810,9 +2896,9 @@ def update_multimodal_sequence_transitions(model, pair_batch, vocab, view_dims,
     anchors = [a for a, _b in pair_batch]
     positives = [b for _a, b in pair_batch]
     anchor_features, anchor_txt, _anchor_ids = _batch_from_records(
-        anchors, vocab, device, view_dims)
+        anchors, vocab, device, view_dims, decode_objective=decode_objective)
     positive_features, positive_txt, _positive_ids = _batch_from_records(
-        positives, vocab, device, view_dims)
+        positives, vocab, device, view_dims, decode_objective=decode_objective)
     source_slots = model.latent_concept_states(
         anchor_features, anchor_txt, mode="full", project=True)
     target_slots = model.latent_concept_states(
@@ -2953,7 +3039,7 @@ def latent_multimodal_cluster_loss_from_views(views, temperature=0.1,
 def latent_multimodal_graph_prediction_examples(
         model, records, vocab, view_dims, n=0, seed=0, device=DEV,
         temperature=0.1, self_loop_w=0.05, transitive_steps=2,
-        transitive_w=0.1, target_power=1.0):
+        transitive_w=0.1, target_power=1.0, decode_objective="target"):
     memory = getattr(model, "latent_concept_memory", None)
     if getattr(model, "latent_concepts", None) is None or memory is None:
         return [], {"n_records": 0, "n_selected": 0, "skipped": True}
@@ -2966,7 +3052,8 @@ def latent_multimodal_graph_prediction_examples(
         for off in range(0, len(sample), 64):
             batch_records = sample[off:off + 64]
             features, txt, ids = _batch_from_records(
-                batch_records, vocab, device, view_dims)
+                batch_records, vocab, device, view_dims,
+                decode_objective=decode_objective)
             target = model.latent_concept_states(
                 features, txt, mode="full", project=True)
             scores_by_mode = []
@@ -2993,7 +3080,8 @@ def latent_multimodal_graph_prediction_examples(
 
 
 def latent_multimodal_fer_examples(
-        model, records, vocab, view_dims, n=0, seed=0, device=DEV):
+        model, records, vocab, view_dims, n=0, seed=0, device=DEV,
+        decode_objective="target"):
     if getattr(model, "latent_concepts", None) is None:
         return [], {"n_records": 0, "n_selected": 0,
                     "mean_fer_score": 0.0, "max_fer_score": 0.0,
@@ -3014,7 +3102,8 @@ def latent_multimodal_fer_examples(
         for off in range(0, len(sample), 64):
             batch_records = sample[off:off + 64]
             features, txt, _ids = _batch_from_records(
-                batch_records, vocab, device, view_dims)
+                batch_records, vocab, device, view_dims,
+                decode_objective=decode_objective)
             views = {
                 mode: model.latent_concept_states(
                     features, txt, mode=mode, project=True)
@@ -3052,7 +3141,7 @@ def latent_multimodal_fer_examples(
 
 
 def evaluate(model, records, vocab, view_dims, n=200, seed=1,
-             device=DEV, mode="full"):
+             device=DEV, mode="full", decode_objective="target"):
     rng = np.random.default_rng(seed)
     count = min(int(n), len(records)) if int(n) > 0 else len(records)
     sample = _sample_records(records, count, rng) if count else []
@@ -3061,9 +3150,10 @@ def evaluate(model, records, vocab, view_dims, n=200, seed=1,
     with torch.no_grad():
         for off in range(0, len(sample), 64):
             batch_records = sample[off:off + 64]
-            features, txt, ids = _batch_from_records(
-                batch_records, vocab, device, view_dims)
-            logits = model(features, txt, ids, mode=mode)
+            features, _txt, ids, decode_txt = _batch_from_records(
+                batch_records, vocab, device, view_dims,
+                decode_objective=decode_objective, return_decode_text=True)
+            logits = model(features, decode_txt, ids, mode=mode)
             loss = token_loss(logits, ids, vocab.pad)
             losses.append(float(loss.detach().cpu()))
             if ids.shape[1] >= 2:
@@ -3086,11 +3176,13 @@ def evaluate(model, records, vocab, view_dims, n=200, seed=1,
         "exact_skipped": rows == 0,
         "n_records": int(len(sample)),
         "mode": mode,
+        "decode_objective": str(decode_objective),
     }
 
 
 def latent_multimodal_fer_eval(model, records, vocab, view_dims, n=200,
-                               seed=1, device=DEV):
+                               seed=1, device=DEV,
+                               decode_objective="target"):
     if getattr(model, "latent_concepts", None) is None:
         return {"fer_score": 0.0, "fragmentation": 0.0,
                 "slot_correlation": 0.0, "slot_imbalance": 0.0,
@@ -3111,7 +3203,8 @@ def latent_multimodal_fer_eval(model, records, vocab, view_dims, n=200,
         for off in range(0, len(sample), 64):
             batch_records = sample[off:off + 64]
             features, txt, _ids = _batch_from_records(
-                batch_records, vocab, device, view_dims)
+                batch_records, vocab, device, view_dims,
+                decode_objective=decode_objective)
             views = {
                 mode: model.latent_concept_states(
                     features, txt, mode=mode, project=True)
@@ -3143,7 +3236,8 @@ def latent_multimodal_fer_eval(model, records, vocab, view_dims, n=200,
 
 
 def latent_multimodal_bridge_eval(model, records, vocab, view_dims, n=200,
-                                  seed=1, device=DEV):
+                                  seed=1, device=DEV,
+                                  decode_objective="target"):
     bridge_graph = latent_multimodal_bridge_graph_state(model)
     if getattr(model, "latent_concepts", None) is None or bridge_graph is None:
         return {"bridge_score": 0.0, "bridge_entropy": 0.0,
@@ -3184,7 +3278,8 @@ def latent_multimodal_bridge_eval(model, records, vocab, view_dims, n=200,
         for off in range(0, len(sample), 64):
             batch_records = sample[off:off + 64]
             features, txt, _ids = _batch_from_records(
-                batch_records, vocab, device, view_dims)
+                batch_records, vocab, device, view_dims,
+                decode_objective=decode_objective)
             views = {
                 mode: model.latent_concept_states(
                     features, txt, mode=mode, project=True)
@@ -3222,7 +3317,8 @@ def latent_multimodal_bridge_eval(model, records, vocab, view_dims, n=200,
 
 
 def latent_multimodal_gap_eval(model, records, vocab, view_dims, n=200,
-                               seed=1, device=DEV):
+                               seed=1, device=DEV,
+                               decode_objective="target"):
     memory = getattr(model, "latent_concept_memory", None)
     if getattr(model, "latent_concepts", None) is None or memory is None:
         return {"gap_score": 0.0, "gap_kl": 0.0, "gap_cosine": 0.0,
@@ -3266,7 +3362,8 @@ def latent_multimodal_gap_eval(model, records, vocab, view_dims, n=200,
         for off in range(0, len(sample), 64):
             batch_records = sample[off:off + 64]
             features, txt, _ids = _batch_from_records(
-                batch_records, vocab, device, view_dims)
+                batch_records, vocab, device, view_dims,
+                decode_objective=decode_objective)
             slots = model.latent_concept_states(
                 features, txt, mode="full", project=True)
             scores, parts = latent_concept_memory_gap_scores(
@@ -3306,7 +3403,8 @@ def latent_multimodal_gap_eval(model, records, vocab, view_dims, n=200,
 
 
 def latent_multimodal_sequence_eval(model, records, vocab, view_dims, n=200,
-                                    seed=1, device=DEV):
+                                    seed=1, device=DEV,
+                                    decode_objective="target"):
     if (getattr(model, "latent_concepts", None) is None
             or getattr(model, "concept_sequence_predictor", None) is None):
         return {"sequence_acc": 0.0, "n_records": 0, "n_pairs": 0,
@@ -3329,9 +3427,11 @@ def latent_multimodal_sequence_eval(model, records, vocab, view_dims, n=200,
             anchors = [a for a, _b in pair_batch]
             positives = [b for _a, b in pair_batch]
             anchor_features, anchor_txt, _anchor_ids = _batch_from_records(
-                anchors, vocab, device, view_dims)
+                anchors, vocab, device, view_dims,
+                decode_objective=decode_objective)
             positive_features, positive_txt, _positive_ids = _batch_from_records(
-                positives, vocab, device, view_dims)
+                positives, vocab, device, view_dims,
+                decode_objective=decode_objective)
             source_slots = model.latent_concept_states(
                 anchor_features, anchor_txt, mode="full", project=False)
             target_slots = model.latent_concept_states(
@@ -3612,20 +3712,25 @@ def multimodal_self_teach_weight_maps(score_components=None, budget=0.0,
 
 def multimodal_eval_bundle(model, records, vocab, view_dims, n=200, seed=1,
                            device=DEV, score_metric="mastery",
-                           score_margin_w=0.1):
+                           score_margin_w=0.1, decode_objective="target"):
     metrics = {
         mode: evaluate(model, records, vocab, view_dims, n=n,
-                       seed=seed + 17 + i * 997, device=device, mode=mode)
+                       seed=seed + 17 + i * 997, device=device, mode=mode,
+                       decode_objective=decode_objective)
         for i, mode in enumerate(MODES)
     }
     fer = latent_multimodal_fer_eval(
-        model, records, vocab, view_dims, n=n, seed=seed + 29, device=device)
+        model, records, vocab, view_dims, n=n, seed=seed + 29, device=device,
+        decode_objective=decode_objective)
     bridge = latent_multimodal_bridge_eval(
-        model, records, vocab, view_dims, n=n, seed=seed + 31, device=device)
+        model, records, vocab, view_dims, n=n, seed=seed + 31, device=device,
+        decode_objective=decode_objective)
     gap = latent_multimodal_gap_eval(
-        model, records, vocab, view_dims, n=n, seed=seed + 33, device=device)
+        model, records, vocab, view_dims, n=n, seed=seed + 33, device=device,
+        decode_objective=decode_objective)
     sequence = latent_multimodal_sequence_eval(
-        model, records, vocab, view_dims, n=n, seed=seed + 37, device=device)
+        model, records, vocab, view_dims, n=n, seed=seed + 37, device=device,
+        decode_objective=decode_objective)
     return {"teacher_forced": metrics,
             "latent_fer": fer,
             "latent_bridge": bridge,
@@ -4057,7 +4162,8 @@ def multimodal_learning_event_report(report):
 
 
 def _multimodal_sequence_surprise_rows(
-        model, pairs, vocab, view_dims, device=DEV, temperature=0.1):
+        model, pairs, vocab, view_dims, device=DEV, temperature=0.1,
+        decode_objective="target"):
     rows = []
     if (getattr(model, "latent_concepts", None) is None
             or getattr(model, "concept_sequence_predictor", None) is None
@@ -4072,9 +4178,11 @@ def _multimodal_sequence_surprise_rows(
             anchors = [a for a, _b in pair_batch]
             positives = [b for _a, b in pair_batch]
             anchor_features, anchor_txt, _anchor_ids = _batch_from_records(
-                anchors, vocab, device, view_dims)
+                anchors, vocab, device, view_dims,
+                decode_objective=decode_objective)
             positive_features, positive_txt, _positive_ids = _batch_from_records(
-                positives, vocab, device, view_dims)
+                positives, vocab, device, view_dims,
+                decode_objective=decode_objective)
             source_slots = model.latent_concept_states(
                 anchor_features, anchor_txt, mode="full", project=False)
             target_slots = model.latent_concept_states(
@@ -4101,7 +4209,7 @@ def _multimodal_sequence_surprise_rows(
 
 def latent_multimodal_completion_examples(
         model, records, vocab, view_dims, n=0, seed=0, device=DEV,
-        temperature=0.1):
+        temperature=0.1, decode_objective="target"):
     if (getattr(model, "latent_concepts", None) is None
             or _multimodal_completion_predictor(model) is None):
         return [], {"n_records": 0, "n_selected": 0,
@@ -4117,7 +4225,8 @@ def latent_multimodal_completion_examples(
         for off in range(0, len(candidates), 64):
             batch_records = candidates[off:off + 64]
             features, txt, _ids = _batch_from_records(
-                batch_records, vocab, device, view_dims)
+                batch_records, vocab, device, view_dims,
+                decode_objective=decode_objective)
             views = {
                 mode: model.latent_concept_states(
                     features, txt, mode=mode, project=False)
@@ -4212,7 +4321,8 @@ def latent_multimodal_discovery_examples(
         graph_target_power=1.0, cycle_temperature=0.1,
         cycle_self_loop_w=0.05, cycle_transitive_steps=2,
         cycle_transitive_w=0.1, cycle_target_power=1.0, cycle_w=0.5,
-        sequence_temperature=0.1, completion_temperature=0.1):
+        sequence_temperature=0.1, completion_temperature=0.1,
+        decode_objective="target"):
     memory = getattr(model, "latent_concept_memory", None)
     if getattr(model, "latent_concepts", None) is None or memory is None:
         return [], {"n_records": 0, "n_selected": 0,
@@ -4230,7 +4340,7 @@ def latent_multimodal_discovery_examples(
         ]
     sequence_rows = _multimodal_sequence_surprise_rows(
         model, sequence_pairs, vocab, view_dims, device=device,
-        temperature=sequence_temperature)
+        temperature=sequence_temperature, decode_objective=decode_objective)
     sequence_by_id = {}
     for seq_row in sequence_rows:
         for key in ("anchor", "positive"):
@@ -4251,7 +4361,8 @@ def latent_multimodal_discovery_examples(
         for off in range(0, len(candidates), 64):
             batch_records = candidates[off:off + 64]
             features, txt, _ids = _batch_from_records(
-                batch_records, vocab, device, view_dims)
+                batch_records, vocab, device, view_dims,
+                decode_objective=decode_objective)
             views = {
                 mode: model.latent_concept_states(
                     features, txt, mode=mode, project=True)
@@ -4512,6 +4623,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           max_vocab=0,
           source_balance_w=MULTIMODAL_DEFAULT_SOURCE_BALANCE_W,
           objective_profile="mastery",
+          decode_objective="auto",
           view_tokens=4, txt_tokens=8, trunk_arch="mlp",
           trunk_width=128, trunk_depth=1, text_layers=1,
           text_arch="transformer", modality_dropout=0.0, decode_w=1.0,
@@ -4852,6 +4964,11 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     if selection_insight_min_delta < 0.0:
         raise ValueError("multimodal selection insight min delta must be non-negative")
     records = load_manifest(manifest, root=root)
+    requested_decode_objective = str(decode_objective)
+    decode_objective = infer_multimodal_decode_objective(
+        records, requested=requested_decode_objective)
+    decode_objective_info = multimodal_decode_objective_report(
+        records, requested_decode_objective, decode_objective)
     train_records, eval_records = split_records(records)
     training_sampling_weights = multimodal_training_sampling_weights(
         train_records, source_balance_w=source_balance_w)
@@ -4884,7 +5001,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             model, eval_records, vocab, view_dims, n=text_transfer_probe_n,
             seed=seed + 149, device=device,
             score_metric=selection_score_metric,
-            score_margin_w=selection_score_margin_w)
+            score_margin_w=selection_score_margin_w,
+            decode_objective=decode_objective)
     if text_checkpoint:
         text_import_report = import_text_checkpoint(
             model, vocab, text_checkpoint, device=device)
@@ -4893,7 +5011,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 model, eval_records, vocab, view_dims, n=text_transfer_probe_n,
                 seed=seed + 149, device=device,
                 score_metric=selection_score_metric,
-                score_margin_w=selection_score_margin_w)
+                score_margin_w=selection_score_margin_w,
+                decode_objective=decode_objective)
             calibration = multimodal_transfer_calibration_report(
                 text_transfer_before_bundle, text_transfer_after_bundle,
                 score_min_delta=text_transfer_score_min_delta,
@@ -5071,7 +5190,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         before_bundle = multimodal_eval_bundle(
             model, eval_records, vocab, view_dims, n=selection_eval_n,
             seed=seed, device=device, score_metric=selection_score_metric,
-            score_margin_w=selection_score_margin_w)
+            score_margin_w=selection_score_margin_w,
+            decode_objective=decode_objective)
         representation_before_bundle = before_bundle
         representation_progress_probe_n = int(selection_eval_n)
         representation_progress_seed = seed
@@ -5080,7 +5200,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             model, eval_records, vocab, view_dims, n=representation_probe_n,
             seed=seed + 211, device=device,
             score_metric=selection_score_metric,
-            score_margin_w=selection_score_margin_w)
+            score_margin_w=selection_score_margin_w,
+            decode_objective=decode_objective)
         representation_progress_probe_n = int(representation_probe_n)
         representation_progress_seed = seed + 211
     if self_teach_w > 0.0:
@@ -5130,7 +5251,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 cycle_transitive_w=latent_concept_graph_predict_transitive_w,
                 cycle_target_power=latent_concept_graph_predict_target_power,
                 sequence_temperature=latent_concept_sequence_temperature,
-                completion_temperature=latent_concept_completion_temperature)
+                completion_temperature=latent_concept_completion_temperature,
+                decode_objective=decode_objective)
         elif hard_study_strategy == "completion":
             probe_n = (int(latent_concept_completion_probe_n)
                        if int(latent_concept_completion_probe_n) > 0
@@ -5139,7 +5261,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             selected, report = latent_multimodal_completion_examples(
                 model, train_records, vocab, view_dims, n=probe_n,
                 seed=seed + 1301 + int(step), device=device,
-                temperature=latent_concept_completion_temperature)
+                temperature=latent_concept_completion_temperature,
+                decode_objective=decode_objective)
         else:
             probe_n = (int(latent_concept_fer_probe_n)
                        if int(latent_concept_fer_probe_n) > 0
@@ -5147,7 +5270,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             hard_max = int(latent_concept_fer_hard_max)
             selected, report = latent_multimodal_fer_examples(
                 model, train_records, vocab, view_dims, n=probe_n,
-                seed=seed + 1301 + int(step), device=device)
+                seed=seed + 1301 + int(step), device=device,
+                decode_objective=decode_objective)
         selected = selected[:hard_max]
         if selected:
             study_pool = selected
@@ -5183,28 +5307,50 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             training_sampling_weights if batch_source is train_records
             else multimodal_training_sampling_weights(
                 batch_source, source_balance_w=source_balance_w))
-        features, txt, ids = _batch_from_records(
+        features, txt, ids, decode_txt = _batch_from_records(
             _sample_records(batch_source, batch, rng, weights=batch_weights),
-            vocab, device, view_dims)
+            vocab, device, view_dims, decode_objective=decode_objective,
+            return_decode_text=True)
         needs_latent = bool(any(float(w) > 0.0 for w in current_latent_weights())
                             or latent_concept_memory_size > 0
                             or hard_study_enabled)
-        bundles_by_mode = {
-            mode: model.mode_bundle(
-                features, txt, ids, mode=mode, need_latent=needs_latent,
-                latent_view_dropout=latent_concept_view_dropout,
-                latent_project=True,
-                need_logits=bool(float(decode_w) > 0.0 or float(agreement_w) > 0.0))
-            for mode in MODES
-        }
+        needs_logits = bool(float(decode_w) > 0.0 or float(agreement_w) > 0.0)
+        if decode_txt is txt or not needs_latent:
+            bundles_by_mode = {
+                mode: model.mode_bundle(
+                    features, decode_txt, ids, mode=mode,
+                    need_latent=needs_latent,
+                    latent_view_dropout=latent_concept_view_dropout,
+                    latent_project=True,
+                    need_logits=needs_logits)
+                for mode in MODES
+            }
+            latent_bundles_by_mode = bundles_by_mode
+            logit_bundles_by_mode = bundles_by_mode
+        else:
+            latent_bundles_by_mode = {
+                mode: model.mode_bundle(
+                    features, txt, ids, mode=mode, need_latent=True,
+                    latent_view_dropout=latent_concept_view_dropout,
+                    latent_project=True, need_logits=False)
+                for mode in MODES
+            }
+            logit_bundles_by_mode = {
+                mode: model.mode_bundle(
+                    features, decode_txt, ids, mode=mode, need_latent=False,
+                    latent_view_dropout=0.0, latent_project=False,
+                    need_logits=needs_logits)
+                for mode in MODES
+            }
         logits_by_mode = {mode: bundle["logits"]
-                          for mode, bundle in bundles_by_mode.items()}
+                          for mode, bundle in logit_bundles_by_mode.items()}
         base_loss = sum(token_loss(logits, ids, vocab.pad)
                         for logits in logits_by_mode.values()) / len(logits_by_mode)
         agreement = (logit_agreement_loss(logits_by_mode, ids, vocab.pad)
                      if agreement_w else base_loss * 0.0)
         latent_views = {
-            mode: bundle.get("latent_concepts") for mode, bundle in bundles_by_mode.items()
+            mode: bundle.get("latent_concepts")
+            for mode, bundle in latent_bundles_by_mode.items()
         }
         latent_concept = (
             latent_multimodal_concept_loss_from_views(
@@ -5435,7 +5581,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             latent_sequence = latent_multimodal_sequence_prediction_loss(
                 model, sequence_pair_batch, vocab, view_dims, device=device,
                 temperature=latent_concept_sequence_temperature,
-                view_dropout=latent_concept_view_dropout)
+                view_dropout=latent_concept_view_dropout,
+                decode_objective=decode_objective)
         latent_neighborhood = (
             latent_multimodal_neighborhood_loss_from_views(
                 latent_views, temperature=latent_concept_neighborhood_temperature,
@@ -5501,13 +5648,16 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             sequence_pair_batch = _sample_pairs(sequence_pairs, sequence_batch, rng)
             sequence_transition_updates = int(update_multimodal_sequence_transitions(
                 model, sequence_pair_batch, vocab, view_dims, device=device,
-                decay=latent_concept_association_decay))
+                decay=latent_concept_association_decay,
+                decode_objective=decode_objective))
         fer_metrics = latent_multimodal_fer_metrics_from_views(latent_views)
         bridge_metrics = latent_multimodal_bridge_metrics_from_views(model, latent_views)
         last = {
             "loss": float(loss.detach()),
             "objective_profile": objective_profile,
             "objective_profile_report": objective_profile_report,
+            "decode_objective": str(decode_objective),
+            "decode_objective_report": decode_objective_info,
             "decode_w": float(decode_w),
             "token_loss": float(base_loss.detach()),
             "agreement_loss": float(agreement.detach()),
@@ -5732,7 +5882,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             bundle = multimodal_eval_bundle(
                 model, eval_records, vocab, view_dims, n=selection_eval_n,
                 seed=seed, device=device, score_metric=selection_score_metric,
-                score_margin_w=selection_score_margin_w)
+                score_margin_w=selection_score_margin_w,
+                decode_objective=decode_objective)
             row = selection_row(round_id, round_steps, bundle)
             round_weight_update = multimodal_weight_update_report(
                 weight_update_before, multimodal_weight_update_snapshot(model))
@@ -5914,6 +6065,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             }
     last = dict(last) | {
         **source_balance_train_report,
+        "decode_objective": str(decode_objective),
+        "decode_objective_report": decode_objective_info,
         "self_teach_history_prior_w": float(self_teach_history_prior_w),
         "text_checkpoint_history_prior": text_checkpoint_history_prior,
         "text_checkpoint_history_prior_raw": text_checkpoint_history_prior_raw,
@@ -5932,7 +6085,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             model, eval_records, vocab, view_dims,
             n=representation_progress_probe_n, seed=representation_progress_seed,
             device=device, score_metric=selection_score_metric,
-            score_margin_w=selection_score_margin_w)
+            score_margin_w=selection_score_margin_w,
+            decode_objective=decode_objective)
         representation_progress = multimodal_representation_progress_report(
             representation_before_bundle, representation_after_bundle)
     attempted_weight_update_count = 0
@@ -5973,6 +6127,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         "view_dims": dict(view_dims),
         "view_names": list(view_dims.keys()),
         "view_count": len(view_dims),
+        "decode_objective": str(decode_objective),
+        "decode_objective_report": decode_objective_info,
         "source_balance_w": float(source_balance_w),
         "source_count": int(source_balance_train_report["training_source_count"]),
         "source_counts": dict(
@@ -5989,43 +6145,50 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         checkpoint=None, out=None, **kwargs):
     model, vocab, records, train_records, eval_records, view_dims = train(
         manifest, root=root, steps=steps, seed=seed, device=device, **kwargs)
+    decode_objective = str(
+        getattr(model, "manifest_info", {}).get("decode_objective", "target"))
     metrics = {
         mode: evaluate(model, eval_records, vocab, view_dims, n=eval_n,
-                       seed=seed + 17, device=device, mode=mode)
+                       seed=seed + 17, device=device, mode=mode,
+                       decode_objective=decode_objective)
         for mode in MODES
     }
     latent_probe = {}
     if getattr(model, "latent_concept_memory", None) is not None:
         selected, latent_probe = latent_multimodal_graph_prediction_examples(
             model, train_records, vocab, view_dims,
-            n=min(64, len(train_records)), seed=seed + 23, device=device)
+            n=min(64, len(train_records)), seed=seed + 23, device=device,
+            decode_objective=decode_objective)
         latent_probe["top_ids"] = [r.rec_id for r in selected[:8]]
     latent_fer_probe = latent_multimodal_fer_eval(
         model, eval_records, vocab, view_dims, n=eval_n, seed=seed + 29,
-        device=device)
+        device=device, decode_objective=decode_objective)
     latent_fer_hard_selected, latent_fer_hard_probe = latent_multimodal_fer_examples(
         model, train_records, vocab, view_dims,
-        n=min(64, len(train_records)), seed=seed + 30, device=device)
+        n=min(64, len(train_records)), seed=seed + 30, device=device,
+        decode_objective=decode_objective)
     latent_fer_hard_probe["top_ids"] = [
         r.rec_id for r in latent_fer_hard_selected[:8]]
     latent_completion_selected, latent_completion_probe = (
         latent_multimodal_completion_examples(
             model, train_records, vocab, view_dims,
-            n=min(64, len(train_records)), seed=seed + 33, device=device))
+            n=min(64, len(train_records)), seed=seed + 33, device=device,
+            decode_objective=decode_objective))
     latent_completion_probe["top_ids"] = [
         r.rec_id for r in latent_completion_selected[:8]]
     latent_discovery_selected, latent_discovery_probe = (
         latent_multimodal_discovery_examples(
             model, train_records, vocab, view_dims,
-            n=min(64, len(train_records)), seed=seed + 32, device=device))
+            n=min(64, len(train_records)), seed=seed + 32, device=device,
+            decode_objective=decode_objective))
     latent_discovery_probe["top_ids"] = [
         r.rec_id for r in latent_discovery_selected[:8]]
     latent_bridge_probe = latent_multimodal_bridge_eval(
         model, eval_records, vocab, view_dims, n=eval_n, seed=seed + 31,
-        device=device)
+        device=device, decode_objective=decode_objective)
     latent_sequence_probe = latent_multimodal_sequence_eval(
         model, eval_records, vocab, view_dims, n=eval_n, seed=seed + 37,
-        device=device)
+        device=device, decode_objective=decode_objective)
     architecture = dict(model.config)
     architecture["reader_prefix_tokens"] = (
         int(model.config["view_tokens"]) * len(model.config["view_names"])
@@ -6145,6 +6308,28 @@ def selftest():
         assert implicit_records[0].meta["source"] == os.path.abspath(
             implicit_manifest)
         assert implicit_records[1].meta["dataset"] == "top-level-dataset"
+        continuation_manifest = os.path.join(tmpdir, "mm_continuation.jsonl")
+        continuation_rows = [
+            {"id": "c0", "split": "train", "text": ["a", "b"],
+             "target": ["c", "d"], "meta": {"source": "doc", "chunk_index": 0}},
+            {"id": "c1", "split": "train", "text": ["c", "d"],
+             "target": ["e", "f"], "meta": {"source": "doc", "chunk_index": 1}},
+            {"id": "c2", "split": "eval", "text": ["e", "f"],
+             "target": ["g", "h"], "meta": {"source": "doc", "chunk_index": 2}},
+        ]
+        with open(continuation_manifest, "w") as f:
+            for row in continuation_rows:
+                f.write(json.dumps(row) + "\n")
+        continuation_records = load_manifest(continuation_manifest)
+        assert infer_multimodal_decode_objective(
+            continuation_records, requested="auto") == "causal"
+        continuation_vocab = build_vocab(continuation_records)
+        _features, latent_txt, decoder_ids, decoder_txt = _batch_from_records(
+            continuation_records[:1], continuation_vocab, "cpu", {},
+            decode_objective="causal", return_decode_text=True)
+        assert latent_txt.shape[1] == 4
+        assert decoder_ids.shape[1] == 4
+        assert decoder_txt.shape[1] == 1
         imbalanced_records = [
             MultimodalRecord(
                 f"bulk-{i}", "train", ("bulk", str(i)), ("target",),
@@ -7161,6 +7346,11 @@ def main(argv=None):
                     default="mastery",
                     help=("generic multimodal objective posture; mastery enables "
                           "schema-free concept/self-teach floors"))
+    ap.add_argument("--decode-objective", choices=DECODE_OBJECTIVES,
+                    default="auto", dest="decode_objective",
+                    help=("decoder target construction: target keeps manifest "
+                          "targets, causal trains contiguous next-token windows, "
+                          "auto detects continuation chunks"))
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--log-every", type=int, default=100, dest="log_every")
     ap.add_argument("--agreement-w", type=float, default=0.0, dest="agreement_w",
@@ -7609,6 +7799,7 @@ def main(argv=None):
         heads=args.heads, max_len=args.max_len, max_vocab=args.max_vocab,
         source_balance_w=args.source_balance_w,
         objective_profile=args.objective_profile,
+        decode_objective=args.decode_objective,
         view_tokens=args.view_tokens,
         txt_tokens=args.txt_tokens,
         trunk_arch=args.trunk_arch, trunk_width=args.trunk_width,
