@@ -209,10 +209,35 @@ def _weighted_geomean(parts: Sequence[tuple[str, float | None, float]]):
                           for name, value, weight in usable}
 
 
+def _technical_rgb_tensor(path: str, image_size: int):
+    """Fast RGB tensor loader for image-health stats.
+
+    The shared training loader intentionally preserves transform metadata and torch-side
+    interpolation semantics. The scorer only needs a fixed working image, so resizing
+    through Pillow avoids materializing full-resolution tensors for large web images.
+    """
+    size = max(1, int(image_size))
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".ppm", ".pnm"):
+        x = load_image_tensor(path, size=size, device="cpu", center_crop=False)
+        return ((x.float() + 1.0) * 0.5).clamp(0.0, 1.0)
+    try:
+        from PIL import Image
+    except Exception:
+        x = load_image_tensor(path, size=size, device="cpu", center_crop=False)
+        return ((x.float() + 1.0) * 0.5).clamp(0.0, 1.0)
+    resampling = getattr(getattr(Image, "Resampling", Image), "BILINEAR")
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        if image.size != (size, size):
+            image = image.resize((size, size), resample=resampling)
+        arr = np.asarray(image, dtype=np.float32) / 255.0
+    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+
+
 def technical_quality(path: str, image_size: int = 256) -> tuple[float, dict]:
     """Return a generic image-health score in [0, 1] plus component metrics."""
-    x = load_image_tensor(path, size=max(1, int(image_size)), device="cpu", center_crop=False)
-    rgb = ((x.float() + 1.0) * 0.5).clamp(0.0, 1.0)
+    rgb = _technical_rgb_tensor(path, image_size=image_size)
     r, g, b = rgb[0], rgb[1], rgb[2]
     lum = (0.299 * r + 0.587 * g + 0.114 * b).clamp(0.0, 1.0)
     mean = float(lum.mean())
