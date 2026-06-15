@@ -512,6 +512,70 @@ def text_checkpoint_reading_representation_summary(ckpt, max_entries=8):
     }
 
 
+def text_checkpoint_priority_study_summary(ckpt, max_entries=8):
+    history = text_checkpoint_reading_history(ckpt)
+    entries = history["entries"][-max(1, int(max_entries)):]
+    if not entries:
+        return {
+            "enabled": False,
+            "entry_count": 0,
+            "replay_study_entry_count": 0,
+            "training_priority_entry_count": 0,
+            "latest_replay_study_used": False,
+            "latest_training_priority_sampling": False,
+            "max_training_priority_record_count": 0,
+            "max_training_priority_mean": 0.0,
+            "max_training_priority_max": 0.0,
+        }
+    replay_entries = [
+        entry for entry in entries
+        if bool(entry.get("replay_study_used", False))]
+    priority_entries = [
+        entry for entry in entries
+        if bool(entry.get("training_priority_sampling", False))]
+    latest = entries[-1]
+    return {
+        "enabled": bool(replay_entries or priority_entries),
+        "entry_count": int(len(entries)),
+        "replay_study_entry_count": int(len(replay_entries)),
+        "training_priority_entry_count": int(len(priority_entries)),
+        "latest_replay_study_used": bool(
+            latest.get("replay_study_used", False)),
+        "latest_training_priority_sampling": bool(
+            latest.get("training_priority_sampling", False)),
+        "max_replay_study_records": max(
+            (_mm_int(entry.get("replay_study_records", 0), 0)
+             for entry in entries),
+            default=0),
+        "latest_replay_study_records": _mm_int(
+            latest.get("replay_study_records", 0), 0),
+        "max_study_record_count": max(
+            (_mm_int(entry.get("study_record_count", 0), 0)
+             for entry in entries),
+            default=0),
+        "latest_study_record_count": _mm_int(
+            latest.get("study_record_count", 0), 0),
+        "max_training_priority_record_count": max(
+            (_mm_int(entry.get("training_priority_record_count", 0), 0)
+             for entry in entries),
+            default=0),
+        "latest_training_priority_record_count": _mm_int(
+            latest.get("training_priority_record_count", 0), 0),
+        "max_training_priority_mean": max(
+            (_mm_float(entry.get("training_priority_mean", 0.0), 0.0)
+             for entry in entries),
+            default=0.0),
+        "latest_training_priority_mean": _mm_float(
+            latest.get("training_priority_mean", 0.0), 0.0),
+        "max_training_priority_max": max(
+            (_mm_float(entry.get("training_priority_max", 0.0), 0.0)
+             for entry in entries),
+            default=0.0),
+        "latest_training_priority_max": _mm_float(
+            latest.get("training_priority_max", 0.0), 0.0),
+    }
+
+
 def multimodal_text_history_self_teach_prior(ckpt, enabled=True,
                                              max_entries=8, decay=0.75):
     if not enabled:
@@ -520,6 +584,8 @@ def multimodal_text_history_self_teach_prior(ckpt, enabled=True,
     concept_prior = text_checkpoint_concept_insight_prior(
         ckpt, enabled=True, max_entries=max_entries, decay=decay)
     representation_summary = text_checkpoint_reading_representation_summary(
+        ckpt, max_entries=max_entries)
+    priority_study_summary = text_checkpoint_priority_study_summary(
         ckpt, max_entries=max_entries)
     entries = history["entries"][-max(1, int(max_entries)):]
     decay = min(1.0, max(0.0, _mm_float(decay, 0.75)))
@@ -573,6 +639,13 @@ def multimodal_text_history_self_teach_prior(ckpt, enabled=True,
             if signal in weights:
                 event_score = min(1.0, max(
                     0.0, _mm_float(learning_event.get("event_score", 0.0))))
+                if bool(entry.get("training_priority_sampling", False)):
+                    priority_gain = min(1.0, max(
+                        0.0,
+                        _mm_float(entry.get("training_priority_mean", 0.0), 0.0),
+                        _mm_float(entry.get("training_priority_max", 0.0), 0.0) * 0.1,
+                    ))
+                    event_score = min(1.0, event_score * (1.0 + 0.25 * priority_gain))
                 if event_score > 0.0:
                     weighted[signal] += recency_weight * event_score
                     weights[signal] += recency_weight
@@ -602,6 +675,7 @@ def multimodal_text_history_self_teach_prior(ckpt, enabled=True,
         "concept_connection_signal": float(concept_signal),
         "concept_insight_prior": concept_prior,
         "reading_representation_summary": representation_summary,
+        "reading_priority_study_summary": priority_study_summary,
         "top_signal_counts": {
             signal: count for signal, count in top_counts.items() if count},
     }
@@ -618,29 +692,44 @@ def multimodal_checkpoint_representation_self_teach_prior(ckpt, enabled=True):
     if not enabled:
         return {"enabled": False, "entry_count": 0, "signal_deficits": {}}
     report = _multimodal_checkpoint_report(ckpt)
+    train_metrics = report.get("train_metrics")
+    learning_event = report.get("learning_event")
+    if not isinstance(learning_event, dict) and isinstance(train_metrics, dict):
+        learning_event = train_metrics.get("learning_event")
     progress = report.get("representation_progress")
-    if not isinstance(progress, dict):
-        train_metrics = report.get("train_metrics")
-        if isinstance(train_metrics, dict):
-            progress = train_metrics.get("representation_progress")
-    if not isinstance(progress, dict) or not bool(progress.get("enabled", False)):
-        return {"enabled": False, "entry_count": 0, "signal_deficits": {}}
+    if not isinstance(progress, dict) and isinstance(train_metrics, dict):
+        progress = train_metrics.get("representation_progress")
+    progress_enabled = isinstance(progress, dict) and bool(
+        progress.get("enabled", False))
     signal_after = (
         progress.get("signal_after")
-        if isinstance(progress.get("signal_after"), dict) else {})
+        if progress_enabled and isinstance(progress.get("signal_after"), dict)
+        else {})
     signal_deltas = (
         progress.get("signal_deltas")
-        if isinstance(progress.get("signal_deltas"), dict) else {})
+        if progress_enabled and isinstance(progress.get("signal_deltas"), dict)
+        else {})
     deficits = {}
-    for signal in ("fer", "bridge", "sequence"):
-        if signal not in MULTIMODAL_SELF_TEACH_SIGNALS:
-            continue
-        after_quality = min(1.0, max(0.0, _mm_float(signal_after.get(signal), 0.0)))
-        quality_deficit = max(0.0, 1.0 - after_quality)
-        regression_deficit = max(0.0, -_mm_float(signal_deltas.get(signal), 0.0))
-        deficit = max(quality_deficit, regression_deficit)
-        if deficit > 0.0:
-            deficits[signal] = float(deficit)
+    if progress_enabled:
+        for signal in ("fer", "bridge", "sequence"):
+            if signal not in MULTIMODAL_SELF_TEACH_SIGNALS:
+                continue
+            after_quality = min(1.0, max(0.0, _mm_float(
+                signal_after.get(signal), 0.0)))
+            quality_deficit = max(0.0, 1.0 - after_quality)
+            regression_deficit = max(
+                0.0, -_mm_float(signal_deltas.get(signal), 0.0))
+            deficit = max(quality_deficit, regression_deficit)
+            if deficit > 0.0:
+                deficits[signal] = float(deficit)
+    if (isinstance(learning_event, dict)
+            and bool(learning_event.get("triggered", False))):
+        signal = str(learning_event.get("top_signal", ""))
+        if signal in MULTIMODAL_SELF_TEACH_SIGNALS:
+            deficits[signal] = max(
+                float(deficits.get(signal, 0.0)),
+                min(1.0, max(0.0, _mm_float(
+                    learning_event.get("event_score", 0.0), 0.0))))
     top_signal = None
     if deficits:
         top_signal = max(deficits.items(), key=lambda item: item[1])[0]
@@ -651,14 +740,15 @@ def multimodal_checkpoint_representation_self_teach_prior(ckpt, enabled=True):
         "top_signal": top_signal,
         "source": "multimodal_checkpoint_representation_progress",
         "organization_score_before": _mm_float(
-            progress.get("organization_score_before", 0.0), 0.0),
+            (progress or {}).get("organization_score_before", 0.0), 0.0),
         "organization_score_after": _mm_float(
-            progress.get("organization_score_after", 0.0), 0.0),
+            (progress or {}).get("organization_score_after", 0.0), 0.0),
         "organization_score_delta": _mm_float(
-            progress.get("organization_score_delta", 0.0), 0.0),
+            (progress or {}).get("organization_score_delta", 0.0), 0.0),
         "representation_insight_event": bool(
-            progress.get("representation_insight_event", False)),
-        "progress": progress,
+            (progress or {}).get("representation_insight_event", False)),
+        "progress": progress if isinstance(progress, dict) else {},
+        "learning_event": learning_event if isinstance(learning_event, dict) else {},
     }
 
 
@@ -717,6 +807,7 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
     weight_update = text_checkpoint_weight_update_summary(ckpt)
     learning_event = text_checkpoint_learning_event_summary(ckpt)
     reading_representation = text_checkpoint_reading_representation_summary(ckpt)
+    priority_study = text_checkpoint_priority_study_summary(ckpt)
     latest_history = history["entries"][-1] if history["entries"] else {}
     replay_bank = ckpt.get("reading_replay_bank")
     if not isinstance(replay_bank, dict):
@@ -798,6 +889,23 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
         "source_reading_representation_top_gain_signal": str(
             reading_representation.get("top_gain_signal", "")),
         "source_reading_representation_summary": reading_representation,
+        "source_reading_priority_study_enabled": bool(
+            priority_study.get("enabled", False)),
+        "source_reading_replay_study_entry_count": int(
+            priority_study.get("replay_study_entry_count", 0)),
+        "source_reading_training_priority_entry_count": int(
+            priority_study.get("training_priority_entry_count", 0)),
+        "source_reading_latest_replay_study_used": bool(
+            priority_study.get("latest_replay_study_used", False)),
+        "source_reading_latest_training_priority_sampling": bool(
+            priority_study.get("latest_training_priority_sampling", False)),
+        "source_reading_training_priority_record_count": int(
+            priority_study.get("max_training_priority_record_count", 0)),
+        "source_reading_training_priority_mean": float(
+            priority_study.get("max_training_priority_mean", 0.0)),
+        "source_reading_training_priority_max": float(
+            priority_study.get("max_training_priority_max", 0.0)),
+        "source_reading_priority_study_summary": priority_study,
         "source_reading_replay_bank_records": _mm_int(
             replay_bank.get("record_count", 0), 0),
         "source_reading_replay_priority_records": _mm_int(
@@ -916,6 +1024,13 @@ def import_multimodal_checkpoint(model, vocab, checkpoint, device=DEV):
     report_payload = _multimodal_checkpoint_report(ckpt)
     representation_prior = multimodal_checkpoint_representation_self_teach_prior(
         ckpt, enabled=True)
+    source_learning_event = report_payload.get("learning_event")
+    if not isinstance(source_learning_event, dict):
+        train_metrics = report_payload.get("train_metrics")
+        if isinstance(train_metrics, dict):
+            source_learning_event = train_metrics.get("learning_event")
+    if not isinstance(source_learning_event, dict):
+        source_learning_event = {}
     report = {
         "checkpoint": checkpoint,
         "checkpoint_experiment": report_payload.get("experiment"),
@@ -929,6 +1044,15 @@ def import_multimodal_checkpoint(model, vocab, checkpoint, device=DEV):
         "source_representation_insight_event": bool(
             representation_prior.get("representation_insight_event", False)),
         "source_representation_top_signal": representation_prior.get("top_signal"),
+        "source_learning_event_triggered": bool(
+            source_learning_event.get("triggered", False)),
+        "source_learning_event_kind": str(
+            source_learning_event.get("kind", "")),
+        "source_learning_event_top_signal": str(
+            source_learning_event.get("top_signal", "")),
+        "source_learning_event_score": float(_mm_float(
+            source_learning_event.get("event_score", 0.0), 0.0)),
+        "source_learning_event_summary": source_learning_event,
         "copied_token_embeddings": 0,
         "overlap_tokens": 0,
         "copied_feature_tensors": [],
@@ -3031,6 +3155,126 @@ def multimodal_weight_update_report(before_snapshot, after_snapshot, atol=1e-12)
     }
 
 
+def multimodal_learning_event_report(report):
+    """Summarize whether multimodal training produced reusable learning evidence."""
+    report = report if isinstance(report, dict) else {}
+    train_metrics = report.get("train_metrics")
+    if not isinstance(train_metrics, dict):
+        train_metrics = report
+    selection = train_metrics.get("selection")
+    selection = selection if isinstance(selection, dict) else {}
+    rounds = [
+        row for row in selection.get("rounds", ())
+        if isinstance(row, dict)
+    ]
+    weight_update = train_metrics.get("weight_update")
+    weight_update = weight_update if isinstance(weight_update, dict) else {}
+    weight_moved = bool(
+        train_metrics.get("weight_update_changed",
+                          weight_update.get("changed", False)))
+    selection_enabled = bool(selection.get("enabled", False))
+    accepted_update = bool(selection.get("accepted_update", False))
+    update_applied = bool(accepted_update or not selection_enabled)
+    score_gain = max(
+        0.0,
+        _mm_float(selection.get("selected_score_delta", 0.0), 0.0),
+        _mm_float(selection.get("selected_effective_delta", 0.0), 0.0),
+    )
+    bridge_insight = selection.get("selected_bridge_insight")
+    if not isinstance(bridge_insight, dict):
+        bridge_insight = {}
+    bridge_delta = max(
+        0.0,
+        _mm_float(bridge_insight.get("bridge_insight_delta", 0.0), 0.0),
+        _mm_float(bridge_insight.get("bridge_quality_gain", 0.0), 0.0),
+        _mm_float(bridge_insight.get("bridge_connectivity_gain", 0.0), 0.0),
+    )
+    if not bridge_delta:
+        bridge_delta = max((
+            max(
+                0.0,
+                _mm_float(
+                    (row.get("bridge_insight") or {}).get(
+                        "bridge_insight_delta", 0.0), 0.0),
+                _mm_float(
+                    (row.get("bridge_insight") or {}).get(
+                        "bridge_quality_gain", 0.0), 0.0),
+                _mm_float(
+                    (row.get("bridge_insight") or {}).get(
+                        "bridge_connectivity_gain", 0.0), 0.0),
+            )
+            for row in rounds
+            if bool(row.get("selected", False))
+        ), default=0.0)
+    concept_connection = bool(
+        selection.get("selected_by_insight", False) or bridge_delta > 0.0)
+    progress = train_metrics.get("representation_progress")
+    if not isinstance(progress, dict):
+        progress = report.get("representation_progress")
+    progress = progress if isinstance(progress, dict) else {}
+    representation_delta = _mm_float(
+        progress.get("organization_score_delta", 0.0), 0.0)
+    representation_gain = max(
+        0.0,
+        representation_delta,
+        _mm_float(progress.get("positive_signal_gain", 0.0), 0.0),
+    )
+    representation_event = bool(
+        progress.get("representation_insight_event", False)
+        or representation_gain > 0.0)
+    triggered = bool(
+        update_applied and weight_moved
+        and (score_gain > 0.0 or concept_connection or representation_event))
+    if concept_connection:
+        kind = "concept_connection"
+        top_signal = "bridge"
+    elif representation_event:
+        kind = "representation_reorganization"
+        top_signal = str(progress.get("top_gain_signal", ""))
+    elif score_gain > 0.0:
+        kind = "score_gain"
+        top_signal = str((train_metrics.get("self_teach_plan") or {}).get(
+            "top_signal", ""))
+    else:
+        kind = "parameter_update"
+        top_signal = ""
+    if top_signal not in MULTIMODAL_SELF_TEACH_SIGNALS:
+        top_signal = ""
+    event_score = min(
+        1.0,
+        score_gain + bridge_delta + max(0.0, representation_gain))
+    return {
+        "enabled": True,
+        "triggered": bool(triggered),
+        "kind": kind,
+        "top_signal": top_signal,
+        "event_score": float(event_score),
+        "update_applied": bool(update_applied),
+        "selection_enabled": bool(selection_enabled),
+        "accepted_update": bool(accepted_update),
+        "weight_update_changed": bool(weight_moved),
+        "weight_update_changed_tensor_count": int(_mm_int(
+            train_metrics.get("weight_update_changed_tensor_count",
+                              weight_update.get("changed_tensor_count", 0)), 0)),
+        "weight_update_changed_value_count": int(_mm_int(
+            train_metrics.get("weight_update_changed_value_count",
+                              weight_update.get("changed_value_count", 0)), 0)),
+        "weight_update_max_abs_delta": float(_mm_float(
+            train_metrics.get("weight_update_max_abs_delta",
+                              weight_update.get("max_abs_delta", 0.0)), 0.0)),
+        "attempted_weight_update_count": int(_mm_int(
+            train_metrics.get("attempted_weight_update_count",
+                              selection.get("attempted_weight_update_count", 0)), 0)),
+        "score_gain": float(score_gain),
+        "concept_connection": bool(concept_connection),
+        "concept_connection_delta": float(bridge_delta),
+        "representation_event": bool(representation_event),
+        "representation_organization_score_delta": float(representation_delta),
+        "representation_positive_signal_gain": float(
+            _mm_float(progress.get("positive_signal_gain", 0.0), 0.0)),
+    }
+
+
 def _multimodal_sequence_surprise_rows(
         model, pairs, vocab, view_dims, device=DEV, temperature=0.1):
     rows = []
@@ -4834,6 +5078,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         "representation_probe_n": int(representation_progress_probe_n),
         "representation_progress": representation_progress,
     }
+    last["learning_event"] = multimodal_learning_event_report(last)
     model.train_metrics = last
     model.latent_fer_study_reports = (
         last.get("latent_fer_study_reports", []))
@@ -4912,6 +5157,8 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         "manifest": model.manifest_info,
         "architecture": architecture,
         "train_metrics": getattr(model, "train_metrics", {}),
+        "learning_event": getattr(model, "train_metrics", {}).get(
+            "learning_event", {}),
         "representation_progress": getattr(model, "train_metrics", {}).get(
             "representation_progress", {"enabled": False}),
         "selection": getattr(model, "train_metrics", {}).get(
@@ -5009,6 +5256,10 @@ def selftest():
                 "record_count": 3,
                 "priority_record_count": 2,
             },
+            "replay_study_used": True,
+            "replay_study_records": 3,
+            "study_record_count": 5,
+            "study_train_records": 4,
             "before_score_components": {
                 "mastery_score": 0.2,
                 "signal_coverage": 0.3,
@@ -5042,6 +5293,10 @@ def selftest():
                     "weight_update_changed_tensor_count": 5,
                     "weight_update_changed_value_count": 7,
                     "weight_update_max_abs_delta": 0.02,
+                    "training_priority_sampling": True,
+                    "training_priority_record_count": 2,
+                    "training_priority_mean": 0.5,
+                    "training_priority_max": 1.5,
                 }],
                 "self_teach_reports": [{
                     "enabled": True,
@@ -5080,6 +5335,8 @@ def selftest():
         assert text_history["entry_count"] == 1
         assert text_history["entries"][0]["learning_event_triggered"] is True
         assert text_history["entries"][0]["learning_event_top_signal"] == "bridge"
+        assert text_history["entries"][0]["replay_study_used"] is True
+        assert text_history["entries"][0]["training_priority_sampling"] is True
         text_history_prior = multimodal_text_history_self_teach_prior(
             text_ckpt_payload, enabled=True)
         assert text_history_prior["enabled"] is True
@@ -5092,6 +5349,13 @@ def selftest():
             "reading_representation_summary"]["enabled"] is True
         assert text_history_prior[
             "reading_representation_summary"]["top_gain_signal"] == "bridge"
+        assert text_history_prior[
+            "reading_priority_study_summary"]["enabled"] is True
+        priority_study = text_checkpoint_priority_study_summary(text_ckpt_payload)
+        assert priority_study["enabled"] is True
+        assert priority_study["replay_study_entry_count"] == 1
+        assert priority_study["training_priority_entry_count"] == 1
+        assert priority_study["max_training_priority_record_count"] == 2
         event_only_prior = multimodal_text_history_self_teach_prior({
             "reading_mastery_history": {
                 "entries": [{
@@ -5164,6 +5428,14 @@ def selftest():
             "source_reading_representation_top_gain_signal"] == "bridge"
         assert transfer_report[
             "source_reading_representation_insight_event_count"] == 1
+        assert transfer_report["source_reading_priority_study_enabled"] is True
+        assert transfer_report["source_reading_replay_study_entry_count"] == 1
+        assert transfer_report[
+            "source_reading_training_priority_entry_count"] == 1
+        assert transfer_report[
+            "source_reading_latest_training_priority_sampling"] is True
+        assert transfer_report[
+            "source_reading_training_priority_record_count"] == 2
         assert transfer_report["source_reading_replay_bank_records"] == 3
         assert transfer_report["source_reading_replay_priority_records"] == 2
         assert transfer_report["copied_token_embeddings"] > 0
@@ -5328,6 +5600,34 @@ def selftest():
             insight_allowed=positive_insight["bridge_insight_allowed"],
             insight_gate=True, insight_accept_w=1.0)
         assert positive_decision["selected_by_insight"] is True
+        synthetic_learning_event = multimodal_learning_event_report({
+            "weight_update_changed": True,
+            "weight_update_changed_tensor_count": 2,
+            "weight_update_changed_value_count": 3,
+            "weight_update_max_abs_delta": 0.01,
+            "selection": {
+                "enabled": True,
+                "accepted_update": True,
+                "selected_score_delta": 0.01,
+                "selected_by_insight": True,
+                "selected_bridge_insight": positive_insight,
+            },
+            "representation_progress": {
+                "enabled": True,
+                "organization_score_delta": 0.1,
+                "positive_signal_gain": 0.2,
+                "top_gain_signal": "bridge",
+                "representation_insight_event": True,
+            },
+        })
+        assert synthetic_learning_event["triggered"] is True
+        assert synthetic_learning_event["kind"] == "concept_connection"
+        assert synthetic_learning_event["top_signal"] == "bridge"
+        event_only_prior = multimodal_checkpoint_representation_self_teach_prior({
+            "report": {"learning_event": synthetic_learning_event},
+        }, enabled=True)
+        assert event_only_prior["enabled"] is True
+        assert event_only_prior["signal_deficits"]["bridge"] > 0.0
         negative_insight = multimodal_bridge_selection_insight(
             {"skipped": False, "bridge_score": 0.4, "bridge_connectivity": 0.5},
             {"skipped": False, "bridge_score": 0.8, "bridge_connectivity": 0.2})
@@ -5484,6 +5784,9 @@ def selftest():
         assert (trained_model.train_metrics[
             "weight_update_changed_value_count"] > 0)
         assert trained_model.train_metrics["weight_update_max_abs_delta"] > 0.0
+        assert trained_model.train_metrics["learning_event"]["enabled"] is True
+        assert (trained_model.train_metrics["learning_event"][
+            "weight_update_changed"] is True)
         rep_progress = trained_model.train_metrics["representation_progress"]
         assert rep_progress["enabled"] is True
         assert trained_model.train_metrics["representation_probe_n"] == 4
@@ -5523,6 +5826,9 @@ def selftest():
         assert mm_transfer["copied"] is True
         assert mm_transfer["checkpoint_experiment"] == "multimodal-selftest"
         assert mm_transfer["source_representation_prior"]["enabled"] is True
+        assert "source_learning_event_triggered" in mm_transfer
+        assert (mm_transfer["source_learning_event_summary"].get("enabled")
+                is True)
         assert mm_transfer["copied_token_embeddings"] > 0
         assert mm_transfer["copied_exact_tensor_count"] > 0
         assert torch.allclose(

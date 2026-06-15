@@ -172,6 +172,53 @@ def unique_reading_records_by_id(*record_lists):
     return out
 
 
+def reading_record_with_meta(rec, meta):
+    return ReadingRecord(
+        rec_id=rec.rec_id,
+        split=rec.split,
+        tokens=rec.tokens,
+        kind=rec.kind,
+        meta=meta,
+    )
+
+
+def merge_reading_replay_metadata(records, replay_records):
+    """Carry replay priority onto matching fresh rows before appending old rows."""
+    records = list(records or [])
+    replay_records = list(replay_records or [])
+    replay_meta_by_id = {}
+    for rec in replay_records:
+        meta = getattr(rec, "meta", {}) if isinstance(
+            getattr(rec, "meta", None), dict) else {}
+        priority = float(meta.get("replay_priority", 0.0) or 0.0)
+        reasons = list(meta.get("replay_reasons", ()) or ())
+        if priority <= 0.0 and not reasons:
+            continue
+        row = replay_meta_by_id.setdefault(
+            rec.rec_id, {"priority": 0.0, "reasons": []})
+        row["priority"] = max(float(row["priority"]), priority)
+        for reason in reasons:
+            if reason not in row["reasons"]:
+                row["reasons"].append(reason)
+    merged = []
+    for rec in records:
+        replay_meta = replay_meta_by_id.get(rec.rec_id)
+        if replay_meta is None:
+            merged.append(rec)
+            continue
+        meta = dict(rec.meta or {})
+        meta["replay_priority"] = max(
+            float(meta.get("replay_priority", 0.0) or 0.0),
+            float(replay_meta["priority"]))
+        existing_reasons = list(meta.get("replay_reasons", ()) or ())
+        for reason in replay_meta["reasons"]:
+            if reason not in existing_reasons:
+                existing_reasons.append(reason)
+        meta["replay_reasons"] = existing_reasons
+        merged.append(reading_record_with_meta(rec, meta))
+    return unique_reading_records_by_id(merged, replay_records)
+
+
 def reading_hard_record_ids(study_reports):
     ids = []
     seen = set()
@@ -614,6 +661,23 @@ def reading_mastery_history_entry(report, session_index=None):
     replay_priority_counts = [
         value for value in replay_priority_counts if value is not None
     ]
+    training_priority_counts = [
+        _reading_int_or_none(row.get("training_priority_record_count"))
+        for row in rounds
+    ]
+    training_priority_counts = [
+        value for value in training_priority_counts if value is not None
+    ]
+    training_priority_means = [
+        _reading_float(row.get("training_priority_mean", 0.0))
+        for row in rounds
+        if "training_priority_mean" in row
+    ]
+    training_priority_maxes = [
+        _reading_float(row.get("training_priority_max", 0.0))
+        for row in rounds
+        if "training_priority_max" in row
+    ]
     self_teach_reports = selection.get("self_teach_reports", ())
     if not self_teach_reports and isinstance(train_metrics.get("self_teach_plan"), dict):
         self_teach_reports = (train_metrics["self_teach_plan"],)
@@ -656,6 +720,10 @@ def reading_mastery_history_entry(report, session_index=None):
         "train_records": int(report.get("train_records", 0) or 0),
         "eval_records": int(report.get("eval_records", 0) or 0),
         "replay_bank_used": bool(report.get("replay_bank_used", False)),
+        "replay_study_used": bool(report.get("replay_study_used", False)),
+        "replay_study_records": int(report.get("replay_study_records", 0) or 0),
+        "study_record_count": int(report.get("study_record_count", 0) or 0),
+        "study_train_records": int(report.get("study_train_records", 0) or 0),
         "replay_bank_record_count": int(bank.get("record_count", 0) or 0),
         "replay_priority_record_count": int(
             bank.get("priority_record_count", 0) or 0),
@@ -671,6 +739,20 @@ def reading_mastery_history_entry(report, session_index=None):
             bool(row.get("replay_priority_sampling", False)) for row in rounds),
         "replay_priority_round_record_count": (
             max(replay_priority_counts) if replay_priority_counts else 0),
+        "training_priority_sampling": bool(
+            train_metrics.get("training_priority_sampling", False)
+            or any(bool(row.get("training_priority_sampling", False))
+                   for row in rounds)),
+        "training_priority_record_count": max(
+            [_reading_int_or_none(
+                train_metrics.get("training_priority_record_count")) or 0]
+            + training_priority_counts),
+        "training_priority_mean": max(
+            [_reading_float(train_metrics.get("training_priority_mean", 0.0))]
+            + training_priority_means),
+        "training_priority_max": max(
+            [_reading_float(train_metrics.get("training_priority_max", 0.0))]
+            + training_priority_maxes),
         "weight_update_changed": bool(weight_update["changed"]),
         "weight_update_changed_tensor_count": int(
             weight_update["changed_tensor_count"]),
@@ -1200,8 +1282,11 @@ def pack_reading(records, vocab, device):
     return txt
 
 
-def batch_records(records, rng, batch):
-    return [records[int(rng.integers(len(records)))] for _ in range(batch)]
+def batch_records(records, rng, batch, weights=None):
+    if not weights:
+        return [records[int(rng.integers(len(records)))] for _ in range(batch)]
+    idx = rng.choice(len(records), size=int(batch), replace=True, p=np.asarray(weights))
+    return [records[int(i)] for i in idx]
 
 
 def reading_replay_sampling_weights(records, priority_power=1.0):
@@ -1213,6 +1298,23 @@ def reading_replay_sampling_weights(records, priority_power=1.0):
         weights.append(max(0.0, priority) ** float(priority_power))
     total = float(sum(weights))
     if total <= 0.0:
+        return None
+    return [float(w) / total for w in weights]
+
+
+def reading_training_sampling_weights(records, priority_power=1.0,
+                                      priority_boost=1.0):
+    weights = []
+    saw_priority = False
+    for rec in records or ():
+        priority = 0.0
+        if isinstance(getattr(rec, "meta", None), dict):
+            priority = float(rec.meta.get("replay_priority", 0.0) or 0.0)
+        saw_priority = saw_priority or priority > 0.0
+        weights.append(1.0 + float(priority_boost) * (
+            max(0.0, priority) ** float(priority_power)))
+    total = float(sum(weights))
+    if not saw_priority or total <= 0.0:
         return None
     return [float(w) / total for w in weights]
 
@@ -4846,6 +4948,12 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     train_records = [r for r in records if r.split == "train"]
     if not train_records:
         raise ValueError("cannot train reading concepts without train records")
+    training_sampling_weights = reading_training_sampling_weights(train_records)
+    training_priority_active = training_sampling_weights is not None
+    training_priority_record_count = sum(
+        1 for rec in train_records
+        if isinstance(getattr(rec, "meta", None), dict)
+        and float(rec.meta.get("replay_priority", 0.0) or 0.0) > 0.0)
     replay_records = list(replay_records or [])
     replay_sources = [r for r in replay_records if r.split == "train"] or replay_records
     replay_sampling_weights = reading_replay_sampling_weights(replay_sources)
@@ -4971,6 +5079,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_replay = 0.0
     last_replay_priority_mean = 0.0
     last_replay_priority_max = 0.0
+    last_training_priority_mean = 0.0
+    last_training_priority_max = 0.0
 
     def selected_id_sample(selected, limit=16):
         return [rec.rec_id for rec in selected[:int(limit)]]
@@ -5162,7 +5272,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
             model.train()
         source = (study_pool if study_strategy in READING_POOL_STUDY_STRATEGIES
                   and study_pool else train_records)
-        rec_batch = batch_records(source, rng, batch)
+        source_weights = training_sampling_weights if source is train_records else None
+        rec_batch = batch_records(source, rng, batch, weights=source_weights)
         txt = pack_reading(rec_batch, vocab, device)
         view_loss = reading_latent_view_loss(
             model, txt, vocab.pad, vocab.unk, token_drop_p=token_drop_p,
@@ -5613,6 +5724,14 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_transition = float(transition_loss.detach())
         last_cluster = float(cluster_loss.detach())
         last_replay = float(replay_loss.detach())
+        training_priorities = [
+            float(getattr(rec, "meta", {}).get("replay_priority", 0.0) or 0.0)
+            for rec in rec_batch] if training_priority_active else []
+        last_training_priority_mean = (
+            sum(training_priorities) / float(len(training_priorities))
+            if training_priorities else 0.0)
+        last_training_priority_max = (
+            max(training_priorities) if training_priorities else 0.0)
         replay_priorities = [
             float(getattr(rec, "meta", {}).get("replay_priority", 0.0) or 0.0)
             for rec in replay_batch_records] if replay_w and replay_sources else []
@@ -5886,6 +6005,10 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "clusters": len(clusters),
         "cluster_records": sum(len(rows) for rows in clusters),
         "replay_loss": last_replay,
+        "training_priority_sampling": bool(training_priority_active),
+        "training_priority_record_count": int(training_priority_record_count),
+        "training_priority_mean": float(last_training_priority_mean),
+        "training_priority_max": float(last_training_priority_max),
         "replay_w": float(replay_w),
         "replay_batch": int(replay_batch),
         "replay_records": len(replay_sources),
@@ -6058,7 +6181,9 @@ def fit_reading_concepts_select_best(
         score_min_delta=0.0, score_patience=0, score_target=0.0,
         insight_accept_w=0.25, insight_min_delta=0.0,
         representation_accept_w=0.0, representation_min_delta=0.0,
-        rounds=1, before_bundle=None):
+        rounds=1, before_bundle=None, score_records=None):
+    records = list(records)
+    score_records = list(score_records or records)
     schedule = _step_schedule(steps, rounds)
     if not schedule:
         raise ValueError("reading selected training requires at least one step")
@@ -6093,7 +6218,7 @@ def fit_reading_concepts_select_best(
     initial_study_strategy = resolve_reading_study_strategy(
         study_strategy, model)
     before_bundle = before_bundle or reading_eval_bundle(
-        model, vocab, records, device=device, eval_n=eval_n, seed=seed,
+        model, vocab, score_records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=score_metric,
         score_margin_w=score_margin_w, span_mask_frac=span_mask_frac,
@@ -6332,7 +6457,7 @@ def fit_reading_concepts_select_best(
         all_neighborhood_reports.extend(round_neighborhood_reports)
         all_cluster_reports.extend(round_cluster_reports)
         bundle = reading_eval_bundle(
-            model, vocab, records, device=device, eval_n=eval_n, seed=seed,
+            model, vocab, score_records, device=device, eval_n=eval_n, seed=seed,
             token_drop_p=token_drop_p, token_replace_p=token_replace_p,
             context_keep_p=context_keep_p, score_metric=score_metric,
             score_margin_w=score_margin_w, span_mask_frac=span_mask_frac,
@@ -6396,6 +6521,14 @@ def fit_reading_concepts_select_best(
             "representation_insight_allowed": bool(
                 representation_insight_allowed),
             "representation_progress": representation_progress,
+            "training_priority_sampling": bool(
+                round_train_metrics.get("training_priority_sampling", False)),
+            "training_priority_record_count": int(
+                round_train_metrics.get("training_priority_record_count", 0)),
+            "training_priority_mean": float(
+                round_train_metrics.get("training_priority_mean", 0.0)),
+            "training_priority_max": float(
+                round_train_metrics.get("training_priority_max", 0.0)),
             "replay_priority_sampling": bool(
                 round_train_metrics.get("replay_priority_sampling", False)),
             "replay_priority_record_count": int(
@@ -6476,6 +6609,8 @@ def fit_reading_concepts_select_best(
         "target_round": (
             int(target_round) if target_round is not None else None),
         "adaptive_study_strategy": str(study_strategy) == "auto",
+        "training_record_count": int(len(records)),
+        "score_record_count": int(len(score_records)),
         "branch_from_best": True,
         "bridge_insight_gate": bool(bridge_insight_gate),
         "concept_insight_gate": bool(
@@ -7703,6 +7838,9 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         checkpoint, device="cpu")
     replay_records = unique_reading_records_by_id(
         external_replay_records, checkpoint_replay_records)
+    replay_study_records = (
+        replay_records if str(reading_objective_profile) == "mastery" else [])
+    study_records = merge_reading_replay_metadata(records, replay_study_records)
     checkpoint_profile = reading_checkpoint_profile_kwargs(
         reading_objective_profile, replay_records=replay_records,
         replay_w=replay_w, replay_retention_w=replay_retention_w)
@@ -7752,7 +7890,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
     selection = {"enabled": False}
     if study_select_best:
         _model, _vocab, selection = fit_reading_concepts_select_best(
-            model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
+            model, vocab, study_records, steps=steps, batch=batch, lr=lr, seed=seed,
             device=device, log_every=log_every, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
             invariance_w=invariance_w, variance_w=variance_w,
@@ -7866,7 +8004,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             replay_teacher_vocab=replay_teacher_vocab,
             replay_w=replay_w, replay_batch=replay_batch,
             replay_retention_w=replay_retention_w, rounds=study_rounds,
-            before_bundle=before_bundle)
+            before_bundle=before_bundle, score_records=records)
     else:
         self_teach_plan, self_teach_base_weights, train_weights = (
             reading_self_teach_weight_maps(
@@ -7886,7 +8024,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                 transition_w=transition_w,
                 cluster_w=cluster_w))
         fit_reading_concepts(
-            model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
+            model, vocab, study_records, steps=steps, batch=batch, lr=lr, seed=seed,
             device=device, log_every=log_every, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
             invariance_w=invariance_w, variance_w=variance_w,
@@ -8051,6 +8189,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "replay_external_records": len(external_replay_records),
               "replay_bank_records": len(checkpoint_replay_records),
               "replay_bank_used": bool(checkpoint_replay_records),
+              "replay_study_used": bool(replay_study_records),
+              "replay_study_records": len(replay_study_records),
+              "study_record_count": len(study_records),
+              "study_train_records": sum(r.split == "train" for r in study_records),
               "steps": int(steps), "batch": int(batch), "lr": float(lr),
               "text_encoder_arch": ckpt.get("text_encoder_arch", "transformer"),
               "text_encoder_layers": int(ckpt.get("text_encoder_layers", 1)),
@@ -9202,6 +9344,15 @@ def selftest():
         {"reading_replay_bank": priority_replay_bank})
     assert priority_records[0].meta["replay_priority"] > 0.0
     assert "hard:discovery" in priority_records[0].meta["replay_reasons"]
+    merged_priority_records = merge_reading_replay_metadata(
+        [ReadingRecord(
+            rec_id=priority_records[0].rec_id,
+            split=priority_records[0].split,
+            tokens=priority_records[0].tokens,
+        )],
+        priority_records)
+    assert merged_priority_records[0].meta["replay_priority"] > 0.0
+    assert "hard:discovery" in merged_priority_records[0].meta["replay_reasons"]
     carried_priority_bank = build_reading_replay_bank(
         priority_records, study_reports=[], max_records=3)
     assert carried_priority_bank["priority_record_count"] == 3
@@ -9210,6 +9361,10 @@ def selftest():
     assert replay_weights is not None
     assert math.isclose(sum(replay_weights), 1.0, rel_tol=1e-6, abs_tol=1e-6)
     assert replay_weights[0] == max(replay_weights)
+    training_weights = reading_training_sampling_weights(priority_records)
+    assert training_weights is not None
+    assert math.isclose(sum(training_weights), 1.0, rel_tol=1e-6, abs_tol=1e-6)
+    assert training_weights[0] == max(training_weights)
     priority_batch = batch_replay_records(
         priority_records, np.random.default_rng(0), batch=8,
         weights=replay_weights)
@@ -9262,6 +9417,10 @@ def selftest():
         assert study_report["replay_bank_used"] is True
         assert study_report["replay_bank_records"] > 0
         assert study_report["replay_train_records"] > 0
+        assert study_report["replay_study_used"] is True
+        assert study_report["replay_study_records"] > 0
+        assert study_report["study_record_count"] > len(study_rows)
+        assert study_report["study_train_records"] >= 2
         assert study_report["before_replay"] is not None
         checkpoint_profile_report = study_report[
             "reading_objective_profile_report"]["checkpoint_replay"]
@@ -9296,6 +9455,8 @@ def selftest():
             "weight_extras"].values()) > 0.0
         assert study_report["train_metrics"]["replay_records"] > 0
         if reading_payload["reading_replay_bank"]["priority_record_count"] > 0:
+            assert study_report["train_metrics"]["training_priority_sampling"] is True
+            assert study_report["train_metrics"]["training_priority_record_count"] > 0
             assert study_report["train_metrics"]["replay_priority_sampling"] is True
             assert study_report["train_metrics"]["replay_priority_record_count"] > 0
         assert math.isfinite(study_report["train_metrics"]["gap_loss"])
@@ -9312,6 +9473,11 @@ def selftest():
         assert history_entries[1]["experiment"] == (
             "text_raw_reading_checkpoint_study")
         assert history_entries[1]["replay_bank_used"] is True
+        assert history_entries[1]["replay_study_used"] is True
+        assert history_entries[1]["replay_study_records"] > 0
+        assert history_entries[1]["study_record_count"] > 0
+        assert history_entries[1]["training_priority_sampling"] is True
+        assert history_entries[1]["training_priority_record_count"] > 0
         assert history_entries[1]["weight_update_changed"] is True
         assert history_entries[1]["weight_update_changed_tensor_count"] > 0
         assert history_entries[1]["weight_update_changed_value_count"] > 0

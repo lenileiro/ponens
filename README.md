@@ -22,7 +22,14 @@ an applied update moved sampled weights and improved score, representation struc
 concept-connection signals; continuation and multimodal transfer can use that event as self-teach
 pressure, and replay banks prioritize the study records attached to those events. Selected study
 rounds can also keep a guarded representation reorganization as a model-discovered "light bulb"
-moment, instead of depending only on surface score. The code keeps model inputs manifest-driven:
+moment, instead of depending only on surface score. Checkpoint continuation now folds those
+priority replay rows back into the primary self-supervised study pool while still scoring selection
+on the new reading task, so the model rereads material tied to real weight movement without
+turning replay into labels. Multimodal text-checkpoint transfer also exposes that priority-study
+evidence and uses it when converting text learning events into self-teach pressure. Multimodal
+training now writes its own generic `learning_event` when applied updates move sampled weights and
+improve score, bridge insight, or internal representation organization, so multimodal checkpoints
+can also seed later self-teaching. The code keeps model inputs manifest-driven:
 datasets provide text, feature views, image records, and optional target tokens; model code learns
 the representations.
 

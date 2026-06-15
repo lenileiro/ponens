@@ -223,6 +223,11 @@ def run_quality_loop(
         vision_read_steps=0, vision_read_seed=0, vision_read_device="cpu",
         vision_read_batch=4, vision_read_dim=32, vision_read_layers=1,
         vision_read_heads=2, vision_read_max_len=64, vision_read_eval_n=16,
+        vision_read_structure_view="vision_structure",
+        vision_read_physics_view="vision_physics",
+        vision_read_raw_visual_size=64,
+        vision_read_raw_visual_patch=8,
+        vision_read_structure_vector_mode="summary",
         vision_read_min_sensor_token_acc=0.0,
         vision_read_min_full_token_acc=0.0,
         vision_read_max_sensor_loss=None):
@@ -294,7 +299,12 @@ def run_quality_loop(
     vision_manifest = os.path.join(work_dir, "vision_read.jsonl")
     vision_rows, vision_manifest_report = build_manifest(
         [real_embed_path, generated_embed_path], root="", split="",
-        split_map=parse_split_map("generated=eval"))
+        split_map=parse_split_map("generated=eval"),
+        structure_view=vision_read_structure_view,
+        physics_view=vision_read_physics_view,
+        raw_visual_size=vision_read_raw_visual_size,
+        raw_visual_patch=vision_read_raw_visual_patch,
+        structure_vector_mode=vision_read_structure_vector_mode)
     write_jsonl(vision_rows, vision_manifest)
     vision_manifest_report["out"] = vision_manifest
 
@@ -411,6 +421,8 @@ def selftest():
             report["embedding_eval"])
         assert report["vision_read_manifest"]["splits"] == {"eval": 2, "train": 2}
         assert report["vision_read_eval"]["manifest"]["view_dims"]["vision"] == 8
+        assert report["vision_read_eval"]["manifest"]["view_dims"]["vision_structure"] == 48
+        assert report["vision_read_eval"]["manifest"]["view_dims"]["vision_physics"] == 12
         assert "sensor_only" in report["vision_read_eval"]["teacher_forced"]
         extra_manifest = os.path.join(td, "extra_embedded.jsonl")
         _write_jsonl(extra_manifest, [
@@ -520,6 +532,12 @@ def main(argv=None):
     ap.add_argument("--vision-read-heads", type=int, default=2)
     ap.add_argument("--vision-read-max-len", type=int, default=64)
     ap.add_argument("--vision-read-eval-n", type=int, default=16)
+    ap.add_argument("--vision-read-structure-view", default="vision_structure")
+    ap.add_argument("--vision-read-physics-view", default="vision_physics")
+    ap.add_argument("--vision-read-raw-visual-size", type=int, default=64)
+    ap.add_argument("--vision-read-raw-visual-patch", type=int, default=8)
+    ap.add_argument("--vision-read-structure-vector-mode", default="summary",
+                    choices=("summary", "flatten"))
     ap.add_argument("--vision-read-min-sensor-token-acc", type=float, default=0.0)
     ap.add_argument("--vision-read-min-full-token-acc", type=float, default=0.0)
     ap.add_argument("--vision-read-max-sensor-loss", type=float, default=None)
@@ -537,9 +555,14 @@ def main(argv=None):
             "generated_embed_max_records", "eval_max_records",
             "real_eval_max_records", "generated_eval_max_records",
             "visual_stats_size", "visual_stats_max_records",
-            "vision_read_steps"):
+            "vision_read_steps", "vision_read_raw_visual_size",
+            "vision_read_raw_visual_patch"):
         if getattr(args, name) < 0:
             ap.error(f"--{name.replace('_', '-')} must be non-negative")
+    if args.vision_read_raw_visual_size <= 0:
+        ap.error("--vision-read-raw-visual-size must be positive")
+    if args.vision_read_raw_visual_patch <= 0:
+        ap.error("--vision-read-raw-visual-patch must be positive")
     if (args.min_generated_neighbor_l2_p05 is not None
             and args.min_generated_neighbor_l2_p05 < 0.0):
         ap.error("--min-generated-neighbor-l2-p05 must be non-negative")
@@ -614,6 +637,11 @@ def main(argv=None):
         vision_read_heads=args.vision_read_heads,
         vision_read_max_len=args.vision_read_max_len,
         vision_read_eval_n=args.vision_read_eval_n,
+        vision_read_structure_view=args.vision_read_structure_view,
+        vision_read_physics_view=args.vision_read_physics_view,
+        vision_read_raw_visual_size=args.vision_read_raw_visual_size,
+        vision_read_raw_visual_patch=args.vision_read_raw_visual_patch,
+        vision_read_structure_vector_mode=args.vision_read_structure_vector_mode,
         vision_read_min_sensor_token_acc=args.vision_read_min_sensor_token_acc,
         vision_read_min_full_token_acc=args.vision_read_min_full_token_acc,
         vision_read_max_sensor_loss=args.vision_read_max_sensor_loss)

@@ -735,6 +735,10 @@ def apply_image_quality_preset(args):
         int(args.image_quality_loop_vision_read_heads), 4)
     args.image_quality_loop_vision_read_eval_n = max(
         int(args.image_quality_loop_vision_read_eval_n), 64 if hq else 32)
+    args.image_quality_loop_vision_read_raw_visual_size = max(
+        int(args.image_quality_loop_vision_read_raw_visual_size), 64)
+    args.image_quality_loop_vision_read_raw_visual_patch = max(
+        int(args.image_quality_loop_vision_read_raw_visual_patch), 8)
     args.image_generated_eval_visual_stats_size = max(
         int(args.image_generated_eval_visual_stats_size), 64)
     args.image_generated_eval_visual_stats_max_records = max(
@@ -1672,6 +1676,16 @@ def payload(args):
                         f"{args.image_quality_loop_vision_read_max_len} "
                         f"--vision-read-eval-n "
                         f"{args.image_quality_loop_vision_read_eval_n} "
+                        f"--vision-read-structure-view "
+                        f"{shlex_quote(args.image_quality_loop_vision_read_structure_view)} "
+                        f"--vision-read-physics-view "
+                        f"{shlex_quote(args.image_quality_loop_vision_read_physics_view)} "
+                        f"--vision-read-raw-visual-size "
+                        f"{args.image_quality_loop_vision_read_raw_visual_size} "
+                        f"--vision-read-raw-visual-patch "
+                        f"{args.image_quality_loop_vision_read_raw_visual_patch} "
+                        f"--vision-read-structure-vector-mode "
+                        f"{args.image_quality_loop_vision_read_structure_vector_mode} "
                         f"--vision-read-min-sensor-token-acc "
                         f"{args.image_quality_loop_min_sensor_token_acc} "
                         f"--vision-read-min-full-token-acc "
@@ -3317,6 +3331,26 @@ def main():
                     dest="image_quality_loop_vision_read_max_len")
     ap.add_argument("--image-quality-loop-vision-read-eval-n", type=int, default=64,
                     dest="image_quality_loop_vision_read_eval_n")
+    ap.add_argument("--image-quality-loop-vision-read-structure-view",
+                    default="vision_structure",
+                    dest="image_quality_loop_vision_read_structure_view",
+                    help="named raw patch-structure view for generated-sample vision-read")
+    ap.add_argument("--image-quality-loop-vision-read-physics-view",
+                    default="vision_physics",
+                    dest="image_quality_loop_vision_read_physics_view",
+                    help="named raw visual-physics view for generated-sample vision-read")
+    ap.add_argument("--image-quality-loop-vision-read-raw-visual-size",
+                    type=int, default=64,
+                    dest="image_quality_loop_vision_read_raw_visual_size",
+                    help="image size for generated-sample raw visual read views")
+    ap.add_argument("--image-quality-loop-vision-read-raw-visual-patch",
+                    type=int, default=8,
+                    dest="image_quality_loop_vision_read_raw_visual_patch",
+                    help="patch size for generated-sample raw visual structure view")
+    ap.add_argument("--image-quality-loop-vision-read-structure-vector-mode",
+                    default="summary", choices=("summary", "flatten"),
+                    dest="image_quality_loop_vision_read_structure_vector_mode",
+                    help="raw patch-structure reduction for generated-sample vision-read")
     ap.add_argument("--image-quality-loop-min-sensor-token-acc", type=float,
                     default=0.0, dest="image_quality_loop_min_sensor_token_acc",
                     help=("minimum caption-token accuracy recoverable from vision-only "
@@ -4792,6 +4826,10 @@ def main():
             args.image_quality_loop_vision_read_max_len),
         "--image-quality-loop-vision-read-eval-n": (
             args.image_quality_loop_vision_read_eval_n),
+        "--image-quality-loop-vision-read-raw-visual-size": (
+            args.image_quality_loop_vision_read_raw_visual_size),
+        "--image-quality-loop-vision-read-raw-visual-patch": (
+            args.image_quality_loop_vision_read_raw_visual_patch),
     }
     bad_quality_loop_positive = [
         name for name, value in quality_loop_positive.items() if value <= 0

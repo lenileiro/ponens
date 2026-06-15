@@ -58,7 +58,10 @@ text and multimodal self-teach priors can reuse that event without task labels. 
 bounded candidate set, caps selected hard records, and periodically refreshes neighborhood and
 cluster mining instead of requiring those controls to be repeated in every launch command. Triggered
 learning events also add replay reasons to the selected study records, so continuation can revisit
-chunks tied to actual weight movement and internal reorganization. Use
+chunks tied to actual weight movement and internal reorganization. During checkpoint continuation,
+the mastery profile now includes those replay-bank rows in the primary self-supervised study pool
+and samples priority rows more often, while acceptance is still scored on the new reading corpus.
+Use
 `manual` for exact low-level
 ablations.
 Optional `--latent-concept-topk` applies the shared latent-slot sparsity gate used by
@@ -102,8 +105,12 @@ transfer, `--text-transfer-probe-n` probes the current multimodal manifest befor
 checkpoint import; by default it probes 64 records, requires a `0.1` target-score gain, and keeps
 `--text-transfer-gate` enabled so harmful imports are rolled back and their reading-history prior
 is not trusted for self-teach. The import report also exposes source `learning_event` counts,
-top signal, kind, and score, so multimodal runs can see whether the text source learned by moving
-weights and reorganizing concepts before it transferred. Multimodal train reports include the same
+top signal, kind, score, and priority-study evidence, so multimodal runs can see whether the text
+source learned by moving weights, revisiting event-linked chunks, and reorganizing concepts before
+it transferred. Multimodal train reports now write their own generic `learning_event` from applied
+weight movement, score gain, bridge insight, and representation reorganization, and multimodal
+checkpoint transfer can reuse event-only evidence for later self-teach. Multimodal train reports
+include the same
 bounded sampled parameter-update summary for the current run, including attempted selected rounds
 that are later rolled back. Optional `--representation-probe-n` records a before/after
 label-free organization report over FER, bridge, and sequence signals, so a run can distinguish

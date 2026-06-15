@@ -15,10 +15,14 @@ import tempfile
 
 import numpy as np
 
-from .image_data import caption_tokens, read_image_manifest, summarize_records
+from .image_data import (caption_tokens, load_image_tensor, read_image_manifest,
+                         summarize_records)
+from .vision_understanding import (patch_structure_targets,
+                                   visual_physics_moments)
 
 
 VECTOR_SOURCES = ("embedding", "sequence_mean", "sequence_first", "sequence_flatten")
+STRUCTURE_VECTOR_MODES = ("summary", "flatten")
 DEFAULT_SPLIT_MAP = {"train": "train", "eval": "eval", "generated": "eval"}
 
 
@@ -104,10 +108,54 @@ def _token_list(text):
     return tuple(tokens) if tokens else ("<empty>",)
 
 
+def _summary_vector(arr):
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 1:
+        return arr.astype(np.float32, copy=False)
+    flat = arr.reshape(-1, arr.shape[-1])
+    return np.concatenate((
+        flat.mean(axis=0),
+        flat.std(axis=0),
+        flat.min(axis=0),
+        flat.max(axis=0),
+    )).astype(np.float32, copy=False)
+
+
+def raw_visual_feature_views(rec, *, structure=False, physics=False,
+                             size=64, patch=8, structure_mode="summary"):
+    """Compute generic pixel-derived visual feature views for one image record."""
+    if structure_mode not in STRUCTURE_VECTOR_MODES:
+        raise ValueError(f"unknown structure vector mode {structure_mode!r}")
+    if int(size) <= 0:
+        raise ValueError("raw visual feature size must be positive")
+    if int(patch) <= 0:
+        raise ValueError("raw visual feature patch must be positive")
+    if not structure and not physics:
+        return {}
+    x = load_image_tensor(
+        rec.path, size=int(size), device="cpu", crop_mode="center").unsqueeze(0)
+    out = {}
+    if structure:
+        desc = patch_structure_targets(x, patch=int(patch)).squeeze(0).detach().cpu().numpy()
+        if structure_mode == "flatten":
+            vec = desc.reshape(-1).astype(np.float32, copy=False)
+        else:
+            vec = _summary_vector(desc)
+        out["structure"] = vec
+    if physics:
+        out["physics"] = (
+            visual_physics_moments(x).squeeze(0).detach().cpu().numpy()
+            .astype(np.float32, copy=False)
+        )
+    return out
+
+
 def image_records_to_multimodal_rows(
         records, *, split_map=None, image_view="vision", text_view="text_feature",
         include_text_view=True, image_vector_mode="embedding",
-        text_vector_mode="embedding", require_vision=True, id_prefix="vision"):
+        text_vector_mode="embedding", require_vision=True, id_prefix="vision",
+        structure_view="", physics_view="", raw_visual_size=64,
+        raw_visual_patch=8, structure_vector_mode="summary"):
     split_map = split_map or DEFAULT_SPLIT_MAP
     rows = []
     report = {
@@ -115,24 +163,52 @@ def image_records_to_multimodal_rows(
         "records_written": 0,
         "records_skipped_missing_vision": 0,
         "records_skipped_missing_text_view": 0,
+        "records_skipped_missing_raw_visual": 0,
         "view_dims": OrderedDict(),
         "view_sources": Counter(),
         "splits": Counter(),
         "sources": Counter(),
+        "raw_visual_failures": [],
     }
+    structure_view = str(structure_view or "")
+    physics_view = str(physics_view or "")
     for idx, rec in enumerate(records):
         report["input_records"] += 1
         row_id = f"{id_prefix}-{idx:06d}"
         views = OrderedDict()
         vision, vision_source = record_embedding_vector(
             rec, side="image", mode=image_vector_mode)
-        if vision is None:
-            if require_vision:
-                report["records_skipped_missing_vision"] += 1
-                continue
-        else:
+        if vision is not None:
             views[str(image_view)] = vision.tolist()
             report["view_sources"][f"{image_view}:{vision_source}"] += 1
+        if structure_view or physics_view:
+            try:
+                raw_views = raw_visual_feature_views(
+                    rec, structure=bool(structure_view), physics=bool(physics_view),
+                    size=raw_visual_size, patch=raw_visual_patch,
+                    structure_mode=structure_vector_mode)
+            except Exception as exc:
+                report["records_skipped_missing_raw_visual"] += 1
+                if len(report["raw_visual_failures"]) < 8:
+                    report["raw_visual_failures"].append({
+                        "id": row_id,
+                        "image": rec.path,
+                        "error": str(exc)[:240],
+                    })
+            else:
+                if structure_view and "structure" in raw_views:
+                    views[structure_view] = raw_views["structure"].tolist()
+                    report["view_sources"][f"{structure_view}:raw_pixels"] += 1
+                if physics_view and "physics" in raw_views:
+                    views[physics_view] = raw_views["physics"].tolist()
+                    report["view_sources"][f"{physics_view}:raw_pixels"] += 1
+        visual_names = {
+            str(name) for name in (image_view, structure_view, physics_view)
+            if str(name or "")
+        }
+        if require_vision and not any(name in views for name in visual_names):
+            report["records_skipped_missing_vision"] += 1
+            continue
         if include_text_view:
             text_vec, text_source = record_embedding_vector(
                 rec, side="text", mode=text_vector_mode)
@@ -191,7 +267,9 @@ def build_manifest(
         manifests, *, root="", split="", max_records=0, split_map=None,
         image_view="vision", text_view="text_feature", include_text_view=True,
         image_vector_mode="embedding", text_vector_mode="embedding",
-        require_vision=True, id_prefix="vision"):
+        require_vision=True, id_prefix="vision", structure_view="",
+        physics_view="", raw_visual_size=64, raw_visual_patch=8,
+        structure_vector_mode="summary"):
     split_map = split_map or DEFAULT_SPLIT_MAP
     all_rows = []
     manifest_reports = []
@@ -202,7 +280,10 @@ def build_manifest(
             records, split_map=split_map, image_view=image_view,
             text_view=text_view, include_text_view=include_text_view,
             image_vector_mode=image_vector_mode, text_vector_mode=text_vector_mode,
-            require_vision=require_vision, id_prefix=f"{id_prefix}{manifest_idx}")
+            require_vision=require_vision, id_prefix=f"{id_prefix}{manifest_idx}",
+            structure_view=structure_view, physics_view=physics_view,
+            raw_visual_size=raw_visual_size, raw_visual_patch=raw_visual_patch,
+            structure_vector_mode=structure_vector_mode)
         all_rows.extend(rows)
         report.update({
             "manifest": manifest,
@@ -226,6 +307,11 @@ def build_manifest(
         "include_text_view": bool(include_text_view),
         "image_vector_mode": str(image_vector_mode),
         "text_vector_mode": str(text_vector_mode),
+        "structure_view": str(structure_view or ""),
+        "physics_view": str(physics_view or ""),
+        "raw_visual_size": int(raw_visual_size),
+        "raw_visual_patch": int(raw_visual_patch),
+        "structure_vector_mode": str(structure_vector_mode),
         "require_vision": bool(require_vision),
         "manifest_reports": manifest_reports,
     }
@@ -252,17 +338,30 @@ def selftest():
                 "text_embedding_sequence": [[0.0, 1.0, 0.0], [0.1, 0.8, 0.1]],
             },
         ]
+        for idx, row in enumerate(rows):
+            pixels = np.zeros((24, 24, 3), dtype=np.uint8)
+            yy, xx = np.mgrid[0:24, 0:24]
+            pixels[..., 0] = (40 + xx * (5 + idx)) % 255
+            pixels[..., 1] = (80 + yy * (4 + idx)) % 255
+            pixels[..., 2] = (120 + (xx + yy) * (3 + idx)) % 255
+            with open(os.path.join(td, row["image"]), "wb") as f:
+                f.write(b"P6\n24 24\n255\n")
+                f.write(pixels.tobytes())
         with open(manifest, "w", encoding="utf-8") as f:
             for row in rows:
                 f.write(json.dumps(row) + "\n")
         out = os.path.join(td, "mm.jsonl")
         records, report = build_manifest(
             [manifest], root=td, split="", split_map=parse_split_map("generated=eval"),
-            image_vector_mode="sequence_mean", text_vector_mode="sequence_mean")
+            image_vector_mode="sequence_mean", text_vector_mode="sequence_mean",
+            structure_view="vision_structure", physics_view="vision_physics",
+            raw_visual_size=16, raw_visual_patch=4, structure_vector_mode="flatten")
         write_jsonl(records, out)
         assert report["records_written"] == 2
         assert report["splits"] == {"eval": 1, "train": 1}
         assert report["view_dims"]["vision"] == 3
+        assert report["view_dims"]["vision_structure"] == 16 * 16 // (4 * 4) * 12
+        assert report["view_dims"]["vision_physics"] == 12
         with open(out, "r", encoding="utf-8") as f:
             written = [json.loads(line) for line in f if line.strip()]
         assert written[0]["target"] == ["red", "square", "sample"]
@@ -271,6 +370,8 @@ def selftest():
         from .multimodal import feature_dims, load_manifest
         mm_records = load_manifest(out)
         assert feature_dims(mm_records)["vision"] == 3
+        assert feature_dims(mm_records)["vision_structure"] == report[
+            "view_dims"]["vision_structure"]
     print("vision_read selftest OK")
 
 
@@ -294,6 +395,17 @@ def main(argv=None):
                     help="omit pooled text embedding view; text tokens are still written")
     ap.add_argument("--image-vector-mode", default="embedding", choices=VECTOR_SOURCES)
     ap.add_argument("--text-vector-mode", default="embedding", choices=VECTOR_SOURCES)
+    ap.add_argument("--structure-view", default="",
+                    help="optional named view for raw pixel patch-structure features")
+    ap.add_argument("--physics-view", default="",
+                    help="optional named view for raw pixel visual-physics moments")
+    ap.add_argument("--raw-visual-size", type=int, default=64,
+                    help="image size for optional raw pixel visual views")
+    ap.add_argument("--raw-visual-patch", type=int, default=8,
+                    help="patch size for optional raw pixel structure view")
+    ap.add_argument("--structure-vector-mode", default="summary",
+                    choices=STRUCTURE_VECTOR_MODES,
+                    help="how to reduce patch structure descriptors into a feature vector")
     ap.add_argument("--allow-missing-vision", action="store_true",
                     help="write records even when only non-vision feature views exist")
     args = ap.parse_args(argv)
@@ -306,6 +418,10 @@ def main(argv=None):
         ap.error("--out is required")
     if args.max_records < 0:
         ap.error("--max-records must be non-negative")
+    if args.raw_visual_size <= 0:
+        ap.error("--raw-visual-size must be positive")
+    if args.raw_visual_patch <= 0:
+        ap.error("--raw-visual-patch must be positive")
     try:
         split_map = parse_split_map(args.split_map)
         rows, report = build_manifest(
@@ -315,7 +431,12 @@ def main(argv=None):
             include_text_view=not args.no_text_view,
             image_vector_mode=args.image_vector_mode,
             text_vector_mode=args.text_vector_mode,
-            require_vision=not args.allow_missing_vision)
+            require_vision=not args.allow_missing_vision,
+            structure_view=args.structure_view,
+            physics_view=args.physics_view,
+            raw_visual_size=args.raw_visual_size,
+            raw_visual_patch=args.raw_visual_patch,
+            structure_vector_mode=args.structure_vector_mode)
     except ValueError as exc:
         ap.error(str(exc))
     write_jsonl(rows, args.out)
