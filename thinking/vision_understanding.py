@@ -26,6 +26,82 @@ from .image_data import (load_image_tensor, read_image_manifest,
 
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
+PATCH_STRUCTURE_DIM = 12
+GLOBAL_PHYSICS_DIM = 12
+
+
+def _weighted_spatial_moments(weight, xx, yy, eps=1.0e-6):
+    denom = weight.sum(dim=(-2, -1)).clamp_min(float(eps))
+    cx = (weight * xx).sum(dim=(-2, -1)) / denom
+    cy = (weight * yy).sum(dim=(-2, -1)) / denom
+    dx = xx - cx[:, None, None]
+    dy = yy - cy[:, None, None]
+    var_x = (weight * dx.pow(2)).sum(dim=(-2, -1)) / denom
+    var_y = (weight * dy.pow(2)).sum(dim=(-2, -1)) / denom
+    cov_xy = (weight * dx * dy).sum(dim=(-2, -1)) / denom
+    mass = denom / float(max(1, int(weight.shape[-2]) * int(weight.shape[-1])))
+    return torch.stack((mass, cx, cy, var_x, var_y, cov_xy), dim=-1)
+
+
+def visual_physics_moments(x, eps=1.0e-6):
+    """Category-free visual mass and edge-layout moments."""
+    if x.ndim != 4:
+        raise ValueError(f"visual physics moments expect BCHW tensors, got {tuple(x.shape)}")
+    data = torch.nan_to_num(x.float(), nan=0.0, posinf=1.0, neginf=-1.0)
+    bsz, _ch, h, w = data.shape
+    if h <= 0 or w <= 0:
+        raise ValueError("visual physics moments require non-empty spatial dimensions")
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1.0, 1.0, int(h), device=data.device, dtype=data.dtype),
+        torch.linspace(-1.0, 1.0, int(w), device=data.device, dtype=data.dtype),
+        indexing="ij")
+    xx = xx.unsqueeze(0).expand(bsz, -1, -1)
+    yy = yy.unsqueeze(0).expand(bsz, -1, -1)
+    mass = data.pow(2).mean(dim=1)
+    dx = data[..., :, 1:] - data[..., :, :-1]
+    dy = data[..., 1:, :] - data[..., :-1, :]
+    dx_energy = F.pad(dx.pow(2).mean(dim=1), (0, 1), value=0.0)
+    dy_energy = F.pad(dy.pow(2).mean(dim=1), (0, 0, 0, 1), value=0.0)
+    edge = (dx_energy + dy_energy + float(eps)).sqrt()
+    layout = _weighted_spatial_moments(mass + edge, xx, yy, eps=eps)
+    edge_layout = _weighted_spatial_moments(edge, xx, yy, eps=eps)
+    return torch.cat((layout, edge_layout), dim=-1)
+
+
+def patch_structure_targets(x, patch):
+    """Per-patch color, texture, edge and coordinate targets for raw visual tokens."""
+    if x.ndim != 4 or x.shape[1] != 3:
+        raise ValueError("patch structure targets expect images shaped [batch,3,h,w]")
+    p = int(patch)
+    if p <= 0:
+        raise ValueError("patch size must be positive")
+    data = torch.nan_to_num(x.float(), nan=0.0, posinf=1.0, neginf=-1.0)
+    h, w = int(data.shape[-2]), int(data.shape[-1])
+    pad_h = (p - h % p) % p
+    pad_w = (p - w % p) % p
+    if pad_h or pad_w:
+        data = F.pad(data, (0, pad_w, 0, pad_h), value=0.0)
+    hp, wp = int(data.shape[-2]), int(data.shape[-1])
+    patches = F.unfold(data, kernel_size=p, stride=p).transpose(1, 2)
+    patches = patches.reshape(data.shape[0], -1, 3, p, p)
+    rgb_mean = patches.mean(dim=(-2, -1))
+    rgb_std = patches.flatten(-2).std(dim=-1, unbiased=False)
+    luminance = patches.mean(dim=2)
+    dx = luminance[..., :, 1:] - luminance[..., :, :-1]
+    dy = luminance[..., 1:, :] - luminance[..., :-1, :]
+    edge_x = dx.abs().mean(dim=(-2, -1)).unsqueeze(-1)
+    edge_y = dy.abs().mean(dim=(-2, -1)).unsqueeze(-1)
+    mass = patches.pow(2).mean(dim=(2, 3, 4)).unsqueeze(-1)
+    contrast = luminance.flatten(-2).std(dim=-1, unbiased=False).unsqueeze(-1)
+    grid_h, grid_w = hp // p, wp // p
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1.0, 1.0, grid_h, device=data.device, dtype=data.dtype),
+        torch.linspace(-1.0, 1.0, grid_w, device=data.device, dtype=data.dtype),
+        indexing="ij")
+    coords = torch.stack((xx, yy), dim=-1).reshape(1, -1, 2)
+    coords = coords.expand(data.shape[0], -1, -1)
+    return torch.cat(
+        (rgb_mean, rgb_std, edge_x, edge_y, mass, contrast, coords), dim=-1)
 
 
 class PatchVisionEncoder(nn.Module):
@@ -71,6 +147,18 @@ class VisionUnderstandingModel(nn.Module):
         self.encoder = PatchVisionEncoder(patch=patch, dim=dim, max_tokens=max_tokens)
         self.concepts = LatentConceptHead(slots=slots, d=dim, heads=heads,
                                           mixer_layers=layers)
+        self.patch_structure = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, PATCH_STRUCTURE_DIM),
+        )
+        self.global_physics = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, GLOBAL_PHYSICS_DIM),
+        )
 
     def forward(self, x, project=False, return_tokens=False):
         tokens = self.encoder(x)
@@ -78,6 +166,12 @@ class VisionUnderstandingModel(nn.Module):
         if return_tokens:
             return slots, tokens
         return slots
+
+    def patch_structure_prediction(self, tokens):
+        return self.patch_structure(tokens)
+
+    def global_physics_prediction(self, slots):
+        return self.global_physics(slots.mean(dim=1))
 
 
 class EmbeddingAligner(nn.Module):
@@ -190,6 +284,8 @@ def train_vision_understanding(
         relation_decay=0.99,
         association_w=0.05,
         composition_w=0.02,
+        structure_w=0.1,
+        physics_w=0.1,
         text_align_w=0.0,
         image_align_w=0.0,
         align_embed_dim=128,
@@ -212,6 +308,8 @@ def train_vision_understanding(
             "memory_balance_w": memory_balance_w,
             "association_w": association_w,
             "composition_w": composition_w,
+            "structure_w": structure_w,
+            "physics_w": physics_w,
             "text_align_w": text_align_w,
             "image_align_w": image_align_w,
     }.items():
@@ -261,8 +359,8 @@ def train_vision_understanding(
         ], dim=0)
 
         opt.zero_grad(set_to_none=True)
-        slots1 = model(x1)
-        slots2 = model(x2)
+        slots1, tokens1 = model(x1, return_tokens=True)
+        slots2, tokens2 = model(x2, return_tokens=True)
         view_loss = latent_concept_vicreg_loss(
             slots1, slots2, invariance_weight=1.0,
             variance_weight=1.0, covariance_weight=0.05, variance_target=0.25)
@@ -285,6 +383,32 @@ def train_vision_understanding(
             "association_loss": assoc_loss.detach(),
             "composition_loss": comp_loss.detach(),
         }
+        if structure_w > 0.0:
+            target1 = patch_structure_targets(x1, patch=patch)
+            target2 = patch_structure_targets(x2, patch=patch)
+            pred1 = model.patch_structure_prediction(tokens1)
+            pred2 = model.patch_structure_prediction(tokens2)
+            structure_loss = 0.5 * (
+                F.smooth_l1_loss(pred1, target1)
+                + F.smooth_l1_loss(pred2, target2)
+            )
+            loss = loss + float(structure_w) * structure_loss
+            parts["structure_loss"] = structure_loss.detach()
+            parts["structure_pred_abs_mean"] = pred1.detach().abs().mean()
+            parts["structure_target_abs_mean"] = target1.detach().abs().mean()
+        if physics_w > 0.0:
+            target1 = visual_physics_moments(x1)
+            target2 = visual_physics_moments(x2)
+            pred1 = model.global_physics_prediction(slots1)
+            pred2 = model.global_physics_prediction(slots2)
+            physics_loss = 0.5 * (
+                F.smooth_l1_loss(pred1, target1)
+                + F.smooth_l1_loss(pred2, target2)
+            )
+            loss = loss + float(physics_w) * physics_loss
+            parts["physics_loss"] = physics_loss.detach()
+            parts["physics_pred_abs_mean"] = pred1.detach().abs().mean()
+            parts["physics_target_abs_mean"] = target1.detach().abs().mean()
         if text_aligner is not None:
             target = _embedding_tensor(chosen, "text_embedding", device)
             text_loss, text_parts = _alignment_loss(
@@ -344,6 +468,10 @@ def train_vision_understanding(
         "memory_w": float(memory_w),
         "association_w": float(association_w),
         "composition_w": float(composition_w),
+        "structure_w": float(structure_w),
+        "physics_w": float(physics_w),
+        "patch_structure_dim": int(PATCH_STRUCTURE_DIM),
+        "global_physics_dim": int(GLOBAL_PHYSICS_DIM),
         "text_align_w": float(text_align_w),
         "image_align_w": float(image_align_w),
         "text_embedding_in_dim": int(text_dim),
@@ -413,6 +541,10 @@ def selftest():
         assert report["concept_memory_filled"] > 0
         assert report["concept_relation_updates"] > 0
         assert "view_loss" in report["last"]
+        assert "structure_loss" in report["last"]
+        assert "physics_loss" in report["last"]
+        assert report["patch_structure_dim"] == PATCH_STRUCTURE_DIM
+        assert report["global_physics_dim"] == GLOBAL_PHYSICS_DIM
         assert "self_learning_novelty_mean" in report["last"]
         assert int(memory.filled.detach().cpu()) == report["concept_memory_filled"]
     print("vision_understanding selftest OK")
@@ -458,6 +590,10 @@ def main(argv=None):
                     dest="association_w")
     ap.add_argument("--composition-w", type=float, default=0.02,
                     dest="composition_w")
+    ap.add_argument("--structure-w", type=float, default=0.1, dest="structure_w",
+                    help="self-supervised local patch structure prediction weight")
+    ap.add_argument("--physics-w", type=float, default=0.1, dest="physics_w",
+                    help="self-supervised global visual mass/edge moment prediction weight")
     ap.add_argument("--text-align-w", type=float, default=0.0, dest="text_align_w")
     ap.add_argument("--image-align-w", type=float, default=0.0, dest="image_align_w")
     ap.add_argument("--align-embed-dim", type=int, default=128,
@@ -478,6 +614,8 @@ def main(argv=None):
         ap.error("--max-records must be non-negative")
     if args.hflip_prob < 0.0 or args.hflip_prob > 1.0:
         ap.error("--hflip-prob must be in [0, 1]")
+    if args.structure_w < 0.0 or args.physics_w < 0.0:
+        ap.error("visual structure/physics weights must be non-negative")
     try:
         size = int(args.size) if "x" not in str(args.size).lower() else tuple(
             int(x) for x in str(args.size).lower().split("x", 1))
@@ -495,6 +633,7 @@ def main(argv=None):
         memory_balance_w=args.memory_balance_w,
         memory_momentum=args.memory_momentum, relation_decay=args.relation_decay,
         association_w=args.association_w, composition_w=args.composition_w,
+        structure_w=args.structure_w, physics_w=args.physics_w,
         text_align_w=args.text_align_w, image_align_w=args.image_align_w,
         align_embed_dim=args.align_embed_dim,
         align_temperature=args.align_temperature, report_out=args.report_out,

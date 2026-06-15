@@ -459,6 +459,23 @@ def apply_image_quality_preset(args):
         args.image_embed_text_sequence_model = "google-t5/t5-large"
     args.image_embed_text_sequence_max_length = max(
         int(args.image_embed_text_sequence_max_length), 192 if hq else 128)
+    args.vision_understanding = True
+    if str(args.vision_understanding_size).strip() == "128":
+        args.vision_understanding_size = "512" if hq else "256"
+    args.vision_understanding_dim = max(
+        int(args.vision_understanding_dim), 256 if hq else 128)
+    args.vision_understanding_slots = max(
+        int(args.vision_understanding_slots), 16 if hq else 8)
+    args.vision_understanding_layers = max(
+        int(args.vision_understanding_layers), 2 if hq else 1)
+    args.vision_understanding_memory_size = max(
+        int(args.vision_understanding_memory_size), 4096 if hq else 2048)
+    args.vision_understanding_structure_w = max(
+        float(args.vision_understanding_structure_w), 0.1)
+    args.vision_understanding_physics_w = max(
+        float(args.vision_understanding_physics_w), 0.1)
+    args.vision_understanding_image_align_w = max(
+        float(args.vision_understanding_image_align_w), 0.05)
     args.image_latent = True
     args.image_cond_mode = "text"
     args.image_caption_cond_source = "auto"
@@ -684,6 +701,8 @@ def apply_image_quality_preset(args):
     if not args.image_sample_reference_manifest_out:
         args.image_sample_reference_manifest_out = path_with_suffix(
             args.image_sample_reference_grid_out, "_manifest.jsonl")
+    args.image_reference_eval = True
+    args.image_reference_eval_size = max(int(args.image_reference_eval_size), 256 if hq else 128)
     if not str(args.image_sample_reference_denoise_strengths or "").strip():
         args.image_sample_reference_denoise_strengths = (
             "1.0,0.75,0.5,0.25,0.0" if hq else "1.0,0.5,0.25,0.0")
@@ -975,6 +994,8 @@ def payload(args):
                   f"--memory-w {args.vision_understanding_memory_w} "
                   f"--association-w {args.vision_understanding_association_w} "
                   f"--composition-w {args.vision_understanding_composition_w} "
+                  f"--structure-w {args.vision_understanding_structure_w} "
+                  f"--physics-w {args.vision_understanding_physics_w} "
                   f"--text-align-w {args.vision_understanding_text_align_w} "
                   f"--image-align-w {args.vision_understanding_image_align_w} "
                   f"--device cuda "
@@ -1422,6 +1443,43 @@ def payload(args):
                 if args.image_sample_reference_grid:
                     eval_cmd += reference_grid_args
                 train += eval_cmd
+            if (args.image_reference_eval
+                    and args.image_sample_reference_grid
+                    and args.image_sample_reference_manifest_out):
+                IREF_EVAL = mod("thinking.image_reproduction_eval")
+                reference_eval_report = (
+                    args.image_reference_eval_report_out
+                    or path_with_suffix(
+                        args.image_sample_reference_manifest_out, "_eval_report.json")
+                )
+                reference_eval = (
+                    f" && {IREF_EVAL} "
+                    f"--manifest {shlex_quote(args.image_sample_reference_manifest_out)} "
+                    f"--size {args.image_reference_eval_size} "
+                    f"--max-records {args.image_reference_eval_max_records} "
+                    f"--report-out {shlex_quote(reference_eval_report)}"
+                )
+                for flag, value in (
+                        ("max-pixel-mse", args.image_sample_reference_max_pixel_mse),
+                        ("max-pixel-mae", args.image_sample_reference_max_pixel_mae),
+                        ("max-structure-edge-l1",
+                         args.image_sample_reference_max_structure_edge_l1),
+                        ("max-structure-multiscale-l1",
+                         args.image_sample_reference_max_structure_multiscale_l1),
+                        ("max-structure-frequency-l1",
+                         args.image_sample_reference_max_structure_frequency_l1),
+                        ("max-structure-ssim-loss",
+                         args.image_sample_reference_max_structure_ssim_loss),
+                        ("max-texture-stats-l1",
+                         args.image_sample_reference_max_texture_stats_l1),
+                        ("max-physics-l1", args.image_sample_reference_max_physics_l1),
+                        ("max-selected-score",
+                         args.image_sample_reference_max_selected_score)):
+                    if value is not None:
+                        reference_eval += f" --{flag} {value}"
+                if args.image_reference_eval_fail_on_gate:
+                    reference_eval += " --fail-on-gate"
+                train += reference_eval
             if args.image_eval_generated:
                 IEVAL = mod("thinking.image_eval")
                 IGEN_EMBED = mod("thinking.image_embed")
@@ -2368,6 +2426,12 @@ def main():
     ap.add_argument("--vision-understanding-composition-w", type=float, default=0.02,
                     dest="vision_understanding_composition_w",
                     help="self-mined concept composition loss weight")
+    ap.add_argument("--vision-understanding-structure-w", type=float, default=0.1,
+                    dest="vision_understanding_structure_w",
+                    help="local patch structure prediction loss weight")
+    ap.add_argument("--vision-understanding-physics-w", type=float, default=0.1,
+                    dest="vision_understanding_physics_w",
+                    help="global visual mass/edge moment prediction loss weight")
     ap.add_argument("--vision-understanding-text-align-w", type=float, default=0.0,
                     dest="vision_understanding_text_align_w",
                     help="optional text_embedding alignment weight")
@@ -3099,6 +3163,23 @@ def main():
                     dest="image_sample_reference_image_dir",
                     help=("optional image directory for "
                           "--image-sample-reference-manifest-out"))
+    ap.add_argument("--image-reference-eval", action="store_true",
+                    dest="image_reference_eval",
+                    help=("score --image-sample-reference-manifest-out with paired "
+                          "pixel/structure/physics reproduction metrics"))
+    ap.add_argument("--image-reference-eval-report-out", default="",
+                    dest="image_reference_eval_report_out",
+                    help=("optional report path for paired reference reproduction eval; "
+                          "default derives from --image-sample-reference-manifest-out"))
+    ap.add_argument("--image-reference-eval-size", type=int, default=64,
+                    dest="image_reference_eval_size",
+                    help="image size for paired reference reproduction eval")
+    ap.add_argument("--image-reference-eval-max-records", type=int, default=0,
+                    dest="image_reference_eval_max_records",
+                    help="maximum paired reference reproductions to score; 0 means all")
+    ap.add_argument("--image-reference-eval-fail-on-gate", action="store_true",
+                    dest="image_reference_eval_fail_on_gate",
+                    help="fail the RunPod job if paired reference reproduction gates fail")
     ap.add_argument("--image-sample-reference-manifest", default="",
                     dest="image_sample_reference_manifest",
                     help=("optional reference manifest for image reproduction grid; "
@@ -4561,6 +4642,16 @@ def main():
         sys.exit(
             "ERROR: --image-sample-reference-image-dir requires "
             "--image-sample-reference-manifest-out")
+    if args.image_reference_eval and not args.image_sample_reference_grid:
+        sys.exit("ERROR: --image-reference-eval requires --image-sample-reference-grid")
+    if args.image_reference_eval and not args.image_sample_reference_manifest_out:
+        sys.exit(
+            "ERROR: --image-reference-eval requires "
+            "--image-sample-reference-manifest-out")
+    if args.image_reference_eval_size <= 0:
+        sys.exit("ERROR: --image-reference-eval-size must be positive")
+    if args.image_reference_eval_max_records < 0:
+        sys.exit("ERROR: --image-reference-eval-max-records must be non-negative")
     if args.image_sample_reference_grid and not args.image_flow_self_condition:
         sys.exit(
             "ERROR: --image-sample-reference-grid requires "
@@ -4869,6 +4960,8 @@ def main():
         if (args.vision_understanding_memory_w < 0.0
                 or args.vision_understanding_association_w < 0.0
                 or args.vision_understanding_composition_w < 0.0
+                or args.vision_understanding_structure_w < 0.0
+                or args.vision_understanding_physics_w < 0.0
                 or args.vision_understanding_text_align_w < 0.0
                 or args.vision_understanding_image_align_w < 0.0):
             sys.exit("ERROR: vision understanding loss weights must be non-negative")
