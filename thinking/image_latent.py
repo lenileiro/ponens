@@ -6414,6 +6414,40 @@ def image_quality_guidance_step(scorer, z, weight=0.0, step_size=1.0, eps=1.0e-6
     return guided.detach()
 
 
+def decoded_visual_detail_scores(decoded, patch=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE):
+    patch = int(patch)
+    if patch <= 0:
+        raise ValueError("visual detail guidance patch size must be positive")
+    desc = visual_patch_structure_targets(decoded, patch=patch)
+    channels = int(decoded.shape[1])
+    color_end = channels * 2
+    edge = desc[..., color_end:color_end + 2].mean(dim=(-1, -2))
+    contrast = desc[..., color_end + 2].mean(dim=-1)
+    detail = desc[..., color_end + 3].mean(dim=-1)
+    variation = desc[..., color_end + 3].std(dim=-1, unbiased=False)
+    return 0.35 * detail + 0.25 * contrast + 0.25 * edge + 0.15 * variation
+
+
+def decoded_visual_detail_guidance_step(
+        ae, z, weight=0.0, step_size=1.0,
+        patch=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE, eps=1.0e-6):
+    """Sampling-time latent guidance toward generic decoded local detail."""
+    if weight <= 0.0:
+        return z, z.new_zeros((int(z.shape[0]),), dtype=torch.float32)
+    if ae is None:
+        raise ValueError("visual detail guidance requires an autoencoder")
+    z_var = z.detach().requires_grad_(True)
+    with torch.enable_grad():
+        decoded = ae.decode(z_var)
+        scores = decoded_visual_detail_scores(decoded, patch=patch)
+        objective = scores.sum()
+        grad = torch.autograd.grad(objective, z_var, allow_unused=False)[0]
+    flat = grad.flatten(1)
+    denom = flat.norm(dim=1).view((-1,) + (1,) * (grad.ndim - 1)).clamp_min(float(eps))
+    guided = z_var + float(weight) * abs(float(step_size)) * grad / denom
+    return guided.detach(), scores.detach().float()
+
+
 def couple_flow_noise_to_data(x0, z1, mode="random", projections=1, eps=1.0e-8):
     mode = str(mode)
     if mode not in FLOW_NOISE_COUPLINGS:
@@ -7889,6 +7923,9 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                    feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                    quality_guidance_w=0.0, quality_guidance_scorer=None,
                    quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                   visual_detail_guidance_w=0.0,
+                   visual_detail_guidance_patch=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE,
+                   visual_detail_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                    sample_finite_guard=False, sample_velocity_clip=0.0,
                    sample_latent_clip=0.0, cfg_mode="standard",
                    reference_latent=None, reference_denoise_strength=1.0,
@@ -7969,6 +8006,14 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         raise ValueError("quality_guidance_w must be non-negative")
     if quality_guidance_w > 0.0 and quality_guidance_scorer is None:
         raise ValueError("quality guidance requires a checkpoint image_quality_scorer")
+    visual_detail_guidance_w = float(visual_detail_guidance_w)
+    visual_detail_guidance_patch = int(visual_detail_guidance_patch)
+    if visual_detail_guidance_w < 0.0:
+        raise ValueError("visual_detail_guidance_w must be non-negative")
+    if visual_detail_guidance_patch <= 0:
+        raise ValueError("visual_detail_guidance_patch must be positive")
+    if visual_detail_guidance_w > 0.0 and ae is None:
+        raise ValueError("visual detail guidance requires an autoencoder")
     if sample_method not in SAMPLE_METHODS:
         raise ValueError(f"unknown sample method {sample_method!r}")
     if sample_schedule not in SAMPLE_SCHEDULES:
@@ -7997,6 +8042,8 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
         feature_guidance_interval, name="feature_guidance_interval")
     quality_guidance_interval = validate_guidance_interval(
         quality_guidance_interval, name="quality_guidance_interval")
+    visual_detail_guidance_interval = validate_guidance_interval(
+        visual_detail_guidance_interval, name="visual_detail_guidance_interval")
     schedule = flow_time_schedule(
         steps, device=device, shift=sample_time_shift, schedule=sample_schedule)
     schedule = flow_time_schedule_window(schedule, start_t=reference_start_t, end_t=1.0)
@@ -8013,6 +8060,10 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
     trace["sample_trace_reference_start_t"] = float(reference_start_t)
     trace["sample_trace_self_condition_updates"] = 0
     trace["sample_trace_self_condition_rollbacks"] = 0
+    trace["sample_trace_visual_detail_guidance_w"] = float(visual_detail_guidance_w)
+    trace["sample_trace_visual_detail_guidance_patch"] = int(visual_detail_guidance_patch)
+    trace["sample_trace_visual_detail_guidance_steps"] = 0
+    trace["sample_trace_visual_detail_guidance_score_mean"] = 0.0
     update_sample_trace(trace, "latent", z)
 
     def stabilize_latent(z_in):
@@ -8225,6 +8276,21 @@ def sample_latents(flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV, se
                 weight=quality_guidance_w, step_size=dt)
             z = normalize_latent(z_raw, latent_stats)
             z = stabilize_latent(z)
+        if (visual_detail_guidance_w > 0.0
+                and interval_active(t_scalar, visual_detail_guidance_interval)):
+            z_raw = denormalize_latent(z, latent_stats)
+            z_raw, detail_scores = decoded_visual_detail_guidance_step(
+                ae, z_raw, weight=visual_detail_guidance_w, step_size=dt,
+                patch=visual_detail_guidance_patch)
+            z = normalize_latent(z_raw, latent_stats)
+            z = stabilize_latent(z)
+            count = int(trace.get("sample_trace_visual_detail_guidance_steps", 0))
+            prev = float(trace.get("sample_trace_visual_detail_guidance_score_mean", 0.0))
+            score = float(detail_scores.mean().detach().cpu())
+            trace["sample_trace_visual_detail_guidance_score_mean"] = (
+                (prev * count + score) / float(count + 1)
+            )
+            trace["sample_trace_visual_detail_guidance_steps"] = count + 1
     final_stats = sampler_tensor_stats(z)
     trace.update({
         "sample_trace_final_latent_finite_frac": final_stats["finite_frac"],
@@ -8253,6 +8319,9 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
                   feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                   quality_guidance_w=0.0, quality_guidance_scorer=None,
                   quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                  visual_detail_guidance_w=0.0,
+                  visual_detail_guidance_patch=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE,
+                  visual_detail_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                   sample_finite_guard=False, sample_velocity_clip=0.0,
                   sample_latent_clip=0.0, cfg_mode="standard",
                   sample_pixel_dynamic_threshold_percentile=0.0,
@@ -8279,6 +8348,9 @@ def sample_images(ae, flow, cond, latent_shape=(16, 8, 8), steps=16, device=DEV,
         quality_guidance_w=quality_guidance_w,
         quality_guidance_scorer=quality_guidance_scorer,
         quality_guidance_interval=quality_guidance_interval,
+        visual_detail_guidance_w=visual_detail_guidance_w,
+        visual_detail_guidance_patch=visual_detail_guidance_patch,
+        visual_detail_guidance_interval=visual_detail_guidance_interval,
         sample_finite_guard=sample_finite_guard,
         sample_velocity_clip=sample_velocity_clip,
         sample_latent_clip=sample_latent_clip,
@@ -9184,6 +9256,9 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
                              sample_latent_clip=0.0, cfg_mode="standard",
                              sample_pixel_dynamic_threshold_percentile=0.0,
                              sample_pixel_dynamic_threshold_max=1.0,
+                             visual_detail_guidance_w=0.0,
+                             visual_detail_guidance_patch=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE,
+                             visual_detail_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                              sample_manifest_out="", sample_image_dir=""):
     ae.eval()
     flow.eval()
@@ -9207,6 +9282,9 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
         sample_schedule=sample_schedule,
         sample_churn=sample_churn,
         sample_churn_interval=sample_churn_interval,
+        visual_detail_guidance_w=visual_detail_guidance_w,
+        visual_detail_guidance_patch=visual_detail_guidance_patch,
+        visual_detail_guidance_interval=visual_detail_guidance_interval,
         sample_finite_guard=sample_finite_guard,
         sample_velocity_clip=sample_velocity_clip,
         sample_latent_clip=sample_latent_clip,
@@ -9232,6 +9310,12 @@ def save_caption_sample_grid(ae, flow, records, path, size=32, device=DEV, condi
             sample_pixel_dynamic_threshold_percentile),
         "sample_grid_pixel_dynamic_threshold_max": float(
             sample_pixel_dynamic_threshold_max),
+        "sample_grid_visual_detail_guidance_w": float(visual_detail_guidance_w),
+        "sample_grid_visual_detail_guidance_patch": int(visual_detail_guidance_patch),
+        "sample_grid_visual_detail_guidance_interval": list(
+            validate_guidance_interval(
+                visual_detail_guidance_interval,
+                name="visual_detail_guidance_interval")),
         "sample_grid_sample_churn_interval": list(validate_guidance_interval(
             sample_churn_interval, name="sample_churn_interval")),
         "sample_grid_cfg_interval": list(validate_guidance_interval(cfg_interval)),
@@ -9481,6 +9565,11 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
                                  sample_latent_clip=0.0, cfg_mode="standard",
                                  sample_pixel_dynamic_threshold_percentile=0.0,
                                  sample_pixel_dynamic_threshold_max=1.0,
+                                 visual_detail_guidance_w=0.0,
+                                 visual_detail_guidance_patch=(
+                                     DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE),
+                                 visual_detail_guidance_interval=(
+                                     DEFAULT_GUIDANCE_INTERVAL),
                                  sample_manifest_out="", sample_image_dir="",
                                  sample_candidates_manifest_out="",
                                  sample_candidates_image_dir="",
@@ -9585,6 +9674,9 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
             quality_guidance_w=quality_guidance_w,
             quality_guidance_scorer=quality_scorer,
             quality_guidance_interval=quality_guidance_interval,
+            visual_detail_guidance_w=visual_detail_guidance_w,
+            visual_detail_guidance_patch=visual_detail_guidance_patch,
+            visual_detail_guidance_interval=visual_detail_guidance_interval,
             sample_finite_guard=sample_finite_guard,
             sample_velocity_clip=sample_velocity_clip,
             sample_latent_clip=sample_latent_clip,
@@ -9665,6 +9757,12 @@ def save_text_prompt_sample_grid(ae, flow, prompts, path, size=32, device=DEV, c
         "sample_grid_quality_guidance_scorer": (
             "image_quality_scorer" if quality_guidance_w > 0.0 else "none"
         ),
+        "sample_grid_visual_detail_guidance_w": float(visual_detail_guidance_w),
+        "sample_grid_visual_detail_guidance_patch": int(visual_detail_guidance_patch),
+        "sample_grid_visual_detail_guidance_interval": list(
+            validate_guidance_interval(
+                visual_detail_guidance_interval,
+                name="visual_detail_guidance_interval")),
         "sample_grid_cond_mode": "prompt",
         "sample_grid_caption_cond_source": caption_cond_source,
         "sample_grid_cfg_uncond_mode": (
@@ -9907,6 +10005,9 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
                            feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                            quality_guidance_w=0.0,
                            quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                           visual_detail_guidance_w=0.0,
+                           visual_detail_guidance_patch=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE,
+                           visual_detail_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                            generated_eval_n=0, generated_eval_candidates_per_prompt=1,
                            sample_selection_text_w=1.0,
                            sample_selection_feature_w=1.0,
@@ -9921,6 +10022,8 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
     ae.eval()
     flow.eval()
     recon_losses, flow_losses = [], []
+    recon_metric_sums = defaultdict(float)
+    recon_metric_weight = 0
     endpoint_mses, endpoint_consistency_mses, endpoint_time_gaps = [], [], []
     latent_means, latent_stds = [], []
     align_losses, align_i2t, align_t2i = [], [], []
@@ -9934,6 +10037,14 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         feature_guidance_interval, name="feature_guidance_interval")
     quality_guidance_interval = validate_guidance_interval(
         quality_guidance_interval, name="quality_guidance_interval")
+    visual_detail_guidance_w = float(visual_detail_guidance_w)
+    visual_detail_guidance_patch = int(visual_detail_guidance_patch)
+    if visual_detail_guidance_w < 0.0:
+        raise ValueError("visual_detail_guidance_w must be non-negative")
+    if visual_detail_guidance_patch <= 0:
+        raise ValueError("visual_detail_guidance_patch must be positive")
+    visual_detail_guidance_interval = validate_guidance_interval(
+        visual_detail_guidance_interval, name="visual_detail_guidance_interval")
     generated_eval_n = int(generated_eval_n)
     if generated_eval_n < 0:
         raise ValueError("generated_eval_n must be non-negative")
@@ -9979,7 +10090,17 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
             records, rng, batch=b, size=size, device=device, return_records=True)
         out = ae(x)
         z = out["latent"]
-        recon_losses.append(float(F.mse_loss(out["recon"], x).detach().cpu()))
+        recon = out["recon"].clamp(-1.0, 1.0)
+        recon_losses.append(float(F.mse_loss(recon, x).detach().cpu()))
+        recon_metrics = image_reproduction_metrics(
+            x, recon, prefix="autoencoder_recon")
+        recon_score = image_reproduction_score(
+            recon_metrics, prefix="autoencoder_recon")
+        for key, value in recon_metrics.items():
+            if isinstance(value, (int, float)) and np.isfinite(float(value)):
+                recon_metric_sums[key] += float(value) * int(b)
+        recon_metric_sums["autoencoder_recon_score"] += float(recon_score) * int(b)
+        recon_metric_weight += int(b)
         cond = caption_record_condition(
             captions, chosen_records, conditioner, prompt_vocab, source=caption_cond_source,
             max_len=caption_max_len, device=device, return_tokens=flow_uses_cond_tokens(flow))
@@ -10090,6 +10211,9 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
             quality_guidance_w=quality_guidance_w,
             quality_guidance_scorer=image_quality_scorer,
             quality_guidance_interval=quality_guidance_interval,
+            visual_detail_guidance_w=visual_detail_guidance_w,
+            visual_detail_guidance_patch=visual_detail_guidance_patch,
+            visual_detail_guidance_interval=visual_detail_guidance_interval,
             sample_finite_guard=sample_finite_guard,
             sample_velocity_clip=sample_velocity_clip,
             sample_latent_clip=sample_latent_clip,
@@ -10182,11 +10306,19 @@ def evaluate_image_records(ae, flow, records, n=128, batch=64, seed=10, size=32,
         "feature_guidance_interval": list(feature_guidance_interval),
         "quality_guidance_w": float(quality_guidance_w),
         "quality_guidance_interval": list(quality_guidance_interval),
+        "visual_detail_guidance_w": float(visual_detail_guidance_w),
+        "visual_detail_guidance_patch": int(visual_detail_guidance_patch),
+        "visual_detail_guidance_interval": list(visual_detail_guidance_interval),
         "cond_mode": "text",
         "caption_cond_source": caption_cond_source,
         "data_mode": "image_manifest",
         "eval_captions": sample_captions[:min(3, len(sample_captions))],
     }
+    if recon_metric_weight > 0:
+        report.update({
+            key: float(value) / float(recon_metric_weight)
+            for key, value in recon_metric_sums.items()
+        })
     report.update(sample_trace)
     report.update(sample_health_metrics(sample))
     for key, values in selection_component_scores.items():
@@ -10900,6 +11032,9 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                        feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                        quality_guidance_weights=(0.0,),
                        quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                       visual_detail_guidance_w=0.0,
+                       visual_detail_guidance_patch=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE,
+                       visual_detail_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                        generated_eval_n=0, generated_eval_candidates_per_prompt=1,
                        sample_selection_text_w=1.0,
                        sample_selection_feature_w=1.0,
@@ -10934,6 +11069,14 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
     text_guidance_weights = tuple(float(x) for x in (text_guidance_weights or (0.0,)))
     feature_guidance_weights = tuple(float(x) for x in (feature_guidance_weights or (0.0,)))
     quality_guidance_weights = tuple(float(x) for x in (quality_guidance_weights or (0.0,)))
+    visual_detail_guidance_w = float(visual_detail_guidance_w)
+    visual_detail_guidance_patch = int(visual_detail_guidance_patch)
+    if visual_detail_guidance_w < 0.0:
+        raise ValueError("visual_detail_guidance_w must be non-negative")
+    if visual_detail_guidance_patch <= 0:
+        raise ValueError("visual_detail_guidance_patch must be positive")
+    visual_detail_guidance_interval = validate_guidance_interval(
+        visual_detail_guidance_interval, name="visual_detail_guidance_interval")
     generated_eval_candidates_per_prompt = int(generated_eval_candidates_per_prompt)
     if generated_eval_candidates_per_prompt <= 0:
         raise ValueError("generated_eval_candidates_per_prompt must be positive")
@@ -10992,6 +11135,12 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                                                     quality_guidance_w=float(quality_w),
                                                     quality_guidance_interval=(
                                                         quality_guidance_interval),
+                                                    visual_detail_guidance_w=(
+                                                        visual_detail_guidance_w),
+                                                    visual_detail_guidance_patch=(
+                                                        visual_detail_guidance_patch),
+                                                    visual_detail_guidance_interval=(
+                                                        visual_detail_guidance_interval),
                                                     generated_eval_n=generated_eval_n,
                                                     generated_eval_candidates_per_prompt=(
                                                         generated_eval_candidates_per_prompt),
@@ -11031,6 +11180,8 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                                                     f"text={float(text_w):g};"
                                                     f"feature={float(feature_w):g};"
                                                     f"quality={float(quality_w):g};"
+                                                    f"detail={float(visual_detail_guidance_w):g};"
+                                                    f"detailpatch={int(visual_detail_guidance_patch)};"
                                                     f"select_text="
                                                     f"{float(sample_selection_text_w):g};"
                                                     f"select_feature="
@@ -11049,7 +11200,9 @@ def image_record_sweep(ae, flow, records, cfg_scales=(1.0, 1.5), sample_steps_li
                                                     f"featureint="
                                                     f"{format_interval(feature_guidance_interval)};"
                                                     f"qualityint="
-                                                    f"{format_interval(quality_guidance_interval)}"
+                                                    f"{format_interval(quality_guidance_interval)};"
+                                                    f"detailint="
+                                                    f"{format_interval(visual_detail_guidance_interval)}"
                                                 )
                                                 rows.append(row)
     return rows
@@ -11127,6 +11280,8 @@ SWEEP_METRICS = (
     "sample_trace_finite_guard_events",
     "sample_trace_velocity_clip_events",
     "sample_trace_latent_clip_events",
+    "sample_trace_visual_detail_guidance_steps",
+    "sample_trace_visual_detail_guidance_score_mean",
     "sample_trace_max_velocity_rms",
     "sample_trace_max_velocity_abs",
     "sample_trace_max_latent_rms",
@@ -11142,6 +11297,16 @@ SWEEP_METRICS = (
     "sample_collapsed_frac",
     "sample_health_score",
     "recon_mse",
+    "autoencoder_recon_score",
+    "autoencoder_recon_pixel_mse",
+    "autoencoder_recon_pixel_mae",
+    "autoencoder_recon_structure_edge_l1",
+    "autoencoder_recon_structure_multiscale_l1",
+    "autoencoder_recon_structure_frequency_l1",
+    "autoencoder_recon_structure_ssim_loss",
+    "autoencoder_recon_patch_structure_l1",
+    "autoencoder_recon_texture_stats_l1",
+    "autoencoder_recon_physics_l1",
     "latent_velocity_mse",
     "latent_endpoint_mse",
     "latent_endpoint_consistency_mse",
@@ -11263,9 +11428,12 @@ def eval_report_summary(report):
         "text_guidance_interval",
         "feature_guidance_w",
         "feature_guidance_interval",
-        "quality_guidance_w",
-        "quality_guidance_interval",
-        "caption_sample_mse",
+    "quality_guidance_w",
+    "quality_guidance_interval",
+    "visual_detail_guidance_w",
+    "visual_detail_guidance_patch",
+    "visual_detail_guidance_interval",
+    "caption_sample_mse",
         "caption_retrieval_i2t_acc",
         "caption_retrieval_t2i_acc",
         "generated_caption_retrieval_i2t_acc",
@@ -11321,6 +11489,10 @@ def eval_report_summary(report):
         "sample_trace_finite_guard_events",
         "sample_trace_velocity_clip_events",
         "sample_trace_latent_clip_events",
+        "sample_trace_visual_detail_guidance_w",
+        "sample_trace_visual_detail_guidance_patch",
+        "sample_trace_visual_detail_guidance_steps",
+        "sample_trace_visual_detail_guidance_score_mean",
         "sample_trace_max_velocity_rms",
         "sample_trace_max_velocity_abs",
         "sample_trace_max_latent_rms",
@@ -11367,6 +11539,11 @@ def aggregate_sweep_rows(rows):
                float(row.get("quality_guidance_w", 0.0)),
                tuple(float(x) for x in row.get("quality_guidance_interval",
                                                 DEFAULT_GUIDANCE_INTERVAL)),
+               float(row.get("visual_detail_guidance_w", 0.0)),
+               int(row.get("visual_detail_guidance_patch",
+                           DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE)),
+               tuple(float(x) for x in row.get("visual_detail_guidance_interval",
+                                                DEFAULT_GUIDANCE_INTERVAL)),
                int(row.get("generated_eval_candidates_per_prompt", 1)),
                float(row.get("generated_eval_selection_text_w", 1.0)),
                float(row.get("generated_eval_selection_feature_w", 1.0)),
@@ -11387,6 +11564,8 @@ def aggregate_sweep_rows(rows):
          text_guidance_w, text_guidance_interval,
          feature_guidance_w, feature_guidance_interval,
          quality_guidance_w, quality_guidance_interval,
+         visual_detail_guidance_w, visual_detail_guidance_patch,
+         visual_detail_guidance_interval,
          generated_eval_candidates_per_prompt,
          selection_text_w, selection_feature_w, selection_quality_w,
          selection_health_w, selection_patch_structure_w,
@@ -11403,6 +11582,8 @@ def aggregate_sweep_rows(rows):
                 f"text={text_guidance_w:g};"
                 f"feature={feature_guidance_w:g};"
                 f"quality={quality_guidance_w:g};"
+                f"detail={visual_detail_guidance_w:g};"
+                f"detailpatch={int(visual_detail_guidance_patch)};"
                 f"candidates={int(generated_eval_candidates_per_prompt)};"
                 f"select_text={selection_text_w:g};"
                 f"select_feature={selection_feature_w:g};"
@@ -11416,7 +11597,8 @@ def aggregate_sweep_rows(rows):
                 f"cfgint={format_interval(cfg_interval)};"
                 f"textint={format_interval(text_guidance_interval)};"
                 f"featureint={format_interval(feature_guidance_interval)};"
-                f"qualityint={format_interval(quality_guidance_interval)}"
+                f"qualityint={format_interval(quality_guidance_interval)};"
+                f"detailint={format_interval(visual_detail_guidance_interval)}"
             ),
             "cfg_scale": float(cfg_scale),
             "cfg_rescale": float(cfg_rescale),
@@ -11435,6 +11617,9 @@ def aggregate_sweep_rows(rows):
             "feature_guidance_interval": list(feature_guidance_interval),
             "quality_guidance_w": float(quality_guidance_w),
             "quality_guidance_interval": list(quality_guidance_interval),
+            "visual_detail_guidance_w": float(visual_detail_guidance_w),
+            "visual_detail_guidance_patch": int(visual_detail_guidance_patch),
+            "visual_detail_guidance_interval": list(visual_detail_guidance_interval),
             "generated_eval_candidates_per_prompt": int(
                 generated_eval_candidates_per_prompt),
             "generated_eval_selection_text_w": float(selection_text_w),
@@ -11481,6 +11666,9 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         feature_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                         quality_guidance_weights=(0.0,),
                         quality_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                        visual_detail_guidance_w=0.0,
+                        visual_detail_guidance_patch=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE,
+                        visual_detail_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                         eval_image_manifest="", eval_image_root="", eval_image_split="eval",
                         eval_image_min_aesthetic=None, eval_image_max_records=0,
                         sample_time_shift=None, generated_eval_n=0,
@@ -11532,6 +11720,14 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
         raise ValueError("feature guidance weights must be non-negative")
     if any(w < 0.0 for w in quality_guidance_weights):
         raise ValueError("quality guidance weights must be non-negative")
+    visual_detail_guidance_w = float(visual_detail_guidance_w)
+    visual_detail_guidance_patch = int(visual_detail_guidance_patch)
+    if visual_detail_guidance_w < 0.0:
+        raise ValueError("visual_detail_guidance_w must be non-negative")
+    if visual_detail_guidance_patch <= 0:
+        raise ValueError("visual_detail_guidance_patch must be positive")
+    visual_detail_guidance_interval = validate_guidance_interval(
+        visual_detail_guidance_interval, name="visual_detail_guidance_interval")
     if (sample_selection_text_w < 0.0 or sample_selection_feature_w < 0.0
             or sample_selection_quality_w < 0.0
             or sample_selection_health_w < 0.0
@@ -11601,6 +11797,9 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                     feature_guidance_interval=feature_guidance_interval,
                     quality_guidance_weights=quality_guidance_weights,
                     quality_guidance_interval=quality_guidance_interval,
+                    visual_detail_guidance_w=visual_detail_guidance_w,
+                    visual_detail_guidance_patch=visual_detail_guidance_patch,
+                    visual_detail_guidance_interval=visual_detail_guidance_interval,
                     generated_eval_n=generated_eval_n,
                     generated_eval_candidates_per_prompt=(
                         generated_eval_candidates_per_prompt),
@@ -11656,6 +11855,10 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             "quality_guidance_weights": [float(x) for x in quality_guidance_weights],
             "quality_guidance_interval": list(validate_guidance_interval(
                 quality_guidance_interval, name="quality_guidance_interval")),
+            "visual_detail_guidance_w": float(visual_detail_guidance_w),
+            "visual_detail_guidance_patch": int(visual_detail_guidance_patch),
+            "visual_detail_guidance_interval": list(
+                visual_detail_guidance_interval),
             "sample_selection_patch_structure_w": float(
                 sample_selection_patch_structure_w),
             "sample_selection_patch_structure_patch": int(
@@ -11855,6 +12058,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       sample_selection_patch_structure_w=0.0,
                       sample_selection_patch_structure_patch=(
                           DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE),
+                      visual_detail_guidance_w=0.0,
+                      visual_detail_guidance_patch=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE,
+                      visual_detail_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
                       train_precision="fp32", ae_accum_steps=1, flow_accum_steps=1,
                       grad_clip=0.0,
                       flow_cache_latents=False, flow_cache_records=0, flow_cache_batch=64,
@@ -12230,6 +12436,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("sample selection weights must be non-negative")
     if sample_selection_patch_structure_patch <= 0:
         raise ValueError("sample_selection_patch_structure_patch must be positive")
+    visual_detail_guidance_w = float(visual_detail_guidance_w)
+    visual_detail_guidance_patch = int(visual_detail_guidance_patch)
+    if visual_detail_guidance_w < 0.0:
+        raise ValueError("visual_detail_guidance_w must be non-negative")
+    if visual_detail_guidance_patch <= 0:
+        raise ValueError("visual_detail_guidance_patch must be positive")
+    visual_detail_guidance_interval = validate_guidance_interval(
+        visual_detail_guidance_interval, name="visual_detail_guidance_interval")
     cfg_interval = validate_guidance_interval(cfg_interval, name="cfg_interval")
     if dit_head_width_mult <= 0:
         raise ValueError("dit_head_width_mult must be positive")
@@ -13316,6 +13530,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             sample_selection_health_w=sample_selection_health_w,
             sample_selection_patch_structure_w=sample_selection_patch_structure_w,
             sample_selection_patch_structure_patch=sample_selection_patch_structure_patch,
+            visual_detail_guidance_w=visual_detail_guidance_w,
+            visual_detail_guidance_patch=visual_detail_guidance_patch,
+            visual_detail_guidance_interval=visual_detail_guidance_interval,
             sample_finite_guard=sample_finite_guard,
             sample_velocity_clip=sample_velocity_clip,
             sample_latent_clip=sample_latent_clip)
@@ -13601,6 +13818,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "sample_selection_health_w": float(sample_selection_health_w),
         "sample_selection_patch_structure_w": float(sample_selection_patch_structure_w),
         "sample_selection_patch_structure_patch": int(sample_selection_patch_structure_patch),
+        "visual_detail_guidance_w": float(visual_detail_guidance_w),
+        "visual_detail_guidance_patch": int(visual_detail_guidance_patch),
+        "visual_detail_guidance_interval": list(visual_detail_guidance_interval),
         "weight_eval_candidates": {
             mode: eval_report_summary(candidate)
             for mode, candidate in candidate_reports.items()
@@ -14056,6 +14276,9 @@ def selftest():
             def encode(self, x):
                 return x
 
+            def decode(self, x):
+                return x
+
         class _FlatQualityScorer:
             def eval(self):
                 return self
@@ -14093,6 +14316,15 @@ def selftest():
         partial_seed_settings = prompt_candidate_sampler_settings(
             4, seed=7, seeds=(11, 23))
         assert [s["seed"] for s in partial_seed_settings] == [11, 23, 104740, 104752]
+        detail_z = 0.1 * torch.randn(2, 3, 16, 16)
+        before_detail = decoded_visual_detail_scores(detail_z, patch=4).mean()
+        guided_detail_z, detail_scores = decoded_visual_detail_guidance_step(
+            _IdentityAE(), detail_z, weight=0.1, step_size=1.0, patch=4)
+        after_detail = decoded_visual_detail_scores(guided_detail_z, patch=4).mean()
+        assert tuple(guided_detail_z.shape) == tuple(detail_z.shape)
+        assert torch.isfinite(guided_detail_z).all()
+        assert torch.isfinite(detail_scores).all()
+        assert after_detail >= before_detail - 1.0e-6
         _patch_only_pixels, patch_only_meta = select_prompt_candidates(
             _IdentityAE(), candidate_pixels, None, ("prompt a", "prompt b"),
             candidates_per_prompt=2, quality_scorer=_FlatQualityScorer(),
@@ -14310,6 +14542,8 @@ def selftest():
         assert report["flow_distill_steps_run"] == 1
         assert report["flow_distill_teacher_used"] == "ema"
         assert "recon_mse" in report
+        assert "autoencoder_recon_score" in report
+        assert "autoencoder_recon_patch_structure_l1" in report
         assert conditioner is not None and vocab
         sample_path = os.path.join(td, "samples.ppm")
         meta = save_caption_sample_grid(
@@ -15282,6 +15516,18 @@ def main(argv=None):
                     dest="sample_quality_guidance_interval",
                     help=("quality guidance active interval over flow time, "
                           "formatted start,end"))
+    ap.add_argument("--sample-visual-detail-guidance-w", type=float, default=0.0,
+                    dest="sample_visual_detail_guidance_w",
+                    help=("sampling-time generic decoded visual-detail guidance "
+                          "weight; 0 disables"))
+    ap.add_argument("--sample-visual-detail-guidance-patch", type=int,
+                    default=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE,
+                    dest="sample_visual_detail_guidance_patch",
+                    help="patch size for --sample-visual-detail-guidance-w")
+    ap.add_argument("--sample-visual-detail-guidance-interval", default="0.0,1.0",
+                    dest="sample_visual_detail_guidance_interval",
+                    help=("visual-detail guidance active interval over flow time, "
+                          "formatted start,end"))
     ap.add_argument("--sample-min-finite-frac", type=float, default=None,
                     dest="sample_min_finite_frac",
                     help=("fail after --sample-grid-out if generated finite pixel "
@@ -15375,6 +15621,8 @@ def main(argv=None):
             args.sample_feature_guidance_interval)
         sample_quality_guidance_interval = _parse_interval(
             args.sample_quality_guidance_interval)
+        sample_visual_detail_guidance_interval = _parse_interval(
+            args.sample_visual_detail_guidance_interval)
         parse_source_weight_spec(args.image_source_weights)
         sample_schedules = (
             _parse_string_list(args.sample_schedules) if args.sample_schedules else None
@@ -15643,6 +15891,10 @@ def main(argv=None):
         ap.error("--sample-quality-guidance-w must be non-negative")
     if args.sample_quality_guidance_w > 0.0 and not sample_prompts:
         ap.error("--sample-quality-guidance-w requires --sample-prompts")
+    if args.sample_visual_detail_guidance_w < 0.0:
+        ap.error("--sample-visual-detail-guidance-w must be non-negative")
+    if args.sample_visual_detail_guidance_patch <= 0:
+        ap.error("--sample-visual-detail-guidance-patch must be positive")
     for gate_name in (
             "sample_min_finite_frac", "sample_max_nonfinite_frac",
             "sample_max_collapsed_frac"):
@@ -15715,6 +15967,9 @@ def main(argv=None):
             text_guidance_weights=eval_text_guidance_weights,
             feature_guidance_weights=eval_feature_guidance_weights,
             quality_guidance_weights=eval_quality_guidance_weights,
+            visual_detail_guidance_w=args.sample_visual_detail_guidance_w,
+            visual_detail_guidance_patch=args.sample_visual_detail_guidance_patch,
+            visual_detail_guidance_interval=sample_visual_detail_guidance_interval,
             eval_image_manifest=args.eval_image_manifest,
             eval_image_root=args.eval_image_root,
             eval_image_split=args.eval_image_split,
@@ -15806,6 +16061,10 @@ def main(argv=None):
                     feature_guidance_interval=sample_feature_guidance_interval,
                     quality_guidance_w=args.sample_quality_guidance_w,
                     quality_guidance_interval=sample_quality_guidance_interval,
+                    visual_detail_guidance_w=args.sample_visual_detail_guidance_w,
+                    visual_detail_guidance_patch=args.sample_visual_detail_guidance_patch,
+                    visual_detail_guidance_interval=(
+                        sample_visual_detail_guidance_interval),
                     sample_finite_guard=settings["sample_finite_guard"],
                     sample_velocity_clip=settings["sample_velocity_clip"],
                     sample_latent_clip=settings["sample_latent_clip"],
@@ -15848,6 +16107,10 @@ def main(argv=None):
                     sample_schedule=settings["sample_schedule"],
                     sample_churn=settings["sample_churn"],
                     sample_churn_interval=settings["sample_churn_interval"],
+                    visual_detail_guidance_w=args.sample_visual_detail_guidance_w,
+                    visual_detail_guidance_patch=args.sample_visual_detail_guidance_patch,
+                    visual_detail_guidance_interval=(
+                        sample_visual_detail_guidance_interval),
                     sample_finite_guard=settings["sample_finite_guard"],
                     sample_velocity_clip=settings["sample_velocity_clip"],
                     sample_latent_clip=settings["sample_latent_clip"],
@@ -16140,6 +16403,9 @@ def main(argv=None):
         sample_selection_health_w=args.sample_selection_health_w,
         sample_selection_patch_structure_w=args.sample_selection_patch_structure_w,
         sample_selection_patch_structure_patch=args.sample_selection_patch_structure_patch,
+        visual_detail_guidance_w=args.sample_visual_detail_guidance_w,
+        visual_detail_guidance_patch=args.sample_visual_detail_guidance_patch,
+        visual_detail_guidance_interval=sample_visual_detail_guidance_interval,
         train_precision=args.train_precision,
         ae_accum_steps=args.ae_accum_steps,
         flow_accum_steps=args.flow_accum_steps,
@@ -16223,6 +16489,9 @@ def main(argv=None):
                 feature_guidance_interval=sample_feature_guidance_interval,
                 quality_guidance_w=args.sample_quality_guidance_w,
                 quality_guidance_interval=sample_quality_guidance_interval,
+                visual_detail_guidance_w=args.sample_visual_detail_guidance_w,
+                visual_detail_guidance_patch=args.sample_visual_detail_guidance_patch,
+                visual_detail_guidance_interval=sample_visual_detail_guidance_interval,
                 sample_finite_guard=settings["sample_finite_guard"],
                 sample_velocity_clip=settings["sample_velocity_clip"],
                 sample_latent_clip=settings["sample_latent_clip"],
@@ -16261,6 +16530,9 @@ def main(argv=None):
                 sample_schedule=settings["sample_schedule"],
                 sample_churn=settings["sample_churn"],
                 sample_churn_interval=settings["sample_churn_interval"],
+                visual_detail_guidance_w=args.sample_visual_detail_guidance_w,
+                visual_detail_guidance_patch=args.sample_visual_detail_guidance_patch,
+                visual_detail_guidance_interval=sample_visual_detail_guidance_interval,
                 sample_finite_guard=settings["sample_finite_guard"],
                 sample_velocity_clip=settings["sample_velocity_clip"],
                 sample_latent_clip=settings["sample_latent_clip"],
@@ -16563,6 +16835,10 @@ def main(argv=None):
         "sample_selection_health_w": args.sample_selection_health_w,
         "sample_selection_patch_structure_w": args.sample_selection_patch_structure_w,
         "sample_selection_patch_structure_patch": args.sample_selection_patch_structure_patch,
+        "sample_visual_detail_guidance_w": args.sample_visual_detail_guidance_w,
+        "sample_visual_detail_guidance_patch": args.sample_visual_detail_guidance_patch,
+        "sample_visual_detail_guidance_interval": list(
+            sample_visual_detail_guidance_interval),
         "sample_finite_guard": args.sample_finite_guard,
         "sample_velocity_clip": args.sample_velocity_clip,
         "sample_latent_clip": args.sample_latent_clip,
