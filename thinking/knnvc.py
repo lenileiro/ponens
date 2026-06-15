@@ -97,16 +97,27 @@ def run(device=DEV, n=120, topk=4, seed=1, save_dir="data/synth", out=None):
             for s in spks}
     cmat = torch.stack([cent[s] for s in spks])
 
-    voice_hit = src_match = total = saved = 0
+    MAX_SRC = SR * 8        # cap lengths so WavLM activations + kNN matrix stay bounded (OOM fix)
+    MAX_REF = SR * 6
+    voice_hit = src_match = total = saved = errs = 0
     for _ in range(n):
         a, b = rng.choice(len(spks), 2, replace=False)
         a, b = spks[a], spks[b]
-        src = hold[a][int(rng.integers(len(hold[a])))]
-        refs = [hold[b][j] for j in rng.permutation(len(hold[b]))[:6]]
-        with torch.no_grad():
-            q = knn.get_features(_to_wav_tensor(src, device))
-            mset = knn.get_matching_set([_to_wav_tensor(r, device) for r in refs])
-            conv = knn.match(q, mset, topk=topk).cpu().numpy()
+        src = hold[a][int(rng.integers(len(hold[a])))][:MAX_SRC]
+        refs = [hold[b][j][:MAX_REF] for j in rng.permutation(len(hold[b]))[:4]]
+        try:
+            with torch.no_grad():
+                q = knn.get_features(_to_wav_tensor(src, device))
+                mset = knn.get_matching_set([_to_wav_tensor(r, device) for r in refs])
+                conv = knn.match(q, mset, topk=topk).cpu().numpy()
+            del q, mset
+            if device != "cpu":
+                torch.cuda.empty_cache()
+        except RuntimeError as e:                          # skip-dont-die: one bad pair != dead run
+            errs += 1
+            if device != "cpu":
+                torch.cuda.empty_cache()
+            continue
         emb = _spk_embed(se, conv, device)
         pred = spks[int((cmat @ emb).argmax())]
         voice_hit += (pred == b)                           # converted lands as TARGET b
@@ -118,7 +129,7 @@ def run(device=DEV, n=120, topk=4, seed=1, save_dir="data/synth", out=None):
             _write_wav(os.path.join(save_dir, f"knn{saved}_ref_B.wav"), refs[0])
             _write_wav(os.path.join(save_dir, f"knn{saved}_cloned_AinB.wav"), conv)
             saved += 1
-    report = {"experiment": "knnvc_pretrained_wavlm", "topk": topk, "n": total,
+    report = {"experiment": "knnvc_pretrained_wavlm", "topk": topk, "n": total, "errors": errs,
               "n_holdout_speakers": len(spks), "voice_chance": 1 / len(spks),
               "voice_match": voice_hit / total, "stayed_source": src_match / total,
               "works": voice_hit / total > 0.5}
