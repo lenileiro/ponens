@@ -6557,6 +6557,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        decoded_endpoint_patch_structure_w=0.0,
                        decoded_endpoint_patch_structure_size=(
                            DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE),
+                       decoded_endpoint_target=None,
                        equivariance_w=0.0, equivariance_p=1.0,
                        equivariance_transforms=DEFAULT_FLOW_EQUIVARIANCE_TRANSFORMS,
                        equivariance_shift_frac=0.125,
@@ -6630,6 +6631,13 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         raise ValueError("decoded_endpoint_patch_structure_size must be positive")
     if decoded_endpoint_w > 0.0 and ae is None:
         raise ValueError("decoded_endpoint_w requires an autoencoder")
+    if decoded_endpoint_target is not None:
+        if not torch.is_tensor(decoded_endpoint_target):
+            raise TypeError("decoded_endpoint_target must be a tensor")
+        if decoded_endpoint_target.ndim != 4:
+            raise ValueError("decoded_endpoint_target must have shape B,C,H,W")
+        if int(decoded_endpoint_target.shape[0]) != int(z1.shape[0]):
+            raise ValueError("decoded_endpoint_target batch must match z1")
     equivariance_w = float(equivariance_w)
     equivariance_p = float(equivariance_p)
     if equivariance_w < 0.0:
@@ -6764,6 +6772,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         "flow_decoded_endpoint_patch_structure_size": torch.tensor(
             float(decoded_endpoint_patch_structure_size), device=z1.device),
         "flow_decoded_endpoint_active": torch.tensor(0.0, device=z1.device),
+        "flow_decoded_endpoint_target_source": torch.tensor(
+            1.0 if decoded_endpoint_target is not None else 0.0, device=z1.device),
         "flow_equivariance_w": torch.tensor(float(equivariance_w), device=z1.device),
         "flow_equivariance_p": torch.tensor(float(equivariance_p), device=z1.device),
         "flow_equivariance_transform_count": torch.tensor(
@@ -6864,8 +6874,27 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         endpoint_raw = denormalize_latent(endpoint_pred, latent_stats)
         target_raw = denormalize_latent(z1_model, latent_stats)
         pred_img = ae.decode(endpoint_raw)
-        with torch.no_grad():
-            target_img = ae.decode(target_raw.detach())
+        target_source = 0.0
+        if decoded_endpoint_target is None:
+            with torch.no_grad():
+                target_img = ae.decode(target_raw.detach())
+        else:
+            with torch.no_grad():
+                target_img = decoded_endpoint_target.detach().to(
+                    device=pred_img.device, dtype=pred_img.dtype)
+                if target_img.ndim != pred_img.ndim:
+                    raise ValueError(
+                        "decoded_endpoint_target rank must match decoded endpoint")
+                if (int(target_img.shape[0]) != int(pred_img.shape[0])
+                        or int(target_img.shape[1]) != int(pred_img.shape[1])):
+                    raise ValueError(
+                        "decoded_endpoint_target batch/channels must match decoded endpoint")
+                if tuple(target_img.shape[-2:]) != tuple(pred_img.shape[-2:]):
+                    target_img = F.interpolate(
+                        target_img.float(), size=pred_img.shape[-2:],
+                        mode="bilinear", align_corners=False).to(dtype=pred_img.dtype)
+                target_img = target_img.clamp(-1.0, 1.0)
+            target_source = 1.0
         decoded_loss, decoded_parts = reconstruction_loss_parts(
             pred_img, target_img, mode="mse",
             grad_w=decoded_endpoint_grad_w,
@@ -6879,6 +6908,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         total = total + float(decoded_endpoint_w) * decoded_loss
         parts["flow_decoded_endpoint_loss"] = decoded_loss.detach()
         parts["flow_decoded_endpoint_active"] = torch.tensor(1.0, device=z1.device)
+        parts["flow_decoded_endpoint_target_source"] = torch.tensor(
+            target_source, device=z1.device)
         for key, value in decoded_parts.items():
             parts[f"flow_decoded_endpoint_{key}"] = value
     if endpoint_stats_w > 0.0:
@@ -13410,6 +13441,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 image_feature_tokens = cache_payload.get("image_embedding_sequences")
                 quality_targets = cache_payload.get("quality_targets")
                 quality_masks = cache_payload.get("quality_masks")
+                decoded_endpoint_target = None
             else:
                 flow_batch = sample_bucketed_image_text_batch(
                     image_records, rng, batch=batch, size_buckets=active_size_buckets,
@@ -13425,6 +13457,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 size_bucket_sample_counts[image_size_key(batch_size)] += int(batch)
                 with torch.no_grad(), amp_autocast(device, train_precision):
                     z1 = ae.encode(x)
+                decoded_endpoint_target = x
                 cond = caption_record_condition(
                     captions, chosen_records, conditioner, prompt_vocab,
                     source=caption_cond_source, max_len=caption_max_len, device=device,
@@ -13528,6 +13561,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                         flow_decoded_endpoint_patch_structure_w),
                     decoded_endpoint_patch_structure_size=(
                         flow_decoded_endpoint_patch_structure_size),
+                    decoded_endpoint_target=decoded_endpoint_target,
                     equivariance_w=flow_equivariance_w,
                     equivariance_p=flow_equivariance_p,
                     equivariance_transforms=flow_equivariance_transforms,
@@ -14736,6 +14770,7 @@ def selftest():
         assert report["last_flow"]["flow_multiscale_active_scales"] >= 1
         assert math.isclose(report["flow_decoded_endpoint_w"], 0.01)
         assert report["last_flow"]["flow_decoded_endpoint_active"] == 1.0
+        assert report["last_flow"]["flow_decoded_endpoint_target_source"] == 1.0
         assert "flow_decoded_endpoint_recon_grad_l1" in report["last_flow"]
         assert "flow_decoded_endpoint_recon_multiscale_l1" in report["last_flow"]
         assert "flow_decoded_endpoint_recon_fft_l1" in report["last_flow"]
