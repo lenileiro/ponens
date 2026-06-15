@@ -1492,6 +1492,14 @@ def payload(args):
                     generated_eval += f" --max-frechet {args.image_generated_eval_max_frechet}"
                 if args.image_generated_eval_max_mmd_rbf is not None:
                     generated_eval += f" --max-mmd-rbf {args.image_generated_eval_max_mmd_rbf}"
+                if args.image_generated_eval_min_neighbor_l2_p05 is not None:
+                    generated_eval += (
+                        f" --min-generated-neighbor-l2-p05 "
+                        f"{args.image_generated_eval_min_neighbor_l2_p05}")
+                if args.image_generated_eval_min_real_l2_p01 is not None:
+                    generated_eval += (
+                        f" --min-generated-real-l2-p01 "
+                        f"{args.image_generated_eval_min_real_l2_p01}")
                 if args.image_generated_eval_fail_on_gate:
                     generated_eval += " --fail-on-gate"
                 train += generated_embed + generated_eval
@@ -1585,6 +1593,14 @@ def payload(args):
                         quality_loop += (
                             f" --max-mmd-rbf "
                             f"{args.image_generated_eval_max_mmd_rbf}")
+                    if args.image_generated_eval_min_neighbor_l2_p05 is not None:
+                        quality_loop += (
+                            f" --min-generated-neighbor-l2-p05 "
+                            f"{args.image_generated_eval_min_neighbor_l2_p05}")
+                    if args.image_generated_eval_min_real_l2_p01 is not None:
+                        quality_loop += (
+                            f" --min-generated-real-l2-p01 "
+                            f"{args.image_generated_eval_min_real_l2_p01}")
                     if args.image_quality_loop_max_sensor_loss is not None:
                         quality_loop += (
                             f" --vision-read-max-sensor-loss "
@@ -3143,6 +3159,16 @@ def main():
     ap.add_argument("--image-generated-eval-max-mmd-rbf", type=float, default=None,
                     dest="image_generated_eval_max_mmd_rbf",
                     help="maximum RBF-MMD distance for generated-sample image_eval")
+    ap.add_argument("--image-generated-eval-min-neighbor-l2-p05", type=float,
+                    default=None,
+                    dest="image_generated_eval_min_neighbor_l2_p05",
+                    help=("minimum generated/generated nearest-neighbor L2 p05 "
+                          "for generated-sample image_eval"))
+    ap.add_argument("--image-generated-eval-min-real-l2-p01", type=float,
+                    default=None,
+                    dest="image_generated_eval_min_real_l2_p01",
+                    help=("minimum generated/real nearest-neighbor L2 p01 "
+                          "for generated-sample image_eval"))
     ap.add_argument("--image-generated-eval-fail-on-gate", action="store_true",
                     dest="image_generated_eval_fail_on_gate",
                     help="fail the RunPod job if configured generated-sample eval gates fail")
@@ -4420,6 +4446,13 @@ def main():
     if (args.image_generated_eval_max_mmd_rbf is not None
             and args.image_generated_eval_max_mmd_rbf < 0.0):
         sys.exit("ERROR: --image-generated-eval-max-mmd-rbf must be non-negative")
+    if (args.image_generated_eval_min_neighbor_l2_p05 is not None
+            and args.image_generated_eval_min_neighbor_l2_p05 < 0.0):
+        sys.exit(
+            "ERROR: --image-generated-eval-min-neighbor-l2-p05 must be non-negative")
+    if (args.image_generated_eval_min_real_l2_p01 is not None
+            and args.image_generated_eval_min_real_l2_p01 < 0.0):
+        sys.exit("ERROR: --image-generated-eval-min-real-l2-p01 must be non-negative")
     if args.image_quality_loop_vision_read_steps < 0:
         sys.exit("ERROR: --image-quality-loop-vision-read-steps must be non-negative")
     quality_loop_positive = {

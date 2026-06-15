@@ -285,6 +285,99 @@ def _support_radius(x):
     return float(np.median(finite)) if finite.size else 0.0
 
 
+def _finite_percentile(vals, q, default=0.0):
+    vals = np.asarray(vals, dtype=np.float64).reshape(-1)
+    vals = vals[np.isfinite(vals)]
+    if vals.size <= 0:
+        return float(default)
+    return float(np.percentile(vals, float(q)))
+
+
+def _nearest_stats(vals, prefix):
+    vals = np.asarray(vals, dtype=np.float64).reshape(-1)
+    vals = vals[np.isfinite(vals)]
+    if vals.size <= 0:
+        return {
+            f"{prefix}_n": 0,
+            f"{prefix}_min": 0.0,
+            f"{prefix}_p01": 0.0,
+            f"{prefix}_p05": 0.0,
+            f"{prefix}_p10": 0.0,
+            f"{prefix}_p50": 0.0,
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_p90": 0.0,
+            f"{prefix}_max": 0.0,
+        }
+    return {
+        f"{prefix}_n": int(vals.size),
+        f"{prefix}_min": float(vals.min()),
+        f"{prefix}_p01": _finite_percentile(vals, 1),
+        f"{prefix}_p05": _finite_percentile(vals, 5),
+        f"{prefix}_p10": _finite_percentile(vals, 10),
+        f"{prefix}_p50": _finite_percentile(vals, 50),
+        f"{prefix}_mean": float(vals.mean()),
+        f"{prefix}_p90": _finite_percentile(vals, 90),
+        f"{prefix}_max": float(vals.max()),
+    }
+
+
+def _self_nearest_l2(x):
+    n = int(x.shape[0])
+    if n <= 1:
+        return np.zeros((0,), dtype=np.float64)
+    dist = np.sqrt(_sqdist(x, x))
+    dist[np.eye(n, dtype=bool)] = np.inf
+    vals = dist.min(axis=1)
+    return vals[np.isfinite(vals)]
+
+
+def embedding_neighborhood_metrics(generated, real, prefix="image_distribution"):
+    generated = np.asarray(generated, dtype=np.float64)
+    real = np.asarray(real, dtype=np.float64)
+    if generated.ndim != 2 or real.ndim != 2:
+        raise ValueError("generated and real embeddings must be matrices")
+    if generated.shape[0] <= 0 or real.shape[0] <= 0:
+        out = {
+            f"{prefix}_generated_nearest_generated_l2_n": 0,
+            f"{prefix}_real_nearest_real_l2_n": 0,
+            f"{prefix}_generated_nearest_real_l2_n": 0,
+            f"{prefix}_real_nearest_generated_l2_n": 0,
+            f"{prefix}_generated_duplicate_l2_ratio_to_real_p05": 0.0,
+            f"{prefix}_generated_nearest_real_l2_ratio_to_real_p01": 0.0,
+            f"{prefix}_generated_nearest_real_l2_ratio_to_real_p05": 0.0,
+        }
+        return out
+    if generated.shape[1] != real.shape[1]:
+        raise ValueError(
+            f"generated/real embedding dims differ: {generated.shape[1]} vs {real.shape[1]}"
+        )
+    gen_self = _self_nearest_l2(generated)
+    real_self = _self_nearest_l2(real)
+    cross = np.sqrt(_sqdist(generated, real))
+    gen_to_real = cross.min(axis=1)
+    real_to_gen = cross.min(axis=0)
+    real_p05 = max(_finite_percentile(real_self, 5), EPS)
+    out = {}
+    out.update(_nearest_stats(
+        gen_self, f"{prefix}_generated_nearest_generated_l2"))
+    out.update(_nearest_stats(
+        real_self, f"{prefix}_real_nearest_real_l2"))
+    out.update(_nearest_stats(
+        gen_to_real, f"{prefix}_generated_nearest_real_l2"))
+    out.update(_nearest_stats(
+        real_to_gen, f"{prefix}_real_nearest_generated_l2"))
+    out[f"{prefix}_generated_duplicate_l2_ratio_to_real_p05"] = float(
+        _finite_percentile(gen_self, 5) / real_p05
+        if gen_self.size else 0.0)
+    out[f"{prefix}_generated_nearest_real_l2_ratio_to_real_p01"] = float(
+        _finite_percentile(gen_to_real, 1) / real_p05
+        if gen_to_real.size else 0.0)
+    out[f"{prefix}_generated_nearest_real_l2_ratio_to_real_p05"] = float(
+        _finite_percentile(gen_to_real, 5) / real_p05
+        if gen_to_real.size else 0.0)
+    return out
+
+
 def _trace_sqrt_product(a, b):
     vals = np.linalg.eigvals(a.dot(b)).real
     vals = np.maximum(vals, 0.0)
@@ -519,7 +612,10 @@ def image_eval_composite_score(report, embedding_kind="image"):
 
 def image_eval_gate(report, min_score=0.0, min_support_precision=0.0,
                     min_support_recall=0.0, min_image_text_cos=None,
-                    max_frechet=None, max_mmd_rbf=None, embedding_kind="image"):
+                    max_frechet=None, max_mmd_rbf=None,
+                    min_generated_neighbor_l2_p05=None,
+                    min_generated_real_l2_p01=None,
+                    embedding_kind="image"):
     prefix = f"{embedding_kind}_distribution"
     checks = []
 
@@ -563,6 +659,18 @@ def image_eval_gate(report, min_score=0.0, min_support_precision=0.0,
     )
     add_check(f"{prefix}_frechet", report.get(f"{prefix}_frechet"), max_frechet, "max")
     add_check(f"{prefix}_mmd_rbf", report.get(f"{prefix}_mmd_rbf"), max_mmd_rbf, "max")
+    add_check(
+        f"{prefix}_generated_nearest_generated_l2_p05",
+        report.get(f"{prefix}_generated_nearest_generated_l2_p05"),
+        min_generated_neighbor_l2_p05,
+        "min",
+    )
+    add_check(
+        f"{prefix}_generated_nearest_real_l2_p01",
+        report.get(f"{prefix}_generated_nearest_real_l2_p01"),
+        min_generated_real_l2_p01,
+        "min",
+    )
     passed = all(row["pass"] for row in checks)
     return {
         "image_eval_gate_pass": bool(passed),
@@ -593,6 +701,9 @@ def evaluate_records(real_records: Sequence[ImageTextRecord],
     report.update(embedding_distribution_metrics(
         gen_matrix.matrix, real_matrix.matrix,
         prefix=f"{embedding_kind}_distribution"))
+    report.update(embedding_neighborhood_metrics(
+        gen_matrix.matrix, real_matrix.matrix,
+        prefix=f"{embedding_kind}_distribution"))
     report.update(image_text_alignment_metrics(
         real_records, prefix="real_image_text_alignment",
         dim_policy=dim_policy, normalize=normalize))
@@ -614,6 +725,7 @@ def selftest():
         real = os.path.join(td, "real.jsonl")
         good = os.path.join(td, "good.jsonl")
         bad = os.path.join(td, "bad.jsonl")
+        memorized = os.path.join(td, "memorized.jsonl")
         _write_jsonl(real, [
             {"image": "r0.ppm", "caption": "red square", "split": "eval",
              "image_embedding": [1.0, 0.0], "text_embedding": [1.0, 0.0]},
@@ -632,11 +744,19 @@ def selftest():
             {"image": "b1.ppm", "caption": "blue circle", "split": "eval",
              "image_embedding": [-1.0, 0.0], "text_embedding": [0.0, 1.0]},
         ])
+        _write_jsonl(memorized, [
+            {"image": "m0.ppm", "caption": "red square", "split": "eval",
+             "image_embedding": [1.0, 0.0], "text_embedding": [1.0, 0.0]},
+            {"image": "m1.ppm", "caption": "blue circle", "split": "eval",
+             "image_embedding": [0.0, 1.0], "text_embedding": [0.0, 1.0]},
+        ])
         real_records, _ = load_records(real, split="eval")
         good_records, _ = load_records(good, split="eval")
         bad_records, _ = load_records(bad, split="eval")
+        memorized_records, _ = load_records(memorized, split="eval")
         good_report = evaluate_records(real_records, good_records)
         bad_report = evaluate_records(real_records, bad_records)
+        memorized_report = evaluate_records(real_records, memorized_records)
         assert good_report["image_distribution_generated_n"] == 2
         assert good_report["generated_image_text_alignment_n"] == 2
         assert good_report["generated_image_text_alignment_i2t_acc"] == 1.0
@@ -644,11 +764,21 @@ def selftest():
             "image_distribution_frechet"]
         assert good_report["image_distribution_mmd_rbf"] < bad_report[
             "image_distribution_mmd_rbf"]
+        assert good_report["image_distribution_generated_nearest_generated_l2_p05"] > (
+            bad_report["image_distribution_generated_nearest_generated_l2_p05"])
+        assert memorized_report[
+            "image_distribution_generated_nearest_real_l2_p01"] == 0.0
         assert good_report["image_eval_score"] > bad_report["image_eval_score"]
         good_gate = image_eval_gate(good_report, min_score=0.01)
         bad_gate = image_eval_gate(bad_report, min_score=good_report["image_eval_score"] + 0.01)
+        duplicate_gate = image_eval_gate(
+            bad_report, min_generated_neighbor_l2_p05=0.01)
+        memorized_gate = image_eval_gate(
+            memorized_report, min_generated_real_l2_p01=1.0e-6)
         assert good_gate["image_eval_gate_pass"] is True
         assert bad_gate["image_eval_gate_pass"] is False
+        assert duplicate_gate["image_eval_gate_pass"] is False
+        assert memorized_gate["image_eval_gate_pass"] is False
         assert bad_gate["image_eval_gate_failed"][0]["name"] == "image_eval_score"
     print("image_eval selftest OK")
 
@@ -700,6 +830,12 @@ def main(argv=None):
                     help="maximum embedding Fréchet distance for the quality gate")
     ap.add_argument("--max-mmd-rbf", type=float, default=None,
                     help="maximum RBF-MMD distance for the quality gate")
+    ap.add_argument("--min-generated-neighbor-l2-p05", type=float, default=None,
+                    help=("minimum generated/generated nearest-neighbor L2 p05; "
+                          "catches collapsed duplicate outputs"))
+    ap.add_argument("--min-generated-real-l2-p01", type=float, default=None,
+                    help=("minimum generated/real nearest-neighbor L2 p01; "
+                          "catches over-near training-set copies"))
     ap.add_argument("--fail-on-gate", action="store_true",
                     help="exit non-zero when configured quality-gate checks fail")
     ap.add_argument("--report-out", default="", help="optional JSON report path")
@@ -710,6 +846,12 @@ def main(argv=None):
         return {"selftest": True}
     if not args.real_manifest or not args.generated_manifest:
         ap.error("--real-manifest and --generated-manifest are required")
+    if (args.min_generated_neighbor_l2_p05 is not None
+            and args.min_generated_neighbor_l2_p05 < 0.0):
+        ap.error("--min-generated-neighbor-l2-p05 must be non-negative")
+    if (args.min_generated_real_l2_p01 is not None
+            and args.min_generated_real_l2_p01 < 0.0):
+        ap.error("--min-generated-real-l2-p01 must be non-negative")
 
     shared_max = int(args.max_records)
     real_max = int(args.real_max_records or shared_max)
@@ -737,6 +879,8 @@ def main(argv=None):
         min_image_text_cos=args.min_image_text_cos,
         max_frechet=args.max_frechet,
         max_mmd_rbf=args.max_mmd_rbf,
+        min_generated_neighbor_l2_p05=args.min_generated_neighbor_l2_p05,
+        min_generated_real_l2_p01=args.min_generated_real_l2_p01,
         embedding_kind=args.embedding_kind,
     ))
     report.update({
@@ -754,6 +898,12 @@ def main(argv=None):
         "max_nsfw": float(args.max_nsfw) if args.max_nsfw is not None else None,
         "max_watermark": (
             float(args.max_watermark) if args.max_watermark is not None else None),
+        "min_generated_neighbor_l2_p05": (
+            float(args.min_generated_neighbor_l2_p05)
+            if args.min_generated_neighbor_l2_p05 is not None else None),
+        "min_generated_real_l2_p01": (
+            float(args.min_generated_real_l2_p01)
+            if args.min_generated_real_l2_p01 is not None else None),
     })
     if real_merge:
         report["real_embedding_merge"] = real_merge

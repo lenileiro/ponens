@@ -214,6 +214,8 @@ def run_quality_loop(
         embedding_kind="image", dim_policy="error",
         min_score=0.0, min_support_precision=0.0, min_support_recall=0.0,
         min_image_text_cos=None, max_frechet=None, max_mmd_rbf=None,
+        min_generated_neighbor_l2_p05=None,
+        min_generated_real_l2_p01=None,
         vision_read_steps=0, vision_read_seed=0, vision_read_device="cpu",
         vision_read_batch=4, vision_read_dim=32, vision_read_layers=1,
         vision_read_heads=2, vision_read_max_len=64, vision_read_eval_n=16,
@@ -269,7 +271,10 @@ def run_quality_loop(
         min_support_precision=min_support_precision,
         min_support_recall=min_support_recall,
         min_image_text_cos=min_image_text_cos, max_frechet=max_frechet,
-        max_mmd_rbf=max_mmd_rbf, embedding_kind=embedding_kind))
+        max_mmd_rbf=max_mmd_rbf,
+        min_generated_neighbor_l2_p05=min_generated_neighbor_l2_p05,
+        min_generated_real_l2_p01=min_generated_real_l2_p01,
+        embedding_kind=embedding_kind))
     if real_merge:
         embedding_report["real_embedding_merge"] = real_merge
     if generated_merge:
@@ -306,7 +311,9 @@ def run_quality_loop(
         or float(min_support_recall or 0.0) > 0.0
         or min_image_text_cos is not None
         or max_frechet is not None
-        or max_mmd_rbf is not None)
+        or max_mmd_rbf is not None
+        or min_generated_neighbor_l2_p05 is not None
+        or min_generated_real_l2_p01 is not None)
     vision_gate_configured = bool(
         vision_report and (
             float(vision_read_min_sensor_token_acc or 0.0) > 0.0
@@ -379,6 +386,10 @@ def selftest():
             vision_read_steps=1, vision_read_eval_n=2,
             vision_read_max_len=16)
         assert report["embedding_eval"]["image_distribution_generated_n"] == 2
+        assert "image_distribution_generated_nearest_generated_l2_p05" in (
+            report["embedding_eval"])
+        assert "image_distribution_generated_nearest_real_l2_p01" in (
+            report["embedding_eval"])
         assert report["vision_read_manifest"]["splits"] == {"eval": 2, "train": 2}
         assert report["vision_read_eval"]["manifest"]["view_dims"]["vision"] == 8
         assert "sensor_only" in report["vision_read_eval"]["teacher_forced"]
@@ -466,6 +477,12 @@ def main(argv=None):
     ap.add_argument("--min-image-text-cos", type=float, default=None)
     ap.add_argument("--max-frechet", type=float, default=None)
     ap.add_argument("--max-mmd-rbf", type=float, default=None)
+    ap.add_argument("--min-generated-neighbor-l2-p05", type=float, default=None,
+                    help=("minimum generated/generated nearest-neighbor L2 p05; "
+                          "catches collapsed duplicate outputs"))
+    ap.add_argument("--min-generated-real-l2-p01", type=float, default=None,
+                    help=("minimum generated/real nearest-neighbor L2 p01; "
+                          "catches over-near training-set copies"))
     ap.add_argument("--vision-read-steps", type=int, default=0)
     ap.add_argument("--vision-read-seed", type=int, default=0)
     ap.add_argument("--vision-read-device", default="")
@@ -494,6 +511,12 @@ def main(argv=None):
             "vision_read_steps"):
         if getattr(args, name) < 0:
             ap.error(f"--{name.replace('_', '-')} must be non-negative")
+    if (args.min_generated_neighbor_l2_p05 is not None
+            and args.min_generated_neighbor_l2_p05 < 0.0):
+        ap.error("--min-generated-neighbor-l2-p05 must be non-negative")
+    if (args.min_generated_real_l2_p01 is not None
+            and args.min_generated_real_l2_p01 < 0.0):
+        ap.error("--min-generated-real-l2-p01 must be non-negative")
     report = run_quality_loop(
         real_manifest=args.real_manifest,
         generated_manifest=args.generated_manifest,
@@ -537,6 +560,8 @@ def main(argv=None):
         min_image_text_cos=args.min_image_text_cos,
         max_frechet=args.max_frechet,
         max_mmd_rbf=args.max_mmd_rbf,
+        min_generated_neighbor_l2_p05=args.min_generated_neighbor_l2_p05,
+        min_generated_real_l2_p01=args.min_generated_real_l2_p01,
         vision_read_steps=args.vision_read_steps,
         vision_read_seed=args.vision_read_seed,
         vision_read_device=args.vision_read_device or args.embedding_device,
