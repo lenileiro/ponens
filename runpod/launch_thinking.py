@@ -451,7 +451,7 @@ def apply_image_quality_preset(args):
         if float(args.image_score_technical_w) == 1.0:
             args.image_score_technical_w = 0.25
         args.image_score_pickscore_w = max(float(args.image_score_pickscore_w), 0.75)
-        args.image_score_pickscore_batch = max(int(args.image_score_pickscore_batch), 8)
+        args.image_score_pickscore_batch = max(int(args.image_score_pickscore_batch), 32)
         args.image_score_pickscore_dtype = "auto"
     args.image_embed = True
     args.image_embed_backend = "hf"
@@ -731,6 +731,12 @@ def apply_image_quality_preset(args):
             int(args.image_sample_selection_patch_structure_patch), 8)
     args.image_sample_grid = True
     args.image_sample_reference_grid = True
+    if not args.image_train_progress_out:
+        args.image_train_progress_out = (
+            "runs/image_latent_web_hf_vae_hq_progress.jsonl" if hq
+            else "runs/image_latent_web_hf_vae_progress.jsonl")
+    args.image_train_progress_interval = max(
+        int(args.image_train_progress_interval), 250 if hq else 100)
     if not args.image_sample_manifest_out:
         args.image_sample_manifest_out = (
             "runs/image_latent_web_hf_vae_hq_generated.jsonl" if hq
@@ -1249,6 +1255,8 @@ def payload(args):
                      f"--flow-cache-dtype {args.image_flow_cache_dtype} "
                      f"--flow-cache-max-loaded-shards {args.image_flow_cache_max_loaded_shards} "
                      f"--train-precision {args.image_train_precision} "
+                     f"--train-progress-out {shlex_quote(args.image_train_progress_out)} "
+                     f"--train-progress-interval {args.image_train_progress_interval} "
                      f"--grad-clip {args.image_grad_clip} "
                      f"--size {args.image_size} "
                      f"--size-buckets {shlex_quote(args.image_size_buckets)} "
@@ -2963,6 +2971,12 @@ def main():
     ap.add_argument("--image-flow-accum-steps", type=int, default=1,
                     dest="image_flow_accum_steps",
                     help="flow gradient accumulation microsteps")
+    ap.add_argument("--image-train-progress-out", default="",
+                    dest="image_train_progress_out",
+                    help="JSONL path for live image latent training progress")
+    ap.add_argument("--image-train-progress-interval", type=int, default=0,
+                    dest="image_train_progress_interval",
+                    help="optimizer-step interval for image latent progress rows")
     ap.add_argument("--image-flow-cache-latents", action="store_true",
                     dest="image_flow_cache_latents",
                     help="precompute AE latents for manifest flow training")
@@ -4789,6 +4803,8 @@ def main():
         sys.exit("ERROR: image AE reconstruction weights must be non-negative")
     if args.image_ae_patch_structure_size <= 0:
         sys.exit("ERROR: --image-ae-patch-structure-size must be positive")
+    if args.image_train_progress_interval < 0:
+        sys.exit("ERROR: --image-train-progress-interval must be non-negative")
     if (args.image_time_mode_scale < 0.0
             or args.image_time_mode_scale >= IMAGE_MAX_TIME_MODE_SCALE):
         sys.exit(

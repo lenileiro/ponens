@@ -14065,6 +14065,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_cache_has_image_geometry": bool(
             flow_cache.get("has_image_geometry", False) if flow_cache is not None else False
         ),
+        "train_progress_out": train_progress_out,
+        "train_progress_interval": int(train_progress_interval),
         "flow_cache_image_embedding_sequence_max_len": int(
             flow_cache.get("image_embedding_sequence_max_len", 0)
             if flow_cache is not None else 0
@@ -14417,6 +14419,20 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "last_flow_loss": last_flow.get("velocity_mse"),
     })
     report.update(summarize_records(image_records))
+    emit_train_progress("train", int(ae_train_steps_run) + int(flow_steps),
+                        int(ae_steps) + int(flow_steps), {
+                            "selected_eval_weights": selected_eval_weights,
+                            "last_ae": last_ae,
+                            "last_quality_score": last_quality_score,
+                            "last_flow": last_flow,
+                            "last_distill": last_distill,
+                            "flow_ema_updates": int(ema_updates),
+                            "flow_ema_effective_decay": float(last_ema_decay),
+                            "flow_decoded_endpoint_real_target_frac": (
+                                float(flow_decoded_endpoint_real_target_microbatches)
+                                / float(max(1, flow_decoded_endpoint_active_microbatches))
+                            ),
+                        }, event="train_complete")
     if return_ema:
         if return_conditioner:
             if return_aligner:
@@ -14877,6 +14893,7 @@ def selftest():
         assert pref_report["image_preference_pairs_with_sample_metadata"] == 1
         assert pref_report["image_preference_chosen_cfg_schedules"] == {
             "triangular": 1}
+        progress_path = os.path.join(td, "image_latent_progress.jsonl")
         ae, flow, conditioner, vocab, report = train_latent_flow(
             ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=16,
             flow_arch="dit", dit_depth=1, dit_heads=2, seed=5, device="cpu",
@@ -14928,7 +14945,20 @@ def selftest():
             autoencoder_recon_max_patch_structure_l1=10.0,
             autoencoder_recon_max_score=20.0,
             image_geometry_cond=True,
+            train_progress_out=progress_path,
+            train_progress_interval=1,
             return_conditioner=True)
+        with open(progress_path, "r", encoding="utf-8") as f:
+            progress_rows = [json.loads(line) for line in f if line.strip()]
+        progress_events = [row["event"] for row in progress_rows]
+        progress_stages = [row["stage"] for row in progress_rows]
+        assert progress_events[0] == "train_start"
+        assert progress_events[-1] == "train_complete"
+        assert "autoencoder" in progress_stages
+        assert "flow" in progress_stages
+        assert "flow_distill" in progress_stages
+        assert any(row.get("flow_decoded_endpoint_real_target_frac") == 1.0
+                   for row in progress_rows)
         assert report["experiment"] == "image_latent_manifest_rectified_flow"
         assert report["data_mode"] == "image_manifest"
         assert report["cond_mode"] == "text"
@@ -15312,6 +15342,12 @@ def main(argv=None):
                           "aligner/quality reranking"))
     ap.add_argument("--resume-checkpoint", default="", dest="resume_checkpoint",
                     help="image_latent checkpoint to continue training from")
+    ap.add_argument("--train-progress-out", default="", dest="train_progress_out",
+                    help="optional JSONL path for live image training progress")
+    ap.add_argument("--train-progress-interval", type=int, default=0,
+                    dest="train_progress_interval",
+                    help=("optimizer-step interval for live training progress rows; "
+                          "0 only writes start/complete rows when a progress path is set"))
     ap.add_argument("--ae-steps", type=int, default=200, dest="ae_steps")
     ap.add_argument("--flow-steps", type=int, default=200, dest="flow_steps")
     ap.add_argument("--batch", type=int, default=64)
@@ -16249,6 +16285,8 @@ def main(argv=None):
         ap.error("--eval-generated-samples must be non-negative")
     if args.eval_generated_candidates_per_prompt <= 0:
         ap.error("--eval-generated-candidates-per-prompt must be positive")
+    if args.train_progress_interval < 0:
+        ap.error("--train-progress-interval must be non-negative")
     if args.sample_velocity_clip < 0.0:
         ap.error("--sample-velocity-clip must be non-negative")
     if args.sample_latent_clip < 0.0:
@@ -17034,6 +17072,8 @@ def main(argv=None):
         flow_cache_dtype=args.flow_cache_dtype,
         flow_cache_max_loaded_shards=args.flow_cache_max_loaded_shards,
         resume_checkpoint=args.resume_checkpoint,
+        train_progress_out=args.train_progress_out,
+        train_progress_interval=args.train_progress_interval,
         return_conditioner=True, return_ema=True, return_aligner=True)
     if args.sample_grid_out:
         raw_flow = clone_state_dict(flow)
