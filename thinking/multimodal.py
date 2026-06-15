@@ -149,6 +149,10 @@ MULTIMODAL_DEFAULT_SOURCE_BALANCE_W = 0.5
 MULTIMODAL_DEFAULT_LATENT_CONCEPT_SLOTS = 4
 MULTIMODAL_DEFAULT_LATENT_CONCEPT_MEMORY_SIZE = 64
 MULTIMODAL_OBJECTIVE_PROFILES = ("manual", "language", "mastery")
+MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS = {
+    "continuation_repair_w": 0.05,
+    "continuation_repair_steps": 4,
+}
 MULTIMODAL_MASTERY_OBJECTIVE_FLOORS = {
     "latent_concept_slots": MULTIMODAL_DEFAULT_LATENT_CONCEPT_SLOTS,
     "latent_concept_memory_size": MULTIMODAL_DEFAULT_LATENT_CONCEPT_MEMORY_SIZE,
@@ -1418,15 +1422,20 @@ def multimodal_objective_profile_kwargs(objective_profile="manual", **kwargs):
         raise ValueError(f"unknown multimodal objective profile {objective_profile!r}")
     effective = dict(kwargs)
     updates = {}
+    floors = {}
+    if objective_profile in ("language", "mastery"):
+        floors.update(MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS)
     if objective_profile == "mastery":
+        floors.update(MULTIMODAL_MASTERY_PROFILE_FLOORS)
+    if floors:
         missing = [
-            key for key in MULTIMODAL_MASTERY_PROFILE_FLOORS
+            key for key in floors
             if key not in effective]
         if missing:
             raise ValueError(
                 "missing multimodal objective profile controls: "
                 + ", ".join(sorted(missing)))
-        for key, floor in MULTIMODAL_MASTERY_PROFILE_FLOORS.items():
+        for key, floor in floors.items():
             before_raw = effective[key]
             before = float(before_raw)
             after_raw = max(before, float(floor))
@@ -1439,8 +1448,10 @@ def multimodal_objective_profile_kwargs(objective_profile="manual", **kwargs):
                 updates[key] = {"from": before_raw, "to": after}
     report = {
         "profile": objective_profile,
-        "enabled": objective_profile == "mastery",
+        "enabled": objective_profile != "manual",
         "language_first": objective_profile == "language",
+        "language_floors": dict(MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS)
+        if objective_profile in ("language", "mastery") else {},
         "floors": dict(MULTIMODAL_MASTERY_PROFILE_FLOORS)
         if objective_profile == "mastery" else {},
         "objective_floors": dict(MULTIMODAL_MASTERY_OBJECTIVE_FLOORS)
@@ -2542,6 +2553,117 @@ def token_loss(logits, ids, pad):
     raw = F.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]),
                           targets.reshape(-1), reduction="none").view_as(targets)
     return raw.masked_select(mask).mean()
+
+
+def continuation_repair_loss(
+        model, features, txt, ids, modes, pad, repair_steps=4,
+        prompt_frac=0.5, temperature=0.0, top_k=0):
+    """Train recovery from the model's own free-running continuation errors."""
+    zero = ids.new_zeros((), dtype=torch.float32)
+    if ids.shape[0] == 0 or ids.shape[1] < 2 or int(repair_steps) <= 0:
+        return zero, {
+            "enabled": False, "skipped": True, "skip_reason": "too_short",
+            "tokens": 0, "generated_tokens": 0, "changed_tokens": 0,
+        }
+    lengths = ids.ne(int(pad)).sum(dim=1).detach().cpu().tolist()
+    prompt_lens = []
+    repair_lens = []
+    for length in lengths:
+        length = int(length)
+        if length < 2:
+            prompt_lens.append(0)
+            repair_lens.append(0)
+            continue
+        prompt_len = int(round(float(length) * float(prompt_frac)))
+        prompt_len = max(1, min(prompt_len, length - 1))
+        repair_len = min(int(repair_steps), length - prompt_len)
+        prompt_lens.append(prompt_len)
+        repair_lens.append(repair_len)
+    if not any(repair_lens):
+        return zero, {
+            "enabled": False, "skipped": True,
+            "skip_reason": "no_repair_targets", "tokens": 0,
+            "generated_tokens": 0, "changed_tokens": 0,
+        }
+
+    mixed_ids = ids.detach().clone()
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        max_repair = max(repair_lens)
+        for step in range(max_repair):
+            active_rows = [
+                i for i, repair_len in enumerate(repair_lens)
+                if step < repair_len
+            ]
+            if not active_rows:
+                continue
+            row_index = torch.tensor(active_rows, dtype=torch.long, device=ids.device)
+            sub_features = [x.index_select(0, row_index) for x in features]
+            sub_txt = txt.index_select(0, row_index)
+            context_lens = [prompt_lens[i] + step for i in active_rows]
+            max_context = max(context_lens)
+            context = ids.new_full((len(active_rows), max_context), int(pad))
+            for out_i, row_i in enumerate(active_rows):
+                context[out_i, :context_lens[out_i]] = mixed_ids[
+                    row_i, :context_lens[out_i]]
+            logits = model(sub_features, sub_txt, context, mode="full")
+            for out_i, row_i in enumerate(active_rows):
+                next_id = _generation_next_id(
+                    logits[out_i, context_lens[out_i] - 1], pad,
+                    temperature=temperature, top_k=top_k)
+                mixed_ids[row_i, prompt_lens[row_i] + step] = next_id
+    if was_training:
+        model.train()
+
+    mode_losses = []
+    token_counts = []
+    for mode in modes:
+        logits = model(features, txt, mixed_ids, mode=mode)
+        if logits.shape[1] < 2:
+            continue
+        targets = ids[:, 1:]
+        raw = F.cross_entropy(
+            logits[:, :-1].reshape(-1, logits.shape[-1]),
+            targets.reshape(-1), reduction="none").view_as(targets)
+        mask = torch.zeros_like(targets, dtype=torch.bool)
+        for row_i, repair_len in enumerate(repair_lens):
+            if repair_len <= 0:
+                continue
+            start = max(0, prompt_lens[row_i] - 1)
+            end = min(targets.shape[1], prompt_lens[row_i] + repair_len - 1)
+            if end > start:
+                mask[row_i, start:end] = True
+        mask &= targets.ne(int(pad))
+        if bool(mask.any()):
+            mode_losses.append(raw.masked_select(mask).mean())
+            token_counts.append(int(mask.sum().detach().cpu()))
+    if not mode_losses:
+        return zero, {
+            "enabled": False, "skipped": True,
+            "skip_reason": "empty_loss_mask", "tokens": 0,
+            "generated_tokens": int(sum(repair_lens)), "changed_tokens": 0,
+        }
+    changed = 0
+    generated = 0
+    for row_i, repair_len in enumerate(repair_lens):
+        if repair_len <= 0:
+            continue
+        start = prompt_lens[row_i]
+        end = start + repair_len
+        generated += repair_len
+        changed += int((mixed_ids[row_i, start:end] != ids[row_i, start:end]).sum().cpu())
+    return sum(mode_losses) / len(mode_losses), {
+        "enabled": True,
+        "skipped": False,
+        "tokens": int(sum(token_counts)),
+        "generated_tokens": int(generated),
+        "changed_tokens": int(changed),
+        "steps": int(repair_steps),
+        "prompt_frac": float(prompt_frac),
+        "temperature": float(temperature),
+        "top_k": int(top_k),
+    }
 
 
 def logit_agreement_loss(logits_by_mode, ids, pad):
@@ -4864,6 +4986,10 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           trunk_width=128, trunk_depth=1, text_layers=1,
           text_arch="transformer", modality_dropout=0.0, decode_w=1.0,
           agreement_w=0.0,
+          continuation_repair_w=0.0, continuation_repair_steps=4,
+          continuation_repair_prompt_frac=0.5,
+          continuation_repair_temperature=0.0,
+          continuation_repair_top_k=0,
           text_checkpoint=None, multimodal_checkpoint=None,
           concept_tokens=4, fusion_layers=1,
           latent_concept_slots=0, latent_concept_layers=1,
@@ -4983,6 +5109,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_concept_memory_size = ckpt_latents["latent_concept_memory_size"]
     profile_kwargs = multimodal_objective_profile_kwargs(
         objective_profile,
+        continuation_repair_w=continuation_repair_w,
+        continuation_repair_steps=continuation_repair_steps,
         latent_concept_slots=latent_concept_slots,
         latent_concept_memory_size=latent_concept_memory_size,
         latent_concept_factorization_w=latent_concept_factorization_w,
@@ -5017,6 +5145,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         selection_score_patience=selection_score_patience)
     objective_profile = profile_kwargs["objective_profile"]
     objective_profile_report = profile_kwargs["objective_profile_report"]
+    continuation_repair_w = profile_kwargs["continuation_repair_w"]
+    continuation_repair_steps = profile_kwargs["continuation_repair_steps"]
     latent_concept_slots = profile_kwargs["latent_concept_slots"]
     latent_concept_memory_size = profile_kwargs["latent_concept_memory_size"]
     latent_concept_factorization_w = profile_kwargs[
@@ -5069,9 +5199,25 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_concept_completion_w,
         latent_concept_sequence_w,
         latent_concept_neighborhood_w,
-        latent_concept_transition_w, latent_concept_cluster_w)
+    latent_concept_transition_w, latent_concept_cluster_w)
     if float(decode_w) < 0.0:
         raise ValueError("decoder loss weight must be non-negative")
+    continuation_repair_w = float(continuation_repair_w)
+    continuation_repair_steps = int(continuation_repair_steps)
+    continuation_repair_prompt_frac = float(continuation_repair_prompt_frac)
+    continuation_repair_temperature = float(continuation_repair_temperature)
+    continuation_repair_top_k = int(continuation_repair_top_k)
+    if continuation_repair_w < 0.0:
+        raise ValueError("continuation repair loss weight must be non-negative")
+    if continuation_repair_steps < 0:
+        raise ValueError("continuation repair steps must be non-negative")
+    if (continuation_repair_prompt_frac <= 0.0
+            or continuation_repair_prompt_frac >= 1.0):
+        raise ValueError("continuation repair prompt fraction must be in (0, 1)")
+    if continuation_repair_temperature < 0.0:
+        raise ValueError("continuation repair temperature must be non-negative")
+    if continuation_repair_top_k < 0:
+        raise ValueError("continuation repair top-k must be non-negative")
     source_balance_w = float(source_balance_w)
     if source_balance_w < 0.0:
         raise ValueError("multimodal source balance weight must be non-negative")
@@ -5551,7 +5697,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         needs_latent = bool(any(float(w) > 0.0 for w in current_latent_weights())
                             or latent_concept_memory_size > 0
                             or hard_study_enabled)
-        needs_logits = bool(float(decode_w) > 0.0 or float(agreement_w) > 0.0)
+        needs_logits = bool(float(decode_w) > 0.0 or float(agreement_w) > 0.0
+                            or float(continuation_repair_w) > 0.0)
         if decode_txt is txt or not needs_latent:
             bundles_by_mode = {
                 mode: model.mode_bundle(
@@ -5585,6 +5732,30 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                         for logits in logits_by_mode.values()) / len(logits_by_mode)
         agreement = (logit_agreement_loss(logits_by_mode, ids, vocab.pad)
                      if agreement_w else base_loss * 0.0)
+        if continuation_repair_w and decode_objective == "causal":
+            continuation_repair, continuation_repair_metrics = (
+                continuation_repair_loss(
+                    model, features, decode_txt, ids, active_modes, vocab.pad,
+                    repair_steps=continuation_repair_steps,
+                    prompt_frac=continuation_repair_prompt_frac,
+                    temperature=continuation_repair_temperature,
+                    top_k=continuation_repair_top_k))
+        else:
+            continuation_repair = base_loss * 0.0
+            continuation_repair_metrics = {
+                "enabled": False,
+                "skipped": True,
+                "skip_reason": (
+                    "weight_zero" if not continuation_repair_w
+                    else "requires_causal_decode"),
+                "tokens": 0,
+                "generated_tokens": 0,
+                "changed_tokens": 0,
+                "steps": int(continuation_repair_steps),
+                "prompt_frac": float(continuation_repair_prompt_frac),
+                "temperature": float(continuation_repair_temperature),
+                "top_k": int(continuation_repair_top_k),
+            }
         latent_views = {
             mode: bundle.get("latent_concepts")
             for mode, bundle in latent_bundles_by_mode.items()
@@ -5837,6 +6008,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 min_cluster_size=latent_concept_cluster_min_size)
             if latent_concept_cluster_w else base_loss * 0.0)
         loss = (float(decode_w) * base_loss + float(agreement_w) * agreement
+                + float(continuation_repair_w) * continuation_repair
                 + float(latent_concept_w) * latent_concept
                 + float(latent_concept_factorization_w) * latent_factorization
                 + float(latent_concept_fer_w) * latent_fer
@@ -5898,6 +6070,26 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "decode_w": float(decode_w),
             "token_loss": float(base_loss.detach()),
             "agreement_loss": float(agreement.detach()),
+            "continuation_repair_loss": float(continuation_repair.detach()),
+            "continuation_repair_w": float(continuation_repair_w),
+            "continuation_repair_steps": int(continuation_repair_steps),
+            "continuation_repair_prompt_frac": float(
+                continuation_repair_prompt_frac),
+            "continuation_repair_temperature": float(
+                continuation_repair_temperature),
+            "continuation_repair_top_k": int(continuation_repair_top_k),
+            "continuation_repair_enabled": bool(
+                continuation_repair_metrics["enabled"]),
+            "continuation_repair_skipped": bool(
+                continuation_repair_metrics["skipped"]),
+            "continuation_repair_skip_reason": str(
+                continuation_repair_metrics.get("skip_reason", "")),
+            "continuation_repair_tokens": int(
+                continuation_repair_metrics["tokens"]),
+            "continuation_repair_generated_tokens": int(
+                continuation_repair_metrics["generated_tokens"]),
+            "continuation_repair_changed_tokens": int(
+                continuation_repair_metrics["changed_tokens"]),
             "self_teach_w": float(self_teach_w),
             "self_teach_history_prior_w": float(self_teach_history_prior_w),
             **source_balance_train_report,
@@ -7445,7 +7637,13 @@ def selftest():
             "objective_profile_report"]
         assert language_profile_model.train_metrics["objective_profile"] == "language"
         assert language_profile["language_first"] is True
-        assert language_profile["applied"] is False
+        assert language_profile["applied"] is True
+        assert language_profile["updates"]["continuation_repair_w"]["to"] == (
+            MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS["continuation_repair_w"])
+        assert (language_profile_model.train_metrics["continuation_repair_w"]
+                == MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS["continuation_repair_w"])
+        assert language_profile_model.train_metrics[
+            "continuation_repair_skipped"] is True
         assert language_profile_model.latent_concept_slots == 0
         assert language_profile_model.train_metrics["active_modes"] == list(MODES)
         mastery_profile_model, *_ = train(
@@ -7540,6 +7738,9 @@ def selftest():
         assert causal_model.train_metrics["active_modes"] == ["full"]
         assert causal_model.train_metrics["decode_objective"] == "causal"
         assert causal_model.train_metrics["token_loss"] > 0.1
+        assert causal_model.train_metrics["continuation_repair_w"] > 0.0
+        assert causal_model.train_metrics["continuation_repair_enabled"] is True
+        assert causal_model.train_metrics["continuation_repair_tokens"] > 0
         causal_bundle = multimodal_eval_bundle(
             causal_model, causal_eval, causal_vocab, causal_dims, n=0,
             device="cpu", decode_objective="causal")
@@ -7716,6 +7917,22 @@ def main(argv=None):
                     help="cross-mode token-distribution agreement loss weight")
     ap.add_argument("--decode-w", type=float, default=1.0, dest="decode_w",
                     help="target-token decoder loss weight; set 0 for latent-only bridge training")
+    ap.add_argument("--continuation-repair-w", type=float, default=0.0,
+                    dest="continuation_repair_w",
+                    help=("loss weight for recovery from the model's own "
+                          "free-running continuation tokens"))
+    ap.add_argument("--continuation-repair-steps", type=int, default=4,
+                    dest="continuation_repair_steps",
+                    help="number of self-generated tokens used in repair contexts")
+    ap.add_argument("--continuation-repair-prompt-frac", type=float, default=0.5,
+                    dest="continuation_repair_prompt_frac",
+                    help="fraction of each causal window kept as the gold prompt")
+    ap.add_argument("--continuation-repair-temperature", type=float, default=0.0,
+                    dest="continuation_repair_temperature",
+                    help="0 uses greedy self-rollout for repair")
+    ap.add_argument("--continuation-repair-top-k", type=int, default=0,
+                    dest="continuation_repair_top_k",
+                    help="optional top-k sampling cap for repair self-rollout")
     ap.add_argument("--text-checkpoint", default=None, dest="text_checkpoint",
                     help="optional thinking.text checkpoint for text/latent warm start")
     ap.add_argument("--multimodal-checkpoint", default=None,
@@ -8070,6 +8287,17 @@ def main(argv=None):
     ]
     if any(w < 0.0 for w in latent_weights) or args.agreement_w < 0.0 or args.decode_w < 0.0:
         ap.error("decoder/agreement/latent loss weights must be non-negative")
+    if args.continuation_repair_w < 0.0:
+        ap.error("--continuation-repair-w must be non-negative")
+    if args.continuation_repair_steps < 0:
+        ap.error("--continuation-repair-steps must be non-negative")
+    if (args.continuation_repair_prompt_frac <= 0.0
+            or args.continuation_repair_prompt_frac >= 1.0):
+        ap.error("--continuation-repair-prompt-frac must be in (0, 1)")
+    if args.continuation_repair_temperature < 0.0:
+        ap.error("--continuation-repair-temperature must be non-negative")
+    if args.continuation_repair_top_k < 0:
+        ap.error("--continuation-repair-top-k must be non-negative")
     if args.self_teach_w < 0.0:
         ap.error("--self-teach-w must be non-negative")
     if args.self_teach_history_prior_w < 0.0:
@@ -8231,6 +8459,11 @@ def main(argv=None):
         trunk_depth=args.trunk_depth, text_layers=args.text_layers,
         text_arch=args.text_arch, modality_dropout=args.modality_dropout,
         decode_w=args.decode_w, agreement_w=args.agreement_w,
+        continuation_repair_w=args.continuation_repair_w,
+        continuation_repair_steps=args.continuation_repair_steps,
+        continuation_repair_prompt_frac=args.continuation_repair_prompt_frac,
+        continuation_repair_temperature=args.continuation_repair_temperature,
+        continuation_repair_top_k=args.continuation_repair_top_k,
         text_checkpoint=args.text_checkpoint,
         multimodal_checkpoint=args.multimodal_checkpoint,
         concept_tokens=args.concept_tokens, fusion_layers=args.fusion_layers,

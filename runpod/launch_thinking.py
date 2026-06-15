@@ -2038,11 +2038,20 @@ def payload(args):
                 f"--batch {args.multimodal_batch} --dim {mm_dim} "
                 f"--layers {args.multimodal_layers} --heads {args.multimodal_heads} "
                 f"--max-vocab {args.multimodal_max_vocab} "
+                f"--objective-profile {args.multimodal_objective_profile} "
                 f"--decode-objective {args.multimodal_decode_objective} "
                 f"--source-balance-w {args.multimodal_source_balance_w} "
                 f"--lr {args.multimodal_lr} --log-every {args.multimodal_log_every} "
                 f"--decode-w {args.multimodal_decode_w} "
                 f"--agreement-w {args.multimodal_agreement_w} "
+                f"--continuation-repair-w {args.multimodal_continuation_repair_w} "
+                f"--continuation-repair-steps {args.multimodal_continuation_repair_steps} "
+                f"--continuation-repair-prompt-frac "
+                f"{args.multimodal_continuation_repair_prompt_frac} "
+                f"--continuation-repair-temperature "
+                f"{args.multimodal_continuation_repair_temperature} "
+                f"--continuation-repair-top-k "
+                f"{args.multimodal_continuation_repair_top_k} "
                 f"--concept-tokens {args.multimodal_concept_tokens} "
                 f"--fusion-layers {args.multimodal_fusion_layers} "
                 f"--latent-concept-slots {args.multimodal_latent_concept_slots} "
@@ -4085,6 +4094,11 @@ def main():
                     help="M-0 decoder width; default uses --dim or 96")
     ap.add_argument("--multimodal-layers", type=int, default=3, dest="multimodal_layers")
     ap.add_argument("--multimodal-heads", type=int, default=4, dest="multimodal_heads")
+    ap.add_argument("--multimodal-objective-profile", default="language",
+                    choices=("manual", "language", "mastery"),
+                    dest="multimodal_objective_profile",
+                    help=("generic multimodal objective posture passed to "
+                          "thinking.multimodal"))
     ap.add_argument("--multimodal-decode-objective", default="auto",
                     choices=("auto", "target", "causal"),
                     dest="multimodal_decode_objective",
@@ -4108,6 +4122,24 @@ def main():
     ap.add_argument("--multimodal-agreement-w", type=float, default=0.0,
                     dest="multimodal_agreement_w",
                     help="cross-mode token-distribution agreement loss weight")
+    ap.add_argument("--multimodal-continuation-repair-w", type=float, default=0.0,
+                    dest="multimodal_continuation_repair_w",
+                    help=("M-0 loss weight for recovery from self-generated "
+                          "continuation errors"))
+    ap.add_argument("--multimodal-continuation-repair-steps", type=int, default=4,
+                    dest="multimodal_continuation_repair_steps",
+                    help="self-generated continuation tokens used for repair contexts")
+    ap.add_argument("--multimodal-continuation-repair-prompt-frac",
+                    type=float, default=0.5,
+                    dest="multimodal_continuation_repair_prompt_frac",
+                    help="fraction of each causal window kept as gold prompt")
+    ap.add_argument("--multimodal-continuation-repair-temperature",
+                    type=float, default=0.0,
+                    dest="multimodal_continuation_repair_temperature",
+                    help="0 uses greedy self-rollout for repair")
+    ap.add_argument("--multimodal-continuation-repair-top-k", type=int, default=0,
+                    dest="multimodal_continuation_repair_top_k",
+                    help="optional top-k sampling cap for repair self-rollout")
     ap.add_argument("--multimodal-concept-tokens", type=int, default=4,
                     dest="multimodal_concept_tokens")
     ap.add_argument("--multimodal-fusion-layers", type=int, default=1,
@@ -5450,6 +5482,14 @@ def main():
         multimodal_nonnegative = {
             "--multimodal-decode-w": args.multimodal_decode_w,
             "--multimodal-agreement-w": args.multimodal_agreement_w,
+            "--multimodal-continuation-repair-w": (
+                args.multimodal_continuation_repair_w),
+            "--multimodal-continuation-repair-steps": (
+                args.multimodal_continuation_repair_steps),
+            "--multimodal-continuation-repair-temperature": (
+                args.multimodal_continuation_repair_temperature),
+            "--multimodal-continuation-repair-top-k": (
+                args.multimodal_continuation_repair_top_k),
             "--multimodal-source-balance-w": args.multimodal_source_balance_w,
             "--multimodal-latent-concept-w": args.multimodal_latent_concept_w,
             "--multimodal-latent-concept-invariance-w": (
@@ -5608,6 +5648,10 @@ def main():
         if bad_nonnegative:
             bad_flags = ", ".join(bad_nonnegative)
             sys.exit(f"ERROR: multimodal controls must be non-negative: {bad_flags}")
+        if (args.multimodal_continuation_repair_prompt_frac <= 0.0
+                or args.multimodal_continuation_repair_prompt_frac >= 1.0):
+            sys.exit(
+                "ERROR: --multimodal-continuation-repair-prompt-frac must be in (0, 1)")
         if args.multimodal_latent_concept_slots < 0:
             sys.exit("ERROR: --multimodal-latent-concept-slots must be non-negative")
         multimodal_latent_weights = [

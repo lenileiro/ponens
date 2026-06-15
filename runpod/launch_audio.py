@@ -146,6 +146,10 @@ def main(argv=None):
         # crossmodal.py recovered to worktree (not in HEAD) -- ship it too
         if os.path.exists(os.path.join(HERE, "thinking/crossmodal.py")):
             sh(f"tar czf - -C {quote(HERE)} thinking/crossmodal.py | {ssh} 'tar --no-same-owner -xzf - -C {REMOTE}'")
+        # TTS reuses the trained realvoice vocoder (gitignored) for natural synthesis
+        if args.job == "tts" and os.path.exists(os.path.join(HERE, "runs/realvoice.pt")):
+            sh(f"{ssh} 'mkdir -p {REMOTE}/runs'")
+            sh(f"tar czf - -C {quote(HERE)} runs/realvoice.pt | {ssh} 'tar --no-same-owner -xzf - -C {REMOTE}'")
         if need_banks:
             banks = ("data/ljspeech",) if args.job == "realvoice" else ("data/speech24k",) if args.job == "vocoder24" else ("data/pronounce", "data/mimic", "data/speech16k")
             for bank in banks:
