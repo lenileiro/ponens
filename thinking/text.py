@@ -61,7 +61,7 @@ from .concepts import (
     latent_concept_transition_consistency_loss,
     latent_concept_vicreg_loss,
 )
-from .selection import concept_round_selection_decision
+from .selection import concept_round_selection_decision, signal_regression_report
 from .trace import Vocab
 
 DEV = get_device()
@@ -3318,6 +3318,7 @@ READING_DISCOVERY_SIGNALS = (
     "language", "generation", "view", "context", "span", "closure", "sequence",
     "neighborhood", "cluster", "fer", "bridge", "connection")
 READING_OBJECTIVE_PROFILES = ("manual", "mastery")
+READING_DEFAULT_SIGNAL_REGRESSION_TOLERANCE = 0.02
 READING_MASTERY_OBJECTIVE_FLOORS = {
     "lm_w": 1.0,
     "factorization_w": 0.05,
@@ -6884,7 +6885,7 @@ def reading_round_selection_decision(
         insight_accept_w=0.25, insight_min_delta=0.0,
         representation_delta=0.0, representation_allowed=True,
         representation_gate=False, representation_accept_w=0.0,
-        representation_min_delta=0.0):
+        representation_min_delta=0.0, signal_regression_allowed=True):
     base = concept_round_selection_decision(
         score_delta_from_best, score_min_delta, insight_delta=insight_delta,
         insight_allowed=insight_allowed, insight_gate=bridge_insight_gate,
@@ -6907,17 +6908,33 @@ def reading_round_selection_decision(
         bool(representation_allowed) and representation_boost > 0.0
         and selection_effective_delta > float(score_min_delta)
         and not bool(base["selected_by_score"]))
-    selected = bool(base["selected"] or selected_by_representation)
+    pre_signal_selected = bool(base["selected"] or selected_by_representation)
+    selected = bool(pre_signal_selected and signal_regression_allowed)
+    blocked_by_signal_regression = (
+        not bool(signal_regression_allowed) and pre_signal_selected)
     reasons = []
-    if bool(base["selected_by_score"]):
+    if selected and bool(base["selected_by_score"]):
         reasons.append("score")
-    if bool(base["selected_by_insight"]):
+    if selected and bool(base["selected_by_insight"]):
         reasons.append("concept_insight")
-    if selected_by_representation:
+    if selected and selected_by_representation:
         reasons.append("representation_insight")
+    blocked_reasons = []
+    if blocked_by_signal_regression:
+        blocked_reasons.append("signal_regression")
     return base | {
         "selected": selected,
-        "selected_by_representation": bool(selected_by_representation),
+        "selected_by_score": bool(selected and base["selected_by_score"]),
+        "selected_by_insight": bool(selected and base["selected_by_insight"]),
+        "selected_by_representation": bool(
+            selected and selected_by_representation),
+        "pre_signal_selected": bool(pre_signal_selected),
+        "pre_signal_selected_by_score": bool(base["selected_by_score"]),
+        "pre_signal_selected_by_insight": bool(base["selected_by_insight"]),
+        "pre_signal_selected_by_representation": bool(
+            selected_by_representation),
+        "blocked_by_signal_regression": bool(blocked_by_signal_regression),
+        "blocked_reasons": blocked_reasons,
         "representation_score_boost": float(representation_boost),
         "representation_effective_delta": float(representation_effective_delta),
         "selection_effective_delta": float(selection_effective_delta),
@@ -7015,6 +7032,7 @@ def fit_reading_concepts_select_best(
         generation_eval_n=0, generation_prompt_tokens=16,
         generation_max_new_tokens=32, generation_temperature=0.0,
         generation_top_k=0,
+        signal_regression_tolerance=READING_DEFAULT_SIGNAL_REGRESSION_TOLERANCE,
         score_min_delta=0.0, score_patience=0, score_target=0.0,
         insight_accept_w=0.25, insight_min_delta=0.0,
         representation_accept_w=0.0, representation_min_delta=0.0,
@@ -7034,6 +7052,10 @@ def fit_reading_concepts_select_best(
     score_target = float(score_target)
     if score_target < 0.0:
         raise ValueError("reading study score target must be non-negative")
+    signal_regression_tolerance = float(signal_regression_tolerance)
+    if signal_regression_tolerance < 0.0:
+        raise ValueError(
+            "reading study signal regression tolerance must be non-negative")
     insight_accept_w = float(insight_accept_w)
     if insight_accept_w < 0.0:
         raise ValueError("reading study insight accept weight must be non-negative")
@@ -7356,6 +7378,11 @@ def fit_reading_concepts_select_best(
             reading_representation_insight_delta(
                 representation_progress,
                 enabled=representation_accept_w > 0.0))
+        signal_regression = signal_regression_report(
+            current_bundle["score_components"], bundle["score_components"],
+            READING_SELF_TEACH_SCORE_KEYS,
+            tolerance=signal_regression_tolerance,
+            signals=READING_DISCOVERY_SIGNALS)
         decision = reading_round_selection_decision(
             score_delta_from_best, score_min_delta,
             insight_delta=concept_insight["delta"],
@@ -7367,7 +7394,8 @@ def fit_reading_concepts_select_best(
             representation_allowed=representation_insight_allowed,
             representation_gate=representation_accept_w > 0.0,
             representation_accept_w=representation_accept_w,
-            representation_min_delta=representation_min_delta)
+            representation_min_delta=representation_min_delta,
+            signal_regression_allowed=signal_regression["allowed"])
         selected = decision["selected"]
         rounds_report.append(row | {
             "selected": bool(selected),
@@ -7390,6 +7418,15 @@ def fit_reading_concepts_select_best(
             "representation_insight_allowed": bool(
                 representation_insight_allowed),
             "representation_progress": representation_progress,
+            "signal_regression_gate": True,
+            "signal_regression_allowed": bool(signal_regression["allowed"]),
+            "signal_regression": signal_regression,
+            "signal_regression_tolerance": float(
+                signal_regression_tolerance),
+            "signal_regression_max": float(
+                signal_regression["max_regression"]),
+            "signal_regression_signals": list(
+                signal_regression["regressed_signals"]),
             "training_weighted_sampling": bool(
                 round_train_metrics.get("training_weighted_sampling", False)),
             "training_priority_sampling": bool(
@@ -7442,6 +7479,17 @@ def fit_reading_concepts_select_best(
             "selected_by_insight": bool(decision["selected_by_insight"]),
             "selected_by_representation": bool(
                 decision["selected_by_representation"]),
+            "pre_signal_selected": bool(
+                decision.get("pre_signal_selected", False)),
+            "pre_signal_selected_by_score": bool(
+                decision.get("pre_signal_selected_by_score", False)),
+            "pre_signal_selected_by_insight": bool(
+                decision.get("pre_signal_selected_by_insight", False)),
+            "pre_signal_selected_by_representation": bool(
+                decision.get("pre_signal_selected_by_representation", False)),
+            "blocked_by_signal_regression": bool(
+                decision.get("blocked_by_signal_regression", False)),
+            "blocked_reasons": list(decision.get("blocked_reasons", ())),
             "insight_score_boost": float(decision["insight_score_boost"]),
             "insight_effective_delta": float(
                 decision["insight_effective_delta"]),
@@ -7495,6 +7543,8 @@ def fit_reading_concepts_select_best(
         "score_min_delta": float(score_min_delta),
         "score_patience": int(score_patience),
         "score_target": float(score_target),
+        "signal_regression_gate": True,
+        "signal_regression_tolerance": float(signal_regression_tolerance),
         "generation_eval_n": int(generation_eval_n),
         "generation_prompt_tokens": int(generation_prompt_tokens),
         "generation_max_new_tokens": int(generation_max_new_tokens),
@@ -7527,6 +7577,9 @@ def fit_reading_concepts_select_best(
             sum(1 for row in rounds_report
                 if int(row.get("round", 0)) > 0
                 and bool(row.get("weight_update_changed", False)))),
+        "signal_regression_blocked_round_count": int(
+            sum(1 for row in rounds_report
+                if bool(row.get("blocked_by_signal_regression", False)))),
         "selected_round": int(best_round),
         "accepted_update": bool(best_round > 0),
         "selected_score": float(best_score),
@@ -7562,6 +7615,10 @@ def fit_reading_concepts_select_best(
             selected_row.get("selection_effective_delta", 0.0))
         selection["selected_reasons"] = list(
             selected_row.get("selection_reasons", ()))
+        selection["selected_signal_regression"] = selected_row.get(
+            "signal_regression")
+        selection["selected_signal_regression_allowed"] = bool(
+            selected_row.get("signal_regression_allowed", True))
         selection["selected_insight"] = selected_row.get("study_pool_insight")
         selection["selected_representation_progress"] = selected_row.get(
             "representation_progress")
@@ -7670,6 +7727,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            study_score_min_delta=0.0,
                            study_score_patience=0,
                            study_score_target=0.0,
+                           study_signal_regression_tolerance=(
+                               READING_DEFAULT_SIGNAL_REGRESSION_TOLERANCE),
                            study_insight_accept_w=0.25,
                            study_insight_min_delta=0.0,
                            study_representation_accept_w=0.0,
@@ -7812,6 +7871,7 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             score_min_delta=study_score_min_delta,
             score_patience=study_score_patience,
             score_target=study_score_target,
+            signal_regression_tolerance=study_signal_regression_tolerance,
             generation_eval_n=generation_eval_n,
             generation_prompt_tokens=generation_prompt_tokens,
             generation_max_new_tokens=generation_max_new_tokens,
@@ -8077,6 +8137,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          study_score_metric="mastery", study_score_margin_w=0.1,
                          study_score_min_delta=0.0, study_score_patience=0,
                          study_score_target=0.0,
+                         study_signal_regression_tolerance=(
+                             READING_DEFAULT_SIGNAL_REGRESSION_TOLERANCE),
                          study_insight_accept_w=0.25,
                          study_insight_min_delta=0.0,
                          study_representation_accept_w=0.0,
@@ -8234,6 +8296,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             score_min_delta=study_score_min_delta,
             score_patience=study_score_patience,
             score_target=study_score_target,
+            signal_regression_tolerance=study_signal_regression_tolerance,
             generation_eval_n=generation_eval_n,
             generation_prompt_tokens=generation_prompt_tokens,
             generation_max_new_tokens=generation_max_new_tokens,
@@ -8541,6 +8604,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "study_score_min_delta": float(study_score_min_delta),
               "study_score_patience": int(study_score_patience),
               "study_score_target": float(study_score_target),
+              "study_signal_regression_tolerance": float(
+                  study_signal_regression_tolerance),
               "study_insight_accept_w": float(study_insight_accept_w),
               "study_insight_min_delta": float(study_insight_min_delta),
               "study_representation_accept_w": float(
@@ -8850,6 +8915,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              study_score_metric="mastery", study_score_margin_w=0.1,
                              study_score_min_delta=0.0, study_score_patience=0,
                              study_score_target=0.0,
+                             study_signal_regression_tolerance=(
+                                 READING_DEFAULT_SIGNAL_REGRESSION_TOLERANCE),
                              study_insight_accept_w=0.25,
                              study_insight_min_delta=0.0,
                              study_representation_accept_w=0.0,
@@ -9062,6 +9129,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             score_min_delta=study_score_min_delta,
             score_patience=study_score_patience,
             score_target=study_score_target,
+            signal_regression_tolerance=study_signal_regression_tolerance,
             generation_eval_n=generation_eval_n,
             generation_prompt_tokens=generation_prompt_tokens,
             generation_max_new_tokens=generation_max_new_tokens,
@@ -9426,6 +9494,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "study_score_min_delta": float(study_score_min_delta),
               "study_score_patience": int(study_score_patience),
               "study_score_target": float(study_score_target),
+              "study_signal_regression_tolerance": float(
+                  study_signal_regression_tolerance),
               "study_insight_accept_w": float(study_insight_accept_w),
               "study_insight_min_delta": float(study_insight_min_delta),
               "study_representation_accept_w": float(

@@ -960,7 +960,10 @@ def image_training_requirement_report(
         require_image_embeddings=False,
         require_image_embedding_sequences=False,
         require_quality_scores=False,
-        require_quality_score_range=False):
+        require_quality_score_range=False,
+        require_flow_width_for_image_embeddings=False,
+        flow_hidden=0,
+        image_embedding_dim=0):
     """Summarize generic data/representation prerequisites for serious image runs."""
     rows = list(records)
     n = len(rows)
@@ -1001,12 +1004,22 @@ def image_training_requirement_report(
             f"({int(quality_stats['n'])}/{n})")
     if require_quality_score_range and not bool(quality_stats["has_range"]):
         failures.append("quality score range required but all available scores are tied/missing")
+    flow_hidden = int(flow_hidden or 0)
+    image_embedding_dim = int(image_embedding_dim or 0)
+    if require_flow_width_for_image_embeddings:
+        if image_embedding_dim <= 0:
+            failures.append("image embedding dimension required for flow width check")
+        elif flow_hidden < image_embedding_dim:
+            failures.append(
+                "flow hidden width must be at least image embedding dimension "
+                f"({flow_hidden} < {image_embedding_dim})")
     return {
         "image_training_requirements_enabled": bool(
             min_records > 0 or require_text_embeddings
             or require_text_embedding_sequences or require_image_embeddings
             or require_image_embedding_sequences or require_quality_scores
-            or require_quality_score_range),
+            or require_quality_score_range
+            or require_flow_width_for_image_embeddings),
         "image_training_requirements_passed": not failures,
         "image_training_requirement_failures": failures,
         "min_image_records": int(min_records),
@@ -1016,7 +1029,11 @@ def image_training_requirement_report(
         "require_image_embedding_sequences": bool(require_image_embedding_sequences),
         "require_quality_scores": bool(require_quality_scores),
         "require_quality_score_range": bool(require_quality_score_range),
+        "require_flow_width_for_image_embeddings": bool(
+            require_flow_width_for_image_embeddings),
         "requirement_image_records": int(n),
+        "requirement_flow_hidden": int(flow_hidden),
+        "requirement_image_embedding_dim": int(image_embedding_dim),
         "requirement_text_embedding_records": int(text_embedding_records),
         "requirement_text_embedding_sequence_records": int(
             text_embedding_sequence_records),
@@ -12407,6 +12424,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       require_image_embedding_sequences=False,
                       require_quality_scores=False,
                       require_quality_score_range=False,
+                      require_flow_width_for_image_embeddings=False,
                       image_quality_weight=0.0,
                       image_source_weights="",
                       image_quality_score_w=0.0, flow_quality_score_w=0.0,
@@ -12547,6 +12565,24 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 or flow_repa_w > 0.0 or flow_repa_structure_w > 0.0
                 ) and image_embedding_in_dim <= 0:
             raise ValueError("image feature/REPA alignment requires image_embedding rows")
+        image_training_requirements = image_training_requirement_report(
+            image_records, quality_stats=image_quality_score_stats,
+            min_records=min_image_records,
+            require_text_embeddings=require_text_embeddings,
+            require_text_embedding_sequences=require_text_embedding_sequences,
+            require_image_embeddings=require_image_embeddings,
+            require_image_embedding_sequences=require_image_embedding_sequences,
+            require_quality_scores=require_quality_scores,
+            require_quality_score_range=require_quality_score_range,
+            require_flow_width_for_image_embeddings=(
+                require_flow_width_for_image_embeddings),
+            flow_hidden=hidden,
+            image_embedding_dim=image_embedding_in_dim)
+        if image_training_requirements["image_training_requirement_failures"]:
+            raise ValueError(
+                "image training requirements not met: "
+                + "; ".join(image_training_requirements[
+                    "image_training_requirement_failures"]))
         if (flow_repa_structure_w > 0.0
                 or (flow_repa_w > 0.0 and flow_repa_mode in ("token", "both"))):
             if not has_image_embedding_sequences:
@@ -14795,12 +14831,21 @@ def selftest():
             require_image_embeddings=True,
             require_image_embedding_sequences=True,
             require_quality_scores=True,
-            require_quality_score_range=True)
+            require_quality_score_range=True,
+            require_flow_width_for_image_embeddings=True,
+            flow_hidden=3,
+            image_embedding_dim=3)
         assert req_ok["image_training_requirements_passed"] is True
         req_bad = image_training_requirement_report(
             manifest_records[:1], min_records=2, require_quality_score_range=True)
         assert req_bad["image_training_requirements_passed"] is False
         assert len(req_bad["image_training_requirement_failures"]) == 2
+        req_width_bad = image_training_requirement_report(
+            manifest_records, require_flow_width_for_image_embeddings=True,
+            flow_hidden=2, image_embedding_dim=3)
+        assert req_width_bad["image_training_requirements_passed"] is False
+        assert "flow hidden width" in req_width_bad[
+            "image_training_requirement_failures"][0]
         dual_payload = record_text_condition_payload(manifest_records[:2], device="cpu")
         assert isinstance(dual_payload, dict)
         assert tuple(dual_payload["sequence"].shape) == (2, 2, 2)
@@ -15123,6 +15168,7 @@ def selftest():
             require_image_embedding_sequences=True,
             require_quality_scores=True,
             require_quality_score_range=True,
+            require_flow_width_for_image_embeddings=True,
             flow_preference_w=0.01, flow_preference_loss="dpo",
             flow_preference_beta=0.5, flow_preference_batch=1,
             sample_steps=1, flow_distill_steps=1,
@@ -15193,6 +15239,9 @@ def selftest():
         assert report["requirement_text_embedding_sequence_records"] == 3
         assert report["requirement_image_embedding_sequence_records"] == 3
         assert report["requirement_quality_score_has_range"] is True
+        assert report["require_flow_width_for_image_embeddings"] is True
+        assert report["requirement_flow_hidden"] == 16
+        assert report["requirement_image_embedding_dim"] == 3
         assert report["time_shift_mode"] == "auto"
         assert report["time_shift_effective_mode"] == "manual"
         assert report["time_sampling"] == "adaptive"
@@ -16265,6 +16314,10 @@ def main(argv=None):
     ap.add_argument("--require-quality-score-range", action="store_true",
                     dest="require_quality_score_range",
                     help="require non-tied quality scores for ranking/quality learning")
+    ap.add_argument("--require-flow-width-for-image-embeddings", action="store_true",
+                    dest="require_flow_width_for_image_embeddings",
+                    help=("require transformer hidden width to be at least the image "
+                          "embedding dimension used by feature/REPA alignment"))
     ap.add_argument("--caption-vocab-max", type=int, default=8192, dest="caption_vocab_max",
                     help="maximum caption vocabulary size for image manifests")
     ap.add_argument("--caption-max-len", type=int, default=64, dest="caption_max_len",
@@ -17303,6 +17356,8 @@ def main(argv=None):
         require_image_embedding_sequences=args.require_image_embedding_sequences,
         require_quality_scores=args.require_quality_scores,
         require_quality_score_range=args.require_quality_score_range,
+        require_flow_width_for_image_embeddings=(
+            args.require_flow_width_for_image_embeddings),
         image_quality_weight=args.image_quality_weight,
         image_source_weights=args.image_source_weights,
         image_quality_score_w=args.image_quality_score_w,
