@@ -151,19 +151,18 @@ def animate_preset(x, style, fs=SR):
 
 
 # ---- synthesis-from-text bridge (uses the trained tts_fast acoustic model) ----------------------
-def speak(text, ckpt="runs/tts_fast.pt", fs=SR):
-    """text -> human-voice waveform via the trained FastTTS + realvoice vocoder."""
+def speak(text, ckpt="runs/tts_ar.pt", fs=SR):
+    """text -> human-voice waveform via the trained autoregressive TransformerTTS + realvoice vocoder."""
     import torch
     from device import get_device
-    from .tts_fast import FastTTS, infer
+    from .tts_ar import TransformerTTS
     from .tts import encode_text
     dev = get_device()
-    model = FastTTS().to(dev)
+    model = TransformerTTS().to(dev)
     ck = torch.load(ckpt, map_location=dev)
-    model.load_state_dict(ck["state_dict"]); model.frames_per_char = ck.get("frames_per_char", 8)
-    model.eval()
+    model.load_state_dict(ck["state_dict"]); model.eval()
     ids = torch.tensor([encode_text(text)], device=dev)
-    spec = infer(model, ids, dev)[0].cpu().numpy()
+    spec = model.infer(ids)[0].cpu().numpy()
     from .realvoice import Vocos, griffin_lim
     if os.path.exists("runs/realvoice.pt"):
         voc = Vocos(d=512).to(dev)
@@ -225,7 +224,7 @@ STORY = [
 ]
 
 
-def story(lines=STORY, ckpt="runs/tts_fast.pt", out="data/synth/story_narration.wav", gap=0.25):
+def story(lines=STORY, ckpt="runs/tts_ar.pt", out="data/synth/story_narration.wav", gap=0.25):
     """Synthesize a narration, animating each line with its character/emotion voice, then stitch
     into one wav -> demonstrates ANIMATED storytelling variation."""
     sil = np.zeros(int(gap * SR), dtype=np.float32)
@@ -244,7 +243,7 @@ def main(argv=None):
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--in", dest="inp", default="")
     ap.add_argument("--from-text", dest="from_text", default="")
-    ap.add_argument("--ckpt", default="runs/tts_fast.pt")
+    ap.add_argument("--ckpt", default="runs/tts_ar.pt")
     ap.add_argument("--sing", action="store_true")
     ap.add_argument("--animate", action="store_true")
     ap.add_argument("--story", action="store_true")

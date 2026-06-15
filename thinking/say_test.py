@@ -59,7 +59,7 @@ def _asr_pipe(device):
     return pipeline("automatic-speech-recognition", model="openai/whisper-base.en", device=dev)
 
 
-def run(ckpt="runs/tts_fast.pt", out=None, synth_out="data/synth", device=None):
+def run(ckpt="runs/tts_ar.pt", out=None, synth_out="data/synth", device=None):
     from device import get_device
     from .prosody import speak, _write, SR
     device = device or get_device()
@@ -99,7 +99,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--run", action="store_true")
-    ap.add_argument("--ckpt", default="runs/tts_fast.pt")
+    ap.add_argument("--ckpt", default="runs/tts_ar.pt")
     ap.add_argument("--out", default="runs/say_test.json")
     ap.add_argument("--synth-out", dest="synth_out", default="data/synth")
     args = ap.parse_args(argv)
