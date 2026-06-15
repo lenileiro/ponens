@@ -944,6 +944,46 @@ def upload_path_cmd(local_path, remote_path, ssh):
     )
 
 
+def robust_upload_large_file(local_path, remote_path, ssh, shard_bytes=400_000_000, tries=6):
+    """Reliable multi-GB upload: byte-split locally, gzip-stream each shard to a separate
+    remote file with size-verify + retry (idempotent overwrite), then cat shards in order on
+    the pod. cat of byte-split shards reproduces the file exactly. Avoids the single-stream
+    tar|ssh broken-pipe failure on large manifests (no rsync/apt dependency)."""
+    import glob as _glob
+    import shutil as _shutil
+    import tempfile as _tempfile
+    local_path = os.path.abspath(local_path)
+    remote_dir = os.path.dirname(remote_path) or "."
+    sh(f"{ssh} {shlex_quote('mkdir -p ' + remote_dir + ' && rm -f ' + remote_path + ' ' + remote_path + '.part.*')}")
+    work = _tempfile.mkdtemp(prefix="mmshard_")
+    try:
+        prefix = os.path.join(work, "part.")
+        if subprocess.run(["split", "-b", str(int(shard_bytes)), local_path, prefix]).returncode != 0:
+            raise RuntimeError("local split failed for manifest upload")
+        shards = sorted(_glob.glob(prefix + "*"))
+        if not shards:
+            raise RuntimeError("manifest split produced no shards")
+        print(f"  robust upload: {len(shards)} shards x ~{shard_bytes//1_000_000}MB -> {remote_path}")
+        for i, sh_path in enumerate(shards):
+            size = os.path.getsize(sh_path)
+            rp = f"{remote_path}.part.{i:04d}"
+            ok = False
+            for _ in range(tries):
+                if sh(f"gzip -c {shlex_quote(sh_path)} | {ssh} {shlex_quote('gunzip -c > ' + rp)}") != 0:
+                    continue
+                chk = subprocess.run(f"{ssh} {shlex_quote('stat -c %s ' + rp)}",
+                                     shell=True, capture_output=True, text=True)
+                if chk.returncode == 0 and chk.stdout.strip() == str(size):
+                    ok = True
+                    break
+            if not ok:
+                raise RuntimeError(f"manifest shard {i} upload failed after {tries} tries")
+        if sh(f"{ssh} {shlex_quote('cat ' + remote_path + '.part.* > ' + remote_path + ' && rm -f ' + remote_path + '.part.*')}") != 0:
+            raise RuntimeError("manifest shard concat failed on pod")
+    finally:
+        _shutil.rmtree(work, ignore_errors=True)
+
+
 def payload(args):
     """Build the pod-side command for supported manifest/raw-data training jobs."""
     py = "python3 -u" if args.fast else "/root/fer-venv/bin/python -u"
@@ -2157,6 +2197,7 @@ def payload(args):
                 f"--batch {args.multimodal_batch} --dim {mm_dim} "
                 f"--layers {args.multimodal_layers} --heads {args.multimodal_heads} "
                 f"--max-vocab {args.multimodal_max_vocab} "
+                f"--max-len {args.multimodal_max_len} "
                 f"--objective-profile {args.multimodal_objective_profile} "
                 f"--decode-objective {args.multimodal_decode_objective} "
                 f"--source-balance-w {args.multimodal_source_balance_w} "
@@ -4305,6 +4346,10 @@ def main():
                     help="train generic manifest-driven multimodal prefix bridge")
     ap.add_argument("--multimodal-manifest", default="", dest="multimodal_manifest",
                     help="JSONL manifest passed to thinking.multimodal --manifest")
+    ap.add_argument("--multimodal-upload-manifest", action="store_true",
+                    dest="multimodal_upload_manifest",
+                    help="scp the (large, uncommitted) --multimodal-manifest to the pod instead "
+                         "of shipping it via git-archive; rewrites the arg to the pod path")
     ap.add_argument("--multimodal-text-data", action="append", default=None,
                     dest="multimodal_text_data",
                     help=("raw text/code source passed to thinking.multimodal "
@@ -4347,6 +4392,9 @@ def main():
     ap.add_argument("--multimodal-max-vocab", type=int, default=0,
                     dest="multimodal_max_vocab",
                     help="cap vocab to N most frequent tokens (0 = uncapped)")
+    ap.add_argument("--multimodal-max-len", type=int, default=128,
+                    dest="multimodal_max_len",
+                    help="decoder max sequence length (raise for longer causal windows)")
     ap.add_argument("--multimodal-source-balance-w", type=float,
                     default=MULTIMODAL_DEFAULT_SOURCE_BALANCE_W,
                     dest="multimodal_source_balance_w",
@@ -6172,6 +6220,13 @@ def main():
             "cloudType": args.cloud, "containerDiskInGb": args.disk, "ports": ["22/tcp"],
             "env": {"PUBLIC_KEY": pubkey}}
     cap = args.max_minutes * 60
+    multimodal_manifest_upload_src = ""
+    if args.multimodal_upload_manifest:
+        if not args.multimodal_manifest:
+            sys.exit("ERROR: --multimodal-upload-manifest requires --multimodal-manifest")
+        multimodal_manifest_upload_src = os.path.abspath(args.multimodal_manifest)
+        args.multimodal_manifest = os.path.join(
+            REMOTE, "data", os.path.basename(args.multimodal_manifest))
     try:
         run = payload(args)
     except ValueError as exc:
@@ -6308,6 +6363,9 @@ def main():
                   f"--exclude '*.tgz' -C {HERE} . "
                   f"| {ssh} 'mkdir -p {REMOTE} && tar --no-same-owner -xzf - -C {REMOTE}'")
         sh(up)
+        if multimodal_manifest_upload_src:
+            robust_upload_large_file(
+                multimodal_manifest_upload_src, args.multimodal_manifest, ssh)
         if args.upload_image_data:
             root_local = local_path_for_arg(args.image_root)
             root_remote = remote_path_for_arg(args.image_root)
