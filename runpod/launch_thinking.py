@@ -687,6 +687,18 @@ def apply_image_quality_preset(args):
         args.image_sample_pixel_dynamic_threshold_percentile = 0.995
     args.image_sample_pixel_dynamic_threshold_max = max(
         float(args.image_sample_pixel_dynamic_threshold_max), 1.0)
+    if args.image_sample_min_finite_frac is None:
+        args.image_sample_min_finite_frac = 1.0
+    if args.image_sample_max_nonfinite_frac is None:
+        args.image_sample_max_nonfinite_frac = 0.0
+    if hq and args.image_sample_max_collapsed_frac is None:
+        args.image_sample_max_collapsed_frac = 0.25
+    if hq and args.image_sample_min_detail_energy is None:
+        args.image_sample_min_detail_energy = 0.04
+    if hq and args.image_sample_min_dynamic_range is None:
+        args.image_sample_min_dynamic_range = 0.25
+    if hq and args.image_sample_min_luminance_std is None:
+        args.image_sample_min_luminance_std = 0.04
     args.image_eval_sweep = True
     args.image_eval_generated_candidates_per_prompt = max(
         int(args.image_eval_generated_candidates_per_prompt), 4 if hq else 2)
@@ -1040,6 +1052,17 @@ def payload(args):
                     sample_manifest_args += (
                         f" --sample-candidates-image-dir "
                         f"{shlex_quote(args.image_sample_candidates_image_dir)}")
+            sample_quality_gate_args = ""
+            for flag, value in (
+                    ("sample-min-finite-frac", args.image_sample_min_finite_frac),
+                    ("sample-max-nonfinite-frac", args.image_sample_max_nonfinite_frac),
+                    ("sample-max-collapsed-frac", args.image_sample_max_collapsed_frac),
+                    ("sample-min-health-score", args.image_sample_min_health_score),
+                    ("sample-min-detail-energy", args.image_sample_min_detail_energy),
+                    ("sample-min-dynamic-range", args.image_sample_min_dynamic_range),
+                    ("sample-min-luminance-std", args.image_sample_min_luminance_std)):
+                if value is not None:
+                    sample_quality_gate_args += f" --{flag} {value}"
             prompt_grid_args = ""
             if args.image_sample_prompts:
                 prompt_grid_args += f" --sample-prompts {shlex_quote(args.image_sample_prompts)}"
@@ -1372,7 +1395,8 @@ def payload(args):
             if args.image_sample_grid:
                 train += (f" --sample-grid-out {grid} "
                           f"--sample-grid-samples {args.image_sample_grid_samples}"
-                          f"{sample_manifest_args}{prompt_grid_args}")
+                          f"{sample_manifest_args}{prompt_grid_args}"
+                          f"{sample_quality_gate_args}")
             if args.image_sample_reference_grid:
                 train += reference_grid_args
             if args.image_no_ema_warmup:
@@ -1461,7 +1485,8 @@ def payload(args):
                 if args.image_sample_grid:
                     eval_cmd += (f" --sample-grid-out {grid} "
                                  f"--sample-grid-samples {args.image_sample_grid_samples}"
-                                 f"{sample_manifest_args}{prompt_grid_args}")
+                                 f"{sample_manifest_args}{prompt_grid_args}"
+                                 f"{sample_quality_gate_args}")
                 if args.image_sample_reference_grid:
                     eval_cmd += reference_grid_args
                 train += eval_cmd
@@ -3507,6 +3532,27 @@ def main():
     ap.add_argument("--image-sample-selection-health-w", type=float, default=1.0,
                     dest="image_sample_selection_health_w",
                     help="latent prompt candidate-selection weight for sample health")
+    ap.add_argument("--image-sample-min-finite-frac", type=float, default=None,
+                    dest="image_sample_min_finite_frac",
+                    help="fail latent sample grid if finite-pixel fraction is below this")
+    ap.add_argument("--image-sample-max-nonfinite-frac", type=float, default=None,
+                    dest="image_sample_max_nonfinite_frac",
+                    help="fail latent sample grid if non-finite pixel fraction exceeds this")
+    ap.add_argument("--image-sample-max-collapsed-frac", type=float, default=None,
+                    dest="image_sample_max_collapsed_frac",
+                    help="fail latent sample grid if collapsed-sample fraction exceeds this")
+    ap.add_argument("--image-sample-min-health-score", type=float, default=None,
+                    dest="image_sample_min_health_score",
+                    help="fail latent sample grid if health score is below this")
+    ap.add_argument("--image-sample-min-detail-energy", type=float, default=None,
+                    dest="image_sample_min_detail_energy",
+                    help="fail latent sample grid if detail energy is below this")
+    ap.add_argument("--image-sample-min-dynamic-range", type=float, default=None,
+                    dest="image_sample_min_dynamic_range",
+                    help="fail latent sample grid if luminance dynamic range is below this")
+    ap.add_argument("--image-sample-min-luminance-std", type=float, default=None,
+                    dest="image_sample_min_luminance_std",
+                    help="fail latent sample grid if luminance standard deviation is below this")
     ap.add_argument("--image-sample-text-guidance-w", type=float, default=0.0,
                     dest="image_sample_text_guidance_w",
                     help=("sampling-time text-image alignment guidance weight for latent "
@@ -4728,6 +4774,18 @@ def main():
         sys.exit(
             "ERROR: --image-sample-reference-image-dir requires "
             "--image-sample-reference-manifest-out")
+    for name in (
+            "image_sample_min_finite_frac", "image_sample_max_nonfinite_frac",
+            "image_sample_max_collapsed_frac"):
+        value = getattr(args, name)
+        if value is not None and (value < 0.0 or value > 1.0):
+            sys.exit(f"ERROR: --{name.replace('_', '-')} must be in [0, 1]")
+    for name in (
+            "image_sample_min_health_score", "image_sample_min_detail_energy",
+            "image_sample_min_dynamic_range", "image_sample_min_luminance_std"):
+        value = getattr(args, name)
+        if value is not None and value < 0.0:
+            sys.exit(f"ERROR: --{name.replace('_', '-')} must be non-negative")
     if args.image_reference_eval and not args.image_sample_reference_grid:
         sys.exit("ERROR: --image-reference-eval requires --image-sample-reference-grid")
     if args.image_reference_eval and not args.image_sample_reference_manifest_out:
