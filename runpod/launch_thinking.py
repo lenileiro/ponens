@@ -4306,6 +4306,10 @@ def main():
                     help="train generic manifest-driven multimodal prefix bridge")
     ap.add_argument("--multimodal-manifest", default="", dest="multimodal_manifest",
                     help="JSONL manifest passed to thinking.multimodal --manifest")
+    ap.add_argument("--multimodal-upload-manifest", action="store_true",
+                    dest="multimodal_upload_manifest",
+                    help="scp the (large, uncommitted) --multimodal-manifest to the pod instead "
+                         "of shipping it via git-archive; rewrites the arg to the pod path")
     ap.add_argument("--multimodal-text-data", action="append", default=None,
                     dest="multimodal_text_data",
                     help=("raw text/code source passed to thinking.multimodal "
@@ -6176,6 +6180,13 @@ def main():
             "cloudType": args.cloud, "containerDiskInGb": args.disk, "ports": ["22/tcp"],
             "env": {"PUBLIC_KEY": pubkey}}
     cap = args.max_minutes * 60
+    multimodal_manifest_upload_src = ""
+    if args.multimodal_upload_manifest:
+        if not args.multimodal_manifest:
+            sys.exit("ERROR: --multimodal-upload-manifest requires --multimodal-manifest")
+        multimodal_manifest_upload_src = os.path.abspath(args.multimodal_manifest)
+        args.multimodal_manifest = os.path.join(
+            REMOTE, "data", os.path.basename(args.multimodal_manifest))
     try:
         run = payload(args)
     except ValueError as exc:
@@ -6312,6 +6323,8 @@ def main():
                   f"--exclude '*.tgz' -C {HERE} . "
                   f"| {ssh} 'mkdir -p {REMOTE} && tar --no-same-owner -xzf - -C {REMOTE}'")
         sh(up)
+        if multimodal_manifest_upload_src:
+            sh(upload_path_cmd(multimodal_manifest_upload_src, args.multimodal_manifest, ssh))
         if args.upload_image_data:
             root_local = local_path_for_arg(args.image_root)
             root_remote = remote_path_for_arg(args.image_root)
