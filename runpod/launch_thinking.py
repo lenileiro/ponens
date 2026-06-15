@@ -713,6 +713,16 @@ def apply_image_quality_preset(args):
         int(args.image_quality_loop_vision_read_heads), 4)
     args.image_quality_loop_vision_read_eval_n = max(
         int(args.image_quality_loop_vision_read_eval_n), 64 if hq else 32)
+    args.image_generated_eval_visual_stats_size = max(
+        int(args.image_generated_eval_visual_stats_size), 64)
+    args.image_generated_eval_visual_stats_max_records = max(
+        int(args.image_generated_eval_visual_stats_max_records), 512 if hq else 256)
+    if args.image_generated_eval_min_visual_detail_ratio is None:
+        args.image_generated_eval_min_visual_detail_ratio = 0.02
+    if args.image_generated_eval_min_visual_dynamic_range_ratio is None:
+        args.image_generated_eval_min_visual_dynamic_range_ratio = 0.05
+    if args.image_generated_eval_min_visual_luminance_std_ratio is None:
+        args.image_generated_eval_min_visual_luminance_std_ratio = 0.05
     args.image_prompt_embed_backend = args.image_embed_backend
     args.image_prompt_embed_model = args.image_embed_model
     if not args.image_prompt_embed_text_sequence_model:
@@ -1512,6 +1522,34 @@ def payload(args):
                     generated_eval += (
                         f" --min-generated-real-l2-p01 "
                         f"{args.image_generated_eval_min_real_l2_p01}")
+                if args.image_generated_eval_visual_stats_size > 0:
+                    generated_eval += (
+                        f" --visual-stats-size "
+                        f"{args.image_generated_eval_visual_stats_size}")
+                    if args.image_generated_eval_visual_stats_max_records > 0:
+                        generated_eval += (
+                            f" --visual-stats-max-records "
+                            f"{args.image_generated_eval_visual_stats_max_records}")
+                if args.image_generated_eval_max_visual_physics_l1 is not None:
+                    generated_eval += (
+                        f" --max-visual-physics-l1 "
+                        f"{args.image_generated_eval_max_visual_physics_l1}")
+                if args.image_generated_eval_max_visual_physics_mmd_rbf is not None:
+                    generated_eval += (
+                        f" --max-visual-physics-mmd-rbf "
+                        f"{args.image_generated_eval_max_visual_physics_mmd_rbf}")
+                if args.image_generated_eval_min_visual_detail_ratio is not None:
+                    generated_eval += (
+                        f" --min-visual-detail-ratio "
+                        f"{args.image_generated_eval_min_visual_detail_ratio}")
+                if args.image_generated_eval_min_visual_dynamic_range_ratio is not None:
+                    generated_eval += (
+                        f" --min-visual-dynamic-range-ratio "
+                        f"{args.image_generated_eval_min_visual_dynamic_range_ratio}")
+                if args.image_generated_eval_min_visual_luminance_std_ratio is not None:
+                    generated_eval += (
+                        f" --min-visual-luminance-std-ratio "
+                        f"{args.image_generated_eval_min_visual_luminance_std_ratio}")
                 if args.image_generated_eval_fail_on_gate:
                     generated_eval += " --fail-on-gate"
                 train += generated_embed + generated_eval
@@ -1613,6 +1651,34 @@ def payload(args):
                         quality_loop += (
                             f" --min-generated-real-l2-p01 "
                             f"{args.image_generated_eval_min_real_l2_p01}")
+                    if args.image_generated_eval_visual_stats_size > 0:
+                        quality_loop += (
+                            f" --visual-stats-size "
+                            f"{args.image_generated_eval_visual_stats_size}")
+                        if args.image_generated_eval_visual_stats_max_records > 0:
+                            quality_loop += (
+                                f" --visual-stats-max-records "
+                                f"{args.image_generated_eval_visual_stats_max_records}")
+                    if args.image_generated_eval_max_visual_physics_l1 is not None:
+                        quality_loop += (
+                            f" --max-visual-physics-l1 "
+                            f"{args.image_generated_eval_max_visual_physics_l1}")
+                    if args.image_generated_eval_max_visual_physics_mmd_rbf is not None:
+                        quality_loop += (
+                            f" --max-visual-physics-mmd-rbf "
+                            f"{args.image_generated_eval_max_visual_physics_mmd_rbf}")
+                    if args.image_generated_eval_min_visual_detail_ratio is not None:
+                        quality_loop += (
+                            f" --min-visual-detail-ratio "
+                            f"{args.image_generated_eval_min_visual_detail_ratio}")
+                    if args.image_generated_eval_min_visual_dynamic_range_ratio is not None:
+                        quality_loop += (
+                            f" --min-visual-dynamic-range-ratio "
+                            f"{args.image_generated_eval_min_visual_dynamic_range_ratio}")
+                    if args.image_generated_eval_min_visual_luminance_std_ratio is not None:
+                        quality_loop += (
+                            f" --min-visual-luminance-std-ratio "
+                            f"{args.image_generated_eval_min_visual_luminance_std_ratio}")
                     if args.image_quality_loop_max_sensor_loss is not None:
                         quality_loop += (
                             f" --vision-read-max-sensor-loss "
@@ -3220,6 +3286,36 @@ def main():
                     dest="image_generated_eval_min_real_l2_p01",
                     help=("minimum generated/real nearest-neighbor L2 p01 "
                           "for generated-sample image_eval"))
+    ap.add_argument("--image-generated-eval-visual-stats-size", type=int,
+                    default=0,
+                    dest="image_generated_eval_visual_stats_size",
+                    help=("compute generic visual-physics stats for generated-sample "
+                          "image_eval at this image size; presets enable this"))
+    ap.add_argument("--image-generated-eval-visual-stats-max-records", type=int,
+                    default=0,
+                    dest="image_generated_eval_visual_stats_max_records",
+                    help=("maximum records per manifest for generated-sample "
+                          "visual-physics stats; 0 means all loaded records"))
+    ap.add_argument("--image-generated-eval-max-visual-physics-l1", type=float,
+                    default=None,
+                    dest="image_generated_eval_max_visual_physics_l1",
+                    help="maximum generated/reference visual-physics feature L1 drift")
+    ap.add_argument("--image-generated-eval-max-visual-physics-mmd-rbf", type=float,
+                    default=None,
+                    dest="image_generated_eval_max_visual_physics_mmd_rbf",
+                    help="maximum generated/reference visual-physics RBF-MMD distance")
+    ap.add_argument("--image-generated-eval-min-visual-detail-ratio", type=float,
+                    default=None,
+                    dest="image_generated_eval_min_visual_detail_ratio",
+                    help="minimum generated/reference detail-energy ratio")
+    ap.add_argument("--image-generated-eval-min-visual-dynamic-range-ratio", type=float,
+                    default=None,
+                    dest="image_generated_eval_min_visual_dynamic_range_ratio",
+                    help="minimum generated/reference luminance dynamic-range ratio")
+    ap.add_argument("--image-generated-eval-min-visual-luminance-std-ratio", type=float,
+                    default=None,
+                    dest="image_generated_eval_min_visual_luminance_std_ratio",
+                    help="minimum generated/reference luminance standard-deviation ratio")
     ap.add_argument("--image-generated-eval-fail-on-gate", action="store_true",
                     dest="image_generated_eval_fail_on_gate",
                     help="fail the RunPod job if configured generated-sample eval gates fail")
@@ -4544,6 +4640,25 @@ def main():
     if (args.image_generated_eval_min_real_l2_p01 is not None
             and args.image_generated_eval_min_real_l2_p01 < 0.0):
         sys.exit("ERROR: --image-generated-eval-min-real-l2-p01 must be non-negative")
+    if args.image_generated_eval_visual_stats_size < 0:
+        sys.exit("ERROR: --image-generated-eval-visual-stats-size must be non-negative")
+    if args.image_generated_eval_visual_stats_max_records < 0:
+        sys.exit("ERROR: --image-generated-eval-visual-stats-max-records must be non-negative")
+    generated_eval_visual_thresholds = {
+        "--image-generated-eval-max-visual-physics-l1": (
+            args.image_generated_eval_max_visual_physics_l1),
+        "--image-generated-eval-max-visual-physics-mmd-rbf": (
+            args.image_generated_eval_max_visual_physics_mmd_rbf),
+        "--image-generated-eval-min-visual-detail-ratio": (
+            args.image_generated_eval_min_visual_detail_ratio),
+        "--image-generated-eval-min-visual-dynamic-range-ratio": (
+            args.image_generated_eval_min_visual_dynamic_range_ratio),
+        "--image-generated-eval-min-visual-luminance-std-ratio": (
+            args.image_generated_eval_min_visual_luminance_std_ratio),
+    }
+    for name, value in generated_eval_visual_thresholds.items():
+        if value is not None and value < 0.0:
+            sys.exit(f"ERROR: {name} must be non-negative")
     if args.image_quality_loop_vision_read_steps < 0:
         sys.exit("ERROR: --image-quality-loop-vision-read-steps must be non-negative")
     quality_loop_positive = {

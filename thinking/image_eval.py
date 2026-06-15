@@ -23,6 +23,7 @@ from .image_data import (
     ImageTextRecord,
     _coerce_record,
     caption_tokens,
+    load_image_tensor,
     merge_embedding_sidecar,
     read_image_manifest,
     summarize_records,
@@ -32,6 +33,24 @@ from .image_data import (
 EMBEDDING_KINDS = ("image", "text", "image_sequence", "text_sequence")
 DIM_POLICIES = ("error", "largest")
 EPS = 1.0e-12
+VISUAL_FEATURE_NAMES = (
+    "layout_mass",
+    "layout_cx",
+    "layout_cy",
+    "layout_var_x",
+    "layout_var_y",
+    "layout_cov_xy",
+    "edge_mass",
+    "edge_cx",
+    "edge_cy",
+    "edge_var_x",
+    "edge_var_y",
+    "edge_cov_xy",
+    "detail_energy",
+    "luminance_std",
+    "dynamic_range",
+    "channel_std",
+)
 
 
 @dataclass(frozen=True)
@@ -147,6 +166,133 @@ def _normalize_rows(x, eps=1.0e-12):
     x = np.asarray(x, dtype=np.float64)
     denom = np.linalg.norm(x, axis=1, keepdims=True)
     return x / np.maximum(denom, float(eps))
+
+
+def _weighted_moments_2d(weight, xx, yy, eps=1.0e-12):
+    denom = max(float(np.sum(weight)), float(eps))
+    cx = float(np.sum(weight * xx) / denom)
+    cy = float(np.sum(weight * yy) / denom)
+    dx = xx - cx
+    dy = yy - cy
+    return [
+        float(denom / max(1, int(weight.shape[0]) * int(weight.shape[1]))),
+        cx,
+        cy,
+        float(np.sum(weight * dx * dx) / denom),
+        float(np.sum(weight * dy * dy) / denom),
+        float(np.sum(weight * dx * dy) / denom),
+    ]
+
+
+def visual_physics_feature(image, eps=1.0e-12):
+    """Return category-free visual structure stats for an image tensor/array.
+
+    The feature vector mirrors the training-side visual physics loss: visual
+    mass, edge mass, centroids, spread, orientation, and simple image-health
+    statistics. It does not encode object labels, grammar, or color rules.
+    """
+    arr = np.asarray(image, dtype=np.float64)
+    if arr.ndim != 3:
+        raise ValueError(f"visual physics feature expects CHW image, got {arr.shape}")
+    arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0)
+    arr = np.clip(arr, -1.0, 1.0)
+    _c, h, w = arr.shape
+    if h <= 0 or w <= 0:
+        raise ValueError("visual physics feature requires non-empty spatial dimensions")
+    yy, xx = np.meshgrid(
+        np.linspace(-1.0, 1.0, int(h), dtype=np.float64),
+        np.linspace(-1.0, 1.0, int(w), dtype=np.float64),
+        indexing="ij",
+    )
+    mass = np.mean(arr * arr, axis=0)
+    dx = arr[:, :, 1:] - arr[:, :, :-1]
+    dy = arr[:, 1:, :] - arr[:, :-1, :]
+    dx_energy = np.pad(np.mean(dx * dx, axis=0), ((0, 0), (0, 1)))
+    dy_energy = np.pad(np.mean(dy * dy, axis=0), ((0, 1), (0, 0)))
+    edge = np.sqrt(dx_energy + dy_energy + float(eps))
+    layout = _weighted_moments_2d(mass + edge, xx, yy, eps=eps)
+    edge_layout = _weighted_moments_2d(edge, xx, yy, eps=eps)
+    lum = arr.mean(axis=0)
+    detail = float(np.sqrt(np.mean(dx_energy + dy_energy)))
+    dynamic = float(np.max(lum) - np.min(lum))
+    channel_std = float(np.mean(np.std(arr.reshape(arr.shape[0], -1), axis=1)))
+    return np.asarray(
+        layout + edge_layout + [
+            detail,
+            float(np.std(lum)),
+            dynamic,
+            channel_std,
+        ],
+        dtype=np.float64,
+    )
+
+
+def _visual_feature_summary(mat, prefix):
+    mat = np.asarray(mat, dtype=np.float64)
+    report = {
+        f"{prefix}_feature_names": list(VISUAL_FEATURE_NAMES),
+        f"{prefix}_n": int(mat.shape[0]) if mat.ndim == 2 else 0,
+    }
+    if mat.ndim != 2 or mat.shape[0] <= 0:
+        for name in ("detail_energy", "luminance_std", "dynamic_range", "channel_std"):
+            report[f"{prefix}_{name}_mean"] = 0.0
+            report[f"{prefix}_{name}_p05"] = 0.0
+        return report
+    for name in ("detail_energy", "luminance_std", "dynamic_range", "channel_std"):
+        idx = VISUAL_FEATURE_NAMES.index(name)
+        vals = mat[:, idx]
+        report[f"{prefix}_{name}_mean"] = float(np.mean(vals))
+        report[f"{prefix}_{name}_p05"] = _finite_percentile(vals, 5)
+    return report
+
+
+def visual_physics_matrix(records: Sequence[ImageTextRecord], size=64,
+                          max_records=0, prefix="visual_physics"):
+    size = int(size or 0)
+    if size <= 0:
+        return MatrixRows(
+            matrix=np.zeros((0, len(VISUAL_FEATURE_NAMES)), dtype=np.float64),
+            records=tuple(),
+            report={
+                f"{prefix}_enabled": False,
+                f"{prefix}_size": int(size),
+                f"{prefix}_records": int(len(records)),
+                f"{prefix}_usable": 0,
+                f"{prefix}_failed": 0,
+                f"{prefix}_max_records": int(max_records or 0),
+                f"{prefix}_feature_names": list(VISUAL_FEATURE_NAMES),
+            },
+        )
+    rows = []
+    kept = []
+    failures = []
+    limit = int(max_records or 0)
+    for rec in records:
+        if limit and len(kept) + len(failures) >= limit:
+            break
+        try:
+            img = load_image_tensor(
+                rec.path, size=size, device="cpu", crop_mode="center")
+            rows.append(visual_physics_feature(img.detach().cpu().numpy()))
+            kept.append(rec)
+        except Exception as exc:
+            failures.append({"image": rec.path, "error": str(exc)[:200]})
+    matrix = (
+        np.stack(rows, axis=0).astype(np.float64, copy=False)
+        if rows else np.zeros((0, len(VISUAL_FEATURE_NAMES)), dtype=np.float64)
+    )
+    report = {
+        f"{prefix}_enabled": True,
+        f"{prefix}_size": int(size),
+        f"{prefix}_records": int(len(records)),
+        f"{prefix}_usable": int(matrix.shape[0]),
+        f"{prefix}_failed": int(len(failures)),
+        f"{prefix}_max_records": int(limit),
+        f"{prefix}_failures": failures[:5],
+        f"{prefix}_feature_names": list(VISUAL_FEATURE_NAMES),
+    }
+    report.update(_visual_feature_summary(matrix, prefix))
+    return MatrixRows(matrix=matrix, records=tuple(kept), report=report)
 
 
 def _clamp01(x):
@@ -478,6 +624,47 @@ def embedding_distribution_metrics(generated, real, prefix="image_embedding_dist
     }
 
 
+def visual_physics_distribution_metrics(generated, real, prefix="visual_physics_distribution"):
+    generated = np.asarray(generated, dtype=np.float64)
+    real = np.asarray(real, dtype=np.float64)
+    if generated.ndim != 2 or real.ndim != 2:
+        raise ValueError("generated and real visual physics features must be matrices")
+    if generated.shape[0] <= 0 or real.shape[0] <= 0:
+        out = {
+            f"{prefix}_generated_n": int(generated.shape[0]) if generated.ndim == 2 else 0,
+            f"{prefix}_real_n": int(real.shape[0]) if real.ndim == 2 else 0,
+            f"{prefix}_available": False,
+            f"{prefix}_mean_feature_l1": 0.0,
+            f"{prefix}_detail_energy_ratio": 0.0,
+            f"{prefix}_dynamic_range_ratio": 0.0,
+            f"{prefix}_luminance_std_ratio": 0.0,
+        }
+        return out
+    if generated.shape[1] != real.shape[1]:
+        raise ValueError(
+            f"generated/real visual feature dims differ: "
+            f"{generated.shape[1]} vs {real.shape[1]}"
+        )
+    out = embedding_distribution_metrics(generated, real, prefix=prefix)
+    out.update(embedding_neighborhood_metrics(generated, real, prefix=prefix))
+    gen_mean = generated.mean(axis=0)
+    real_mean = real.mean(axis=0)
+    detail_idx = VISUAL_FEATURE_NAMES.index("detail_energy")
+    dynamic_idx = VISUAL_FEATURE_NAMES.index("dynamic_range")
+    lum_idx = VISUAL_FEATURE_NAMES.index("luminance_std")
+    out.update({
+        f"{prefix}_available": True,
+        f"{prefix}_mean_feature_l1": float(np.mean(np.abs(gen_mean - real_mean))),
+        f"{prefix}_detail_energy_ratio": float(
+            gen_mean[detail_idx] / max(real_mean[detail_idx], EPS)),
+        f"{prefix}_dynamic_range_ratio": float(
+            gen_mean[dynamic_idx] / max(real_mean[dynamic_idx], EPS)),
+        f"{prefix}_luminance_std_ratio": float(
+            gen_mean[lum_idx] / max(real_mean[lum_idx], EPS)),
+    })
+    return out
+
+
 def image_text_alignment_metrics(records: Sequence[ImageTextRecord], prefix="image_text_alignment",
                                  dim_policy="error", normalize=True):
     image_rows = []
@@ -593,6 +780,24 @@ def image_eval_composite_score(report, embedding_kind="image"):
                 report.get("generated_image_text_alignment_t2i_acc")), 0.25),
         ])
         components.append(("alignment", alignment_score, 0.20))
+    visual_parts = {}
+    visual_score = None
+    if report.get("visual_physics_distribution_available"):
+        visual_score, visual_parts = _weighted_geomean([
+            ("visual_frechet", _lower_is_better_score(
+                report.get("visual_physics_distribution_frechet")), 0.25),
+            ("visual_mmd_rbf", _lower_is_better_score(
+                report.get("visual_physics_distribution_mmd_rbf")), 0.20),
+            ("visual_mean_feature_l1", _lower_is_better_score(
+                report.get("visual_physics_distribution_mean_feature_l1")), 0.20),
+            ("visual_detail_energy_ratio", _ratio_target_one_score(
+                report.get("visual_physics_distribution_detail_energy_ratio")), 0.15),
+            ("visual_dynamic_range_ratio", _ratio_target_one_score(
+                report.get("visual_physics_distribution_dynamic_range_ratio")), 0.10),
+            ("visual_luminance_std_ratio", _ratio_target_one_score(
+                report.get("visual_physics_distribution_luminance_std_ratio")), 0.10),
+        ])
+        components.append(("visual_physics", visual_score, 0.15))
     score, component_weights = _weighted_geomean(components)
     out = {
         "image_eval_score": float(score),
@@ -603,10 +808,14 @@ def image_eval_composite_score(report, embedding_kind="image"):
         "image_eval_support_parts": support_parts,
         "image_eval_diversity_score": float(diversity_score),
         "image_eval_alignment_available": bool(align_n > 0),
+        "image_eval_visual_physics_available": bool(visual_score is not None),
     }
     if alignment_score is not None:
         out["image_eval_alignment_score"] = float(alignment_score)
         out["image_eval_alignment_parts"] = alignment_parts
+    if visual_score is not None:
+        out["image_eval_visual_physics_score"] = float(visual_score)
+        out["image_eval_visual_physics_parts"] = visual_parts
     return out
 
 
@@ -615,6 +824,11 @@ def image_eval_gate(report, min_score=0.0, min_support_precision=0.0,
                     max_frechet=None, max_mmd_rbf=None,
                     min_generated_neighbor_l2_p05=None,
                     min_generated_real_l2_p01=None,
+                    max_visual_physics_l1=None,
+                    max_visual_physics_mmd_rbf=None,
+                    min_visual_detail_ratio=None,
+                    min_visual_dynamic_range_ratio=None,
+                    min_visual_luminance_std_ratio=None,
                     embedding_kind="image"):
     prefix = f"{embedding_kind}_distribution"
     checks = []
@@ -671,6 +885,53 @@ def image_eval_gate(report, min_score=0.0, min_support_precision=0.0,
         min_generated_real_l2_p01,
         "min",
     )
+    visual_gate_requested = any(
+        value is not None for value in (
+            max_visual_physics_l1,
+            max_visual_physics_mmd_rbf,
+            min_visual_detail_ratio,
+            min_visual_dynamic_range_ratio,
+            min_visual_luminance_std_ratio,
+        )
+    )
+    if visual_gate_requested and not report.get("visual_physics_distribution_available"):
+        checks.append({
+            "name": "visual_physics_distribution_available",
+            "value": 0.0,
+            "threshold": 1.0,
+            "mode": "min",
+            "pass": False,
+        })
+    add_check(
+        "visual_physics_distribution_mean_feature_l1",
+        report.get("visual_physics_distribution_mean_feature_l1"),
+        max_visual_physics_l1,
+        "max",
+    )
+    add_check(
+        "visual_physics_distribution_mmd_rbf",
+        report.get("visual_physics_distribution_mmd_rbf"),
+        max_visual_physics_mmd_rbf,
+        "max",
+    )
+    add_check(
+        "visual_physics_distribution_detail_energy_ratio",
+        report.get("visual_physics_distribution_detail_energy_ratio"),
+        min_visual_detail_ratio,
+        "min",
+    )
+    add_check(
+        "visual_physics_distribution_dynamic_range_ratio",
+        report.get("visual_physics_distribution_dynamic_range_ratio"),
+        min_visual_dynamic_range_ratio,
+        "min",
+    )
+    add_check(
+        "visual_physics_distribution_luminance_std_ratio",
+        report.get("visual_physics_distribution_luminance_std_ratio"),
+        min_visual_luminance_std_ratio,
+        "min",
+    )
     passed = all(row["pass"] for row in checks)
     return {
         "image_eval_gate_pass": bool(passed),
@@ -681,7 +942,8 @@ def image_eval_gate(report, min_score=0.0, min_support_precision=0.0,
 
 def evaluate_records(real_records: Sequence[ImageTextRecord],
                      generated_records: Sequence[ImageTextRecord],
-                     embedding_kind="image", dim_policy="error", normalize=True):
+                     embedding_kind="image", dim_policy="error", normalize=True,
+                     visual_stats_size=0, visual_stats_max_records=0):
     real_matrix = embedding_matrix(
         real_records, kind=embedding_kind, dim_policy=dim_policy,
         normalize=normalize, prefix="real")
@@ -710,6 +972,26 @@ def evaluate_records(real_records: Sequence[ImageTextRecord],
     report.update(image_text_alignment_metrics(
         generated_records, prefix="generated_image_text_alignment",
         dim_policy=dim_policy, normalize=normalize))
+    if int(visual_stats_size or 0) > 0:
+        real_visual = visual_physics_matrix(
+            real_records, size=visual_stats_size,
+            max_records=visual_stats_max_records,
+            prefix="real_visual_physics")
+        generated_visual = visual_physics_matrix(
+            generated_records, size=visual_stats_size,
+            max_records=visual_stats_max_records,
+            prefix="generated_visual_physics")
+        report.update(real_visual.report)
+        report.update(generated_visual.report)
+        report.update(visual_physics_distribution_metrics(
+            generated_visual.matrix, real_visual.matrix,
+            prefix="visual_physics_distribution"))
+    else:
+        report.update({
+            "real_visual_physics_enabled": False,
+            "generated_visual_physics_enabled": False,
+            "visual_physics_distribution_available": False,
+        })
     report.update(image_eval_composite_score(report, embedding_kind=embedding_kind))
     return report
 
@@ -720,12 +1002,54 @@ def _write_jsonl(path, rows):
             f.write(json.dumps(row) + "\n")
 
 
+def _write_ppm(path, pixels):
+    pixels = np.asarray(pixels, dtype=np.uint8)
+    if pixels.ndim == 1:
+        pixels = np.tile(pixels.reshape(1, 1, 3), (16, 16, 1))
+    if pixels.ndim != 3 or pixels.shape[2] != 3:
+        raise ValueError("PPM test fixture must be HWC RGB")
+    with open(path, "wb") as f:
+        f.write(f"P6\n{pixels.shape[1]} {pixels.shape[0]}\n255\n".encode("ascii"))
+        f.write(pixels.tobytes())
+
+
+def _visual_fixture(seed=0, collapsed=False):
+    rng = np.random.default_rng(int(seed))
+    yy, xx = np.meshgrid(
+        np.linspace(0.0, 1.0, 32, dtype=np.float64),
+        np.linspace(0.0, 1.0, 32, dtype=np.float64),
+        indexing="ij",
+    )
+    if collapsed:
+        base = np.full((32, 32, 3), 0.52, dtype=np.float64)
+        base += rng.normal(0.0, 0.003, size=base.shape)
+        return np.clip(base * 255.0, 0.0, 255.0).astype(np.uint8)
+    waves = 0.5 + 0.25 * np.sin((xx * (3.0 + seed) + yy * 1.5) * np.pi)
+    spot = np.exp(-(((xx - 0.35 - 0.1 * seed) ** 2) + ((yy - 0.58) ** 2)) / 0.025)
+    stripe = ((np.floor((xx + yy * 0.35) * (5 + seed)) % 2) * 0.18)
+    img = np.stack([
+        waves + 0.35 * spot,
+        0.35 + stripe + 0.18 * yy,
+        0.30 + 0.40 * (1.0 - xx) + 0.20 * spot,
+    ], axis=-1)
+    img += rng.normal(0.0, 0.015, size=img.shape)
+    return np.clip(img * 255.0, 0.0, 255.0).astype(np.uint8)
+
+
 def selftest():
     with tempfile.TemporaryDirectory() as td:
         real = os.path.join(td, "real.jsonl")
         good = os.path.join(td, "good.jsonl")
         bad = os.path.join(td, "bad.jsonl")
         memorized = os.path.join(td, "memorized.jsonl")
+        _write_ppm(os.path.join(td, "r0.ppm"), _visual_fixture(seed=0))
+        _write_ppm(os.path.join(td, "r1.ppm"), _visual_fixture(seed=1))
+        _write_ppm(os.path.join(td, "g0.ppm"), _visual_fixture(seed=0))
+        _write_ppm(os.path.join(td, "g1.ppm"), _visual_fixture(seed=1))
+        _write_ppm(os.path.join(td, "b0.ppm"), _visual_fixture(seed=2, collapsed=True))
+        _write_ppm(os.path.join(td, "b1.ppm"), _visual_fixture(seed=3, collapsed=True))
+        _write_ppm(os.path.join(td, "m0.ppm"), _visual_fixture(seed=0))
+        _write_ppm(os.path.join(td, "m1.ppm"), _visual_fixture(seed=1))
         _write_jsonl(real, [
             {"image": "r0.ppm", "caption": "red square", "split": "eval",
              "image_embedding": [1.0, 0.0], "text_embedding": [1.0, 0.0]},
@@ -754,12 +1078,19 @@ def selftest():
         good_records, _ = load_records(good, split="eval")
         bad_records, _ = load_records(bad, split="eval")
         memorized_records, _ = load_records(memorized, split="eval")
-        good_report = evaluate_records(real_records, good_records)
-        bad_report = evaluate_records(real_records, bad_records)
-        memorized_report = evaluate_records(real_records, memorized_records)
+        good_report = evaluate_records(real_records, good_records, visual_stats_size=16)
+        bad_report = evaluate_records(real_records, bad_records, visual_stats_size=16)
+        memorized_report = evaluate_records(
+            real_records, memorized_records, visual_stats_size=16)
         assert good_report["image_distribution_generated_n"] == 2
         assert good_report["generated_image_text_alignment_n"] == 2
         assert good_report["generated_image_text_alignment_i2t_acc"] == 1.0
+        assert good_report["visual_physics_distribution_available"] is True
+        assert good_report["generated_visual_physics_usable"] == 2
+        assert bad_report["visual_physics_distribution_detail_energy_ratio"] < (
+            good_report["visual_physics_distribution_detail_energy_ratio"])
+        assert bad_report["visual_physics_distribution_dynamic_range_ratio"] < (
+            good_report["visual_physics_distribution_dynamic_range_ratio"])
         assert good_report["image_distribution_frechet"] < bad_report[
             "image_distribution_frechet"]
         assert good_report["image_distribution_mmd_rbf"] < bad_report[
@@ -775,10 +1106,14 @@ def selftest():
             bad_report, min_generated_neighbor_l2_p05=0.01)
         memorized_gate = image_eval_gate(
             memorized_report, min_generated_real_l2_p01=1.0e-6)
+        visual_gate = image_eval_gate(
+            bad_report, min_visual_detail_ratio=0.10,
+            min_visual_dynamic_range_ratio=0.10)
         assert good_gate["image_eval_gate_pass"] is True
         assert bad_gate["image_eval_gate_pass"] is False
         assert duplicate_gate["image_eval_gate_pass"] is False
         assert memorized_gate["image_eval_gate_pass"] is False
+        assert visual_gate["image_eval_gate_pass"] is False
         assert bad_gate["image_eval_gate_failed"][0]["name"] == "image_eval_score"
     print("image_eval selftest OK")
 
@@ -836,6 +1171,22 @@ def main(argv=None):
     ap.add_argument("--min-generated-real-l2-p01", type=float, default=None,
                     help=("minimum generated/real nearest-neighbor L2 p01; "
                           "catches over-near training-set copies"))
+    ap.add_argument("--visual-stats-size", type=int, default=0,
+                    help=("compute generic visual-physics stats at this image size; "
+                          "0 disables pixel-structure evaluation"))
+    ap.add_argument("--visual-stats-max-records", type=int, default=0,
+                    help=("maximum records per manifest for visual-physics stats; "
+                          "0 means use all loaded records"))
+    ap.add_argument("--max-visual-physics-l1", type=float, default=None,
+                    help="maximum mean visual-physics feature L1 drift")
+    ap.add_argument("--max-visual-physics-mmd-rbf", type=float, default=None,
+                    help="maximum visual-physics RBF-MMD distance")
+    ap.add_argument("--min-visual-detail-ratio", type=float, default=None,
+                    help="minimum generated/reference detail-energy ratio")
+    ap.add_argument("--min-visual-dynamic-range-ratio", type=float, default=None,
+                    help="minimum generated/reference luminance dynamic-range ratio")
+    ap.add_argument("--min-visual-luminance-std-ratio", type=float, default=None,
+                    help="minimum generated/reference luminance standard-deviation ratio")
     ap.add_argument("--fail-on-gate", action="store_true",
                     help="exit non-zero when configured quality-gate checks fail")
     ap.add_argument("--report-out", default="", help="optional JSON report path")
@@ -852,6 +1203,17 @@ def main(argv=None):
     if (args.min_generated_real_l2_p01 is not None
             and args.min_generated_real_l2_p01 < 0.0):
         ap.error("--min-generated-real-l2-p01 must be non-negative")
+    if args.visual_stats_size < 0:
+        ap.error("--visual-stats-size must be non-negative")
+    if args.visual_stats_max_records < 0:
+        ap.error("--visual-stats-max-records must be non-negative")
+    for name in (
+            "max_visual_physics_l1", "max_visual_physics_mmd_rbf",
+            "min_visual_detail_ratio", "min_visual_dynamic_range_ratio",
+            "min_visual_luminance_std_ratio"):
+        value = getattr(args, name)
+        if value is not None and value < 0.0:
+            ap.error(f"--{name.replace('_', '-')} must be non-negative")
 
     shared_max = int(args.max_records)
     real_max = int(args.real_max_records or shared_max)
@@ -870,7 +1232,9 @@ def main(argv=None):
         embedding_key=args.embedding_key, embedding_overwrite=args.embedding_overwrite)
     report = evaluate_records(
         real_records, generated_records, embedding_kind=args.embedding_kind,
-        dim_policy=args.dim_policy, normalize=not args.no_normalize)
+        dim_policy=args.dim_policy, normalize=not args.no_normalize,
+        visual_stats_size=args.visual_stats_size,
+        visual_stats_max_records=args.visual_stats_max_records)
     report.update(image_eval_gate(
         report,
         min_score=args.min_score,
@@ -881,6 +1245,11 @@ def main(argv=None):
         max_mmd_rbf=args.max_mmd_rbf,
         min_generated_neighbor_l2_p05=args.min_generated_neighbor_l2_p05,
         min_generated_real_l2_p01=args.min_generated_real_l2_p01,
+        max_visual_physics_l1=args.max_visual_physics_l1,
+        max_visual_physics_mmd_rbf=args.max_visual_physics_mmd_rbf,
+        min_visual_detail_ratio=args.min_visual_detail_ratio,
+        min_visual_dynamic_range_ratio=args.min_visual_dynamic_range_ratio,
+        min_visual_luminance_std_ratio=args.min_visual_luminance_std_ratio,
         embedding_kind=args.embedding_kind,
     ))
     report.update({
@@ -893,6 +1262,8 @@ def main(argv=None):
         "max_records": shared_max,
         "real_max_records": real_max,
         "generated_max_records": generated_max,
+        "visual_stats_size": int(args.visual_stats_size),
+        "visual_stats_max_records": int(args.visual_stats_max_records),
         "min_aesthetic": (
             float(args.min_aesthetic) if args.min_aesthetic is not None else None),
         "max_nsfw": float(args.max_nsfw) if args.max_nsfw is not None else None,
@@ -904,6 +1275,21 @@ def main(argv=None):
         "min_generated_real_l2_p01": (
             float(args.min_generated_real_l2_p01)
             if args.min_generated_real_l2_p01 is not None else None),
+        "max_visual_physics_l1": (
+            float(args.max_visual_physics_l1)
+            if args.max_visual_physics_l1 is not None else None),
+        "max_visual_physics_mmd_rbf": (
+            float(args.max_visual_physics_mmd_rbf)
+            if args.max_visual_physics_mmd_rbf is not None else None),
+        "min_visual_detail_ratio": (
+            float(args.min_visual_detail_ratio)
+            if args.min_visual_detail_ratio is not None else None),
+        "min_visual_dynamic_range_ratio": (
+            float(args.min_visual_dynamic_range_ratio)
+            if args.min_visual_dynamic_range_ratio is not None else None),
+        "min_visual_luminance_std_ratio": (
+            float(args.min_visual_luminance_std_ratio)
+            if args.min_visual_luminance_std_ratio is not None else None),
     })
     if real_merge:
         report["real_embedding_merge"] = real_merge
