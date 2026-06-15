@@ -227,9 +227,9 @@ def evaluate(model, data, device=DEV, n=80, seed=1):
 
 
 def run(steps=60000, seed=0, device=DEV, save_dir="data/synth", ckpt_path="runs/tts_ar.pt",
-        batch=16, d=256, layers=4, heads=4):
+        batch=16, d=256, layers=4, heads=4, lr=3e-4):
     model, data = train(steps=steps, seed=seed, device=device, ckpt_path=ckpt_path,
-                        batch=batch, d=d, layers=layers, heads=heads)
+                        batch=batch, d=d, layers=layers, heads=heads, lr=lr)
     torch.save({"state_dict": model.state_dict(), "config": model.cfg}, ckpt_path)
     ev = evaluate(model, data, device=device)
     report = {"experiment": "tts_transformer_ar_ljspeech", "sr": SR, "steps": steps,
@@ -272,12 +272,13 @@ def main(argv=None):
     ap.add_argument("--dim", type=int, default=256)
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--heads", type=int, default=4)
+    ap.add_argument("--lr", type=float, default=3e-4)
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return
     if args.train:
         report, _ = run(steps=args.steps, seed=args.seed, save_dir=args.synth_out, ckpt_path=args.checkpoint,
-                        batch=args.batch, d=args.dim, layers=args.layers, heads=args.heads)
+                        batch=args.batch, d=args.dim, layers=args.layers, heads=args.heads, lr=args.lr)
         json.dump(report, open(args.out, "w"), indent=1)
         print(f"saved -> {args.out}")
         return
