@@ -3,7 +3,9 @@
 This module intentionally has no built-in sensory oracle or fixed modality schema.
 It trains from a JSONL manifest where each record supplies optional named feature
 views, text tokens, and an optional target token sequence.  The bridge learns to fuse those
-views into continuous prefixes for one ScratchpadLM decoder.
+views into continuous prefixes for one ScratchpadLM decoder.  When no explicit
+targets are present, the default decoder objective treats text as a causal token
+sequence instead of skipping token learning.
 
 Example manifest row:
 
@@ -2231,6 +2233,11 @@ def infer_multimodal_decode_objective(records, requested="auto"):
                 matches += 1
     if considered and matches / float(considered) >= 0.5:
         return "causal"
+    targetless_text_records = sum(
+        1 for rec in records or () if rec.text and not rec.target)
+    target_records = sum(1 for rec in records or () if rec.target)
+    if targetless_text_records and target_records == 0:
+        return "causal"
     return "target"
 
 
@@ -2250,12 +2257,22 @@ def multimodal_decode_objective_report(records, requested, resolved):
                 matches += 1
     target_records = sum(1 for rec in records or () if rec.target)
     text_records = sum(1 for rec in records or () if rec.text)
+    targetless_text_records = sum(
+        1 for rec in records or () if rec.text and not rec.target)
     view_records = sum(1 for rec in records or () if rec.views)
+    causal_reason = ""
+    if resolved == "causal":
+        if considered and matches / float(considered) >= 0.5:
+            causal_reason = "continuation"
+        elif targetless_text_records and target_records == 0:
+            causal_reason = "targetless_text"
     return {
         "requested": str(requested),
         "resolved": str(resolved),
+        "causal_reason": causal_reason,
         "text_records": int(text_records),
         "target_records": int(target_records),
+        "targetless_text_records": int(targetless_text_records),
         "view_records": int(view_records),
         "continuation_candidates": int(considered),
         "continuation_matches": int(matches),
@@ -7206,6 +7223,8 @@ def selftest():
                 f.write(json.dumps(row) + "\n")
         no_target_records = load_manifest(no_target_manifest)
         assert no_target_records[0].target == ()
+        assert infer_multimodal_decode_objective(
+            no_target_records, requested="auto") == "causal"
         no_target_model, no_target_vocab, _all, _trn, no_target_eval, no_target_dims = train(
             no_target_manifest, steps=1, batch=2, d=32, layers=1, heads=4,
             device="cpu", objective_profile="manual",
@@ -7214,11 +7233,15 @@ def selftest():
             latent_concept_memory_size=8, latent_concept_memory_w=0.01,
             latent_concept_bridge_w=0.01)
         assert no_target_model.train_metrics["decode_w"] == 0.0
+        assert no_target_model.train_metrics["decode_objective"] == "causal"
+        assert (no_target_model.train_metrics["decode_objective_report"][
+            "causal_reason"] == "targetless_text")
         no_target_bundle = multimodal_eval_bundle(
             no_target_model, no_target_eval, no_target_vocab, no_target_dims,
-            n=0, device="cpu", score_metric="mastery")
-        assert no_target_bundle["score_components"]["token_skipped"] is True
-        assert no_target_bundle["score_components"]["exact_skipped"] is True
+            n=0, device="cpu", score_metric="mastery",
+            decode_objective=no_target_model.manifest_info["decode_objective"])
+        assert no_target_bundle["score_components"]["token_skipped"] is False
+        assert no_target_bundle["score_components"]["exact_skipped"] is False
         assert no_target_bundle["score_components"]["bridge_skipped"] is False
         completion_model, *_ = train(
             manifest, steps=1, batch=2, d=32, layers=1, heads=4, device="cpu",

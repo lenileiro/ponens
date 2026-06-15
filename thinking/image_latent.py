@@ -3783,7 +3783,7 @@ def image_latent_cache_fingerprint(ae, rows, size=32, caption_max_len=64,
                 rec.image_embedding_sequence),
         })
     payload = {
-        "version": 2,
+        "version": 3,
         "ae": autoencoder_cache_identity(ae),
         "size": image_size_pair_value(size),
         "size_buckets": [image_size_pair_value(bucket) for bucket in size_buckets],
@@ -3871,6 +3871,7 @@ def load_disk_image_latent_cache(cache_dir, expected_fingerprint=None):
                 meta.get("image_embedding_sequence_max_len", 0) or 0),
             "has_image_geometry": bool(meta.get("has_image_geometry", False)),
             "has_quality_targets": bool(meta.get("has_quality_targets", False)),
+            "has_image_targets": bool(meta.get("has_image_targets", False)),
             "latent_dtype": str(meta.get("latent_dtype", "")),
             "weighted": bool(meta.get("weighted", False)),
             "weight_sum": float(meta.get("weight_sum", 0.0)),
@@ -3913,6 +3914,7 @@ def load_disk_image_latent_cache(cache_dir, expected_fingerprint=None):
             meta.get("image_embedding_sequence_max_len", 0) or 0),
         "has_image_geometry": bool(meta.get("has_image_geometry", False)),
         "has_quality_targets": bool(meta.get("has_quality_targets", False)),
+        "has_image_targets": bool(meta.get("has_image_targets", False)),
         "latent_dtype": str(meta.get("latent_dtype", "")),
         "shard_size": int(meta.get("shard_size", 0)),
         "shards": shards,
@@ -4029,6 +4031,9 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             "image_embedding_sequence_max_len": int(image_embedding_sequence_token_cap),
             "has_image_geometry": bool(include_image_geometry),
             "has_quality_targets": bool(include_quality_targets),
+            "has_image_targets": all(
+                bool(b.get("cache", {}).get("has_image_targets", False))
+                for b in subcaches),
             "latent_dtype": cache_dtype,
             "weighted": bool(weighted),
             "weight_sum": float(total_weight),
@@ -4064,6 +4069,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                         image_embedding_sequence_token_cap),
                     "has_image_geometry": bool(include_image_geometry),
                     "has_quality_targets": bool(include_quality_targets),
+                    "has_image_targets": cache["has_image_targets"],
                     "latent_dtype": cache_dtype,
                     "weighted": bool(weighted),
                     "weight_sum": float(total_weight),
@@ -4096,6 +4102,7 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             cache_dtype=cache_dtype, cache_fingerprint=cache_fingerprint)
     latents, captions, embeddings, pooled_embeddings, pooled_masks = [], [], [], [], []
     image_embeddings, image_embedding_sequences, image_geometry_features = [], [], []
+    image_paths, image_transform_metadata = [], []
     quality_targets, quality_masks = [], []
     sequence_max_len = image_embedding_sequence_max_len(
         rows, cap=image_embedding_sequence_token_cap)
@@ -4109,18 +4116,17 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
             loaded = load_image_tensor(
                 rec.path, size=size, device=device, crop_mode=crop_mode,
                 hflip=(hflip_prob > 0.0 and float(crop_rng.random()) < float(hflip_prob)),
-                rng=crop_rng, return_metadata=include_image_geometry)
-            if include_image_geometry:
-                img, meta = loaded
-                transform_metadata.append(meta)
-            else:
-                img = loaded
+                rng=crop_rng, return_metadata=True)
+            img, meta = loaded
+            transform_metadata.append(meta)
             imgs.append(img)
         x = torch.stack(imgs, dim=0)
         with amp_autocast(device, precision):
             z = ae.encode(x)
         latents.append(cache_latent_tensor(z, cache_dtype))
         captions.extend(rec.caption for rec in chunk)
+        image_paths.extend(rec.path for rec in chunk)
+        image_transform_metadata.extend(transform_metadata)
         if cond_source == "embedding":
             embeddings.append(record_text_embedding_tensor(chunk, device="cpu"))
             pooled, pooled_mask = record_text_pooled_embedding_tensor(chunk, device="cpu")
@@ -4175,12 +4181,15 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         "quality_masks": (
             torch.cat(quality_masks, dim=0).contiguous() if quality_masks else None
         ),
+        "image_paths": image_paths,
+        "image_transform_metadata": image_transform_metadata,
         "cond_source": cond_source,
         "has_image_embeddings": bool(image_embeddings),
         "has_image_embedding_sequences": bool(image_embedding_sequences),
         "image_embedding_sequence_max_len": int(image_embedding_sequence_token_cap),
         "has_image_geometry": bool(image_geometry_features),
         "has_quality_targets": bool(quality_targets),
+        "has_image_targets": bool(image_paths and image_transform_metadata),
         "latent_dtype": cache_dtype,
         "records": len(rows),
         "latent_shape": tuple(int(x) for x in latents[0].shape[1:]),
@@ -4291,12 +4300,9 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
                         hflip_prob > 0.0
                         and float(crop_rng.random()) < float(hflip_prob)
                     ),
-                    rng=crop_rng, return_metadata=include_image_geometry)
-                if include_image_geometry:
-                    img, meta = loaded
-                    transform_metadata.append(meta)
-                else:
-                    img = loaded
+                    rng=crop_rng, return_metadata=True)
+                img, meta = loaded
+                transform_metadata.append(meta)
                 imgs.append(img)
             x = torch.stack(imgs, dim=0)
             with amp_autocast(device, precision):
@@ -4349,12 +4355,15 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
             ),
             "quality_targets": q_target.cpu().contiguous() if q_target is not None else None,
             "quality_masks": q_mask.cpu().contiguous() if q_mask is not None else None,
+            "image_paths": [rec.path for rec in chunk_rows],
+            "image_transform_metadata": transform_metadata,
             "cond_source": cond_source,
             "has_image_embeddings": bool(include_image_embeddings),
             "has_image_embedding_sequences": bool(include_image_embedding_sequences),
             "image_embedding_sequence_max_len": int(image_embedding_sequence_token_cap),
             "has_image_geometry": bool(include_image_geometry),
             "has_quality_targets": bool(include_quality_targets),
+            "has_image_targets": True,
             "latent_dtype": cache_dtype,
             "weights": chunk_weight_tensor,
             "weighted": bool(chunk_weight_tensor is not None),
@@ -4409,6 +4418,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         "image_embedding_sequence_max_len": int(image_embedding_sequence_token_cap),
         "has_image_geometry": bool(include_image_geometry),
         "has_quality_targets": bool(include_quality_targets),
+        "has_image_targets": True,
         "latent_dtype": cache_dtype,
         "shard_size": int(shard_size),
         "shards": [
@@ -4449,6 +4459,7 @@ def build_disk_image_latent_cache(ae, rows, prompt_vocab, caption_max_len=64, ba
         "image_embedding_sequence_max_len": int(image_embedding_sequence_token_cap),
         "has_image_geometry": bool(include_image_geometry),
         "has_quality_targets": bool(include_quality_targets),
+        "has_image_targets": True,
         "latent_dtype": cache_dtype,
         "shard_size": int(shard_size),
         "shards": shards,
@@ -4704,7 +4715,8 @@ def _load_latent_cache_shard(shard, cache=None):
 def _latent_cache_payload(source, ids=None, embeddings=None, pooled_embeddings=None,
                           pooled_masks=None, image_embeddings=None,
                           image_embedding_sequences=None, image_geometry_features=None,
-                          quality_targets=None, quality_masks=None, size_bucket=""):
+                          quality_targets=None, quality_masks=None, image_paths=None,
+                          image_transform_metadata=None, size_bucket=""):
     return {
         "cond_source": source,
         "caption_ids": ids,
@@ -4716,6 +4728,8 @@ def _latent_cache_payload(source, ids=None, embeddings=None, pooled_embeddings=N
         "image_geometry_features": image_geometry_features,
         "quality_targets": quality_targets,
         "quality_masks": quality_masks,
+        "image_paths": image_paths,
+        "image_transform_metadata": image_transform_metadata,
         "size_bucket": size_bucket,
     }
 
@@ -4765,6 +4779,7 @@ def sample_latent_cache(cache, rng, batch, device=DEV, bucket_keys=None):
             idx_np = rng.integers(0, n, size=int(batch))
         else:
             idx_np = rng.choice(n, size=int(batch), replace=True, p=shard_probs)
+        idx_list = [int(i) for i in idx_np]
         idx = torch.tensor(idx_np, dtype=torch.long)
         z1 = shard["latents"][idx].to(device=device, dtype=torch.float32)
         image_embs = (
@@ -4792,19 +4807,31 @@ def sample_latent_cache(cache, rng, batch, device=DEV, bucket_keys=None):
             shard["text_pooled_masks"][idx]
             if shard.get("text_pooled_masks") is not None else None
         )
+        image_paths = (
+            [shard["image_paths"][i] for i in idx_list]
+            if shard.get("image_paths") is not None else None
+        )
+        image_transform_metadata = (
+            [shard["image_transform_metadata"][i] for i in idx_list]
+            if shard.get("image_transform_metadata") is not None else None
+        )
         if cache["cond_source"] == "embedding":
             payload = _latent_cache_payload(
                 "embedding", embeddings=shard["text_embeddings"][idx],
                 pooled_embeddings=pooled_text, pooled_masks=pooled_text_masks,
                 image_embeddings=image_embs, image_embedding_sequences=image_seq,
                 image_geometry_features=image_geom,
-                quality_targets=quality_targets, quality_masks=quality_masks)
+                quality_targets=quality_targets, quality_masks=quality_masks,
+                image_paths=image_paths,
+                image_transform_metadata=image_transform_metadata)
         else:
             payload = _latent_cache_payload(
                 "tokens", ids=shard["caption_ids"][idx], image_embeddings=image_embs,
                 image_embedding_sequences=image_seq,
                 image_geometry_features=image_geom,
-                quality_targets=quality_targets, quality_masks=quality_masks)
+                quality_targets=quality_targets, quality_masks=quality_masks,
+                image_paths=image_paths,
+                image_transform_metadata=image_transform_metadata)
         return z1, payload
     cache_probs = normalized_sampling_weights(
         cache.get("weights"), int(cache["records"])) if cache.get("weights") is not None else None
@@ -4812,6 +4839,7 @@ def sample_latent_cache(cache, rng, batch, device=DEV, bucket_keys=None):
         idx_np = rng.integers(0, int(cache["records"]), size=int(batch))
     else:
         idx_np = rng.choice(int(cache["records"]), size=int(batch), replace=True, p=cache_probs)
+    idx_list = [int(i) for i in idx_np]
     idx = torch.tensor(idx_np, dtype=torch.long)
     z1 = cache["latents"][idx].to(device=device, dtype=torch.float32)
     image_embs = (
@@ -4839,20 +4867,54 @@ def sample_latent_cache(cache, rng, batch, device=DEV, bucket_keys=None):
         cache["text_pooled_masks"][idx]
         if cache.get("text_pooled_masks") is not None else None
     )
+    image_paths = (
+        [cache["image_paths"][i] for i in idx_list]
+        if cache.get("image_paths") is not None else None
+    )
+    image_transform_metadata = (
+        [cache["image_transform_metadata"][i] for i in idx_list]
+        if cache.get("image_transform_metadata") is not None else None
+    )
     if cache["cond_source"] == "embedding":
         payload = _latent_cache_payload(
             "embedding", embeddings=cache["text_embeddings"][idx],
             pooled_embeddings=pooled_text, pooled_masks=pooled_text_masks,
             image_embeddings=image_embs, image_embedding_sequences=image_seq,
             image_geometry_features=image_geom,
-            quality_targets=quality_targets, quality_masks=quality_masks)
+            quality_targets=quality_targets, quality_masks=quality_masks,
+            image_paths=image_paths,
+            image_transform_metadata=image_transform_metadata)
     else:
         payload = _latent_cache_payload(
             "tokens", ids=cache["caption_ids"][idx], image_embeddings=image_embs,
             image_embedding_sequences=image_seq,
             image_geometry_features=image_geom,
-            quality_targets=quality_targets, quality_masks=quality_masks)
+            quality_targets=quality_targets, quality_masks=quality_masks,
+            image_paths=image_paths,
+            image_transform_metadata=image_transform_metadata)
     return z1, payload
+
+
+def cached_decoded_endpoint_target(cache_payload, device=DEV):
+    paths = list((cache_payload or {}).get("image_paths") or [])
+    metadata = list((cache_payload or {}).get("image_transform_metadata") or [])
+    if not paths or not metadata:
+        return None
+    if len(paths) != len(metadata):
+        raise ValueError(
+            f"cache image target path count {len(paths)} "
+            f"does not match metadata count {len(metadata)}")
+    imgs = []
+    for path, meta in zip(paths, metadata):
+        if not path or not isinstance(meta, dict):
+            return None
+        size = (
+            max(1, int(meta.get("target_height", 0) or 0)),
+            max(1, int(meta.get("target_width", 0) or 0)),
+        )
+        imgs.append(load_image_tensor(
+            path, size=size, device=device, transform_metadata=meta))
+    return torch.stack(imgs, dim=0) if imgs else None
 
 
 @torch.no_grad()
@@ -6558,6 +6620,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        decoded_endpoint_patch_structure_size=(
                            DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE),
                        decoded_endpoint_target=None,
+                       decoded_endpoint_active_override=None,
                        equivariance_w=0.0, equivariance_p=1.0,
                        equivariance_transforms=DEFAULT_FLOW_EQUIVARIANCE_TRANSFORMS,
                        equivariance_shift_frac=0.125,
@@ -6638,6 +6701,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
             raise ValueError("decoded_endpoint_target must have shape B,C,H,W")
         if int(decoded_endpoint_target.shape[0]) != int(z1.shape[0]):
             raise ValueError("decoded_endpoint_target batch must match z1")
+    if decoded_endpoint_active_override is not None:
+        decoded_endpoint_active_override = bool(decoded_endpoint_active_override)
     equivariance_w = float(equivariance_w)
     equivariance_p = float(equivariance_p)
     if equivariance_w < 0.0:
@@ -6868,9 +6933,16 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
             endpoint_pred, z1_model, prefix="flow_physics")
         total = total + float(physics_w) * physics
         parts.update(physics_parts)
-    if (decoded_endpoint_w > 0.0 and decoded_endpoint_p > 0.0
-            and (decoded_endpoint_p >= 1.0
-                 or bool(torch.rand((), device=z1.device) < decoded_endpoint_p))):
+    decoded_endpoint_active = False
+    if decoded_endpoint_w > 0.0 and decoded_endpoint_p > 0.0:
+        decoded_endpoint_active = (
+            decoded_endpoint_active_override
+            if decoded_endpoint_active_override is not None else (
+                decoded_endpoint_p >= 1.0
+                or bool(torch.rand((), device=z1.device) < decoded_endpoint_p)
+            )
+        )
+    if decoded_endpoint_active:
         endpoint_raw = denormalize_latent(endpoint_pred, latent_stats)
         target_raw = denormalize_latent(z1_model, latent_stats)
         pred_img = ae.decode(endpoint_raw)
@@ -13442,6 +13514,14 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 quality_targets = cache_payload.get("quality_targets")
                 quality_masks = cache_payload.get("quality_masks")
                 decoded_endpoint_target = None
+                decoded_endpoint_active_override = None
+                if flow_decoded_endpoint_w > 0.0 and flow_decoded_endpoint_p > 0.0:
+                    decoded_endpoint_active_override = (
+                        flow_decoded_endpoint_p >= 1.0
+                        or float(rng.random()) < flow_decoded_endpoint_p)
+                    if decoded_endpoint_active_override:
+                        decoded_endpoint_target = cached_decoded_endpoint_target(
+                            cache_payload, device=device)
             else:
                 flow_batch = sample_bucketed_image_text_batch(
                     image_records, rng, batch=batch, size_buckets=active_size_buckets,
@@ -13458,6 +13538,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 with torch.no_grad(), amp_autocast(device, train_precision):
                     z1 = ae.encode(x)
                 decoded_endpoint_target = x
+                decoded_endpoint_active_override = None
                 cond = caption_record_condition(
                     captions, chosen_records, conditioner, prompt_vocab,
                     source=caption_cond_source, max_len=caption_max_len, device=device,
@@ -13562,6 +13643,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     decoded_endpoint_patch_structure_size=(
                         flow_decoded_endpoint_patch_structure_size),
                     decoded_endpoint_target=decoded_endpoint_target,
+                    decoded_endpoint_active_override=decoded_endpoint_active_override,
                     equivariance_w=flow_equivariance_w,
                     equivariance_p=flow_equivariance_p,
                     equivariance_transforms=flow_equivariance_transforms,
@@ -13861,6 +13943,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         ),
         "flow_cache_has_quality_targets": bool(
             flow_cache.get("has_quality_targets", False) if flow_cache is not None else False
+        ),
+        "flow_cache_has_image_targets": bool(
+            flow_cache.get("has_image_targets", False) if flow_cache is not None else False
         ),
         "flow_cache_has_image_geometry": bool(
             flow_cache.get("has_image_geometry", False) if flow_cache is not None else False
@@ -17114,6 +17199,7 @@ def main(argv=None):
         "flow_cache_bytes": report.get("flow_cache_bytes", 0),
         "flow_cache_weighted": report.get("flow_cache_weighted", False),
         "flow_cache_has_quality_targets": report.get("flow_cache_has_quality_targets", False),
+        "flow_cache_has_image_targets": report.get("flow_cache_has_image_targets", False),
         "resume_checkpoint": report.get("resume_checkpoint", args.resume_checkpoint),
         "resume_checkpoint_loaded": report.get("resume_checkpoint_loaded", False),
         "resume_ae_state": report.get("resume_ae_state", ""),

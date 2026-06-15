@@ -1048,7 +1048,8 @@ def _target_hw(size):
 
 
 def load_image_tensor(path, size=256, device="cpu", center_crop=True,
-                      crop_mode=None, hflip=False, rng=None, return_metadata=False):
+                      crop_mode=None, hflip=False, rng=None, return_metadata=False,
+                      transform_metadata=None):
     ext = os.path.splitext(path)[1].lower()
     if ext in (".ppm", ".pnm"):
         arr = _read_ppm(path)
@@ -1064,6 +1065,46 @@ def load_image_tensor(path, size=256, device="cpu", center_crop=True,
     if crop_mode not in ("center", "random", "none", "pad"):
         raise ValueError(f"unknown crop mode {crop_mode!r}")
     target_hw = _target_hw(size)
+    if isinstance(transform_metadata, dict):
+        meta = dict(transform_metadata)
+        replay_mode = str(meta.get("crop_mode", crop_mode))
+        target_h = int(meta.get(
+            "target_height",
+            target_hw[0] if target_hw is not None else original_h))
+        target_w = int(meta.get(
+            "target_width",
+            target_hw[1] if target_hw is not None else original_w))
+        target_h = max(1, target_h)
+        target_w = max(1, target_w)
+        pad_top = max(0, int(meta.get("pad_top", 0) or 0))
+        pad_bottom = max(0, int(meta.get("pad_bottom", 0) or 0))
+        pad_left = max(0, int(meta.get("pad_left", 0) or 0))
+        pad_right = max(0, int(meta.get("pad_right", 0) or 0))
+        if replay_mode == "pad":
+            resize_h = max(1, target_h - pad_top - pad_bottom)
+            resize_w = max(1, target_w - pad_left - pad_right)
+            x = F.interpolate(x[None], size=(resize_h, resize_w), mode="bilinear",
+                              align_corners=False)[0]
+            x = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
+        else:
+            crop_top = max(0, int(meta.get("crop_top", 0) or 0))
+            crop_left = max(0, int(meta.get("crop_left", 0) or 0))
+            crop_h = max(1, int(meta.get("crop_height", original_h) or original_h))
+            crop_w = max(1, int(meta.get("crop_width", original_w) or original_w))
+            crop_top = min(crop_top, max(0, original_h - 1))
+            crop_left = min(crop_left, max(0, original_w - 1))
+            crop_h = min(crop_h, original_h - crop_top)
+            crop_w = min(crop_w, original_w - crop_left)
+            x = x[:, crop_top:crop_top + crop_h, crop_left:crop_left + crop_w]
+        if bool(meta.get("hflip", False)):
+            x = torch.flip(x, dims=(2,))
+        if replay_mode != "pad":
+            x = F.interpolate(x[None], size=(target_h, target_w), mode="bilinear",
+                              align_corners=False)[0]
+        x = x.to(device=device)
+        if not return_metadata:
+            return x
+        return x, meta
     crop_top = 0
     crop_left = 0
     crop_h = int(original_h)
@@ -1463,8 +1504,14 @@ def selftest():
         assert x.shape == (3, 4, 4) and float(x.max()) <= 1.0 and float(x.min()) >= -1.0
         xr = load_image_tensor(records[0].path, size=4, crop_mode="random",
                                rng=np.random.default_rng(2))
+        xrm, rmeta = load_image_tensor(
+            records[0].path, size=4, crop_mode="random",
+            rng=np.random.default_rng(2), return_metadata=True)
+        xrr = load_image_tensor(records[0].path, size=4, transform_metadata=rmeta)
         xf = load_image_tensor(records[0].path, size=4, crop_mode="center", hflip=True)
         assert xr.shape == (3, 4, 4) and xf.shape == (3, 4, 4)
+        assert torch.allclose(xr.cpu(), xrm.cpu())
+        assert torch.allclose(xrm.cpu(), xrr.cpu())
         assert torch.allclose(x[:, :, 0], xf[:, :, -1])
         xm, meta = load_image_tensor(
             records[0].path, size=4, crop_mode="center", hflip=True,
@@ -1475,6 +1522,8 @@ def selftest():
         assert meta["crop_height"] == 6 and meta["crop_width"] == 6
         assert meta["target_height"] == 4 and meta["target_width"] == 4
         assert meta["hflip"] is True
+        xmr = load_image_tensor(records[0].path, size=4, transform_metadata=meta)
+        assert torch.allclose(xm.cpu(), xmr.cpu())
         xp = load_image_tensor(records[0].path, size=8, crop_mode="pad")
         assert xp.shape == (3, 8, 8)
         assert torch.allclose(xp[:, 0, :], torch.zeros_like(xp[:, 0, :]))
@@ -1484,6 +1533,8 @@ def selftest():
         assert xpm.shape == (3, 8, 8)
         assert pmeta["pad_top"] == 1 and pmeta["pad_bottom"] == 1
         assert pmeta["pad_left"] == 0 and pmeta["pad_right"] == 0
+        xpr = load_image_tensor(records[0].path, size=8, transform_metadata=pmeta)
+        assert torch.allclose(xpm.cpu(), xpr.cpu())
         xt = load_image_tensor(records[0].path, size=(6, 10), crop_mode="pad")
         assert xt.shape == (3, 6, 10)
         vocab = build_caption_vocab(records)
