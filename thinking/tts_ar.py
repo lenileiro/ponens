@@ -71,6 +71,7 @@ class TransformerTTS(nn.Module):
     def __init__(self, d=256, n_bins=N_BINS, layers=4, heads=4, r=R):
         super().__init__()
         self.d = d; self.r = r; self.n_bins = n_bins
+        self.cfg = {"d": d, "layers": layers, "heads": heads, "r": r}
         self.enc = CharEncoder(d)
         self.prenet = nn.Sequential(nn.Linear(n_bins, 256), nn.ReLU(), nn.Linear(256, d), nn.ReLU())
         self.layers = nn.ModuleList([DecoderLayer(d, heads) for _ in range(layers)])
@@ -154,10 +155,22 @@ def _batch(data, rng, batch, device):
     return idt, mel, stop, ids_len, mel_len, grp_len
 
 
-def train(steps=60000, seed=0, device=DEV, batch=16, lr=3e-4, ckpt_path=None, save_dir=None):
+def build_from_ckpt(path, device=DEV):
+    """Rebuild the model at the size it was trained (config saved in the checkpoint)."""
+    global R
+    ck = torch.load(path, map_location=device)
+    cfg = ck.get("config", {"d": 256, "layers": 4, "heads": 4, "r": 1})
+    R = cfg.get("r", R)                                   # keep the batcher's reduction factor in sync
+    m = TransformerTTS(d=cfg["d"], layers=cfg["layers"], heads=cfg["heads"], r=cfg["r"]).to(device)
+    m.load_state_dict(ck["state_dict"]); m.eval()
+    return m
+
+
+def train(steps=60000, seed=0, device=DEV, batch=16, lr=3e-4, ckpt_path=None, save_dir=None,
+          d=256, layers=4, heads=4):
     torch.manual_seed(seed); rng = np.random.default_rng(seed)
     data = load(); train_data = data[:int(len(data) * 0.95)]
-    model = TransformerTTS().to(device); model.train()
+    model = TransformerTTS(d=d, layers=layers, heads=heads).to(device); model.train()
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     for st in range(1, steps + 1):
         idt, mel, stop, ids_len, mel_len, grp_len = _batch(train_data, rng, batch, device)
@@ -177,7 +190,7 @@ def train(steps=60000, seed=0, device=DEV, batch=16, lr=3e-4, ckpt_path=None, sa
             print(f"  ar {st}/{steps} mel {l_mel.item():.3f} stop {l_stop.item():.3f} "
                   f"ga {l_ga.item():.4f} focus {focus:.3f}", flush=True)
         if st % max(1, steps // 5) == 0 and ckpt_path:
-            torch.save({"state_dict": model.state_dict()}, ckpt_path)
+            torch.save({"state_dict": model.state_dict(), "config": model.cfg}, ckpt_path)
             model.train()
     return model, data
 
@@ -213,11 +226,14 @@ def evaluate(model, data, device=DEV, n=80, seed=1):
     return {"heldout_spec_l1": float(np.mean(errs)), "attention_focus": float(np.mean(focus))}
 
 
-def run(steps=60000, seed=0, device=DEV, save_dir="data/synth", ckpt_path="runs/tts_ar.pt"):
-    model, data = train(steps=steps, seed=seed, device=device, ckpt_path=ckpt_path)
+def run(steps=60000, seed=0, device=DEV, save_dir="data/synth", ckpt_path="runs/tts_ar.pt",
+        batch=16, d=256, layers=4, heads=4):
+    model, data = train(steps=steps, seed=seed, device=device, ckpt_path=ckpt_path,
+                        batch=batch, d=d, layers=layers, heads=heads)
+    torch.save({"state_dict": model.state_dict(), "config": model.cfg}, ckpt_path)
     ev = evaluate(model, data, device=device)
-    report = {"experiment": "tts_transformer_ar_ljspeech", "sr": SR, "steps": steps, **ev,
-              "aligned": ev["attention_focus"] > 0.4}
+    report = {"experiment": "tts_transformer_ar_ljspeech", "sr": SR, "steps": steps,
+              "batch": batch, **model.cfg, **ev, "aligned": ev["attention_focus"] > 0.4}
     print(f"\nheld-out spec L1 {ev['heldout_spec_l1']:.3f}  attention_focus {ev['attention_focus']:.3f}")
     synth(model, ["the quick brown fox jumps over the lazy dog.",
                   "hello, this is a test of the speech system.",
@@ -252,11 +268,16 @@ def main(argv=None):
     ap.add_argument("--out", default="runs/tts_ar.json")
     ap.add_argument("--checkpoint", default="runs/tts_ar.pt")
     ap.add_argument("--synth-out", default="data/synth", dest="synth_out")
+    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--dim", type=int, default=256)
+    ap.add_argument("--layers", type=int, default=4)
+    ap.add_argument("--heads", type=int, default=4)
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return
     if args.train:
-        report, _ = run(steps=args.steps, seed=args.seed, save_dir=args.synth_out, ckpt_path=args.checkpoint)
+        report, _ = run(steps=args.steps, seed=args.seed, save_dir=args.synth_out, ckpt_path=args.checkpoint,
+                        batch=args.batch, d=args.dim, layers=args.layers, heads=args.heads)
         json.dump(report, open(args.out, "w"), indent=1)
         print(f"saved -> {args.out}")
         return
