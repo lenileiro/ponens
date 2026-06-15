@@ -2030,6 +2030,7 @@ def payload(args):
                 f"--batch {args.multimodal_batch} --dim {mm_dim} "
                 f"--layers {args.multimodal_layers} --heads {args.multimodal_heads} "
                 f"--max-vocab {args.multimodal_max_vocab} "
+                f"--decode-objective {args.multimodal_decode_objective} "
                 f"--source-balance-w {args.multimodal_source_balance_w} "
                 f"--lr {args.multimodal_lr} --log-every {args.multimodal_log_every} "
                 f"--decode-w {args.multimodal_decode_w} "
@@ -4070,6 +4071,11 @@ def main():
                     help="M-0 decoder width; default uses --dim or 96")
     ap.add_argument("--multimodal-layers", type=int, default=3, dest="multimodal_layers")
     ap.add_argument("--multimodal-heads", type=int, default=4, dest="multimodal_heads")
+    ap.add_argument("--multimodal-decode-objective", default="auto",
+                    choices=("auto", "target", "causal"),
+                    dest="multimodal_decode_objective",
+                    help="decoder target construction: auto detects continuation "
+                         "chunks, causal trains contiguous next-token windows")
     ap.add_argument("--multimodal-max-vocab", type=int, default=0,
                     dest="multimodal_max_vocab",
                     help="cap vocab to N most frequent tokens (0 = uncapped)")
