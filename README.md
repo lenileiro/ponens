@@ -17,8 +17,14 @@ runs reuse internal FER/bridge/sequence weaknesses rather than only surface scor
 transfer is target-probed before trust: a harmful reading checkpoint can be rolled back before its
 history prior drives new training. The default reading profile also owns bounded hard-study
 probing, selected hard-record caps, and periodic structure refreshes, so normal commands do not
-need low-level study flags. The code keeps model inputs manifest-driven: datasets provide text,
-feature views, image records, and optional target tokens; model code learns the representations.
+need low-level study flags. Reading checkpoints now expose compact `learning_event` evidence when
+an applied update moved sampled weights and improved score, representation structure, or
+concept-connection signals; continuation and multimodal transfer can use that event as self-teach
+pressure, and replay banks prioritize the study records attached to those events. Selected study
+rounds can also keep a guarded representation reorganization as a model-discovered "light bulb"
+moment, instead of depending only on surface score. The code keeps model inputs manifest-driven:
+datasets provide text, feature views, image records, and optional target tokens; model code learns
+the representations.
 
 ## What's here
 

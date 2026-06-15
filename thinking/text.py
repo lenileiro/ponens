@@ -186,7 +186,29 @@ def reading_hard_record_ids(study_reports):
     return ids
 
 
-def reading_replay_record_metadata(study_reports):
+def _reading_replay_learning_event_record_ids(study_reports):
+    ids = []
+    seen = set()
+    for report in study_reports or ():
+        if not isinstance(report, dict):
+            continue
+        for raw_id in tuple(report.get("hard_record_ids", ()) or ()) + tuple(
+                report.get("record_ids", ()) or ()):
+            rec_id = str(raw_id)
+            if rec_id and rec_id not in seen:
+                seen.add(rec_id)
+                ids.append(rec_id)
+        insight = report.get("study_pool_insight")
+        if isinstance(insight, dict):
+            for raw_id in insight.get("record_ids", ()):
+                rec_id = str(raw_id)
+                if rec_id and rec_id not in seen:
+                    seen.add(rec_id)
+                    ids.append(rec_id)
+    return ids
+
+
+def reading_replay_record_metadata(study_reports, learning_event=None):
     meta = {}
 
     def bump(rec_id, reason, priority):
@@ -215,10 +237,24 @@ def reading_replay_record_metadata(study_reports):
                 bump(raw_id, "concept_insight", 1.5 + insight_delta)
         for raw_id in report.get("record_ids", ()):
             bump(raw_id, f"study_pool:{strategy}", 1.0 + score)
+    if isinstance(learning_event, dict) and bool(
+            learning_event.get("triggered", False)):
+        event_score = min(
+            1.0, max(0.0, _reading_float(
+                learning_event.get("event_score", 0.0))))
+        event_kind = str(learning_event.get("kind", "learning"))
+        event_signal = str(learning_event.get("top_signal", ""))
+        reasons = [f"learning_event:{event_kind}"]
+        if event_signal in READING_DISCOVERY_SIGNALS:
+            reasons.append(f"learning_signal:{event_signal}")
+        for raw_id in _reading_replay_learning_event_record_ids(study_reports):
+            for reason in reasons:
+                bump(raw_id, reason, 2.5 + event_score)
     return meta
 
 
 def build_reading_replay_bank(records, study_reports=None,
+                              learning_event=None,
                               max_records=READING_REPLAY_BANK_SIZE, seed=0):
     max_records = int(max_records)
     if max_records <= 0:
@@ -227,7 +263,8 @@ def build_reading_replay_bank(records, study_reports=None,
     records = unique_reading_records_by_id(records)
     by_id = {rec.rec_id: rec for rec in records}
     hard_ids = reading_hard_record_ids(study_reports)
-    replay_meta = reading_replay_record_metadata(study_reports)
+    replay_meta = reading_replay_record_metadata(
+        study_reports, learning_event=learning_event)
     for rec in records:
         if not isinstance(getattr(rec, "meta", None), dict):
             continue
@@ -459,6 +496,103 @@ def _reading_weight_update_history_summary(train_metrics, selection, rounds):
     }
 
 
+def reading_learning_event_report(report):
+    """Summarize whether a raw-reading update produced reusable learning evidence."""
+    report = report if isinstance(report, dict) else {}
+    selection = report.get("selection") if isinstance(
+        report.get("selection"), dict) else {}
+    train_metrics = report.get("train_metrics") if isinstance(
+        report.get("train_metrics"), dict) else {}
+    if not selection and isinstance(train_metrics.get("selection"), dict):
+        selection = train_metrics["selection"]
+    rounds = selection.get("rounds", ()) if isinstance(selection, dict) else ()
+    rounds = [row for row in rounds if isinstance(row, dict)]
+    weight_update = _reading_weight_update_history_summary(
+        train_metrics, selection, rounds)
+    representation_progress = reading_representation_progress_digest(
+        report.get("representation_progress"))
+    delta = report.get("delta") if isinstance(report.get("delta"), dict) else {}
+    score_gain = max(
+        0.0,
+        _reading_float(delta.get("score", 0.0)),
+        _reading_float(delta.get("mastery_score", 0.0)),
+        _reading_float(delta.get("active_mean_score", 0.0)),
+        _reading_float(selection.get("selected_score_delta", 0.0)),
+    )
+    selected_round = _reading_int_or_none(selection.get("selected_round"))
+    if bool(selection.get("enabled", False)) and selected_round is not None:
+        event_rounds = [
+            row for row in rounds
+            if _reading_int_or_none(row.get("round")) == selected_round]
+    else:
+        event_rounds = rounds
+    concept_delta = max((
+        max(0.0, _reading_float(row.get("concept_insight_delta", 0.0)))
+        for row in event_rounds
+    ), default=0.0)
+    selected_by_insight = bool(selection.get("selected_by_insight", False))
+    concept_connection = bool(
+        selected_by_insight or concept_delta > 0.0)
+    representation_delta = _reading_float(
+        representation_progress.get("organization_score_delta", 0.0))
+    representation_gain = max(
+        0.0,
+        representation_delta,
+        _reading_float(representation_progress.get("positive_signal_gain", 0.0)),
+    )
+    representation_event = bool(
+        representation_progress.get("representation_insight_event", False)
+        or representation_gain > 0.0)
+    selection_enabled = bool(selection.get("enabled", False))
+    accepted_update = bool(selection.get("accepted_update", False))
+    update_applied = bool(accepted_update or not selection_enabled)
+    weight_moved = bool(weight_update["changed"])
+    triggered = bool(
+        update_applied and weight_moved
+        and (score_gain > 0.0 or concept_connection or representation_event))
+    if concept_connection:
+        kind = "concept_connection"
+        top_signal = "bridge"
+    elif representation_event:
+        kind = "representation_reorganization"
+        top_signal = str(representation_progress.get("top_gain_signal", ""))
+    elif score_gain > 0.0:
+        kind = "score_gain"
+        top_signal = str(selection.get("self_teach_top_signal", ""))
+    else:
+        kind = "parameter_update"
+        top_signal = ""
+    if top_signal not in READING_DISCOVERY_SIGNALS:
+        top_signal = ""
+    event_score = min(
+        1.0,
+        score_gain + max(0.0, concept_delta) + max(0.0, representation_gain))
+    return {
+        "enabled": True,
+        "triggered": bool(triggered),
+        "kind": kind,
+        "top_signal": top_signal,
+        "event_score": float(event_score),
+        "update_applied": bool(update_applied),
+        "selection_enabled": bool(selection_enabled),
+        "accepted_update": bool(accepted_update),
+        "weight_update_changed": bool(weight_moved),
+        "weight_update_changed_tensor_count": int(
+            weight_update["changed_tensor_count"]),
+        "weight_update_changed_value_count": int(
+            weight_update["changed_value_count"]),
+        "weight_update_max_abs_delta": float(weight_update["max_abs_delta"]),
+        "attempted_weight_update_count": int(weight_update["attempted_count"]),
+        "score_gain": float(score_gain),
+        "concept_connection": bool(concept_connection),
+        "concept_connection_delta": float(concept_delta),
+        "representation_event": bool(representation_event),
+        "representation_organization_score_delta": float(representation_delta),
+        "representation_positive_signal_gain": float(
+            representation_progress.get("positive_signal_gain", 0.0)),
+    }
+
+
 def reading_mastery_history_entry(report, session_index=None):
     report = report if isinstance(report, dict) else {}
     selection = report.get("selection") if isinstance(
@@ -490,6 +624,10 @@ def reading_mastery_history_entry(report, session_index=None):
         train_metrics, selection, rounds)
     representation_progress = reading_representation_progress_digest(
         report.get("representation_progress"))
+    learning_event = (
+        report.get("learning_event")
+        if isinstance(report.get("learning_event"), dict)
+        else reading_learning_event_report(report))
     top_self_teach = self_teach_reports[0] if self_teach_reports else {}
     bank = report.get("reading_replay_bank")
     bank = bank if isinstance(bank, dict) else {}
@@ -547,6 +685,14 @@ def reading_mastery_history_entry(report, session_index=None):
             representation_progress.get("organization_score_delta", 0.0)),
         "representation_top_gain_signal": str(
             representation_progress.get("top_gain_signal", "")),
+        "learning_event": learning_event,
+        "learning_event_triggered": bool(
+            learning_event.get("triggered", False)),
+        "learning_event_kind": str(learning_event.get("kind", "")),
+        "learning_event_top_signal": str(
+            learning_event.get("top_signal", "")),
+        "learning_event_score": _reading_float(
+            learning_event.get("event_score", 0.0)),
         "self_teach_top_signal": str(top_self_teach.get("top_signal", "")),
         "self_teach_active_signals": [
             str(item) for item in top_self_teach.get("active_signals", ())],
@@ -2547,6 +2693,8 @@ READING_MASTERY_STUDY_FLOORS = {
     "study_rounds": 3,
     "study_score_patience": 2,
     "study_score_target": 0.85,
+    "study_representation_accept_w": 0.25,
+    "study_representation_min_delta": 0.01,
 }
 READING_MASTERY_OPERATION_FLOORS = {
     "study_probe_n": 256,
@@ -2765,6 +2913,12 @@ def reading_mastery_history_concept_insight_prior(history, enabled=True,
             continue
         delta = max(
             0.0, _reading_float(entry.get("max_concept_insight_delta", 0.0)))
+        learning_event = entry.get("learning_event")
+        if (isinstance(learning_event, dict)
+                and bool(learning_event.get("triggered", False))
+                and str(learning_event.get("kind", "")) == "concept_connection"):
+            delta = max(delta, _reading_float(
+                learning_event.get("event_score", 0.0)))
         if offset == 0:
             latest_delta = delta
         recency_weight = decay ** offset
@@ -2804,21 +2958,20 @@ def reading_mastery_history_self_teach_prior(history, enabled=True,
     for offset, entry in enumerate(reversed(entries)):
         if not isinstance(entry, dict):
             continue
-        score_components = entry.get("after_score_components")
-        if not isinstance(score_components, dict):
-            continue
         recency_weight = decay ** offset
-        for signal in READING_DISCOVERY_SIGNALS:
-            skip_key = f"{signal}_skipped"
-            if bool(score_components.get(skip_key, False)):
-                continue
-            score_key = READING_SELF_TEACH_SCORE_KEYS[signal]
-            if score_key not in score_components:
-                continue
-            quality = min(1.0, max(0.0, _reading_float(
-                score_components.get(score_key, 0.0))))
-            weighted[signal] += recency_weight * max(0.0, 1.0 - quality)
-            weights[signal] += recency_weight
+        score_components = entry.get("after_score_components")
+        if isinstance(score_components, dict):
+            for signal in READING_DISCOVERY_SIGNALS:
+                skip_key = f"{signal}_skipped"
+                if bool(score_components.get(skip_key, False)):
+                    continue
+                score_key = READING_SELF_TEACH_SCORE_KEYS[signal]
+                if score_key not in score_components:
+                    continue
+                quality = min(1.0, max(0.0, _reading_float(
+                    score_components.get(score_key, 0.0))))
+                weighted[signal] += recency_weight * max(0.0, 1.0 - quality)
+                weights[signal] += recency_weight
         representation_progress = entry.get("representation_progress")
         if (isinstance(representation_progress, dict)
                 and bool(representation_progress.get("enabled", False))):
@@ -2838,6 +2991,17 @@ def reading_mastery_history_self_teach_prior(history, enabled=True,
                     continue
                 weighted[signal] += recency_weight * deficit
                 weights[signal] += recency_weight
+        learning_event = entry.get("learning_event")
+        if (isinstance(learning_event, dict)
+                and bool(learning_event.get("triggered", False))):
+            signal = str(learning_event.get("top_signal", ""))
+            if signal in READING_DISCOVERY_SIGNALS:
+                event_score = min(1.0, max(
+                    0.0, _reading_float(
+                        learning_event.get("event_score", 0.0))))
+                if event_score > 0.0:
+                    weighted[signal] += recency_weight * event_score
+                    weights[signal] += recency_weight
         top_signal = str(entry.get("self_teach_top_signal", ""))
         if top_signal in top_counts:
             top_counts[top_signal] += 1
@@ -5765,12 +5929,64 @@ def _step_schedule(steps, rounds):
 def reading_round_selection_decision(
         score_delta_from_best, score_min_delta, insight_delta=0.0,
         insight_allowed=True, bridge_insight_gate=False,
-        insight_accept_w=0.25, insight_min_delta=0.0):
-    return concept_round_selection_decision(
+        insight_accept_w=0.25, insight_min_delta=0.0,
+        representation_delta=0.0, representation_allowed=True,
+        representation_gate=False, representation_accept_w=0.0,
+        representation_min_delta=0.0):
+    base = concept_round_selection_decision(
         score_delta_from_best, score_min_delta, insight_delta=insight_delta,
         insight_allowed=insight_allowed, insight_gate=bridge_insight_gate,
         insight_accept_w=insight_accept_w,
         insight_min_delta=insight_min_delta)
+    representation_delta = float(representation_delta)
+    representation_accept_w = float(representation_accept_w)
+    representation_min_delta = float(representation_min_delta)
+    representation_boost = 0.0
+    if (bool(representation_allowed) and bool(representation_gate)
+            and representation_accept_w > 0.0
+            and representation_delta > representation_min_delta):
+        representation_boost = representation_accept_w * max(
+            0.0, representation_delta)
+    representation_effective_delta = (
+        float(score_delta_from_best) + representation_boost)
+    selection_effective_delta = (
+        float(base["insight_effective_delta"]) + representation_boost)
+    selected_by_representation = (
+        bool(representation_allowed) and representation_boost > 0.0
+        and selection_effective_delta > float(score_min_delta)
+        and not bool(base["selected_by_score"]))
+    selected = bool(base["selected"] or selected_by_representation)
+    reasons = []
+    if bool(base["selected_by_score"]):
+        reasons.append("score")
+    if bool(base["selected_by_insight"]):
+        reasons.append("concept_insight")
+    if selected_by_representation:
+        reasons.append("representation_insight")
+    return base | {
+        "selected": selected,
+        "selected_by_representation": bool(selected_by_representation),
+        "representation_score_boost": float(representation_boost),
+        "representation_effective_delta": float(representation_effective_delta),
+        "selection_effective_delta": float(selection_effective_delta),
+        "selection_reasons": reasons,
+    }
+
+
+def reading_representation_insight_delta(progress, enabled=True):
+    if (not enabled or not isinstance(progress, dict)
+            or not bool(progress.get("enabled", False))):
+        return 0.0, True
+    organization_delta = _reading_float(
+        progress.get("organization_score_delta", 0.0))
+    positive_gain = _reading_float(progress.get("positive_signal_gain", 0.0))
+    negative_drift = _reading_float(progress.get("negative_signal_drift", 0.0))
+    raw_delta = organization_delta + 0.25 * positive_gain - 0.25 * negative_drift
+    allowed = bool(
+        progress.get("representation_insight_event", False)
+        and organization_delta >= -1e-9
+        and raw_delta >= -1e-9)
+    return float(raw_delta), bool(allowed)
 
 
 def fit_reading_concepts_select_best(
@@ -5841,6 +6057,7 @@ def fit_reading_concepts_select_best(
         eval_n=64, score_metric="mastery", score_margin_w=0.1,
         score_min_delta=0.0, score_patience=0, score_target=0.0,
         insight_accept_w=0.25, insight_min_delta=0.0,
+        representation_accept_w=0.0, representation_min_delta=0.0,
         rounds=1, before_bundle=None):
     schedule = _step_schedule(steps, rounds)
     if not schedule:
@@ -5860,6 +6077,14 @@ def fit_reading_concepts_select_best(
     insight_min_delta = float(insight_min_delta)
     if insight_min_delta < 0.0:
         raise ValueError("reading study insight min delta must be non-negative")
+    representation_accept_w = float(representation_accept_w)
+    if representation_accept_w < 0.0:
+        raise ValueError(
+            "reading study representation accept weight must be non-negative")
+    representation_min_delta = float(representation_min_delta)
+    if representation_min_delta < 0.0:
+        raise ValueError(
+            "reading study representation min delta must be non-negative")
     study_self_teach_w = float(study_self_teach_w)
     if study_self_teach_w < 0.0:
         raise ValueError("reading study self-teach weight must be non-negative")
@@ -6131,13 +6356,24 @@ def fit_reading_concepts_select_best(
         concept_insight = reading_concept_insight_report(
             current_bundle["score_components"], bundle["score_components"],
             bridge_insight=insight, enabled=round_concept_insight_gate)
+        representation_progress = reading_representation_progress_report(
+            current_bundle, bundle)
+        representation_insight_delta, representation_insight_allowed = (
+            reading_representation_insight_delta(
+                representation_progress,
+                enabled=representation_accept_w > 0.0))
         decision = reading_round_selection_decision(
             score_delta_from_best, score_min_delta,
             insight_delta=concept_insight["delta"],
             insight_allowed=concept_insight["allowed"],
             bridge_insight_gate=round_concept_insight_gate,
             insight_accept_w=insight_accept_w,
-            insight_min_delta=insight_min_delta)
+            insight_min_delta=insight_min_delta,
+            representation_delta=representation_insight_delta,
+            representation_allowed=representation_insight_allowed,
+            representation_gate=representation_accept_w > 0.0,
+            representation_accept_w=representation_accept_w,
+            representation_min_delta=representation_min_delta)
         selected = decision["selected"]
         rounds_report.append(row | {
             "selected": bool(selected),
@@ -6154,6 +6390,12 @@ def fit_reading_concepts_select_best(
             "concept_insight_delta": float(concept_insight["delta"]),
             "concept_insight_allowed": bool(concept_insight["allowed"]),
             "concept_insight": concept_insight,
+            "representation_insight_gate": bool(representation_accept_w > 0.0),
+            "representation_insight_delta": float(
+                representation_insight_delta),
+            "representation_insight_allowed": bool(
+                representation_insight_allowed),
+            "representation_progress": representation_progress,
             "replay_priority_sampling": bool(
                 round_train_metrics.get("replay_priority_sampling", False)),
             "replay_priority_record_count": int(
@@ -6173,9 +6415,18 @@ def fit_reading_concepts_select_best(
                 round_train_metrics.get("weight_update_max_abs_delta", 0.0)),
             "selected_by_score": bool(decision["selected_by_score"]),
             "selected_by_insight": bool(decision["selected_by_insight"]),
+            "selected_by_representation": bool(
+                decision["selected_by_representation"]),
             "insight_score_boost": float(decision["insight_score_boost"]),
             "insight_effective_delta": float(
                 decision["insight_effective_delta"]),
+            "representation_score_boost": float(
+                decision["representation_score_boost"]),
+            "representation_effective_delta": float(
+                decision["representation_effective_delta"]),
+            "selection_effective_delta": float(
+                decision["selection_effective_delta"]),
+            "selection_reasons": list(decision["selection_reasons"]),
             "study_pool_insight": insight,
             "study_pool_bridge_before": round_train_metrics.get(
                 "study_pool_bridge_before"),
@@ -6232,6 +6483,8 @@ def fit_reading_concepts_select_best(
             and getattr(model, "latent_concept_memory", None) is not None),
         "insight_accept_w": float(insight_accept_w),
         "insight_min_delta": float(insight_min_delta),
+        "representation_accept_w": float(representation_accept_w),
+        "representation_min_delta": float(representation_min_delta),
         "stopped_early": bool(stopped_early),
         "stop_round": int(stop_round),
         "no_improve_rounds": int(no_improve_rounds),
@@ -6263,11 +6516,23 @@ def fit_reading_concepts_select_best(
             selected_row.get("selected_by_score", False))
         selection["selected_by_insight"] = bool(
             selected_row.get("selected_by_insight", False))
+        selection["selected_by_representation"] = bool(
+            selected_row.get("selected_by_representation", False))
         selection["selected_insight_score_boost"] = float(
             selected_row.get("insight_score_boost", 0.0))
         selection["selected_insight_effective_delta"] = float(
             selected_row.get("insight_effective_delta", 0.0))
+        selection["selected_representation_score_boost"] = float(
+            selected_row.get("representation_score_boost", 0.0))
+        selection["selected_representation_effective_delta"] = float(
+            selected_row.get("representation_effective_delta", 0.0))
+        selection["selected_effective_delta"] = float(
+            selected_row.get("selection_effective_delta", 0.0))
+        selection["selected_reasons"] = list(
+            selected_row.get("selection_reasons", ()))
         selection["selected_insight"] = selected_row.get("study_pool_insight")
+        selection["selected_representation_progress"] = selected_row.get(
+            "representation_progress")
     best_metrics = best_metrics | {"selection": selection}
     model.reading_train_metrics = best_metrics
     model.reading_study_reports = best_study_reports
@@ -6368,6 +6633,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            study_score_target=0.0,
                            study_insight_accept_w=0.25,
                            study_insight_min_delta=0.0,
+                           study_representation_accept_w=0.0,
+                           study_representation_min_delta=0.0,
                            study_self_teach_w=0.0,
                            self_teach_history_prior=None,
                            self_teach_history_prior_w=0.5,
@@ -6493,6 +6760,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             score_target=study_score_target,
             insight_accept_w=study_insight_accept_w,
             insight_min_delta=study_insight_min_delta,
+            representation_accept_w=study_representation_accept_w,
+            representation_min_delta=study_representation_min_delta,
             study_self_teach_w=study_self_teach_w,
             self_teach_history_prior=self_teach_history_prior,
             self_teach_history_prior_w=self_teach_history_prior_w,
@@ -6726,6 +6995,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          study_score_target=0.0,
                          study_insight_accept_w=0.25,
                          study_insight_min_delta=0.0,
+                         study_representation_accept_w=0.0,
+                         study_representation_min_delta=0.0,
                          study_self_teach_w=0.0,
                          reading_objective_profile="manual",
                          reading_objective_profile_report=None,
@@ -6860,6 +7131,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             score_target=study_score_target,
             insight_accept_w=study_insight_accept_w,
             insight_min_delta=study_insight_min_delta,
+            representation_accept_w=study_representation_accept_w,
+            representation_min_delta=study_representation_min_delta,
             study_self_teach_w=study_self_teach_w,
             rounds=study_rounds,
             before_bundle=before_bundle)
@@ -7022,8 +7295,6 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
     resolved_study_strategy = train_metrics.get("study_strategy", study_strategy)
     requested_study_strategy = train_metrics.get(
         "study_strategy_requested", study_strategy)
-    reading_replay_bank = build_reading_replay_bank(
-        records, study_reports=getattr(model, "reading_study_reports", []))
     report = {"experiment": "text_raw_reading_concept_pretrain",
               "data": data,
               "steps": int(steps), "batch": int(batch), "lr": float(lr),
@@ -7131,6 +7402,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "study_score_target": float(study_score_target),
               "study_insight_accept_w": float(study_insight_accept_w),
               "study_insight_min_delta": float(study_insight_min_delta),
+              "study_representation_accept_w": float(
+                  study_representation_accept_w),
+              "study_representation_min_delta": float(
+                  study_representation_min_delta),
               "study_self_teach_w": float(study_self_teach_w),
               "reading_objective_profile": str(reading_objective_profile),
               "reading_objective_profile_report": (
@@ -7141,7 +7416,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                       "updates": {},
                       "applied": False,
                   }),
-              "reading_replay_bank": reading_replay_bank,
+              "reading_replay_bank": {},
               "train_records": sum(r.split == "train" for r in records),
               "eval_records": sum(r.split == "eval" for r in records),
               "vocab_size": len(vocab),
@@ -7245,6 +7520,10 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "study_neighborhoods": getattr(
                   model, "reading_neighborhood_reports", []),
               "study_clusters": getattr(model, "reading_cluster_reports", [])}
+    report["learning_event"] = reading_learning_event_report(report)
+    report["reading_replay_bank"] = build_reading_replay_bank(
+        records, study_reports=getattr(model, "reading_study_reports", []),
+        learning_event=report["learning_event"])
     report["reading_mastery_history"] = reading_mastery_history_with_entry(
         [], report)
     report["reading_mastery_history_count"] = report[
@@ -7394,6 +7673,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              study_score_target=0.0,
                              study_insight_accept_w=0.25,
                              study_insight_min_delta=0.0,
+                             study_representation_accept_w=0.0,
+                             study_representation_min_delta=0.0,
                              study_self_teach_w=0.0,
                              reading_objective_profile="manual",
                              reading_objective_profile_report=None,
@@ -7575,6 +7856,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             score_target=study_score_target,
             insight_accept_w=study_insight_accept_w,
             insight_min_delta=study_insight_min_delta,
+            representation_accept_w=study_representation_accept_w,
+            representation_min_delta=study_representation_min_delta,
             study_self_teach_w=study_self_teach_w,
             self_teach_history_prior=self_teach_history_prior,
             self_teach_history_prior_w=self_teach_history_prior_w,
@@ -7760,9 +8043,6 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
     resolved_study_strategy = train_metrics.get("study_strategy", study_strategy)
     requested_study_strategy = train_metrics.get(
         "study_strategy_requested", study_strategy)
-    reading_replay_bank = build_reading_replay_bank(
-        unique_reading_records_by_id(records, replay_records),
-        study_reports=getattr(model, "reading_study_reports", []))
     report = {"experiment": "text_raw_reading_checkpoint_study",
               "checkpoint": checkpoint,
               "checkpoint_experiment": ckpt.get("report", {}).get("experiment"),
@@ -7895,6 +8175,10 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "study_score_target": float(study_score_target),
               "study_insight_accept_w": float(study_insight_accept_w),
               "study_insight_min_delta": float(study_insight_min_delta),
+              "study_representation_accept_w": float(
+                  study_representation_accept_w),
+              "study_representation_min_delta": float(
+                  study_representation_min_delta),
               "study_self_teach_w": float(study_self_teach_w),
               "reading_objective_profile": str(reading_objective_profile),
               "reading_objective_profile_report": (
@@ -7909,7 +8193,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "replay_w": float(replay_w),
               "replay_batch": int(replay_batch),
               "replay_retention_w": float(replay_retention_w),
-              "reading_replay_bank": reading_replay_bank,
+              "reading_replay_bank": {},
               "train_records": sum(r.split == "train" for r in records),
               "eval_records": sum(r.split == "eval" for r in records),
               "replay_train_records": sum(r.split == "train" for r in replay_records),
@@ -8024,6 +8308,11 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "study_neighborhoods": getattr(
                   model, "reading_neighborhood_reports", []),
               "study_clusters": getattr(model, "reading_cluster_reports", [])}
+    report["learning_event"] = reading_learning_event_report(report)
+    report["reading_replay_bank"] = build_reading_replay_bank(
+        unique_reading_records_by_id(records, replay_records),
+        study_reports=getattr(model, "reading_study_reports", []),
+        learning_event=report["learning_event"])
     report["reading_mastery_history"] = reading_mastery_history_with_entry(
         reading_mastery_history_from_payload(ckpt), report)
     report["reading_mastery_history_count"] = report[
@@ -8391,6 +8680,17 @@ def selftest():
         }]
     })
     assert representation_prior["signal_deficits"]["sequence"] > 0.0
+    event_prior = reading_mastery_history_self_teach_prior({
+        "entries": [{
+            "learning_event": {
+                "triggered": True,
+                "kind": "representation_reorganization",
+                "top_signal": "cluster",
+                "event_score": 0.7,
+            },
+        }]
+    })
+    assert event_prior["signal_deficits"]["cluster"] > 0.0
     concept_prior = reading_mastery_history_self_teach_prior({
         "entries": [{
             "after_score_components": current_scores,
@@ -8438,6 +8738,8 @@ def selftest():
         sequence_w=0.0, neighborhood_w=0.0, transition_w=0.0,
         cluster_w=0.0, study_self_teach_w=0.0, study_rounds=1,
         study_score_patience=0, study_score_target=0.0,
+        study_representation_accept_w=0.0,
+        study_representation_min_delta=0.0,
         study_probe_n=0, study_hard_max=0, study_refresh_steps=0,
         neighborhood_probe_n=0, neighborhood_refresh_steps=0,
         cluster_probe_n=0, cluster_refresh_steps=0, passthrough="kept")
@@ -8448,6 +8750,8 @@ def selftest():
     assert mastery_kwargs["study_rounds"] == 3
     assert mastery_kwargs["study_score_patience"] == 2
     assert mastery_kwargs["study_score_target"] == 0.85
+    assert mastery_kwargs["study_representation_accept_w"] == 0.25
+    assert mastery_kwargs["study_representation_min_delta"] == 0.01
     assert mastery_kwargs["study_probe_n"] == 256
     assert mastery_kwargs["study_hard_max"] == 64
     assert mastery_kwargs["study_refresh_steps"] == 100
@@ -8477,12 +8781,16 @@ def selftest():
         sequence_w=0.0, neighborhood_w=0.0, transition_w=0.0,
         cluster_w=0.0, study_self_teach_w=0.0, study_rounds=1,
         study_score_patience=0, study_score_target=0.0,
+        study_representation_accept_w=0.0,
+        study_representation_min_delta=0.0,
         study_probe_n=0, study_hard_max=0, study_refresh_steps=0,
         neighborhood_probe_n=0, neighborhood_refresh_steps=0,
         cluster_probe_n=0, cluster_refresh_steps=0)
     assert manual_kwargs["study_self_teach_w"] == 0.0
     assert manual_kwargs["study_rounds"] == 1
     assert manual_kwargs["study_score_target"] == 0.0
+    assert manual_kwargs["study_representation_accept_w"] == 0.0
+    assert manual_kwargs["study_representation_min_delta"] == 0.0
     assert manual_kwargs["study_probe_n"] == 0
     assert manual_kwargs["study_hard_max"] == 0
     assert manual_kwargs["study_refresh_steps"] == 0
@@ -8655,6 +8963,31 @@ def selftest():
         bridge_insight_gate=True, insight_accept_w=1.0,
         insight_min_delta=0.3)
     assert no_insight_decision["selected"] is False
+    representation_decision = reading_round_selection_decision(
+        -0.01, 0.0, insight_delta=0.0, insight_allowed=True,
+        bridge_insight_gate=False, insight_accept_w=0.0,
+        representation_delta=0.2, representation_allowed=True,
+        representation_gate=True, representation_accept_w=1.0,
+        representation_min_delta=0.05)
+    assert representation_decision["selected"] is True
+    assert representation_decision["selected_by_representation"] is True
+    assert "representation_insight" in representation_decision["selection_reasons"]
+    no_representation_decision = reading_round_selection_decision(
+        -0.01, 0.0, insight_delta=0.0, insight_allowed=True,
+        bridge_insight_gate=False, insight_accept_w=0.0,
+        representation_delta=0.02, representation_allowed=True,
+        representation_gate=True, representation_accept_w=1.0,
+        representation_min_delta=0.05)
+    assert no_representation_decision["selected"] is False
+    rep_delta, rep_allowed = reading_representation_insight_delta({
+        "enabled": True,
+        "representation_insight_event": True,
+        "organization_score_delta": 0.2,
+        "positive_signal_gain": 0.4,
+        "negative_signal_drift": 0.1,
+    })
+    assert rep_allowed is True
+    assert rep_delta > 0.0
     patience_model = TextReadingLM(
         len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
         latent_concept_slots=2, latent_concept_memory_size=8).to("cpu")
@@ -8701,6 +9034,9 @@ def selftest():
         READING_STUDY_STRATEGIES)
     assert "concept_insight" in helper_selection["rounds"][1]
     assert "concept_insight_delta" in helper_selection["rounds"][1]
+    assert "representation_progress" in helper_selection["rounds"][1]
+    assert "representation_insight_delta" in helper_selection["rounds"][1]
+    assert "selected_by_representation" in helper_selection["rounds"][1]
     assert "replay_priority_sampling" in helper_selection["rounds"][1]
     assert helper_selection["rounds"][1]["weight_update_changed"] is True
     assert (helper_selection["rounds"][1][
@@ -8824,6 +9160,10 @@ def selftest():
         "representation_organization_score_delta"] == 0.2)
     assert first_history_entry["representation_top_gain_signal"] == "bridge"
     assert first_history_entry["representation_progress"]["enabled"] is True
+    assert first_history_entry["learning_event_triggered"] is True
+    assert first_history_entry["learning_event_kind"] == "concept_connection"
+    assert first_history_entry["learning_event_top_signal"] == "bridge"
+    assert first_history_entry["learning_event_score"] > 0.0
     assert reading_mastery_history_from_payload({})["entry_count"] == 0
     priority_replay_bank = build_reading_replay_bank(
         reading_records,
@@ -8838,13 +9178,26 @@ def selftest():
             },
             "record_ids": ["read-train-3"],
         }],
+        learning_event={
+            "triggered": True,
+            "kind": "representation_reorganization",
+            "top_signal": "bridge",
+            "event_score": 0.6,
+        },
         max_records=3)
     assert priority_replay_bank["priority_record_count"] == 3
     priority_rows = priority_replay_bank["records"]
     assert priority_rows[0]["id"] == "read-eval-1"
     assert "hard:discovery" in priority_rows[0]["replay_reasons"]
+    assert "learning_event:representation_reorganization" in (
+        priority_rows[0]["replay_reasons"])
+    assert "learning_signal:bridge" in priority_rows[0]["replay_reasons"]
     assert priority_rows[1]["id"] == "read-train-2"
     assert "concept_insight" in priority_rows[1]["replay_reasons"]
+    assert "learning_event:representation_reorganization" in (
+        priority_rows[1]["replay_reasons"])
+    assert "learning_event:representation_reorganization" in (
+        priority_rows[2]["replay_reasons"])
     priority_records = reading_replay_bank_records_from_payload(
         {"reading_replay_bank": priority_replay_bank})
     assert priority_records[0].meta["replay_priority"] > 0.0
@@ -8967,6 +9320,8 @@ def selftest():
         assert history_entries[1]["representation_progress"]["enabled"] is True
         assert math.isfinite(
             history_entries[1]["representation_organization_score_delta"])
+        assert history_entries[1]["learning_event"]["enabled"] is True
+        assert "learning_event_triggered" in history_entries[1]
         assert history_entries[1]["self_teach_top_signal"]
     print("text selftest OK")
 
@@ -9126,6 +9481,10 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-study-insight-accept-w", "--reading-study-insight-w",
                     type=float, default=0.25, dest="reading_study_insight_accept_w")
     ap.add_argument("--reading-study-insight-min-delta", type=float, default=0.0)
+    ap.add_argument("--reading-study-representation-accept-w",
+                    type=float, default=0.0)
+    ap.add_argument("--reading-study-representation-min-delta",
+                    type=float, default=0.0)
     ap.add_argument("--reading-study-self-teach-w", type=float, default=0.0)
     ap.add_argument("--reading-self-teach-history-prior-w", type=float, default=0.5,
                     help=("blend weight for checkpoint mastery-history deficits "
@@ -9243,6 +9602,10 @@ def _reading_kwargs(args):
                   study_score_target=args.reading_study_score_target,
                   study_insight_accept_w=args.reading_study_insight_accept_w,
                   study_insight_min_delta=args.reading_study_insight_min_delta,
+                  study_representation_accept_w=(
+                      args.reading_study_representation_accept_w),
+                  study_representation_min_delta=(
+                      args.reading_study_representation_min_delta),
                   study_self_teach_w=args.reading_study_self_teach_w,
                   text_field=args.reading_text_field,
                   max_tokens=args.reading_max_tokens,
@@ -9291,6 +9654,12 @@ def main(argv=None):
         raise SystemExit("--latent-concept-topk must be non-negative")
     if args.reading_self_teach_history_prior_w < 0.0:
         raise SystemExit("--reading-self-teach-history-prior-w must be non-negative")
+    if args.reading_study_representation_accept_w < 0.0:
+        raise SystemExit(
+            "--reading-study-representation-accept-w must be non-negative")
+    if args.reading_study_representation_min_delta < 0.0:
+        raise SystemExit(
+            "--reading-study-representation-min-delta must be non-negative")
     if not args.reading_data:
         raise SystemExit("--reading-data is required unless --selftest is set")
     reading_common = _reading_kwargs(args)

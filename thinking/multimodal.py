@@ -114,6 +114,11 @@ MULTIMODAL_TEXT_HISTORY_SIGNAL_KEYS = {
 }
 MULTIMODAL_TEXT_HISTORY_TOP_SIGNAL_MAP = {
     "view": "mode_floor",
+    "context": "mode_floor",
+    "span": "mode_floor",
+    "closure": "mode_floor",
+    "neighborhood": "sequence",
+    "cluster": "sequence",
     "fer": "fer",
     "bridge": "bridge",
     "sequence": "sequence",
@@ -350,6 +355,13 @@ def text_checkpoint_concept_insight_prior(ckpt, enabled=True,
     accepted_updates = 0
     for offset, entry in enumerate(reversed(entries)):
         delta = max(0.0, _mm_float(entry.get("max_concept_insight_delta", 0.0)))
+        learning_event = entry.get("learning_event")
+        if (isinstance(learning_event, dict)
+                and bool(learning_event.get("triggered", False))
+                and str(learning_event.get("kind", "")) == "concept_connection"):
+            delta = max(
+                delta,
+                _mm_float(learning_event.get("event_score", 0.0), 0.0))
         if offset == 0:
             latest_delta = delta
         recency_weight = decay ** offset
@@ -411,6 +423,61 @@ def text_checkpoint_weight_update_summary(ckpt, max_entries=8):
     }
 
 
+def text_checkpoint_learning_event_summary(ckpt, max_entries=8):
+    history = text_checkpoint_reading_history(ckpt)
+    entries = history["entries"][-max(1, int(max_entries)):]
+    events = [
+        entry.get("learning_event")
+        for entry in entries
+        if isinstance(entry.get("learning_event"), dict)
+    ]
+    if not events:
+        return {
+            "enabled": False,
+            "entry_count": int(len(entries)),
+            "event_count": 0,
+            "triggered_count": 0,
+            "latest_triggered": False,
+            "max_event_score": 0.0,
+            "latest_event_score": 0.0,
+            "top_signal": "",
+            "latest_top_signal": "",
+            "kind_counts": {},
+        }
+    triggered = [
+        event for event in events
+        if bool(event.get("triggered", False))
+    ]
+    latest = events[-1]
+    top_event = max(
+        triggered,
+        key=lambda event: _mm_float(event.get("event_score", 0.0), 0.0),
+        default={})
+    kind_counts = {}
+    for event in triggered:
+        kind = str(event.get("kind", ""))
+        if kind:
+            kind_counts[kind] = int(kind_counts.get(kind, 0)) + 1
+    return {
+        "enabled": True,
+        "entry_count": int(len(entries)),
+        "event_count": int(len(events)),
+        "triggered_count": int(len(triggered)),
+        "latest_triggered": bool(latest.get("triggered", False)),
+        "max_event_score": max(
+            (_mm_float(event.get("event_score", 0.0), 0.0)
+             for event in triggered),
+            default=0.0),
+        "latest_event_score": _mm_float(
+            latest.get("event_score", 0.0), 0.0),
+        "top_signal": str(top_event.get("top_signal", "")),
+        "latest_top_signal": str(latest.get("top_signal", "")),
+        "top_kind": str(top_event.get("kind", "")),
+        "latest_kind": str(latest.get("kind", "")),
+        "kind_counts": kind_counts,
+    }
+
+
 def text_checkpoint_reading_representation_summary(ckpt, max_entries=8):
     history = text_checkpoint_reading_history(ckpt)
     entries = history["entries"][-max(1, int(max_entries)):]
@@ -460,24 +527,23 @@ def multimodal_text_history_self_teach_prior(ckpt, enabled=True,
     weights = {signal: 0.0 for signal in MULTIMODAL_SELF_TEACH_SIGNALS}
     top_counts = {signal: 0 for signal in MULTIMODAL_SELF_TEACH_SIGNALS}
     for offset, entry in enumerate(reversed(entries)):
-        score_components = entry.get("after_score_components")
-        if not isinstance(score_components, dict):
-            continue
         recency_weight = decay ** offset
-        for signal, score_keys in MULTIMODAL_TEXT_HISTORY_SIGNAL_KEYS.items():
-            skip_key = f"{signal}_skipped"
-            if bool(score_components.get(skip_key, False)):
-                continue
-            qualities = [
-                min(1.0, max(0.0, _mm_float(score_components.get(score_key))))
-                for score_key in score_keys
-                if score_key in score_components
-            ]
-            if not qualities:
-                continue
-            quality = min(qualities)
-            weighted[signal] += recency_weight * max(0.0, 1.0 - quality)
-            weights[signal] += recency_weight
+        score_components = entry.get("after_score_components")
+        if isinstance(score_components, dict):
+            for signal, score_keys in MULTIMODAL_TEXT_HISTORY_SIGNAL_KEYS.items():
+                skip_key = f"{signal}_skipped"
+                if bool(score_components.get(skip_key, False)):
+                    continue
+                qualities = [
+                    min(1.0, max(0.0, _mm_float(score_components.get(score_key))))
+                    for score_key in score_keys
+                    if score_key in score_components
+                ]
+                if not qualities:
+                    continue
+                quality = min(qualities)
+                weighted[signal] += recency_weight * max(0.0, 1.0 - quality)
+                weights[signal] += recency_weight
         representation_progress = entry.get("representation_progress")
         if (isinstance(representation_progress, dict)
                 and bool(representation_progress.get("enabled", False))):
@@ -499,6 +565,17 @@ def multimodal_text_history_self_teach_prior(ckpt, enabled=True,
                     continue
                 weighted[signal] += recency_weight * deficit
                 weights[signal] += recency_weight
+        learning_event = entry.get("learning_event")
+        if (isinstance(learning_event, dict)
+                and bool(learning_event.get("triggered", False))):
+            signal = MULTIMODAL_TEXT_HISTORY_TOP_SIGNAL_MAP.get(
+                str(learning_event.get("top_signal", "")))
+            if signal in weights:
+                event_score = min(1.0, max(
+                    0.0, _mm_float(learning_event.get("event_score", 0.0))))
+                if event_score > 0.0:
+                    weighted[signal] += recency_weight * event_score
+                    weights[signal] += recency_weight
         source_top = str(entry.get("self_teach_top_signal", ""))
         top_signal = MULTIMODAL_TEXT_HISTORY_TOP_SIGNAL_MAP.get(source_top)
         if top_signal in top_counts:
@@ -638,6 +715,7 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
     history = text_checkpoint_reading_history(ckpt)
     concept_prior = text_checkpoint_concept_insight_prior(ckpt)
     weight_update = text_checkpoint_weight_update_summary(ckpt)
+    learning_event = text_checkpoint_learning_event_summary(ckpt)
     reading_representation = text_checkpoint_reading_representation_summary(ckpt)
     latest_history = history["entries"][-1] if history["entries"] else {}
     replay_bank = ckpt.get("reading_replay_bank")
@@ -688,6 +766,27 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
         "source_reading_attempted_weight_update_count": int(
             weight_update.get("attempted_weight_update_count", 0)),
         "source_reading_weight_update_summary": weight_update,
+        "source_reading_learning_event_triggered": bool(
+            learning_event.get("triggered_count", 0)),
+        "source_reading_learning_event_latest_triggered": bool(
+            learning_event.get("latest_triggered", False)),
+        "source_reading_learning_event_count": int(
+            learning_event.get("event_count", 0)),
+        "source_reading_learning_event_triggered_count": int(
+            learning_event.get("triggered_count", 0)),
+        "source_reading_learning_event_top_signal": str(
+            learning_event.get("top_signal", "")),
+        "source_reading_learning_event_latest_top_signal": str(
+            learning_event.get("latest_top_signal", "")),
+        "source_reading_learning_event_top_kind": str(
+            learning_event.get("top_kind", "")),
+        "source_reading_learning_event_latest_kind": str(
+            learning_event.get("latest_kind", "")),
+        "source_reading_learning_event_max_score": float(
+            learning_event.get("max_event_score", 0.0)),
+        "source_reading_learning_event_latest_score": float(
+            learning_event.get("latest_event_score", 0.0)),
+        "source_reading_learning_event_summary": learning_event,
         "source_reading_representation_progress_enabled": bool(
             reading_representation.get("enabled", False)),
         "source_reading_representation_insight_event_count": int(
@@ -4979,11 +5078,13 @@ def selftest():
         assert text_latent_config["latent_concept_topk"] == 2
         text_history = text_checkpoint_reading_history(text_ckpt_payload)
         assert text_history["entry_count"] == 1
+        assert text_history["entries"][0]["learning_event_triggered"] is True
+        assert text_history["entries"][0]["learning_event_top_signal"] == "bridge"
         text_history_prior = multimodal_text_history_self_teach_prior(
             text_ckpt_payload, enabled=True)
         assert text_history_prior["enabled"] is True
         assert text_history_prior["entry_count"] == 1
-        assert text_history_prior["top_signal"] == "sequence"
+        assert text_history_prior["top_signal"] == "bridge"
         assert text_history_prior["signal_deficits"]["sequence"] > 0.0
         assert text_history_prior["concept_connection_signal"] > 0.0
         assert text_history_prior["signal_deficits"]["bridge"] > 0.0
@@ -4991,11 +5092,30 @@ def selftest():
             "reading_representation_summary"]["enabled"] is True
         assert text_history_prior[
             "reading_representation_summary"]["top_gain_signal"] == "bridge"
+        event_only_prior = multimodal_text_history_self_teach_prior({
+            "reading_mastery_history": {
+                "entries": [{
+                    "learning_event": {
+                        "triggered": True,
+                        "kind": "representation_reorganization",
+                        "top_signal": "cluster",
+                        "event_score": 0.6,
+                    },
+                }],
+            },
+        }, enabled=True)
+        assert event_only_prior["signal_deficits"]["sequence"] > 0.0
         concept_prior = text_checkpoint_concept_insight_prior(
             text_ckpt_payload, enabled=True)
         assert concept_prior["concept_connection_signal"] > 0.0
         assert concept_prior["selected_by_insight_count"] == 1
         assert concept_prior["accepted_update_count"] == 1
+        learning_event = text_checkpoint_learning_event_summary(text_ckpt_payload)
+        assert learning_event["triggered_count"] == 1
+        assert learning_event["latest_triggered"] is True
+        assert learning_event["top_signal"] == "bridge"
+        assert learning_event["top_kind"] == "concept_connection"
+        assert learning_event["max_event_score"] > 0.0
         weight_update = text_checkpoint_weight_update_summary(text_ckpt_payload)
         assert weight_update["changed"] is True
         assert weight_update["changed_tensor_count"] == 5
@@ -5016,7 +5136,7 @@ def selftest():
         assert (transfer_report["source_reading_mastery_latest_self_teach_signal"]
                 == "sequence")
         assert transfer_report["source_reading_concept_connection_signal"] > 0.0
-        assert transfer_report["source_reading_concept_insight_max_delta"] == 0.8
+        assert transfer_report["source_reading_concept_insight_max_delta"] >= 0.8
         assert transfer_report["source_reading_concept_insight_selected_count"] == 1
         assert transfer_report["source_reading_concept_insight_accepted_count"] == 1
         assert transfer_report["source_reading_weight_update_changed"] is True
@@ -5028,6 +5148,16 @@ def selftest():
             "source_reading_weight_update_max_abs_delta"] == 0.02
         assert transfer_report[
             "source_reading_attempted_weight_update_count"] == 1
+        assert transfer_report[
+            "source_reading_learning_event_triggered"] is True
+        assert transfer_report[
+            "source_reading_learning_event_triggered_count"] == 1
+        assert transfer_report[
+            "source_reading_learning_event_top_signal"] == "bridge"
+        assert transfer_report[
+            "source_reading_learning_event_top_kind"] == "concept_connection"
+        assert transfer_report[
+            "source_reading_learning_event_max_score"] > 0.0
         assert transfer_report[
             "source_reading_representation_progress_enabled"] is True
         assert transfer_report[
@@ -5430,6 +5560,8 @@ def selftest():
             "source_reading_concept_connection_signal"] > 0.0
         assert self_teach_model.text_checkpoint_transfer[
             "source_reading_weight_update_changed"] is True
+        assert self_teach_model.text_checkpoint_transfer[
+            "source_reading_learning_event_triggered"] is True
         assert self_teach_model.train_metrics["weight_update_changed"] is True
         assert self_teach_model.train_metrics["selection"]["enabled"] is False
         assert self_teach_model.train_metrics["selection"]["self_teach_reports"]

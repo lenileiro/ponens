@@ -36,6 +36,9 @@ round branches from the best accepted state so rejected self-teaching attempts d
 poison the next attempt. Concept-memory study rounds also report a model-derived
 concept-insight delta from weak-signal gains and bridge connectivity, giving the loop
 a generic "new connection discovered" acceptance path without English-specific rules.
+Selected-round study can also accept a guarded representation-insight update when internal
+organization improves enough, so a round can be kept for a real "light bulb" reorganization even
+when the surface score alone is not decisive.
 Checkpoint continuation also turns on replay and retention from the checkpoint's own
 reading replay bank when available; replay rows carry model-derived priority and
 reasons such as hard-study examples or concept-insight records, and continuation
@@ -48,9 +51,14 @@ closure signals, plus compact sampled parameter-update evidence, including selec
 attempts that are rolled back, so runs can verify that reading actually moved weights and changed
 internal organization. Checkpoint study feeds prior concept-insight and representation weakness
 signals back into self-teach, so previously discovered connections can shape later reading
-updates. The default `mastery` profile also owns the practical hard-study defaults: it probes a
+updates. Each run also writes a compact `learning_event` when an applied update both moved sampled
+weights and improved score, representation organization, or concept-connection evidence; later
+text and multimodal self-teach priors can reuse that event without task labels. The default
+`mastery` profile also owns the practical hard-study defaults: it probes a
 bounded candidate set, caps selected hard records, and periodically refreshes neighborhood and
-cluster mining instead of requiring those controls to be repeated in every launch command. Use
+cluster mining instead of requiring those controls to be repeated in every launch command. Triggered
+learning events also add replay reasons to the selected study records, so continuation can revisit
+chunks tied to actual weight movement and internal reorganization. Use
 `manual` for exact low-level
 ablations.
 Optional `--latent-concept-topk` applies the shared latent-slot sparsity gate used by
@@ -93,7 +101,9 @@ evidence that it is inheriting learned parameters rather than only configuration
 transfer, `--text-transfer-probe-n` probes the current multimodal manifest before and after a text
 checkpoint import; by default it probes 64 records, requires a `0.1` target-score gain, and keeps
 `--text-transfer-gate` enabled so harmful imports are rolled back and their reading-history prior
-is not trusted for self-teach. Multimodal train reports include the same
+is not trusted for self-teach. The import report also exposes source `learning_event` counts,
+top signal, kind, and score, so multimodal runs can see whether the text source learned by moving
+weights and reorganizing concepts before it transferred. Multimodal train reports include the same
 bounded sampled parameter-update summary for the current run, including attempted selected rounds
 that are later rolled back. Optional `--representation-probe-n` records a before/after
 label-free organization report over FER, bridge, and sequence signals, so a run can distinguish
