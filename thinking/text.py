@@ -78,16 +78,17 @@ READING_MASTERY_SCORE_KEYS = (
     "balanced_score", "floor_score", "view_score", "fer_score",
     "bridge_score", "bridge_connectivity", "sequence_score", "context_score",
     "span_score", "context_closure_score", "neighborhood_score",
-    "cluster_score",
+    "cluster_score", "connection_score",
 )
 READING_REPRESENTATION_PROGRESS_KEYS = (
     "mastery_score", "active_mean_score", "floor_score", "balanced_score",
     "signal_coverage", "fer_score", "bridge_score", "bridge_connectivity",
-    "sequence_score", "neighborhood_score", "cluster_score", "span_score",
-    "context_closure_score")
+    "connection_score", "sequence_score", "neighborhood_score", "cluster_score",
+    "span_score", "context_closure_score")
 READING_REPRESENTATION_SIGNAL_SCORES = (
     ("fer", "fer_score"),
     ("bridge", "bridge_score"),
+    ("connection", "connection_score"),
     ("sequence", "sequence_score"),
     ("neighborhood", "neighborhood_score"),
     ("cluster", "cluster_score"),
@@ -601,7 +602,7 @@ def reading_learning_event_report(report):
         and (score_gain > 0.0 or concept_connection or representation_event))
     if concept_connection:
         kind = "concept_connection"
-        top_signal = "bridge"
+        top_signal = "connection"
     elif representation_event:
         kind = "representation_reorganization"
         top_signal = str(representation_progress.get("top_gain_signal", ""))
@@ -1149,6 +1150,7 @@ class TextReadingLM(nn.Module):
         self.lm = ScratchpadLM(vocab_size, d=d, layers=layers, heads=heads, max_len=max_len,
                                pad=pad, pointer=False, loop=False)
         self.reading_predictor = LatentConceptSequencePredictor(d)
+        self.reading_completion_predictor = LatentConceptSequencePredictor(d)
         self.latent_concept_refiner = None
         self.latent_concepts = (LatentConceptHead(
             self.latent_concept_slots, d, heads=heads,
@@ -1763,6 +1765,9 @@ def reading_context_target_loss(model, txt, pad, context_keep_p=0.5,
                                 feature_dropout=0.1, temperature=0.1):
     if getattr(model, "latent_concepts", None) is None:
         return torch.tensor(0.0, device=txt.device)
+    predictor = _reading_completion_predictor(model)
+    if predictor is None:
+        return txt.float().sum() * 0.0
     if txt.shape[0] <= 1:
         return txt.float().sum() * 0.0
     context_txt, target_txt = split_reading_context_target(
@@ -1772,9 +1777,15 @@ def reading_context_target_loss(model, txt, pad, context_keep_p=0.5,
     target_slots = model.latent_concept_states(
         target_txt, feature_dropout=0.0, project=False).detach()
     loss, _metrics = latent_concept_completion_loss(
-        model.reading_predictor, {"context": context_slots}, target_slots,
+        predictor, {"context": context_slots}, target_slots,
         temperature=temperature)
     return loss
+
+
+def _reading_completion_predictor(model):
+    return getattr(
+        model, "reading_completion_predictor",
+        getattr(model, "reading_predictor", None))
 
 
 def reading_span_completion_loss(model, txt, pad, span_frac=0.25,
@@ -1782,7 +1793,8 @@ def reading_span_completion_loss(model, txt, pad, span_frac=0.25,
     zero = txt.float().sum() * 0.0
     metrics = {"completion_loss": zero, "hidden_token_rate": zero,
                "view_count": 0, "skipped": True}
-    if getattr(model, "latent_concepts", None) is None:
+    predictor = _reading_completion_predictor(model)
+    if getattr(model, "latent_concepts", None) is None or predictor is None:
         return zero, metrics
     if txt.shape[0] <= 1:
         return zero, metrics
@@ -1798,7 +1810,7 @@ def reading_span_completion_loss(model, txt, pad, span_frac=0.25,
     full_slots = model.latent_concept_states(
         txt, feature_dropout=0.0, project=False).detach()
     loss, completion_metrics = latent_concept_completion_loss(
-        model.reading_predictor, {"span": partial_slots}, full_slots,
+        predictor, {"span": partial_slots}, full_slots,
         temperature=temperature)
     return loss, {
         "completion_loss": completion_metrics["completion_loss"],
@@ -1813,7 +1825,8 @@ def reading_context_closure_loss(model, txt, pad, split_frac=0.5,
     zero = txt.float().sum() * 0.0
     metrics = {"completion_loss": zero, "prefix_token_rate": zero,
                "suffix_token_rate": zero, "view_count": 0, "skipped": True}
-    if getattr(model, "latent_concepts", None) is None:
+    predictor = _reading_completion_predictor(model)
+    if getattr(model, "latent_concepts", None) is None or predictor is None:
         return zero, metrics
     if txt.shape[0] <= 1:
         return zero, metrics
@@ -1832,7 +1845,7 @@ def reading_context_closure_loss(model, txt, pad, split_frac=0.5,
     full_slots = model.latent_concept_states(
         txt, feature_dropout=0.0, project=False).detach()
     loss, completion_metrics = latent_concept_completion_loss(
-        model.reading_predictor, {"prefix": prefix_slots, "suffix": suffix_slots},
+        predictor, {"prefix": prefix_slots, "suffix": suffix_slots},
         full_slots, temperature=temperature)
     return loss, {
         "completion_loss": completion_metrics["completion_loss"],
@@ -2141,7 +2154,7 @@ def _reading_context_target_embeddings(model, txt, pad, seed=0, context_keep_p=0
         txt, pad, context_keep_p=context_keep_p)
     context_slots = model.latent_concept_states(context_txt, project=False)
     target_slots = model.latent_concept_states(target_txt, project=False)
-    predicted = model.reading_predictor(context_slots)
+    predicted = _reading_completion_predictor(model)(context_slots)
     predicted = F.normalize(predicted.reshape(predicted.shape[0], -1), dim=-1)
     target = F.normalize(target_slots.reshape(target_slots.shape[0], -1), dim=-1)
     return predicted, target
@@ -2152,7 +2165,7 @@ def _reading_span_completion_embeddings(model, txt, pad, seed=0, span_frac=0.25)
     masked_txt, _hidden = mask_reading_spans(txt, pad, span_frac=span_frac)
     partial_slots = model.latent_concept_states(masked_txt, project=False)
     full_slots = model.latent_concept_states(txt, project=False)
-    predicted = model.reading_predictor(partial_slots)
+    predicted = _reading_completion_predictor(model)(partial_slots)
     predicted = F.normalize(predicted.reshape(predicted.shape[0], -1), dim=-1)
     target = F.normalize(full_slots.reshape(full_slots.shape[0], -1), dim=-1)
     return predicted, target
@@ -2165,8 +2178,9 @@ def _reading_context_closure_embeddings(model, txt, pad, seed=0, split_frac=0.5)
     prefix_slots = model.latent_concept_states(prefix_txt, project=False)
     suffix_slots = model.latent_concept_states(suffix_txt, project=False)
     full_slots = model.latent_concept_states(txt, project=False)
-    prefix_pred = model.reading_predictor(prefix_slots)
-    suffix_pred = model.reading_predictor(suffix_slots)
+    predictor = _reading_completion_predictor(model)
+    prefix_pred = predictor(prefix_slots)
+    suffix_pred = predictor(suffix_slots)
     prefix_pred = F.normalize(prefix_pred.reshape(prefix_pred.shape[0], -1), dim=-1)
     suffix_pred = F.normalize(suffix_pred.reshape(suffix_pred.shape[0], -1), dim=-1)
     predicted = F.normalize(torch.stack((prefix_pred, suffix_pred), dim=0).mean(0), dim=-1)
@@ -2525,7 +2539,7 @@ def reading_latent_retrieval_eval(model, vocab, records, device=DEV, n=0, seed=0
 def reading_context_target_retrieval_eval(model, vocab, records, device=DEV, n=0,
                                           seed=0, context_keep_p=0.5):
     if (getattr(model, "latent_concepts", None) is None
-            or not hasattr(model, "reading_predictor")):
+            or _reading_completion_predictor(model) is None):
         return {"context_target_acc": 0.0, "n_records": 0, "sampled": False,
                 "skipped": True}
     selected = eval_reading_records(records, n=n, seed=seed)
@@ -2570,7 +2584,7 @@ def reading_context_target_retrieval_eval(model, vocab, records, device=DEV, n=0
 def reading_span_completion_retrieval_eval(model, vocab, records, device=DEV, n=0,
                                            seed=0, span_frac=0.25):
     if (getattr(model, "latent_concepts", None) is None
-            or not hasattr(model, "reading_predictor")):
+            or _reading_completion_predictor(model) is None):
         return {"span_completion_acc": 0.0, "n_records": 0, "sampled": False,
                 "skipped": True}
     selected = eval_reading_records(records, n=n, seed=seed)
@@ -2615,7 +2629,7 @@ def reading_span_completion_retrieval_eval(model, vocab, records, device=DEV, n=
 def reading_context_closure_retrieval_eval(model, vocab, records, device=DEV, n=0,
                                            seed=0, split_frac=0.5):
     if (getattr(model, "latent_concepts", None) is None
-            or not hasattr(model, "reading_predictor")):
+            or _reading_completion_predictor(model) is None):
         return {"context_closure_acc": 0.0, "n_records": 0, "sampled": False,
                 "skipped": True}
     selected = eval_reading_records(records, n=n, seed=seed)
@@ -2907,10 +2921,10 @@ def reading_fer_eval(model, vocab, records, device=DEV, n=0, seed=0,
 
 READING_SCORE_METRICS = (
     "view", "context", "span", "closure", "sequence", "neighborhood", "cluster",
-    "fer", "bridge", "both", "min", "all", "balanced", "mastery")
+    "fer", "bridge", "connection", "both", "min", "all", "balanced", "mastery")
 READING_DISCOVERY_SIGNALS = (
     "view", "context", "span", "closure", "sequence", "neighborhood", "cluster",
-    "fer", "bridge")
+    "fer", "bridge", "connection")
 READING_OBJECTIVE_PROFILES = ("manual", "mastery")
 READING_MASTERY_OBJECTIVE_FLOORS = {
     "factorization_w": 0.05,
@@ -2971,8 +2985,8 @@ READING_BRIDGE_INSIGHT_STUDY_STRATEGIES = (
     "curiosity", "graph", "cycle", "gap", "discovery")
 READING_CONCEPT_INSIGHT_SCORE_KEYS = (
     "floor_score", "balanced_score", "signal_coverage", "fer_score",
-    "bridge_score", "bridge_connectivity", "neighborhood_score",
-    "cluster_score")
+    "bridge_score", "bridge_connectivity", "connection_score",
+    "neighborhood_score", "cluster_score")
 READING_SELF_TEACH_SCORE_KEYS = {
     "view": "view_score",
     "context": "context_score",
@@ -2983,6 +2997,7 @@ READING_SELF_TEACH_SCORE_KEYS = {
     "cluster": "cluster_score",
     "fer": "fer_score",
     "bridge": "bridge_score",
+    "connection": "connection_score",
 }
 READING_SELF_TEACH_SIGNAL_OBJECTIVES = {
     "view": ("factorization_w",),
@@ -2994,6 +3009,7 @@ READING_SELF_TEACH_SIGNAL_OBJECTIVES = {
     "cluster": ("cluster_w",),
     "fer": ("fer_w",),
     "bridge": ("bridge_w", "discovery_w", "gap_w"),
+    "connection": ("bridge_w", "discovery_w", "gap_w"),
 }
 READING_SELF_TEACH_SIGNAL_STUDY_STRATEGIES = {
     "view": "errors",
@@ -3005,6 +3021,7 @@ READING_SELF_TEACH_SIGNAL_STUDY_STRATEGIES = {
     "cluster": "discovery",
     "fer": "fer",
     "bridge": "discovery",
+    "connection": "discovery",
 }
 READING_SELF_TEACH_WEIGHT_KEYS = tuple(dict.fromkeys(
     key
@@ -3257,8 +3274,8 @@ def reading_mastery_history_self_teach_prior(history, enabled=True,
     concept_signal = max(
         0.0, _reading_float(concept_prior.get("concept_connection_signal", 0.0)))
     if concept_signal > 0.0:
-        deficits["bridge"] = max(float(deficits.get("bridge", 0.0)),
-                                 float(concept_signal))
+        deficits["connection"] = max(float(deficits.get("connection", 0.0)),
+                                     float(concept_signal))
     top_signal = None
     if deficits:
         top_signal = max(deficits.items(), key=lambda item: item[1])[0]
@@ -3297,12 +3314,14 @@ def reading_self_teach_weight_plan(score_components, budget=0.0,
         if bool(score_components.get(f"{signal}_skipped", False)):
             continue
         score_key = READING_SELF_TEACH_SCORE_KEYS[signal]
+        if score_key not in score_components:
+            continue
         score = float(score_components.get(score_key, 0.0))
         quality = min(1.0, max(0.0, score))
         current_deficit = max(0.0, 1.0 - quality)
         history_deficit = max(
             0.0, _reading_float(history_deficits.get(signal, 0.0)))
-        if signal == "bridge":
+        if signal == "connection":
             history_deficit = max(history_deficit, concept_connection_signal)
         deficit = max(current_deficit, history_prior_w * history_deficit)
         current_deficits[signal] = float(current_deficit)
@@ -3521,8 +3540,9 @@ def reading_weight_update_report(before_snapshot, after_snapshot, atol=1e-12):
 def reading_discovery_score_components(view_eval, context_eval, metric="both",
                                        margin_w=0.1, neighborhood_eval=None,
                                        cluster_eval=None, fer_eval=None,
-                                       bridge_eval=None, sequence_eval=None,
-                                       span_eval=None, closure_eval=None):
+                                       bridge_eval=None, gap_eval=None,
+                                       sequence_eval=None, span_eval=None,
+                                       closure_eval=None):
     metric = str(metric)
     if metric not in READING_SCORE_METRICS:
         raise ValueError(f"unknown reading score metric {metric!r}")
@@ -3557,6 +3577,16 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
         bridge_eval.get("mean_bridge_connectivity", 1.0))))
     bridge_score = (0.0 if bool(bridge_eval.get("skipped", False))
                     else 0.5 * (bridge_resolution + bridge_connectivity))
+    gap_eval = {"skipped": True} if gap_eval is None else gap_eval
+    gap_raw_score = max(0.0, float(gap_eval.get("mean_gap_score", 0.0)))
+    gap_resolution = 1.0 / (1.0 + gap_raw_score)
+    connection_parts = []
+    if not bool(bridge_eval.get("skipped", False)):
+        connection_parts.append(bridge_score)
+    if not bool(gap_eval.get("skipped", False)):
+        connection_parts.append(gap_resolution)
+    connection_score = (
+        float(np.mean(connection_parts)) if connection_parts else 0.0)
     view_score = view_acc + margin_w * view_margin
     context_score = context_acc + margin_w * context_margin
     span_score = span_acc + margin_w * span_margin
@@ -3567,7 +3597,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     scores = {"view": view_score, "context": context_score, "span": span_score,
               "closure": closure_score, "sequence": sequence_score,
               "neighborhood": neighborhood_score, "cluster": cluster_score,
-              "fer": fer_score, "bridge": bridge_score}
+              "fer": fer_score, "bridge": bridge_score,
+              "connection": connection_score}
     skipped = {"view": bool(view_eval.get("skipped", False)),
                "context": bool(context_eval.get("skipped", False)),
                "span": bool(span_eval.get("skipped", False)),
@@ -3576,7 +3607,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
                "neighborhood": bool(neighborhood_eval.get("skipped", False)),
                "cluster": bool(cluster_eval.get("skipped", False)),
                "fer": bool(fer_eval.get("skipped", False)),
-               "bridge": bool(bridge_eval.get("skipped", False))}
+               "bridge": bool(bridge_eval.get("skipped", False)),
+               "connection": not bool(connection_parts)}
     active_scores = [scores[name] for name in READING_DISCOVERY_SIGNALS
                      if not skipped[name]]
     if not active_scores:
@@ -3607,6 +3639,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
         score = fer_score
     elif metric == "bridge":
         score = bridge_score
+    elif metric == "connection":
+        score = connection_score
     elif metric == "min":
         score = min(view_score, context_score)
     elif metric == "all":
@@ -3642,6 +3676,10 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "bridge_resolution": float(bridge_resolution),
             "bridge_connectivity": float(bridge_connectivity),
             "bridge_entropy": float(bridge_eval.get("mean_bridge_entropy", 0.0)),
+            "gap_raw_score": float(gap_raw_score),
+            "gap_resolution": float(gap_resolution),
+            "gap_target_mass": float(gap_eval.get("mean_gap_target_mass", 0.0)),
+            "connection_score": float(connection_score),
             "paired_view_acc": view_acc,
             "paired_view_margin": view_margin,
             "context_target_acc": context_acc,
@@ -3665,7 +3703,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "neighborhood_skipped": skipped["neighborhood"],
             "cluster_skipped": skipped["cluster"],
             "fer_skipped": skipped["fer"],
-            "bridge_skipped": skipped["bridge"]}
+            "bridge_skipped": skipped["bridge"],
+            "connection_skipped": skipped["connection"]}
 
 
 def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
@@ -3700,6 +3739,9 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
     bridge = reading_latent_bridge_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 41,
         feature_dropout=0.0)
+    _gap_records, gap = reading_latent_gap_records(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 43,
+        feature_dropout=0.0)
     return {"view": view,
             "context_target": context,
             "span_completion": span,
@@ -3709,11 +3751,12 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
             "cluster": cluster,
             "fer": fer,
             "bridge": bridge,
+            "gap": gap,
             "score_components": reading_discovery_score_components(
                 view, context, metric=score_metric, margin_w=score_margin_w,
                 neighborhood_eval=neighborhood, cluster_eval=cluster,
-                fer_eval=fer, bridge_eval=bridge, sequence_eval=sequence,
-                span_eval=span, closure_eval=closure)}
+                fer_eval=fer, bridge_eval=bridge, gap_eval=gap,
+                sequence_eval=sequence, span_eval=span, closure_eval=closure)}
 
 
 def reading_representation_progress_report(before_bundle, after_bundle):
@@ -4134,7 +4177,7 @@ def reading_context_closure_surprise_records(
         model, vocab, records, device=DEV, n=0, seed=0, split="train",
         split_frac=0.5, feature_dropout=0.0, temperature=0.1):
     if (getattr(model, "latent_concepts", None) is None
-            or not hasattr(model, "reading_predictor")):
+            or _reading_completion_predictor(model) is None):
         return [], {"n_records": 0, "sampled": False, "split": split,
                     "n_selected": 0, "mean_score": 0.0,
                     "max_score": 0.0, "mean_closure_surprise": 0.0,
@@ -4170,7 +4213,7 @@ def reading_context_closure_surprise_records(
             full_slots = model.latent_concept_states(
                 txt, feature_dropout=0.0, project=False)
             closure_surprise, closure_parts = latent_concept_completion_scores(
-                model.reading_predictor,
+                _reading_completion_predictor(model),
                 {"prefix": prefix_slots, "suffix": suffix_slots},
                 full_slots, temperature=temp)
             mode_parts = closure_parts.get("modes", {})
@@ -4583,7 +4626,7 @@ def reading_latent_discovery_records(
             closure_target_slots = model.latent_concept_states(
                 txt, feature_dropout=0.0, project=False)
             closure, closure_parts = latent_concept_completion_scores(
-                model.reading_predictor,
+                _reading_completion_predictor(model),
                 {"prefix": prefix_slots, "suffix": suffix_slots},
                 closure_target_slots, temperature=context_closure_temperature)
             curiosity, curiosity_parts = latent_concept_graph_curiosity_scores(
@@ -9112,7 +9155,7 @@ def selftest():
     concept_self_teach_plan = reading_self_teach_weight_plan(
         current_scores, budget=0.06, history_prior=concept_prior,
         history_prior_w=1.0)
-    assert concept_self_teach_plan["top_signal"] == "bridge"
+    assert concept_self_teach_plan["top_signal"] == "connection"
     assert concept_self_teach_plan["history_concept_connection_signal"] > 0.0
     assert concept_self_teach_plan["weight_extras"]["bridge_w"] > 0.0
     assert concept_self_teach_plan["weight_extras"]["discovery_w"] > 0.0
@@ -9568,7 +9611,7 @@ def selftest():
     assert first_history_entry["representation_progress"]["enabled"] is True
     assert first_history_entry["learning_event_triggered"] is True
     assert first_history_entry["learning_event_kind"] == "concept_connection"
-    assert first_history_entry["learning_event_top_signal"] == "bridge"
+    assert first_history_entry["learning_event_top_signal"] == "connection"
     assert first_history_entry["learning_event_score"] > 0.0
     assert reading_mastery_history_from_payload({})["entry_count"] == 0
     priority_replay_bank = build_reading_replay_bank(

@@ -75,14 +75,16 @@ FEATURE_VIEW_KEYS = ("views", "features", "feature_views")
 TEXT_KEYS = ("text_tokens", "tokens", "text", "caption")
 TARGET_KEYS = ("target_tokens", "target", "trace_tokens", "trace")
 MULTIMODAL_SCORE_METRICS = (
-    "token", "exact", "fer", "bridge", "sequence", "all", "balanced", "mastery")
+    "token", "exact", "fer", "bridge", "connection", "sequence", "all",
+    "balanced", "mastery")
 MULTIMODAL_SELF_TEACH_SIGNALS = (
-    "token", "mode_floor", "fer", "bridge", "sequence")
+    "token", "mode_floor", "fer", "bridge", "connection", "sequence")
 MULTIMODAL_SELF_TEACH_SCORE_KEYS = {
     "token": "token_score",
     "mode_floor": "mode_floor_score",
     "fer": "fer_score",
     "bridge": "bridge_score",
+    "connection": "connection_score",
     "sequence": "sequence_score",
 }
 MULTIMODAL_SELF_TEACH_SKIP_KEYS = {
@@ -90,6 +92,7 @@ MULTIMODAL_SELF_TEACH_SKIP_KEYS = {
     "mode_floor": "token_skipped",
     "fer": "fer_skipped",
     "bridge": "bridge_skipped",
+    "connection": "connection_skipped",
     "sequence": "sequence_skipped",
 }
 MULTIMODAL_SELF_TEACH_SIGNAL_OBJECTIVES = {
@@ -98,6 +101,9 @@ MULTIMODAL_SELF_TEACH_SIGNAL_OBJECTIVES = {
         "agreement_w", "latent_concept_w", "latent_concept_completion_w"),
     "fer": ("latent_concept_fer_w", "latent_concept_factorization_w"),
     "bridge": (
+        "latent_concept_bridge_w", "latent_concept_discovery_w",
+        "latent_concept_gap_w", "latent_concept_graph_predict_w"),
+    "connection": (
         "latent_concept_bridge_w", "latent_concept_discovery_w",
         "latent_concept_gap_w", "latent_concept_graph_predict_w"),
     "sequence": ("latent_concept_sequence_w", "latent_concept_transition_w"),
@@ -110,6 +116,7 @@ MULTIMODAL_TEXT_HISTORY_SIGNAL_KEYS = {
     "mode_floor": ("signal_coverage", "balanced_score", "floor_score"),
     "fer": ("fer_score",),
     "bridge": ("bridge_score", "bridge_connectivity"),
+    "connection": ("connection_score",),
     "sequence": ("sequence_score",),
 }
 MULTIMODAL_TEXT_HISTORY_TOP_SIGNAL_MAP = {
@@ -121,14 +128,15 @@ MULTIMODAL_TEXT_HISTORY_TOP_SIGNAL_MAP = {
     "cluster": "sequence",
     "fer": "fer",
     "bridge": "bridge",
+    "connection": "connection",
     "sequence": "sequence",
 }
 MULTIMODAL_REPRESENTATION_PROGRESS_KEYS = (
     "mastery_score", "active_mean_score", "floor_score", "balanced_score",
     "signal_coverage", "mode_floor_score", "fer_score", "bridge_score",
-    "sequence_score")
+    "connection_score", "sequence_score")
 MULTIMODAL_REPRESENTATION_SIGNAL_KEYS = (
-    "fer_score", "bridge_score", "sequence_score")
+    "fer_score", "bridge_score", "connection_score", "sequence_score")
 DEFAULT_TEXT_TRANSFER_PROBE_N = 64
 DEFAULT_TEXT_TRANSFER_SCORE_MIN_DELTA = 0.1
 DEFAULT_TEXT_TRANSFER_INSIGHT_ACCEPT_W = 0.0
@@ -673,11 +681,12 @@ def multimodal_score_digest(score_components):
         "balanced_score", "mastery_score", "signal_coverage", "token_score",
         "exact_score", "mode_floor", "mode_floor_score", "mode_gap",
         "fer_score", "fer_raw_score", "bridge_score", "bridge_raw_score",
-        "bridge_resolution", "bridge_connectivity", "sequence_score",
-        "sequence_acc", "sequence_margin")
+        "bridge_resolution", "bridge_connectivity", "gap_raw_score",
+        "gap_resolution", "gap_target_mass", "connection_score",
+        "sequence_score", "sequence_acc", "sequence_margin")
     skip_keys = (
         "token_skipped", "exact_skipped", "fer_skipped",
-        "bridge_skipped", "sequence_skipped")
+        "bridge_skipped", "connection_skipped", "sequence_skipped")
     digest = {}
     for key in scalar_keys:
         if key not in score_components:
@@ -1107,8 +1116,8 @@ def multimodal_text_history_self_teach_prior(ckpt, enabled=True,
     concept_signal = max(
         0.0, _mm_float(concept_prior.get("concept_connection_signal", 0.0)))
     if concept_signal > 0.0:
-        deficits["bridge"] = max(float(deficits.get("bridge", 0.0)),
-                                 float(concept_signal))
+        deficits["connection"] = max(
+            float(deficits.get("connection", 0.0)), float(concept_signal))
     top_signal = None
     if deficits:
         top_signal = max(deficits.items(), key=lambda item: item[1])[0]
@@ -1148,7 +1157,7 @@ def _multimodal_prior_signal_deficits(progress=None, learning_event=None):
         else {})
     deficits = {}
     if progress_enabled:
-        for signal in ("fer", "bridge", "sequence"):
+        for signal in ("fer", "bridge", "connection", "sequence"):
             if signal not in MULTIMODAL_SELF_TEACH_SIGNALS:
                 continue
             after_quality = min(1.0, max(0.0, _mm_float(
@@ -1289,8 +1298,8 @@ def merge_multimodal_self_teach_priors(*priors):
             concept_connection_signal,
             max(0.0, _mm_float(prior.get("concept_connection_signal", 0.0), 0.0)))
     if concept_connection_signal > 0.0:
-        merged_deficits["bridge"] = max(
-            float(merged_deficits.get("bridge", 0.0)),
+        merged_deficits["connection"] = max(
+            float(merged_deficits.get("connection", 0.0)),
             float(concept_connection_signal))
     top_signal = None
     if merged_deficits:
@@ -1426,6 +1435,7 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
         "copied_text_tensors": [],
         "copied_latent_tensors": [],
         "copied_sequence_tensors": [],
+        "copied_completion_tensors": [],
         "skipped_shape": [],
         "skipped_missing": [],
     }
@@ -1466,6 +1476,9 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
     text_prefixes = ("txt.enc.", "txt.blocks.", "txt.ln.")
     latent_prefixes = ("latent_concepts.", "latent_concept_memory.")
     sequence_prefix = "reading_predictor."
+    completion_prefix = "reading_completion_predictor."
+    has_completion_prefix = any(
+        name.startswith(completion_prefix) for name in state)
     memory_key = "latent_concept_memory.memory"
     src_memory = state.get(memory_key)
     dst_memory = dst_state.get(memory_key)
@@ -1482,6 +1495,11 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
             elif name.startswith(latent_prefixes):
                 dst_name = name
                 copied_key = "copied_latent_tensors"
+            elif name.startswith(completion_prefix):
+                dst_name = (
+                    "concept_completion_predictor."
+                    + name[len(completion_prefix):])
+                copied_key = "copied_completion_tensors"
             elif name.startswith(sequence_prefix):
                 dst_name = "concept_sequence_predictor." + name[len(sequence_prefix):]
                 copied_key = "copied_sequence_tensors"
@@ -1510,15 +1528,39 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
                 continue
             dst_val.copy_(src_val.to(device=dst_val.device, dtype=dst_val.dtype))
             report[copied_key].append(dst_name)
+        if not has_completion_prefix:
+            for name, src_val in sorted(state.items()):
+                if not name.startswith(sequence_prefix):
+                    continue
+                dst_name = (
+                    "concept_completion_predictor."
+                    + name[len(sequence_prefix):])
+                dst_val = dst_state.get(dst_name)
+                if dst_val is None:
+                    report["skipped_missing"].append(dst_name)
+                    continue
+                if tuple(src_val.shape) != tuple(dst_val.shape):
+                    report["skipped_shape"].append({
+                        "name": dst_name,
+                        "source": list(src_val.shape),
+                        "target": list(dst_val.shape),
+                    })
+                    continue
+                dst_val.copy_(src_val.to(
+                    device=dst_val.device, dtype=dst_val.dtype))
+                report["copied_completion_tensors"].append(dst_name)
     report["copied_text_tensor_count"] = len(report["copied_text_tensors"])
     report["copied_latent_tensor_count"] = len(report["copied_latent_tensors"])
     report["copied_sequence_tensor_count"] = len(report["copied_sequence_tensors"])
+    report["copied_completion_tensor_count"] = len(
+        report["copied_completion_tensors"])
     report["copied"] = bool(
         report["copied_token_embeddings"]
         or report["copied_position_rows"]
         or report["copied_text_tensor_count"]
         or report["copied_latent_tensor_count"]
-        or report["copied_sequence_tensor_count"])
+        or report["copied_sequence_tensor_count"]
+        or report["copied_completion_tensor_count"])
     model.text_checkpoint_transfer = report
     return report
 
@@ -1894,6 +1936,9 @@ class MultimodalLM(nn.Module):
             mixer_layers=self.latent_concept_layers, topk=self.latent_concept_topk)
             if self.latent_concept_slots > 0 else None)
         self.concept_sequence_predictor = (
+            LatentConceptSequencePredictor(d)
+            if self.latent_concept_slots > 0 else None)
+        self.concept_completion_predictor = (
             LatentConceptSequencePredictor(d)
             if self.latent_concept_slots > 0 else None)
         self.latent_concept_memory = (LatentConceptMemory(
@@ -2633,8 +2678,14 @@ def latent_multimodal_completion_loss_from_views(model, views, temperature=0.1):
     """
     views = {mode: slots for mode, slots in views.items() if slots is not None}
     return latent_concept_completion_loss(
-        getattr(model, "concept_sequence_predictor", None), views,
+        _multimodal_completion_predictor(model), views,
         temperature=temperature, full_key="full")
+
+
+def _multimodal_completion_predictor(model):
+    return getattr(
+        model, "concept_completion_predictor",
+        getattr(model, "concept_sequence_predictor", None))
 
 
 def latent_multimodal_sequence_prediction_loss(
@@ -3086,6 +3137,90 @@ def latent_multimodal_bridge_eval(model, records, vocab, view_dims, n=200,
     return report
 
 
+def latent_multimodal_gap_eval(model, records, vocab, view_dims, n=200,
+                               seed=1, device=DEV):
+    memory = getattr(model, "latent_concept_memory", None)
+    if getattr(model, "latent_concepts", None) is None or memory is None:
+        return {"gap_score": 0.0, "gap_kl": 0.0, "gap_cosine": 0.0,
+                "gap_entropy": 0.0, "gap_target_mass": 0.0,
+                "gap_present_overlap": 0.0, "usable_gap_records": 0,
+                "n_records": 0, "sampled": False, "memory_filled": 0,
+                "graph_ready": False, "skipped": True,
+                "skip_reason": "latent_concept_memory_unavailable"}
+    rng = np.random.default_rng(seed)
+    count = min(int(n), len(records)) if int(n) > 0 else len(records)
+    sample = _sample_records(records, count, rng) if count else []
+    filled = int(getattr(memory, "filled", torch.zeros((), dtype=torch.long)).item())
+    if not sample:
+        return {"gap_score": 0.0, "gap_kl": 0.0, "gap_cosine": 0.0,
+                "gap_entropy": 0.0, "gap_target_mass": 0.0,
+                "gap_present_overlap": 0.0, "usable_gap_records": 0,
+                "n_records": 0, "sampled": False, "memory_filled": filled,
+                "graph_ready": False, "skipped": True,
+                "skip_reason": "no_records"}
+    active = memory.active()
+    if active.numel() == 0:
+        return {"gap_score": 0.0, "gap_kl": 0.0, "gap_cosine": 0.0,
+                "gap_entropy": 0.0, "gap_target_mass": 0.0,
+                "gap_present_overlap": 0.0, "usable_gap_records": 0,
+                "n_records": len(sample),
+                "sampled": bool(int(n) > 0 and int(n) < len(records)),
+                "memory_filled": filled, "graph_ready": False, "skipped": True,
+                "skip_reason": "latent_concept_memory_empty"}
+    values = {
+        "gap_score": [],
+        "gap_kl": [],
+        "gap_cosine": [],
+        "gap_entropy": [],
+        "gap_target_mass": [],
+        "gap_present_overlap": [],
+    }
+    graph_ready = False
+    usable_count = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(sample), 64):
+            batch_records = sample[off:off + 64]
+            features, txt, _ids = _batch_from_records(
+                batch_records, vocab, device, view_dims)
+            slots = model.latent_concept_states(
+                features, txt, mode="full", project=True)
+            scores, parts = latent_concept_memory_gap_scores(
+                slots, active, relations=memory.active_relations(),
+                transitions=memory.active_transitions())
+            graph_ready = bool(graph_ready or parts.get("graph_ready", False))
+            usable = parts.get("usable")
+            if usable is not None:
+                usable_count += int(usable.detach().sum().item())
+            for key, part_key in (
+                    ("gap_score", None),
+                    ("gap_kl", "kl"),
+                    ("gap_cosine", "cosine"),
+                    ("gap_entropy", "entropy"),
+                    ("gap_target_mass", "target_mass"),
+                    ("gap_present_overlap", "present_overlap")):
+                row = (scores if part_key is None else parts.get(
+                    part_key, scores.new_zeros(scores.shape)))
+                values[key].extend(float(x) for x in row.detach().cpu().tolist())
+
+    def mean_value(name):
+        rows = values[name]
+        return float(np.mean(rows)) if rows else 0.0
+
+    return {"gap_score": mean_value("gap_score"),
+            "gap_kl": mean_value("gap_kl"),
+            "gap_cosine": mean_value("gap_cosine"),
+            "gap_entropy": mean_value("gap_entropy"),
+            "gap_target_mass": mean_value("gap_target_mass"),
+            "gap_present_overlap": mean_value("gap_present_overlap"),
+            "usable_gap_records": int(usable_count),
+            "n_records": len(sample),
+            "sampled": bool(int(n) > 0 and int(n) < len(records)),
+            "memory_filled": filled,
+            "graph_ready": bool(graph_ready),
+            "skipped": not (graph_ready and usable_count > 0)}
+
+
 def latent_multimodal_sequence_eval(model, records, vocab, view_dims, n=200,
                                     seed=1, device=DEV):
     if (getattr(model, "latent_concepts", None) is None
@@ -3145,8 +3280,8 @@ def latent_multimodal_sequence_eval(model, records, vocab, view_dims, n=200,
 
 
 def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
-                                sequence_eval=None, metric="mastery",
-                                margin_w=0.1):
+                                gap_eval=None, sequence_eval=None,
+                                metric="mastery", margin_w=0.1):
     metric = str(metric)
     if metric not in MULTIMODAL_SCORE_METRICS:
         raise ValueError(f"unknown multimodal score metric {metric!r}")
@@ -3170,6 +3305,7 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
     mode_gap = float(token_score - mode_floor) if token_values else 0.0
     fer_eval = fer_eval or {"skipped": True}
     bridge_eval = bridge_eval or {"skipped": True}
+    gap_eval = gap_eval or {"skipped": True}
     sequence_eval = sequence_eval or {"skipped": True}
     fer_raw_score = max(0.0, float(fer_eval.get("fer_score", 0.0)))
     fer_score = (0.0 if bool(fer_eval.get("skipped", False))
@@ -3180,16 +3316,27 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
         bridge_eval.get("bridge_connectivity", 1.0))))
     bridge_score = (0.0 if bool(bridge_eval.get("skipped", False))
                     else 0.5 * (bridge_resolution + bridge_connectivity))
+    gap_raw_score = max(0.0, float(gap_eval.get("gap_score", 0.0)))
+    gap_resolution = 1.0 / (1.0 + gap_raw_score)
+    connection_parts = []
+    if not bool(bridge_eval.get("skipped", False)):
+        connection_parts.append(bridge_score)
+    if not bool(gap_eval.get("skipped", False)):
+        connection_parts.append(gap_resolution)
+    connection_score = (
+        float(np.mean(connection_parts)) if connection_parts else 0.0)
     sequence_acc = float(sequence_eval.get("sequence_acc", 0.0))
     sequence_margin = float(sequence_eval.get("margin", 0.0))
     sequence_score = (0.0 if bool(sequence_eval.get("skipped", False))
                       else sequence_acc + margin_w * sequence_margin)
     scores = {"token": token_score, "exact": exact_score,
               "fer": fer_score, "bridge": bridge_score,
+              "connection": connection_score,
               "sequence": sequence_score}
     skipped = {"token": not token_values, "exact": not exact_values,
                "fer": bool(fer_eval.get("skipped", False)),
                "bridge": bool(bridge_eval.get("skipped", False)),
+               "connection": not bool(connection_parts),
                "sequence": bool(sequence_eval.get("skipped", False))}
     active_scores = [scores[name] for name in scores if not skipped[name]]
     if not active_scores:
@@ -3214,6 +3361,8 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
         score = fer_score
     elif metric == "bridge":
         score = bridge_score
+    elif metric == "connection":
+        score = connection_score
     elif metric == "sequence":
         score = sequence_score
     elif metric == "all":
@@ -3246,6 +3395,10 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
             "bridge_resolution": float(bridge_resolution),
             "bridge_connectivity": float(bridge_connectivity),
             "bridge_entropy": float(bridge_eval.get("bridge_entropy", 0.0)),
+            "gap_raw_score": float(gap_raw_score),
+            "gap_resolution": float(gap_resolution),
+            "gap_target_mass": float(gap_eval.get("gap_target_mass", 0.0)),
+            "connection_score": float(connection_score),
             "sequence_score": float(sequence_score),
             "sequence_acc": sequence_acc,
             "sequence_margin": sequence_margin,
@@ -3253,6 +3406,7 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
             "exact_skipped": skipped["exact"],
             "fer_skipped": skipped["fer"],
             "bridge_skipped": skipped["bridge"],
+            "connection_skipped": skipped["connection"],
             "sequence_skipped": skipped["sequence"],
             "mode_scores": {
                 mode: {
@@ -3293,13 +3447,15 @@ def multimodal_self_teach_weight_plan(score_components, budget=0.0,
         if bool(score_components.get(
                 MULTIMODAL_SELF_TEACH_SKIP_KEYS[signal], False)):
             continue
-        score = float(score_components.get(
-            MULTIMODAL_SELF_TEACH_SCORE_KEYS[signal], 0.0))
+        score_key = MULTIMODAL_SELF_TEACH_SCORE_KEYS[signal]
+        if score_key not in score_components:
+            continue
+        score = float(score_components.get(score_key, 0.0))
         quality = min(1.0, max(0.0, score))
         current_deficit = max(0.0, 1.0 - quality)
         history_deficit = max(
             0.0, _mm_float(history_deficits.get(signal, 0.0)))
-        if signal == "bridge":
+        if signal == "connection":
             history_deficit = max(history_deficit, concept_connection_signal)
         deficit = max(current_deficit, history_prior_w * history_deficit)
         current_deficits[signal] = float(current_deficit)
@@ -3382,15 +3538,18 @@ def multimodal_eval_bundle(model, records, vocab, view_dims, n=200, seed=1,
         model, records, vocab, view_dims, n=n, seed=seed + 29, device=device)
     bridge = latent_multimodal_bridge_eval(
         model, records, vocab, view_dims, n=n, seed=seed + 31, device=device)
+    gap = latent_multimodal_gap_eval(
+        model, records, vocab, view_dims, n=n, seed=seed + 33, device=device)
     sequence = latent_multimodal_sequence_eval(
         model, records, vocab, view_dims, n=n, seed=seed + 37, device=device)
     return {"teacher_forced": metrics,
             "latent_fer": fer,
             "latent_bridge": bridge,
+            "latent_gap": gap,
             "latent_sequence": sequence,
             "score_components": multimodal_score_components(
                 metrics, fer_eval=fer, bridge_eval=bridge,
-                sequence_eval=sequence, metric=score_metric,
+                gap_eval=gap, sequence_eval=sequence, metric=score_metric,
                 margin_w=score_margin_w)}
 
 
@@ -3765,7 +3924,7 @@ def multimodal_learning_event_report(report):
         and (score_gain > 0.0 or concept_connection or representation_event))
     if concept_connection:
         kind = "concept_connection"
-        top_signal = "bridge"
+        top_signal = "connection"
     elif representation_event:
         kind = "representation_reorganization"
         top_signal = str(progress.get("top_gain_signal", ""))
@@ -3860,7 +4019,7 @@ def latent_multimodal_completion_examples(
         model, records, vocab, view_dims, n=0, seed=0, device=DEV,
         temperature=0.1):
     if (getattr(model, "latent_concepts", None) is None
-            or getattr(model, "concept_sequence_predictor", None) is None):
+            or _multimodal_completion_predictor(model) is None):
         return [], {"n_records": 0, "n_selected": 0,
                     "mean_score": 0.0, "max_score": 0.0,
                     "mean_completion_surprise": 0.0,
@@ -3881,7 +4040,7 @@ def latent_multimodal_completion_examples(
                 for mode in MODES
             }
             scores, parts = latent_concept_completion_scores(
-                model.concept_sequence_predictor, views,
+                _multimodal_completion_predictor(model), views,
                 temperature=temperature, full_key="full")
             mode_parts = parts.get("modes", {})
             sensor_parts = mode_parts.get("sensor_only", {})
@@ -4016,7 +4175,7 @@ def latent_multimodal_discovery_examples(
             }
             full_slots = views["full"]
             completion, completion_parts = latent_concept_completion_scores(
-                model.concept_sequence_predictor, views,
+                _multimodal_completion_predictor(model), views,
                 temperature=completion_temperature, full_key="full")
             curiosity, curiosity_parts = latent_concept_graph_curiosity_scores(
                 full_slots, active_memory, active_relations,
@@ -5876,6 +6035,8 @@ def selftest():
             text_model.latent_concept_memory.filled.fill_(1)
             for param in text_model.reading_predictor.parameters():
                 param.fill_(0.03125)
+            for param in text_model.reading_completion_predictor.parameters():
+                param.fill_(0.0625)
         text_report = {
             "experiment": "text-raw-reading-selftest",
             "latent_concept_topk": 2,
@@ -5961,16 +6122,17 @@ def selftest():
         text_history = text_checkpoint_reading_history(text_ckpt_payload)
         assert text_history["entry_count"] == 1
         assert text_history["entries"][0]["learning_event_triggered"] is True
-        assert text_history["entries"][0]["learning_event_top_signal"] == "bridge"
+        assert text_history["entries"][0]["learning_event_top_signal"] == "connection"
         assert text_history["entries"][0]["replay_study_used"] is True
         assert text_history["entries"][0]["training_priority_sampling"] is True
         text_history_prior = multimodal_text_history_self_teach_prior(
             text_ckpt_payload, enabled=True)
         assert text_history_prior["enabled"] is True
         assert text_history_prior["entry_count"] == 1
-        assert text_history_prior["top_signal"] == "bridge"
+        assert text_history_prior["top_signal"] == "connection"
         assert text_history_prior["signal_deficits"]["sequence"] > 0.0
         assert text_history_prior["concept_connection_signal"] > 0.0
+        assert text_history_prior["signal_deficits"]["connection"] > 0.0
         assert text_history_prior["signal_deficits"]["bridge"] > 0.0
         assert text_history_prior[
             "reading_representation_summary"]["enabled"] is True
@@ -6004,7 +6166,7 @@ def selftest():
         learning_event = text_checkpoint_learning_event_summary(text_ckpt_payload)
         assert learning_event["triggered_count"] == 1
         assert learning_event["latest_triggered"] is True
-        assert learning_event["top_signal"] == "bridge"
+        assert learning_event["top_signal"] == "connection"
         assert learning_event["top_kind"] == "concept_connection"
         assert learning_event["max_event_score"] > 0.0
         weight_update = text_checkpoint_weight_update_summary(text_ckpt_payload)
@@ -6044,7 +6206,7 @@ def selftest():
         assert transfer_report[
             "source_reading_learning_event_triggered_count"] == 1
         assert transfer_report[
-            "source_reading_learning_event_top_signal"] == "bridge"
+            "source_reading_learning_event_top_signal"] == "connection"
         assert transfer_report[
             "source_reading_learning_event_top_kind"] == "concept_connection"
         assert transfer_report[
@@ -6065,9 +6227,12 @@ def selftest():
             "source_reading_training_priority_record_count"] == 2
         assert transfer_report["source_reading_replay_bank_records"] == 3
         assert transfer_report["source_reading_replay_priority_records"] == 2
+        assert (transfer_report[
+            "source_reading_learning_event_top_signal"] == "connection")
         assert transfer_report["copied_token_embeddings"] > 0
         assert transfer_report["copied_latent_tensor_count"] > 0
         assert transfer_report["copied_sequence_tensor_count"] > 0
+        assert transfer_report["copied_completion_tensor_count"] > 0
         assert torch.allclose(
             transfer_model.txt.emb.weight[sample_idx],
             text_model.txt.emb.weight[sample_idx])
@@ -6077,6 +6242,9 @@ def selftest():
         assert torch.allclose(
             transfer_model.concept_sequence_predictor[0].weight,
             text_model.reading_predictor[0].weight)
+        assert torch.allclose(
+            transfer_model.concept_completion_predictor[0].weight,
+            text_model.reading_completion_predictor[0].weight)
         batch = records[:2]
         features, txt, ids = _batch_from_records(
             batch, vocab, "cpu", view_dims)
@@ -6162,11 +6330,13 @@ def selftest():
             "token_skipped": False,
             "fer_skipped": False,
             "bridge_skipped": False,
+            "connection_skipped": False,
             "sequence_skipped": False,
             "token_score": 1.0,
             "mode_floor_score": 0.0,
             "fer_score": 1.0,
             "bridge_score": 0.25,
+            "connection_score": 1.0,
             "sequence_score": 0.5,
         }
         self_teach_plan = multimodal_self_teach_weight_plan(
@@ -6204,16 +6374,19 @@ def selftest():
             history_prior={
                 "enabled": True,
                 "entry_count": 1,
-                "top_signal": "bridge",
+                "top_signal": "connection",
                 "signal_deficits": {},
                 "concept_connection_signal": 0.9,
             },
             history_prior_w=1.0)
-        assert concept_history_plan["top_signal"] == "bridge"
+        assert concept_history_plan["top_signal"] == "connection"
         assert (concept_history_plan["history_concept_connection_signal"]
                 == 0.9)
         assert concept_history_plan["weight_extras"]["latent_concept_bridge_w"] > 0.0
         assert concept_history_plan["weight_extras"]["latent_concept_discovery_w"] > 0.0
+        assert concept_history_plan["weight_extras"]["latent_concept_gap_w"] > 0.0
+        assert (concept_history_plan["weight_extras"][
+            "latent_concept_graph_predict_w"] > 0.0)
         assert math.isclose(
             sum(concept_history_plan["weight_extras"].values()),
             0.07, rel_tol=1e-6, abs_tol=1e-6)
@@ -6249,12 +6422,12 @@ def selftest():
         })
         assert synthetic_learning_event["triggered"] is True
         assert synthetic_learning_event["kind"] == "concept_connection"
-        assert synthetic_learning_event["top_signal"] == "bridge"
+        assert synthetic_learning_event["top_signal"] == "connection"
         event_only_prior = multimodal_checkpoint_representation_self_teach_prior({
             "report": {"learning_event": synthetic_learning_event},
         }, enabled=True)
         assert event_only_prior["enabled"] is True
-        assert event_only_prior["signal_deficits"]["bridge"] > 0.0
+        assert event_only_prior["signal_deficits"]["connection"] > 0.0
         synthetic_history = multimodal_learning_history_with_entry([], {
             "experiment": "synthetic-mm-history",
             "steps": 1,
@@ -6297,18 +6470,18 @@ def selftest():
         assert (synthetic_history["entries"][0]["learning_event_triggered"]
                 is True)
         assert (synthetic_history["entries"][0][
-            "learning_event_top_signal"] == "bridge")
+            "learning_event_top_signal"] == "connection")
         history_prior = multimodal_checkpoint_representation_self_teach_prior({
             "multimodal_learning_history": synthetic_history,
         }, enabled=True)
         assert history_prior["enabled"] is True
         assert history_prior["entry_count"] == 1
-        assert history_prior["signal_deficits"]["bridge"] > 0.0
+        assert history_prior["signal_deficits"]["connection"] > 0.0
         history_summary = multimodal_checkpoint_learning_history_summary({
             "multimodal_learning_history": synthetic_history,
         })
         assert history_summary["triggered_count"] == 1
-        assert history_summary["top_signal"] == "bridge"
+        assert history_summary["top_signal"] == "connection"
         negative_insight = multimodal_bridge_selection_insight(
             {"skipped": False, "bridge_score": 0.4, "bridge_connectivity": 0.5},
             {"skipped": False, "bridge_score": 0.8, "bridge_connectivity": 0.2})
