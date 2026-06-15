@@ -89,6 +89,28 @@ def _time_stretch(arr, n_out):
     return arr[lo] * (1 - frac) + arr[hi] * frac
 
 
+def _formant_shift(sp, ratio):
+    """Warp the spectral envelope along the FREQUENCY axis -> shifts formants (vocal-tract size).
+    ratio>1 raises formants (smaller tract: child/fairy); <1 lowers them (bigger tract: giant).
+    Shifting formants, not just F0, is what makes a character voice sound real vs. a chipmunk."""
+    if ratio == 1.0:
+        return sp
+    D = sp.shape[1]
+    src = np.arange(D) / ratio                      # sample envelope at warped freq positions
+    lo = np.clip(np.floor(src).astype(int), 0, D - 1)
+    hi = np.clip(lo + 1, 0, D - 1)
+    fr = (src - lo)[None, :]
+    return sp[:, lo] * (1 - fr) + sp[:, hi] * fr
+
+
+def _smooth(x, k=5):
+    """Moving-average smooth a 1-D contour (for portamento on the pitch line)."""
+    if k < 2:
+        return x
+    pad = np.pad(x, (k // 2, k // 2), mode="edge")
+    return np.convolve(pad, np.ones(k) / k, mode="valid")[:len(x)]
+
+
 # ---- SINGING ------------------------------------------------------------------------------------
 def sing(x, melody, fs=SR, bpm=120, vibrato_hz=5.0, vibrato_cents=25, frame_period=FRAME_PERIOD):
     """Re-pitch the utterance onto `melody` -> the SAME human voice, singing.
@@ -99,40 +121,47 @@ def sing(x, melody, fs=SR, bpm=120, vibrato_hz=5.0, vibrato_cents=25, frame_peri
     """
     melody = parse_melody(melody) if isinstance(melody, str) else melody
     f0, sp, ap = analyze(x, fs, frame_period)
-    nF = f0.shape[0]
+    # sing only the VOICED frames (vowels carry the tune); drop long silences/unvoiced gaps so notes
+    # land on syllables instead of on chopped-up consonants.
+    voiced = np.where(f0 > 0)[0]
+    if len(voiced) < len(melody) * 2:
+        voiced = np.arange(f0.shape[0])
+    sp_v, ap_v = sp[voiced], ap[voiced]
     spf = int(round(60.0 / bpm / (frame_period / 1000.0)))      # frames per beat
-    seg_in = np.array_split(np.arange(nF), len(melody))         # speech frames per note
+    seg_in = np.array_split(np.arange(len(sp_v)), len(melody))  # voiced frames per note
     out_f0, out_sp, out_ap = [], [], []
     for (hz, beats), idx in zip(melody, seg_in):
-        n_out = max(2, int(round(beats * spf)))
+        n_out = max(3, int(round(beats * spf)))
         s0, s1 = idx[0], idx[-1] + 1
-        out_sp.append(_time_stretch(sp[s0:s1], n_out))
-        out_ap.append(_time_stretch(ap[s0:s1], n_out))
-        # vibrato: small sinusoidal pitch wobble (musical, not robotic)
+        out_sp.append(_time_stretch(sp_v[s0:s1], n_out))
+        out_ap.append(_time_stretch(ap_v[s0:s1], n_out))
         tt = np.arange(n_out) * (frame_period / 1000.0)
-        vib = 2.0 ** (vibrato_cents / 1200.0 * np.sin(2 * np.pi * vibrato_hz * tt))
+        onset = np.clip(tt / 0.18, 0, 1)                        # vibrato fades IN (no wobble on attack)
+        vib = 2.0 ** (vibrato_cents / 1200.0 * onset * np.sin(2 * np.pi * vibrato_hz * tt))
         out_f0.append(hz * vib)
-    return resynth(np.concatenate(out_f0), np.concatenate(out_sp, 0),
-                   np.concatenate(out_ap, 0), fs, frame_period)
+    f0_line = np.concatenate(out_f0)
+    f0_line = _smooth(f0_line, 5)                               # portamento: glide between notes
+    return resynth(f0_line, np.concatenate(out_sp, 0), np.concatenate(out_ap, 0), fs, frame_period)
 
 
 # ---- ANIMATION (storytelling prosody) ----------------------------------------------------------
 PRESETS = {
-    #            pitch  range  speed  energy   (pitch=mean shift, range=expressiveness)
-    "narrator":  (1.00, 1.15, 0.98, 1.00),   # calm, lightly expressive default
-    "excited":   (1.12, 1.55, 1.12, 1.20),   # higher, animated, quicker
-    "sad":       (0.90, 0.65, 0.86, 0.92),   # low, flat, slow
-    "suspense":  (0.95, 0.60, 0.84, 0.88),   # hushed, even, deliberate
-    "giant":     (0.68, 1.20, 0.90, 1.15),   # deep booming character voice
-    "fairy":     (1.42, 1.45, 1.10, 1.00),   # tiny high character voice
-    "question":  (1.00, 1.30, 1.00, 1.00),   # rising, inquisitive
+    #            pitch  range  speed  energy  formant   (formant warps vocal-tract size)
+    "narrator":  (1.00, 1.15, 0.98, 1.00, 1.00),   # calm, lightly expressive default
+    "excited":   (1.10, 1.45, 1.10, 1.12, 1.03),   # higher, animated, quicker
+    "sad":       (0.92, 0.70, 0.88, 0.94, 0.98),   # low, flat, slow
+    "suspense":  (0.96, 0.65, 0.86, 0.90, 0.99),   # hushed, even, deliberate
+    "giant":     (0.72, 1.20, 0.92, 1.12, 0.80),   # deep + LOWER formants -> big vocal tract
+    "fairy":     (1.38, 1.40, 1.08, 1.00, 1.22),   # high + HIGHER formants -> tiny vocal tract
+    "question":  (1.00, 1.30, 1.00, 1.00, 1.00),   # rising, inquisitive
 }
 
 
-def animate(x, pitch=1.0, range_=1.0, speed=1.0, energy=1.0, fs=SR, frame_period=FRAME_PERIOD):
-    """Expressive prosody: shift pitch MEAN, scale pitch RANGE, time-scale SPEED, scale ENERGY.
-
-    Timbre (spectral envelope) is preserved, so emotion changes but identity does not."""
+def animate(x, pitch=1.0, range_=1.0, speed=1.0, energy=1.0, formant=1.0, fs=SR,
+            frame_period=FRAME_PERIOD):
+    """Expressive prosody: shift pitch MEAN, scale pitch RANGE, time-scale SPEED, scale ENERGY,
+    and warp FORMANTS (vocal-tract size). Pitch+formant together = a believable character voice;
+    pitch alone is a chipmunk. The voiced/unvoiced structure stays intact, so it's still speech."""
     f0, sp, ap = analyze(x, fs, frame_period)
     if speed != 1.0:
         n_out = max(2, int(round(f0.shape[0] / speed)))
@@ -140,14 +169,15 @@ def animate(x, pitch=1.0, range_=1.0, speed=1.0, energy=1.0, fs=SR, frame_period
     voiced = f0 > 0
     if voiced.any():
         mean = float(np.exp(np.log(f0[voiced]).mean()))         # geometric mean pitch
-        f0 = np.where(voiced, np.clip(mean * pitch + (f0 - mean) * range_, 50.0, 1000.0), 0.0)
-    sp = sp * (energy ** 2)                                      # spectral power = loudness/emphasis
+        line = np.clip(mean * pitch + (f0 - mean) * range_, 50.0, 1000.0)
+        f0 = np.where(voiced, _smooth(line, 3), 0.0)            # smooth -> no jitter artifacts
+    sp = _formant_shift(sp, formant) * (energy ** 2)            # formant warp + loudness
     return resynth(f0, sp, ap, fs, frame_period)
 
 
 def animate_preset(x, style, fs=SR):
-    p, r, sp_, e = PRESETS[style]
-    return animate(x, pitch=p, range_=r, speed=sp_, energy=e, fs=fs)
+    p, r, sp_, e, fm = PRESETS[style]
+    return animate(x, pitch=p, range_=r, speed=sp_, energy=e, formant=fm, fs=fs)
 
 
 # ---- synthesis-from-text bridge (uses the trained tts_fast acoustic model) ----------------------
