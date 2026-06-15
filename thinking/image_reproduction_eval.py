@@ -261,6 +261,7 @@ def main(argv=None):
     ap.add_argument("--max-structure-multiscale-l1", type=float, default=None)
     ap.add_argument("--max-structure-frequency-l1", type=float, default=None)
     ap.add_argument("--max-structure-ssim-loss", type=float, default=None)
+    ap.add_argument("--max-patch-structure-l1", type=float, default=None)
     ap.add_argument("--max-texture-stats-l1", type=float, default=None)
     ap.add_argument("--max-physics-l1", type=float, default=None)
     ap.add_argument("--max-selected-score", type=float, default=None)
@@ -281,8 +282,8 @@ def main(argv=None):
     for name in (
             "max_pixel_mse", "max_pixel_mae", "max_structure_edge_l1",
             "max_structure_multiscale_l1", "max_structure_frequency_l1",
-            "max_structure_ssim_loss", "max_texture_stats_l1",
-            "max_physics_l1", "max_selected_score"):
+            "max_structure_ssim_loss", "max_patch_structure_l1",
+            "max_texture_stats_l1", "max_physics_l1", "max_selected_score"):
         value = getattr(args, name)
         if value is not None and value < 0.0:
             ap.error(f"--{name.replace('_', '-')} must be non-negative")
@@ -298,6 +299,7 @@ def main(argv=None):
         max_structure_multiscale_l1=args.max_structure_multiscale_l1,
         max_structure_frequency_l1=args.max_structure_frequency_l1,
         max_structure_ssim_loss=args.max_structure_ssim_loss,
+        max_patch_structure_l1=args.max_patch_structure_l1,
         max_texture_stats_l1=args.max_texture_stats_l1,
         max_physics_l1=args.max_physics_l1,
         max_selected_score=args.max_selected_score,
