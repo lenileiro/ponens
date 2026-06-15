@@ -213,6 +213,31 @@ def selftest():
 # twinkle twinkle (C major), one note per syllable
 TWINKLE = ("c4:1 c4:1 g4:1 g4:1 a4:1 a4:1 g4:2 f4:1 f4:1 e4:1 e4:1 d4:1 d4:1 c4:2")
 
+# a short story: each line gets a character/emotion voice -> "animated" narration
+STORY = [
+    ("once upon a time, in a quiet little village,", "narrator"),
+    ("there lived a tiny fairy who loved to sing.", "fairy"),
+    ("but deep in the mountain, a giant was waking up.", "giant"),
+    ("who dares to enter my cave?", "giant"),
+    ("the fairy was frightened, and she did not know what to do.", "suspense"),
+    ("then she had a wonderful idea!", "excited"),
+    ("and they all became the best of friends.", "narrator"),
+]
+
+
+def story(lines=STORY, ckpt="runs/tts_fast.pt", out="data/synth/story_narration.wav", gap=0.25):
+    """Synthesize a narration, animating each line with its character/emotion voice, then stitch
+    into one wav -> demonstrates ANIMATED storytelling variation."""
+    sil = np.zeros(int(gap * SR), dtype=np.float32)
+    pieces = []
+    for text, style in lines:
+        w = animate_preset(speak(text, ckpt), style)
+        pieces.append(w / (np.abs(w).max() + 1e-8) * 0.95)
+        pieces.append(sil)
+        print(f"  [{style:9}] {text!r}")
+    _write(out, np.concatenate(pieces))
+    return out
+
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
@@ -222,6 +247,7 @@ def main(argv=None):
     ap.add_argument("--ckpt", default="runs/tts_fast.pt")
     ap.add_argument("--sing", action="store_true")
     ap.add_argument("--animate", action="store_true")
+    ap.add_argument("--story", action="store_true")
     ap.add_argument("--melody", default=TWINKLE)
     ap.add_argument("--bpm", type=int, default=120)
     ap.add_argument("--out", default="data/synth/prosody_out.wav")
@@ -229,6 +255,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return
+    if args.story:
+        story(ckpt=args.ckpt, out=os.path.join(args.out_dir, "story_narration.wav")); return
     x = _read(args.inp) if args.inp else speak(args.from_text, args.ckpt)
     if not (args.sing or args.animate):
         _write(args.out, x); return
