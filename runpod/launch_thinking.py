@@ -590,6 +590,7 @@ def apply_image_quality_preset(args):
     args.image_flow_self_repa_mode = "auto"
     args.image_flow_factorization_w = max(float(args.image_flow_factorization_w), 0.01)
     args.image_flow_sra_w = max(float(args.image_flow_sra_w), 0.05)
+    args.image_flow_sra_frac = max(float(args.image_flow_sra_frac), 0.6 if hq else 0.5)
     args.image_flow_sra_mode = "both"
     args.image_flow_sra_time_gap = float(args.image_flow_sra_time_gap or 0.25)
     args.image_cond_drop = max(float(args.image_cond_drop), 0.1)
@@ -1306,6 +1307,7 @@ def payload(args):
                      f"{args.image_flow_factorization_token_correlation_w} "
                      f"--flow-sra-w {args.image_flow_sra_w} "
                      f"--flow-sra-steps {args.image_flow_sra_steps} "
+                     f"--flow-sra-frac {args.image_flow_sra_frac} "
                      f"--flow-sra-time-gap {args.image_flow_sra_time_gap} "
                      f"--flow-sra-mode {args.image_flow_sra_mode} "
                      f"--cond-mode {args.image_cond_mode} "
@@ -3184,6 +3186,10 @@ def main():
     ap.add_argument("--image-flow-sra-steps", type=int, default=0,
                     dest="image_flow_sra_steps",
                     help="limit image flow SRA to the first N flow steps; 0 means all steps")
+    ap.add_argument("--image-flow-sra-frac", type=float, default=0.0,
+                    dest="image_flow_sra_frac",
+                    help=("fraction of image flow steps to keep SRA active; "
+                          "--image-flow-sra-steps overrides when positive"))
     ap.add_argument("--image-flow-sra-time-gap", type=float, default=0.25,
                     dest="image_flow_sra_time_gap",
                     help="fractional move toward clean data for the detached SRA teacher pass")
@@ -4636,6 +4642,12 @@ def main():
         base_steps = int(args.train_steps or 800)
         repa_steps = max(1, int(math.ceil(float(base_steps) * float(args.image_flow_repa_frac))))
         args.image_flow_repa_steps = repa_steps
+    if args.image_flow_sra_frac < 0.0 or args.image_flow_sra_frac > 1.0:
+        sys.exit("ERROR: --image-flow-sra-frac must be in [0, 1]")
+    if args.image_flow_sra_frac > 0.0 and int(args.image_flow_sra_steps) <= 0:
+        base_steps = int(args.train_steps or 800)
+        sra_steps = max(1, int(math.ceil(float(base_steps) * float(args.image_flow_sra_frac))))
+        args.image_flow_sra_steps = sra_steps
     if args.vision_understanding and not (args.image_manifest or args.image_fetch):
         sys.exit("ERROR: --vision-understanding requires --image-manifest or --image-fetch")
     if args.image_latent and not (args.image_manifest or args.image_fetch):

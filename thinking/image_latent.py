@@ -11157,6 +11157,8 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
             "flow_factorization_token_correlation_w",
             report.get("flow_factorization_token_correlation_w", 0.05))),
         "flow_sra_w": float(ckpt.get("flow_sra_w", report.get("flow_sra_w", 0.0))),
+        "flow_sra_frac": float(ckpt.get(
+            "flow_sra_frac", report.get("flow_sra_frac", 0.0)) or 0.0),
         "flow_sra_steps": int(ckpt.get(
             "flow_sra_steps", report.get("flow_sra_steps", 0)) or 0),
         "flow_sra_time_gap": float(ckpt.get(
@@ -12134,7 +12136,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       flow_factorization_variance_target=0.05,
                       flow_factorization_covariance_w=0.05,
                       flow_factorization_token_correlation_w=0.05,
-                      flow_sra_w=0.0, flow_sra_steps=0, flow_sra_time_gap=0.25,
+                      flow_sra_w=0.0, flow_sra_steps=0, flow_sra_frac=0.0,
+                      flow_sra_time_gap=0.25,
                       flow_sra_mode="token",
                       sample_steps=4,
                       flow_consistency_w=0.0, flow_endpoint_w=0.0,
@@ -12470,8 +12473,16 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("flow factorization component weights must be non-negative")
     if flow_sra_w < 0.0:
         raise ValueError("flow_sra_w must be non-negative")
+    flow_sra_steps = int(flow_sra_steps)
+    flow_sra_requested_steps = int(flow_sra_steps)
+    flow_sra_frac = float(flow_sra_frac)
+    if flow_sra_frac < 0.0 or flow_sra_frac > 1.0:
+        raise ValueError("flow_sra_frac must be in [0, 1]")
     if flow_sra_steps < 0:
         raise ValueError("flow_sra_steps must be non-negative")
+    if flow_sra_steps <= 0:
+        flow_sra_steps = fractional_active_steps(
+            flow_steps, flow_sra_frac, name="flow_sra_frac")
     if flow_sra_time_gap <= 0.0 or flow_sra_time_gap > 1.0:
         raise ValueError("flow_sra_time_gap must be in (0, 1]")
     if text_embed_dim <= 0:
@@ -13965,6 +13976,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_factorization_token_correlation_w": float(
             flow_factorization_token_correlation_w),
         "flow_sra_w": float(flow_sra_w),
+        "flow_sra_frac": float(flow_sra_frac),
+        "flow_sra_requested_steps": int(flow_sra_requested_steps),
         "flow_sra_steps": int(flow_sra_steps),
         "flow_sra_active_steps": (
             int(flow_steps) if flow_sra_w > 0.0 and int(flow_sra_steps) == 0
@@ -14637,6 +14650,7 @@ def selftest():
             flow_repa_mode="auto",
             image_embedding_sequence_max_len=2,
             flow_factorization_w=0.01,
+            flow_sra_w=0.01, flow_sra_frac=1.0, flow_sra_mode="both",
             flow_multiscale_w=0.01, flow_multiscale_scales=(2,),
             flow_boundary_mode="double-cosine",
             flow_time_embed="fourier", flow_time_embed_dim=8,
@@ -14713,6 +14727,10 @@ def selftest():
         assert "flow_physics_loss" in report["last_flow"]
         assert math.isclose(report["flow_factorization_w"], 0.01)
         assert "flow_factorization_loss" in report["last_flow"]
+        assert math.isclose(report["flow_sra_frac"], 1.0)
+        assert report["flow_sra_steps"] == 1
+        assert report["flow_sra_active_steps"] == 1
+        assert "flow_sra_loss" in report["last_flow"]
         assert math.isclose(report["flow_multiscale_w"], 0.01)
         assert report["flow_multiscale_scales"] == [2]
         assert report["last_flow"]["flow_multiscale_active_scales"] >= 1
@@ -15234,6 +15252,10 @@ def main(argv=None):
                           "tokens to detached cleaner-step hidden tokens"))
     ap.add_argument("--flow-sra-steps", type=int, default=0, dest="flow_sra_steps",
                     help="limit flow SRA alignment to the first N flow steps; 0 means all steps")
+    ap.add_argument("--flow-sra-frac", type=float, default=0.0,
+                    dest="flow_sra_frac",
+                    help=("fraction of flow steps to keep SRA active; "
+                          "--flow-sra-steps overrides when positive"))
     ap.add_argument("--flow-sra-time-gap", type=float, default=0.25,
                     dest="flow_sra_time_gap",
                     help="fractional move toward clean data for the detached SRA teacher pass")
@@ -16131,6 +16153,8 @@ def main(argv=None):
         ap.error("--flow-sra-w must be non-negative")
     if args.flow_sra_steps < 0:
         ap.error("--flow-sra-steps must be non-negative")
+    if args.flow_sra_frac < 0.0 or args.flow_sra_frac > 1.0:
+        ap.error("--flow-sra-frac must be in [0, 1]")
     if args.flow_sra_time_gap <= 0.0 or args.flow_sra_time_gap > 1.0:
         ap.error("--flow-sra-time-gap must be in (0, 1]")
     if args.flow_noise_coupling_projections <= 0:
@@ -16610,6 +16634,7 @@ def main(argv=None):
             args.flow_factorization_token_correlation_w),
         flow_sra_w=args.flow_sra_w,
         flow_sra_steps=args.flow_sra_steps,
+        flow_sra_frac=args.flow_sra_frac,
         flow_sra_time_gap=args.flow_sra_time_gap,
         flow_sra_mode=args.flow_sra_mode,
         sample_steps=args.sample_steps, cond_mode=args.cond_mode,
@@ -17025,7 +17050,10 @@ def main(argv=None):
         "flow_factorization_token_correlation_w": (
             args.flow_factorization_token_correlation_w),
         "flow_sra_w": args.flow_sra_w,
-        "flow_sra_steps": args.flow_sra_steps,
+        "flow_sra_frac": report.get("flow_sra_frac", args.flow_sra_frac),
+        "flow_sra_requested_steps": report.get(
+            "flow_sra_requested_steps", args.flow_sra_steps),
+        "flow_sra_steps": report.get("flow_sra_steps", args.flow_sra_steps),
         "flow_sra_time_gap": args.flow_sra_time_gap,
         "flow_sra_mode": args.flow_sra_mode,
         "hidden": args.hidden,

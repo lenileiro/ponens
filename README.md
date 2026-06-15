@@ -237,7 +237,8 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
 # frequency-domain endpoint
 # detail loss, logit-normal flow times with soft Min-SNR velocity weighting,
 # SD3-style mode-biased timestep priors inside adaptive loss-tracked timestep sampling,
-# EMA-teacher guided self-distillation, triangular middle-window CFG scheduling,
+# early-stopped REPA/SRA representation alignment, EMA-teacher guided self-distillation,
+# triangular middle-window CFG scheduling,
 # Karras/cosine/linear timestep sweeps,
 # adaLN-Zero residual-gated DiT/CrossDiT/MM-DiT blocks,
 # Heun/adaptive-Heun/RK4 sampling sweeps, and standard CFG plus CFG++ sweeps.
