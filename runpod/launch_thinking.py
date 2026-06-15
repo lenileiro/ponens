@@ -736,6 +736,15 @@ def apply_image_quality_preset(args):
     if not str(args.image_sample_reference_denoise_strengths or "").strip():
         args.image_sample_reference_denoise_strengths = (
             "1.0,0.75,0.5,0.25,0.0" if hq else "1.0,0.5,0.25,0.0")
+    if args.image_sample_reference_max_pixel_mse is None:
+        args.image_sample_reference_max_pixel_mse = 0.12 if hq else 0.18
+    if args.image_sample_reference_max_pixel_mae is None:
+        args.image_sample_reference_max_pixel_mae = 0.24 if hq else 0.32
+    if args.image_sample_reference_max_patch_structure_l1 is None:
+        args.image_sample_reference_max_patch_structure_l1 = 0.12 if hq else 0.18
+    if args.image_sample_reference_max_selected_score is None:
+        args.image_sample_reference_max_selected_score = 1.8 if hq else 2.6
+    args.image_reference_eval_fail_on_gate = True
     if hq and not args.image_sample_candidates_manifest_out:
         args.image_sample_candidates_manifest_out = path_with_suffix(
             args.image_sample_manifest_out, "_candidates.jsonl")
