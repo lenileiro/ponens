@@ -8706,6 +8706,94 @@ def reference_reproduction_gate_failure_message(report):
     )
 
 
+def autoencoder_reconstruction_gate_report(
+        report, prefix="autoencoder_recon", max_pixel_mse=None,
+        max_pixel_mae=None, max_structure_edge_l1=None,
+        max_structure_multiscale_l1=None, max_structure_frequency_l1=None,
+        max_structure_ssim_loss=None, max_patch_structure_l1=None,
+        max_texture_stats_l1=None, max_physics_l1=None, max_score=None,
+        gate_prefix="autoencoder_recon"):
+    """Return pass/fail metadata for latent-codec reconstruction thresholds."""
+    thresholds = {
+        "max_pixel_mse": max_pixel_mse,
+        "max_pixel_mae": max_pixel_mae,
+        "max_structure_edge_l1": max_structure_edge_l1,
+        "max_structure_multiscale_l1": max_structure_multiscale_l1,
+        "max_structure_frequency_l1": max_structure_frequency_l1,
+        "max_structure_ssim_loss": max_structure_ssim_loss,
+        "max_patch_structure_l1": max_patch_structure_l1,
+        "max_texture_stats_l1": max_texture_stats_l1,
+        "max_physics_l1": max_physics_l1,
+        "max_score": max_score,
+    }
+    thresholds = {
+        key: (None if value is None else float(value))
+        for key, value in thresholds.items()
+    }
+    enabled = any(value is not None for value in thresholds.values())
+    failures = []
+
+    def check_max(metric, gate_name):
+        threshold = thresholds[gate_name]
+        if threshold is None:
+            return
+        metric_key = f"{prefix}_{metric}"
+        value = _sample_gate_metric_value(report, metric_key)
+        if value is None:
+            failures.append(f"{metric_key} is missing for {gate_name}={threshold:g}")
+        elif value > threshold:
+            failures.append(
+                f"{metric_key} {value:g} > {gate_name} {threshold:g}")
+
+    check_max("pixel_mse", "max_pixel_mse")
+    check_max("pixel_mae", "max_pixel_mae")
+    check_max("structure_edge_l1", "max_structure_edge_l1")
+    check_max("structure_multiscale_l1", "max_structure_multiscale_l1")
+    check_max("structure_frequency_l1", "max_structure_frequency_l1")
+    check_max("structure_ssim_loss", "max_structure_ssim_loss")
+    check_max("patch_structure_l1", "max_patch_structure_l1")
+    check_max("texture_stats_l1", "max_texture_stats_l1")
+    check_max("physics_l1", "max_physics_l1")
+    check_max("score", "max_score")
+
+    meta = {
+        f"{gate_prefix}_quality_gate_enabled": bool(enabled),
+        f"{gate_prefix}_quality_gate_passed": bool(not failures),
+        f"{gate_prefix}_quality_gate_failures": failures,
+    }
+    for name, value in thresholds.items():
+        meta[f"{gate_prefix}_quality_gate_{name}"] = value
+    return meta
+
+
+def cli_autoencoder_reconstruction_gate_report(report, args, prefix="autoencoder_recon"):
+    return autoencoder_reconstruction_gate_report(
+        report, prefix=prefix,
+        max_pixel_mse=args.autoencoder_recon_max_pixel_mse,
+        max_pixel_mae=args.autoencoder_recon_max_pixel_mae,
+        max_structure_edge_l1=args.autoencoder_recon_max_structure_edge_l1,
+        max_structure_multiscale_l1=(
+            args.autoencoder_recon_max_structure_multiscale_l1),
+        max_structure_frequency_l1=(
+            args.autoencoder_recon_max_structure_frequency_l1),
+        max_structure_ssim_loss=args.autoencoder_recon_max_structure_ssim_loss,
+        max_patch_structure_l1=args.autoencoder_recon_max_patch_structure_l1,
+        max_texture_stats_l1=args.autoencoder_recon_max_texture_stats_l1,
+        max_physics_l1=args.autoencoder_recon_max_physics_l1,
+        max_score=args.autoencoder_recon_max_score)
+
+
+def autoencoder_reconstruction_gate_failure_message(
+        report, gate_prefix="autoencoder_recon"):
+    failures = report.get(f"{gate_prefix}_quality_gate_failures", [])
+    if not failures:
+        return ""
+    return (
+        "autoencoder reconstruction quality gate failed: "
+        + "; ".join(str(x) for x in failures)
+    )
+
+
 REPRODUCTION_SCORE_METRICS = (
     "pixel_mse",
     "structure_edge_l1",
@@ -8843,6 +8931,40 @@ def summarize_reproduction_per_sample_metrics(rows, prefix="reference"):
             out[f"{key}_max"] = 0.0
             out[f"{key}_min"] = 0.0
     return out
+
+
+@torch.no_grad()
+def evaluate_autoencoder_reconstruction_records(
+        ae, records, n=128, batch=64, seed=10, size=32, device=DEV,
+        prefix="autoencoder_recon"):
+    """Score only the image codec path: real image -> latent -> reconstruction."""
+    records = list(records)
+    if not records:
+        raise ValueError("autoencoder reconstruction eval requires image records")
+    rng = np.random.default_rng(seed)
+    ae.eval()
+    total = 0
+    metric_sums = defaultdict(float)
+    while total < int(n):
+        b = min(int(batch), int(n) - total)
+        x, _captions, _chosen_records = sample_image_text_batch(
+            records, rng, batch=b, size=size, device=device, return_records=True)
+        out = ae(x)
+        recon = out["recon"].clamp(-1.0, 1.0)
+        metrics = image_reproduction_metrics(x, recon, prefix=prefix)
+        score = image_reproduction_score(metrics, prefix=prefix)
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)) and np.isfinite(float(value)):
+                metric_sums[key] += float(value) * int(b)
+        metric_sums[f"{prefix}_score"] += float(score) * int(b)
+        total += int(b)
+    report = {f"{prefix}_sample_count": int(total)}
+    if total > 0:
+        report.update({
+            key: float(value) / float(total)
+            for key, value in metric_sums.items()
+        })
+    return report
 
 
 def write_ppm_grid(samples, path, rows, cols, pad=2, bg=32):
@@ -11681,7 +11803,8 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
                         sample_selection_patch_structure_patch=(
                             DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE),
                         sample_finite_guard=False, sample_velocity_clip=0.0,
-                        sample_latent_clip=0.0):
+                        sample_latent_clip=0.0,
+                        autoencoder_recon_samples=0):
     if weight_mode is None:
         weight_mode = "ema" if prefer_ema else "raw"
     if weight_mode not in EVAL_WEIGHT_MODES:
@@ -11745,6 +11868,9 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
         raise ValueError("sample_velocity_clip must be non-negative")
     if sample_latent_clip < 0.0:
         raise ValueError("sample_latent_clip must be non-negative")
+    autoencoder_recon_samples = int(autoencoder_recon_samples)
+    if autoencoder_recon_samples < 0:
+        raise ValueError("autoencoder_recon_samples must be non-negative")
 
     def run_mode(mode):
         ae, flow, conditioner, prompt_vocab, _prompt_templates, meta = load_checkpoint(
@@ -11767,6 +11893,12 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             manifest_path, root=image_root, split=split,
             min_aesthetic=eval_image_min_aesthetic,
             max_records=eval_image_max_records)
+        recon_eval_n = int(autoencoder_recon_samples)
+        if recon_eval_n <= 0:
+            recon_eval_n = min(int(n), max(int(batch), len(records)))
+        autoencoder_recon_report = evaluate_autoencoder_reconstruction_records(
+            ae, records, n=recon_eval_n, batch=batch, seed=seed + 23,
+            size=eval_size, device=device, prefix="autoencoder_recon")
         rows = []
         for eval_seed in eval_seeds:
             for row in image_record_sweep(
@@ -11875,6 +12007,7 @@ def evaluate_checkpoint(path, cfg_scales=(1.0, 1.5), sample_steps_list=(4, 8),
             "rows": rows,
             "aggregate": aggregate,
             "best": best,
+            **autoencoder_recon_report,
         }
         report.update(summarize_records(records))
         return report
@@ -12061,6 +12194,17 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       visual_detail_guidance_w=0.0,
                       visual_detail_guidance_patch=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE,
                       visual_detail_guidance_interval=DEFAULT_GUIDANCE_INTERVAL,
+                      autoencoder_recon_gate_samples=0,
+                      autoencoder_recon_max_pixel_mse=None,
+                      autoencoder_recon_max_pixel_mae=None,
+                      autoencoder_recon_max_structure_edge_l1=None,
+                      autoencoder_recon_max_structure_multiscale_l1=None,
+                      autoencoder_recon_max_structure_frequency_l1=None,
+                      autoencoder_recon_max_structure_ssim_loss=None,
+                      autoencoder_recon_max_patch_structure_l1=None,
+                      autoencoder_recon_max_texture_stats_l1=None,
+                      autoencoder_recon_max_physics_l1=None,
+                      autoencoder_recon_max_score=None,
                       train_precision="fp32", ae_accum_steps=1, flow_accum_steps=1,
                       grad_clip=0.0,
                       flow_cache_latents=False, flow_cache_records=0, flow_cache_batch=64,
@@ -12444,6 +12588,31 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         raise ValueError("visual_detail_guidance_patch must be positive")
     visual_detail_guidance_interval = validate_guidance_interval(
         visual_detail_guidance_interval, name="visual_detail_guidance_interval")
+    autoencoder_recon_gate_samples = int(autoencoder_recon_gate_samples)
+    if autoencoder_recon_gate_samples < 0:
+        raise ValueError("autoencoder_recon_gate_samples must be non-negative")
+    autoencoder_recon_gate_thresholds = {
+        "max_pixel_mse": autoencoder_recon_max_pixel_mse,
+        "max_pixel_mae": autoencoder_recon_max_pixel_mae,
+        "max_structure_edge_l1": autoencoder_recon_max_structure_edge_l1,
+        "max_structure_multiscale_l1": (
+            autoencoder_recon_max_structure_multiscale_l1),
+        "max_structure_frequency_l1": (
+            autoencoder_recon_max_structure_frequency_l1),
+        "max_structure_ssim_loss": autoencoder_recon_max_structure_ssim_loss,
+        "max_patch_structure_l1": autoencoder_recon_max_patch_structure_l1,
+        "max_texture_stats_l1": autoencoder_recon_max_texture_stats_l1,
+        "max_physics_l1": autoencoder_recon_max_physics_l1,
+        "max_score": autoencoder_recon_max_score,
+    }
+    autoencoder_recon_gate_thresholds = {
+        key: (None if value is None else float(value))
+        for key, value in autoencoder_recon_gate_thresholds.items()
+    }
+    if any(
+            value is not None and value < 0.0
+            for value in autoencoder_recon_gate_thresholds.values()):
+        raise ValueError("autoencoder reconstruction gate thresholds must be non-negative")
     cfg_interval = validate_guidance_interval(cfg_interval, name="cfg_interval")
     if dit_head_width_mult <= 0:
         raise ValueError("dit_head_width_mult must be positive")
@@ -12717,6 +12886,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     size_bucket_sample_counts = {image_size_key(bucket): 0 for bucket in train_size_buckets}
     last_ae = {}
     ae_train_steps_run = 0
+    autoencoder_recon_preflight_report = {}
     for _ in range(ae_steps if opt_ae is not None else 0):
         ae_train_steps_run += 1
         opt_ae.zero_grad(set_to_none=True)
@@ -12794,6 +12964,29 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             last_ae["grad_norm"] = float(grad_norm.detach().cpu())
         scaler.step(opt_ae)
         scaler.update()
+
+    autoencoder_recon_gate_enabled = any(
+        value is not None for value in autoencoder_recon_gate_thresholds.values())
+    if autoencoder_recon_gate_enabled:
+        gate_samples = int(autoencoder_recon_gate_samples)
+        if gate_samples <= 0:
+            gate_samples = min(128, max(int(batch), len(image_records)))
+        autoencoder_recon_preflight_report = (
+            evaluate_autoencoder_reconstruction_records(
+                ae, image_records, n=gate_samples, batch=batch, seed=seed + 23,
+                size=size, device=device, prefix="autoencoder_recon_preflight")
+        )
+        autoencoder_recon_preflight_report.update(
+            autoencoder_reconstruction_gate_report(
+                autoencoder_recon_preflight_report,
+                prefix="autoencoder_recon_preflight",
+                gate_prefix="autoencoder_recon_preflight",
+                **autoencoder_recon_gate_thresholds))
+        preflight_gate_message = autoencoder_reconstruction_gate_failure_message(
+            autoencoder_recon_preflight_report,
+            gate_prefix="autoencoder_recon_preflight")
+        if preflight_gate_message:
+            raise ValueError(preflight_gate_message)
 
     flow_params = list(flow.parameters()) + ([] if conditioner is None
                                              else list(conditioner.parameters()))
@@ -13612,6 +13805,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "train_amp_enabled": bool(amp_cfg["enabled"]),
         "train_amp_dtype": amp_cfg["dtype_name"],
         "grad_clip": float(grad_clip),
+        "autoencoder_recon_gate_samples": int(autoencoder_recon_gate_samples),
+        **autoencoder_recon_preflight_report,
         "image_size": image_size_value(size),
         "image_h": int(size[0]),
         "image_w": int(size[1]),
@@ -14254,6 +14449,19 @@ def selftest():
             {**ref_gate_report, "reference_flow_pixel_mse_max": 0.25},
             max_pixel_mse=0.20)
         assert ref_gate_max_fail["sample_reference_quality_gate_passed"] is False
+        ae_gate_pass = autoencoder_reconstruction_gate_report(
+            {"autoencoder_recon_pixel_mse": 0.02,
+             "autoencoder_recon_patch_structure_l1": 0.03,
+             "autoencoder_recon_score": 0.20},
+            max_pixel_mse=0.05, max_patch_structure_l1=0.05,
+            max_score=0.40)
+        assert ae_gate_pass["autoencoder_recon_quality_gate_enabled"] is True
+        assert ae_gate_pass["autoencoder_recon_quality_gate_passed"] is True
+        ae_gate_fail = autoencoder_reconstruction_gate_report(
+            {"autoencoder_recon_pixel_mse": 0.20},
+            max_pixel_mse=0.05)
+        assert ae_gate_fail["autoencoder_recon_quality_gate_passed"] is False
+        assert autoencoder_reconstruction_gate_failure_message(ae_gate_fail)
         per_ref_metrics = image_reproduction_per_sample_metrics(
             torch.cat([textured_sample, flat_sample], dim=0),
             torch.cat([textured_sample, flat_sample], dim=0),
@@ -14422,6 +14630,10 @@ def selftest():
             time_stratified=True,
             time_adaptive_uniform_mix=0.1,
             time_adaptive_prior="mode", time_adaptive_prior_mix=0.25,
+            autoencoder_recon_gate_samples=2,
+            autoencoder_recon_max_pixel_mse=10.0,
+            autoencoder_recon_max_patch_structure_l1=10.0,
+            autoencoder_recon_max_score=20.0,
             image_geometry_cond=True,
             return_conditioner=True)
         assert report["experiment"] == "image_latent_manifest_rectified_flow"
@@ -14544,6 +14756,8 @@ def selftest():
         assert "recon_mse" in report
         assert "autoencoder_recon_score" in report
         assert "autoencoder_recon_patch_structure_l1" in report
+        assert report["autoencoder_recon_preflight_quality_gate_enabled"] is True
+        assert report["autoencoder_recon_preflight_quality_gate_passed"] is True
         assert conditioner is not None and vocab
         sample_path = os.path.join(td, "samples.ppm")
         meta = save_caption_sample_grid(
@@ -14868,6 +15082,48 @@ def main(argv=None):
                     help="patch size for --ae-patch-structure-w")
     ap.add_argument("--ae-latent-reg-w", type=float, default=0.0, dest="ae_latent_reg_w",
                     help="latent L2 regularization weight during AE training")
+    ap.add_argument("--autoencoder-recon-gate-samples", type=int, default=0,
+                    dest="autoencoder_recon_gate_samples",
+                    help=("records used for early autoencoder reconstruction gate; "
+                          "0 derives a bounded default when any gate is enabled"))
+    ap.add_argument("--autoencoder-recon-max-pixel-mse", type=float, default=None,
+                    dest="autoencoder_recon_max_pixel_mse",
+                    help="fail if autoencoder reconstruction pixel MSE exceeds this")
+    ap.add_argument("--autoencoder-recon-max-pixel-mae", type=float, default=None,
+                    dest="autoencoder_recon_max_pixel_mae",
+                    help="fail if autoencoder reconstruction pixel MAE exceeds this")
+    ap.add_argument("--autoencoder-recon-max-structure-edge-l1", type=float,
+                    default=None,
+                    dest="autoencoder_recon_max_structure_edge_l1",
+                    help="fail if autoencoder reconstruction edge L1 exceeds this")
+    ap.add_argument("--autoencoder-recon-max-structure-multiscale-l1", type=float,
+                    default=None,
+                    dest="autoencoder_recon_max_structure_multiscale_l1",
+                    help="fail if autoencoder reconstruction multiscale L1 exceeds this")
+    ap.add_argument("--autoencoder-recon-max-structure-frequency-l1", type=float,
+                    default=None,
+                    dest="autoencoder_recon_max_structure_frequency_l1",
+                    help="fail if autoencoder reconstruction frequency L1 exceeds this")
+    ap.add_argument("--autoencoder-recon-max-structure-ssim-loss", type=float,
+                    default=None,
+                    dest="autoencoder_recon_max_structure_ssim_loss",
+                    help=("fail if autoencoder reconstruction SSIM-style structure "
+                          "loss exceeds this"))
+    ap.add_argument("--autoencoder-recon-max-patch-structure-l1", type=float,
+                    default=None,
+                    dest="autoencoder_recon_max_patch_structure_l1",
+                    help=("fail if autoencoder reconstruction patch-structure "
+                          "descriptor L1 exceeds this"))
+    ap.add_argument("--autoencoder-recon-max-texture-stats-l1", type=float,
+                    default=None,
+                    dest="autoencoder_recon_max_texture_stats_l1",
+                    help="fail if autoencoder reconstruction texture-statistics L1 exceeds this")
+    ap.add_argument("--autoencoder-recon-max-physics-l1", type=float, default=None,
+                    dest="autoencoder_recon_max_physics_l1",
+                    help="fail if autoencoder reconstruction visual physics L1 exceeds this")
+    ap.add_argument("--autoencoder-recon-max-score", type=float, default=None,
+                    dest="autoencoder_recon_max_score",
+                    help="fail if summed autoencoder reconstruction score exceeds this")
     ap.add_argument("--image-text-align-w", type=float, default=0.0,
                     dest="image_text_align_w",
                     help="contrastive image-latent/caption alignment weight during AE training")
@@ -15733,6 +15989,24 @@ def main(argv=None):
         ap.error("--sample-reference-manifest-out requires --sample-reference-grid-out")
     if args.sample_reference_image_dir and not args.sample_reference_manifest_out:
         ap.error("--sample-reference-image-dir requires --sample-reference-manifest-out")
+    if args.autoencoder_recon_gate_samples < 0:
+        ap.error("--autoencoder-recon-gate-samples must be non-negative")
+    autoencoder_recon_gate_names = (
+        "autoencoder_recon_max_pixel_mse",
+        "autoencoder_recon_max_pixel_mae",
+        "autoencoder_recon_max_structure_edge_l1",
+        "autoencoder_recon_max_structure_multiscale_l1",
+        "autoencoder_recon_max_structure_frequency_l1",
+        "autoencoder_recon_max_structure_ssim_loss",
+        "autoencoder_recon_max_patch_structure_l1",
+        "autoencoder_recon_max_texture_stats_l1",
+        "autoencoder_recon_max_physics_l1",
+        "autoencoder_recon_max_score",
+    )
+    for gate_name in autoencoder_recon_gate_names:
+        gate_value = getattr(args, gate_name)
+        if gate_value is not None and gate_value < 0.0:
+            ap.error(f"--{gate_name.replace('_', '-')} must be non-negative")
     for gate_name in reference_gate_names:
         gate_value = getattr(args, gate_name)
         if gate_value is not None and gate_value < 0.0:
@@ -15989,6 +16263,7 @@ def main(argv=None):
             sample_finite_guard=args.sample_finite_guard,
             sample_velocity_clip=args.sample_velocity_clip,
             sample_latent_clip=args.sample_latent_clip,
+            autoencoder_recon_samples=args.autoencoder_recon_gate_samples,
             cfg_modes=cfg_modes,
         )
         if args.sample_grid_out:
@@ -16213,6 +16488,7 @@ def main(argv=None):
             report.update(reference_meta)
             report.update(cli_sample_quality_gate_report(report, args))
             report.update(cli_reference_reproduction_gate_report(report, args))
+        report.update(cli_autoencoder_reconstruction_gate_report(report, args))
         if args.eval_out:
             os.makedirs(os.path.dirname(args.eval_out) or ".", exist_ok=True)
             with open(args.eval_out, "w") as f:
@@ -16222,7 +16498,8 @@ def main(argv=None):
         else:
             print(json.dumps(report, indent=1))
         gate_message = (
-            sample_quality_gate_failure_message(report)
+            autoencoder_reconstruction_gate_failure_message(report)
+            or sample_quality_gate_failure_message(report)
             or reference_reproduction_gate_failure_message(report)
         )
         if gate_message:
@@ -16406,6 +16683,24 @@ def main(argv=None):
         visual_detail_guidance_w=args.sample_visual_detail_guidance_w,
         visual_detail_guidance_patch=args.sample_visual_detail_guidance_patch,
         visual_detail_guidance_interval=sample_visual_detail_guidance_interval,
+        autoencoder_recon_gate_samples=args.autoencoder_recon_gate_samples,
+        autoencoder_recon_max_pixel_mse=args.autoencoder_recon_max_pixel_mse,
+        autoencoder_recon_max_pixel_mae=args.autoencoder_recon_max_pixel_mae,
+        autoencoder_recon_max_structure_edge_l1=(
+            args.autoencoder_recon_max_structure_edge_l1),
+        autoencoder_recon_max_structure_multiscale_l1=(
+            args.autoencoder_recon_max_structure_multiscale_l1),
+        autoencoder_recon_max_structure_frequency_l1=(
+            args.autoencoder_recon_max_structure_frequency_l1),
+        autoencoder_recon_max_structure_ssim_loss=(
+            args.autoencoder_recon_max_structure_ssim_loss),
+        autoencoder_recon_max_patch_structure_l1=(
+            args.autoencoder_recon_max_patch_structure_l1),
+        autoencoder_recon_max_texture_stats_l1=(
+            args.autoencoder_recon_max_texture_stats_l1),
+        autoencoder_recon_max_physics_l1=(
+            args.autoencoder_recon_max_physics_l1),
+        autoencoder_recon_max_score=args.autoencoder_recon_max_score,
         train_precision=args.train_precision,
         ae_accum_steps=args.ae_accum_steps,
         flow_accum_steps=args.flow_accum_steps,
@@ -16624,6 +16919,7 @@ def main(argv=None):
         load_flow_state(flow, raw_flow)
         if conditioner is not None and raw_conditioner is not None:
             conditioner.load_state_dict(raw_conditioner)
+    report.update(cli_autoencoder_reconstruction_gate_report(report, args))
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save({
         "autoencoder_state_dict": (
@@ -16998,7 +17294,8 @@ def main(argv=None):
     print(json.dumps(report, indent=1))
     print(f"saved -> {args.out}")
     gate_message = (
-        sample_quality_gate_failure_message(report)
+        autoencoder_reconstruction_gate_failure_message(report)
+        or sample_quality_gate_failure_message(report)
         or reference_reproduction_gate_failure_message(report)
     )
     if gate_message:

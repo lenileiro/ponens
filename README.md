@@ -208,8 +208,9 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
 # The preset also writes a generated sample manifest, embeds it, runs image_eval, and runs
 # image_quality_loop for generic vision-read caption recovery; add --image-generated-eval-fail-on-gate
 # or --image-quality-loop-fail-on-gate plus threshold flags to make quality gates hard. It also
-# enables reference-reproduction gates by default so the run fails if the latent codec cannot
-# reconstruct shown images before free prompt sampling is judged.
+# enables autoencoder reconstruction and reference-reproduction gates by default so the run
+# fails if the latent codec collapses or cannot reconstruct shown images before free prompt
+# sampling is judged.
 # runs image_score before embedding/cleaning so quality_score metadata reaches sampling,
 # duplicate selection, quality-head training, quality-guided prompt sampling, and direct
 # chosen/rejected latent-flow preference updates. The `web-hf-vae` preset is the broad

@@ -567,6 +567,16 @@ def apply_image_quality_preset(args):
         float(args.image_ae_patch_structure_w), 0.15 if hq else 0.05)
     args.image_ae_patch_structure_size = max(
         int(args.image_ae_patch_structure_size), 8)
+    args.image_autoencoder_recon_gate_samples = max(
+        int(args.image_autoencoder_recon_gate_samples), 256 if hq else 128)
+    if args.image_autoencoder_recon_max_pixel_mse is None:
+        args.image_autoencoder_recon_max_pixel_mse = 0.12 if hq else 0.18
+    if args.image_autoencoder_recon_max_pixel_mae is None:
+        args.image_autoencoder_recon_max_pixel_mae = 0.24 if hq else 0.32
+    if args.image_autoencoder_recon_max_patch_structure_l1 is None:
+        args.image_autoencoder_recon_max_patch_structure_l1 = 0.12 if hq else 0.18
+    if args.image_autoencoder_recon_max_score is None:
+        args.image_autoencoder_recon_max_score = 1.8 if hq else 2.6
     args.image_feature_align_w = max(float(args.image_feature_align_w), 0.05)
     args.image_flow_feature_align_w = max(float(args.image_flow_feature_align_w), 0.05)
     if int(args.image_embedding_sequence_max_len) <= 0:
@@ -1096,6 +1106,21 @@ def payload(args):
                     ("sample-min-luminance-std", args.image_sample_min_luminance_std)):
                 if value is not None:
                     sample_quality_gate_args += f" --{flag} {value}"
+            autoencoder_gate_args = (
+                " --autoencoder-recon-gate-samples "
+                f"{args.image_autoencoder_recon_gate_samples}"
+            )
+            for flag, value in (
+                    ("autoencoder-recon-max-pixel-mse",
+                     args.image_autoencoder_recon_max_pixel_mse),
+                    ("autoencoder-recon-max-pixel-mae",
+                     args.image_autoencoder_recon_max_pixel_mae),
+                    ("autoencoder-recon-max-patch-structure-l1",
+                     args.image_autoencoder_recon_max_patch_structure_l1),
+                    ("autoencoder-recon-max-score",
+                     args.image_autoencoder_recon_max_score)):
+                if value is not None:
+                    autoencoder_gate_args += f" --{flag} {value}"
             prompt_grid_args = ""
             if args.image_sample_prompts:
                 prompt_grid_args += f" --sample-prompts {shlex_quote(args.image_sample_prompts)}"
@@ -1432,6 +1457,7 @@ def payload(args):
                      f"--flow-loss-weight-gamma {args.image_flow_loss_weight_gamma} "
                      f"--latent-normalize {args.image_latent_normalize} "
                      f"--latent-stat-samples {args.image_latent_stat_samples} "
+                     f"{autoencoder_gate_args} "
                      f"--out {ckpt}")
             if args.image_sample_grid:
                 train += (f" --sample-grid-out {grid} "
@@ -1532,6 +1558,7 @@ def payload(args):
                                  f"--sample-grid-samples {args.image_sample_grid_samples}"
                                  f"{sample_manifest_args}{prompt_grid_args}"
                                  f"{sample_quality_gate_args}")
+                eval_cmd += autoencoder_gate_args
                 if args.image_sample_reference_grid:
                     eval_cmd += reference_grid_args
                 train += eval_cmd
@@ -3062,6 +3089,24 @@ def main():
     ap.add_argument("--image-ae-latent-reg-w", type=float, default=0.0,
                     dest="image_ae_latent_reg_w",
                     help="latent L2 regularization weight during AE training")
+    ap.add_argument("--image-autoencoder-recon-gate-samples", type=int, default=0,
+                    dest="image_autoencoder_recon_gate_samples",
+                    help=("records used for image autoencoder reconstruction gate; "
+                          "presets raise this when codec quality gates are enabled"))
+    ap.add_argument("--image-autoencoder-recon-max-pixel-mse", type=float, default=None,
+                    dest="image_autoencoder_recon_max_pixel_mse",
+                    help="fail image latent training if codec pixel MSE exceeds this")
+    ap.add_argument("--image-autoencoder-recon-max-pixel-mae", type=float, default=None,
+                    dest="image_autoencoder_recon_max_pixel_mae",
+                    help="fail image latent training if codec pixel MAE exceeds this")
+    ap.add_argument("--image-autoencoder-recon-max-patch-structure-l1",
+                    type=float, default=None,
+                    dest="image_autoencoder_recon_max_patch_structure_l1",
+                    help=("fail image latent training if codec patch-structure "
+                          "descriptor L1 exceeds this"))
+    ap.add_argument("--image-autoencoder-recon-max-score", type=float, default=None,
+                    dest="image_autoencoder_recon_max_score",
+                    help="fail image latent training if summed codec reconstruction score is high")
     ap.add_argument("--image-text-align-w", type=float, default=0.0,
                     dest="image_text_align_w",
                     help="contrastive image-latent/caption alignment weight during AE training")
@@ -5002,6 +5047,19 @@ def main():
             "ERROR: image reference reproduction gates require "
             "--image-sample-reference-grid")
     for gate_name in image_reference_gate_names:
+        gate_value = getattr(args, gate_name)
+        if gate_value is not None and gate_value < 0.0:
+            flag = "--" + gate_name.replace("_", "-")
+            sys.exit(f"ERROR: {flag} must be non-negative")
+    if args.image_autoencoder_recon_gate_samples < 0:
+        sys.exit("ERROR: --image-autoencoder-recon-gate-samples must be non-negative")
+    image_autoencoder_recon_gate_names = (
+        "image_autoencoder_recon_max_pixel_mse",
+        "image_autoencoder_recon_max_pixel_mae",
+        "image_autoencoder_recon_max_patch_structure_l1",
+        "image_autoencoder_recon_max_score",
+    )
+    for gate_name in image_autoencoder_recon_gate_names:
         gate_value = getattr(args, gate_name)
         if gate_value is not None and gate_value < 0.0:
             flag = "--" + gate_name.replace("_", "-")
