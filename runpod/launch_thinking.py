@@ -273,6 +273,14 @@ def text_reading_cmd(args, py):
         f"--reading-min-tokens {args.reading_min_tokens} "
         f"--reading-eval-frac {args.reading_eval_frac} "
         f"--reading-eval-n {args.reading_eval_n} "
+        f"--reading-generation-eval-n {args.reading_generation_eval_n} "
+        f"--reading-generation-prompt-tokens "
+        f"{args.reading_generation_prompt_tokens} "
+        f"--reading-generation-max-new-tokens "
+        f"{args.reading_generation_max_new_tokens} "
+        f"--reading-generation-temperature "
+        f"{args.reading_generation_temperature} "
+        f"--reading-generation-top-k {args.reading_generation_top_k} "
         f"--reading-objective-profile {args.reading_objective_profile} "
         f"--reading-lr {args.reading_lr} "
         f"--reading-lm-w {args.reading_lm_w} "
@@ -2421,6 +2429,18 @@ def main():
                     dest="reading_eval_frac")
     ap.add_argument("--reading-eval-n", type=int, default=256,
                     dest="reading_eval_n")
+    ap.add_argument("--reading-generation-eval-n", type=int, default=0,
+                    dest="reading_generation_eval_n",
+                    help=("free-continuation eval samples passed to "
+                          "thinking.text; mastery raises this by default"))
+    ap.add_argument("--reading-generation-prompt-tokens", type=int, default=16,
+                    dest="reading_generation_prompt_tokens")
+    ap.add_argument("--reading-generation-max-new-tokens", type=int, default=32,
+                    dest="reading_generation_max_new_tokens")
+    ap.add_argument("--reading-generation-temperature", type=float, default=0.0,
+                    dest="reading_generation_temperature")
+    ap.add_argument("--reading-generation-top-k", type=int, default=0,
+                    dest="reading_generation_top_k")
     ap.add_argument("--reading-lr", type=float, default=1e-3, dest="reading_lr")
     ap.add_argument("--reading-lm-w", type=float, default=0.0,
                     dest="reading_lm_w",
@@ -4564,6 +4584,8 @@ def main():
                 args.text_reading_latent_concept_layers),
             "--reading-max-tokens": args.reading_max_tokens,
             "--reading-min-tokens": args.reading_min_tokens,
+            "--reading-generation-prompt-tokens": (
+                args.reading_generation_prompt_tokens),
             "--reading-association-transitive-steps": (
                 args.reading_association_transitive_steps),
             "--reading-composition-transitive-steps": (
@@ -4595,6 +4617,12 @@ def main():
             sys.exit("ERROR: --text-reading-latent-concept-slots must be non-negative")
         text_nonnegative = {
             "--reading-eval-n": args.reading_eval_n,
+            "--reading-generation-eval-n": args.reading_generation_eval_n,
+            "--reading-generation-max-new-tokens": (
+                args.reading_generation_max_new_tokens),
+            "--reading-generation-temperature": (
+                args.reading_generation_temperature),
+            "--reading-generation-top-k": args.reading_generation_top_k,
             "--reading-replay-w": args.reading_replay_w,
             "--reading-replay-batch": args.reading_replay_batch,
             "--reading-replay-retention-w": args.reading_replay_retention_w,

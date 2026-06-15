@@ -78,15 +78,19 @@ READING_MASTERY_SCORE_KEYS = (
     "balanced_score", "floor_score", "view_score", "fer_score",
     "bridge_score", "bridge_connectivity", "sequence_score", "context_score",
     "span_score", "context_closure_score", "neighborhood_score",
-    "cluster_score", "connection_score", "language_score",
+    "cluster_score", "connection_score", "language_score", "generation_score",
+    "generation_token_acc", "generation_diversity",
+    "generation_collapse_penalty",
 )
 READING_REPRESENTATION_PROGRESS_KEYS = (
     "mastery_score", "active_mean_score", "floor_score", "balanced_score",
     "signal_coverage", "fer_score", "bridge_score", "bridge_connectivity",
     "connection_score", "sequence_score", "neighborhood_score", "cluster_score",
-    "span_score", "context_closure_score", "language_score")
+    "span_score", "context_closure_score", "language_score",
+    "generation_score")
 READING_REPRESENTATION_SIGNAL_SCORES = (
     ("language", "language_score"),
+    ("generation", "generation_score"),
     ("fer", "fer_score"),
     ("bridge", "bridge_score"),
     ("connection", "connection_score"),
@@ -1601,6 +1605,118 @@ def reading_causal_lm_eval(model, vocab, records, device=DEV, n=0, seed=0):
             "skipped": False}
 
 
+def _reading_generation_next_id(logits, pad, temperature=0.0, top_k=0):
+    scores = logits.detach().float().clone()
+    if 0 <= int(pad) < scores.numel():
+        scores[int(pad)] = -float("inf")
+    temperature = float(temperature)
+    top_k = int(top_k)
+    if temperature <= 0.0:
+        return int(torch.argmax(scores).item())
+    if top_k > 0 and top_k < scores.numel():
+        vals, _idx = torch.topk(scores, k=top_k)
+        floor = vals[-1]
+        scores = torch.where(
+            scores >= floor, scores,
+            scores.new_full(scores.shape, -float("inf")))
+    probs = torch.softmax(scores / temperature, dim=-1)
+    if not torch.isfinite(probs).all() or float(probs.sum().item()) <= 0.0:
+        return int(torch.argmax(logits.detach().float()).item())
+    return int(torch.multinomial(probs, num_samples=1).item())
+
+
+@torch.no_grad()
+def reading_generate_tokens(model, vocab, prompt_tokens, max_new_tokens=32,
+                            temperature=0.0, top_k=0, device=DEV):
+    """Autoregressively continue a raw reading prompt without task labels."""
+    prompt = tuple(prompt_tokens or ())
+    if not prompt:
+        raise ValueError("reading generation prompt must contain at least one token")
+    generated_ids = list(vocab.enc(prompt))
+    prompt_len = len(generated_ids)
+    max_context = max(
+        1, int(getattr(getattr(model, "lm", None), "config", {}).get(
+            "max_len", 0) or len(generated_ids)))
+    stop_tokens = {int(vocab.pad)}
+    model.eval()
+    for _ in range(max(0, int(max_new_tokens))):
+        context_ids = generated_ids[-max_context:]
+        ids = torch.tensor([context_ids], dtype=torch.long, device=device)
+        logits = model.lm(ids)
+        if logits.shape[1] == 0:
+            break
+        next_id = _reading_generation_next_id(
+            logits[0, -1], vocab.pad, temperature=temperature, top_k=top_k)
+        if next_id in stop_tokens:
+            break
+        generated_ids.append(next_id)
+    return tuple(vocab.dec(generated_ids[prompt_len:]))
+
+
+def reading_generation_eval(model, vocab, records, device=DEV, n=0, seed=0,
+                            prompt_tokens=16, max_new_tokens=32,
+                            temperature=0.0, top_k=0):
+    """Free continuation probe for held-out raw reading windows."""
+    candidates = [
+        rec for rec in ([r for r in records if r.split == "eval"] or list(records))
+        if len(rec.tokens) >= 2
+    ]
+    count = min(int(n), len(candidates)) if int(n) > 0 else len(candidates)
+    if count <= 0:
+        return {"enabled": False, "skipped": True,
+                "skip_reason": "no_generation_records", "n_records": 0}
+    rng = np.random.default_rng(seed)
+    if count < len(candidates):
+        idx = rng.choice(len(candidates), size=count, replace=False)
+        sample = [candidates[int(i)] for i in idx]
+    else:
+        sample = list(candidates)
+    rows = []
+    total_matches = total_gold = exact = 0
+    model.eval()
+    for rec in sample:
+        sequence = tuple(rec.tokens)
+        prompt_len = min(max(1, int(prompt_tokens)), len(sequence) - 1)
+        prompt = sequence[:prompt_len]
+        gold = sequence[prompt_len:prompt_len + max(0, int(max_new_tokens))]
+        if not gold:
+            continue
+        generated = reading_generate_tokens(
+            model, vocab, prompt, max_new_tokens=len(gold),
+            temperature=temperature, top_k=top_k, device=device)
+        matches = sum(1 for a, b in zip(generated, gold) if a == b)
+        total_matches += int(matches)
+        total_gold += int(len(gold))
+        exact_match = tuple(generated) == tuple(gold)
+        exact += int(exact_match)
+        rows.append({
+            "id": str(rec.rec_id),
+            "prompt": list(prompt),
+            "gold": list(gold),
+            "generated": list(generated),
+            "token_acc": float(matches) / float(len(gold)) if gold else 0.0,
+            "exact": bool(exact_match),
+        })
+    generated_signatures = {tuple(row["generated"]) for row in rows}
+    return {
+        "enabled": bool(rows),
+        "skipped": not bool(rows),
+        "skip_reason": "" if rows else "no_generation_targets",
+        "n_records": int(len(rows)),
+        "prompt_tokens": int(prompt_tokens),
+        "max_new_tokens": int(max_new_tokens),
+        "temperature": float(temperature),
+        "top_k": int(top_k),
+        "token_acc": (
+            float(total_matches) / float(total_gold) if total_gold else 0.0),
+        "exact": float(exact) / float(len(rows)) if rows else 0.0,
+        "unique_generation_count": int(len(generated_signatures)),
+        "all_generations_identical": (
+            bool(len(rows) > 1 and len(generated_signatures) == 1)),
+        "samples": rows,
+    }
+
+
 def latent_text_concept_loss(model, txt, view_dropout=0.1,
                              invariance_w=25.0, variance_w=25.0,
                              covariance_w=1.0, variance_target=1.0):
@@ -3020,11 +3136,11 @@ def reading_fer_eval(model, vocab, records, device=DEV, n=0, seed=0,
 
 
 READING_SCORE_METRICS = (
-    "language", "view", "context", "span", "closure", "sequence",
+    "language", "generation", "view", "context", "span", "closure", "sequence",
     "neighborhood", "cluster", "fer", "bridge", "connection", "both", "min",
     "all", "balanced", "mastery")
 READING_DISCOVERY_SIGNALS = (
-    "language", "view", "context", "span", "closure", "sequence",
+    "language", "generation", "view", "context", "span", "closure", "sequence",
     "neighborhood", "cluster", "fer", "bridge", "connection")
 READING_OBJECTIVE_PROFILES = ("manual", "mastery")
 READING_MASTERY_OBJECTIVE_FLOORS = {
@@ -3064,6 +3180,7 @@ READING_MASTERY_OPERATION_FLOORS = {
     "neighborhood_refresh_steps": 100,
     "cluster_probe_n": 256,
     "cluster_refresh_steps": 100,
+    "generation_eval_n": 16,
 }
 READING_MASTERY_CHECKPOINT_FLOORS = {
     "replay_w": 0.05,
@@ -3091,6 +3208,7 @@ READING_CONCEPT_INSIGHT_SCORE_KEYS = (
     "neighborhood_score", "cluster_score")
 READING_SELF_TEACH_SCORE_KEYS = {
     "language": "language_score",
+    "generation": "generation_score",
     "view": "view_score",
     "context": "context_score",
     "span": "span_score",
@@ -3104,6 +3222,7 @@ READING_SELF_TEACH_SCORE_KEYS = {
 }
 READING_SELF_TEACH_SIGNAL_OBJECTIVES = {
     "language": ("lm_w",),
+    "generation": ("lm_w", "sequence_w", "context_closure_w"),
     "view": ("factorization_w",),
     "context": ("context_target_w",),
     "span": ("span_completion_w",),
@@ -3117,6 +3236,7 @@ READING_SELF_TEACH_SIGNAL_OBJECTIVES = {
 }
 READING_SELF_TEACH_SIGNAL_STUDY_STRATEGIES = {
     "language": "sequence",
+    "generation": "sequence",
     "view": "errors",
     "context": "closure",
     "span": "closure",
@@ -3647,7 +3767,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
                                        cluster_eval=None, fer_eval=None,
                                        bridge_eval=None, gap_eval=None,
                                        sequence_eval=None, span_eval=None,
-                                       closure_eval=None, lm_eval=None):
+                                       closure_eval=None, lm_eval=None,
+                                       generation_eval=None):
     metric = str(metric)
     if metric not in READING_SCORE_METRICS:
         raise ValueError(f"unknown reading score metric {metric!r}")
@@ -3664,6 +3785,22 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     closure_margin = float(closure_eval.get("margin", 0.0))
     lm_eval = lm_eval or {}
     language_score = float(lm_eval.get("lm_token_acc", 0.0))
+    generation_eval = generation_eval or {"skipped": True}
+    generation_token_acc = float(generation_eval.get("token_acc", 0.0))
+    generation_exact = float(generation_eval.get("exact", 0.0))
+    generation_n = int(generation_eval.get("n_records", 0) or 0)
+    generation_unique = int(
+        generation_eval.get("unique_generation_count", 0) or 0)
+    generation_diversity = (
+        float(generation_unique) / float(generation_n) if generation_n else 0.0)
+    generation_collapse_penalty = (
+        0.5 if bool(generation_eval.get("all_generations_identical", False))
+        and generation_n > 1 else 1.0)
+    generation_floor = 1.0 / float(max(1, generation_n))
+    generation_score = (
+        0.0 if bool(generation_eval.get("skipped", False))
+        else generation_token_acc * max(generation_diversity, generation_floor)
+        * generation_collapse_penalty)
     sequence_eval = sequence_eval or {}
     sequence_acc = float(sequence_eval.get("sequence_acc", 0.0))
     sequence_margin = float(sequence_eval.get("margin", 0.0))
@@ -3702,12 +3839,14 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     neighborhood_score = neighborhood_acc + margin_w * neighborhood_margin
     cluster_score = cluster_acc + margin_w * cluster_margin
     scores = {"language": language_score,
+              "generation": generation_score,
               "view": view_score, "context": context_score, "span": span_score,
               "closure": closure_score, "sequence": sequence_score,
               "neighborhood": neighborhood_score, "cluster": cluster_score,
               "fer": fer_score, "bridge": bridge_score,
               "connection": connection_score}
     skipped = {"language": bool(lm_eval.get("skipped", False)),
+               "generation": bool(generation_eval.get("skipped", False)),
                "view": bool(view_eval.get("skipped", False)),
                "context": bool(context_eval.get("skipped", False)),
                "span": bool(span_eval.get("skipped", False)),
@@ -3732,6 +3871,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     mastery_score = 0.5 * active_mean_score + 0.25 * all_score + 0.25 * signal_coverage
     if metric == "language":
         score = language_score
+    elif metric == "generation":
+        score = generation_score
     elif metric == "view":
         score = view_score
     elif metric == "context":
@@ -3774,6 +3915,11 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "language_score": float(language_score),
             "lm_loss": float(lm_eval.get("lm_loss", 0.0)),
             "lm_token_acc": float(lm_eval.get("lm_token_acc", 0.0)),
+            "generation_score": float(generation_score),
+            "generation_token_acc": float(generation_token_acc),
+            "generation_exact": float(generation_exact),
+            "generation_diversity": float(generation_diversity),
+            "generation_collapse_penalty": float(generation_collapse_penalty),
             "view_score": float(view_score),
             "context_score": float(context_score),
             "span_score": float(span_score),
@@ -3810,6 +3956,7 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "cluster_acc": cluster_acc,
             "cluster_margin": cluster_margin,
             "language_skipped": skipped["language"],
+            "generation_skipped": skipped["generation"],
             "view_skipped": skipped["view"],
             "context_skipped": skipped["context"],
             "span_skipped": skipped["span"],
@@ -3826,9 +3973,24 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
                         token_drop_p=0.15, token_replace_p=0.05,
                         context_keep_p=0.5, span_mask_frac=0.25,
                         context_closure_split_frac=0.5,
-                        score_metric="mastery", score_margin_w=0.1):
+                        score_metric="mastery", score_margin_w=0.1,
+                        generation_eval_n=0,
+                        generation_prompt_tokens=16,
+                        generation_max_new_tokens=32,
+                        generation_temperature=0.0,
+                        generation_top_k=0):
     lm = reading_causal_lm_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 13)
+    generation = (
+        reading_generation_eval(
+            model, vocab, records, device=device, n=generation_eval_n,
+            seed=seed + 14, prompt_tokens=generation_prompt_tokens,
+            max_new_tokens=generation_max_new_tokens,
+            temperature=generation_temperature, top_k=generation_top_k)
+        if int(generation_eval_n) > 0 else {
+            "enabled": False, "skipped": True,
+            "skip_reason": "generation_eval_n_zero",
+        })
     view = reading_latent_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 17,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p)
@@ -3860,6 +4022,7 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
         model, vocab, records, device=device, n=eval_n, seed=seed + 43,
         feature_dropout=0.0)
     return {"lm": lm,
+            "generation": generation,
             "view": view,
             "context_target": context,
             "span_completion": span,
@@ -3875,7 +4038,8 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
                 neighborhood_eval=neighborhood, cluster_eval=cluster,
                 fer_eval=fer, bridge_eval=bridge, gap_eval=gap,
                 sequence_eval=sequence, span_eval=span, closure_eval=closure,
-                lm_eval=lm)}
+                lm_eval=lm, generation_eval=(
+                    generation if int(generation_eval_n) > 0 else None))}
 
 
 def reading_representation_progress_report(before_bundle, after_bundle):
@@ -6538,6 +6702,9 @@ def fit_reading_concepts_select_best(
         self_teach_history_prior=None,
         self_teach_history_prior_w=0.5,
         eval_n=64, score_metric="mastery", score_margin_w=0.1,
+        generation_eval_n=0, generation_prompt_tokens=16,
+        generation_max_new_tokens=32, generation_temperature=0.0,
+        generation_top_k=0,
         score_min_delta=0.0, score_patience=0, score_target=0.0,
         insight_accept_w=0.25, insight_min_delta=0.0,
         representation_accept_w=0.0, representation_min_delta=0.0,
@@ -6579,6 +6746,13 @@ def fit_reading_concepts_select_best(
         raise ValueError("reading source balance weight must be non-negative")
     if int(memory_size) > 0:
         model.enable_latent_concept_memory(int(memory_size))
+    generation_eval_kwargs = {
+        "generation_eval_n": int(generation_eval_n),
+        "generation_prompt_tokens": int(generation_prompt_tokens),
+        "generation_max_new_tokens": int(generation_max_new_tokens),
+        "generation_temperature": float(generation_temperature),
+        "generation_top_k": int(generation_top_k),
+    }
     initial_study_strategy = resolve_reading_study_strategy(
         study_strategy, model)
     before_bundle = before_bundle or reading_eval_bundle(
@@ -6586,7 +6760,8 @@ def fit_reading_concepts_select_best(
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=score_metric,
         score_margin_w=score_margin_w, span_mask_frac=span_mask_frac,
-        context_closure_split_frac=context_closure_split_frac)
+        context_closure_split_frac=context_closure_split_frac,
+        **generation_eval_kwargs)
     bridge_insight_gate = bool(
         bridge_w and initial_study_strategy in READING_POOL_STUDY_STRATEGIES
         and initial_study_strategy not in ("sequence", "fer"))
@@ -6599,7 +6774,8 @@ def fit_reading_concepts_select_best(
             token_replace_p=token_replace_p, context_keep_p=context_keep_p,
             score_metric=score_metric, score_margin_w=score_margin_w,
             span_mask_frac=span_mask_frac,
-            context_closure_split_frac=context_closure_split_frac)
+            context_closure_split_frac=context_closure_split_frac,
+            **generation_eval_kwargs)
 
     def selection_row(round_id, round_steps, bundle, replay_bundle=None):
         base_score = float(bundle["score_components"]["score"])
@@ -6829,7 +7005,8 @@ def fit_reading_concepts_select_best(
             token_drop_p=token_drop_p, token_replace_p=token_replace_p,
             context_keep_p=context_keep_p, score_metric=score_metric,
             score_margin_w=score_margin_w, span_mask_frac=span_mask_frac,
-            context_closure_split_frac=context_closure_split_frac)
+            context_closure_split_frac=context_closure_split_frac,
+            **generation_eval_kwargs)
         replay_bundle = None
         if before_replay_bundle is not None:
             replay_bundle = reading_eval_bundle(
@@ -6838,7 +7015,8 @@ def fit_reading_concepts_select_best(
                 token_replace_p=token_replace_p, context_keep_p=context_keep_p,
                 score_metric=score_metric, score_margin_w=score_margin_w,
                 span_mask_frac=span_mask_frac,
-                context_closure_split_frac=context_closure_split_frac)
+                context_closure_split_frac=context_closure_split_frac,
+                **generation_eval_kwargs)
         row = selection_row(round_i, round_steps, bundle, replay_bundle)
         score = float(row["score"])
         row["target_met"] = bool(score_target > 0.0 and score >= score_target)
@@ -6994,6 +7172,11 @@ def fit_reading_concepts_select_best(
         "score_min_delta": float(score_min_delta),
         "score_patience": int(score_patience),
         "score_target": float(score_target),
+        "generation_eval_n": int(generation_eval_n),
+        "generation_prompt_tokens": int(generation_prompt_tokens),
+        "generation_max_new_tokens": int(generation_max_new_tokens),
+        "generation_temperature": float(generation_temperature),
+        "generation_top_k": int(generation_top_k),
         "target_enabled": bool(score_target > 0.0),
         "target_met": bool(
             score_target > 0.0 and float(best_score) >= score_target),
@@ -7165,6 +7348,11 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            self_teach_history_prior=None,
                            self_teach_history_prior_w=0.5,
                            eval_n=64,
+                           generation_eval_n=0,
+                           generation_prompt_tokens=16,
+                           generation_max_new_tokens=32,
+                           generation_temperature=0.0,
+                           generation_top_k=0,
                            max_vocab=READING_DEFAULT_MAX_VOCAB,
                            source_balance_w=READING_DEFAULT_SOURCE_BALANCE_W):
     if int(latent_concept_slots) <= 0:
@@ -7287,6 +7475,11 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             score_min_delta=study_score_min_delta,
             score_patience=study_score_patience,
             score_target=study_score_target,
+            generation_eval_n=generation_eval_n,
+            generation_prompt_tokens=generation_prompt_tokens,
+            generation_max_new_tokens=generation_max_new_tokens,
+            generation_temperature=generation_temperature,
+            generation_top_k=generation_top_k,
             insight_accept_w=study_insight_accept_w,
             insight_min_delta=study_insight_min_delta,
             representation_accept_w=study_representation_accept_w,
@@ -7304,7 +7497,12 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             token_drop_p=token_drop_p, token_replace_p=token_replace_p,
             context_keep_p=context_keep_p, score_metric=study_score_metric,
             score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac,
-            context_closure_split_frac=context_closure_split_frac)
+            context_closure_split_frac=context_closure_split_frac,
+            generation_eval_n=generation_eval_n,
+            generation_prompt_tokens=generation_prompt_tokens,
+            generation_max_new_tokens=generation_max_new_tokens,
+            generation_temperature=generation_temperature,
+            generation_top_k=generation_top_k)
     self_teach_plan, self_teach_base_weights, train_weights = (
         reading_self_teach_weight_maps(
             (self_teach_before_bundle["score_components"]
@@ -7535,6 +7733,11 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          reading_objective_profile_report=None,
                          text_field="text", max_tokens=128, min_tokens=8,
                          eval_frac=0.10, eval_n=64,
+                         generation_eval_n=0,
+                         generation_prompt_tokens=16,
+                         generation_max_new_tokens=32,
+                         generation_temperature=0.0,
+                         generation_top_k=0,
                          max_vocab=READING_DEFAULT_MAX_VOCAB,
                          source_balance_w=READING_DEFAULT_SOURCE_BALANCE_W,
                          out=None, checkpoint=None):
@@ -7559,7 +7762,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=study_score_metric,
         score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac,
-        context_closure_split_frac=context_closure_split_frac)
+        context_closure_split_frac=context_closure_split_frac,
+        generation_eval_n=generation_eval_n,
+        generation_prompt_tokens=generation_prompt_tokens,
+        generation_max_new_tokens=generation_max_new_tokens,
+        generation_temperature=generation_temperature,
+        generation_top_k=generation_top_k)
     selection = {"enabled": False}
     if study_select_best:
         _model, _vocab, selection = fit_reading_concepts_select_best(
@@ -7666,6 +7874,11 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             score_min_delta=study_score_min_delta,
             score_patience=study_score_patience,
             score_target=study_score_target,
+            generation_eval_n=generation_eval_n,
+            generation_prompt_tokens=generation_prompt_tokens,
+            generation_max_new_tokens=generation_max_new_tokens,
+            generation_temperature=generation_temperature,
+            generation_top_k=generation_top_k,
             insight_accept_w=study_insight_accept_w,
             insight_min_delta=study_insight_min_delta,
             representation_accept_w=study_representation_accept_w,
@@ -7811,9 +8024,14 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
     after_bundle = reading_eval_bundle(
         model, vocab, records, device=device, eval_n=eval_n, seed=seed,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
-        context_keep_p=context_keep_p, score_metric=study_score_metric,
-        score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac,
-        context_closure_split_frac=context_closure_split_frac)
+            context_keep_p=context_keep_p, score_metric=study_score_metric,
+            score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac,
+            context_closure_split_frac=context_closure_split_frac,
+            generation_eval_n=generation_eval_n,
+            generation_prompt_tokens=generation_prompt_tokens,
+            generation_max_new_tokens=generation_max_new_tokens,
+            generation_temperature=generation_temperature,
+            generation_top_k=generation_top_k)
     before_lm = before_bundle["lm"]
     after_lm = after_bundle["lm"]
     before = before_bundle["view"]
@@ -7951,6 +8169,11 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "study_representation_min_delta": float(
                   study_representation_min_delta),
               "study_self_teach_w": float(study_self_teach_w),
+              "generation_eval_n": int(generation_eval_n),
+              "generation_prompt_tokens": int(generation_prompt_tokens),
+              "generation_max_new_tokens": int(generation_max_new_tokens),
+              "generation_temperature": float(generation_temperature),
+              "generation_top_k": int(generation_top_k),
               "reading_objective_profile": str(reading_objective_profile),
               "reading_objective_profile_report": (
                   reading_objective_profile_report or {
@@ -7973,6 +8196,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "after_context_target": after_context,
               "before_lm": before_lm,
               "after_lm": after_lm,
+              "before_generation": before_bundle["generation"],
+              "after_generation": after_bundle["generation"],
               "before_span_completion": before_span,
               "after_span_completion": after_span,
               "before_context_closure": before_closure,
@@ -8014,6 +8239,16 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                   "lm_loss": (
                       after_lm.get("lm_loss", 0.0)
                       - before_lm.get("lm_loss", 0.0)),
+                  "generation_score": (
+                      after_bundle["score_components"].get(
+                          "generation_score", 0.0)
+                      - before_bundle["score_components"].get(
+                          "generation_score", 0.0)),
+                  "generation_token_acc": (
+                      after_bundle["score_components"].get(
+                          "generation_token_acc", 0.0)
+                      - before_bundle["score_components"].get(
+                          "generation_token_acc", 0.0)),
                   "paired_view_acc": (
                       after["paired_view_acc"] - before["paired_view_acc"]),
                   "margin": after.get("margin", 0.0) - before.get("margin", 0.0),
@@ -8241,6 +8476,11 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              self_teach_history_prior_w=0.5,
                              text_field="text", max_tokens=128, min_tokens=8,
                              eval_frac=0.10, eval_n=64,
+                             generation_eval_n=0,
+                             generation_prompt_tokens=16,
+                             generation_max_new_tokens=32,
+                             generation_temperature=0.0,
+                             generation_top_k=0,
                              max_vocab=READING_DEFAULT_MAX_VOCAB,
                              source_balance_w=READING_DEFAULT_SOURCE_BALANCE_W,
                              latent_concept_slots=0, latent_concept_layers=None,
@@ -8304,14 +8544,24 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=study_score_metric,
         score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac,
-        context_closure_split_frac=context_closure_split_frac)
+        context_closure_split_frac=context_closure_split_frac,
+        generation_eval_n=generation_eval_n,
+        generation_prompt_tokens=generation_prompt_tokens,
+        generation_max_new_tokens=generation_max_new_tokens,
+        generation_temperature=generation_temperature,
+        generation_top_k=generation_top_k)
     before_replay_bundle = (reading_eval_bundle(
         model, vocab, replay_records, device=device, eval_n=eval_n,
         seed=seed + 4093, token_drop_p=token_drop_p,
         token_replace_p=token_replace_p, context_keep_p=context_keep_p,
         score_metric=study_score_metric, score_margin_w=study_score_margin_w,
         span_mask_frac=span_mask_frac,
-        context_closure_split_frac=context_closure_split_frac)
+        context_closure_split_frac=context_closure_split_frac,
+        generation_eval_n=generation_eval_n,
+        generation_prompt_tokens=generation_prompt_tokens,
+        generation_max_new_tokens=generation_max_new_tokens,
+        generation_temperature=generation_temperature,
+        generation_top_k=generation_top_k)
         if replay_records else None)
     selection = {"enabled": False}
     if study_select_best:
@@ -8419,6 +8669,11 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             score_min_delta=study_score_min_delta,
             score_patience=study_score_patience,
             score_target=study_score_target,
+            generation_eval_n=generation_eval_n,
+            generation_prompt_tokens=generation_prompt_tokens,
+            generation_max_new_tokens=generation_max_new_tokens,
+            generation_temperature=generation_temperature,
+            generation_top_k=generation_top_k,
             insight_accept_w=study_insight_accept_w,
             insight_min_delta=study_insight_min_delta,
             representation_accept_w=study_representation_accept_w,
@@ -8578,14 +8833,24 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p,
         context_keep_p=context_keep_p, score_metric=study_score_metric,
         score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac,
-        context_closure_split_frac=context_closure_split_frac)
+        context_closure_split_frac=context_closure_split_frac,
+        generation_eval_n=generation_eval_n,
+        generation_prompt_tokens=generation_prompt_tokens,
+        generation_max_new_tokens=generation_max_new_tokens,
+        generation_temperature=generation_temperature,
+        generation_top_k=generation_top_k)
     after_replay_bundle = (reading_eval_bundle(
         model, vocab, replay_records, device=device, eval_n=eval_n,
         seed=seed + 4093, token_drop_p=token_drop_p,
         token_replace_p=token_replace_p, context_keep_p=context_keep_p,
         score_metric=study_score_metric, score_margin_w=study_score_margin_w,
         span_mask_frac=span_mask_frac,
-        context_closure_split_frac=context_closure_split_frac)
+        context_closure_split_frac=context_closure_split_frac,
+        generation_eval_n=generation_eval_n,
+        generation_prompt_tokens=generation_prompt_tokens,
+        generation_max_new_tokens=generation_max_new_tokens,
+        generation_temperature=generation_temperature,
+        generation_top_k=generation_top_k)
         if replay_records else None)
     before_lm = before_bundle["lm"]
     after_lm = after_bundle["lm"]
@@ -8756,6 +9021,11 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "study_representation_min_delta": float(
                   study_representation_min_delta),
               "study_self_teach_w": float(study_self_teach_w),
+              "generation_eval_n": int(generation_eval_n),
+              "generation_prompt_tokens": int(generation_prompt_tokens),
+              "generation_max_new_tokens": int(generation_max_new_tokens),
+              "generation_temperature": float(generation_temperature),
+              "generation_top_k": int(generation_top_k),
               "reading_objective_profile": str(reading_objective_profile),
               "reading_objective_profile_report": (
                   reading_objective_profile_report or {
@@ -8786,6 +9056,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "after_context_target": after_context,
               "before_lm": before_lm,
               "after_lm": after_lm,
+              "before_generation": before_bundle["generation"],
+              "after_generation": after_bundle["generation"],
               "before_span_completion": before_span,
               "after_span_completion": after_span,
               "before_context_closure": before_closure,
@@ -8829,6 +9101,16 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                   "lm_loss": (
                       after_lm.get("lm_loss", 0.0)
                       - before_lm.get("lm_loss", 0.0)),
+                  "generation_score": (
+                      after_bundle["score_components"].get(
+                          "generation_score", 0.0)
+                      - before_bundle["score_components"].get(
+                          "generation_score", 0.0)),
+                  "generation_token_acc": (
+                      after_bundle["score_components"].get(
+                          "generation_token_acc", 0.0)
+                      - before_bundle["score_components"].get(
+                          "generation_token_acc", 0.0)),
                   "paired_view_acc": (
                       after["paired_view_acc"] - before["paired_view_acc"]),
                   "margin": after.get("margin", 0.0) - before.get("margin", 0.0),
@@ -9229,18 +9511,25 @@ def selftest():
     assert "context_closure" in closure_bundle
     mastery_bundle = reading_eval_bundle(
         reading_model, reading_vocab, reading_records, device="cpu", eval_n=0,
-        score_metric="mastery")
+        score_metric="mastery", generation_eval_n=2,
+        generation_prompt_tokens=2, generation_max_new_tokens=2)
     assert mastery_bundle["score_components"]["metric"] == "mastery"
     assert ("mastery_score" in mastery_bundle["score_components"]
             and "signal_coverage" in mastery_bundle["score_components"]
             and "language_score" in mastery_bundle["score_components"]
+            and "generation_score" in mastery_bundle["score_components"]
             and "span_score" in mastery_bundle["score_components"]
             and "context_closure_score" in mastery_bundle["score_components"]
             and "sequence_score" in mastery_bundle["score_components"]
             and "bridge_score" in mastery_bundle["score_components"])
     assert "lm" in mastery_bundle
+    assert "generation" in mastery_bundle
     assert mastery_bundle["score_components"]["language_skipped"] is False
+    assert mastery_bundle["score_components"]["generation_skipped"] is False
+    assert mastery_bundle["generation"]["enabled"] is True
+    assert mastery_bundle["generation"]["samples"]
     assert math.isfinite(mastery_bundle["score_components"]["lm_loss"])
+    assert math.isfinite(mastery_bundle["score_components"]["generation_score"])
     assert mastery_bundle["score_components"]["span_skipped"] is False
     assert mastery_bundle["score_components"]["closure_skipped"] is False
     assert mastery_bundle["score_components"]["bridge_skipped"] is False
@@ -9273,6 +9562,23 @@ def selftest():
     assert language_plan["weight_extras"]["lm_w"] > 0.0
     assert math.isclose(sum(language_plan["weight_extras"].values()),
                         0.07, rel_tol=1e-6, abs_tol=1e-6)
+    generation_scores = {
+        f"{name}_skipped": False for name in READING_DISCOVERY_SIGNALS}
+    for name, score_key in READING_SELF_TEACH_SCORE_KEYS.items():
+        generation_scores[score_key] = 1.0
+    generation_scores["generation_score"] = 0.0
+    generation_plan = reading_self_teach_weight_plan(
+        generation_scores, budget=0.09)
+    assert generation_plan["top_signal"] == "generation"
+    assert math.isclose(generation_plan["weight_extras"]["lm_w"], 0.03,
+                        rel_tol=1e-6, abs_tol=1e-6)
+    assert math.isclose(generation_plan["weight_extras"]["sequence_w"], 0.03,
+                        rel_tol=1e-6, abs_tol=1e-6)
+    assert math.isclose(
+        generation_plan["weight_extras"]["context_closure_w"], 0.03,
+        rel_tol=1e-6, abs_tol=1e-6)
+    assert math.isclose(sum(generation_plan["weight_extras"].values()),
+                        0.09, rel_tol=1e-6, abs_tol=1e-6)
     prior_scores = {
         f"{name}_skipped": False for name in READING_DISCOVERY_SIGNALS}
     for name, score_key in READING_SELF_TEACH_SCORE_KEYS.items():
@@ -9370,7 +9676,8 @@ def selftest():
         study_representation_min_delta=0.0,
         study_probe_n=0, study_hard_max=0, study_refresh_steps=0,
         neighborhood_probe_n=0, neighborhood_refresh_steps=0,
-        cluster_probe_n=0, cluster_refresh_steps=0, passthrough="kept")
+        cluster_probe_n=0, cluster_refresh_steps=0,
+        generation_eval_n=0, passthrough="kept")
     assert mastery_kwargs["reading_objective_profile"] == "mastery"
     assert mastery_kwargs["reading_objective_profile_report"]["applied"] is True
     assert mastery_kwargs["lm_w"] == 1.0
@@ -9388,6 +9695,7 @@ def selftest():
     assert mastery_kwargs["neighborhood_refresh_steps"] == 100
     assert mastery_kwargs["cluster_probe_n"] == 256
     assert mastery_kwargs["cluster_refresh_steps"] == 100
+    assert mastery_kwargs["generation_eval_n"] == 16
     assert (mastery_kwargs["reading_objective_profile_report"]
             ["operation_floors"]["study_probe_n"] == 256)
     assert mastery_kwargs["passthrough"] == "kept"
@@ -9414,7 +9722,8 @@ def selftest():
         study_representation_min_delta=0.0,
         study_probe_n=0, study_hard_max=0, study_refresh_steps=0,
         neighborhood_probe_n=0, neighborhood_refresh_steps=0,
-        cluster_probe_n=0, cluster_refresh_steps=0)
+        cluster_probe_n=0, cluster_refresh_steps=0,
+        generation_eval_n=0)
     assert manual_kwargs["study_self_teach_w"] == 0.0
     assert manual_kwargs["lm_w"] == 0.0
     assert manual_kwargs["study_rounds"] == 1
@@ -9426,6 +9735,7 @@ def selftest():
     assert manual_kwargs["study_refresh_steps"] == 0
     assert manual_kwargs["neighborhood_probe_n"] == 0
     assert manual_kwargs["cluster_probe_n"] == 0
+    assert manual_kwargs["generation_eval_n"] == 0
     assert manual_kwargs["reading_objective_profile_report"]["applied"] is False
     checkpoint_kwargs = reading_checkpoint_profile_kwargs(
         "mastery", replay_records=reading_records,
@@ -9652,6 +9962,7 @@ def selftest():
         eval_n=0)
     helper_selection = helper_model.reading_train_metrics["selection"]
     assert helper_selection["enabled"] is True
+    assert helper_selection["generation_eval_n"] == 0
     assert helper_selection["adaptive_study_strategy"] is True
     assert helper_selection["branch_from_best"] is True
     assert helper_selection["concept_insight_gate"] is True
@@ -9934,8 +10245,13 @@ def selftest():
             study_select_best=False, context_target_w=0.0,
             sequence_w=0.0, transition_w=0.0,
             study_self_teach_w=0.05, reading_objective_profile="mastery",
+            generation_eval_n=16,
             print_report=False)
         assert study_report["experiment"] == "text_raw_reading_checkpoint_study"
+        assert study_report["generation_eval_n"] == 16
+        assert study_report["before_generation"]["enabled"] is True
+        assert study_report["after_generation"]["enabled"] is True
+        assert "generation_score" in study_report["delta"]
         assert study_report["checkpoint_experiment"] == "reading-selftest"
         assert os.path.exists(studied_ckpt)
         assert os.path.exists(study_out)
@@ -10072,6 +10388,13 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-min-tokens", type=int, default=8)
     ap.add_argument("--reading-eval-frac", type=float, default=0.10)
     ap.add_argument("--reading-eval-n", type=int, default=64)
+    ap.add_argument("--reading-generation-eval-n", type=int, default=0,
+                    help=("free-continuation eval samples; mastery profile "
+                          "raises this to a bounded default"))
+    ap.add_argument("--reading-generation-prompt-tokens", type=int, default=16)
+    ap.add_argument("--reading-generation-max-new-tokens", type=int, default=32)
+    ap.add_argument("--reading-generation-temperature", type=float, default=0.0)
+    ap.add_argument("--reading-generation-top-k", type=int, default=0)
     ap.add_argument("--reading-lr", type=float, default=1e-3)
     ap.add_argument("--reading-lm-w", type=float, default=0.0,
                     help=("causal next-token loss weight over raw reading "
@@ -10341,7 +10664,13 @@ def _reading_kwargs(args):
                   source_balance_w=args.reading_source_balance_w,
                   min_tokens=args.reading_min_tokens,
                   eval_frac=args.reading_eval_frac,
-                  eval_n=args.reading_eval_n)
+                  eval_n=args.reading_eval_n,
+                  generation_eval_n=args.reading_generation_eval_n,
+                  generation_prompt_tokens=args.reading_generation_prompt_tokens,
+                  generation_max_new_tokens=(
+                      args.reading_generation_max_new_tokens),
+                  generation_temperature=args.reading_generation_temperature,
+                  generation_top_k=args.reading_generation_top_k)
     return reading_objective_profile_kwargs(
         args.reading_objective_profile, **kwargs)
 
@@ -10388,6 +10717,16 @@ def main(argv=None):
         raise SystemExit("--reading-source-balance-w must be non-negative")
     if args.reading_lm_w < 0.0:
         raise SystemExit("--reading-lm-w must be non-negative")
+    if args.reading_generation_eval_n < 0:
+        raise SystemExit("--reading-generation-eval-n must be non-negative")
+    if args.reading_generation_prompt_tokens <= 0:
+        raise SystemExit("--reading-generation-prompt-tokens must be positive")
+    if args.reading_generation_max_new_tokens < 0:
+        raise SystemExit("--reading-generation-max-new-tokens must be non-negative")
+    if args.reading_generation_temperature < 0.0:
+        raise SystemExit("--reading-generation-temperature must be non-negative")
+    if args.reading_generation_top_k < 0:
+        raise SystemExit("--reading-generation-top-k must be non-negative")
     if args.reading_self_teach_history_prior_w < 0.0:
         raise SystemExit("--reading-self-teach-history-prior-w must be non-negative")
     if args.reading_study_representation_accept_w < 0.0:
