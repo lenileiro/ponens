@@ -16,8 +16,8 @@ multimodal checkpoints carry label-free representation-progress signals, letting
 runs reuse internal FER/bridge/sequence weaknesses rather than only surface scores. Multimodal text
 transfer is target-probed before trust: a harmful reading checkpoint can be rolled back before its
 history prior drives new training. The default reading profile also owns bounded hard-study
-probing, selected hard-record caps, periodic structure refreshes, and a bounded raw-reading
-vocabulary, and source-balanced sampling, so normal commands do not need low-level study flags,
+probing, selected hard-record caps, periodic structure refreshes, bounded raw-reading vocabulary,
+and source-balanced train/replay sampling, so normal commands do not need low-level study flags,
 do not let the longest source dominate, and do not grow an embedding table for every one-off corpus
 token. Multimodal training uses the same generic source-balanced default from manifest `source` /
 `document` / `dataset` metadata, exposed as `--source-balance-w` locally and

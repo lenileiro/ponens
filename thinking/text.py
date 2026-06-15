@@ -663,6 +663,29 @@ def reading_mastery_history_entry(report, session_index=None):
     replay_priority_counts = [
         value for value in replay_priority_counts if value is not None
     ]
+    replay_source_counts = [
+        _reading_int_or_none(row.get("replay_source_count"))
+        for row in rounds
+    ]
+    replay_source_counts = [
+        value for value in replay_source_counts if value is not None
+    ]
+    replay_max_source_fracs = [
+        _reading_float(row.get("replay_max_source_record_frac", 0.0))
+        for row in rounds
+        if "replay_max_source_record_frac" in row
+    ]
+    replay_min_source_fracs = [
+        _reading_float(row.get("replay_min_source_record_frac", 0.0))
+        for row in rounds
+        if "replay_min_source_record_frac" in row
+    ]
+    replay_min_source_frac_candidates = [
+        _reading_float(train_metrics.get("replay_min_source_record_frac", 0.0))
+    ] + replay_min_source_fracs
+    replay_min_source_frac_candidates = [
+        value for value in replay_min_source_frac_candidates if value > 0.0
+    ] or [0.0]
     training_priority_counts = [
         _reading_int_or_none(row.get("training_priority_record_count"))
         for row in rounds
@@ -764,6 +787,23 @@ def reading_mastery_history_entry(report, session_index=None):
             bool(row.get("replay_priority_sampling", False)) for row in rounds),
         "replay_priority_round_record_count": (
             max(replay_priority_counts) if replay_priority_counts else 0),
+        "replay_source_balance_sampling": bool(
+            train_metrics.get("replay_source_balance_sampling", False)
+            or any(bool(row.get("replay_source_balance_sampling", False))
+                   for row in rounds)),
+        "replay_source_balance_w": max(
+            [_reading_float(train_metrics.get("replay_source_balance_w", 0.0))]
+            + [_reading_float(row.get("replay_source_balance_w", 0.0))
+               for row in rounds if "replay_source_balance_w" in row]),
+        "replay_source_count": max(
+            [_reading_int_or_none(train_metrics.get("replay_source_count")) or 0]
+            + replay_source_counts),
+        "replay_max_source_record_frac": max(
+            [_reading_float(
+                train_metrics.get("replay_max_source_record_frac", 0.0))]
+            + replay_max_source_fracs),
+        "replay_min_source_record_frac": min(
+            replay_min_source_frac_candidates),
         "training_priority_sampling": bool(
             train_metrics.get("training_priority_sampling", False)
             or any(bool(row.get("training_priority_sampling", False))
@@ -1361,13 +1401,32 @@ def reading_source_counts(records):
     return Counter(reading_record_source(rec) for rec in records or ())
 
 
-def reading_replay_sampling_weights(records, priority_power=1.0):
-    weights = []
+def reading_replay_sampling_weights(
+        records, priority_power=1.0,
+        source_balance_w=READING_DEFAULT_SOURCE_BALANCE_W):
+    source_balance_w = float(source_balance_w)
+    if source_balance_w < 0.0:
+        raise ValueError("reading replay source balance weight must be non-negative")
+    counts = reading_source_counts(records)
+    balance_sources = source_balance_w > 0.0 and len(counts) > 1
+    priority_weights = []
+    saw_priority = False
     for rec in records or ():
         priority = 0.0
         if isinstance(getattr(rec, "meta", None), dict):
             priority = float(rec.meta.get("replay_priority", 0.0) or 0.0)
-        weights.append(max(0.0, priority) ** float(priority_power))
+        saw_priority = saw_priority or priority > 0.0
+        priority_weights.append(max(0.0, priority) ** float(priority_power))
+    if not saw_priority and not balance_sources:
+        return None
+    weights = []
+    for rec, priority_weight in zip(records or (), priority_weights):
+        source_weight = 1.0
+        if balance_sources:
+            source_weight = 1.0 / (
+                float(counts[reading_record_source(rec)]) ** source_balance_w)
+        weights.append(
+            source_weight * (priority_weight if saw_priority else 1.0))
     total = float(sum(weights))
     if total <= 0.0:
         return None
@@ -5057,8 +5116,22 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         for count in train_source_counts.values()]
     replay_records = list(replay_records or [])
     replay_sources = [r for r in replay_records if r.split == "train"] or replay_records
-    replay_sampling_weights = reading_replay_sampling_weights(replay_sources)
-    replay_priority_active = replay_sampling_weights is not None
+    replay_sampling_weights = reading_replay_sampling_weights(
+        replay_sources, source_balance_w=source_balance_w)
+    replay_priority_record_count = sum(
+        1 for rec in replay_sources
+        if float(getattr(rec, "meta", {}).get("replay_priority", 0.0)
+                 or 0.0) > 0.0)
+    replay_priority_active = (
+        replay_sampling_weights is not None and replay_priority_record_count > 0)
+    replay_source_counts = reading_source_counts(replay_sources)
+    replay_source_balance_active = (
+        replay_sampling_weights is not None and source_balance_w > 0.0
+        and len(replay_source_counts) > 1)
+    replay_record_count = max(1, len(replay_sources))
+    replay_source_fracs = [
+        float(count) / float(replay_record_count)
+        for count in replay_source_counts.values()]
     if int(memory_size) > 0:
         model.enable_latent_concept_memory(int(memory_size))
     weight_update_before = reading_weight_update_snapshot(model)
@@ -6122,13 +6195,18 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "replay_w": float(replay_w),
         "replay_batch": int(replay_batch),
         "replay_records": len(replay_sources),
+        "replay_weighted_sampling": bool(replay_sampling_weights is not None),
         "replay_priority_sampling": bool(replay_priority_active),
-        "replay_priority_record_count": int(
-            sum(1 for rec in replay_sources
-                if float(getattr(rec, "meta", {}).get("replay_priority", 0.0)
-                         or 0.0) > 0.0)),
+        "replay_priority_record_count": int(replay_priority_record_count),
         "replay_priority_mean": float(last_replay_priority_mean),
         "replay_priority_max": float(last_replay_priority_max),
+        "replay_source_balance_sampling": bool(replay_source_balance_active),
+        "replay_source_balance_w": float(source_balance_w),
+        "replay_source_count": int(len(replay_source_counts)),
+        "replay_max_source_record_frac": (
+            float(max(replay_source_fracs)) if replay_source_fracs else 0.0),
+        "replay_min_source_record_frac": (
+            float(min(replay_source_fracs)) if replay_source_fracs else 0.0),
         "context_target_w": float(context_target_w),
         "context_keep_p": float(context_keep_p),
         "context_target_temperature": float(context_target_temperature),
@@ -6665,6 +6743,16 @@ def fit_reading_concepts_select_best(
                 round_train_metrics.get("replay_priority_mean", 0.0)),
             "replay_priority_max": float(
                 round_train_metrics.get("replay_priority_max", 0.0)),
+            "replay_source_balance_sampling": bool(
+                round_train_metrics.get("replay_source_balance_sampling", False)),
+            "replay_source_balance_w": float(
+                round_train_metrics.get("replay_source_balance_w", 0.0)),
+            "replay_source_count": int(
+                round_train_metrics.get("replay_source_count", 0)),
+            "replay_max_source_record_frac": float(
+                round_train_metrics.get("replay_max_source_record_frac", 0.0)),
+            "replay_min_source_record_frac": float(
+                round_train_metrics.get("replay_min_source_record_frac", 0.0)),
             "weight_update": round_train_metrics.get("weight_update", {}),
             "weight_update_changed": bool(
                 round_train_metrics.get("weight_update_changed", False)),
@@ -9548,6 +9636,8 @@ def selftest():
     ]
     assert reading_training_sampling_weights(
         imbalanced_records, source_balance_w=0.0) is None
+    assert reading_replay_sampling_weights(
+        imbalanced_records, source_balance_w=0.0) is None
     source_weights = reading_training_sampling_weights(
         imbalanced_records, source_balance_w=1.0)
     assert source_weights is not None
@@ -9560,6 +9650,21 @@ def selftest():
         if reading_record_source(rec) == "source-b")
     assert math.isclose(source_a_mass, source_b_mass, rel_tol=1e-6, abs_tol=1e-6)
     assert source_weights[0] < source_weights[-1]
+    replay_source_weights = reading_replay_sampling_weights(
+        imbalanced_records, source_balance_w=1.0)
+    assert replay_source_weights is not None
+    assert math.isclose(
+        sum(replay_source_weights), 1.0, rel_tol=1e-6, abs_tol=1e-6)
+    replay_source_a_mass = sum(
+        weight for weight, rec in zip(replay_source_weights, imbalanced_records)
+        if reading_record_source(rec) == "source-a")
+    replay_source_b_mass = sum(
+        weight for weight, rec in zip(replay_source_weights, imbalanced_records)
+        if reading_record_source(rec) == "source-b")
+    assert math.isclose(
+        replay_source_a_mass, replay_source_b_mass,
+        rel_tol=1e-6, abs_tol=1e-6)
+    assert replay_source_weights[0] < replay_source_weights[-1]
     training_weights = reading_training_sampling_weights(priority_records)
     assert training_weights is not None
     assert math.isclose(sum(training_weights), 1.0, rel_tol=1e-6, abs_tol=1e-6)
@@ -9667,6 +9772,10 @@ def selftest():
             assert study_report["train_metrics"]["training_priority_record_count"] > 0
             assert study_report["train_metrics"]["replay_priority_sampling"] is True
             assert study_report["train_metrics"]["replay_priority_record_count"] > 0
+        assert "replay_source_balance_sampling" in study_report["train_metrics"]
+        assert (study_report["train_metrics"]["replay_source_balance_w"]
+                == READING_DEFAULT_SOURCE_BALANCE_W)
+        assert study_report["train_metrics"]["replay_source_count"] >= 1
         assert math.isfinite(study_report["train_metrics"]["gap_loss"])
         _studied_model, studied_vocab, studied_payload = load_checkpoint(
             studied_ckpt, device="cpu")
@@ -9684,6 +9793,10 @@ def selftest():
         assert history_entries[1]["replay_study_used"] is True
         assert history_entries[1]["replay_study_records"] > 0
         assert history_entries[1]["study_record_count"] > 0
+        assert "replay_source_balance_sampling" in history_entries[1]
+        assert (history_entries[1]["replay_source_balance_w"]
+                == READING_DEFAULT_SOURCE_BALANCE_W)
+        assert history_entries[1]["replay_source_count"] >= 1
         assert history_entries[1]["training_priority_sampling"] is True
         assert history_entries[1]["training_priority_record_count"] > 0
         assert (history_entries[1]["training_source_balance_w"]

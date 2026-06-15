@@ -42,7 +42,8 @@ when the surface score alone is not decisive.
 Checkpoint continuation also turns on replay and retention from the checkpoint's own
 reading replay bank when available; replay rows carry model-derived priority and
 reasons such as hard-study examples or concept-insight records, and continuation
-sampling uses those priorities before falling back to uniform replay. Checkpoints also
+sampling uses those priorities plus the same smooth source balance before falling back to
+uniform replay. Checkpoints also
 carry a compact reading-mastery history, so long training runs preserve each session's
 score deltas, accepted update, self-teach signal, replay priority counts, and concept
 insight evidence without task-specific labels. The history also stores label-free
@@ -64,9 +65,9 @@ and samples priority rows more often, while acceptance is still scored on the ne
 Raw-reading vocabularies are capped by default with frequency-based retention
 (`--reading-max-vocab`, set `0` to disable), preserving known checkpoint tokens while mapping the
 long tail to `<unk>` instead of growing the embedding table for every one-off corpus token.
-Training batches also use smooth source-balanced sampling by default
-(`--reading-source-balance-w`, set `0` to disable), so mixed reading corpora are not dominated by
-the longest source.
+Training and replay batches also use smooth source-balanced sampling by default
+(`--reading-source-balance-w`, set `0` to disable), so mixed reading corpora and replay banks are
+not dominated by the longest source.
 Use
 `manual` for exact low-level
 ablations.
