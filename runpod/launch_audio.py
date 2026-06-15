@@ -67,6 +67,9 @@ def payload(args):
         jobs.append(f"{PY}.vocoder24 --train --steps 100000 --out runs/vocoder24.json --checkpoint runs/vocoder24.pt")
     if args.job == "realvoice":
         jobs.append(f"{PY}.realvoice --train --steps 120000 --out runs/realvoice.json --checkpoint runs/realvoice.pt")
+    if args.job == "libriclone":
+        jobs.append(f"{PY}.libriclone --fetch --n-clips 2000")
+        jobs.append(f"{PY}.libriclone --train --steps-spk 12000 --steps-vc 20000 --steps-voc 80000 --out runs/libriclone.json --checkpoint runs/libriclone.pt")
     # non-fatal chaining: one job's failure must not kill the rest
     return " ; ".join(jobs)
 
@@ -75,7 +78,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--go", action="store_true")
     ap.add_argument("--job", default="all",
-                    choices=("all", "sing-sweep", "polyglot", "pronounce", "mimic", "vocoder", "vocoder-gan", "vocoder24", "realvoice"))
+                    choices=("all", "sing-sweep", "polyglot", "pronounce", "mimic", "vocoder", "vocoder-gan", "vocoder24", "realvoice", "libriclone"))
     ap.add_argument("--gpu", default="NVIDIA H100 80GB HBM3")
     ap.add_argument("--cloud", default="SECURE")
     ap.add_argument("--disk", type=int, default=40)
@@ -94,7 +97,7 @@ def main(argv=None):
     # say-banks needed by pronounce/mimic (pods have no macOS `say`)
     need_banks = args.job in ("all", "pronounce", "mimic", "vocoder", "vocoder-gan", "vocoder24", "realvoice")
 
-    setup = "pip install -q numpy tokenizers pandas pyarrow"
+    setup = "pip install -q numpy tokenizers pandas pyarrow" + (" soundfile" if args.job == "libriclone" else "")
     remote = (f"cd {REMOTE} && rm -f /root/thinking.log && "
               f"({setup} && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && "
               f"timeout {cap}s bash -c {quote(f'cd {REMOTE} && ({run})')}) "
