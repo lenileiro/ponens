@@ -2682,6 +2682,53 @@ def multimodal_generation_eval(
     }
 
 
+def multimodal_generation_gate(generation, decode_objective="target"):
+    """Gate causal language runs on actual free continuation, not teacher forcing."""
+    generation = dict(generation or {})
+    if str(decode_objective) != "causal":
+        return {
+            "required": False,
+            "passed": True,
+            "reason": "non_causal_decode",
+        }
+    if bool(generation.get("skipped", False)) or not bool(
+            generation.get("enabled", False)):
+        return {
+            "required": True,
+            "passed": False,
+            "reason": str(generation.get("skip_reason", "generation_not_run")),
+        }
+    n_records = int(generation.get("n_records", 0) or 0)
+    token_acc = float(generation.get("token_acc", 0.0) or 0.0)
+    collapsed = bool(generation.get("all_generations_identical", False))
+    empty_count = sum(
+        1 for row in generation.get("samples", ()) or ()
+        if not row.get("generated"))
+    unique_count = int(generation.get("unique_generation_count", 0) or 0)
+    passed = (
+        n_records > 0
+        and token_acc > 0.0
+        and not collapsed
+        and empty_count < n_records
+        and unique_count > 0
+    )
+    reason = "passed" if passed else (
+        "collapsed_generation" if collapsed else
+        "zero_generation_token_acc" if token_acc <= 0.0 else
+        "empty_generations" if empty_count >= n_records else
+        "no_generation_records")
+    return {
+        "required": True,
+        "passed": bool(passed),
+        "reason": reason,
+        "token_acc": float(token_acc),
+        "n_records": int(n_records),
+        "unique_generation_count": int(unique_count),
+        "empty_generation_count": int(empty_count),
+        "all_generations_identical": bool(collapsed),
+    }
+
+
 def multimodal_prompt_generation_report(
         model, prompts, vocab, view_dims, mode="full", max_new_tokens=32,
         temperature=0.0, top_k=0, device=DEV):
@@ -7293,7 +7340,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
 
 
 def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
-        checkpoint=None, out=None, generation_n=0,
+        checkpoint=None, out=None, generation_n=None,
         generation_prompt_tokens=16, generation_max_new_tokens=32,
         generation_temperature=0.0, generation_top_k=0,
         generate_prompts=None, **kwargs):
@@ -7322,6 +7369,8 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         }
         if replay_eval_records else {})
     generation_mode = "full" if "full" in active_modes else active_modes[0]
+    if generation_n is None:
+        generation_n = min(16, len(eval_records)) if decode_objective == "causal" else 0
     generation = (
         multimodal_generation_eval(
             model, eval_records, vocab, view_dims, n=generation_n,
@@ -7334,6 +7383,10 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
             "enabled": False, "skipped": True,
             "skip_reason": "generation_n_is_zero",
         })
+    generation_gate = multimodal_generation_gate(
+        generation, decode_objective=decode_objective)
+    teacher_forced_gate = bool(metrics["full"]["token_acc"] >= 0.50)
+    gate = bool(teacher_forced_gate and generation_gate["passed"])
     prompt_generations = (
         multimodal_prompt_generation_report(
             model, generate_prompts, vocab, view_dims, mode=generation_mode,
@@ -7410,6 +7463,7 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
             "eval_records": len(replay_eval_records),
         },
         "generation": generation,
+        "generation_gate": generation_gate,
         "prompt_generations": prompt_generations,
         "latent_graph_probe": latent_probe,
         "latent_fer_probe": latent_fer_probe,
@@ -7421,7 +7475,14 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         "text_checkpoint_transfer": getattr(model, "text_checkpoint_transfer", {}),
         "multimodal_checkpoint_transfer": getattr(
             model, "multimodal_checkpoint_transfer", {}),
-        "gate": metrics["full"]["token_acc"] >= 0.50,
+        "gate": gate,
+        "gate_report": {
+            "teacher_forced_token_acc_min": 0.50,
+            "teacher_forced_passed": teacher_forced_gate,
+            "generation_passed": bool(generation_gate["passed"]),
+            "generation_required": bool(generation_gate["required"]),
+            "generation_reason": str(generation_gate["reason"]),
+        },
     }
     report["multimodal_replay_bank"] = build_multimodal_replay_bank(
         unique_multimodal_records_by_id(records, replay_records),
@@ -8728,6 +8789,18 @@ def selftest():
         assert isinstance(causal_generation["all_generations_identical"], bool)
         assert causal_generation["samples"]
         assert "generated" in causal_generation["samples"][0]
+        assert multimodal_generation_gate(
+            {"enabled": True, "skipped": False, "n_records": 1,
+             "token_acc": 0.5, "exact": 0.0, "unique_generation_count": 1,
+             "all_generations_identical": False,
+             "samples": [{"generated": ["x"]}]},
+            decode_objective="causal")["passed"] is True
+        assert multimodal_generation_gate(
+            {"enabled": True, "skipped": False, "n_records": 2,
+             "token_acc": 0.5, "exact": 0.0, "unique_generation_count": 1,
+             "all_generations_identical": True,
+             "samples": [{"generated": ["x"]}, {"generated": ["x"]}]},
+            decode_objective="causal")["reason"] == "collapsed_generation"
         prompt_generation = multimodal_prompt_generation_report(
             causal_model, ["def add"], causal_vocab, causal_dims,
             device="cpu", max_new_tokens=4)
@@ -9168,9 +9241,9 @@ def main(argv=None):
                     dest="text_arch")
     ap.add_argument("--modality-dropout", type=float, default=0.0, dest="modality_dropout")
     ap.add_argument("--eval-n", type=int, default=200, dest="eval_n")
-    ap.add_argument("--generation-n", type=int, default=0, dest="generation_n",
+    ap.add_argument("--generation-n", type=int, default=None, dest="generation_n",
                     help=("number of eval records to probe with free "
-                          "autoregressive continuation"))
+                          "autoregressive continuation; omit for causal auto"))
     ap.add_argument("--generation-prompt-tokens", type=int, default=16,
                     dest="generation_prompt_tokens",
                     help="number of gold tokens used as the generation prompt")
@@ -9243,7 +9316,7 @@ def main(argv=None):
         ap.error("--text-eval-frac must be in [0, 1)")
     if args.eval_n < 0:
         ap.error("--eval-n must be non-negative")
-    if args.generation_n < 0:
+    if args.generation_n is not None and args.generation_n < 0:
         ap.error("--generation-n must be non-negative")
     if args.generation_prompt_tokens <= 0:
         ap.error("--generation-prompt-tokens must be positive")
