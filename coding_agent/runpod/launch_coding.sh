@@ -1,0 +1,78 @@
+#!/bin/bash
+# Coding-agent run: full reasoning stack, capped vocab, on latest main + crash fix.
+set -euo pipefail
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PY=/Users/leiro/workspace/llm/.venv/bin/python
+RUNPOD_API_KEY="${RUNPOD_API_KEY:-}" "$PY" runpod/launch_thinking.py \
+  --gpu "NVIDIA H100 80GB HBM3" \
+  --name coding-agent \
+  --train-steps 16000 \
+  --multimodal \
+  --multimodal-manifest data/manifest.jsonl \
+  --multimodal-dim 1024 --multimodal-layers 12 --multimodal-heads 16 \
+  --multimodal-batch 64 \
+  --multimodal-lr 3e-4 \
+  --multimodal-max-vocab 32000 \
+  --multimodal-max-len 256 \
+  --multimodal-decode-objective causal \
+  --multimodal-source-balance-w 0.2 \
+  --multimodal-repetition-unlikelihood-w 0.5 \
+  --multimodal-latent-concept-slots 16 \
+  --multimodal-latent-concept-layers 2 \
+  --multimodal-latent-concept-w 1.0 \
+  --multimodal-latent-concept-factorization-w 1.0 \
+  --multimodal-latent-concept-memory-size 256 \
+  --multimodal-latent-concept-memory-w 1.0 \
+  --multimodal-latent-concept-memory-balance-w 1.0 \
+  --multimodal-latent-concept-fer-w 1.0 \
+  --multimodal-latent-concept-fer-fragmentation-w 1.0 \
+  --multimodal-latent-concept-fer-correlation-w 1.0 \
+  --multimodal-latent-concept-fer-balance-w 1.0 \
+  --multimodal-latent-concept-fer-probe-n 64 \
+  --multimodal-latent-concept-fer-hard-max 32 \
+  --multimodal-latent-concept-fer-refresh-steps 200 \
+  --multimodal-latent-concept-discovery-probe-n 64 \
+  --multimodal-latent-concept-discovery-hard-max 32 \
+  --multimodal-latent-concept-discovery-refresh-steps 200 \
+  --multimodal-latent-concept-discovery-w 1.0 \
+  --multimodal-latent-concept-discovery-curiosity-w 1.0 \
+  --multimodal-latent-concept-discovery-graph-w 1.0 \
+  --multimodal-latent-concept-discovery-cycle-w 1.0 \
+  --multimodal-latent-concept-discovery-bridge-w 1.0 \
+  --multimodal-latent-concept-discovery-fer-w 1.0 \
+  --multimodal-latent-concept-reanalysis-w 1.0 \
+  --multimodal-latent-concept-reanalysis-graph-w 1.0 \
+  --multimodal-latent-concept-reanalysis-cycle-w 1.0 \
+  --multimodal-latent-concept-reanalysis-bridge-w 1.0 \
+  --multimodal-latent-concept-reanalysis-fer-w 1.0 \
+  --multimodal-latent-concept-reanalysis-cycle-consistency-w 1.0 \
+  --multimodal-latent-concept-consolidation-w 1.0 \
+  --multimodal-latent-concept-consolidation-balance-w 1.0 \
+  --multimodal-latent-concept-consolidation-anchor-w 1.0 \
+  --multimodal-latent-concept-consolidation-fer-w 1.0 \
+  --multimodal-latent-concept-gap-w 1.0 \
+  --multimodal-latent-concept-gap-self-loop-w 1.0 \
+  --multimodal-latent-concept-gap-transitive-steps 3 \
+  --multimodal-latent-concept-gap-transitive-w 1.0 \
+  --multimodal-latent-concept-association-w 1.0 \
+  --multimodal-latent-concept-association-self-loop-w 1.0 \
+  --multimodal-latent-concept-association-transitive-steps 3 \
+  --multimodal-latent-concept-association-transitive-w 1.0 \
+  --multimodal-latent-concept-composition-w 1.0 \
+  --multimodal-latent-concept-composition-self-loop-w 1.0 \
+  --multimodal-latent-concept-composition-transitive-steps 3 \
+  --multimodal-latent-concept-composition-transitive-w 1.0 \
+  --multimodal-latent-concept-graph-predict-w 1.0 \
+  --multimodal-latent-concept-graph-predict-self-loop-w 1.0 \
+  --multimodal-latent-concept-graph-predict-transitive-steps 3 \
+  --multimodal-latent-concept-graph-predict-transitive-w 1.0 \
+  --multimodal-latent-concept-completion-w 1.0 \
+  --multimodal-latent-concept-completion-probe-n 64 \
+  --multimodal-latent-concept-completion-hard-max 32 \
+  --multimodal-latent-concept-completion-refresh-steps 200 \
+  --multimodal-latent-concept-cluster-w 1.0 \
+  --multimodal-latent-concept-neighborhood-w 1.0 \
+  --multimodal-latent-concept-transition-w 1.0 \
+  --multimodal-latent-concept-bridge-w 1.0 \
+  --multimodal-latent-concept-sequence-w 1.0 \
+  "$@"
