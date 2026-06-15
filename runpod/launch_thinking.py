@@ -766,12 +766,27 @@ def apply_image_quality_preset(args):
         int(args.image_generated_eval_visual_stats_size), 64)
     args.image_generated_eval_visual_stats_max_records = max(
         int(args.image_generated_eval_visual_stats_max_records), 512 if hq else 256)
+    args.image_generated_eval_patch_structure_size = max(
+        int(args.image_generated_eval_patch_structure_size), 64)
+    args.image_generated_eval_patch_structure_patch = max(
+        int(args.image_generated_eval_patch_structure_patch), 8)
+    args.image_generated_eval_patch_structure_max_records = max(
+        int(args.image_generated_eval_patch_structure_max_records),
+        512 if hq else 256)
     if args.image_generated_eval_min_visual_detail_ratio is None:
         args.image_generated_eval_min_visual_detail_ratio = 0.02
     if args.image_generated_eval_min_visual_dynamic_range_ratio is None:
         args.image_generated_eval_min_visual_dynamic_range_ratio = 0.05
     if args.image_generated_eval_min_visual_luminance_std_ratio is None:
         args.image_generated_eval_min_visual_luminance_std_ratio = 0.05
+    if args.image_generated_eval_min_patch_detail_ratio is None:
+        args.image_generated_eval_min_patch_detail_ratio = 0.05
+    if args.image_generated_eval_min_patch_contrast_ratio is None:
+        args.image_generated_eval_min_patch_contrast_ratio = 0.05
+    if args.image_generated_eval_min_patch_edge_ratio is None:
+        args.image_generated_eval_min_patch_edge_ratio = 0.05
+    if args.image_generated_eval_min_patch_variation_ratio is None:
+        args.image_generated_eval_min_patch_variation_ratio = 0.02
     args.image_prompt_embed_backend = args.image_embed_backend
     args.image_prompt_embed_model = args.image_embed_model
     if not args.image_prompt_embed_text_sequence_model:
@@ -1650,6 +1665,16 @@ def payload(args):
                         generated_eval += (
                             f" --visual-stats-max-records "
                             f"{args.image_generated_eval_visual_stats_max_records}")
+                if args.image_generated_eval_patch_structure_size > 0:
+                    generated_eval += (
+                        f" --patch-structure-size "
+                        f"{args.image_generated_eval_patch_structure_size} "
+                        f"--patch-structure-patch "
+                        f"{args.image_generated_eval_patch_structure_patch}")
+                    if args.image_generated_eval_patch_structure_max_records > 0:
+                        generated_eval += (
+                            f" --patch-structure-max-records "
+                            f"{args.image_generated_eval_patch_structure_max_records}")
                 if args.image_generated_eval_max_visual_physics_l1 is not None:
                     generated_eval += (
                         f" --max-visual-physics-l1 "
@@ -1670,6 +1695,30 @@ def payload(args):
                     generated_eval += (
                         f" --min-visual-luminance-std-ratio "
                         f"{args.image_generated_eval_min_visual_luminance_std_ratio}")
+                if args.image_generated_eval_max_patch_structure_l1 is not None:
+                    generated_eval += (
+                        f" --max-patch-structure-l1 "
+                        f"{args.image_generated_eval_max_patch_structure_l1}")
+                if args.image_generated_eval_max_patch_structure_mmd_rbf is not None:
+                    generated_eval += (
+                        f" --max-patch-structure-mmd-rbf "
+                        f"{args.image_generated_eval_max_patch_structure_mmd_rbf}")
+                if args.image_generated_eval_min_patch_detail_ratio is not None:
+                    generated_eval += (
+                        f" --min-patch-detail-ratio "
+                        f"{args.image_generated_eval_min_patch_detail_ratio}")
+                if args.image_generated_eval_min_patch_contrast_ratio is not None:
+                    generated_eval += (
+                        f" --min-patch-contrast-ratio "
+                        f"{args.image_generated_eval_min_patch_contrast_ratio}")
+                if args.image_generated_eval_min_patch_edge_ratio is not None:
+                    generated_eval += (
+                        f" --min-patch-edge-ratio "
+                        f"{args.image_generated_eval_min_patch_edge_ratio}")
+                if args.image_generated_eval_min_patch_variation_ratio is not None:
+                    generated_eval += (
+                        f" --min-patch-variation-ratio "
+                        f"{args.image_generated_eval_min_patch_variation_ratio}")
                 if args.image_generated_eval_fail_on_gate:
                     generated_eval += " --fail-on-gate"
                 train += generated_embed + generated_eval
@@ -1789,6 +1838,16 @@ def payload(args):
                             quality_loop += (
                                 f" --visual-stats-max-records "
                                 f"{args.image_generated_eval_visual_stats_max_records}")
+                    if args.image_generated_eval_patch_structure_size > 0:
+                        quality_loop += (
+                            f" --patch-structure-size "
+                            f"{args.image_generated_eval_patch_structure_size} "
+                            f"--patch-structure-patch "
+                            f"{args.image_generated_eval_patch_structure_patch}")
+                        if args.image_generated_eval_patch_structure_max_records > 0:
+                            quality_loop += (
+                                f" --patch-structure-max-records "
+                                f"{args.image_generated_eval_patch_structure_max_records}")
                     if args.image_generated_eval_max_visual_physics_l1 is not None:
                         quality_loop += (
                             f" --max-visual-physics-l1 "
@@ -1809,6 +1868,30 @@ def payload(args):
                         quality_loop += (
                             f" --min-visual-luminance-std-ratio "
                             f"{args.image_generated_eval_min_visual_luminance_std_ratio}")
+                    if args.image_generated_eval_max_patch_structure_l1 is not None:
+                        quality_loop += (
+                            f" --max-patch-structure-l1 "
+                            f"{args.image_generated_eval_max_patch_structure_l1}")
+                    if args.image_generated_eval_max_patch_structure_mmd_rbf is not None:
+                        quality_loop += (
+                            f" --max-patch-structure-mmd-rbf "
+                            f"{args.image_generated_eval_max_patch_structure_mmd_rbf}")
+                    if args.image_generated_eval_min_patch_detail_ratio is not None:
+                        quality_loop += (
+                            f" --min-patch-detail-ratio "
+                            f"{args.image_generated_eval_min_patch_detail_ratio}")
+                    if args.image_generated_eval_min_patch_contrast_ratio is not None:
+                        quality_loop += (
+                            f" --min-patch-contrast-ratio "
+                            f"{args.image_generated_eval_min_patch_contrast_ratio}")
+                    if args.image_generated_eval_min_patch_edge_ratio is not None:
+                        quality_loop += (
+                            f" --min-patch-edge-ratio "
+                            f"{args.image_generated_eval_min_patch_edge_ratio}")
+                    if args.image_generated_eval_min_patch_variation_ratio is not None:
+                        quality_loop += (
+                            f" --min-patch-variation-ratio "
+                            f"{args.image_generated_eval_min_patch_variation_ratio}")
                     if args.image_quality_loop_max_sensor_loss is not None:
                         quality_loop += (
                             f" --vision-read-max-sensor-loss "
@@ -3514,6 +3597,44 @@ def main():
                     default=None,
                     dest="image_generated_eval_min_visual_luminance_std_ratio",
                     help="minimum generated/reference luminance standard-deviation ratio")
+    ap.add_argument("--image-generated-eval-patch-structure-size", type=int,
+                    default=0,
+                    dest="image_generated_eval_patch_structure_size",
+                    help=("compute generated/reference local patch-structure stats "
+                          "at this image size; presets enable this"))
+    ap.add_argument("--image-generated-eval-patch-structure-patch", type=int,
+                    default=8,
+                    dest="image_generated_eval_patch_structure_patch",
+                    help="patch size for generated-sample local structure eval")
+    ap.add_argument("--image-generated-eval-patch-structure-max-records", type=int,
+                    default=0,
+                    dest="image_generated_eval_patch_structure_max_records",
+                    help=("maximum records per manifest for generated-sample "
+                          "patch-structure stats; 0 means all loaded records"))
+    ap.add_argument("--image-generated-eval-max-patch-structure-l1", type=float,
+                    default=None,
+                    dest="image_generated_eval_max_patch_structure_l1",
+                    help="maximum generated/reference local patch-structure L1 drift")
+    ap.add_argument("--image-generated-eval-max-patch-structure-mmd-rbf", type=float,
+                    default=None,
+                    dest="image_generated_eval_max_patch_structure_mmd_rbf",
+                    help="maximum generated/reference local patch-structure RBF-MMD")
+    ap.add_argument("--image-generated-eval-min-patch-detail-ratio", type=float,
+                    default=None,
+                    dest="image_generated_eval_min_patch_detail_ratio",
+                    help="minimum generated/reference local patch detail-energy ratio")
+    ap.add_argument("--image-generated-eval-min-patch-contrast-ratio", type=float,
+                    default=None,
+                    dest="image_generated_eval_min_patch_contrast_ratio",
+                    help="minimum generated/reference local patch contrast ratio")
+    ap.add_argument("--image-generated-eval-min-patch-edge-ratio", type=float,
+                    default=None,
+                    dest="image_generated_eval_min_patch_edge_ratio",
+                    help="minimum generated/reference local patch edge ratio")
+    ap.add_argument("--image-generated-eval-min-patch-variation-ratio", type=float,
+                    default=None,
+                    dest="image_generated_eval_min_patch_variation_ratio",
+                    help="minimum generated/reference local patch variation ratio")
     ap.add_argument("--image-generated-eval-fail-on-gate", action="store_true",
                     dest="image_generated_eval_fail_on_gate",
                     help="fail the RunPod job if configured generated-sample eval gates fail")
@@ -4916,6 +5037,14 @@ def main():
         sys.exit("ERROR: --image-generated-eval-visual-stats-size must be non-negative")
     if args.image_generated_eval_visual_stats_max_records < 0:
         sys.exit("ERROR: --image-generated-eval-visual-stats-max-records must be non-negative")
+    if args.image_generated_eval_patch_structure_size < 0:
+        sys.exit(
+            "ERROR: --image-generated-eval-patch-structure-size must be non-negative")
+    if args.image_generated_eval_patch_structure_patch <= 0:
+        sys.exit("ERROR: --image-generated-eval-patch-structure-patch must be positive")
+    if args.image_generated_eval_patch_structure_max_records < 0:
+        sys.exit(
+            "ERROR: --image-generated-eval-patch-structure-max-records must be non-negative")
     generated_eval_visual_thresholds = {
         "--image-generated-eval-max-visual-physics-l1": (
             args.image_generated_eval_max_visual_physics_l1),
@@ -4927,6 +5056,18 @@ def main():
             args.image_generated_eval_min_visual_dynamic_range_ratio),
         "--image-generated-eval-min-visual-luminance-std-ratio": (
             args.image_generated_eval_min_visual_luminance_std_ratio),
+        "--image-generated-eval-max-patch-structure-l1": (
+            args.image_generated_eval_max_patch_structure_l1),
+        "--image-generated-eval-max-patch-structure-mmd-rbf": (
+            args.image_generated_eval_max_patch_structure_mmd_rbf),
+        "--image-generated-eval-min-patch-detail-ratio": (
+            args.image_generated_eval_min_patch_detail_ratio),
+        "--image-generated-eval-min-patch-contrast-ratio": (
+            args.image_generated_eval_min_patch_contrast_ratio),
+        "--image-generated-eval-min-patch-edge-ratio": (
+            args.image_generated_eval_min_patch_edge_ratio),
+        "--image-generated-eval-min-patch-variation-ratio": (
+            args.image_generated_eval_min_patch_variation_ratio),
     }
     for name, value in generated_eval_visual_thresholds.items():
         if value is not None and value < 0.0:

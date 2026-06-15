@@ -51,6 +51,36 @@ VISUAL_FEATURE_NAMES = (
     "dynamic_range",
     "channel_std",
 )
+PATCH_STRUCTURE_DESCRIPTOR_NAMES = (
+    "channel_mean_r",
+    "channel_mean_g",
+    "channel_mean_b",
+    "channel_std_r",
+    "channel_std_g",
+    "channel_std_b",
+    "edge_x",
+    "edge_y",
+    "contrast",
+    "detail_energy",
+    "layout_mass",
+    "layout_cx",
+    "layout_cy",
+    "layout_var_x",
+    "layout_var_y",
+    "layout_cov_xy",
+    "edge_mass",
+    "edge_cx",
+    "edge_cy",
+    "edge_var_x",
+    "edge_var_y",
+    "edge_cov_xy",
+)
+PATCH_STRUCTURE_REDUCTIONS = ("mean", "std", "p05", "p95")
+PATCH_STRUCTURE_FEATURE_NAMES = tuple(
+    f"{reduction}_{name}"
+    for reduction in PATCH_STRUCTURE_REDUCTIONS
+    for name in PATCH_STRUCTURE_DESCRIPTOR_NAMES
+)
 
 
 @dataclass(frozen=True)
@@ -292,6 +322,135 @@ def visual_physics_matrix(records: Sequence[ImageTextRecord], size=64,
         f"{prefix}_feature_names": list(VISUAL_FEATURE_NAMES),
     }
     report.update(_visual_feature_summary(matrix, prefix))
+    return MatrixRows(matrix=matrix, records=tuple(kept), report=report)
+
+
+def _patch_structure_summary(desc):
+    desc = np.asarray(desc, dtype=np.float64)
+    if desc.ndim != 2 or desc.shape[0] <= 0:
+        return np.zeros((len(PATCH_STRUCTURE_FEATURE_NAMES),), dtype=np.float64)
+    desc = np.nan_to_num(desc, nan=0.0, posinf=1.0, neginf=-1.0)
+    return np.concatenate(
+        [
+            desc.mean(axis=0),
+            desc.std(axis=0),
+            np.percentile(desc, 5, axis=0),
+            np.percentile(desc, 95, axis=0),
+        ],
+        axis=0,
+    ).astype(np.float64, copy=False)
+
+
+def visual_patch_structure_feature(image, patch=8):
+    """Return fixed local-structure stats for a CHW image.
+
+    The per-patch descriptor is the same generic, category-free descriptor used
+    by the training-side patch-structure loss.  The evaluator only summarizes
+    its distribution over patches, so cost is linear in pixels and independent
+    of object labels, grammar, or task-specific rules.
+    """
+    import torch
+    from .image_latent import visual_patch_structure_targets
+
+    arr = np.asarray(image, dtype=np.float32)
+    if arr.ndim != 3:
+        raise ValueError(f"patch structure feature expects CHW image, got {arr.shape}")
+    if arr.shape[0] != 3:
+        raise ValueError(
+            f"patch structure feature expects RGB CHW image, got {arr.shape}")
+    patch = int(patch)
+    if patch <= 0:
+        raise ValueError("patch structure size must be positive")
+    arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0)
+    arr = np.clip(arr, -1.0, 1.0)
+    with torch.no_grad():
+        x = torch.from_numpy(arr).unsqueeze(0)
+        desc = visual_patch_structure_targets(x, patch=patch).squeeze(0)
+    return _patch_structure_summary(desc.detach().cpu().numpy())
+
+
+def _patch_structure_feature_summary(mat, prefix):
+    mat = np.asarray(mat, dtype=np.float64)
+    report = {
+        f"{prefix}_feature_names": list(PATCH_STRUCTURE_FEATURE_NAMES),
+        f"{prefix}_descriptor_names": list(PATCH_STRUCTURE_DESCRIPTOR_NAMES),
+        f"{prefix}_n": int(mat.shape[0]) if mat.ndim == 2 else 0,
+    }
+    tracked = (
+        "mean_edge_x",
+        "mean_edge_y",
+        "mean_contrast",
+        "mean_detail_energy",
+        "std_detail_energy",
+    )
+    if mat.ndim != 2 or mat.shape[0] <= 0:
+        for name in tracked:
+            report[f"{prefix}_{name}_mean"] = 0.0
+            report[f"{prefix}_{name}_p05"] = 0.0
+        return report
+    for name in tracked:
+        idx = PATCH_STRUCTURE_FEATURE_NAMES.index(name)
+        vals = mat[:, idx]
+        report[f"{prefix}_{name}_mean"] = float(np.mean(vals))
+        report[f"{prefix}_{name}_p05"] = _finite_percentile(vals, 5)
+    return report
+
+
+def visual_patch_structure_matrix(records: Sequence[ImageTextRecord], size=64,
+                                  patch=8, max_records=0,
+                                  prefix="visual_patch_structure"):
+    size = int(size or 0)
+    patch = int(patch or 0)
+    if size <= 0:
+        return MatrixRows(
+            matrix=np.zeros((0, len(PATCH_STRUCTURE_FEATURE_NAMES)), dtype=np.float64),
+            records=tuple(),
+            report={
+                f"{prefix}_enabled": False,
+                f"{prefix}_size": int(size),
+                f"{prefix}_patch": int(patch),
+                f"{prefix}_records": int(len(records)),
+                f"{prefix}_usable": 0,
+                f"{prefix}_failed": 0,
+                f"{prefix}_max_records": int(max_records or 0),
+                f"{prefix}_feature_names": list(PATCH_STRUCTURE_FEATURE_NAMES),
+                f"{prefix}_descriptor_names": list(PATCH_STRUCTURE_DESCRIPTOR_NAMES),
+            },
+        )
+    if patch <= 0:
+        raise ValueError("patch structure patch size must be positive")
+    rows = []
+    kept = []
+    failures = []
+    limit = int(max_records or 0)
+    for rec in records:
+        if limit and len(kept) + len(failures) >= limit:
+            break
+        try:
+            img = load_image_tensor(
+                rec.path, size=size, device="cpu", crop_mode="center")
+            rows.append(visual_patch_structure_feature(
+                img.detach().cpu().numpy(), patch=patch))
+            kept.append(rec)
+        except Exception as exc:
+            failures.append({"image": rec.path, "error": str(exc)[:200]})
+    matrix = (
+        np.stack(rows, axis=0).astype(np.float64, copy=False)
+        if rows else np.zeros((0, len(PATCH_STRUCTURE_FEATURE_NAMES)), dtype=np.float64)
+    )
+    report = {
+        f"{prefix}_enabled": True,
+        f"{prefix}_size": int(size),
+        f"{prefix}_patch": int(patch),
+        f"{prefix}_records": int(len(records)),
+        f"{prefix}_usable": int(matrix.shape[0]),
+        f"{prefix}_failed": int(len(failures)),
+        f"{prefix}_max_records": int(limit),
+        f"{prefix}_failures": failures[:5],
+        f"{prefix}_feature_names": list(PATCH_STRUCTURE_FEATURE_NAMES),
+        f"{prefix}_descriptor_names": list(PATCH_STRUCTURE_DESCRIPTOR_NAMES),
+    }
+    report.update(_patch_structure_feature_summary(matrix, prefix))
     return MatrixRows(matrix=matrix, records=tuple(kept), report=report)
 
 
@@ -665,6 +824,53 @@ def visual_physics_distribution_metrics(generated, real, prefix="visual_physics_
     return out
 
 
+def visual_patch_structure_distribution_metrics(
+        generated, real, prefix="patch_structure_distribution"):
+    generated = np.asarray(generated, dtype=np.float64)
+    real = np.asarray(real, dtype=np.float64)
+    if generated.ndim != 2 or real.ndim != 2:
+        raise ValueError("generated and real patch structure features must be matrices")
+    if generated.shape[0] <= 0 or real.shape[0] <= 0:
+        return {
+            f"{prefix}_generated_n": int(generated.shape[0]) if generated.ndim == 2 else 0,
+            f"{prefix}_real_n": int(real.shape[0]) if real.ndim == 2 else 0,
+            f"{prefix}_available": False,
+            f"{prefix}_mean_feature_l1": 0.0,
+            f"{prefix}_detail_energy_ratio": 0.0,
+            f"{prefix}_contrast_ratio": 0.0,
+            f"{prefix}_edge_ratio": 0.0,
+            f"{prefix}_variation_ratio": 0.0,
+        }
+    if generated.shape[1] != real.shape[1]:
+        raise ValueError(
+            f"generated/real patch structure feature dims differ: "
+            f"{generated.shape[1]} vs {real.shape[1]}"
+        )
+    out = embedding_distribution_metrics(generated, real, prefix=prefix)
+    out.update(embedding_neighborhood_metrics(generated, real, prefix=prefix))
+    gen_mean = generated.mean(axis=0)
+    real_mean = real.mean(axis=0)
+    detail_idx = PATCH_STRUCTURE_FEATURE_NAMES.index("mean_detail_energy")
+    contrast_idx = PATCH_STRUCTURE_FEATURE_NAMES.index("mean_contrast")
+    edge_x_idx = PATCH_STRUCTURE_FEATURE_NAMES.index("mean_edge_x")
+    edge_y_idx = PATCH_STRUCTURE_FEATURE_NAMES.index("mean_edge_y")
+    variation_idx = PATCH_STRUCTURE_FEATURE_NAMES.index("std_detail_energy")
+    gen_edge = 0.5 * (gen_mean[edge_x_idx] + gen_mean[edge_y_idx])
+    real_edge = 0.5 * (real_mean[edge_x_idx] + real_mean[edge_y_idx])
+    out.update({
+        f"{prefix}_available": True,
+        f"{prefix}_mean_feature_l1": float(np.mean(np.abs(gen_mean - real_mean))),
+        f"{prefix}_detail_energy_ratio": float(
+            gen_mean[detail_idx] / max(real_mean[detail_idx], EPS)),
+        f"{prefix}_contrast_ratio": float(
+            gen_mean[contrast_idx] / max(real_mean[contrast_idx], EPS)),
+        f"{prefix}_edge_ratio": float(gen_edge / max(real_edge, EPS)),
+        f"{prefix}_variation_ratio": float(
+            gen_mean[variation_idx] / max(real_mean[variation_idx], EPS)),
+    })
+    return out
+
+
 def image_text_alignment_metrics(records: Sequence[ImageTextRecord], prefix="image_text_alignment",
                                  dim_policy="error", normalize=True):
     image_rows = []
@@ -798,6 +1004,26 @@ def image_eval_composite_score(report, embedding_kind="image"):
                 report.get("visual_physics_distribution_luminance_std_ratio")), 0.10),
         ])
         components.append(("visual_physics", visual_score, 0.15))
+    patch_parts = {}
+    patch_score = None
+    if report.get("patch_structure_distribution_available"):
+        patch_score, patch_parts = _weighted_geomean([
+            ("patch_frechet", _lower_is_better_score(
+                report.get("patch_structure_distribution_frechet")), 0.20),
+            ("patch_mmd_rbf", _lower_is_better_score(
+                report.get("patch_structure_distribution_mmd_rbf")), 0.20),
+            ("patch_mean_feature_l1", _lower_is_better_score(
+                report.get("patch_structure_distribution_mean_feature_l1")), 0.20),
+            ("patch_detail_energy_ratio", _ratio_target_one_score(
+                report.get("patch_structure_distribution_detail_energy_ratio")), 0.15),
+            ("patch_contrast_ratio", _ratio_target_one_score(
+                report.get("patch_structure_distribution_contrast_ratio")), 0.10),
+            ("patch_edge_ratio", _ratio_target_one_score(
+                report.get("patch_structure_distribution_edge_ratio")), 0.10),
+            ("patch_variation_ratio", _ratio_target_one_score(
+                report.get("patch_structure_distribution_variation_ratio")), 0.05),
+        ])
+        components.append(("patch_structure", patch_score, 0.15))
     score, component_weights = _weighted_geomean(components)
     out = {
         "image_eval_score": float(score),
@@ -809,6 +1035,7 @@ def image_eval_composite_score(report, embedding_kind="image"):
         "image_eval_diversity_score": float(diversity_score),
         "image_eval_alignment_available": bool(align_n > 0),
         "image_eval_visual_physics_available": bool(visual_score is not None),
+        "image_eval_patch_structure_available": bool(patch_score is not None),
     }
     if alignment_score is not None:
         out["image_eval_alignment_score"] = float(alignment_score)
@@ -816,6 +1043,9 @@ def image_eval_composite_score(report, embedding_kind="image"):
     if visual_score is not None:
         out["image_eval_visual_physics_score"] = float(visual_score)
         out["image_eval_visual_physics_parts"] = visual_parts
+    if patch_score is not None:
+        out["image_eval_patch_structure_score"] = float(patch_score)
+        out["image_eval_patch_structure_parts"] = patch_parts
     return out
 
 
@@ -829,6 +1059,12 @@ def image_eval_gate(report, min_score=0.0, min_support_precision=0.0,
                     min_visual_detail_ratio=None,
                     min_visual_dynamic_range_ratio=None,
                     min_visual_luminance_std_ratio=None,
+                    max_patch_structure_l1=None,
+                    max_patch_structure_mmd_rbf=None,
+                    min_patch_detail_ratio=None,
+                    min_patch_contrast_ratio=None,
+                    min_patch_edge_ratio=None,
+                    min_patch_variation_ratio=None,
                     embedding_kind="image"):
     prefix = f"{embedding_kind}_distribution"
     checks = []
@@ -932,6 +1168,60 @@ def image_eval_gate(report, min_score=0.0, min_support_precision=0.0,
         min_visual_luminance_std_ratio,
         "min",
     )
+    patch_gate_requested = any(
+        value is not None for value in (
+            max_patch_structure_l1,
+            max_patch_structure_mmd_rbf,
+            min_patch_detail_ratio,
+            min_patch_contrast_ratio,
+            min_patch_edge_ratio,
+            min_patch_variation_ratio,
+        )
+    )
+    if patch_gate_requested and not report.get("patch_structure_distribution_available"):
+        checks.append({
+            "name": "patch_structure_distribution_available",
+            "value": 0.0,
+            "threshold": 1.0,
+            "mode": "min",
+            "pass": False,
+        })
+    add_check(
+        "patch_structure_distribution_mean_feature_l1",
+        report.get("patch_structure_distribution_mean_feature_l1"),
+        max_patch_structure_l1,
+        "max",
+    )
+    add_check(
+        "patch_structure_distribution_mmd_rbf",
+        report.get("patch_structure_distribution_mmd_rbf"),
+        max_patch_structure_mmd_rbf,
+        "max",
+    )
+    add_check(
+        "patch_structure_distribution_detail_energy_ratio",
+        report.get("patch_structure_distribution_detail_energy_ratio"),
+        min_patch_detail_ratio,
+        "min",
+    )
+    add_check(
+        "patch_structure_distribution_contrast_ratio",
+        report.get("patch_structure_distribution_contrast_ratio"),
+        min_patch_contrast_ratio,
+        "min",
+    )
+    add_check(
+        "patch_structure_distribution_edge_ratio",
+        report.get("patch_structure_distribution_edge_ratio"),
+        min_patch_edge_ratio,
+        "min",
+    )
+    add_check(
+        "patch_structure_distribution_variation_ratio",
+        report.get("patch_structure_distribution_variation_ratio"),
+        min_patch_variation_ratio,
+        "min",
+    )
     passed = all(row["pass"] for row in checks)
     return {
         "image_eval_gate_pass": bool(passed),
@@ -943,7 +1233,9 @@ def image_eval_gate(report, min_score=0.0, min_support_precision=0.0,
 def evaluate_records(real_records: Sequence[ImageTextRecord],
                      generated_records: Sequence[ImageTextRecord],
                      embedding_kind="image", dim_policy="error", normalize=True,
-                     visual_stats_size=0, visual_stats_max_records=0):
+                     visual_stats_size=0, visual_stats_max_records=0,
+                     patch_structure_size=0, patch_structure_patch=8,
+                     patch_structure_max_records=0):
     real_matrix = embedding_matrix(
         real_records, kind=embedding_kind, dim_policy=dim_policy,
         normalize=normalize, prefix="real")
@@ -991,6 +1283,26 @@ def evaluate_records(real_records: Sequence[ImageTextRecord],
             "real_visual_physics_enabled": False,
             "generated_visual_physics_enabled": False,
             "visual_physics_distribution_available": False,
+        })
+    if int(patch_structure_size or 0) > 0:
+        real_patch = visual_patch_structure_matrix(
+            real_records, size=patch_structure_size, patch=patch_structure_patch,
+            max_records=patch_structure_max_records,
+            prefix="real_patch_structure")
+        generated_patch = visual_patch_structure_matrix(
+            generated_records, size=patch_structure_size,
+            patch=patch_structure_patch, max_records=patch_structure_max_records,
+            prefix="generated_patch_structure")
+        report.update(real_patch.report)
+        report.update(generated_patch.report)
+        report.update(visual_patch_structure_distribution_metrics(
+            generated_patch.matrix, real_patch.matrix,
+            prefix="patch_structure_distribution"))
+    else:
+        report.update({
+            "real_patch_structure_enabled": False,
+            "generated_patch_structure_enabled": False,
+            "patch_structure_distribution_available": False,
         })
     report.update(image_eval_composite_score(report, embedding_kind=embedding_kind))
     return report
@@ -1078,19 +1390,32 @@ def selftest():
         good_records, _ = load_records(good, split="eval")
         bad_records, _ = load_records(bad, split="eval")
         memorized_records, _ = load_records(memorized, split="eval")
-        good_report = evaluate_records(real_records, good_records, visual_stats_size=16)
-        bad_report = evaluate_records(real_records, bad_records, visual_stats_size=16)
+        good_report = evaluate_records(
+            real_records, good_records, visual_stats_size=16,
+            patch_structure_size=16, patch_structure_patch=4)
+        bad_report = evaluate_records(
+            real_records, bad_records, visual_stats_size=16,
+            patch_structure_size=16, patch_structure_patch=4)
         memorized_report = evaluate_records(
-            real_records, memorized_records, visual_stats_size=16)
+            real_records, memorized_records, visual_stats_size=16,
+            patch_structure_size=16, patch_structure_patch=4)
         assert good_report["image_distribution_generated_n"] == 2
         assert good_report["generated_image_text_alignment_n"] == 2
         assert good_report["generated_image_text_alignment_i2t_acc"] == 1.0
         assert good_report["visual_physics_distribution_available"] is True
         assert good_report["generated_visual_physics_usable"] == 2
+        assert good_report["patch_structure_distribution_available"] is True
+        assert good_report["generated_patch_structure_usable"] == 2
         assert bad_report["visual_physics_distribution_detail_energy_ratio"] < (
             good_report["visual_physics_distribution_detail_energy_ratio"])
         assert bad_report["visual_physics_distribution_dynamic_range_ratio"] < (
             good_report["visual_physics_distribution_dynamic_range_ratio"])
+        assert bad_report["patch_structure_distribution_detail_energy_ratio"] < (
+            good_report["patch_structure_distribution_detail_energy_ratio"])
+        assert bad_report["patch_structure_distribution_contrast_ratio"] < (
+            good_report["patch_structure_distribution_contrast_ratio"])
+        assert bad_report["patch_structure_distribution_edge_ratio"] < (
+            good_report["patch_structure_distribution_edge_ratio"])
         assert good_report["image_distribution_frechet"] < bad_report[
             "image_distribution_frechet"]
         assert good_report["image_distribution_mmd_rbf"] < bad_report[
@@ -1109,11 +1434,15 @@ def selftest():
         visual_gate = image_eval_gate(
             bad_report, min_visual_detail_ratio=0.10,
             min_visual_dynamic_range_ratio=0.10)
+        patch_gate = image_eval_gate(
+            bad_report, min_patch_detail_ratio=0.10,
+            min_patch_contrast_ratio=0.10, min_patch_edge_ratio=0.10)
         assert good_gate["image_eval_gate_pass"] is True
         assert bad_gate["image_eval_gate_pass"] is False
         assert duplicate_gate["image_eval_gate_pass"] is False
         assert memorized_gate["image_eval_gate_pass"] is False
         assert visual_gate["image_eval_gate_pass"] is False
+        assert patch_gate["image_eval_gate_pass"] is False
         assert bad_gate["image_eval_gate_failed"][0]["name"] == "image_eval_score"
     print("image_eval selftest OK")
 
@@ -1187,6 +1516,26 @@ def main(argv=None):
                     help="minimum generated/reference luminance dynamic-range ratio")
     ap.add_argument("--min-visual-luminance-std-ratio", type=float, default=None,
                     help="minimum generated/reference luminance standard-deviation ratio")
+    ap.add_argument("--patch-structure-size", type=int, default=0,
+                    help=("compute generic local patch-structure stats at this image "
+                          "size; 0 disables local patch evaluation"))
+    ap.add_argument("--patch-structure-patch", type=int, default=8,
+                    help="patch size for local patch-structure stats")
+    ap.add_argument("--patch-structure-max-records", type=int, default=0,
+                    help=("maximum records per manifest for patch-structure stats; "
+                          "0 means use all loaded records"))
+    ap.add_argument("--max-patch-structure-l1", type=float, default=None,
+                    help="maximum mean local patch-structure feature L1 drift")
+    ap.add_argument("--max-patch-structure-mmd-rbf", type=float, default=None,
+                    help="maximum local patch-structure RBF-MMD distance")
+    ap.add_argument("--min-patch-detail-ratio", type=float, default=None,
+                    help="minimum generated/reference local detail-energy ratio")
+    ap.add_argument("--min-patch-contrast-ratio", type=float, default=None,
+                    help="minimum generated/reference local contrast ratio")
+    ap.add_argument("--min-patch-edge-ratio", type=float, default=None,
+                    help="minimum generated/reference local edge ratio")
+    ap.add_argument("--min-patch-variation-ratio", type=float, default=None,
+                    help="minimum generated/reference patch variation ratio")
     ap.add_argument("--fail-on-gate", action="store_true",
                     help="exit non-zero when configured quality-gate checks fail")
     ap.add_argument("--report-out", default="", help="optional JSON report path")
@@ -1207,10 +1556,19 @@ def main(argv=None):
         ap.error("--visual-stats-size must be non-negative")
     if args.visual_stats_max_records < 0:
         ap.error("--visual-stats-max-records must be non-negative")
+    if args.patch_structure_size < 0:
+        ap.error("--patch-structure-size must be non-negative")
+    if args.patch_structure_patch <= 0:
+        ap.error("--patch-structure-patch must be positive")
+    if args.patch_structure_max_records < 0:
+        ap.error("--patch-structure-max-records must be non-negative")
     for name in (
             "max_visual_physics_l1", "max_visual_physics_mmd_rbf",
             "min_visual_detail_ratio", "min_visual_dynamic_range_ratio",
-            "min_visual_luminance_std_ratio"):
+            "min_visual_luminance_std_ratio",
+            "max_patch_structure_l1", "max_patch_structure_mmd_rbf",
+            "min_patch_detail_ratio", "min_patch_contrast_ratio",
+            "min_patch_edge_ratio", "min_patch_variation_ratio"):
         value = getattr(args, name)
         if value is not None and value < 0.0:
             ap.error(f"--{name.replace('_', '-')} must be non-negative")
@@ -1234,7 +1592,10 @@ def main(argv=None):
         real_records, generated_records, embedding_kind=args.embedding_kind,
         dim_policy=args.dim_policy, normalize=not args.no_normalize,
         visual_stats_size=args.visual_stats_size,
-        visual_stats_max_records=args.visual_stats_max_records)
+        visual_stats_max_records=args.visual_stats_max_records,
+        patch_structure_size=args.patch_structure_size,
+        patch_structure_patch=args.patch_structure_patch,
+        patch_structure_max_records=args.patch_structure_max_records)
     report.update(image_eval_gate(
         report,
         min_score=args.min_score,
@@ -1250,6 +1611,12 @@ def main(argv=None):
         min_visual_detail_ratio=args.min_visual_detail_ratio,
         min_visual_dynamic_range_ratio=args.min_visual_dynamic_range_ratio,
         min_visual_luminance_std_ratio=args.min_visual_luminance_std_ratio,
+        max_patch_structure_l1=args.max_patch_structure_l1,
+        max_patch_structure_mmd_rbf=args.max_patch_structure_mmd_rbf,
+        min_patch_detail_ratio=args.min_patch_detail_ratio,
+        min_patch_contrast_ratio=args.min_patch_contrast_ratio,
+        min_patch_edge_ratio=args.min_patch_edge_ratio,
+        min_patch_variation_ratio=args.min_patch_variation_ratio,
         embedding_kind=args.embedding_kind,
     ))
     report.update({
@@ -1264,6 +1631,9 @@ def main(argv=None):
         "generated_max_records": generated_max,
         "visual_stats_size": int(args.visual_stats_size),
         "visual_stats_max_records": int(args.visual_stats_max_records),
+        "patch_structure_size": int(args.patch_structure_size),
+        "patch_structure_patch": int(args.patch_structure_patch),
+        "patch_structure_max_records": int(args.patch_structure_max_records),
         "min_aesthetic": (
             float(args.min_aesthetic) if args.min_aesthetic is not None else None),
         "max_nsfw": float(args.max_nsfw) if args.max_nsfw is not None else None,
@@ -1290,6 +1660,24 @@ def main(argv=None):
         "min_visual_luminance_std_ratio": (
             float(args.min_visual_luminance_std_ratio)
             if args.min_visual_luminance_std_ratio is not None else None),
+        "max_patch_structure_l1": (
+            float(args.max_patch_structure_l1)
+            if args.max_patch_structure_l1 is not None else None),
+        "max_patch_structure_mmd_rbf": (
+            float(args.max_patch_structure_mmd_rbf)
+            if args.max_patch_structure_mmd_rbf is not None else None),
+        "min_patch_detail_ratio": (
+            float(args.min_patch_detail_ratio)
+            if args.min_patch_detail_ratio is not None else None),
+        "min_patch_contrast_ratio": (
+            float(args.min_patch_contrast_ratio)
+            if args.min_patch_contrast_ratio is not None else None),
+        "min_patch_edge_ratio": (
+            float(args.min_patch_edge_ratio)
+            if args.min_patch_edge_ratio is not None else None),
+        "min_patch_variation_ratio": (
+            float(args.min_patch_variation_ratio)
+            if args.min_patch_variation_ratio is not None else None),
     })
     if real_merge:
         report["real_embedding_merge"] = real_merge

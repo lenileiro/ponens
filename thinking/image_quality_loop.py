@@ -8,6 +8,7 @@ vision feature view.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import os
 import sys
@@ -33,6 +34,10 @@ def _read_records(path, *, root="", split="", min_aesthetic=None, max_records=0,
         max_records=max_records, max_nsfw=max_nsfw, max_watermark=max_watermark)
 
 
+def _absolute_records(records):
+    return tuple(replace(rec, path=os.path.abspath(rec.path)) for rec in records)
+
+
 def _normalize_embedded_manifest(src_path, out_path, *, root="", split="",
                                  embedded_manifest="", embedded_root="",
                                  min_aesthetic=None, max_records=0,
@@ -49,6 +54,7 @@ def _normalize_embedded_manifest(src_path, out_path, *, root="", split="",
         rec for rec in embedded_records
         if os.path.abspath(rec.path) in source_paths
     ]
+    records = _absolute_records(records)
     write_image_manifest(records, out_path, root="")
     return {
         "embedded_manifest": out_path,
@@ -72,6 +78,7 @@ def _embed_manifest(src_path, out_path, *, root="", split="", min_aesthetic=None
     records = _read_records(
         src_path, root=root, split=split, min_aesthetic=min_aesthetic,
         max_records=max_records, max_nsfw=max_nsfw, max_watermark=max_watermark)
+    records = _absolute_records(records)
     report = write_embedding_sidecar(
         records, out_path, root="", embedder=embedder, features=features,
         batch=batch)
@@ -220,6 +227,11 @@ def run_quality_loop(
         max_visual_physics_l1=None, max_visual_physics_mmd_rbf=None,
         min_visual_detail_ratio=None, min_visual_dynamic_range_ratio=None,
         min_visual_luminance_std_ratio=None,
+        patch_structure_size=0, patch_structure_patch=8,
+        patch_structure_max_records=0,
+        max_patch_structure_l1=None, max_patch_structure_mmd_rbf=None,
+        min_patch_detail_ratio=None, min_patch_contrast_ratio=None,
+        min_patch_edge_ratio=None, min_patch_variation_ratio=None,
         vision_read_steps=0, vision_read_seed=0, vision_read_device="cpu",
         vision_read_batch=4, vision_read_dim=32, vision_read_layers=1,
         vision_read_heads=2, vision_read_max_len=64, vision_read_eval_n=16,
@@ -276,7 +288,10 @@ def run_quality_loop(
         real_records, generated_records, embedding_kind=embedding_kind,
         dim_policy=dim_policy, normalize=normalize_embeddings,
         visual_stats_size=visual_stats_size,
-        visual_stats_max_records=visual_stats_max_records)
+        visual_stats_max_records=visual_stats_max_records,
+        patch_structure_size=patch_structure_size,
+        patch_structure_patch=patch_structure_patch,
+        patch_structure_max_records=patch_structure_max_records)
     embedding_report.update(image_eval_gate(
         embedding_report, min_score=min_score,
         min_support_precision=min_support_precision,
@@ -290,6 +305,12 @@ def run_quality_loop(
         min_visual_detail_ratio=min_visual_detail_ratio,
         min_visual_dynamic_range_ratio=min_visual_dynamic_range_ratio,
         min_visual_luminance_std_ratio=min_visual_luminance_std_ratio,
+        max_patch_structure_l1=max_patch_structure_l1,
+        max_patch_structure_mmd_rbf=max_patch_structure_mmd_rbf,
+        min_patch_detail_ratio=min_patch_detail_ratio,
+        min_patch_contrast_ratio=min_patch_contrast_ratio,
+        min_patch_edge_ratio=min_patch_edge_ratio,
+        min_patch_variation_ratio=min_patch_variation_ratio,
         embedding_kind=embedding_kind))
     if real_merge:
         embedding_report["real_embedding_merge"] = real_merge
@@ -339,7 +360,13 @@ def run_quality_loop(
         or max_visual_physics_mmd_rbf is not None
         or min_visual_detail_ratio is not None
         or min_visual_dynamic_range_ratio is not None
-        or min_visual_luminance_std_ratio is not None)
+        or min_visual_luminance_std_ratio is not None
+        or max_patch_structure_l1 is not None
+        or max_patch_structure_mmd_rbf is not None
+        or min_patch_detail_ratio is not None
+        or min_patch_contrast_ratio is not None
+        or min_patch_edge_ratio is not None
+        or min_patch_variation_ratio is not None)
     vision_gate_configured = bool(
         vision_report and (
             float(vision_read_min_sensor_token_acc or 0.0) > 0.0
@@ -409,12 +436,15 @@ def selftest():
             real_manifest=real_manifest, generated_manifest=generated_manifest,
             real_root=real_dir, generated_root=gen_dir,
             work_dir=os.path.join(td, "loop"), stats_dim=8,
-            visual_stats_size=16,
+            visual_stats_size=16, patch_structure_size=16,
+            patch_structure_patch=4,
             vision_read_steps=1, vision_read_eval_n=2,
             vision_read_max_len=16)
         assert report["embedding_eval"]["image_distribution_generated_n"] == 2
         assert report["embedding_eval"]["visual_physics_distribution_available"] is True
         assert report["embedding_eval"]["generated_visual_physics_usable"] == 2
+        assert report["embedding_eval"]["patch_structure_distribution_available"] is True
+        assert report["embedding_eval"]["generated_patch_structure_usable"] == 2
         assert "image_distribution_generated_nearest_generated_l2_p05" in (
             report["embedding_eval"])
         assert "image_distribution_generated_nearest_real_l2_p01" in (
@@ -523,6 +553,16 @@ def main(argv=None):
     ap.add_argument("--min-visual-detail-ratio", type=float, default=None)
     ap.add_argument("--min-visual-dynamic-range-ratio", type=float, default=None)
     ap.add_argument("--min-visual-luminance-std-ratio", type=float, default=None)
+    ap.add_argument("--patch-structure-size", type=int, default=0,
+                    help="compute generic local patch-structure stats at this image size")
+    ap.add_argument("--patch-structure-patch", type=int, default=8)
+    ap.add_argument("--patch-structure-max-records", type=int, default=0)
+    ap.add_argument("--max-patch-structure-l1", type=float, default=None)
+    ap.add_argument("--max-patch-structure-mmd-rbf", type=float, default=None)
+    ap.add_argument("--min-patch-detail-ratio", type=float, default=None)
+    ap.add_argument("--min-patch-contrast-ratio", type=float, default=None)
+    ap.add_argument("--min-patch-edge-ratio", type=float, default=None)
+    ap.add_argument("--min-patch-variation-ratio", type=float, default=None)
     ap.add_argument("--vision-read-steps", type=int, default=0)
     ap.add_argument("--vision-read-seed", type=int, default=0)
     ap.add_argument("--vision-read-device", default="")
@@ -555,10 +595,13 @@ def main(argv=None):
             "generated_embed_max_records", "eval_max_records",
             "real_eval_max_records", "generated_eval_max_records",
             "visual_stats_size", "visual_stats_max_records",
+            "patch_structure_size", "patch_structure_max_records",
             "vision_read_steps", "vision_read_raw_visual_size",
             "vision_read_raw_visual_patch"):
         if getattr(args, name) < 0:
             ap.error(f"--{name.replace('_', '-')} must be non-negative")
+    if args.patch_structure_patch <= 0:
+        ap.error("--patch-structure-patch must be positive")
     if args.vision_read_raw_visual_size <= 0:
         ap.error("--vision-read-raw-visual-size must be positive")
     if args.vision_read_raw_visual_patch <= 0:
@@ -572,7 +615,10 @@ def main(argv=None):
     for name in (
             "max_visual_physics_l1", "max_visual_physics_mmd_rbf",
             "min_visual_detail_ratio", "min_visual_dynamic_range_ratio",
-            "min_visual_luminance_std_ratio"):
+            "min_visual_luminance_std_ratio",
+            "max_patch_structure_l1", "max_patch_structure_mmd_rbf",
+            "min_patch_detail_ratio", "min_patch_contrast_ratio",
+            "min_patch_edge_ratio", "min_patch_variation_ratio"):
         value = getattr(args, name)
         if value is not None and value < 0.0:
             ap.error(f"--{name.replace('_', '-')} must be non-negative")
@@ -628,6 +674,15 @@ def main(argv=None):
         min_visual_detail_ratio=args.min_visual_detail_ratio,
         min_visual_dynamic_range_ratio=args.min_visual_dynamic_range_ratio,
         min_visual_luminance_std_ratio=args.min_visual_luminance_std_ratio,
+        patch_structure_size=args.patch_structure_size,
+        patch_structure_patch=args.patch_structure_patch,
+        patch_structure_max_records=args.patch_structure_max_records,
+        max_patch_structure_l1=args.max_patch_structure_l1,
+        max_patch_structure_mmd_rbf=args.max_patch_structure_mmd_rbf,
+        min_patch_detail_ratio=args.min_patch_detail_ratio,
+        min_patch_contrast_ratio=args.min_patch_contrast_ratio,
+        min_patch_edge_ratio=args.min_patch_edge_ratio,
+        min_patch_variation_ratio=args.min_patch_variation_ratio,
         vision_read_steps=args.vision_read_steps,
         vision_read_seed=args.vision_read_seed,
         vision_read_device=args.vision_read_device or args.embedding_device,
