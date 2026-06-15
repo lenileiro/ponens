@@ -75,7 +75,7 @@ def payload(args):
         jobs.append(f"{PY}.knnvc --run --n 150 --out runs/knnvc.json --synth-out data/synth")
     if args.job == "tts":
         jobs.append(f"{PY}.tts --fetch --n-clips 6000")
-        jobs.append(f"{PY}.tts --train --steps 80000 --out runs/tts.json --checkpoint runs/tts.pt --synth-out data/synth")
+        jobs.append(f"{PY}.tts --train --steps 45000 --out runs/tts.json --checkpoint runs/tts.pt --synth-out data/synth")
     # non-fatal chaining: one job's failure must not kill the rest
     return " ; ".join(jobs)
 

@@ -200,7 +200,7 @@ def _batch(data, rng, batch, device):
     return idt, mel, stop
 
 
-def train(steps=60000, seed=0, device=DEV, batch=16, lr=3e-4):
+def train(steps=60000, seed=0, device=DEV, batch=16, lr=3e-4, ckpt_path=None, save_dir=None):
     torch.manual_seed(seed); rng = np.random.default_rng(seed)
     data = load()
     split = int(len(data) * 0.95); train_data = data[:split]
@@ -219,6 +219,15 @@ def train(steps=60000, seed=0, device=DEV, batch=16, lr=3e-4):
         if st % max(1, steps // 12) == 0 or st == steps:
             print(f"  tts {st}/{steps} mel {l_mel.item():.3f} stop {l_stop.item():.3f} "
                   f"ga {l_ga.item():.4f}", flush=True)
+        if st % max(1, steps // 5) == 0 and (ckpt_path or save_dir):   # periodic safety: a pod
+            if ckpt_path:                                              # timeout still leaves output
+                torch.save({"state_dict": model.state_dict()}, ckpt_path)
+            if save_dir:
+                try:
+                    synth(model, ["the quick brown fox jumps over the lazy dog.",
+                                  "hello, this is a test of the speech system."], save_dir, device=device)
+                except Exception as e:
+                    print(f"  (periodic synth skipped: {e})", flush=True)
     return model, data
 
 
@@ -261,8 +270,8 @@ def synth(model, texts, out_dir, device=DEV):
         print(f"  tts{i}: \"{t[:50]}\" -> {out_dir}/tts{i}.wav ({spec.shape[1]} frames)")
 
 
-def run(steps=60000, seed=0, device=DEV, save_dir="data/synth"):
-    model, data = train(steps=steps, seed=seed, device=device)
+def run(steps=60000, seed=0, device=DEV, save_dir="data/synth", ckpt_path="runs/tts.pt"):
+    model, data = train(steps=steps, seed=seed, device=device, ckpt_path=ckpt_path, save_dir=save_dir)
     ev = evaluate(model, data, device=device)
     report = {"experiment": "tts_tacotron_ljspeech", "sr": SR, "steps": steps, **ev,
               "aligned": ev["attention_focus"] > 0.4}
@@ -311,7 +320,7 @@ def main(argv=None):
     if args.selftest:
         selftest(); return
     if args.train:
-        report, model = run(steps=args.steps, seed=args.seed, save_dir=args.synth_out)
+        report, model = run(steps=args.steps, seed=args.seed, save_dir=args.synth_out, ckpt_path=args.checkpoint)
         os.makedirs(os.path.dirname(args.checkpoint) or ".", exist_ok=True)
         torch.save({"state_dict": model.state_dict()}, args.checkpoint)
         json.dump(report, open(args.out, "w"), indent=1)
