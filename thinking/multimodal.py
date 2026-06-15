@@ -2195,6 +2195,170 @@ def _pack_token_rows(rows, vocab, device):
     return out
 
 
+def _record_feature_tensors(rec, view_dims, device):
+    tensors = []
+    for name, dim in view_dims.items():
+        arr = rec.views.get(name)
+        if arr is None:
+            arr = np.zeros(int(dim), dtype=np.float32)
+        tensors.append(torch.tensor(
+            np.asarray(arr, dtype=np.float32)[None, :],
+            dtype=torch.float32, device=device))
+    return tensors
+
+
+def _generation_next_id(logits, pad, temperature=0.0, top_k=0):
+    scores = logits.detach().float().clone()
+    if 0 <= int(pad) < scores.numel():
+        scores[int(pad)] = -float("inf")
+    temperature = float(temperature)
+    top_k = int(top_k)
+    if temperature <= 0.0:
+        return int(torch.argmax(scores).item())
+    if top_k > 0 and top_k < scores.numel():
+        vals, _idx = torch.topk(scores, k=top_k)
+        floor = vals[-1]
+        scores = torch.where(
+            scores >= floor, scores, scores.new_full(scores.shape, -float("inf")))
+    probs = torch.softmax(scores / temperature, dim=-1)
+    if not torch.isfinite(probs).all() or float(probs.sum().item()) <= 0.0:
+        return int(torch.argmax(logits.detach().float()).item())
+    return int(torch.multinomial(probs, num_samples=1).item())
+
+
+@torch.no_grad()
+def multimodal_generate_tokens(
+        model, vocab, prompt_tokens, view_dims=None, views=None,
+        decode_text_tokens=EMPTY_TEXT_TOKENS, mode="full", max_new_tokens=32,
+        temperature=0.0, top_k=0, device=DEV):
+    """Autoregressively continue prompt tokens from the multimodal decoder."""
+    prompt = tuple(prompt_tokens or ())
+    if not prompt:
+        raise ValueError("generation prompt must contain at least one token")
+    view_dims = OrderedDict((str(k), int(v)) for k, v in (view_dims or {}).items())
+    rec = MultimodalRecord(
+        rec_id="generation", split="eval", text=tuple(decode_text_tokens or ()),
+        target=(), views=dict(views or {}), meta={})
+    features = _record_feature_tensors(rec, view_dims, device)
+    txt = _pack_token_rows([tuple(decode_text_tokens or EMPTY_TEXT_TOKENS)], vocab, device)
+    generated_ids = vocab.enc(prompt)
+    prompt_len = len(generated_ids)
+    max_context = max(1, int(model.config.get("max_len", 0) or len(generated_ids)))
+    stop_tokens = {int(vocab.pad)}
+    for _ in range(max(0, int(max_new_tokens))):
+        context_ids = generated_ids[-max_context:]
+        ids = torch.tensor([context_ids], dtype=torch.long, device=device)
+        logits = model(features, txt, ids, mode=mode)
+        if logits.shape[1] == 0:
+            break
+        next_id = _generation_next_id(
+            logits[0, -1], vocab.pad, temperature=temperature, top_k=top_k)
+        if next_id in stop_tokens:
+            break
+        generated_ids.append(next_id)
+    return tuple(vocab.dec(generated_ids[prompt_len:]))
+
+
+def multimodal_generation_eval(
+        model, records, vocab, view_dims, n=0, seed=1, device=DEV,
+        mode="full", decode_objective="causal", prompt_tokens=16,
+        max_new_tokens=32, temperature=0.0, top_k=0):
+    """Free continuation probe for causal text windows from the eval manifest."""
+    if str(decode_objective) != "causal":
+        return {"enabled": False, "skipped": True,
+                "skip_reason": "generation_eval_requires_causal_decode"}
+    rng = np.random.default_rng(seed)
+    candidates = [
+        rec for rec in records
+        if len(tuple(rec.text) + tuple(rec.target)) >= 2
+    ]
+    count = min(int(n), len(candidates)) if int(n) > 0 else len(candidates)
+    sample = _sample_unique_records(candidates, count, rng) if count else []
+    rows = []
+    total_matches = total_gold = exact = 0
+    model.eval()
+    for rec in sample:
+        sequence = tuple(rec.text) + tuple(rec.target)
+        prompt_len = min(max(1, int(prompt_tokens)), len(sequence) - 1)
+        prompt = sequence[:prompt_len]
+        gold = sequence[prompt_len:prompt_len + max(0, int(max_new_tokens))]
+        if not gold:
+            continue
+        generated = multimodal_generate_tokens(
+            model, vocab, prompt, view_dims=view_dims, views=rec.views,
+            decode_text_tokens=EMPTY_TEXT_TOKENS, mode=mode,
+            max_new_tokens=len(gold), temperature=temperature, top_k=top_k,
+            device=device)
+        matches = sum(1 for a, b in zip(generated, gold) if a == b)
+        total_matches += int(matches)
+        total_gold += int(len(gold))
+        exact_match = tuple(generated) == tuple(gold)
+        exact += int(exact_match)
+        rows.append({
+            "id": str(rec.rec_id),
+            "prompt": list(prompt),
+            "gold": list(gold),
+            "generated": list(generated),
+            "token_acc": float(matches) / float(len(gold)) if gold else 0.0,
+            "exact": bool(exact_match),
+        })
+    generated_signatures = {tuple(row["generated"]) for row in rows}
+    return {
+        "enabled": bool(rows),
+        "skipped": not bool(rows),
+        "mode": str(mode),
+        "decode_objective": str(decode_objective),
+        "n_records": int(len(rows)),
+        "prompt_tokens": int(prompt_tokens),
+        "max_new_tokens": int(max_new_tokens),
+        "temperature": float(temperature),
+        "top_k": int(top_k),
+        "token_acc": (
+            float(total_matches) / float(total_gold) if total_gold else 0.0),
+        "exact": float(exact) / float(len(rows)) if rows else 0.0,
+        "unique_generation_count": int(len(generated_signatures)),
+        "all_generations_identical": (
+            bool(len(rows) > 1 and len(generated_signatures) == 1)),
+        "samples": rows,
+    }
+
+
+def multimodal_prompt_generation_report(
+        model, prompts, vocab, view_dims, mode="full", max_new_tokens=32,
+        temperature=0.0, top_k=0, device=DEV):
+    from .text import split_words
+
+    rows = []
+    model.eval()
+    for prompt in prompts or ():
+        prompt_tokens = tuple(split_words(str(prompt)))
+        if not prompt_tokens:
+            continue
+        generated = multimodal_generate_tokens(
+            model, vocab, prompt_tokens, view_dims=view_dims, views={},
+            decode_text_tokens=EMPTY_TEXT_TOKENS, mode=mode,
+            max_new_tokens=max_new_tokens, temperature=temperature,
+            top_k=top_k, device=device)
+        rows.append({
+            "prompt": str(prompt),
+            "prompt_tokens": list(prompt_tokens),
+            "generated": list(generated),
+        })
+    generated_signatures = {tuple(row["generated"]) for row in rows}
+    return {
+        "enabled": bool(rows),
+        "skipped": not bool(rows),
+        "mode": str(mode),
+        "max_new_tokens": int(max_new_tokens),
+        "temperature": float(temperature),
+        "top_k": int(top_k),
+        "unique_generation_count": int(len(generated_signatures)),
+        "all_generations_identical": (
+            bool(len(rows) > 1 and len(generated_signatures) == 1)),
+        "samples": rows,
+    }
+
+
 def _batch_from_records(records, vocab, device, view_dims,
                         decode_objective="target", return_decode_text=False):
     feature_rows = {name: [] for name in view_dims}
@@ -6217,7 +6381,10 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
 
 
 def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
-        checkpoint=None, out=None, **kwargs):
+        checkpoint=None, out=None, generation_n=0,
+        generation_prompt_tokens=16, generation_max_new_tokens=32,
+        generation_temperature=0.0, generation_top_k=0,
+        generate_prompts=None, **kwargs):
     model, vocab, records, train_records, eval_records, view_dims = train(
         manifest, root=root, steps=steps, seed=seed, device=device, **kwargs)
     decode_objective = str(
@@ -6231,6 +6398,29 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
                        decode_objective=decode_objective)
         for mode in active_modes
     }
+    generation_mode = "full" if "full" in active_modes else active_modes[0]
+    generation = (
+        multimodal_generation_eval(
+            model, eval_records, vocab, view_dims, n=generation_n,
+            seed=seed + 41, device=device, mode=generation_mode,
+            decode_objective=decode_objective,
+            prompt_tokens=generation_prompt_tokens,
+            max_new_tokens=generation_max_new_tokens,
+            temperature=generation_temperature, top_k=generation_top_k)
+        if int(generation_n) > 0 else {
+            "enabled": False, "skipped": True,
+            "skip_reason": "generation_n_is_zero",
+        })
+    prompt_generations = (
+        multimodal_prompt_generation_report(
+            model, generate_prompts, vocab, view_dims, mode=generation_mode,
+            max_new_tokens=generation_max_new_tokens,
+            temperature=generation_temperature, top_k=generation_top_k,
+            device=device)
+        if generate_prompts else {
+            "enabled": False, "skipped": True,
+            "skip_reason": "no_generate_prompts",
+        })
     latent_probe = {}
     if getattr(model, "latent_concept_memory", None) is not None:
         selected, latent_probe = latent_multimodal_graph_prediction_examples(
@@ -6290,6 +6480,8 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         "selection": getattr(model, "train_metrics", {}).get(
             "selection", {"enabled": False}),
         "teacher_forced": metrics,
+        "generation": generation,
+        "prompt_generations": prompt_generations,
         "latent_graph_probe": latent_probe,
         "latent_fer_probe": latent_fer_probe,
         "latent_fer_hard_probe": latent_fer_hard_probe,
@@ -7353,6 +7545,23 @@ def selftest():
             device="cpu", decode_objective="causal")
         assert list(causal_bundle["teacher_forced"]) == ["full"]
         assert causal_bundle["score_components"]["token_skipped"] is False
+        causal_generation = multimodal_generation_eval(
+            causal_model, causal_eval, causal_vocab, causal_dims, n=1,
+            device="cpu", decode_objective="causal", prompt_tokens=3,
+            max_new_tokens=4)
+        assert causal_generation["enabled"] is True
+        assert causal_generation["mode"] == "full"
+        assert causal_generation["unique_generation_count"] >= 1
+        assert isinstance(causal_generation["all_generations_identical"], bool)
+        assert causal_generation["samples"]
+        assert "generated" in causal_generation["samples"][0]
+        prompt_generation = multimodal_prompt_generation_report(
+            causal_model, ["def add"], causal_vocab, causal_dims,
+            device="cpu", max_new_tokens=4)
+        assert prompt_generation["enabled"] is True
+        assert prompt_generation["unique_generation_count"] >= 1
+        assert prompt_generation["samples"][0]["prompt_tokens"]
+        assert "generated" in prompt_generation["samples"][0]
         completion_model, *_ = train(
             manifest, steps=1, batch=2, d=32, layers=1, heads=4, device="cpu",
             objective_profile="manual",
@@ -7748,6 +7957,24 @@ def main(argv=None):
                     dest="text_arch")
     ap.add_argument("--modality-dropout", type=float, default=0.0, dest="modality_dropout")
     ap.add_argument("--eval-n", type=int, default=200, dest="eval_n")
+    ap.add_argument("--generation-n", type=int, default=0, dest="generation_n",
+                    help=("number of eval records to probe with free "
+                          "autoregressive continuation"))
+    ap.add_argument("--generation-prompt-tokens", type=int, default=16,
+                    dest="generation_prompt_tokens",
+                    help="number of gold tokens used as the generation prompt")
+    ap.add_argument("--generation-max-new-tokens", type=int, default=32,
+                    dest="generation_max_new_tokens",
+                    help="maximum continuation tokens to sample per prompt")
+    ap.add_argument("--generation-temperature", type=float, default=0.0,
+                    dest="generation_temperature",
+                    help="0 uses greedy continuation; positive values sample")
+    ap.add_argument("--generation-top-k", type=int, default=0,
+                    dest="generation_top_k",
+                    help="optional top-k sampling cap for generation")
+    ap.add_argument("--generate-prompt", action="append", default=None,
+                    dest="generate_prompts",
+                    help="free-form prompt to continue after training")
     ap.add_argument("--select-best", action=argparse.BooleanOptionalAction,
                     default=False, dest="select_best",
                     help="reload the best self-scored multimodal checkpoint")
@@ -7786,6 +8013,18 @@ def main(argv=None):
         ap.error("--text-min-tokens must be greater than one")
     if args.text_eval_frac < 0.0 or args.text_eval_frac >= 1.0:
         ap.error("--text-eval-frac must be in [0, 1)")
+    if args.eval_n < 0:
+        ap.error("--eval-n must be non-negative")
+    if args.generation_n < 0:
+        ap.error("--generation-n must be non-negative")
+    if args.generation_prompt_tokens <= 0:
+        ap.error("--generation-prompt-tokens must be positive")
+    if args.generation_max_new_tokens < 0:
+        ap.error("--generation-max-new-tokens must be non-negative")
+    if args.generation_temperature < 0.0:
+        ap.error("--generation-temperature must be non-negative")
+    if args.generation_top_k < 0:
+        ap.error("--generation-top-k must be non-negative")
     positive = {
         "--steps": args.steps, "--batch": args.batch, "--dim": args.d,
         "--layers": args.layers, "--heads": args.heads, "--max-len": args.max_len,
@@ -7975,7 +8214,13 @@ def main(argv=None):
     report = run(
         manifest, root=root, steps=args.steps, seed=args.seed,
         device=args.device, eval_n=args.eval_n, checkpoint=args.checkpoint,
-        out=args.out, batch=args.batch, d=args.d, lr=args.lr, layers=args.layers,
+        out=args.out, generation_n=args.generation_n,
+        generation_prompt_tokens=args.generation_prompt_tokens,
+        generation_max_new_tokens=args.generation_max_new_tokens,
+        generation_temperature=args.generation_temperature,
+        generation_top_k=args.generation_top_k,
+        generate_prompts=args.generate_prompts,
+        batch=args.batch, d=args.d, lr=args.lr, layers=args.layers,
         heads=args.heads, max_len=args.max_len, max_vocab=args.max_vocab,
         source_balance_w=args.source_balance_w,
         objective_profile=args.objective_profile,
