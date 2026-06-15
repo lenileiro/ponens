@@ -80,9 +80,9 @@ def payload(args):
         jobs.append(f"{PY}.tts --fetch --n-clips 6000")
         jobs.append(f"{PY}.tts_fast --train --steps 30000 --out runs/tts_fast.json --checkpoint runs/tts_fast.pt --synth-out data/synth")
     if args.job == "tts-ar":
-        jobs.append(f"{PY}.tts --fetch --n-clips 6000")
-        jobs.append(f"{PY}.tts_ar --train --steps 24000 --batch 96 --dim 512 --layers 6 --heads 8 "
-                    f"--out runs/tts_ar.json --checkpoint runs/tts_ar.pt --synth-out data/synth")
+        jobs.append(f"{PY}.tts --fetch --n-clips 13100 --byte-cap-gb 3.0")   # full LJSpeech
+        jobs.append(f"{PY}.tts_ar --train --steps 28000 --batch 384 --dim 768 --layers 8 --heads 12 "
+                    f"--lr 5e-4 --out runs/tts_ar.json --checkpoint runs/tts_ar.pt --synth-out data/synth")
     # non-fatal chaining: one job's failure must not kill the rest
     return " ; ".join(jobs)
 

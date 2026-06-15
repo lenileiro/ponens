@@ -306,6 +306,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--fetch", action="store_true")
     ap.add_argument("--n-clips", type=int, default=4000, dest="n_clips")
+    ap.add_argument("--byte-cap-gb", type=float, default=0.9, dest="byte_cap_gb")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--train", action="store_true")
     ap.add_argument("--steps", type=int, default=60000)
@@ -316,7 +317,7 @@ def main(argv=None):
     ap.add_argument("--say", default="")
     args = ap.parse_args(argv)
     if args.fetch:
-        fetch(n_clips=args.n_clips); return
+        fetch(n_clips=args.n_clips, byte_cap_gb=args.byte_cap_gb); return
     if args.selftest:
         selftest(); return
     if args.train:
