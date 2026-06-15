@@ -1,0 +1,11 @@
+{
+ "experiment": "knnvc_pretrained_wavlm",
+ "topk": 4,
+ "n": 149,
+ "errors": 1,
+ "n_holdout_speakers": 8,
+ "voice_chance": 0.125,
+ "voice_match": 0.5302013422818792,
+ "stayed_source": 0.0738255033557047,
+ "works": true
+}

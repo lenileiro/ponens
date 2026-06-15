@@ -90,6 +90,15 @@ def should_checkpoint_blocks(module):
     return bool(getattr(module, "checkpoint_blocks", False)
                 and module.training and torch.is_grad_enabled())
 
+
+def append_jsonl_row(path, row, mode="a"):
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, mode, encoding="utf-8") as f:
+        f.write(json.dumps(row, sort_keys=True) + "\n")
+
+
 class SemanticAutoencoder(nn.Module):
     """Small convolutional autoencoder for manifest image latents."""
 
@@ -12348,6 +12357,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       flow_cache_dir="", flow_cache_shard_size=1024, flow_cache_dtype="fp32",
                       flow_cache_max_loaded_shards=0,
                       resume_checkpoint="",
+                      train_progress_out="", train_progress_interval=0,
                       return_conditioner=False, return_ema=False, return_aligner=False):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -12636,6 +12646,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         flow_decoded_endpoint_patch_structure_w)
     flow_decoded_endpoint_patch_structure_size = int(
         flow_decoded_endpoint_patch_structure_size)
+    train_progress_out = str(train_progress_out or "")
+    train_progress_interval = max(0, int(train_progress_interval or 0))
     if flow_decoded_endpoint_w < 0.0:
         raise ValueError("flow_decoded_endpoint_w must be non-negative")
     if flow_decoded_endpoint_p < 0.0 or flow_decoded_endpoint_p > 1.0:
@@ -13032,6 +13044,40 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     last_ae = {}
     ae_train_steps_run = 0
     autoencoder_recon_preflight_report = {}
+
+    def emit_train_progress(stage, step, steps, metrics=None, event="progress", mode="a"):
+        if not train_progress_out:
+            return
+        row = {
+            "event": event,
+            "stage": stage,
+            "step": int(step),
+            "steps": int(steps),
+            "records": int(len(image_records)),
+            "ae_steps": int(ae_steps),
+            "flow_steps": int(flow_steps),
+            "flow_distill_steps": int(flow_distill_steps),
+            "batch": int(batch),
+            "size_buckets": [image_size_key(bucket) for bucket in train_size_buckets],
+            "caption_cond_source": str(caption_cond_source),
+            "flow_cache_requested": bool(flow_cache_latents),
+            "resume_checkpoint": str(resume_checkpoint or ""),
+        }
+        if metrics:
+            row.update(metrics)
+        append_jsonl_row(train_progress_out, row, mode=mode)
+
+    def should_emit_progress(step, steps):
+        step = int(step)
+        steps = int(steps)
+        return (
+            train_progress_interval > 0
+            and (step == 1 or step >= steps
+                 or step % int(train_progress_interval) == 0)
+        )
+
+    emit_train_progress("train", 0, max(int(ae_steps) + int(flow_steps), 0),
+                        event="train_start", mode="w")
     for _ in range(ae_steps if opt_ae is not None else 0):
         ae_train_steps_run += 1
         opt_ae.zero_grad(set_to_none=True)
@@ -13109,6 +13155,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             last_ae["grad_norm"] = float(grad_norm.detach().cpu())
         scaler.step(opt_ae)
         scaler.update()
+        if should_emit_progress(ae_train_steps_run, ae_steps):
+            emit_train_progress("autoencoder", ae_train_steps_run, ae_steps, {
+                "last_ae": last_ae,
+                "size_bucket_sample_counts": dict(size_bucket_sample_counts),
+            })
 
     autoencoder_recon_gate_enabled = any(
         value is not None for value in autoencoder_recon_gate_thresholds.values())
@@ -13342,6 +13393,13 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             scaler.step(opt_quality)
             scaler.update()
             quality_score_steps_run += 1
+            if should_emit_progress(quality_score_steps_run, quality_score_steps):
+                emit_train_progress(
+                    "quality_score", quality_score_steps_run,
+                    quality_score_steps, {
+                        "last_quality_score": last_quality_score,
+                        "size_bucket_sample_counts": dict(size_bucket_sample_counts),
+                    })
 
     if image_quality_scorer is not None:
         image_quality_scorer.eval()
@@ -13759,6 +13817,28 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             update_ema_state(flow_ema, flow, last_ema_decay)
             if conditioner is not None:
                 update_ema_state(conditioner_ema, conditioner, last_ema_decay)
+        flow_step_num = int(flow_step) + 1
+        if should_emit_progress(flow_step_num, flow_steps):
+            emit_train_progress("flow", flow_step_num, flow_steps, {
+                "last_flow": last_flow,
+                "flow_ema_updates": int(ema_updates),
+                "flow_ema_effective_decay": float(last_ema_decay),
+                "flow_decoded_endpoint_microbatches": int(
+                    flow_decoded_endpoint_microbatches),
+                "flow_decoded_endpoint_active_microbatches": int(
+                    flow_decoded_endpoint_active_microbatches),
+                "flow_decoded_endpoint_real_target_microbatches": int(
+                    flow_decoded_endpoint_real_target_microbatches),
+                "flow_decoded_endpoint_codec_target_microbatches": int(
+                    flow_decoded_endpoint_codec_target_microbatches),
+                "flow_decoded_endpoint_real_target_frac": (
+                    float(flow_decoded_endpoint_real_target_microbatches)
+                    / float(max(1, flow_decoded_endpoint_active_microbatches))
+                ),
+                "flow_decoded_endpoint_cache_target_misses": int(
+                    flow_decoded_endpoint_cache_target_misses),
+                "size_bucket_sample_counts": dict(size_bucket_sample_counts),
+            })
 
     last_distill = {}
     flow_distill_steps_run = 0
@@ -13851,6 +13931,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                 update_ema_state(flow_ema, flow, last_ema_decay)
                 if conditioner is not None:
                     update_ema_state(conditioner_ema, conditioner, last_ema_decay)
+            if should_emit_progress(flow_distill_steps_run, flow_distill_steps):
+                emit_train_progress("flow_distill", flow_distill_steps_run,
+                                    flow_distill_steps, {
+                                        "last_distill": last_distill,
+                                        "flow_ema_updates": int(ema_updates),
+                                        "flow_ema_effective_decay": float(last_ema_decay),
+                                        "size_bucket_sample_counts": dict(
+                                            size_bucket_sample_counts),
+                                    })
 
     if conditioner is not None:
         conditioner.eval()
