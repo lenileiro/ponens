@@ -61,6 +61,9 @@ learning events also add replay reasons to the selected study records, so contin
 chunks tied to actual weight movement and internal reorganization. During checkpoint continuation,
 the mastery profile now includes those replay-bank rows in the primary self-supervised study pool
 and samples priority rows more often, while acceptance is still scored on the new reading corpus.
+Raw-reading vocabularies are capped by default with frequency-based retention
+(`--reading-max-vocab`, set `0` to disable), preserving known checkpoint tokens while mapping the
+long tail to `<unk>` instead of growing the embedding table for every one-off corpus token.
 Use
 `manual` for exact low-level
 ablations.

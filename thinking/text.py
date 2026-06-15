@@ -71,6 +71,7 @@ READING_REPLAY_BANK_VERSION = 1
 READING_REPLAY_BANK_SIZE = 128
 READING_MASTERY_HISTORY_VERSION = 1
 READING_MASTERY_HISTORY_SIZE = 32
+READING_DEFAULT_MAX_VOCAB = 32768
 READING_MASTERY_SCORE_KEYS = (
     "score", "mastery_score", "active_mean_score", "signal_coverage",
     "balanced_score", "floor_score", "view_score", "fer_score",
@@ -938,10 +939,20 @@ def _read_text_source(source, timeout=300):
         return f.read()
 
 
-def build_reading_vocab(records, base_vocab=None):
+def build_reading_vocab(records, base_vocab=None, max_size=None):
+    max_size = int(max_size or 0)
     if base_vocab is not None:
         itos = list(base_vocab.itos)
         seen = set(itos)
+        if max_size > 0 and len(itos) >= max_size:
+            return vocab_from_itos(itos)
+        if max_size > 0:
+            from collections import Counter
+            budget = max(0, max_size - len(itos))
+            counts = Counter(
+                tok for rec in records for tok in rec.tokens if tok not in seen)
+            new = sorted(tok for tok, _ in counts.most_common(budget))
+            return vocab_from_itos(itos + new)
         new = []
         for rec in records:
             for tok in rec.tokens:
@@ -952,7 +963,7 @@ def build_reading_vocab(records, base_vocab=None):
     toks = []
     for rec in records:
         toks += list(rec.tokens)
-    return Vocab(toks)
+    return Vocab(toks, max_size=max_size)
 
 
 def vocab_from_itos(itos):
@@ -6776,11 +6787,12 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            study_self_teach_w=0.0,
                            self_teach_history_prior=None,
                            self_teach_history_prior_w=0.5,
-                           eval_n=64):
+                           eval_n=64,
+                           max_vocab=READING_DEFAULT_MAX_VOCAB):
     if int(latent_concept_slots) <= 0:
         raise ValueError("raw reading concept training requires latent_concept_slots > 0")
     torch.manual_seed(seed)
-    vocab = build_reading_vocab(records)
+    vocab = build_reading_vocab(records, max_size=max_vocab)
     model = TextReadingLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
                        text_encoder_arch=text_encoder_arch,
                        text_encoder_layers=text_encoder_layers,
@@ -7139,12 +7151,14 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          reading_objective_profile="manual",
                          reading_objective_profile_report=None,
                          text_field="text", max_tokens=128, min_tokens=8,
-                         eval_frac=0.10, eval_n=64, out=None, checkpoint=None):
+                         eval_frac=0.10, eval_n=64,
+                         max_vocab=READING_DEFAULT_MAX_VOCAB,
+                         out=None, checkpoint=None):
     records = load_reading_records(
         data, text_field=text_field, max_tokens=max_tokens, min_tokens=min_tokens,
         eval_frac=eval_frac, seed=seed)
     torch.manual_seed(seed)
-    vocab = build_reading_vocab(records)
+    vocab = build_reading_vocab(records, max_size=max_vocab)
     model = TextReadingLM(len(vocab), d=d, layers=layers, heads=heads, pad=vocab.pad,
                        text_encoder_arch=text_encoder_arch,
                        text_encoder_layers=text_encoder_layers,
@@ -7557,6 +7571,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "reading_replay_bank": {},
               "train_records": sum(r.split == "train" for r in records),
               "eval_records": sum(r.split == "eval" for r in records),
+              "max_vocab": int(max_vocab or 0),
+              "vocab_capped": bool(max_vocab and int(max_vocab) > 0),
               "vocab_size": len(vocab),
               "before": before,
               "after": after,
@@ -7686,9 +7702,11 @@ def expanded_reading_checkpoint_model(checkpoint, reading_records, device=DEV,
                                       latent_concept_prefix=None,
                                       latent_concept_refine=None,
                                       latent_concept_refine_gate_init=None,
-                                      latent_concept_memory_size=None):
+                                      latent_concept_memory_size=None,
+                                      max_vocab=READING_DEFAULT_MAX_VOCAB):
     src_model, src_vocab, ckpt = load_checkpoint(checkpoint, device=device)
-    vocab = build_reading_vocab(reading_records, base_vocab=src_vocab)
+    vocab = build_reading_vocab(
+        reading_records, base_vocab=src_vocab, max_size=max_vocab)
     ckpt_slots = int(getattr(src_model, "latent_concept_slots", 0)
                      or ckpt.get("latent_concept_slots", 0))
     slots = int(latent_concept_slots or ckpt_slots
@@ -7821,6 +7839,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              self_teach_history_prior_w=0.5,
                              text_field="text", max_tokens=128, min_tokens=8,
                              eval_frac=0.10, eval_n=64,
+                             max_vocab=READING_DEFAULT_MAX_VOCAB,
                              latent_concept_slots=0, latent_concept_layers=None,
                              latent_concept_topk=None,
                              latent_concept_prefix=None,
@@ -7862,7 +7881,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         latent_concept_prefix=latent_concept_prefix,
         latent_concept_refine=latent_concept_refine,
         latent_concept_refine_gate_init=latent_concept_refine_gate_init,
-        latent_concept_memory_size=memory_size)
+        latent_concept_memory_size=memory_size,
+        max_vocab=max_vocab)
     self_teach_history_prior = reading_mastery_history_self_teach_prior(
         reading_mastery_history_from_payload(ckpt),
         enabled=(str(reading_objective_profile) == "mastery"
@@ -8344,6 +8364,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "replay_train_records": sum(r.split == "train" for r in replay_records),
               "replay_eval_records": sum(r.split == "eval" for r in replay_records),
               "old_vocab_size": old_vocab_size,
+              "max_vocab": int(max_vocab or 0),
+              "vocab_capped": bool(max_vocab and int(max_vocab) > 0),
               "new_vocab_size": len(vocab),
               "new_tokens": max(0, len(vocab) - old_vocab_size),
               "before": before,
@@ -8562,6 +8584,23 @@ def selftest():
                       meta={"source": "selftest-eval", "chunk_index": 2}),
     ]
     reading_vocab = build_reading_vocab(reading_records)
+    cap_records = [
+        ReadingRecord(
+            "vocab-cap", "train",
+            tuple(["common"] * 6 + [f"rare{i}" for i in range(20)])),
+    ]
+    capped_vocab = build_reading_vocab(cap_records, max_size=10)
+    assert len(capped_vocab) <= 10
+    assert "common" in capped_vocab.stoi
+    assert capped_vocab.enc(["rare19"])[0] == capped_vocab.unk
+    base_vocab = build_reading_vocab([
+        ReadingRecord("vocab-base", "train", ("base_token",)),
+    ], max_size=0)
+    expanded_vocab = build_reading_vocab(
+        cap_records, base_vocab=base_vocab, max_size=len(base_vocab) + 1)
+    assert "base_token" in expanded_vocab.stoi
+    assert "common" in expanded_vocab.stoi
+    assert expanded_vocab.enc(["rare19"])[0] == expanded_vocab.unk
     reading_model = TextReadingLM(
         len(reading_vocab), d=32, layers=1, heads=4, pad=reading_vocab.pad,
         latent_concept_slots=2, latent_concept_memory_size=8).to("cpu")
@@ -9413,6 +9452,8 @@ def selftest():
         assert os.path.exists(studied_ckpt)
         assert os.path.exists(study_out)
         assert study_report["new_vocab_size"] >= study_report["old_vocab_size"]
+        assert study_report["max_vocab"] == READING_DEFAULT_MAX_VOCAB
+        assert study_report["vocab_capped"] is True
         assert study_report["new_tokens"] > 0
         assert study_report["discovery_w"] == 0.05
         assert study_report["reanalysis_w"] == 0.05
@@ -9514,6 +9555,10 @@ def _add_reading_args(ap):
                           "schema-free concept/self-teach floors"))
     ap.add_argument("--reading-text-field", default="text")
     ap.add_argument("--reading-max-tokens", type=int, default=128)
+    ap.add_argument("--reading-max-vocab", type=int,
+                    default=READING_DEFAULT_MAX_VOCAB,
+                    help=("maximum raw-reading vocabulary size; 0 disables "
+                          "frequency capping"))
     ap.add_argument("--reading-min-tokens", type=int, default=8)
     ap.add_argument("--reading-eval-frac", type=float, default=0.10)
     ap.add_argument("--reading-eval-n", type=int, default=64)
@@ -9778,6 +9823,7 @@ def _reading_kwargs(args):
                   study_self_teach_w=args.reading_study_self_teach_w,
                   text_field=args.reading_text_field,
                   max_tokens=args.reading_max_tokens,
+                  max_vocab=args.reading_max_vocab,
                   min_tokens=args.reading_min_tokens,
                   eval_frac=args.reading_eval_frac,
                   eval_n=args.reading_eval_n)
@@ -9821,6 +9867,8 @@ def main(argv=None):
         return
     if args.latent_concept_topk < 0:
         raise SystemExit("--latent-concept-topk must be non-negative")
+    if args.reading_max_vocab < 0:
+        raise SystemExit("--reading-max-vocab must be non-negative")
     if args.reading_self_teach_history_prior_w < 0.0:
         raise SystemExit("--reading-self-teach-history-prior-w must be non-negative")
     if args.reading_study_representation_accept_w < 0.0:
