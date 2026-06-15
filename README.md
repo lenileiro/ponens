@@ -159,6 +159,8 @@ installs those when this path is active.
     --sample-grid-out runs/image_manifest_eval_grid.ppm \
     --sample-manifest-out data/images/generated_captioned.jsonl \
     --eval-out runs/image_manifest_mmdit_sweep.json
+# `--sample-grid-out` writes real PNG/JPEG/WebP files when the path uses those extensions;
+# `.ppm` remains the dependency-light raw grid format.
 .venv/bin/python -m thinking.image_embed --manifest data/images/generated_captioned.jsonl \
     --root data/images --backend hf --model google/siglip-base-patch16-224 \
     --features both --text-embed-mode pooled --batch 64 --device cuda \

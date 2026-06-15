@@ -8967,8 +8967,41 @@ def evaluate_autoencoder_reconstruction_records(
     return report
 
 
+def sample_image_format_for_path(path):
+    ext = os.path.splitext(str(path).lower())[1]
+    if ext == ".png":
+        return "png"
+    if ext in (".jpg", ".jpeg"):
+        return "jpeg"
+    if ext == ".webp":
+        return "webp"
+    return "ppm"
+
+
+def write_rgb_image(arr, path, image_format):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if image_format == "ppm":
+        h, w, _c = arr.shape
+        with open(path, "wb") as f:
+            f.write(f"P6\n{w} {h}\n255\n".encode("ascii"))
+            f.write(arr.tobytes())
+        return
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError(
+            f"writing {image_format} sample grids requires Pillow"
+        ) from exc
+    save_format = {
+        "png": "PNG",
+        "jpeg": "JPEG",
+        "webp": "WEBP",
+    }[image_format]
+    Image.fromarray(arr).save(path, format=save_format)
+
+
 def write_ppm_grid(samples, path, rows, cols, pad=2, bg=32):
-    """Write a binary PPM grid without image-library dependencies."""
+    """Write a sample grid, using the requested file extension when supported."""
     arr = _rgb8_from_samples(samples)
     n, h, w, c = arr.shape
     if c != 3:
@@ -8988,10 +9021,8 @@ def write_ppm_grid(samples, path, rows, cols, pad=2, bg=32):
         y0 = r * (h + pad)
         x0 = col * (w + pad)
         grid[y0:y0 + h, x0:x0 + w] = arr[idx]
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(f"P6\n{out_w} {out_h}\n255\n".encode("ascii"))
-        f.write(grid.tobytes())
+    image_format = sample_image_format_for_path(path)
+    write_rgb_image(grid, path, image_format)
     return {
         "sample_grid": path,
         "sample_grid_rows": rows,
@@ -9000,7 +9031,7 @@ def write_ppm_grid(samples, path, rows, cols, pad=2, bg=32):
         "sample_grid_tile_h": int(h),
         "sample_grid_tile_w": int(w),
         "sample_grid_pad": pad,
-        "sample_grid_format": "ppm",
+        "sample_grid_format": image_format,
     }
 
 
@@ -14776,6 +14807,16 @@ def selftest():
         assert meta["sample_grid_trace_self_condition_updates"] >= 1
         assert meta["sample_grid_trace_self_condition_rollbacks"] >= 0
         assert os.path.exists(sample_path)
+        assert meta["sample_grid_format"] == "ppm"
+        with open(sample_path, "rb") as f:
+            assert f.read(2) == b"P6"
+        png_sample_path = os.path.join(td, "samples.png")
+        png_meta = write_ppm_grid(
+            torch.zeros((1, 3, 4, 4), dtype=torch.float32),
+            png_sample_path, rows=1, cols=1)
+        assert png_meta["sample_grid_format"] == "png"
+        with open(png_sample_path, "rb") as f:
+            assert f.read(8) == b"\x89PNG\r\n\x1a\n"
         reference_sample_path = os.path.join(td, "reference_samples.ppm")
         reference_manifest_out = os.path.join(td, "reference_samples.jsonl")
         reference_meta = save_reference_reproduction_grid(
