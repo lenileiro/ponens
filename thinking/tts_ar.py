@@ -33,6 +33,8 @@ from .realvoice import SR, N_BINS
 from .tts import ROOT, MAX_T, MAX_CH, encode_text, load, spec_of, CharEncoder, guided_attention_loss
 
 DEV = get_device()
+R = 3                # reduction factor: frames predicted per decoder step (drift/speed fix)
+NOISE = 0.25         # teacher-forcing input noise std (exposure-bias fix)
 
 
 def sinusoidal(T, d, device):
@@ -66,13 +68,13 @@ class DecoderLayer(nn.Module):
 
 
 class TransformerTTS(nn.Module):
-    def __init__(self, d=256, n_bins=N_BINS, layers=4, heads=4):
+    def __init__(self, d=256, n_bins=N_BINS, layers=4, heads=4, r=R):
         super().__init__()
-        self.d = d
+        self.d = d; self.r = r; self.n_bins = n_bins
         self.enc = CharEncoder(d)
         self.prenet = nn.Sequential(nn.Linear(n_bins, 256), nn.ReLU(), nn.Linear(256, d), nn.ReLU())
         self.layers = nn.ModuleList([DecoderLayer(d, heads) for _ in range(layers)])
-        self.out = nn.Linear(d, n_bins)
+        self.out = nn.Linear(d, r * n_bins)                  # predict r frames per step
         self.stop = nn.Linear(d, 1)
         pn, ch = [], 256
         for i in range(5):
@@ -87,56 +89,69 @@ class TransformerTTS(nn.Module):
         x = F.dropout(F.relu(self.prenet[0](x)), 0.5, training=True)
         return F.dropout(F.relu(self.prenet[2](x)), 0.5, training=True)
 
-    def decode(self, ids, mel_in):
-        """Teacher-forced, PARALLEL over time. ids (B,L), mel_in (B,n_bins,T) -> mel, stop, align."""
-        B, _, T = mel_in.shape
-        mem = self.enc(ids); mem_pad = ids.eq(0)
-        x = self.prenet_do(mel_in.transpose(1, 2)) + sinusoidal(T, self.d, ids.device)[None]
-        causal = torch.triu(torch.full((T, T), float("-inf"), device=ids.device), 1)
+    def _run(self, group_in, mem, mem_pad):
+        """group_in (B,Tg,n_bins) -> decoder states (B,Tg,d) + cross-attn weights per layer."""
+        Tg = group_in.shape[1]
+        x = self.prenet_do(group_in) + sinusoidal(Tg, self.d, group_in.device)[None]
+        causal = torch.triu(torch.full((Tg, Tg), float("-inf"), device=group_in.device), 1)
         ws = []
         for layer in self.layers:
-            x, w = layer(x, mem, causal, mem_pad)
-            ws.append(w)
-        coarse = self.out(x).transpose(1, 2)                 # (B,n_bins,T)
+            x, w = layer(x, mem, causal, mem_pad); ws.append(w)
+        return x, ws
+
+    def decode(self, ids, mel):
+        """Teacher-forced, PARALLEL. ids (B,L), mel (B,n_bins,T) [T divisible by r]
+        -> coarse, refined (B,n_bins,T), stop (B,Tg), aligns (list of (B,Tg,L))."""
+        B, nb, T = mel.shape; Tg = T // self.r
+        mem = self.enc(ids); mem_pad = ids.eq(0)
+        last = mel[:, :, self.r - 1::self.r]                          # last frame of each group (B,nb,Tg)
+        start = torch.zeros(B, nb, 1, device=ids.device)
+        group_in = torch.cat([start, last[:, :, :-1]], 2).transpose(1, 2)   # (B,Tg,nb) prev-group last
+        if self.training and NOISE > 0:
+            group_in = group_in + NOISE * torch.randn_like(group_in)  # exposure-bias robustness
+        x, ws = self._run(group_in, mem, mem_pad)
+        coarse = self.out(x).reshape(B, Tg, self.r, nb).permute(0, 3, 1, 2).reshape(B, nb, Tg * self.r)
         refined = coarse + self.postnet(coarse)
-        return coarse, refined, self.stop(x).squeeze(-1), ws  # ws: list of (B,T,L) per layer
+        return coarse, refined, self.stop(x).squeeze(-1), ws
 
     @torch.no_grad()
     def infer(self, ids, max_T=MAX_T, stop_thresh=0.5):
         self.eval()
         mem = self.enc(ids); mem_pad = ids.eq(0)
         B = ids.shape[0]
-        frames = torch.zeros(B, N_BINS, 1, device=ids.device)   # start frame
-        for t in range(max_T):
-            mel_in = frames
-            T = mel_in.shape[2]
-            x = self.prenet_do(mel_in.transpose(1, 2)) + sinusoidal(T, self.d, ids.device)[None]
-            causal = torch.triu(torch.full((T, T), float("-inf"), device=ids.device), 1)
-            for layer in self.layers:
-                x, _ = layer(x, mem, causal, mem_pad)
-            nxt = self.out(x[:, -1])                           # next coarse frame (B,n_bins)
-            frames = torch.cat([frames, nxt[:, :, None]], -1)
-            if t > 8 and torch.sigmoid(self.stop(x[:, -1])).max().item() > stop_thresh:
+        group_in = torch.zeros(B, 1, self.n_bins, device=ids.device)  # start frame (one group input)
+        outs = []
+        for k in range(max_T // self.r):
+            x, _ = self._run(group_in, mem, mem_pad)
+            nxt = self.out(x[:, -1]).reshape(B, self.r, self.n_bins)   # r frames (B,r,nb)
+            outs.append(nxt)
+            group_in = torch.cat([group_in, nxt[:, -1:, :]], 1)        # feed last frame of group
+            if k > 4 and torch.sigmoid(self.stop(x[:, -1])).max().item() > stop_thresh:
                 break
-        coarse = frames[:, :, 1:]                              # drop start frame
-        return coarse + self.postnet(coarse)                   # refined
+        coarse = torch.cat(outs, 1).transpose(1, 2)                    # (B,nb,T)
+        return coarse + self.postnet(coarse)
 
 
 def _batch(data, rng, batch, device):
     items = [data[int(rng.integers(len(data)))] for _ in range(batch)]
     specs = [spec_of(w, device)[:, :MAX_T] for _, w in items]
     ids = [encode_text(t) for t, _ in items]
-    Lc = max(len(i) for i in ids); Tt = max(s.shape[1] for s in specs)
+    Lc = max(len(i) for i in ids)
+    Tt = max(s.shape[1] for s in specs)
+    Tt = ((Tt + R - 1) // R) * R                              # pad time to multiple of r
+    Tg = Tt // R
     idt = torch.zeros(batch, Lc, dtype=torch.long, device=device)
     mel = torch.zeros(batch, N_BINS, Tt, device=device)
-    stop = torch.zeros(batch, Tt, device=device)
+    stop = torch.zeros(batch, Tg, device=device)              # group-level stop target
     ids_len = torch.zeros(batch, dtype=torch.long, device=device)
     mel_len = torch.zeros(batch, dtype=torch.long, device=device)
+    grp_len = torch.zeros(batch, dtype=torch.long, device=device)
     for b, (i, s) in enumerate(zip(ids, specs)):
         idt[b, :len(i)] = torch.tensor(i, device=device); ids_len[b] = len(i)
         mel[b, :, :s.shape[1]] = s; mel_len[b] = s.shape[1]
-        stop[b, s.shape[1] - 1:] = 1.0
-    return idt, mel, stop, ids_len, mel_len
+        g = (s.shape[1] + R - 1) // R; grp_len[b] = g
+        stop[b, g - 1:] = 1.0
+    return idt, mel, stop, ids_len, mel_len, grp_len
 
 
 def train(steps=60000, seed=0, device=DEV, batch=16, lr=3e-4, ckpt_path=None, save_dir=None):
@@ -145,16 +160,14 @@ def train(steps=60000, seed=0, device=DEV, batch=16, lr=3e-4, ckpt_path=None, sa
     model = TransformerTTS().to(device); model.train()
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     for st in range(1, steps + 1):
-        idt, mel, stop, ids_len, mel_len = _batch(train_data, rng, batch, device)
-        T = mel.shape[1] if False else mel.shape[2]
-        mel_in = F.pad(mel, (1, 0))[:, :, :-1]               # shift for teacher forcing
-        coarse, refined, stop_logit, aligns = model.decode(idt, mel_in)
+        idt, mel, stop, ids_len, mel_len, grp_len = _batch(train_data, rng, batch, device)
+        coarse, refined, stop_logit, aligns = model.decode(idt, mel)
         mmask = (torch.arange(mel.shape[2], device=device)[None] < mel_len[:, None]).float()
         l_mel = sum((F.l1_loss(p, mel, reduction="none").mean(1) * mmask).sum() / mmask.sum()
                     for p in (coarse, refined))
         l_stop = F.binary_cross_entropy_with_logits(stop_logit, stop)
         # guided attention on EVERY decoder layer's cross-attn -> all layers must align (no AR-cheat)
-        l_ga = sum(guided_attention_loss(al[b:b + 1], int(ids_len[b]), int(mel_len[b]))
+        l_ga = sum(guided_attention_loss(al[b:b + 1], int(ids_len[b]), int(grp_len[b]))
                    for al in aligns for b in range(idt.shape[0])) / (idt.shape[0] * len(aligns))
         (l_mel + l_stop + 5.0 * l_ga).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -192,9 +205,8 @@ def evaluate(model, data, device=DEV, n=80, seed=1):
     model.eval(); errs, focus = [], []
     with torch.no_grad():
         for _ in range(min(n, len(eval_data) * 2)):
-            idt, mel, stop, ids_len, mel_len = _batch(eval_data, rng, 1, device)
-            mel_in = F.pad(mel, (1, 0))[:, :, :-1]
-            _, refined, _, aligns = model.decode(idt, mel_in)
+            idt, mel, stop, ids_len, mel_len, grp_len = _batch(eval_data, rng, 1, device)
+            _, refined, _, aligns = model.decode(idt, mel)
             mmask = (torch.arange(mel.shape[2], device=device)[None] < mel_len[:, None]).float()
             errs.append(float((F.l1_loss(refined, mel, reduction="none").mean(1) * mmask).sum() / mmask.sum()))
             focus.append(float(aligns[-1].max(-1).values.mean()))
@@ -219,9 +231,10 @@ def selftest():
     a, b = encode_text("hello world"), encode_text("a test.")
     L = max(len(a), len(b))
     ids = torch.tensor([a + [0] * (L - len(a)), b + [0] * (L - len(b))])
-    mel_in = torch.randn(2, N_BINS, 20)
-    coarse, refined, stoplg, aligns = m.decode(ids, mel_in)
-    assert coarse.shape == (2, N_BINS, 20) and aligns[-1].shape == (2, 20, L) and stoplg.shape == (2, 20)
+    mel = torch.randn(2, N_BINS, 24)                          # T divisible by R
+    Tg = 24 // R
+    coarse, refined, stoplg, aligns = m.decode(ids, mel)
+    assert coarse.shape == (2, N_BINS, 24) and aligns[-1].shape == (2, Tg, L) and stoplg.shape == (2, Tg)
     out = m.infer(ids[:1], max_T=12); assert out.shape[0] == 1 and out.shape[1] == N_BINS
     if os.path.exists(os.path.join(ROOT, "manifest.json")):
         data = load(); assert data
