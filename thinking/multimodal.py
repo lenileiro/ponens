@@ -122,6 +122,27 @@ MULTIMODAL_SELF_TEACH_WEIGHT_KEYS = tuple(dict.fromkeys([
     for keys in MULTIMODAL_SELF_TEACH_SIGNAL_OBJECTIVES.values()
     for key in keys
 ] + ["latent_concept_w"]))
+MULTIMODAL_LATENT_SELF_TEACH_WEIGHT_KEYS = tuple(
+    key for key in MULTIMODAL_SELF_TEACH_WEIGHT_KEYS
+    if key.startswith("latent_concept_"))
+
+
+def multimodal_self_teach_available_objectives(latent_concept_slots=0,
+                                               active_mode_count=1):
+    available = {
+        "decode_w",
+        "continuation_repair_w",
+        "repetition_unlikelihood_w",
+    }
+    if int(active_mode_count) > 1:
+        available.add("agreement_w")
+    if int(latent_concept_slots) > 0:
+        available.update(MULTIMODAL_LATENT_SELF_TEACH_WEIGHT_KEYS)
+    return tuple(
+        key for key in MULTIMODAL_SELF_TEACH_WEIGHT_KEYS
+        if key in available)
+
+
 MULTIMODAL_TEXT_HISTORY_SIGNAL_KEYS = {
     "token": ("language_score", "lm_token_acc"),
     "mode_floor": ("signal_coverage", "balanced_score", "floor_score"),
@@ -4079,7 +4100,8 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
 
 def multimodal_self_teach_weight_plan(score_components, budget=0.0,
                                       history_prior=None,
-                                      history_prior_w=0.5):
+                                      history_prior_w=0.5,
+                                      available_objectives=None):
     budget = float(budget)
     if budget < 0.0:
         raise ValueError("multimodal self-teach budget must be non-negative")
@@ -4094,8 +4116,15 @@ def multimodal_self_teach_weight_plan(score_components, budget=0.0,
     concept_connection_signal = max(
         0.0, _mm_float(history_prior.get("concept_connection_signal", 0.0)))
     extras = {key: 0.0 for key in MULTIMODAL_SELF_TEACH_WEIGHT_KEYS}
+    if available_objectives is None:
+        available = set(MULTIMODAL_SELF_TEACH_WEIGHT_KEYS)
+    else:
+        available = {
+            str(key) for key in available_objectives
+            if str(key) in MULTIMODAL_SELF_TEACH_WEIGHT_KEYS}
     deficits = {}
     current_deficits = {}
+    unavailable = {}
     active = []
     score_components = dict(score_components or {})
     for signal in MULTIMODAL_SELF_TEACH_SIGNALS:
@@ -4115,13 +4144,23 @@ def multimodal_self_teach_weight_plan(score_components, budget=0.0,
         deficit = max(current_deficit, history_prior_w * history_deficit)
         current_deficits[signal] = float(current_deficit)
         deficits[signal] = float(deficit)
+        objectives = tuple(
+            key for key in MULTIMODAL_SELF_TEACH_SIGNAL_OBJECTIVES[signal]
+            if key in available)
+        if not objectives:
+            if deficit > 0.0:
+                unavailable[signal] = {
+                    "deficit": float(deficit),
+                    "objectives": list(
+                        MULTIMODAL_SELF_TEACH_SIGNAL_OBJECTIVES[signal]),
+                }
+            continue
         if deficit > 0.0:
-            active.append((signal, deficit))
-    total_deficit = sum(deficit for _signal, deficit in active)
+            active.append((signal, deficit, objectives))
+    total_deficit = sum(deficit for _signal, deficit, _objectives in active)
     if budget > 0.0 and total_deficit > 0.0:
-        for signal, deficit in active:
+        for signal, deficit, objectives in active:
             signal_budget = budget * deficit / total_deficit
-            objectives = MULTIMODAL_SELF_TEACH_SIGNAL_OBJECTIVES[signal]
             objective_share = signal_budget / float(len(objectives))
             for key in objectives:
                 extras[key] += objective_share
@@ -4144,13 +4183,17 @@ def multimodal_self_teach_weight_plan(score_components, budget=0.0,
         "history_prior_top_signal": history_prior.get("top_signal"),
         "history_prior_w": float(history_prior_w),
         "history_concept_connection_signal": float(concept_connection_signal),
-        "active_signals": [signal for signal, _deficit in active],
+        "available_objectives": [
+            key for key in MULTIMODAL_SELF_TEACH_WEIGHT_KEYS if key in available],
+        "unavailable_signals": unavailable,
+        "active_signals": [signal for signal, _deficit, _objectives in active],
         "weight_extras": {key: float(value) for key, value in extras.items()},
     }
 
 
 def multimodal_self_teach_weight_maps(score_components=None, budget=0.0,
                                       history_prior=None, history_prior_w=0.5,
+                                      available_objectives=None,
                                       **base_weights):
     budget = float(budget)
     if budget < 0.0:
@@ -4173,7 +4216,8 @@ def multimodal_self_teach_weight_maps(score_components=None, budget=0.0,
             "multimodal self-teach needs score components when budget is positive")
     plan = multimodal_self_teach_weight_plan(
         score_components, budget=budget,
-        history_prior=history_prior, history_prior_w=history_prior_w)
+        history_prior=history_prior, history_prior_w=history_prior_w,
+        available_objectives=available_objectives)
     extras = plan["weight_extras"]
     effective = {
         key: float(base[key]) + float(extras.get(key, 0.0))
@@ -5440,8 +5484,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         raise ValueError("latent concept consolidation requires memory_size > 0")
     if (any(float(w) > 0.0 for w in latent_weights)
             or latent_concept_memory_size > 0
-            or hard_study_enabled
-            or self_teach_w > 0.0) and latent_concept_slots <= 0:
+            or hard_study_enabled) and latent_concept_slots <= 0:
         raise ValueError("latent concept losses require latent_concept_slots > 0")
     if float(latent_concept_consolidation_temperature) <= 0.0:
         raise ValueError("latent concept consolidation temperature must be positive")
@@ -5547,6 +5590,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         records, split="train")
     view_dims = feature_dims(records)
     active_modes = multimodal_active_modes(view_dims, records)
+    self_teach_available_objectives = multimodal_self_teach_available_objectives(
+        latent_concept_slots=latent_concept_slots,
+        active_mode_count=len(active_modes))
     selection_generation_kwargs = {
         "generation_eval_n": int(selection_generation_n),
         "generation_prompt_tokens": int(selection_generation_prompt_tokens),
@@ -5730,6 +5776,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             score_components, budget=self_teach_w,
             history_prior=self_teach_history_prior,
             history_prior_w=self_teach_history_prior_w,
+            available_objectives=self_teach_available_objectives,
             **self_teach_base_weights)
         self_teach_plan = plan
         self_teach_effective_weights = effective
@@ -6334,6 +6381,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 multimodal_checkpoint_history_prior),
             "self_teach_history_prior": self_teach_history_prior,
             "self_teach_plan": self_teach_plan,
+            "self_teach_available_objectives": list(
+                self_teach_available_objectives),
             "self_teach_base_weights": dict(self_teach_base_weights),
             "self_teach_effective_weights": dict(self_teach_effective_weights),
             "self_teach_reports": list(self_teach_reports),
@@ -6673,6 +6722,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 selection_generation_temperature),
             "selection_generation_top_k": int(selection_generation_top_k),
             "self_teach_w": float(self_teach_w),
+            "self_teach_available_objectives": list(
+                self_teach_available_objectives),
             "self_teach_reports": list(self_teach_reports),
             "bridge_insight_gate": bool(
                 latent_concept_bridge_w and latent_concept_memory_size > 0),
@@ -7949,6 +8000,41 @@ def selftest():
         assert math.isclose(
             sum(generation_plan["weight_extras"].values()), 0.09,
             rel_tol=1e-6, abs_tol=1e-6)
+        language_only_objectives = multimodal_self_teach_available_objectives(
+            latent_concept_slots=0, active_mode_count=1)
+        assert "decode_w" in language_only_objectives
+        assert "continuation_repair_w" in language_only_objectives
+        assert "repetition_unlikelihood_w" in language_only_objectives
+        assert "latent_concept_sequence_w" not in language_only_objectives
+        language_only_plan = multimodal_self_teach_weight_plan({
+            "token_score": 1.0,
+            "generation_score": 0.0,
+            "mode_floor_score": 0.0,
+            "fer_score": 1.0,
+            "bridge_score": 1.0,
+            "connection_score": 1.0,
+            "sequence_score": 0.0,
+            "token_skipped": False,
+            "generation_skipped": False,
+            "fer_skipped": False,
+            "bridge_skipped": False,
+            "connection_skipped": False,
+            "sequence_skipped": False,
+        }, budget=0.09, available_objectives=language_only_objectives)
+        assert language_only_plan["top_signal"] == "generation"
+        assert "sequence" in language_only_plan["unavailable_signals"]
+        assert all(
+            language_only_plan["weight_extras"][key] == 0.0
+            for key in MULTIMODAL_LATENT_SELF_TEACH_WEIGHT_KEYS)
+        assert math.isclose(
+            language_only_plan["weight_extras"]["decode_w"], 0.03,
+            rel_tol=1e-6, abs_tol=1e-6)
+        assert math.isclose(
+            language_only_plan["weight_extras"]["continuation_repair_w"], 0.03,
+            rel_tol=1e-6, abs_tol=1e-6)
+        assert math.isclose(
+            language_only_plan["weight_extras"]["repetition_unlikelihood_w"], 0.03,
+            rel_tol=1e-6, abs_tol=1e-6)
         calibrated_transfer_model, *_ = train(
             manifest, steps=1, batch=2, d=32, layers=1, heads=4, device="cpu",
             objective_profile="manual",
@@ -8139,6 +8225,30 @@ def selftest():
         assert causal_model.train_metrics["repetition_unlikelihood_w"] > 0.0
         assert causal_model.train_metrics["repetition_unlikelihood_enabled"] is True
         assert causal_model.train_metrics["repetition_unlikelihood_candidates"] > 0
+        causal_self_teach_model, *_ = train(
+            causal_manifest, steps=1, batch=2, d=32, layers=1, heads=4,
+            device="cpu", objective_profile="language",
+            log_every=10, view_tokens=2, txt_tokens=4, concept_tokens=2,
+            latent_concept_slots=0, latent_concept_memory_size=0,
+            self_teach_w=0.05, text_transfer_probe_n=0)
+        assert causal_self_teach_model.latent_concept_slots == 0
+        assert causal_self_teach_model.train_metrics["self_teach_w"] == 0.05
+        assert causal_self_teach_model.train_metrics[
+            "self_teach_plan"]["enabled"] is True
+        assert all(
+            key in causal_self_teach_model.train_metrics[
+                "self_teach_available_objectives"]
+            for key in (
+                "decode_w", "continuation_repair_w",
+                "repetition_unlikelihood_w"))
+        assert all(
+            causal_self_teach_model.train_metrics[
+                "self_teach_effective_weights"][key] == 0.0
+            for key in MULTIMODAL_LATENT_SELF_TEACH_WEIGHT_KEYS)
+        assert causal_self_teach_model.train_metrics[
+            "self_teach_effective_weights"]["decode_w"] >= (
+                causal_self_teach_model.train_metrics[
+                    "self_teach_base_weights"]["decode_w"])
         causal_bundle = multimodal_eval_bundle(
             causal_model, causal_eval, causal_vocab, causal_dims, n=0,
             device="cpu", decode_objective="causal", generation_eval_n=2,
@@ -8785,8 +8895,7 @@ def main(argv=None):
         or args.latent_concept_prefix
         or args.latent_concept_fer_hard_max > 0
         or args.latent_concept_discovery_hard_max > 0
-        or args.latent_concept_completion_hard_max > 0
-        or args.self_teach_w > 0.0)
+        or args.latent_concept_completion_hard_max > 0)
     if latent_options_need_slots and args.latent_concept_slots <= 0:
         ap.error("latent concept options require --latent-concept-slots > 0")
     if args.latent_concept_memory_temperature <= 0.0:

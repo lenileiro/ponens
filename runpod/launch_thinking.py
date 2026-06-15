@@ -5944,8 +5944,7 @@ def main():
              or args.multimodal_latent_concept_memory_size > 0
              or args.multimodal_latent_concept_fer_hard_max > 0
              or args.multimodal_latent_concept_discovery_hard_max > 0
-             or args.multimodal_latent_concept_completion_hard_max > 0
-             or args.multimodal_self_teach_w > 0.0)
+             or args.multimodal_latent_concept_completion_hard_max > 0)
                 and args.multimodal_latent_concept_slots <= 0):
             sys.exit(
                 "ERROR: multimodal latent concept options require "
