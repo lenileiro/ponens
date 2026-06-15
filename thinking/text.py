@@ -78,14 +78,15 @@ READING_MASTERY_SCORE_KEYS = (
     "balanced_score", "floor_score", "view_score", "fer_score",
     "bridge_score", "bridge_connectivity", "sequence_score", "context_score",
     "span_score", "context_closure_score", "neighborhood_score",
-    "cluster_score", "connection_score",
+    "cluster_score", "connection_score", "language_score",
 )
 READING_REPRESENTATION_PROGRESS_KEYS = (
     "mastery_score", "active_mean_score", "floor_score", "balanced_score",
     "signal_coverage", "fer_score", "bridge_score", "bridge_connectivity",
     "connection_score", "sequence_score", "neighborhood_score", "cluster_score",
-    "span_score", "context_closure_score")
+    "span_score", "context_closure_score", "language_score")
 READING_REPRESENTATION_SIGNAL_SCORES = (
+    ("language", "language_score"),
     ("fer", "fer_score"),
     ("bridge", "bridge_score"),
     ("connection", "connection_score"),
@@ -1547,6 +1548,59 @@ def token_loss(logits, ids, pad=0):
                            ids[:, 1:].reshape(-1), ignore_index=pad)
 
 
+def reading_causal_lm_loss(model, txt, pad=0):
+    """Autoregressive language loss over the raw reading stream."""
+    if txt.shape[1] < 2:
+        return txt.float().sum() * 0.0
+    logits = model.lm(txt)
+    return token_loss(logits, txt, pad=pad)
+
+
+def reading_causal_lm_eval(model, vocab, records, device=DEV, n=0, seed=0):
+    candidates = [r for r in records if r.split == "eval"] or list(records)
+    if not candidates:
+        return {"lm_loss": 0.0, "lm_token_acc": 0.0, "target_tokens": 0,
+                "n_records": 0, "sampled": False, "skipped": True}
+    sampled = bool(n and n < len(candidates))
+    if sampled:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=int(n), replace=False)
+        candidates = [candidates[int(i)] for i in idx]
+    total_loss = 0.0
+    total_tokens = 0
+    total_correct = 0
+    model.eval()
+    with torch.no_grad():
+        for off in range(0, len(candidates), 64):
+            batch = candidates[off:off + 64]
+            txt = pack_reading(batch, vocab, device)
+            if txt.shape[1] < 2:
+                continue
+            logits = model.lm(txt)
+            targets = txt[:, 1:]
+            mask = targets.ne(vocab.pad)
+            count = int(mask.sum().detach().cpu())
+            if count <= 0:
+                continue
+            raw = F.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.shape[-1]),
+                targets.reshape(-1), reduction="none").view_as(targets)
+            total_loss += float(raw.masked_select(mask).sum().detach().cpu())
+            pred = logits[:, :-1].argmax(-1)
+            total_correct += int((pred.eq(targets) & mask).sum().detach().cpu())
+            total_tokens += count
+    if total_tokens <= 0:
+        return {"lm_loss": 0.0, "lm_token_acc": 0.0, "target_tokens": 0,
+                "n_records": len(candidates), "sampled": sampled,
+                "skipped": True}
+    return {"lm_loss": total_loss / float(total_tokens),
+            "lm_token_acc": total_correct / float(total_tokens),
+            "target_tokens": int(total_tokens),
+            "n_records": len(candidates),
+            "sampled": sampled,
+            "skipped": False}
+
+
 def latent_text_concept_loss(model, txt, view_dropout=0.1,
                              invariance_w=25.0, variance_w=25.0,
                              covariance_w=1.0, variance_target=1.0):
@@ -2966,13 +3020,15 @@ def reading_fer_eval(model, vocab, records, device=DEV, n=0, seed=0,
 
 
 READING_SCORE_METRICS = (
-    "view", "context", "span", "closure", "sequence", "neighborhood", "cluster",
-    "fer", "bridge", "connection", "both", "min", "all", "balanced", "mastery")
+    "language", "view", "context", "span", "closure", "sequence",
+    "neighborhood", "cluster", "fer", "bridge", "connection", "both", "min",
+    "all", "balanced", "mastery")
 READING_DISCOVERY_SIGNALS = (
-    "view", "context", "span", "closure", "sequence", "neighborhood", "cluster",
-    "fer", "bridge", "connection")
+    "language", "view", "context", "span", "closure", "sequence",
+    "neighborhood", "cluster", "fer", "bridge", "connection")
 READING_OBJECTIVE_PROFILES = ("manual", "mastery")
 READING_MASTERY_OBJECTIVE_FLOORS = {
+    "lm_w": 1.0,
     "factorization_w": 0.05,
     "fer_w": 0.05,
     "memory_w": 0.05,
@@ -3034,6 +3090,7 @@ READING_CONCEPT_INSIGHT_SCORE_KEYS = (
     "bridge_score", "bridge_connectivity", "connection_score",
     "neighborhood_score", "cluster_score")
 READING_SELF_TEACH_SCORE_KEYS = {
+    "language": "language_score",
     "view": "view_score",
     "context": "context_score",
     "span": "span_score",
@@ -3046,6 +3103,7 @@ READING_SELF_TEACH_SCORE_KEYS = {
     "connection": "connection_score",
 }
 READING_SELF_TEACH_SIGNAL_OBJECTIVES = {
+    "language": ("lm_w",),
     "view": ("factorization_w",),
     "context": ("context_target_w",),
     "span": ("span_completion_w",),
@@ -3058,6 +3116,7 @@ READING_SELF_TEACH_SIGNAL_OBJECTIVES = {
     "connection": ("bridge_w", "discovery_w", "gap_w"),
 }
 READING_SELF_TEACH_SIGNAL_STUDY_STRATEGIES = {
+    "language": "sequence",
     "view": "errors",
     "context": "closure",
     "span": "closure",
@@ -3588,7 +3647,7 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
                                        cluster_eval=None, fer_eval=None,
                                        bridge_eval=None, gap_eval=None,
                                        sequence_eval=None, span_eval=None,
-                                       closure_eval=None):
+                                       closure_eval=None, lm_eval=None):
     metric = str(metric)
     if metric not in READING_SCORE_METRICS:
         raise ValueError(f"unknown reading score metric {metric!r}")
@@ -3603,6 +3662,8 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     closure_eval = closure_eval or {}
     closure_acc = float(closure_eval.get("context_closure_acc", 0.0))
     closure_margin = float(closure_eval.get("margin", 0.0))
+    lm_eval = lm_eval or {}
+    language_score = float(lm_eval.get("lm_token_acc", 0.0))
     sequence_eval = sequence_eval or {}
     sequence_acc = float(sequence_eval.get("sequence_acc", 0.0))
     sequence_margin = float(sequence_eval.get("margin", 0.0))
@@ -3640,12 +3701,14 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
     sequence_score = sequence_acc + margin_w * sequence_margin
     neighborhood_score = neighborhood_acc + margin_w * neighborhood_margin
     cluster_score = cluster_acc + margin_w * cluster_margin
-    scores = {"view": view_score, "context": context_score, "span": span_score,
+    scores = {"language": language_score,
+              "view": view_score, "context": context_score, "span": span_score,
               "closure": closure_score, "sequence": sequence_score,
               "neighborhood": neighborhood_score, "cluster": cluster_score,
               "fer": fer_score, "bridge": bridge_score,
               "connection": connection_score}
-    skipped = {"view": bool(view_eval.get("skipped", False)),
+    skipped = {"language": bool(lm_eval.get("skipped", False)),
+               "view": bool(view_eval.get("skipped", False)),
                "context": bool(context_eval.get("skipped", False)),
                "span": bool(span_eval.get("skipped", False)),
                "closure": bool(closure_eval.get("skipped", False)),
@@ -3667,7 +3730,9 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
         0 if skipped[name] else 1 for name in READING_DISCOVERY_SIGNALS
     ) / float(len(READING_DISCOVERY_SIGNALS))
     mastery_score = 0.5 * active_mean_score + 0.25 * all_score + 0.25 * signal_coverage
-    if metric == "view":
+    if metric == "language":
+        score = language_score
+    elif metric == "view":
         score = view_score
     elif metric == "context":
         score = context_score
@@ -3706,6 +3771,9 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "balanced_score": float(balanced_score),
             "mastery_score": float(mastery_score),
             "signal_coverage": float(signal_coverage),
+            "language_score": float(language_score),
+            "lm_loss": float(lm_eval.get("lm_loss", 0.0)),
+            "lm_token_acc": float(lm_eval.get("lm_token_acc", 0.0)),
             "view_score": float(view_score),
             "context_score": float(context_score),
             "span_score": float(span_score),
@@ -3741,6 +3809,7 @@ def reading_discovery_score_components(view_eval, context_eval, metric="both",
             "neighborhood_margin": neighborhood_margin,
             "cluster_acc": cluster_acc,
             "cluster_margin": cluster_margin,
+            "language_skipped": skipped["language"],
             "view_skipped": skipped["view"],
             "context_skipped": skipped["context"],
             "span_skipped": skipped["span"],
@@ -3758,6 +3827,8 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
                         context_keep_p=0.5, span_mask_frac=0.25,
                         context_closure_split_frac=0.5,
                         score_metric="mastery", score_margin_w=0.1):
+    lm = reading_causal_lm_eval(
+        model, vocab, records, device=device, n=eval_n, seed=seed + 13)
     view = reading_latent_retrieval_eval(
         model, vocab, records, device=device, n=eval_n, seed=seed + 17,
         token_drop_p=token_drop_p, token_replace_p=token_replace_p)
@@ -3788,7 +3859,8 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
     _gap_records, gap = reading_latent_gap_records(
         model, vocab, records, device=device, n=eval_n, seed=seed + 43,
         feature_dropout=0.0)
-    return {"view": view,
+    return {"lm": lm,
+            "view": view,
             "context_target": context,
             "span_completion": span,
             "context_closure": closure,
@@ -3802,7 +3874,8 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
                 view, context, metric=score_metric, margin_w=score_margin_w,
                 neighborhood_eval=neighborhood, cluster_eval=cluster,
                 fer_eval=fer, bridge_eval=bridge, gap_eval=gap,
-                sequence_eval=sequence, span_eval=span, closure_eval=closure)}
+                sequence_eval=sequence, span_eval=span, closure_eval=closure,
+                lm_eval=lm)}
 
 
 def reading_representation_progress_report(before_bundle, after_bundle):
@@ -4921,7 +4994,7 @@ def reading_latent_discovery_records(
 def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          seed=0, device=DEV, log_every=100,
                          token_drop_p=0.15, token_replace_p=0.05,
-                         feature_dropout=0.1,
+                         feature_dropout=0.1, lm_w=0.0,
                          invariance_w=25.0, variance_w=25.0,
                          covariance_w=1.0, variance_target=1.0,
                          factorization_w=0.05,
@@ -5000,6 +5073,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          source_balance_w=READING_DEFAULT_SOURCE_BALANCE_W):
     if getattr(model, "latent_concepts", None) is None:
         raise ValueError("raw reading concept training requires latent concept slots")
+    if float(lm_w) < 0.0:
+        raise ValueError("reading LM loss weight must be non-negative")
     if float(context_target_w) < 0.0:
         raise ValueError("reading context-target loss weight must be non-negative")
     if float(factorization_w) < 0.0:
@@ -5344,6 +5419,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_replay_priority_max = 0.0
     last_training_priority_mean = 0.0
     last_training_priority_max = 0.0
+    last_lm_loss = 0.0
 
     def selected_id_sample(selected, limit=16):
         return [rec.rec_id for rec in selected[:int(limit)]]
@@ -5538,6 +5614,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         source_weights = training_sampling_weights if source is train_records else None
         rec_batch = batch_records(source, rng, batch, weights=source_weights)
         txt = pack_reading(rec_batch, vocab, device)
+        lm_loss = (reading_causal_lm_loss(model, txt, pad=vocab.pad)
+                   if lm_w else txt.float().sum() * 0.0)
         view_loss = reading_latent_view_loss(
             model, txt, vocab.pad, vocab.unk, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
@@ -5851,7 +5929,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 model, replay_teacher_model, replay_batch_records, vocab,
                 replay_teacher_vocab, device=device,
                 feature_dropout=feature_dropout)
-        loss = (view_loss + float(factorization_w) * factorization_loss
+        loss = (float(lm_w) * lm_loss
+                + view_loss + float(factorization_w) * factorization_loss
                 + float(fer_w) * fer_loss
                 + float(memory_w) * memory_loss
                 + float(consolidation_w) * consolidation_loss
@@ -5904,6 +5983,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                     model, sequence_pair_batch, vocab, device=device,
                     feature_dropout=0.0, decay=association_decay))
         last_loss = float(loss.detach())
+        last_lm_loss = float(lm_loss.detach())
         last_view_loss = float(view_loss.detach())
         last_factorization = float(factorization_loss.detach())
         last_fer = float(fer_loss.detach())
@@ -6004,6 +6084,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         last_replay_priority_max = max(replay_priorities) if replay_priorities else 0.0
         if st % log_every == 0 or st == steps:
             print(f"  reading {st}/{steps} loss {last_loss:.3f} "
+                  f"lm {last_lm_loss:.3f} "
                   f"view {last_view_loss:.3f} "
                   f"factor {last_factorization:.3f} "
                   f"fer {last_fer:.3f} "
@@ -6088,6 +6169,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "weight_update_max_abs_delta": float(weight_update["max_abs_delta"]),
         "study_strategy_requested": requested_study_strategy,
         "study_strategy": study_strategy,
+        "lm_loss": last_lm_loss,
+        "lm_w": float(lm_w),
         "latent_view_loss": last_view_loss,
         "factorization_loss": last_factorization,
         "factorization_w": float(factorization_w),
@@ -6393,7 +6476,7 @@ def fit_reading_concepts_select_best(
         model, vocab, records, steps=400, batch=32, lr=1e-3,
         seed=0, device=DEV, log_every=100,
         token_drop_p=0.15, token_replace_p=0.05,
-        feature_dropout=0.1,
+        feature_dropout=0.1, lm_w=0.0,
         invariance_w=25.0, variance_w=25.0,
         covariance_w=1.0, variance_target=1.0,
         factorization_w=0.05, factorization_variance=0.05,
@@ -6601,7 +6684,9 @@ def fit_reading_concepts_select_best(
             model, vocab, records, steps=round_steps, batch=batch, lr=lr,
             seed=seed + round_i * 1009, device=device, log_every=log_every,
             token_drop_p=token_drop_p, token_replace_p=token_replace_p,
-            feature_dropout=feature_dropout, invariance_w=invariance_w,
+            feature_dropout=feature_dropout,
+            lm_w=lm_w + weight_extras["lm_w"],
+            invariance_w=invariance_w,
             variance_w=variance_w, covariance_w=covariance_w,
             variance_target=variance_target,
             factorization_w=(
@@ -6713,6 +6798,7 @@ def fit_reading_concepts_select_best(
         round_train_metrics["self_teach_study_signal"] = (
             self_teach_plan.get("top_signal"))
         round_train_metrics["self_teach_base_weights"] = {
+            "lm_w": float(lm_w),
             "factorization_w": float(factorization_w),
             "fer_w": float(fer_w),
             "discovery_w": float(discovery_w),
@@ -6995,7 +7081,7 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            latent_concept_refine_gate_init=-2.0,
                            lr=1e-3, seed=0, device=DEV, log_every=100,
                            token_drop_p=0.15, token_replace_p=0.05,
-                           feature_dropout=0.1,
+                           feature_dropout=0.1, lm_w=0.0,
                            invariance_w=25.0, variance_w=25.0,
                            covariance_w=1.0, variance_target=1.0,
                            factorization_w=0.05, factorization_variance=0.05,
@@ -7101,6 +7187,7 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
             device=device, log_every=log_every, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+            lm_w=lm_w,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
             factorization_w=factorization_w,
@@ -7225,6 +7312,7 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             budget=study_self_teach_w,
             history_prior=self_teach_history_prior,
             history_prior_w=self_teach_history_prior_w,
+            lm_w=lm_w,
             factorization_w=factorization_w,
             fer_w=fer_w,
             discovery_w=discovery_w,
@@ -7241,6 +7329,7 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
         device=device, log_every=log_every, token_drop_p=token_drop_p,
         token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+        lm_w=train_weights["lm_w"],
         invariance_w=invariance_w, variance_w=variance_w,
         covariance_w=covariance_w, variance_target=variance_target,
         factorization_w=train_weights["factorization_w"],
@@ -7363,7 +7452,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          latent_concept_refine_gate_init=-2.0,
                          lr=1e-3, seed=0, device=DEV, log_every=100,
                          token_drop_p=0.15, token_replace_p=0.05,
-                         feature_dropout=0.1,
+                         feature_dropout=0.1, lm_w=0.0,
                          invariance_w=25.0, variance_w=25.0,
                          covariance_w=1.0, variance_target=1.0,
                          factorization_w=0.05, factorization_variance=0.05,
@@ -7477,6 +7566,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
             device=device, log_every=log_every, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+            lm_w=lm_w,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
             factorization_w=factorization_w,
@@ -7588,6 +7678,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
         self_teach_plan, self_teach_base_weights, train_weights = (
             reading_self_teach_weight_maps(
                 before_bundle["score_components"], budget=study_self_teach_w,
+                lm_w=lm_w,
                 factorization_w=factorization_w,
                 fer_w=fer_w,
                 discovery_w=discovery_w,
@@ -7604,6 +7695,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             model, vocab, records, steps=steps, batch=batch, lr=lr, seed=seed,
             device=device, log_every=log_every, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+            lm_w=train_weights["lm_w"],
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
             factorization_w=train_weights["factorization_w"],
@@ -7722,6 +7814,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
         context_keep_p=context_keep_p, score_metric=study_score_metric,
         score_margin_w=study_score_margin_w, span_mask_frac=span_mask_frac,
         context_closure_split_frac=context_closure_split_frac)
+    before_lm = before_bundle["lm"]
+    after_lm = after_bundle["lm"]
     before = before_bundle["view"]
     after = after_bundle["view"]
     before_context = before_bundle["context_target"]
@@ -7759,6 +7853,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "token_drop_p": float(token_drop_p),
               "token_replace_p": float(token_replace_p),
               "feature_dropout": float(feature_dropout),
+              "lm_w": float(lm_w),
               "invariance_w": float(invariance_w),
               "variance_w": float(variance_w),
               "covariance_w": float(covariance_w),
@@ -7876,6 +7971,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "after": after,
               "before_context_target": before_context,
               "after_context_target": after_context,
+              "before_lm": before_lm,
+              "after_lm": after_lm,
               "before_span_completion": before_span,
               "after_span_completion": after_span,
               "before_context_closure": before_closure,
@@ -7911,6 +8008,12 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                   "balanced_score": (
                       after_bundle["score_components"].get("balanced_score", 0.0)
                       - before_bundle["score_components"].get("balanced_score", 0.0)),
+                  "lm_token_acc": (
+                      after_lm.get("lm_token_acc", 0.0)
+                      - before_lm.get("lm_token_acc", 0.0)),
+                  "lm_loss": (
+                      after_lm.get("lm_loss", 0.0)
+                      - before_lm.get("lm_loss", 0.0)),
                   "paired_view_acc": (
                       after["paired_view_acc"] - before["paired_view_acc"]),
                   "margin": after.get("margin", 0.0) - before.get("margin", 0.0),
@@ -8051,6 +8154,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              steps=400, batch=32, lr=1e-3, seed=0, device=DEV,
                              log_every=100, token_drop_p=0.15,
                              token_replace_p=0.05, feature_dropout=0.1,
+                             lm_w=0.0,
                              invariance_w=25.0, variance_w=25.0,
                              covariance_w=1.0, variance_target=1.0,
                              factorization_w=0.05, factorization_variance=0.05,
@@ -8215,6 +8319,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             model, vocab, study_records, steps=steps, batch=batch, lr=lr, seed=seed,
             device=device, log_every=log_every, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+            lm_w=lm_w,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
             factorization_w=factorization_w,
@@ -8334,6 +8439,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                 before_bundle["score_components"], budget=study_self_teach_w,
                 history_prior=self_teach_history_prior,
                 history_prior_w=self_teach_history_prior_w,
+                lm_w=lm_w,
                 factorization_w=factorization_w,
                 fer_w=fer_w,
                 discovery_w=discovery_w,
@@ -8350,6 +8456,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             model, vocab, study_records, steps=steps, batch=batch, lr=lr, seed=seed,
             device=device, log_every=log_every, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
+            lm_w=train_weights["lm_w"],
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
             factorization_w=train_weights["factorization_w"],
@@ -8480,6 +8587,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
         span_mask_frac=span_mask_frac,
         context_closure_split_frac=context_closure_split_frac)
         if replay_records else None)
+    before_lm = before_bundle["lm"]
+    after_lm = after_bundle["lm"]
     before = before_bundle["view"]
     after = after_bundle["view"]
     before_context = before_bundle["context_target"]
@@ -8532,6 +8641,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "token_drop_p": float(token_drop_p),
               "token_replace_p": float(token_replace_p),
               "feature_dropout": float(feature_dropout),
+              "lm_w": float(lm_w),
               "invariance_w": float(invariance_w),
               "variance_w": float(variance_w),
               "covariance_w": float(covariance_w),
@@ -8674,6 +8784,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "after": after,
               "before_context_target": before_context,
               "after_context_target": after_context,
+              "before_lm": before_lm,
+              "after_lm": after_lm,
               "before_span_completion": before_span,
               "after_span_completion": after_span,
               "before_context_closure": before_closure,
@@ -8711,6 +8823,12 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                   "balanced_score": (
                       after_bundle["score_components"].get("balanced_score", 0.0)
                       - before_bundle["score_components"].get("balanced_score", 0.0)),
+                  "lm_token_acc": (
+                      after_lm.get("lm_token_acc", 0.0)
+                      - before_lm.get("lm_token_acc", 0.0)),
+                  "lm_loss": (
+                      after_lm.get("lm_loss", 0.0)
+                      - before_lm.get("lm_loss", 0.0)),
                   "paired_view_acc": (
                       after["paired_view_acc"] - before["paired_view_acc"]),
                   "margin": after.get("margin", 0.0) - before.get("margin", 0.0),
@@ -9115,10 +9233,14 @@ def selftest():
     assert mastery_bundle["score_components"]["metric"] == "mastery"
     assert ("mastery_score" in mastery_bundle["score_components"]
             and "signal_coverage" in mastery_bundle["score_components"]
+            and "language_score" in mastery_bundle["score_components"]
             and "span_score" in mastery_bundle["score_components"]
             and "context_closure_score" in mastery_bundle["score_components"]
             and "sequence_score" in mastery_bundle["score_components"]
             and "bridge_score" in mastery_bundle["score_components"])
+    assert "lm" in mastery_bundle
+    assert mastery_bundle["score_components"]["language_skipped"] is False
+    assert math.isfinite(mastery_bundle["score_components"]["lm_loss"])
     assert mastery_bundle["score_components"]["span_skipped"] is False
     assert mastery_bundle["score_components"]["closure_skipped"] is False
     assert mastery_bundle["score_components"]["bridge_skipped"] is False
@@ -9140,6 +9262,17 @@ def selftest():
     assert self_teach_plan["weight_extras"]["bridge_w"] > 0.0
     assert math.isclose(sum(self_teach_plan["weight_extras"].values()),
                         0.12, rel_tol=1e-6, abs_tol=1e-6)
+    language_scores = {
+        f"{name}_skipped": False for name in READING_DISCOVERY_SIGNALS}
+    for name, score_key in READING_SELF_TEACH_SCORE_KEYS.items():
+        language_scores[score_key] = 1.0
+    language_scores["language_score"] = 0.0
+    language_plan = reading_self_teach_weight_plan(
+        language_scores, budget=0.07)
+    assert language_plan["top_signal"] == "language"
+    assert language_plan["weight_extras"]["lm_w"] > 0.0
+    assert math.isclose(sum(language_plan["weight_extras"].values()),
+                        0.07, rel_tol=1e-6, abs_tol=1e-6)
     prior_scores = {
         f"{name}_skipped": False for name in READING_DISCOVERY_SIGNALS}
     for name, score_key in READING_SELF_TEACH_SCORE_KEYS.items():
@@ -9225,7 +9358,7 @@ def selftest():
     assert regressed_concept_insight["allowed"] is False
     mastery_kwargs = reading_objective_profile_kwargs(
         "mastery",
-        factorization_w=0.0, fer_w=0.0, memory_w=0.0,
+        lm_w=0.0, factorization_w=0.0, fer_w=0.0, memory_w=0.0,
         discovery_w=0.0, reanalysis_w=0.0, gap_w=0.0,
         association_w=0.0, composition_w=0.0, graph_predict_w=0.0,
         graph_cycle_w=0.0, bridge_w=0.0, context_target_w=0.0,
@@ -9240,6 +9373,7 @@ def selftest():
         cluster_probe_n=0, cluster_refresh_steps=0, passthrough="kept")
     assert mastery_kwargs["reading_objective_profile"] == "mastery"
     assert mastery_kwargs["reading_objective_profile_report"]["applied"] is True
+    assert mastery_kwargs["lm_w"] == 1.0
     assert mastery_kwargs["graph_predict_w"] == 0.10
     assert mastery_kwargs["study_self_teach_w"] == 0.05
     assert mastery_kwargs["study_rounds"] == 3
@@ -9268,7 +9402,7 @@ def selftest():
         == "gap")
     manual_kwargs = reading_objective_profile_kwargs(
         "manual",
-        factorization_w=0.0, fer_w=0.0, memory_w=0.0,
+        lm_w=0.0, factorization_w=0.0, fer_w=0.0, memory_w=0.0,
         discovery_w=0.0, reanalysis_w=0.0, gap_w=0.0,
         association_w=0.0, composition_w=0.0, graph_predict_w=0.0,
         graph_cycle_w=0.0, bridge_w=0.0, context_target_w=0.0,
@@ -9282,6 +9416,7 @@ def selftest():
         neighborhood_probe_n=0, neighborhood_refresh_steps=0,
         cluster_probe_n=0, cluster_refresh_steps=0)
     assert manual_kwargs["study_self_teach_w"] == 0.0
+    assert manual_kwargs["lm_w"] == 0.0
     assert manual_kwargs["study_rounds"] == 1
     assert manual_kwargs["study_score_target"] == 0.0
     assert manual_kwargs["study_representation_accept_w"] == 0.0
@@ -9317,12 +9452,14 @@ def selftest():
         consolidation_w=0.1, consolidation_fer_w=0.1,
         discovery_w=0.1, discovery_fer_w=0.1,
         reanalysis_w=0.1, reanalysis_fer_w=0.1,
-        gap_w=0.1,
+        gap_w=0.1, lm_w=0.1,
         sequence_w=0.1, sequence_batch=2, sequence_temperature=0.1,
         neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2,
         transition_w=0.1, transition_batch=2,
         cluster_w=0.1, cluster_batch=4, cluster_probe_n=4)
     assert reading_model.reading_train_metrics["memory_active"] > 0
+    assert reading_model.reading_train_metrics["lm_w"] == 0.1
+    assert math.isfinite(reading_model.reading_train_metrics["lm_loss"])
     assert reading_model.reading_train_metrics["consolidation_w"] == 0.1
     assert reading_model.reading_train_metrics["consolidation_fer_w"] == 0.1
     assert reading_model.reading_train_metrics["consolidation_skipped"] is False
@@ -9936,6 +10073,9 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-eval-frac", type=float, default=0.10)
     ap.add_argument("--reading-eval-n", type=int, default=64)
     ap.add_argument("--reading-lr", type=float, default=1e-3)
+    ap.add_argument("--reading-lm-w", type=float, default=0.0,
+                    help=("causal next-token loss weight over raw reading "
+                          "streams; mastery profile raises this by default"))
     ap.add_argument("--reading-token-drop", type=float, default=0.15)
     ap.add_argument("--reading-token-replace", type=float, default=0.05)
     ap.add_argument("--reading-feature-dropout", type=float, default=0.1)
@@ -10080,6 +10220,7 @@ def _add_reading_args(ap):
 
 def _reading_kwargs(args):
     kwargs = dict(lr=args.reading_lr,
+                  lm_w=args.reading_lm_w,
                   token_drop_p=args.reading_token_drop,
                   token_replace_p=args.reading_token_replace,
                   feature_dropout=args.reading_feature_dropout,
@@ -10245,6 +10386,8 @@ def main(argv=None):
         raise SystemExit("--reading-max-vocab must be non-negative")
     if args.reading_source_balance_w < 0.0:
         raise SystemExit("--reading-source-balance-w must be non-negative")
+    if args.reading_lm_w < 0.0:
+        raise SystemExit("--reading-lm-w must be non-negative")
     if args.reading_self_teach_history_prior_w < 0.0:
         raise SystemExit("--reading-self-teach-history-prior-w must be non-negative")
     if args.reading_study_representation_accept_w < 0.0:

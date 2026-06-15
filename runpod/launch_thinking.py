@@ -15,8 +15,8 @@ import os
 import subprocess
 import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 from shlex import quote as shlex_quote
 
 REST = "https://rest.runpod.io/v1"
@@ -44,9 +44,19 @@ def api(method, path, key, body=None):
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             txt = r.read().decode()
-            return r.status, (json.loads(txt) if txt.strip() else {})
+            try:
+                payload = json.loads(txt) if txt.strip() else {}
+            except json.JSONDecodeError:
+                payload = {"error": txt}
+            return r.status, payload
     except urllib.error.HTTPError as e:
         return e.code, {"error": e.read().decode()}
+    except urllib.error.URLError as e:
+        return 0, {"error": f"network error: {getattr(e, 'reason', e)}"}
+    except TimeoutError as e:
+        return 0, {"error": f"timeout: {e}"}
+    except OSError as e:
+        return 0, {"error": f"os error: {e}"}
 
 
 def sh(cmd):
@@ -265,6 +275,7 @@ def text_reading_cmd(args, py):
         f"--reading-eval-n {args.reading_eval_n} "
         f"--reading-objective-profile {args.reading_objective_profile} "
         f"--reading-lr {args.reading_lr} "
+        f"--reading-lm-w {args.reading_lm_w} "
         f"--reading-token-drop {args.reading_token_drop} "
         f"--reading-token-replace {args.reading_token_replace} "
         f"--reading-feature-dropout {args.reading_feature_dropout} "
@@ -779,7 +790,9 @@ def apply_image_quality_preset(args):
             args.image_flow_preference_loss = "gap"
         args.image_flow_preference_batch = max(int(args.image_flow_preference_batch), 1)
     args.image_eval_generated = True
+    args.image_generated_eval_fail_on_gate = True
     args.image_quality_loop_generated = True
+    args.image_quality_loop_fail_on_gate = True
     args.image_quality_loop_reuse_real_embeddings = True
     args.image_quality_loop_vision_read_steps = max(
         int(args.image_quality_loop_vision_read_steps), 400 if hq else 100)
@@ -2382,6 +2395,10 @@ def main():
     ap.add_argument("--reading-eval-n", type=int, default=256,
                     dest="reading_eval_n")
     ap.add_argument("--reading-lr", type=float, default=1e-3, dest="reading_lr")
+    ap.add_argument("--reading-lm-w", type=float, default=0.0,
+                    dest="reading_lm_w",
+                    help=("causal next-token loss weight for raw reading; "
+                          "mastery profile raises this by default"))
     ap.add_argument("--reading-token-drop", type=float, default=0.15,
                     dest="reading_token_drop")
     ap.add_argument("--reading-token-replace", type=float, default=0.05,
@@ -4523,6 +4540,7 @@ def main():
             "--reading-replay-w": args.reading_replay_w,
             "--reading-replay-batch": args.reading_replay_batch,
             "--reading-replay-retention-w": args.reading_replay_retention_w,
+            "--reading-lm-w": args.reading_lm_w,
             "--reading-context-target-w": args.reading_context_target_w,
             "--reading-span-completion-w": args.reading_span_completion_w,
             "--reading-context-closure-w": args.reading_context_closure_w,
