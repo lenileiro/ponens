@@ -202,12 +202,10 @@ def speak(text, ckpt="runs/tts_ar.pt", fs=SR):
     """text -> human-voice waveform via the trained autoregressive TransformerTTS + realvoice vocoder."""
     import torch
     from device import get_device
-    from .tts_ar import TransformerTTS
+    from .tts_ar import build_from_ckpt
     from .tts import encode_text
     dev = get_device()
-    model = TransformerTTS().to(dev)
-    ck = torch.load(ckpt, map_location=dev)
-    model.load_state_dict(ck["state_dict"]); model.eval()
+    model = build_from_ckpt(ckpt, dev)                   # rebuilds at the trained size (config in ckpt)
     ids = torch.tensor([encode_text(text)], device=dev)
     spec = model.infer(ids)[0].cpu().numpy()
     from .realvoice import Vocos, griffin_lim
