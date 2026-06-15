@@ -79,12 +79,14 @@ TARGET_KEYS = ("target_tokens", "target", "trace_tokens", "trace")
 DECODE_OBJECTIVES = ("auto", "target", "causal")
 EMPTY_TEXT_TOKENS = ("<empty_text>",)
 MULTIMODAL_SCORE_METRICS = (
-    "token", "exact", "fer", "bridge", "connection", "sequence", "all",
-    "balanced", "mastery")
+    "token", "exact", "generation", "fer", "bridge", "connection",
+    "sequence", "all", "balanced", "mastery")
 MULTIMODAL_SELF_TEACH_SIGNALS = (
-    "token", "mode_floor", "fer", "bridge", "connection", "sequence")
+    "token", "generation", "mode_floor", "fer", "bridge", "connection",
+    "sequence")
 MULTIMODAL_SELF_TEACH_SCORE_KEYS = {
     "token": "token_score",
+    "generation": "generation_score",
     "mode_floor": "mode_floor_score",
     "fer": "fer_score",
     "bridge": "bridge_score",
@@ -93,6 +95,7 @@ MULTIMODAL_SELF_TEACH_SCORE_KEYS = {
 }
 MULTIMODAL_SELF_TEACH_SKIP_KEYS = {
     "token": "token_skipped",
+    "generation": "generation_skipped",
     "mode_floor": "token_skipped",
     "fer": "fer_skipped",
     "bridge": "bridge_skipped",
@@ -101,6 +104,8 @@ MULTIMODAL_SELF_TEACH_SKIP_KEYS = {
 }
 MULTIMODAL_SELF_TEACH_SIGNAL_OBJECTIVES = {
     "token": ("decode_w",),
+    "generation": (
+        "decode_w", "continuation_repair_w", "repetition_unlikelihood_w"),
     "mode_floor": (
         "agreement_w", "latent_concept_completion_w"),
     "fer": ("latent_concept_fer_w", "latent_concept_factorization_w"),
@@ -118,6 +123,7 @@ MULTIMODAL_SELF_TEACH_WEIGHT_KEYS = tuple(dict.fromkeys([
     for key in keys
 ] + ["latent_concept_w"]))
 MULTIMODAL_TEXT_HISTORY_SIGNAL_KEYS = {
+    "token": ("language_score", "lm_token_acc"),
     "mode_floor": ("signal_coverage", "balanced_score", "floor_score"),
     "fer": ("fer_score",),
     "bridge": ("bridge_score", "bridge_connectivity"),
@@ -125,6 +131,7 @@ MULTIMODAL_TEXT_HISTORY_SIGNAL_KEYS = {
     "sequence": ("sequence_score",),
 }
 MULTIMODAL_TEXT_HISTORY_TOP_SIGNAL_MAP = {
+    "language": "token",
     "view": "mode_floor",
     "context": "mode_floor",
     "span": "mode_floor",
@@ -138,10 +145,12 @@ MULTIMODAL_TEXT_HISTORY_TOP_SIGNAL_MAP = {
 }
 MULTIMODAL_REPRESENTATION_PROGRESS_KEYS = (
     "mastery_score", "active_mean_score", "floor_score", "balanced_score",
-    "signal_coverage", "mode_floor_score", "fer_score", "bridge_score",
-    "connection_score", "sequence_score")
+    "signal_coverage", "mode_floor_score", "token_score",
+    "generation_score", "fer_score", "bridge_score", "connection_score",
+    "sequence_score")
 MULTIMODAL_REPRESENTATION_SIGNAL_KEYS = (
-    "fer_score", "bridge_score", "connection_score", "sequence_score")
+    "token_score", "generation_score", "fer_score", "bridge_score",
+    "connection_score", "sequence_score")
 DEFAULT_TEXT_TRANSFER_PROBE_N = 64
 DEFAULT_TEXT_TRANSFER_SCORE_MIN_DELTA = 0.1
 DEFAULT_TEXT_TRANSFER_INSIGHT_ACCEPT_W = 0.0
@@ -154,6 +163,7 @@ MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS = {
     "continuation_repair_steps": 4,
     "repetition_unlikelihood_w": 0.05,
     "repetition_unlikelihood_window": 32,
+    "selection_generation_n": 16,
 }
 MULTIMODAL_MASTERY_OBJECTIVE_FLOORS = {
     "latent_concept_slots": MULTIMODAL_DEFAULT_LATENT_CONCEPT_SLOTS,
@@ -782,13 +792,15 @@ def multimodal_score_digest(score_components):
     scalar_keys = (
         "metric", "score", "all_score", "active_mean_score", "floor_score",
         "balanced_score", "mastery_score", "signal_coverage", "token_score",
-        "exact_score", "mode_floor", "mode_floor_score", "mode_gap",
+        "exact_score", "generation_score", "generation_token_acc",
+        "generation_exact", "generation_diversity", "generation_collapse_penalty",
+        "mode_floor", "mode_floor_score", "mode_gap",
         "fer_score", "fer_raw_score", "bridge_score", "bridge_raw_score",
         "bridge_resolution", "bridge_connectivity", "gap_raw_score",
         "gap_resolution", "gap_target_mass", "connection_score",
         "sequence_score", "sequence_acc", "sequence_margin")
     skip_keys = (
-        "token_skipped", "exact_skipped", "fer_skipped",
+        "token_skipped", "exact_skipped", "generation_skipped", "fer_skipped",
         "bridge_skipped", "connection_skipped", "sequence_skipped")
     digest = {}
     for key in scalar_keys:
@@ -3894,7 +3906,8 @@ def latent_multimodal_sequence_eval(model, records, vocab, view_dims, n=200,
 
 def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
                                 gap_eval=None, sequence_eval=None,
-                                metric="mastery", margin_w=0.1):
+                                generation_eval=None, metric="mastery",
+                                margin_w=0.1):
     metric = str(metric)
     if metric not in MULTIMODAL_SCORE_METRICS:
         raise ValueError(f"unknown multimodal score metric {metric!r}")
@@ -3920,6 +3933,8 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
     bridge_eval = bridge_eval or {"skipped": True}
     gap_eval = gap_eval or {"skipped": True}
     sequence_eval = sequence_eval or {"skipped": True}
+    include_generation = generation_eval is not None or metric == "generation"
+    generation_eval = generation_eval or {"skipped": True}
     fer_raw_score = max(0.0, float(fer_eval.get("fer_score", 0.0)))
     fer_score = (0.0 if bool(fer_eval.get("skipped", False))
                  else 1.0 / (1.0 + fer_raw_score))
@@ -3942,6 +3957,21 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
     sequence_margin = float(sequence_eval.get("margin", 0.0))
     sequence_score = (0.0 if bool(sequence_eval.get("skipped", False))
                       else sequence_acc + margin_w * sequence_margin)
+    generation_token_acc = float(generation_eval.get("token_acc", 0.0))
+    generation_exact = float(generation_eval.get("exact", 0.0))
+    generation_n = int(generation_eval.get("n_records", 0) or 0)
+    generation_unique = int(
+        generation_eval.get("unique_generation_count", 0) or 0)
+    generation_diversity = (
+        float(generation_unique) / float(generation_n) if generation_n else 0.0)
+    generation_collapse_penalty = (
+        0.5 if bool(generation_eval.get("all_generations_identical", False))
+        and generation_n > 1 else 1.0)
+    generation_floor = 1.0 / float(max(1, generation_n))
+    generation_score = (
+        0.0 if bool(generation_eval.get("skipped", False))
+        else generation_token_acc * max(generation_diversity, generation_floor)
+        * generation_collapse_penalty)
     scores = {"token": token_score, "exact": exact_score,
               "fer": fer_score, "bridge": bridge_score,
               "connection": connection_score,
@@ -3951,6 +3981,9 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
                "bridge": bool(bridge_eval.get("skipped", False)),
                "connection": not bool(connection_parts),
                "sequence": bool(sequence_eval.get("skipped", False))}
+    if include_generation:
+        scores["generation"] = generation_score
+        skipped["generation"] = bool(generation_eval.get("skipped", False))
     active_scores = [scores[name] for name in scores if not skipped[name]]
     if not active_scores:
         active_scores = [0.0]
@@ -3970,6 +4003,8 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
         score = token_score
     elif metric == "exact":
         score = exact_score
+    elif metric == "generation":
+        score = generation_score
     elif metric == "fer":
         score = fer_score
     elif metric == "bridge":
@@ -3995,6 +4030,11 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
             "signal_coverage": float(signal_coverage),
             "token_score": float(token_score),
             "exact_score": float(exact_score),
+            "generation_score": float(generation_score),
+            "generation_token_acc": float(generation_token_acc),
+            "generation_exact": float(generation_exact),
+            "generation_diversity": float(generation_diversity),
+            "generation_collapse_penalty": float(generation_collapse_penalty),
             "mode_floor": float(mode_floor),
             "mode_floor_score": float(mode_floor_score),
             "mode_gap": float(mode_gap),
@@ -4017,6 +4057,7 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
             "sequence_margin": sequence_margin,
             "token_skipped": skipped["token"],
             "exact_skipped": skipped["exact"],
+            "generation_skipped": bool(skipped.get("generation", True)),
             "fer_skipped": skipped["fer"],
             "bridge_skipped": skipped["bridge"],
             "connection_skipped": skipped["connection"],
@@ -4142,7 +4183,11 @@ def multimodal_self_teach_weight_maps(score_components=None, budget=0.0,
 def multimodal_eval_bundle(model, records, vocab, view_dims, n=200, seed=1,
                            device=DEV, score_metric="mastery",
                            score_margin_w=0.1, decode_objective="target",
-                           modes=None):
+                           modes=None, generation_eval_n=0,
+                           generation_prompt_tokens=16,
+                           generation_max_new_tokens=32,
+                           generation_temperature=0.0,
+                           generation_top_k=0):
     modes = tuple(modes or multimodal_active_modes(view_dims, records))
     metrics = {
         mode: evaluate(model, records, vocab, view_dims, n=n,
@@ -4162,15 +4207,37 @@ def multimodal_eval_bundle(model, records, vocab, view_dims, n=200, seed=1,
     sequence = latent_multimodal_sequence_eval(
         model, records, vocab, view_dims, n=n, seed=seed + 37, device=device,
         decode_objective=decode_objective)
+    if int(generation_eval_n) > 0 and modes:
+        generation_mode = "full" if "full" in modes else modes[0]
+        generation = multimodal_generation_eval(
+            model, records, vocab, view_dims, n=generation_eval_n,
+            seed=seed + 41, device=device, mode=generation_mode,
+            decode_objective=decode_objective,
+            prompt_tokens=generation_prompt_tokens,
+            max_new_tokens=generation_max_new_tokens,
+            temperature=generation_temperature, top_k=generation_top_k)
+    elif int(generation_eval_n) > 0:
+        generation = {
+            "enabled": False, "skipped": True,
+            "skip_reason": "no_active_modes",
+        }
+    else:
+        generation = {
+            "enabled": False, "skipped": True,
+            "skip_reason": "generation_eval_n_zero",
+        }
     return {"teacher_forced": metrics,
+            "generation": generation,
             "latent_fer": fer,
             "latent_bridge": bridge,
             "latent_gap": gap,
             "latent_sequence": sequence,
             "score_components": multimodal_score_components(
                 metrics, fer_eval=fer, bridge_eval=bridge,
-                gap_eval=gap, sequence_eval=sequence, metric=score_metric,
-                margin_w=score_margin_w)}
+                gap_eval=gap, sequence_eval=sequence,
+                generation_eval=(
+                    generation if int(generation_eval_n) > 0 else None),
+                metric=score_metric, margin_w=score_margin_w)}
 
 
 def multimodal_representation_progress_report(before_bundle, after_bundle):
@@ -5167,6 +5234,11 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           selection_score_min_delta=0.0,
           selection_score_patience=0,
           selection_eval_n=200,
+          selection_generation_n=0,
+          selection_generation_prompt_tokens=16,
+          selection_generation_max_new_tokens=32,
+          selection_generation_temperature=0.0,
+          selection_generation_top_k=0,
           selection_insight_accept_w=0.25,
           selection_insight_min_delta=0.0):
     ckpt_latents = text_checkpoint_latent_config(
@@ -5187,6 +5259,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         continuation_repair_steps=continuation_repair_steps,
         repetition_unlikelihood_w=repetition_unlikelihood_w,
         repetition_unlikelihood_window=repetition_unlikelihood_window,
+        selection_generation_n=selection_generation_n,
         latent_concept_slots=latent_concept_slots,
         latent_concept_memory_size=latent_concept_memory_size,
         latent_concept_factorization_w=latent_concept_factorization_w,
@@ -5225,6 +5298,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     continuation_repair_steps = profile_kwargs["continuation_repair_steps"]
     repetition_unlikelihood_w = profile_kwargs["repetition_unlikelihood_w"]
     repetition_unlikelihood_window = profile_kwargs["repetition_unlikelihood_window"]
+    selection_generation_n = profile_kwargs["selection_generation_n"]
     latent_concept_slots = profile_kwargs["latent_concept_slots"]
     latent_concept_memory_size = profile_kwargs["latent_concept_memory_size"]
     latent_concept_factorization_w = profile_kwargs[
@@ -5423,6 +5497,26 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         raise ValueError("multimodal selection score patience must be non-negative")
     if int(selection_eval_n) < 0:
         raise ValueError("multimodal selection eval count must be non-negative")
+    selection_generation_n = int(selection_generation_n)
+    selection_generation_prompt_tokens = int(selection_generation_prompt_tokens)
+    selection_generation_max_new_tokens = int(selection_generation_max_new_tokens)
+    selection_generation_temperature = float(selection_generation_temperature)
+    selection_generation_top_k = int(selection_generation_top_k)
+    if selection_generation_n < 0:
+        raise ValueError(
+            "multimodal selection generation count must be non-negative")
+    if selection_generation_prompt_tokens <= 0:
+        raise ValueError(
+            "multimodal selection generation prompt tokens must be positive")
+    if selection_generation_max_new_tokens < 0:
+        raise ValueError(
+            "multimodal selection generation max new tokens must be non-negative")
+    if selection_generation_temperature < 0.0:
+        raise ValueError(
+            "multimodal selection generation temperature must be non-negative")
+    if selection_generation_top_k < 0:
+        raise ValueError(
+            "multimodal selection generation top-k must be non-negative")
     selection_insight_accept_w = float(selection_insight_accept_w)
     if selection_insight_accept_w < 0.0:
         raise ValueError("multimodal selection insight accept weight must be non-negative")
@@ -5445,6 +5539,13 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         records, split="train")
     view_dims = feature_dims(records)
     active_modes = multimodal_active_modes(view_dims, records)
+    selection_generation_kwargs = {
+        "generation_eval_n": int(selection_generation_n),
+        "generation_prompt_tokens": int(selection_generation_prompt_tokens),
+        "generation_max_new_tokens": int(selection_generation_max_new_tokens),
+        "generation_temperature": float(selection_generation_temperature),
+        "generation_top_k": int(selection_generation_top_k),
+    }
     vocab = build_vocab(records, max_size=(int(max_vocab) or None))
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -5469,7 +5570,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             seed=seed + 149, device=device,
             score_metric=selection_score_metric,
             score_margin_w=selection_score_margin_w,
-            decode_objective=decode_objective)
+            decode_objective=decode_objective,
+            **selection_generation_kwargs)
     if text_checkpoint:
         text_import_report = import_text_checkpoint(
             model, vocab, text_checkpoint, device=device)
@@ -5479,7 +5581,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 seed=seed + 149, device=device,
                 score_metric=selection_score_metric,
                 score_margin_w=selection_score_margin_w,
-                decode_objective=decode_objective)
+                decode_objective=decode_objective,
+                **selection_generation_kwargs)
             calibration = multimodal_transfer_calibration_report(
                 text_transfer_before_bundle, text_transfer_after_bundle,
                 score_min_delta=text_transfer_score_min_delta,
@@ -5569,6 +5672,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     stop_round = 0
     self_teach_base_weights = {
         "decode_w": float(decode_w),
+        "continuation_repair_w": float(continuation_repair_w),
+        "repetition_unlikelihood_w": float(repetition_unlikelihood_w),
         "agreement_w": float(agreement_w),
         "latent_concept_w": float(latent_concept_w),
         "latent_concept_factorization_w": float(latent_concept_factorization_w),
@@ -5587,12 +5692,15 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
 
     def set_objective_weights(weights):
         nonlocal decode_w, agreement_w, latent_concept_w
+        nonlocal continuation_repair_w, repetition_unlikelihood_w
         nonlocal latent_concept_factorization_w, latent_concept_fer_w
         nonlocal latent_concept_discovery_w, latent_concept_gap_w
         nonlocal latent_concept_graph_predict_w, latent_concept_bridge_w
         nonlocal latent_concept_completion_w, latent_concept_sequence_w
         nonlocal latent_concept_transition_w
         decode_w = weights["decode_w"]
+        continuation_repair_w = weights["continuation_repair_w"]
+        repetition_unlikelihood_w = weights["repetition_unlikelihood_w"]
         agreement_w = weights["agreement_w"]
         latent_concept_w = weights["latent_concept_w"]
         latent_concept_factorization_w = (
@@ -5642,6 +5750,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "score": score,
             "score_components": bundle["score_components"],
             "teacher_forced": bundle["teacher_forced"],
+            "generation": bundle.get("generation", {}),
             "latent_fer": bundle["latent_fer"],
             "latent_bridge": bundle["latent_bridge"],
             "latent_sequence": bundle["latent_sequence"],
@@ -5658,7 +5767,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             model, eval_records, vocab, view_dims, n=selection_eval_n,
             seed=seed, device=device, score_metric=selection_score_metric,
             score_margin_w=selection_score_margin_w,
-            decode_objective=decode_objective)
+            decode_objective=decode_objective,
+            **selection_generation_kwargs)
         representation_before_bundle = before_bundle
         representation_progress_probe_n = int(selection_eval_n)
         representation_progress_seed = seed
@@ -5668,7 +5778,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             seed=seed + 211, device=device,
             score_metric=selection_score_metric,
             score_margin_w=selection_score_margin_w,
-            decode_objective=decode_objective)
+            decode_objective=decode_objective,
+            **selection_generation_kwargs)
         representation_progress_probe_n = int(representation_probe_n)
         representation_progress_seed = seed + 211
     if self_teach_w > 0.0:
@@ -6428,7 +6539,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 model, eval_records, vocab, view_dims, n=selection_eval_n,
                 seed=seed, device=device, score_metric=selection_score_metric,
                 score_margin_w=selection_score_margin_w,
-                decode_objective=decode_objective)
+                decode_objective=decode_objective,
+                **selection_generation_kwargs)
             row = selection_row(round_id, round_steps, bundle)
             round_weight_update = multimodal_weight_update_report(
                 weight_update_before, multimodal_weight_update_snapshot(model))
@@ -6505,6 +6617,14 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "score_min_delta": float(selection_score_min_delta),
             "score_patience": int(selection_score_patience),
             "selection_eval_n": int(selection_eval_n),
+            "selection_generation_n": int(selection_generation_n),
+            "selection_generation_prompt_tokens": int(
+                selection_generation_prompt_tokens),
+            "selection_generation_max_new_tokens": int(
+                selection_generation_max_new_tokens),
+            "selection_generation_temperature": float(
+                selection_generation_temperature),
+            "selection_generation_top_k": int(selection_generation_top_k),
             "self_teach_w": float(self_teach_w),
             "self_teach_reports": list(self_teach_reports),
             "bridge_insight_gate": bool(
@@ -6587,6 +6707,14 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         selection = {
             "enabled": False,
             "self_teach_w": float(self_teach_w),
+            "selection_generation_n": int(selection_generation_n),
+            "selection_generation_prompt_tokens": int(
+                selection_generation_prompt_tokens),
+            "selection_generation_max_new_tokens": int(
+                selection_generation_max_new_tokens),
+            "selection_generation_temperature": float(
+                selection_generation_temperature),
+            "selection_generation_top_k": int(selection_generation_top_k),
             "text_checkpoint_history_prior": text_checkpoint_history_prior,
             "multimodal_checkpoint_history_prior": (
                 multimodal_checkpoint_history_prior),
@@ -6611,6 +6739,13 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     last = dict(last) | {
         **source_balance_train_report,
         "decode_objective": str(decode_objective),
+        "selection_generation_n": int(selection_generation_n),
+        "selection_generation_prompt_tokens": int(
+            selection_generation_prompt_tokens),
+        "selection_generation_max_new_tokens": int(
+            selection_generation_max_new_tokens),
+        "selection_generation_temperature": float(selection_generation_temperature),
+        "selection_generation_top_k": int(selection_generation_top_k),
         "decode_objective_report": decode_objective_info,
         "active_modes": list(active_modes),
         "self_teach_history_prior_w": float(self_teach_history_prior_w),
@@ -6632,7 +6767,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             n=representation_progress_probe_n, seed=representation_progress_seed,
             device=device, score_metric=selection_score_metric,
             score_margin_w=selection_score_margin_w,
-            decode_objective=decode_objective)
+            decode_objective=decode_objective,
+            **selection_generation_kwargs)
         representation_progress = multimodal_representation_progress_report(
             representation_before_bundle, representation_after_bundle)
     attempted_weight_update_count = 0
@@ -6984,10 +7120,13 @@ def selftest():
                 "signal_coverage": 0.5,
                 "balanced_score": 0.45,
                 "floor_score": 0.35,
+                "language_score": 0.4,
+                "lm_token_acc": 0.4,
                 "fer_score": 0.9,
                 "bridge_score": 0.8,
                 "bridge_connectivity": 0.75,
                 "sequence_score": 0.0,
+                "language_skipped": False,
                 "fer_skipped": False,
                 "bridge_skipped": False,
                 "sequence_skipped": False,
@@ -7024,9 +7163,13 @@ def selftest():
             },
             "representation_progress": {
                 "enabled": True,
-                "active_signals": ["fer", "bridge", "sequence"],
-                "signal_after": {"fer": 0.9, "bridge": 0.8, "sequence": 0.0},
-                "signal_deltas": {"fer": 0.1, "bridge": 0.2, "sequence": -0.3},
+                "active_signals": ["language", "fer", "bridge", "sequence"],
+                "signal_after": {
+                    "language": 0.4, "fer": 0.9,
+                    "bridge": 0.8, "sequence": 0.0},
+                "signal_deltas": {
+                    "language": -0.1, "fer": 0.1,
+                    "bridge": 0.2, "sequence": -0.3},
                 "organization_score_before": 0.25,
                 "organization_score_after": 0.55,
                 "organization_score_delta": 0.3,
@@ -7057,6 +7200,7 @@ def selftest():
         assert text_history_prior["enabled"] is True
         assert text_history_prior["entry_count"] == 1
         assert text_history_prior["top_signal"] == "connection"
+        assert text_history_prior["signal_deficits"]["token"] > 0.0
         assert text_history_prior["signal_deficits"]["sequence"] > 0.0
         assert text_history_prior["concept_connection_signal"] > 0.0
         assert text_history_prior["signal_deficits"]["connection"] > 0.0
@@ -7085,6 +7229,20 @@ def selftest():
             },
         }, enabled=True)
         assert event_only_prior["signal_deficits"]["sequence"] > 0.0
+        language_event_prior = multimodal_text_history_self_teach_prior({
+            "reading_mastery_history": {
+                "entries": [{
+                    "learning_event": {
+                        "triggered": True,
+                        "kind": "representation_reorganization",
+                        "top_signal": "language",
+                        "event_score": 0.6,
+                    },
+                }],
+            },
+        }, enabled=True)
+        assert language_event_prior["top_signal"] == "token"
+        assert language_event_prior["signal_deficits"]["token"] > 0.0
         concept_prior = text_checkpoint_concept_insight_prior(
             text_ckpt_payload, enabled=True)
         assert concept_prior["concept_connection_signal"] > 0.0
@@ -7680,6 +7838,35 @@ def selftest():
         assert math.isclose(
             self_teach_delta, self_teach_extra_sum,
             rel_tol=1e-6, abs_tol=1e-6)
+        generation_plan = multimodal_self_teach_weight_plan({
+            "token_score": 1.0,
+            "generation_score": 0.0,
+            "mode_floor_score": 1.0,
+            "fer_score": 1.0,
+            "bridge_score": 1.0,
+            "connection_score": 1.0,
+            "sequence_score": 1.0,
+            "token_skipped": False,
+            "generation_skipped": False,
+            "fer_skipped": False,
+            "bridge_skipped": False,
+            "connection_skipped": False,
+            "sequence_skipped": False,
+        }, budget=0.09)
+        assert generation_plan["top_signal"] == "generation"
+        assert generation_plan["signal_deficits"]["generation"] > 0.0
+        assert math.isclose(
+            generation_plan["weight_extras"]["decode_w"], 0.03,
+            rel_tol=1e-6, abs_tol=1e-6)
+        assert math.isclose(
+            generation_plan["weight_extras"]["continuation_repair_w"], 0.03,
+            rel_tol=1e-6, abs_tol=1e-6)
+        assert math.isclose(
+            generation_plan["weight_extras"]["repetition_unlikelihood_w"], 0.03,
+            rel_tol=1e-6, abs_tol=1e-6)
+        assert math.isclose(
+            sum(generation_plan["weight_extras"].values()), 0.09,
+            rel_tol=1e-6, abs_tol=1e-6)
         calibrated_transfer_model, *_ = train(
             manifest, steps=1, batch=2, d=32, layers=1, heads=4, device="cpu",
             objective_profile="manual",
@@ -7758,11 +7945,16 @@ def selftest():
             MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS["continuation_repair_w"])
         assert language_profile["updates"]["repetition_unlikelihood_w"]["to"] == (
             MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS["repetition_unlikelihood_w"])
+        assert language_profile["updates"]["selection_generation_n"]["to"] == (
+            MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS["selection_generation_n"])
         assert (language_profile_model.train_metrics["continuation_repair_w"]
                 == MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS["continuation_repair_w"])
         assert (language_profile_model.train_metrics["repetition_unlikelihood_w"]
                 == MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS[
                     "repetition_unlikelihood_w"])
+        assert (language_profile_model.train_metrics["selection_generation_n"]
+                == MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS[
+                    "selection_generation_n"])
         assert language_profile_model.train_metrics[
             "continuation_repair_skipped"] is True
         assert language_profile_model.latent_concept_slots == 0
@@ -7867,9 +8059,14 @@ def selftest():
         assert causal_model.train_metrics["repetition_unlikelihood_candidates"] > 0
         causal_bundle = multimodal_eval_bundle(
             causal_model, causal_eval, causal_vocab, causal_dims, n=0,
-            device="cpu", decode_objective="causal")
+            device="cpu", decode_objective="causal", generation_eval_n=2,
+            generation_prompt_tokens=3, generation_max_new_tokens=4)
         assert list(causal_bundle["teacher_forced"]) == ["full"]
+        assert causal_bundle["generation"]["enabled"] is True
         assert causal_bundle["score_components"]["token_skipped"] is False
+        assert causal_bundle["score_components"]["generation_skipped"] is False
+        assert math.isfinite(
+            causal_bundle["score_components"]["generation_score"])
         causal_generation = multimodal_generation_eval(
             causal_model, causal_eval, causal_vocab, causal_dims, n=1,
             device="cpu", decode_objective="causal", prompt_tokens=3,
@@ -8338,6 +8535,18 @@ def main(argv=None):
                     dest="selection_score_patience")
     ap.add_argument("--selection-eval-n", type=int, default=200,
                     dest="selection_eval_n")
+    ap.add_argument("--selection-generation-n", type=int, default=0,
+                    dest="selection_generation_n",
+                    help=("free-generation eval samples used inside selection/"
+                          "self-teach scoring; language profile raises this"))
+    ap.add_argument("--selection-generation-prompt-tokens", type=int, default=16,
+                    dest="selection_generation_prompt_tokens")
+    ap.add_argument("--selection-generation-max-new-tokens", type=int, default=32,
+                    dest="selection_generation_max_new_tokens")
+    ap.add_argument("--selection-generation-temperature", type=float, default=0.0,
+                    dest="selection_generation_temperature")
+    ap.add_argument("--selection-generation-top-k", type=int, default=0,
+                    dest="selection_generation_top_k")
     ap.add_argument("--selection-insight-accept-w", "--selection-insight-w",
                     type=float, default=0.25,
                     dest="selection_insight_accept_w")
@@ -8373,6 +8582,16 @@ def main(argv=None):
         ap.error("--generation-temperature must be non-negative")
     if args.generation_top_k < 0:
         ap.error("--generation-top-k must be non-negative")
+    if args.selection_generation_n < 0:
+        ap.error("--selection-generation-n must be non-negative")
+    if args.selection_generation_prompt_tokens <= 0:
+        ap.error("--selection-generation-prompt-tokens must be positive")
+    if args.selection_generation_max_new_tokens < 0:
+        ap.error("--selection-generation-max-new-tokens must be non-negative")
+    if args.selection_generation_temperature < 0.0:
+        ap.error("--selection-generation-temperature must be non-negative")
+    if args.selection_generation_top_k < 0:
+        ap.error("--selection-generation-top-k must be non-negative")
     positive = {
         "--steps": args.steps, "--batch": args.batch, "--dim": args.d,
         "--layers": args.layers, "--heads": args.heads, "--max-len": args.max_len,
@@ -8740,6 +8959,11 @@ def main(argv=None):
         selection_score_min_delta=args.selection_score_min_delta,
         selection_score_patience=args.selection_score_patience,
         selection_eval_n=args.selection_eval_n,
+        selection_generation_n=args.selection_generation_n,
+        selection_generation_prompt_tokens=args.selection_generation_prompt_tokens,
+        selection_generation_max_new_tokens=args.selection_generation_max_new_tokens,
+        selection_generation_temperature=args.selection_generation_temperature,
+        selection_generation_top_k=args.selection_generation_top_k,
         selection_insight_accept_w=args.selection_insight_accept_w,
         selection_insight_min_delta=args.selection_insight_min_delta,
         log_every=args.log_every)

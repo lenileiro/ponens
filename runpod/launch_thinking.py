@@ -2266,6 +2266,16 @@ def payload(args):
                 f"--selection-score-patience "
                 f"{args.multimodal_selection_score_patience} "
                 f"--selection-eval-n {args.multimodal_selection_eval_n} "
+                f"--selection-generation-n "
+                f"{args.multimodal_selection_generation_n} "
+                f"--selection-generation-prompt-tokens "
+                f"{args.multimodal_selection_generation_prompt_tokens} "
+                f"--selection-generation-max-new-tokens "
+                f"{args.multimodal_selection_generation_max_new_tokens} "
+                f"--selection-generation-temperature "
+                f"{args.multimodal_selection_generation_temperature} "
+                f"--selection-generation-top-k "
+                f"{args.multimodal_selection_generation_top_k} "
                 f"--selection-insight-accept-w "
                 f"{args.multimodal_selection_insight_accept_w} "
                 f"--selection-insight-min-delta "
@@ -4443,8 +4453,9 @@ def main():
     ap.add_argument("--multimodal-selection-rounds", type=int, default=1,
                     dest="multimodal_selection_rounds")
     ap.add_argument("--multimodal-selection-score-metric",
-                    choices=("token", "exact", "fer", "bridge", "sequence",
-                             "all", "balanced", "mastery"),
+                    choices=("token", "exact", "generation", "fer", "bridge",
+                             "connection", "sequence", "all", "balanced",
+                             "mastery"),
                     default="mastery", dest="multimodal_selection_score_metric")
     ap.add_argument("--multimodal-selection-score-margin-w", type=float,
                     default=0.1, dest="multimodal_selection_score_margin_w")
@@ -4454,6 +4465,21 @@ def main():
                     default=0, dest="multimodal_selection_score_patience")
     ap.add_argument("--multimodal-selection-eval-n", type=int, default=200,
                     dest="multimodal_selection_eval_n")
+    ap.add_argument("--multimodal-selection-generation-n", type=int, default=0,
+                    dest="multimodal_selection_generation_n",
+                    help=("free-generation eval samples used inside "
+                          "multimodal selection/self-teach scoring"))
+    ap.add_argument("--multimodal-selection-generation-prompt-tokens",
+                    type=int, default=16,
+                    dest="multimodal_selection_generation_prompt_tokens")
+    ap.add_argument("--multimodal-selection-generation-max-new-tokens",
+                    type=int, default=32,
+                    dest="multimodal_selection_generation_max_new_tokens")
+    ap.add_argument("--multimodal-selection-generation-temperature",
+                    type=float, default=0.0,
+                    dest="multimodal_selection_generation_temperature")
+    ap.add_argument("--multimodal-selection-generation-top-k", type=int,
+                    default=0, dest="multimodal_selection_generation_top_k")
     ap.add_argument("--multimodal-selection-insight-accept-w",
                     "--multimodal-selection-insight-w", type=float, default=0.25,
                     dest="multimodal_selection_insight_accept_w")
@@ -5499,6 +5525,8 @@ def main():
             "--multimodal-latent-concept-cluster-min-size": (
                 args.multimodal_latent_concept_cluster_min_size),
             "--multimodal-selection-rounds": args.multimodal_selection_rounds,
+            "--multimodal-selection-generation-prompt-tokens": (
+                args.multimodal_selection_generation_prompt_tokens),
             "--multimodal-eval-n": args.multimodal_eval_n,
         }
         for name, value in positive.items():
@@ -5663,6 +5691,14 @@ def main():
             "--multimodal-selection-score-patience": (
                 args.multimodal_selection_score_patience),
             "--multimodal-selection-eval-n": args.multimodal_selection_eval_n,
+            "--multimodal-selection-generation-n": (
+                args.multimodal_selection_generation_n),
+            "--multimodal-selection-generation-max-new-tokens": (
+                args.multimodal_selection_generation_max_new_tokens),
+            "--multimodal-selection-generation-temperature": (
+                args.multimodal_selection_generation_temperature),
+            "--multimodal-selection-generation-top-k": (
+                args.multimodal_selection_generation_top_k),
             "--multimodal-selection-insight-accept-w": (
                 args.multimodal_selection_insight_accept_w),
             "--multimodal-selection-insight-min-delta": (
