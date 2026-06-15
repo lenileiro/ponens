@@ -558,6 +558,10 @@ def apply_image_quality_preset(args):
         float(args.image_ae_texture_w), 0.1 if hq else 0.05)
     args.image_ae_physics_w = max(
         float(args.image_ae_physics_w), 0.1 if hq else 0.05)
+    args.image_ae_patch_structure_w = max(
+        float(args.image_ae_patch_structure_w), 0.15 if hq else 0.05)
+    args.image_ae_patch_structure_size = max(
+        int(args.image_ae_patch_structure_size), 8)
     args.image_feature_align_w = max(float(args.image_feature_align_w), 0.05)
     args.image_flow_feature_align_w = max(float(args.image_flow_feature_align_w), 0.05)
     if int(args.image_embedding_sequence_max_len) <= 0:
@@ -613,6 +617,11 @@ def apply_image_quality_preset(args):
         float(args.image_flow_decoded_endpoint_texture_w), 0.25 if hq else 0.1)
     args.image_flow_decoded_endpoint_physics_w = max(
         float(args.image_flow_decoded_endpoint_physics_w), 0.25 if hq else 0.1)
+    args.image_flow_decoded_endpoint_patch_structure_w = max(
+        float(args.image_flow_decoded_endpoint_patch_structure_w),
+        0.25 if hq else 0.1)
+    args.image_flow_decoded_endpoint_patch_structure_size = max(
+        int(args.image_flow_decoded_endpoint_patch_structure_size), 8)
     args.image_flow_equivariance_w = max(
         float(args.image_flow_equivariance_w), 0.02 if hq else 0.01)
     image_flow_equivariance_p = (
@@ -1127,6 +1136,8 @@ def payload(args):
                          args.image_sample_reference_max_structure_frequency_l1),
                         ("sample-reference-max-structure-ssim-loss",
                          args.image_sample_reference_max_structure_ssim_loss),
+                        ("sample-reference-max-patch-structure-l1",
+                         args.image_sample_reference_max_patch_structure_l1),
                         ("sample-reference-max-texture-stats-l1",
                          args.image_sample_reference_max_texture_stats_l1),
                         ("sample-reference-max-physics-l1",
@@ -1179,6 +1190,9 @@ def payload(args):
                      f"--ae-structure-w {args.image_ae_structure_w} "
                      f"--ae-texture-w {args.image_ae_texture_w} "
                      f"--ae-physics-w {args.image_ae_physics_w} "
+                     f"--ae-patch-structure-w {args.image_ae_patch_structure_w} "
+                     f"--ae-patch-structure-size "
+                     f"{args.image_ae_patch_structure_size} "
                      f"--ae-latent-reg-w {args.image_ae_latent_reg_w} "
                      f"--image-text-align-w {args.image_text_align_w} "
                      f"--flow-text-align-w {args.image_flow_text_align_w} "
@@ -1298,6 +1312,10 @@ def payload(args):
                      f"{args.image_flow_decoded_endpoint_texture_w} "
                      f"--flow-decoded-endpoint-physics-w "
                      f"{args.image_flow_decoded_endpoint_physics_w} "
+                     f"--flow-decoded-endpoint-patch-structure-w "
+                     f"{args.image_flow_decoded_endpoint_patch_structure_w} "
+                     f"--flow-decoded-endpoint-patch-structure-size "
+                     f"{args.image_flow_decoded_endpoint_patch_structure_size} "
                      f"--flow-equivariance-w {args.image_flow_equivariance_w} "
                      f"--flow-equivariance-p {args.image_flow_equivariance_p} "
                      f"--flow-equivariance-transforms "
@@ -1474,6 +1492,8 @@ def payload(args):
                          args.image_sample_reference_max_structure_frequency_l1),
                         ("max-structure-ssim-loss",
                          args.image_sample_reference_max_structure_ssim_loss),
+                        ("max-patch-structure-l1",
+                         args.image_sample_reference_max_patch_structure_l1),
                         ("max-texture-stats-l1",
                          args.image_sample_reference_max_texture_stats_l1),
                         ("max-physics-l1", args.image_sample_reference_max_physics_l1),
@@ -2883,6 +2903,12 @@ def main():
     ap.add_argument("--image-ae-physics-w", type=float, default=0.0,
                     dest="image_ae_physics_w",
                     help="generic visual mass/edge moment reconstruction loss weight")
+    ap.add_argument("--image-ae-patch-structure-w", type=float, default=0.0,
+                    dest="image_ae_patch_structure_w",
+                    help=("category-free patch descriptor reconstruction loss weight"))
+    ap.add_argument("--image-ae-patch-structure-size", type=int, default=8,
+                    dest="image_ae_patch_structure_size",
+                    help="patch size for --image-ae-patch-structure-w")
     ap.add_argument("--image-ae-latent-reg-w", type=float, default=0.0,
                     dest="image_ae_latent_reg_w",
                     help="latent L2 regularization weight during AE training")
@@ -3587,6 +3613,16 @@ def main():
     ap.add_argument("--image-flow-decoded-endpoint-physics-w", type=float, default=0.0,
                     dest="image_flow_decoded_endpoint_physics_w",
                     help="visual mass/edge moment weight inside decoded endpoint loss")
+    ap.add_argument("--image-flow-decoded-endpoint-patch-structure-w",
+                    type=float, default=0.0,
+                    dest="image_flow_decoded_endpoint_patch_structure_w",
+                    help=("category-free patch descriptor weight inside decoded "
+                          "endpoint loss"))
+    ap.add_argument("--image-flow-decoded-endpoint-patch-structure-size",
+                    type=int, default=8,
+                    dest="image_flow_decoded_endpoint_patch_structure_size",
+                    help=("patch size for "
+                          "--image-flow-decoded-endpoint-patch-structure-w"))
     ap.add_argument("--image-flow-equivariance-w", type=float, default=0.0,
                     dest="image_flow_equivariance_w",
                     help=("spatial equivariance loss weight for image flow "
@@ -4452,8 +4488,11 @@ def main():
             or args.image_ae_fft_w < 0.0 or args.image_ae_structure_w < 0.0
             or args.image_ae_texture_w < 0.0
             or args.image_ae_physics_w < 0.0
+            or args.image_ae_patch_structure_w < 0.0
             or args.image_ae_latent_reg_w < 0.0):
         sys.exit("ERROR: image AE reconstruction weights must be non-negative")
+    if args.image_ae_patch_structure_size <= 0:
+        sys.exit("ERROR: --image-ae-patch-structure-size must be positive")
     if (args.image_time_mode_scale < 0.0
             or args.image_time_mode_scale >= IMAGE_MAX_TIME_MODE_SCALE):
         sys.exit(
@@ -4512,8 +4551,12 @@ def main():
             or args.image_flow_decoded_endpoint_fft_w < 0.0
             or args.image_flow_decoded_endpoint_structure_w < 0.0
             or args.image_flow_decoded_endpoint_texture_w < 0.0
-            or args.image_flow_decoded_endpoint_physics_w < 0.0):
+            or args.image_flow_decoded_endpoint_physics_w < 0.0
+            or args.image_flow_decoded_endpoint_patch_structure_w < 0.0):
         sys.exit("ERROR: image decoded endpoint component weights must be non-negative")
+    if args.image_flow_decoded_endpoint_patch_structure_size <= 0:
+        sys.exit(
+            "ERROR: --image-flow-decoded-endpoint-patch-structure-size must be positive")
     if args.image_flow_equivariance_w < 0.0:
         sys.exit("ERROR: --image-flow-equivariance-w must be non-negative")
     if args.image_flow_equivariance_p < 0.0 or args.image_flow_equivariance_p > 1.0:
