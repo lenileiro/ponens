@@ -2157,6 +2157,7 @@ def payload(args):
                 f"--batch {args.multimodal_batch} --dim {mm_dim} "
                 f"--layers {args.multimodal_layers} --heads {args.multimodal_heads} "
                 f"--max-vocab {args.multimodal_max_vocab} "
+                f"--max-len {args.multimodal_max_len} "
                 f"--objective-profile {args.multimodal_objective_profile} "
                 f"--decode-objective {args.multimodal_decode_objective} "
                 f"--source-balance-w {args.multimodal_source_balance_w} "
@@ -4347,6 +4348,9 @@ def main():
     ap.add_argument("--multimodal-max-vocab", type=int, default=0,
                     dest="multimodal_max_vocab",
                     help="cap vocab to N most frequent tokens (0 = uncapped)")
+    ap.add_argument("--multimodal-max-len", type=int, default=128,
+                    dest="multimodal_max_len",
+                    help="decoder max sequence length (raise for longer causal windows)")
     ap.add_argument("--multimodal-source-balance-w", type=float,
                     default=MULTIMODAL_DEFAULT_SOURCE_BALANCE_W,
                     dest="multimodal_source_balance_w",
