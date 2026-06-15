@@ -3262,6 +3262,11 @@ def main():
                     dest="image_sample_reference_max_structure_ssim_loss",
                     help=("fail image reference reproduction if SSIM-style structure "
                           "loss exceeds this"))
+    ap.add_argument("--image-sample-reference-max-patch-structure-l1", type=float,
+                    default=None,
+                    dest="image_sample_reference_max_patch_structure_l1",
+                    help=("fail image reference reproduction if patch-structure "
+                          "descriptor L1 exceeds this"))
     ap.add_argument("--image-sample-reference-max-texture-stats-l1", type=float,
                     default=None,
                     dest="image_sample_reference_max_texture_stats_l1",
@@ -4745,6 +4750,7 @@ def main():
         "image_sample_reference_max_structure_multiscale_l1",
         "image_sample_reference_max_structure_frequency_l1",
         "image_sample_reference_max_structure_ssim_loss",
+        "image_sample_reference_max_patch_structure_l1",
         "image_sample_reference_max_texture_stats_l1",
         "image_sample_reference_max_physics_l1",
         "image_sample_reference_max_selected_score",
