@@ -944,6 +944,46 @@ def upload_path_cmd(local_path, remote_path, ssh):
     )
 
 
+def robust_upload_large_file(local_path, remote_path, ssh, shard_bytes=400_000_000, tries=6):
+    """Reliable multi-GB upload: byte-split locally, gzip-stream each shard to a separate
+    remote file with size-verify + retry (idempotent overwrite), then cat shards in order on
+    the pod. cat of byte-split shards reproduces the file exactly. Avoids the single-stream
+    tar|ssh broken-pipe failure on large manifests (no rsync/apt dependency)."""
+    import glob as _glob
+    import shutil as _shutil
+    import tempfile as _tempfile
+    local_path = os.path.abspath(local_path)
+    remote_dir = os.path.dirname(remote_path) or "."
+    sh(f"{ssh} {shlex_quote('mkdir -p ' + remote_dir + ' && rm -f ' + remote_path + ' ' + remote_path + '.part.*')}")
+    work = _tempfile.mkdtemp(prefix="mmshard_")
+    try:
+        prefix = os.path.join(work, "part.")
+        if subprocess.run(["split", "-b", str(int(shard_bytes)), local_path, prefix]).returncode != 0:
+            raise RuntimeError("local split failed for manifest upload")
+        shards = sorted(_glob.glob(prefix + "*"))
+        if not shards:
+            raise RuntimeError("manifest split produced no shards")
+        print(f"  robust upload: {len(shards)} shards x ~{shard_bytes//1_000_000}MB -> {remote_path}")
+        for i, sh_path in enumerate(shards):
+            size = os.path.getsize(sh_path)
+            rp = f"{remote_path}.part.{i:04d}"
+            ok = False
+            for _ in range(tries):
+                if sh(f"gzip -c {shlex_quote(sh_path)} | {ssh} {shlex_quote('gunzip -c > ' + rp)}") != 0:
+                    continue
+                chk = subprocess.run(f"{ssh} {shlex_quote('stat -c %s ' + rp)}",
+                                     shell=True, capture_output=True, text=True)
+                if chk.returncode == 0 and chk.stdout.strip() == str(size):
+                    ok = True
+                    break
+            if not ok:
+                raise RuntimeError(f"manifest shard {i} upload failed after {tries} tries")
+        if sh(f"{ssh} {shlex_quote('cat ' + remote_path + '.part.* > ' + remote_path + ' && rm -f ' + remote_path + '.part.*')}") != 0:
+            raise RuntimeError("manifest shard concat failed on pod")
+    finally:
+        _shutil.rmtree(work, ignore_errors=True)
+
+
 def payload(args):
     """Build the pod-side command for supported manifest/raw-data training jobs."""
     py = "python3 -u" if args.fast else "/root/fer-venv/bin/python -u"
@@ -6324,7 +6364,8 @@ def main():
                   f"| {ssh} 'mkdir -p {REMOTE} && tar --no-same-owner -xzf - -C {REMOTE}'")
         sh(up)
         if multimodal_manifest_upload_src:
-            sh(upload_path_cmd(multimodal_manifest_upload_src, args.multimodal_manifest, ssh))
+            robust_upload_large_file(
+                multimodal_manifest_upload_src, args.multimodal_manifest, ssh)
         if args.upload_image_data:
             root_local = local_path_for_arg(args.image_root)
             root_remote = remote_path_for_arg(args.image_root)
