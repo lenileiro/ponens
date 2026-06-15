@@ -93,12 +93,13 @@ class TransformerTTS(nn.Module):
         mem = self.enc(ids); mem_pad = ids.eq(0)
         x = self.prenet_do(mel_in.transpose(1, 2)) + sinusoidal(T, self.d, ids.device)[None]
         causal = torch.triu(torch.full((T, T), float("-inf"), device=ids.device), 1)
-        w = None
+        ws = []
         for layer in self.layers:
             x, w = layer(x, mem, causal, mem_pad)
+            ws.append(w)
         coarse = self.out(x).transpose(1, 2)                 # (B,n_bins,T)
         refined = coarse + self.postnet(coarse)
-        return coarse, refined, self.stop(x).squeeze(-1), w  # w: (B,T,L) last-layer cross-attn
+        return coarse, refined, self.stop(x).squeeze(-1), ws  # ws: list of (B,T,L) per layer
 
     @torch.no_grad()
     def infer(self, ids, max_T=MAX_T, stop_thresh=0.5):
@@ -147,18 +148,19 @@ def train(steps=60000, seed=0, device=DEV, batch=16, lr=3e-4, ckpt_path=None, sa
         idt, mel, stop, ids_len, mel_len = _batch(train_data, rng, batch, device)
         T = mel.shape[1] if False else mel.shape[2]
         mel_in = F.pad(mel, (1, 0))[:, :, :-1]               # shift for teacher forcing
-        coarse, refined, stop_logit, align = model.decode(idt, mel_in)
+        coarse, refined, stop_logit, aligns = model.decode(idt, mel_in)
         mmask = (torch.arange(mel.shape[2], device=device)[None] < mel_len[:, None]).float()
         l_mel = sum((F.l1_loss(p, mel, reduction="none").mean(1) * mmask).sum() / mmask.sum()
                     for p in (coarse, refined))
         l_stop = F.binary_cross_entropy_with_logits(stop_logit, stop)
-        l_ga = sum(guided_attention_loss(align[b:b + 1], int(ids_len[b]), int(mel_len[b]))
-                   for b in range(idt.shape[0])) / idt.shape[0]
-        (l_mel + l_stop + 2.0 * l_ga).backward()
+        # guided attention on EVERY decoder layer's cross-attn -> all layers must align (no AR-cheat)
+        l_ga = sum(guided_attention_loss(al[b:b + 1], int(ids_len[b]), int(mel_len[b]))
+                   for al in aligns for b in range(idt.shape[0])) / (idt.shape[0] * len(aligns))
+        (l_mel + l_stop + 5.0 * l_ga).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step(); opt.zero_grad()
         if st % max(1, steps // 20) == 0 or st == steps:
-            focus = float(align.max(-1).values.mean().detach())
+            focus = float(aligns[-1].max(-1).values.mean().detach())
             print(f"  ar {st}/{steps} mel {l_mel.item():.3f} stop {l_stop.item():.3f} "
                   f"ga {l_ga.item():.4f} focus {focus:.3f}", flush=True)
         if st % max(1, steps // 5) == 0 and ckpt_path:
@@ -192,10 +194,10 @@ def evaluate(model, data, device=DEV, n=80, seed=1):
         for _ in range(min(n, len(eval_data) * 2)):
             idt, mel, stop, ids_len, mel_len = _batch(eval_data, rng, 1, device)
             mel_in = F.pad(mel, (1, 0))[:, :, :-1]
-            _, refined, _, align = model.decode(idt, mel_in)
+            _, refined, _, aligns = model.decode(idt, mel_in)
             mmask = (torch.arange(mel.shape[2], device=device)[None] < mel_len[:, None]).float()
             errs.append(float((F.l1_loss(refined, mel, reduction="none").mean(1) * mmask).sum() / mmask.sum()))
-            focus.append(float(align.max(-1).values.mean()))
+            focus.append(float(aligns[-1].max(-1).values.mean()))
     return {"heldout_spec_l1": float(np.mean(errs)), "attention_focus": float(np.mean(focus))}
 
 
@@ -218,8 +220,8 @@ def selftest():
     L = max(len(a), len(b))
     ids = torch.tensor([a + [0] * (L - len(a)), b + [0] * (L - len(b))])
     mel_in = torch.randn(2, N_BINS, 20)
-    coarse, refined, stoplg, align = m.decode(ids, mel_in)
-    assert coarse.shape == (2, N_BINS, 20) and align.shape == (2, 20, L) and stoplg.shape == (2, 20)
+    coarse, refined, stoplg, aligns = m.decode(ids, mel_in)
+    assert coarse.shape == (2, N_BINS, 20) and aligns[-1].shape == (2, 20, L) and stoplg.shape == (2, 20)
     out = m.infer(ids[:1], max_T=12); assert out.shape[0] == 1 and out.shape[1] == N_BINS
     if os.path.exists(os.path.join(ROOT, "manifest.json")):
         data = load(); assert data
