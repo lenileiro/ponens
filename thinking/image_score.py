@@ -20,6 +20,7 @@ import json
 import math
 import os
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
@@ -260,6 +261,51 @@ def technical_quality(path: str, image_size: int = 256) -> tuple[float, dict]:
         "mean_saturation": saturation,
     }
     return float(score or 0.0), components
+
+
+def _technical_quality_row(row: ManifestRow, image_size: int):
+    try:
+        score, metrics = technical_quality(row.record.path, image_size=image_size)
+        return row.index, {"score": float(score), "metrics": metrics}
+    except Exception as exc:
+        return row.index, {"score": None, "metrics": {
+            "technical_quality_error": str(exc),
+        }}
+
+
+def technical_quality_index(rows: Sequence[ManifestRow], image_size: int = 256,
+                            workers: int = 0):
+    workers = int(workers or 0)
+    if workers <= 0:
+        workers = min(8, max(1, (os.cpu_count() or 1)))
+    workers = max(1, workers)
+    index = {}
+    if workers == 1 or len(rows) <= 1:
+        for row in rows:
+            row_id, item = _technical_quality_row(row, image_size)
+            index[row_id] = item
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_technical_quality_row, row, image_size)
+                for row in rows
+            ]
+            for future in futures:
+                row_id, item = future.result()
+                index[row_id] = item
+    vals = [
+        item["score"] for item in index.values()
+        if item.get("score") is not None
+    ]
+    return index, {
+        "technical_precomputed": True,
+        "technical_workers": int(workers),
+        "technical_rows": int(len(rows)),
+        "technical_scored": int(len(vals)),
+        "technical_failed": int(sum(
+            1 for item in index.values() if item.get("score") is None)),
+        "technical_quality_score_stats": _stats(vals),
+    }
 
 
 def embedding_quality(rec: ImageTextRecord) -> tuple[float | None, dict]:
@@ -521,18 +567,28 @@ def pickscore_quality_index(rows: Sequence[ManifestRow], model_name: str = "",
 
 def score_record(row: ManifestRow, backend: str = "stats", external_index: dict | None = None,
                  pickscore_index: dict | None = None,
+                 technical_index: dict | None = None,
                  external_key: str = "image", image_size: int = 256,
                  technical_w: float = 1.0, alignment_w: float = 0.0,
                  external_w: float = 0.0, pickscore_w: float = 0.0):
     external_index = external_index or {}
     pickscore_index = pickscore_index or {}
+    technical_index = technical_index or {}
     components = {}
     parts = []
     reasons = []
     if backend in ("stats", "ensemble") and technical_w > 0.0:
-        score, metrics = technical_quality(row.record.path, image_size=image_size)
+        item = technical_index.get(row.index)
+        if item is None:
+            score, metrics = technical_quality(row.record.path, image_size=image_size)
+        else:
+            score = item.get("score")
+            metrics = item.get("metrics", {})
         components.update(metrics)
-        parts.append(("technical", score, technical_w))
+        if score is None:
+            reasons.append("technical_quality_error")
+        else:
+            parts.append(("technical", score, technical_w))
     if backend in ("embedding", "ensemble") and alignment_w > 0.0:
         score, metrics = embedding_quality(row.record)
         components.update(metrics)
@@ -601,6 +657,7 @@ def score_manifest(manifest: str, root: str = "", split: str = "", max_records: 
                    external_root: str = "", external_key: str = "image",
                    external_score_field: str = "", external_normalize: str = "auto",
                    image_size: int = 256, technical_w: float = 1.0,
+                   technical_workers: int = 0,
                    alignment_w: float = 0.0, external_w: float = 0.0,
                    pickscore_w: float = 0.0, pickscore_model: str = "",
                    pickscore_processor: str = "", pickscore_device: str = "auto",
@@ -628,13 +685,23 @@ def score_manifest(manifest: str, root: str = "", split: str = "", max_records: 
     external_report.update(normalize_external_scores(external_index, mode=external_normalize))
     needs_pickscore = backend == "pickscore" or (
         backend == "ensemble" and float(pickscore_w) > 0.0)
+    needs_technical = backend == "stats" or (
+        backend == "ensemble" and float(technical_w) > 0.0)
     row_source = iter_manifest_rows(
         manifest, root=root, split=split, max_records=max_records)
     pickscore_index, pickscore_report = {}, {
         "pickscore_enabled": bool(needs_pickscore),
     }
-    if needs_pickscore:
+    if needs_pickscore or (needs_technical and int(technical_workers or 0) != 1):
         row_source = list(row_source)
+    technical_index, technical_report = {}, {
+        "technical_precomputed": False,
+        "technical_workers": 1,
+    }
+    if needs_technical and int(technical_workers or 0) != 1:
+        technical_index, technical_report = technical_quality_index(
+            row_source, image_size=image_size, workers=technical_workers)
+    if needs_pickscore:
         pickscore_index, pickscore_report = pickscore_quality_index(
             row_source, model_name=pickscore_model, processor_name=pickscore_processor,
             device=pickscore_device, dtype=pickscore_dtype, batch_size=pickscore_batch,
@@ -657,6 +724,7 @@ def score_manifest(manifest: str, root: str = "", split: str = "", max_records: 
                 score, metrics = score_record(
                     row, backend=backend, external_index=external_index,
                     pickscore_index=pickscore_index,
+                    technical_index=technical_index,
                     external_key=external_key, image_size=image_size,
                     technical_w=technical_w, alignment_w=alignment_w,
                     external_w=external_w, pickscore_w=pickscore_w)
@@ -741,6 +809,7 @@ def score_manifest(manifest: str, root: str = "", split: str = "", max_records: 
         "max_records": int(max_records),
         "image_size": int(image_size),
         "technical_w": float(technical_w),
+        "technical_workers_requested": int(technical_workers or 0),
         "alignment_w": float(alignment_w),
         "external_w": float(external_w),
         "pickscore_w": float(pickscore_w),
@@ -757,6 +826,7 @@ def score_manifest(manifest: str, root: str = "", split: str = "", max_records: 
         "quality_failure_examples": examples,
     }
     report.update(external_report)
+    report.update(technical_report)
     report.update(pickscore_report)
     if report_out:
         os.makedirs(os.path.dirname(report_out) or ".", exist_ok=True)
@@ -803,6 +873,8 @@ def selftest():
             report_out=os.path.join(td, "report.json"), image_size=32)
         rows = _read_jsonl(out)
         assert report["records_scored"] == 2
+        assert report["technical_precomputed"] is True
+        assert report["technical_workers"] >= 1
         assert rows[1]["quality_score"] > rows[0]["quality_score"]
         assert rows[1]["technical_quality_score"] > rows[0]["technical_quality_score"]
 
@@ -840,6 +912,7 @@ def selftest():
             technical_w=0.5, external_w=0.5, alignment_w=0.0)
         ens_rows = _read_jsonl(ensemble_out)
         assert ens_report["records_scored"] == 2
+        assert ens_report["technical_precomputed"] is True
         assert "external" in ens_rows[1]["quality_score_components"]
         norm, norm_report = _normalize_score_values([1.0, 9.0], mode="auto")
         assert norm_report["normalized"] is True
@@ -873,6 +946,9 @@ def main(argv=None):
                     help="working image size for technical stats scorer")
     ap.add_argument("--technical-w", type=float, default=1.0,
                     help="ensemble weight for technical image-health score")
+    ap.add_argument("--technical-workers", type=int, default=0,
+                    help=("parallel CPU workers for technical image-health scoring; "
+                          "0 auto-selects up to 8, 1 preserves serial scoring"))
     ap.add_argument("--alignment-w", type=float, default=0.0,
                     help="ensemble weight for existing image/text embedding cosine")
     ap.add_argument("--external-w", type=float, default=0.0,
@@ -910,6 +986,8 @@ def main(argv=None):
         ap.error("--max-records must be non-negative")
     if args.image_size <= 0:
         ap.error("--image-size must be positive")
+    if args.technical_workers < 0:
+        ap.error("--technical-workers must be non-negative")
     for name in ("technical_w", "alignment_w", "external_w", "pickscore_w"):
         if getattr(args, name) < 0.0:
             ap.error(f"--{name.replace('_', '-')} must be non-negative")
@@ -927,7 +1005,8 @@ def main(argv=None):
         external_root=args.external_root, external_key=args.external_key,
         external_score_field=args.external_score_field,
         external_normalize=args.external_normalize, image_size=args.image_size,
-        technical_w=args.technical_w, alignment_w=args.alignment_w,
+        technical_w=args.technical_w, technical_workers=args.technical_workers,
+        alignment_w=args.alignment_w,
         external_w=args.external_w, pickscore_w=args.pickscore_w,
         pickscore_model=args.pickscore_model,
         pickscore_processor=args.pickscore_processor,
