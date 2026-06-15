@@ -33,6 +33,7 @@ IMAGE_MAX_TIME_U_SHAPE_SCALE = 20.0
 READING_DEFAULT_MAX_VOCAB = 32768
 READING_DEFAULT_SOURCE_BALANCE_W = 0.5
 MULTIMODAL_DEFAULT_SOURCE_BALANCE_W = 0.5
+MULTIMODAL_DEFAULT_REPLAY_BANK_SIZE = 128
 
 
 def image_embed_model_min_flow_width(model):
@@ -261,6 +262,14 @@ def reading_upload_paths(args):
 
 def image_resume_upload_path(args):
     path = str(getattr(args, "image_resume_checkpoint", "") or "").strip()
+    if not path or is_url_arg(path):
+        return ""
+    local = local_path_for_arg(path)
+    return os.path.abspath(local) if os.path.isfile(local) else ""
+
+
+def multimodal_checkpoint_upload_path(args):
+    path = str(getattr(args, "multimodal_checkpoint", "") or "").strip()
     if not path or is_url_arg(path):
         return ""
     local = local_path_for_arg(path)
@@ -2379,6 +2388,7 @@ def payload(args):
                 f"{args.multimodal_self_teach_history_prior_w} "
                 f"--representation-probe-n "
                 f"{args.multimodal_representation_probe_n} "
+                f"--replay-bank-size {args.multimodal_replay_bank_size} "
                 f"--text-transfer-probe-n "
                 f"{args.multimodal_text_transfer_probe_n} "
                 f"--text-transfer-score-min-delta "
@@ -2395,6 +2405,12 @@ def payload(args):
                 mm_cmd += (
                     f" --text-checkpoint "
                     f"{shlex_quote(args.multimodal_text_checkpoint)}")
+            if args.multimodal_checkpoint:
+                mm_cmd += (
+                    f" --multimodal-checkpoint "
+                    f"{shlex_quote(args.multimodal_checkpoint)}")
+            if not args.multimodal_checkpoint_replay:
+                mm_cmd += " --no-checkpoint-replay"
             mm_cmd += (
                 " --text-transfer-gate"
                 if args.multimodal_text_transfer_gate
@@ -4606,6 +4622,19 @@ def main():
     ap.add_argument("--multimodal-text-checkpoint", default="",
                     dest="multimodal_text_checkpoint",
                     help="optional thinking.text checkpoint for multimodal warm start")
+    ap.add_argument("--multimodal-checkpoint", default="",
+                    dest="multimodal_checkpoint",
+                    help=("optional thinking.multimodal checkpoint for multimodal "
+                          "continuation and replay"))
+    ap.add_argument("--multimodal-checkpoint-replay",
+                    action=argparse.BooleanOptionalAction, default=True,
+                    dest="multimodal_checkpoint_replay",
+                    help=("reuse replay rows stored inside --multimodal-checkpoint "
+                          "during continuation"))
+    ap.add_argument("--multimodal-replay-bank-size", type=int,
+                    default=MULTIMODAL_DEFAULT_REPLAY_BANK_SIZE,
+                    dest="multimodal_replay_bank_size",
+                    help="maximum multimodal replay rows saved into checkpoints")
     ap.add_argument("--multimodal-self-teach-w", type=float, default=0.0,
                     dest="multimodal_self_teach_w",
                     help="multimodal self-teach objective reallocation budget")
@@ -5775,6 +5804,8 @@ def main():
             sys.exit("ERROR: --multimodal-text-stride must be non-negative")
         if args.multimodal_text_min_tokens <= 1:
             sys.exit("ERROR: --multimodal-text-min-tokens must be greater than one")
+        if args.multimodal_replay_bank_size < 0:
+            sys.exit("ERROR: --multimodal-replay-bank-size must be non-negative")
         if (args.multimodal_text_eval_frac < 0.0
                 or args.multimodal_text_eval_frac >= 1.0):
             sys.exit("ERROR: --multimodal-text-eval-frac must be in [0, 1)")
@@ -6122,6 +6153,14 @@ def main():
         image_resume_upload = image_resume_upload_path(args)
         if image_resume_upload:
             args.image_resume_checkpoint = local_path_remote_destination(image_resume_upload)
+    multimodal_checkpoint_upload = ""
+    if args.multimodal_checkpoint:
+        if not args.multimodal:
+            sys.exit("ERROR: --multimodal-checkpoint requires --multimodal")
+        multimodal_checkpoint_upload = multimodal_checkpoint_upload_path(args)
+        if multimodal_checkpoint_upload:
+            args.multimodal_checkpoint = local_path_remote_destination(
+                multimodal_checkpoint_upload)
 
     key = os.environ.get("RUNPOD_API_KEY")
     if not key and args.go:
@@ -6211,6 +6250,11 @@ def main():
             f"image resume: {image_resume_upload} -> "
             f"pod:{args.image_resume_checkpoint}"
         )
+    if multimodal_checkpoint_upload:
+        print(
+            f"multimodal checkpoint: {multimodal_checkpoint_upload} -> "
+            f"pod:{args.multimodal_checkpoint}"
+        )
     preference_uploads = (
         preference_upload_paths(args.image_preference_manifest)
         if getattr(args, "image_auto_preference_manifest", False) else []
@@ -6276,6 +6320,9 @@ def main():
             sh(upload_path_cmd(local_path_for_arg(local), remote_path_for_arg(local), ssh))
         if image_resume_upload:
             sh(upload_path_cmd(image_resume_upload, args.image_resume_checkpoint, ssh))
+        if multimodal_checkpoint_upload:
+            sh(upload_path_cmd(
+                multimodal_checkpoint_upload, args.multimodal_checkpoint, ssh))
         for local in preference_uploads:
             sh(upload_path_cmd(local, local_path_remote_destination(local), ssh))
         # DETACHED execution: nohup on the pod + short-poll. A dropped SSH pipe killed three

@@ -224,6 +224,8 @@ MULTIMODAL_MASTERY_STUDY_FLOORS = {
 MULTIMODAL_MASTERY_PROFILE_FLOORS = (
     dict(MULTIMODAL_MASTERY_OBJECTIVE_FLOORS)
     | dict(MULTIMODAL_MASTERY_STUDY_FLOORS))
+MULTIMODAL_REPLAY_BANK_VERSION = 1
+MULTIMODAL_REPLAY_BANK_SIZE = 128
 MULTIMODAL_LEARNING_HISTORY_VERSION = 1
 MULTIMODAL_LEARNING_HISTORY_SIZE = 32
 
@@ -243,6 +245,12 @@ def _mm_int(value, default=0):
         return int(value)
     except (TypeError, ValueError):
         return int(default)
+
+
+def _jsonable_meta(meta):
+    if not isinstance(meta, dict):
+        return {}
+    return json.loads(json.dumps(meta, default=str))
 
 
 @dataclass(frozen=True)
@@ -447,19 +455,33 @@ def multimodal_source_counts(records):
 
 
 def multimodal_training_sampling_weights(
-        records, source_balance_w=MULTIMODAL_DEFAULT_SOURCE_BALANCE_W):
+        records, source_balance_w=MULTIMODAL_DEFAULT_SOURCE_BALANCE_W,
+        priority_power=1.0, priority_boost=1.0):
     source_balance_w = float(source_balance_w)
     if source_balance_w < 0.0:
         raise ValueError("multimodal source balance weight must be non-negative")
-    if not records or source_balance_w <= 0.0:
+    if not records:
         return None
     counts = multimodal_source_counts(records)
-    if len(counts) <= 1:
+    balance_sources = source_balance_w > 0.0 and len(counts) > 1
+    saw_priority = False
+    weights = []
+    for rec in records:
+        source_weight = 1.0
+        if balance_sources:
+            source_weight = (
+                1.0 / (float(counts[multimodal_record_source(rec)])
+                       ** source_balance_w))
+        priority = 0.0
+        if isinstance(getattr(rec, "meta", None), dict):
+            priority = float(rec.meta.get("replay_priority", 0.0) or 0.0)
+        saw_priority = saw_priority or priority > 0.0
+        priority_weight = 1.0 + float(priority_boost) * (
+            max(0.0, priority) ** float(priority_power))
+        weights.append(source_weight * priority_weight)
+    if not balance_sources and not saw_priority:
         return None
-    weights = np.asarray([
-        1.0 / (float(counts[multimodal_record_source(rec)]) ** source_balance_w)
-        for rec in records
-    ], dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
     total = float(weights.sum())
     if total <= 0.0 or not np.isfinite(total):
         return None
@@ -472,15 +494,270 @@ def multimodal_source_balance_report(records, source_balance_w, weights=None):
     fracs = [
         (float(count) / total) for count in counts.values()
     ] if total > 0.0 else []
+    priority_count = sum(
+        1 for rec in records
+        if isinstance(getattr(rec, "meta", None), dict)
+        and float(rec.meta.get("replay_priority", 0.0) or 0.0) > 0.0)
+    source_balance_active = bool(
+        weights is not None and float(source_balance_w) > 0.0
+        and len(counts) > 1)
     return {
         "training_weighted_sampling": weights is not None,
-        "training_source_balance_sampling": bool(weights is not None),
+        "training_source_balance_sampling": source_balance_active,
         "training_source_balance_w": float(source_balance_w),
         "training_source_count": int(len(counts)),
         "training_source_record_counts": dict(counts),
         "training_max_source_record_frac": float(max(fracs) if fracs else 0.0),
         "training_min_source_record_frac": float(min(fracs) if fracs else 0.0),
+        "training_priority_sampling": bool(
+            weights is not None and priority_count > 0),
+        "training_priority_record_count": int(priority_count),
     }
+
+
+def multimodal_record_with_meta(rec, meta):
+    return MultimodalRecord(
+        rec_id=rec.rec_id,
+        split=rec.split,
+        text=rec.text,
+        target=rec.target,
+        views=rec.views,
+        meta=meta,
+    )
+
+
+def multimodal_record_to_bank_row(rec, replay_meta=None):
+    replay_meta = dict(replay_meta or {})
+    if not replay_meta and isinstance(rec.meta, dict):
+        replay_meta = {
+            "priority": rec.meta.get("replay_priority", 0.0),
+            "reasons": rec.meta.get("replay_reasons", ()),
+        }
+    row = {
+        "id": str(rec.rec_id),
+        "split": str(rec.split),
+        "text": list(rec.text),
+        "views": {
+            str(name): np.asarray(value, dtype=np.float32).reshape(-1).tolist()
+            for name, value in dict(rec.views or {}).items()
+        },
+        "meta": _jsonable_meta(rec.meta),
+        "replay_priority": float(replay_meta.get("priority", 0.0)),
+        "replay_reasons": list(replay_meta.get("reasons", ())),
+    }
+    if rec.target:
+        row["target"] = list(rec.target)
+    return row
+
+
+def multimodal_record_from_bank_row(row, idx=0):
+    if not isinstance(row, dict):
+        raise ValueError(f"multimodal replay bank row {idx} must be an object")
+    obj = dict(row)
+    meta = obj.get("meta") if isinstance(obj.get("meta"), dict) else {}
+    meta = meta | {"replay_bank": True}
+    if "replay_priority" in obj:
+        meta["replay_priority"] = float(obj.get("replay_priority", 0.0))
+    if "replay_reasons" in obj:
+        meta["replay_reasons"] = list(obj.get("replay_reasons", ()))
+    obj["meta"] = meta
+    return _record_from_json(
+        obj, idx, root=None, default_source="__multimodal_replay__")
+
+
+def unique_multimodal_records_by_id(*record_lists):
+    out = []
+    seen = set()
+    for records in record_lists:
+        for rec in records or ():
+            if rec.rec_id in seen:
+                continue
+            seen.add(rec.rec_id)
+            out.append(rec)
+    return out
+
+
+def merge_multimodal_replay_metadata(records, replay_records):
+    records = list(records or [])
+    replay_records = list(replay_records or [])
+    replay_meta_by_id = {}
+    for rec in replay_records:
+        meta = getattr(rec, "meta", {}) if isinstance(
+            getattr(rec, "meta", None), dict) else {}
+        priority = float(meta.get("replay_priority", 0.0) or 0.0)
+        reasons = list(meta.get("replay_reasons", ()) or ())
+        if priority <= 0.0 and not reasons:
+            continue
+        row = replay_meta_by_id.setdefault(
+            rec.rec_id, {"priority": 0.0, "reasons": []})
+        row["priority"] = max(float(row["priority"]), priority)
+        for reason in reasons:
+            if reason not in row["reasons"]:
+                row["reasons"].append(reason)
+    merged = []
+    for rec in records:
+        replay_meta = replay_meta_by_id.get(rec.rec_id)
+        if replay_meta is None:
+            merged.append(rec)
+            continue
+        meta = dict(rec.meta or {})
+        meta["replay_priority"] = max(
+            float(meta.get("replay_priority", 0.0) or 0.0),
+            float(replay_meta["priority"]))
+        existing_reasons = list(meta.get("replay_reasons", ()) or ())
+        for reason in replay_meta["reasons"]:
+            if reason not in existing_reasons:
+                existing_reasons.append(reason)
+        meta["replay_reasons"] = existing_reasons
+        merged.append(multimodal_record_with_meta(rec, meta))
+    return unique_multimodal_records_by_id(merged, replay_records)
+
+
+def multimodal_hard_record_ids(study_reports):
+    ids = []
+    seen = set()
+    for report in study_reports or ():
+        if not isinstance(report, dict):
+            continue
+        for raw_id in tuple(report.get("hard_record_ids", ()) or ()) + tuple(
+                report.get("record_ids", ()) or ()) + tuple(
+                report.get("top_ids", ()) or ()):
+            rec_id = str(raw_id)
+            if rec_id and rec_id not in seen:
+                seen.add(rec_id)
+                ids.append(rec_id)
+    return ids
+
+
+def multimodal_replay_record_metadata(study_reports, learning_event=None):
+    meta = {}
+
+    def bump(rec_id, reason, priority):
+        rec_id = str(rec_id)
+        if not rec_id:
+            return
+        row = meta.setdefault(rec_id, {"priority": 0.0, "reasons": []})
+        row["priority"] = max(float(row["priority"]), float(priority))
+        if reason and reason not in row["reasons"]:
+            row["reasons"].append(reason)
+
+    for report in study_reports or ():
+        if not isinstance(report, dict):
+            continue
+        strategy = str(report.get("strategy", "study"))
+        score = max(
+            0.0,
+            float(report.get(
+                "mean_score",
+                report.get(
+                    "mean_gap_score",
+                    report.get("mean_completion_surprise", 0.0))) or 0.0))
+        for raw_id in report.get("hard_record_ids", ()):
+            bump(raw_id, f"hard:{strategy}", 2.0 + score)
+        for raw_id in report.get("record_ids", ()):
+            bump(raw_id, f"study_pool:{strategy}", 1.0 + score)
+    if isinstance(learning_event, dict) and bool(
+            learning_event.get("triggered", False)):
+        event_score = min(
+            1.0, max(0.0, _mm_float(
+                learning_event.get("event_score", 0.0), 0.0)))
+        event_kind = str(learning_event.get("kind", "learning"))
+        event_signal = str(learning_event.get("top_signal", ""))
+        for raw_id in multimodal_hard_record_ids(study_reports):
+            bump(raw_id, f"learning_event:{event_kind}", 2.5 + event_score)
+            if event_signal:
+                bump(raw_id, f"learning_signal:{event_signal}", 2.5 + event_score)
+    return meta
+
+
+def build_multimodal_replay_bank(records, study_reports=None,
+                                 learning_event=None,
+                                 max_records=MULTIMODAL_REPLAY_BANK_SIZE):
+    max_records = int(max_records)
+    if max_records <= 0:
+        return {
+            "version": MULTIMODAL_REPLAY_BANK_VERSION,
+            "max_records": max_records,
+            "records": [],
+            "record_count": 0,
+            "hard_record_count": 0,
+            "priority_record_count": 0,
+        }
+    records = unique_multimodal_records_by_id(records)
+    by_id = {rec.rec_id: rec for rec in records}
+    hard_ids = multimodal_hard_record_ids(study_reports)
+    hard_id_set = set(hard_ids)
+    replay_meta = multimodal_replay_record_metadata(
+        study_reports, learning_event=learning_event)
+    for rec in records:
+        if not isinstance(getattr(rec, "meta", None), dict):
+            continue
+        priority = float(rec.meta.get("replay_priority", 0.0) or 0.0)
+        if priority <= 0.0:
+            continue
+        row = replay_meta.setdefault(rec.rec_id, {"priority": 0.0, "reasons": []})
+        row["priority"] = max(float(row["priority"]), priority)
+        for reason in rec.meta.get("replay_reasons", ()) or ():
+            if reason not in row["reasons"]:
+                row["reasons"].append(reason)
+    hard = [by_id[rec_id] for rec_id in hard_ids if rec_id in by_id]
+    priority = [
+        by_id[rec_id] for rec_id, item in sorted(
+            replay_meta.items(),
+            key=lambda pair: float(pair[1].get("priority", 0.0)),
+            reverse=True)
+        if rec_id in by_id and rec_id not in hard_id_set]
+    priority_ids = hard_id_set | {rec.rec_id for rec in priority}
+    train = [
+        rec for rec in records
+        if rec.split == "train" and rec.rec_id not in priority_ids]
+    evals = [
+        rec for rec in records
+        if rec.split == "eval" and rec.rec_id not in priority_ids]
+    ordered = unique_multimodal_records_by_id(hard, priority, train, evals)
+    if len(ordered) > max_records:
+        keep = ordered[:max_records]
+        if not any(rec.split == "eval" for rec in keep):
+            eval_remaining = next(
+                (rec for rec in ordered[max_records:] if rec.split == "eval"),
+                None)
+            if eval_remaining is not None:
+                keep[-1] = eval_remaining
+        ordered = keep
+    return {
+        "version": MULTIMODAL_REPLAY_BANK_VERSION,
+        "max_records": max_records,
+        "record_count": len(ordered),
+        "hard_record_count": sum(1 for rec in ordered if rec.rec_id in hard_id_set),
+        "priority_record_count": sum(
+            1 for rec in ordered if rec.rec_id in replay_meta),
+        "records": [
+            multimodal_record_to_bank_row(rec, replay_meta.get(rec.rec_id))
+            for rec in ordered],
+    }
+
+
+def multimodal_replay_bank_records_from_payload(payload):
+    if not isinstance(payload, dict):
+        return []
+    bank = payload.get("multimodal_replay_bank")
+    if bank is None:
+        report = payload.get("report") if isinstance(
+            payload.get("report"), dict) else {}
+        bank = report.get("multimodal_replay_bank")
+    rows = bank.get("records", ()) if isinstance(bank, dict) else bank
+    out = []
+    for idx, row in enumerate(rows or ()):
+        try:
+            out.append(multimodal_record_from_bank_row(row, idx=idx))
+        except ValueError:
+            continue
+    return unique_multimodal_records_by_id(out)
+
+
+def multimodal_replay_bank_records_from_checkpoint(path, device="cpu"):
+    ckpt = _torch_load(path, device)
+    return multimodal_replay_bank_records_from_payload(ckpt)
 
 
 def build_vocab(records, max_size=None):
@@ -985,6 +1262,22 @@ def multimodal_learning_history_entry(report, session_index=None):
                 "min_source_record_frac",
                 train_metrics.get("training_min_source_record_frac", 0.0)),
             0.0),
+        "training_records": _mm_int(
+            manifest.get("training_records",
+                         train_metrics.get("training_records", 0)), 0),
+        "replay_records": _mm_int(
+            manifest.get("replay_records",
+                         train_metrics.get("replay_records", 0)), 0),
+        "replay_bank_used": bool(
+            manifest.get("replay_bank_used",
+                         train_metrics.get("replay_bank_used", False))),
+        "replay_bank_records": _mm_int(
+            manifest.get("replay_bank_records",
+                         train_metrics.get("replay_bank_records", 0)), 0),
+        "training_priority_sampling": bool(
+            train_metrics.get("training_priority_sampling", False)),
+        "training_priority_record_count": _mm_int(
+            train_metrics.get("training_priority_record_count", 0), 0),
         "d": _mm_int(architecture.get("d", 0), 0),
         "layers": _mm_int(architecture.get("layers", 0), 0),
         "heads": _mm_int(architecture.get("heads", 0), 0),
@@ -1770,6 +2063,11 @@ def import_multimodal_checkpoint(model, vocab, checkpoint, device=DEV):
     src_config = ckpt.get("model_config") if isinstance(
         ckpt.get("model_config"), dict) else {}
     report_payload = _multimodal_checkpoint_report(ckpt)
+    replay_bank = ckpt.get("multimodal_replay_bank")
+    if not isinstance(replay_bank, dict):
+        replay_bank = report_payload.get("multimodal_replay_bank")
+    if not isinstance(replay_bank, dict):
+        replay_bank = {}
     representation_prior = multimodal_checkpoint_representation_self_teach_prior(
         ckpt, enabled=True)
     learning_history = multimodal_learning_history_from_payload(ckpt)
@@ -1823,6 +2121,12 @@ def import_multimodal_checkpoint(model, vocab, checkpoint, device=DEV):
         "source_learning_event_history_top_kind": str(
             learning_history_summary.get("top_kind", "")),
         "source_learning_history_summary": learning_history_summary,
+        "source_multimodal_replay_bank_records": _mm_int(
+            replay_bank.get("record_count", 0), 0),
+        "source_multimodal_replay_priority_records": _mm_int(
+            replay_bank.get("priority_record_count", 0), 0),
+        "source_multimodal_replay_hard_records": _mm_int(
+            replay_bank.get("hard_record_count", 0), 0),
         "copied_token_embeddings": 0,
         "overlap_tokens": 0,
         "copied_feature_tensors": [],
@@ -5281,6 +5585,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           text_transfer_insight_min_delta=0.0,
           text_transfer_gate=True,
           self_teach_w=0.0, self_teach_history_prior_w=0.5,
+          replay_manifest=None, replay_root=None, checkpoint_replay=True,
+          replay_bank_size=MULTIMODAL_REPLAY_BANK_SIZE,
           select_best=False, selection_rounds=1,
           selection_score_metric="mastery",
           selection_score_margin_w=0.1,
@@ -5582,22 +5888,45 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     selection_insight_min_delta = float(selection_insight_min_delta)
     if selection_insight_min_delta < 0.0:
         raise ValueError("multimodal selection insight min delta must be non-negative")
+    replay_bank_size = int(replay_bank_size)
+    if replay_bank_size < 0:
+        raise ValueError("multimodal replay bank size must be non-negative")
     records = load_manifest(manifest, root=root)
+    if isinstance(replay_manifest, (str, bytes, os.PathLike)):
+        replay_paths = [replay_manifest]
+    else:
+        replay_paths = list(replay_manifest or ())
+    external_replay_records = []
+    for replay_path in replay_paths:
+        external_replay_records.extend(load_manifest(
+            replay_path, root=(replay_root if replay_root is not None else root)))
+    checkpoint_replay_records = (
+        multimodal_replay_bank_records_from_checkpoint(
+            multimodal_checkpoint, device="cpu")
+        if multimodal_checkpoint and checkpoint_replay else [])
+    replay_records = unique_multimodal_records_by_id(
+        external_replay_records, checkpoint_replay_records)
+    training_records = (
+        merge_multimodal_replay_metadata(records, replay_records)
+        if replay_records else list(records))
+    replay_train_records, replay_eval_records = (
+        split_records(replay_records) if replay_records else ([], []))
     requested_decode_objective = str(decode_objective)
     decode_objective = infer_multimodal_decode_objective(
-        records, requested=requested_decode_objective)
+        training_records, requested=requested_decode_objective)
     decode_objective_info = multimodal_decode_objective_report(
-        records, requested_decode_objective, decode_objective)
-    train_records, eval_records = split_records(records)
+        training_records, requested_decode_objective, decode_objective)
+    _new_train_records, eval_records = split_records(records)
+    train_records, _training_eval_records = split_records(training_records)
     training_sampling_weights = multimodal_training_sampling_weights(
         train_records, source_balance_w=source_balance_w)
     source_balance_train_report = multimodal_source_balance_report(
         train_records, source_balance_w, weights=training_sampling_weights)
     sequence_batch = int(latent_concept_sequence_batch) or max(2, batch // 2)
     sequence_pairs, sequence_report = mine_multimodal_sequence_pairs(
-        records, split="train")
-    view_dims = feature_dims(records)
-    active_modes = multimodal_active_modes(view_dims, records)
+        training_records, split="train")
+    view_dims = feature_dims(training_records)
+    active_modes = multimodal_active_modes(view_dims, training_records)
     self_teach_available_objectives = multimodal_self_teach_available_objectives(
         latent_concept_slots=latent_concept_slots,
         active_mode_count=len(active_modes))
@@ -5608,7 +5937,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         "generation_temperature": float(selection_generation_temperature),
         "generation_top_k": int(selection_generation_top_k),
     }
-    vocab = build_vocab(records, max_size=(int(max_vocab) or None))
+    vocab = build_vocab(training_records, max_size=(int(max_vocab) or None))
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     model = MultimodalLM(
@@ -6851,6 +7180,19 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             }
     last = dict(last) | {
         **source_balance_train_report,
+        "training_records": len(train_records),
+        "new_train_records": len(_new_train_records),
+        "new_eval_records": len(eval_records),
+        "replay_records": len(replay_records),
+        "replay_train_records": len(replay_train_records),
+        "replay_eval_records": len(replay_eval_records),
+        "replay_external_records": len(external_replay_records),
+        "replay_bank_records": len(checkpoint_replay_records),
+        "replay_bank_used": bool(checkpoint_replay_records),
+        "replay_manifest": [str(path) for path in replay_paths],
+        "checkpoint_replay_enabled": bool(checkpoint_replay),
+        "replay_study_used": bool(replay_records),
+        "replay_bank_size": int(replay_bank_size),
         "decode_objective": str(decode_objective),
         "selection_generation_n": int(selection_generation_n),
         "selection_generation_prompt_tokens": int(
@@ -6915,12 +7257,23 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     model.latent_completion_study_reports = (
         last.get("latent_completion_study_reports", []))
     model.latent_study_reports = last.get("latent_study_reports", [])
+    model.training_records = train_records
+    model.replay_records = replay_records
+    model.replay_eval_records = replay_eval_records
     model.manifest_info = {
         "path": manifest,
         "root": root,
         "records": len(records),
-        "train_records": len(train_records),
+        "train_records": len(_new_train_records),
         "eval_records": len(eval_records),
+        "training_records": len(train_records),
+        "replay_records": len(replay_records),
+        "replay_train_records": len(replay_train_records),
+        "replay_eval_records": len(replay_eval_records),
+        "replay_bank_records": len(checkpoint_replay_records),
+        "replay_external_records": len(external_replay_records),
+        "replay_bank_used": bool(checkpoint_replay_records),
+        "checkpoint_replay_enabled": bool(checkpoint_replay),
         "view_dims": dict(view_dims),
         "view_names": list(view_dims.keys()),
         "view_count": len(view_dims),
@@ -6957,6 +7310,17 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
                        decode_objective=decode_objective)
         for mode in active_modes
     }
+    replay_records = list(getattr(model, "replay_records", []) or [])
+    replay_eval_records = (
+        list(getattr(model, "replay_eval_records", []) or []) or replay_records)
+    replay_metrics = (
+        {
+            mode: evaluate(model, replay_eval_records, vocab, view_dims, n=eval_n,
+                           seed=seed + 53, device=device, mode=mode,
+                           decode_objective=decode_objective)
+            for mode in active_modes
+        }
+        if replay_eval_records else {})
     generation_mode = "full" if "full" in active_modes else active_modes[0]
     generation = (
         multimodal_generation_eval(
@@ -7039,6 +7403,12 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         "selection": getattr(model, "train_metrics", {}).get(
             "selection", {"enabled": False}),
         "teacher_forced": metrics,
+        "replay_teacher_forced": replay_metrics,
+        "replay": {
+            "enabled": bool(replay_records),
+            "records": len(replay_records),
+            "eval_records": len(replay_eval_records),
+        },
         "generation": generation,
         "prompt_generations": prompt_generations,
         "latent_graph_probe": latent_probe,
@@ -7053,6 +7423,11 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
             model, "multimodal_checkpoint_transfer", {}),
         "gate": metrics["full"]["token_acc"] >= 0.50,
     }
+    report["multimodal_replay_bank"] = build_multimodal_replay_bank(
+        unique_multimodal_records_by_id(records, replay_records),
+        study_reports=getattr(model, "latent_study_reports", []),
+        learning_event=report.get("learning_event", {}),
+        max_records=kwargs.get("replay_bank_size", MULTIMODAL_REPLAY_BANK_SIZE))
     previous_learning_history = {}
     previous_multimodal_checkpoint = kwargs.get("multimodal_checkpoint")
     if previous_multimodal_checkpoint:
@@ -7071,6 +7446,7 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         torch.save({"state_dict": model.state_dict(), "vocab": vocab.itos,
                     "d": model.lm.tok.embedding_dim, "model_config": model.config,
                     "manifest": model.manifest_info, "report": report,
+                    "multimodal_replay_bank": report["multimodal_replay_bank"],
                     "multimodal_learning_history": report[
                         "multimodal_learning_history"]}, checkpoint)
         report["checkpoint"] = checkpoint
@@ -7187,6 +7563,24 @@ def selftest():
         assert balance_report["training_source_balance_sampling"] is True
         assert balance_report["training_source_count"] == 2
         assert balance_report["training_max_source_record_frac"] == 0.8
+        priority_records = [
+            imbalanced_records[0],
+            multimodal_record_with_meta(
+                imbalanced_records[1],
+                dict(imbalanced_records[1].meta) | {
+                    "replay_priority": 3.0,
+                    "replay_reasons": ["hard:fer"],
+                }),
+        ]
+        priority_weights = multimodal_training_sampling_weights(
+            priority_records, source_balance_w=0.0)
+        assert priority_weights is not None
+        assert priority_weights[1] > priority_weights[0]
+        priority_report = multimodal_source_balance_report(
+            priority_records, 0.0, weights=priority_weights)
+        assert priority_report["training_priority_sampling"] is True
+        assert priority_report["training_priority_record_count"] == 1
+        assert priority_report["training_source_balance_sampling"] is False
         model = MultimodalLM(
             len(vocab), view_dims=view_dims, d=32, layers=1,
             heads=4, pad=vocab.pad, view_tokens=2, txt_tokens=4,
@@ -7889,6 +8283,20 @@ def selftest():
             "learning_event": trained_model.train_metrics["learning_event"],
             "representation_progress": rep_progress,
         }
+        mm_replay_bank = build_multimodal_replay_bank(
+            records, study_reports=trained_model.train_metrics[
+                "latent_study_reports"],
+            learning_event=mm_report["learning_event"])
+        assert mm_replay_bank["record_count"] > 0
+        assert mm_replay_bank["priority_record_count"] > 0
+        mm_replay_records = multimodal_replay_bank_records_from_payload({
+            "multimodal_replay_bank": mm_replay_bank})
+        assert mm_replay_records
+        assert any(rec.split == "train" for rec in mm_replay_records)
+        assert any(
+            float(rec.meta.get("replay_priority", 0.0) or 0.0) > 0.0
+            for rec in mm_replay_records)
+        mm_report["multimodal_replay_bank"] = mm_replay_bank
         mm_history = multimodal_learning_history_with_entry([], mm_report)
         mm_report["multimodal_learning_history"] = mm_history
         mm_report["multimodal_learning_history_count"] = mm_history["entry_count"]
@@ -7899,9 +8307,12 @@ def selftest():
             "model_config": trained_model.config,
             "manifest": trained_model.manifest_info,
             "report": mm_report,
+            "multimodal_replay_bank": mm_replay_bank,
             "multimodal_learning_history": mm_history,
         }, mm_ckpt)
         mm_payload = load_multimodal_checkpoint_payload(mm_ckpt, device="cpu")
+        assert len(multimodal_replay_bank_records_from_checkpoint(
+            mm_ckpt, device="cpu")) == mm_replay_bank["record_count"]
         assert (multimodal_learning_history_from_payload(mm_payload)[
             "entry_count"] == 1)
         mm_prior = multimodal_checkpoint_representation_self_teach_prior(
@@ -7925,6 +8336,8 @@ def selftest():
         assert mm_transfer["source_learning_history_count"] == 1
         assert mm_transfer["source_learning_event_triggered_count"] >= 0
         assert mm_transfer["source_learning_history_summary"]["event_count"] == 1
+        assert mm_transfer["source_multimodal_replay_bank_records"] > 0
+        assert mm_transfer["source_multimodal_replay_priority_records"] > 0
         assert mm_transfer["copied_token_embeddings"] > 0
         assert mm_transfer["copied_exact_tensor_count"] > 0
         assert torch.allclose(
@@ -8072,6 +8485,14 @@ def selftest():
             self_teach_w=0.05, self_teach_history_prior_w=1.0,
             representation_probe_n=4)
         assert continued_model.multimodal_checkpoint_transfer["copied"] is True
+        assert continued_model.train_metrics["replay_bank_used"] is True
+        assert continued_model.train_metrics["replay_bank_records"] > 0
+        assert continued_model.train_metrics["replay_records"] > 0
+        assert continued_model.train_metrics["training_records"] >= (
+            continued_model.train_metrics["new_train_records"])
+        assert continued_model.train_metrics["training_priority_sampling"] is True
+        assert continued_model.manifest_info["replay_bank_used"] is True
+        assert continued_model.manifest_info["replay_records"] > 0
         assert (continued_model.train_metrics[
             "multimodal_checkpoint_history_prior"]["enabled"] is True)
         assert continued_model.train_metrics[
@@ -8499,6 +8920,19 @@ def main(argv=None):
                     dest="multimodal_checkpoint",
                     help=("optional thinking.multimodal checkpoint for compatible "
                           "warm start / continuation"))
+    ap.add_argument("--replay-manifest", action="append", default=None,
+                    dest="replay_manifest",
+                    help=("optional prior multimodal manifest to mix into "
+                          "checkpoint continuation"))
+    ap.add_argument("--replay-root", default=None, dest="replay_root",
+                    help="root for relative replay manifest feature paths")
+    ap.add_argument("--no-checkpoint-replay", action="store_false",
+                    dest="checkpoint_replay", default=True,
+                    help="disable replay rows stored inside --multimodal-checkpoint")
+    ap.add_argument("--replay-bank-size", type=int,
+                    default=MULTIMODAL_REPLAY_BANK_SIZE,
+                    dest="replay_bank_size",
+                    help="maximum multimodal replay rows saved into checkpoints")
     ap.add_argument("--concept-tokens", type=int, default=4, dest="concept_tokens",
                     help="shared latent fusion tokens")
     ap.add_argument("--fusion-layers", type=int, default=1, dest="fusion_layers",
@@ -8893,6 +9327,8 @@ def main(argv=None):
         ap.error("--self-teach-w must be non-negative")
     if args.self_teach_history_prior_w < 0.0:
         ap.error("--self-teach-history-prior-w must be non-negative")
+    if args.replay_bank_size < 0:
+        ap.error("--replay-bank-size must be non-negative")
     if args.representation_probe_n < 0:
         ap.error("--representation-probe-n must be non-negative")
     if args.text_transfer_probe_n < 0:
@@ -9060,6 +9496,10 @@ def main(argv=None):
         repetition_unlikelihood_window=args.repetition_unlikelihood_window,
         text_checkpoint=args.text_checkpoint,
         multimodal_checkpoint=args.multimodal_checkpoint,
+        replay_manifest=args.replay_manifest,
+        replay_root=args.replay_root,
+        checkpoint_replay=args.checkpoint_replay,
+        replay_bank_size=args.replay_bank_size,
         concept_tokens=args.concept_tokens, fusion_layers=args.fusion_layers,
         latent_concept_slots=args.latent_concept_slots,
         latent_concept_layers=args.latent_concept_layers,
