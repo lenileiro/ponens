@@ -44,6 +44,34 @@ if [ "${INSTALL_IMAGE_HF_AE_DEPS:-0}" = "1" ]; then
   BASE_DEPS+=(diffusers transformers accelerate safetensors protobuf)
 fi
 VIRTUAL_ENV=$VENV uv pip install --quiet "${BASE_DEPS[@]}"
+
+if [ "${INSTALL_IMAGE_EMBED_DEPS:-0}" = "1" ] || \
+   [ "${INSTALL_IMAGE_SCORE_DEPS:-0}" = "1" ] || \
+   [ "${INSTALL_IMAGE_TEXT_SEQUENCE_DEPS:-0}" = "1" ] || \
+   [ "${INSTALL_IMAGE_CAPTION_DEPS:-0}" = "1" ] || \
+   [ "${INSTALL_IMAGE_HF_AE_DEPS:-0}" = "1" ]; then
+  $VENV/bin/python - <<'PY'
+import google.protobuf  # noqa: F401
+import transformers  # noqa: F401
+print("image optional deps OK: transformers + protobuf")
+PY
+fi
+
+if [ "${INSTALL_IMAGE_SCORE_DEPS:-0}" = "1" ]; then
+  $VENV/bin/python - <<'PY'
+import torch
+from thinking.image_score import _pooled_feature_tensor
+
+class Output:
+    def __init__(self, pooler_output):
+        self.pooler_output = pooler_output
+
+x = torch.randn(2, 3)
+assert torch.equal(_pooled_feature_tensor(Output(x)), x)
+print("image score preflight OK")
+PY
+fi
+
 # WordNet for dictionary.py (genus-projected A1 dictionary)
 $VENV/bin/python -c "import nltk; nltk.download('wordnet', quiet=True); nltk.download('omw-1.4', quiet=True)"
 
