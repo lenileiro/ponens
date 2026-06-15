@@ -76,6 +76,9 @@ def payload(args):
     if args.job == "tts":
         jobs.append(f"{PY}.tts --fetch --n-clips 6000")
         jobs.append(f"{PY}.tts --train --steps 45000 --out runs/tts.json --checkpoint runs/tts.pt --synth-out data/synth")
+    if args.job == "tts-fast":
+        jobs.append(f"{PY}.tts --fetch --n-clips 6000")
+        jobs.append(f"{PY}.tts_fast --train --steps 40000 --out runs/tts_fast.json --checkpoint runs/tts_fast.pt --synth-out data/synth")
     # non-fatal chaining: one job's failure must not kill the rest
     return " ; ".join(jobs)
 
@@ -84,7 +87,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--go", action="store_true")
     ap.add_argument("--job", default="all",
-                    choices=("all", "sing-sweep", "polyglot", "pronounce", "mimic", "vocoder", "vocoder-gan", "vocoder24", "realvoice", "libriclone", "knnvc", "tts"))
+                    choices=("all", "sing-sweep", "polyglot", "pronounce", "mimic", "vocoder", "vocoder-gan", "vocoder24", "realvoice", "libriclone", "knnvc", "tts", "tts-fast"))
     ap.add_argument("--gpu", default="NVIDIA H100 80GB HBM3")
     ap.add_argument("--cloud", default="SECURE")
     ap.add_argument("--disk", type=int, default=40)
@@ -103,7 +106,7 @@ def main(argv=None):
     # say-banks needed by pronounce/mimic (pods have no macOS `say`)
     need_banks = args.job in ("all", "pronounce", "mimic", "vocoder", "vocoder-gan", "vocoder24", "realvoice")
 
-    setup = "pip install -q numpy tokenizers pandas pyarrow" + (" soundfile" if args.job in ("libriclone","knnvc","tts") else "") + (" torchaudio transformers" if args.job == "knnvc" else "")
+    setup = "pip install -q numpy tokenizers pandas pyarrow" + (" soundfile" if args.job in ("libriclone","knnvc","tts","tts-fast") else "") + (" torchaudio transformers" if args.job == "knnvc" else "")
     remote = (f"cd {REMOTE} && rm -f /root/thinking.log && "
               f"({setup} && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && "
               f"timeout {cap}s bash -c {quote(f'cd {REMOTE} && ({run})')}) "
@@ -147,7 +150,7 @@ def main(argv=None):
         if os.path.exists(os.path.join(HERE, "thinking/crossmodal.py")):
             sh(f"tar czf - -C {quote(HERE)} thinking/crossmodal.py | {ssh} 'tar --no-same-owner -xzf - -C {REMOTE}'")
         # TTS reuses the trained realvoice vocoder (gitignored) for natural synthesis
-        if args.job == "tts" and os.path.exists(os.path.join(HERE, "runs/realvoice.pt")):
+        if args.job in ("tts","tts-fast") and os.path.exists(os.path.join(HERE, "runs/realvoice.pt")):
             sh(f"{ssh} 'mkdir -p {REMOTE}/runs'")
             sh(f"tar czf - -C {quote(HERE)} runs/realvoice.pt | {ssh} 'tar --no-same-owner -xzf - -C {REMOTE}'")
         if need_banks:
