@@ -681,6 +681,9 @@ def apply_image_quality_preset(args):
         args.image_sample_reference_grid_out = (
             "runs/image_latent_web_hf_vae_hq_reference_grid.ppm" if hq
             else "runs/image_latent_web_hf_vae_reference_grid.ppm")
+    if not args.image_sample_reference_manifest_out:
+        args.image_sample_reference_manifest_out = path_with_suffix(
+            args.image_sample_reference_grid_out, "_manifest.jsonl")
     if not str(args.image_sample_reference_denoise_strengths or "").strip():
         args.image_sample_reference_denoise_strengths = (
             "1.0,0.75,0.5,0.25,0.0" if hq else "1.0,0.5,0.25,0.0")
@@ -1078,6 +1081,14 @@ def payload(args):
                     f"{args.image_sample_reference_denoise_strength} "
                     f"--sample-reference-denoise-strengths "
                     f"{shlex_quote(args.image_sample_reference_denoise_strengths)}")
+                if args.image_sample_reference_manifest_out:
+                    reference_grid_args += (
+                        f" --sample-reference-manifest-out "
+                        f"{shlex_quote(args.image_sample_reference_manifest_out)}")
+                    if args.image_sample_reference_image_dir:
+                        reference_grid_args += (
+                            f" --sample-reference-image-dir "
+                            f"{shlex_quote(args.image_sample_reference_image_dir)}")
                 for flag, value in (
                         ("sample-reference-max-pixel-mse",
                          args.image_sample_reference_max_pixel_mse),
@@ -3080,6 +3091,14 @@ def main():
     ap.add_argument("--image-sample-reference-grid-out", default="",
                     dest="image_sample_reference_grid_out",
                     help="optional PPM path for latent image reference reproduction grid")
+    ap.add_argument("--image-sample-reference-manifest-out", default="",
+                    dest="image_sample_reference_manifest_out",
+                    help=("optional JSONL manifest for selected reference-image "
+                          "flow reproductions"))
+    ap.add_argument("--image-sample-reference-image-dir", default="",
+                    dest="image_sample_reference_image_dir",
+                    help=("optional image directory for "
+                          "--image-sample-reference-manifest-out"))
     ap.add_argument("--image-sample-reference-manifest", default="",
                     dest="image_sample_reference_manifest",
                     help=("optional reference manifest for image reproduction grid; "
@@ -4534,6 +4553,14 @@ def main():
         sys.exit("ERROR: --image-sample-manifest-out requires --image-sample-grid")
     if args.image_sample_image_dir and not args.image_sample_manifest_out:
         sys.exit("ERROR: --image-sample-image-dir requires --image-sample-manifest-out")
+    if args.image_sample_reference_manifest_out and not args.image_sample_reference_grid:
+        sys.exit(
+            "ERROR: --image-sample-reference-manifest-out requires "
+            "--image-sample-reference-grid")
+    if args.image_sample_reference_image_dir and not args.image_sample_reference_manifest_out:
+        sys.exit(
+            "ERROR: --image-sample-reference-image-dir requires "
+            "--image-sample-reference-manifest-out")
     if args.image_sample_reference_grid and not args.image_flow_self_condition:
         sys.exit(
             "ERROR: --image-sample-reference-grid requires "

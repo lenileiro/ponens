@@ -8449,7 +8449,11 @@ def reference_reproduction_gate_report(
         threshold = thresholds[gate_name]
         if threshold is None:
             return
-        metric_key = key or f"{prefix}_{metric}"
+        if key is None:
+            max_key = f"{prefix}_{metric}_max"
+            metric_key = max_key if max_key in report else f"{prefix}_{metric}"
+        else:
+            metric_key = key
         value = _sample_gate_metric_value(report, metric_key)
         if value is None:
             failures.append(f"{metric_key} is missing for {gate_name}={threshold:g}")
@@ -8506,6 +8510,34 @@ def reference_reproduction_gate_failure_message(report):
     )
 
 
+REPRODUCTION_SCORE_METRICS = (
+    "pixel_mse",
+    "structure_edge_l1",
+    "structure_multiscale_l1",
+    "structure_frequency_l1",
+    "structure_ssim_loss",
+    "texture_stats_l1",
+    "physics_l1",
+)
+REPRODUCTION_REPORT_METRICS = (
+    "pixel_mse",
+    "pixel_mae",
+    "structure_edge_l1",
+    "structure_multiscale_l1",
+    "structure_frequency_l1",
+    "structure_ssim_loss",
+    "texture_stats_l1",
+    "physics_l1",
+)
+
+
+def image_reproduction_score(metrics, prefix="reference"):
+    return float(sum(
+        float(metrics.get(f"{prefix}_{name}", 0.0) or 0.0)
+        for name in REPRODUCTION_SCORE_METRICS
+    ))
+
+
 def sample_candidate_health_scores(samples, eps=1.0e-8):
     return sample_health_components(samples, eps=eps)["health_score"]
 
@@ -8541,6 +8573,47 @@ def image_reproduction_metrics(reference, candidate, prefix="reference"):
     }
     for key, value in physics_parts.items():
         out[key] = float(value.detach().cpu())
+    return out
+
+
+def image_reproduction_per_sample_metrics(reference, candidate, prefix="reference"):
+    if reference.shape != candidate.shape:
+        raise ValueError(
+            f"reproduction metric shapes must match, got "
+            f"{tuple(reference.shape)} and {tuple(candidate.shape)}")
+    if reference.ndim != 4:
+        raise ValueError(
+            f"reproduction per-sample metrics expect BCHW tensors, got "
+            f"{tuple(reference.shape)}")
+    rows = []
+    for idx in range(int(reference.shape[0])):
+        row = image_reproduction_metrics(
+            reference[idx:idx + 1], candidate[idx:idx + 1], prefix=prefix)
+        row[f"{prefix}_sample_index"] = int(idx)
+        row[f"{prefix}_score"] = image_reproduction_score(row, prefix=prefix)
+        rows.append(row)
+    return rows
+
+
+def summarize_reproduction_per_sample_metrics(rows, prefix="reference"):
+    rows = list(rows or [])
+    out = {f"{prefix}_sample_count": int(len(rows))}
+    metric_names = ("score",) + REPRODUCTION_REPORT_METRICS
+    for name in metric_names:
+        key = f"{prefix}_{name}"
+        vals = [
+            float(row[key]) for row in rows
+            if key in row and np.isfinite(float(row[key]))
+        ]
+        if vals:
+            arr = np.asarray(vals, dtype=np.float64)
+            out[f"{key}_mean"] = float(np.mean(arr))
+            out[f"{key}_max"] = float(np.max(arr))
+            out[f"{key}_min"] = float(np.min(arr))
+        else:
+            out[f"{key}_mean"] = 0.0
+            out[f"{key}_max"] = 0.0
+            out[f"{key}_min"] = 0.0
     return out
 
 
@@ -9033,7 +9106,8 @@ def save_reference_reproduction_grid(ae, flow, records, path, size=32, device=DE
                                      sample_pixel_dynamic_threshold_percentile=0.0,
                                      sample_pixel_dynamic_threshold_max=1.0,
                                      reference_denoise_strength=1.0,
-                                     reference_denoise_strengths=None):
+                                     reference_denoise_strengths=None,
+                                     sample_manifest_out="", sample_image_dir=""):
     ae.eval()
     flow.eval()
     if not flow_uses_self_condition(flow):
@@ -9081,28 +9155,35 @@ def save_reference_reproduction_grid(ae, flow, records, path, size=32, device=DE
             reference_denoise_strength=strength,
             return_trace=True)
         metrics_i = image_reproduction_metrics(x, sample_i, prefix="reference_flow")
-        score_i = (
-            metrics_i["reference_flow_pixel_mse"]
-            + metrics_i["reference_flow_structure_edge_l1"]
-            + metrics_i["reference_flow_structure_multiscale_l1"]
-            + metrics_i["reference_flow_structure_frequency_l1"]
-            + metrics_i["reference_flow_structure_ssim_loss"]
-            + metrics_i["reference_flow_texture_stats_l1"]
-            + metrics_i["reference_flow_physics_l1"]
-        )
+        per_sample_i = image_reproduction_per_sample_metrics(
+            x, sample_i, prefix="reference_flow")
+        per_sample_summary_i = summarize_reproduction_per_sample_metrics(
+            per_sample_i, prefix="reference_flow")
+        score_i = per_sample_summary_i["reference_flow_score_max"]
         row_i = {
             "index": int(sweep_idx),
             "strength": float(strength),
             "start_t": float(trace_i.get(
                 "sample_trace_reference_start_t", 1.0 - float(strength))),
             "score": float(score_i),
+            "score_mean": float(per_sample_summary_i["reference_flow_score_mean"]),
+            "score_max": float(per_sample_summary_i["reference_flow_score_max"]),
+            "worst_sample_index": int(max(
+                range(len(per_sample_i)),
+                key=lambda row_idx: per_sample_i[row_idx]["reference_flow_score"]
+            )),
         }
         row_i.update(metrics_i)
+        row_i.update(per_sample_summary_i)
         sweep.append(row_i)
         if best_score is None or score_i < best_score:
             best_score = float(score_i)
             best = (sweep_idx, strength, sample_i, trace_i, metrics_i)
     selected_idx, selected_strength, sample, trace, selected_metrics = best
+    selected_per_sample = image_reproduction_per_sample_metrics(
+        x, sample, prefix="reference_flow")
+    selected_summary = summarize_reproduction_per_sample_metrics(
+        selected_per_sample, prefix="reference_flow")
     grid = torch.stack((x, recon, sample), dim=1).reshape(n * 3, *x.shape[1:])
     meta = write_ppm_grid(grid, path, rows=n, cols=3)
     meta.update({
@@ -9123,6 +9204,10 @@ def save_reference_reproduction_grid(ae, flow, records, path, size=32, device=DE
         ],
         "sample_grid_reference_selected_denoise_index": int(selected_idx),
         "sample_grid_reference_selected_denoise_score": float(best_score),
+        "sample_grid_reference_selected_denoise_score_mean": float(
+            selected_summary["reference_flow_score_mean"]),
+        "sample_grid_reference_selected_denoise_score_max": float(
+            selected_summary["reference_flow_score_max"]),
         "sample_grid_reference_denoise_sweep": sweep,
         "sample_grid_sample_churn_interval": list(validate_guidance_interval(
             sample_churn_interval, name="sample_churn_interval")),
@@ -9140,7 +9225,40 @@ def save_reference_reproduction_grid(ae, flow, records, path, size=32, device=DE
     meta.update(sample_health_metrics(sample, prefix="sample_grid"))
     meta.update(sample_health_metrics(sample, prefix="reference_flow_sample"))
     meta.update(image_reproduction_metrics(x, recon, prefix="reference_recon"))
+    meta.update(summarize_reproduction_per_sample_metrics(
+        image_reproduction_per_sample_metrics(x, recon, prefix="reference_recon"),
+        prefix="reference_recon"))
     meta.update(selected_metrics)
+    meta.update(selected_summary)
+    meta["sample_grid_reference_per_sample_metrics"] = selected_per_sample
+    if sample_manifest_out:
+        row_meta = []
+        for idx, rec in enumerate(chosen):
+            row = {
+                "conditioning_mode": "reference_image",
+                "reference_image": rec.path,
+                "reference_index": int(idx),
+                "reference_denoise_strength": float(selected_strength),
+                "reference_denoise_strength_index": int(selected_idx),
+                "reference_reproduction_score": float(
+                    selected_per_sample[idx]["reference_flow_score"]),
+                "reference_reproduction_score_mean": float(
+                    selected_summary["reference_flow_score_mean"]),
+                "reference_reproduction_score_max": float(
+                    selected_summary["reference_flow_score_max"]),
+            }
+            row.update(selected_per_sample[idx])
+            row_meta.append(row)
+        meta.update(write_sample_manifest(
+            sample, sample_manifest_out, captions, image_dir=sample_image_dir,
+            metadata={
+                "conditioning_mode": "reference_image",
+                "sample_grid": path,
+                "reference_denoise_strength": float(selected_strength),
+                "reference_denoise_strength_index": int(selected_idx),
+            },
+            row_metadata=row_meta, prefix="reference_flow",
+            split="reference_reproduction"))
     return meta
 
 
@@ -13564,6 +13682,20 @@ def selftest():
             ref_gate_report, max_pixel_mse=0.01)
         assert ref_gate_fail["sample_reference_quality_gate_passed"] is False
         assert reference_reproduction_gate_failure_message(ref_gate_fail)
+        ref_gate_max_fail = reference_reproduction_gate_report(
+            {**ref_gate_report, "reference_flow_pixel_mse_max": 0.25},
+            max_pixel_mse=0.20)
+        assert ref_gate_max_fail["sample_reference_quality_gate_passed"] is False
+        per_ref_metrics = image_reproduction_per_sample_metrics(
+            torch.cat([textured_sample, flat_sample], dim=0),
+            torch.cat([textured_sample, flat_sample], dim=0),
+            prefix="unit_reference")
+        per_ref_summary = summarize_reproduction_per_sample_metrics(
+            per_ref_metrics, prefix="unit_reference")
+        assert len(per_ref_metrics) == 2
+        assert per_ref_summary["unit_reference_pixel_mse_max"] == 0.0
+        assert per_ref_summary["unit_reference_physics_l1_max"] < 1.0e-6
+        assert per_ref_summary["unit_reference_score_max"] < 0.01
         flat = torch.zeros(3, 16, 16)
         yy, xx = torch.meshgrid(
             torch.linspace(-0.8, 0.8, 16),
@@ -13817,18 +13949,24 @@ def selftest():
         assert meta["sample_grid_trace_self_condition_rollbacks"] >= 0
         assert os.path.exists(sample_path)
         reference_sample_path = os.path.join(td, "reference_samples.ppm")
+        reference_manifest_out = os.path.join(td, "reference_samples.jsonl")
         reference_meta = save_reference_reproduction_grid(
             ae, flow, read_image_manifest(manifest, root=td), reference_sample_path,
             size=16, device="cpu", conditioner=conditioner, prompt_vocab=vocab,
-            caption_max_len=8, cfg_scale=1.0, sample_steps=2, samples=1,
+            caption_max_len=8, cfg_scale=1.0, sample_steps=2, samples=2,
             reference_denoise_strength=1.0,
-            reference_denoise_strengths=(1.0, 0.0))
+            reference_denoise_strengths=(1.0, 0.0),
+            sample_manifest_out=reference_manifest_out)
         assert reference_meta["sample_grid_cond_mode"] == "reference_image"
         assert reference_meta["sample_grid_cols"] == 3
+        assert reference_meta["sample_grid_reference_count"] == 2
         assert reference_meta["reference_flow_sample_trace_reference_condition"] is True
         assert reference_meta["reference_flow_sample_trace_reference_condition_fixed"] is True
         assert reference_meta["sample_grid_reference_denoise_strengths"] == [1.0, 0.0]
         assert len(reference_meta["sample_grid_reference_denoise_sweep"]) == 2
+        assert len(reference_meta["sample_grid_reference_per_sample_metrics"]) == 2
+        assert reference_meta["reference_flow_sample_count"] == 2
+        assert "reference_flow_score_max" in reference_meta
         selected_strength = reference_meta["sample_grid_reference_denoise_strength"]
         assert selected_strength in (1.0, 0.0)
         assert math.isclose(
@@ -13845,7 +13983,9 @@ def selftest():
         assert "reference_recon_structure_ssim_loss" in reference_meta
         assert "reference_recon_texture_stats_l1" in reference_meta
         assert "reference_recon_physics_l1" in reference_meta
+        assert reference_meta["sample_manifest_records"] == 2
         assert os.path.exists(reference_sample_path)
+        assert os.path.exists(reference_manifest_out)
         resume_path = os.path.join(td, "resume.pt")
         torch.save({
             "autoencoder_state_dict": ae.state_dict(),
@@ -14623,6 +14763,14 @@ def main(argv=None):
                     dest="sample_reference_denoise_strengths",
                     help=("optional comma-separated reference denoise strength sweep; "
                           "the reference grid uses the best reproduction score"))
+    ap.add_argument("--sample-reference-manifest-out", default="",
+                    dest="sample_reference_manifest_out",
+                    help=("optional JSONL manifest for selected reference-image "
+                          "flow reproductions"))
+    ap.add_argument("--sample-reference-image-dir", default="",
+                    dest="sample_reference_image_dir",
+                    help=("optional image directory for --sample-reference-manifest-out "
+                          "reference reproductions"))
     ap.add_argument("--sample-reference-max-pixel-mse", type=float, default=None,
                     dest="sample_reference_max_pixel_mse",
                     help=("fail after --sample-reference-grid-out if reference "
@@ -14916,6 +15064,10 @@ def main(argv=None):
         getattr(args, name) is not None for name in reference_gate_names)
     if reference_gate_enabled and not args.sample_reference_grid_out:
         ap.error("sample reference gates require --sample-reference-grid-out")
+    if args.sample_reference_manifest_out and not args.sample_reference_grid_out:
+        ap.error("--sample-reference-manifest-out requires --sample-reference-grid-out")
+    if args.sample_reference_image_dir and not args.sample_reference_manifest_out:
+        ap.error("--sample-reference-image-dir requires --sample-reference-manifest-out")
     for gate_name in reference_gate_names:
         gate_value = getattr(args, gate_name)
         if gate_value is not None and gate_value < 0.0:
@@ -15363,7 +15515,9 @@ def main(argv=None):
                 seed=args.seed + 1499,
                 caption_cond_source=meta["caption_cond_source"] or "tokens",
                 reference_denoise_strength=args.sample_reference_denoise_strength,
-                reference_denoise_strengths=sample_reference_denoise_strengths)
+                reference_denoise_strengths=sample_reference_denoise_strengths,
+                sample_manifest_out=args.sample_reference_manifest_out,
+                sample_image_dir=args.sample_reference_image_dir)
             reference_meta["sample_grid_checkpoint_weight_mode"] = (
                 "ema" if meta["ema_loaded"] else "raw")
             report.update(reference_meta)
@@ -15749,7 +15903,9 @@ def main(argv=None):
             seed=args.seed + 1499,
             caption_cond_source=report.get("caption_cond_source", "tokens") or "tokens",
             reference_denoise_strength=args.sample_reference_denoise_strength,
-            reference_denoise_strengths=sample_reference_denoise_strengths)
+            reference_denoise_strengths=sample_reference_denoise_strengths,
+            sample_manifest_out=args.sample_reference_manifest_out,
+            sample_image_dir=args.sample_reference_image_dir)
         reference_meta["sample_grid_checkpoint_weight_mode"] = grid_weight_mode
         report.update(reference_meta)
         report.update(cli_sample_quality_gate_report(report, args))
