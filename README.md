@@ -19,7 +19,10 @@ history prior drives new training. The default reading profile also owns bounded
 probing, selected hard-record caps, periodic structure refreshes, and a bounded raw-reading
 vocabulary, and source-balanced sampling, so normal commands do not need low-level study flags,
 do not let the longest source dominate, and do not grow an embedding table for every one-off corpus
-token. Reading checkpoints now expose compact `learning_event` evidence when an applied update
+token. Multimodal training uses the same generic source-balanced default from manifest `source` /
+`document` / `dataset` metadata, exposed as `--source-balance-w` locally and
+`--multimodal-source-balance-w` on RunPod. Reading checkpoints now expose compact
+`learning_event` evidence when an applied update
 moved sampled weights and improved score, representation structure, or
 concept-connection signals; continuation and multimodal transfer can use that event as self-teach
 pressure, and replay banks prioritize the study records attached to those events. Selected study
@@ -268,6 +271,7 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --out runs/text_raw_reading_discovery_study_continued.json
 .venv/bin/python -m thinking.multimodal --manifest data/multimodal_manifest.jsonl \
     --steps 3 --batch 4 --dim 96 --layers 1 --heads 4 --eval-n 20 \
+    --source-balance-w 0.5 \
     --latent-concept-slots 6 \
     --latent-concept-memory-size 64 --latent-concept-memory-w 0.05 \
     --latent-concept-association-w 0.05 \

@@ -100,6 +100,9 @@ so multimodal data can surface records where partial views fail to reconstruct t
 state. If a dataset wants captions, extraction facts, actions, or no decoder target at all, that
 target choice lives in the manifest rather than in module code. Multimodal runs can warm-start
 from `thinking.text` checkpoints, inheriting latent top-k sparsity and reading-mastery history;
+training batches use smooth source-balanced sampling by default (`--source-balance-w`, set `0` to
+disable), using generic `source` / `document` / `dataset` metadata from the manifest so mixed
+vision/text corpora do not collapse onto whichever source contributes the most rows.
 `--self-teach-history-prior-w` lets multimodal self-teach reuse prior abstract weaknesses such as
 FER, bridge, sequence, and mode-floor deficits without labels. Text checkpoint concept-insight
 events also reinforce multimodal bridge/discovery self-teach, so accepted "new connection"
@@ -140,6 +143,7 @@ python -m thinking.multimodal --selftest
 python -m thinking.multimodal --manifest data/multimodal.jsonl \
     --steps 400 --batch 32 --dim 96 \
     --latent-concept-slots 8 --latent-concept-memory-size 64 \
+    --source-balance-w 0.5 \
     --latent-concept-discovery-w 0.05 \
     --latent-concept-reanalysis-w 0.05 \
     --latent-concept-gap-w 0.05 \
@@ -196,6 +200,7 @@ python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
 The H100 launcher exposes only supported current jobs. It does not default to a hidden legacy
 world; select the job explicitly. Raw-reading jobs pass the same bounded vocabulary default as
 `thinking.text` and accept `--reading-max-vocab 0` / `--reading-source-balance-w 0` for ablations.
+Multimodal jobs also pass `--multimodal-source-balance-w` through to `thinking.multimodal`.
 
 ```bash
 RUNPOD_API_KEY=... python runpod/launch_thinking.py \

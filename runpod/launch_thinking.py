@@ -32,6 +32,7 @@ IMAGE_DEFAULT_TIME_U_SHAPE_SCALE = 4.0
 IMAGE_MAX_TIME_U_SHAPE_SCALE = 20.0
 READING_DEFAULT_MAX_VOCAB = 32768
 READING_DEFAULT_SOURCE_BALANCE_W = 0.5
+MULTIMODAL_DEFAULT_SOURCE_BALANCE_W = 0.5
 
 
 def api(method, path, key, body=None):
@@ -1991,6 +1992,7 @@ def payload(args):
                 f"--batch {args.multimodal_batch} --dim {mm_dim} "
                 f"--layers {args.multimodal_layers} --heads {args.multimodal_heads} "
                 f"--max-vocab {args.multimodal_max_vocab} "
+                f"--source-balance-w {args.multimodal_source_balance_w} "
                 f"--lr {args.multimodal_lr} --log-every {args.multimodal_log_every} "
                 f"--decode-w {args.multimodal_decode_w} "
                 f"--agreement-w {args.multimodal_agreement_w} "
@@ -4011,6 +4013,11 @@ def main():
     ap.add_argument("--multimodal-max-vocab", type=int, default=0,
                     dest="multimodal_max_vocab",
                     help="cap vocab to N most frequent tokens (0 = uncapped)")
+    ap.add_argument("--multimodal-source-balance-w", type=float,
+                    default=MULTIMODAL_DEFAULT_SOURCE_BALANCE_W,
+                    dest="multimodal_source_balance_w",
+                    help=("smooth source-balanced multimodal sampling passed "
+                          "to thinking.multimodal; 0 disables"))
     ap.add_argument("--multimodal-batch", type=int, default=32, dest="multimodal_batch")
     ap.add_argument("--multimodal-lr", type=float, default=1e-3, dest="multimodal_lr")
     ap.add_argument("--multimodal-log-every", type=int, default=100,
@@ -5342,6 +5349,7 @@ def main():
         multimodal_nonnegative = {
             "--multimodal-decode-w": args.multimodal_decode_w,
             "--multimodal-agreement-w": args.multimodal_agreement_w,
+            "--multimodal-source-balance-w": args.multimodal_source_balance_w,
             "--multimodal-latent-concept-w": args.multimodal_latent_concept_w,
             "--multimodal-latent-concept-invariance-w": (
                 args.multimodal_latent_concept_invariance_w),

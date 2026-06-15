@@ -132,6 +132,7 @@ MULTIMODAL_REPRESENTATION_SIGNAL_KEYS = (
 DEFAULT_TEXT_TRANSFER_PROBE_N = 64
 DEFAULT_TEXT_TRANSFER_SCORE_MIN_DELTA = 0.1
 DEFAULT_TEXT_TRANSFER_INSIGHT_ACCEPT_W = 0.0
+MULTIMODAL_DEFAULT_SOURCE_BALANCE_W = 0.5
 MULTIMODAL_LEARNING_HISTORY_VERSION = 1
 MULTIMODAL_LEARNING_HISTORY_SIZE = 32
 
@@ -214,7 +215,7 @@ def _feature_views(rec, *, root, rec_id):
     return dict(views)
 
 
-def _record_from_json(obj, idx, root=None):
+def _record_from_json(obj, idx, root=None, default_source=None):
     if not isinstance(obj, dict):
         raise ValueError(f"manifest row {idx} must be an object")
     rec_id = str(obj.get("id", f"record-{idx}"))
@@ -231,17 +232,25 @@ def _record_from_json(obj, idx, root=None):
         target = _tokens(target_value, field=target_key, rec_id=rec_id)
     views = _feature_views(obj, root=root, rec_id=rec_id)
     meta = dict(obj.get("meta", {})) if isinstance(obj.get("meta", {}), dict) else {}
+    for key in ("source", "document", "dataset"):
+        if key not in meta and obj.get(key) is not None:
+            meta[key] = obj[key]
+    if (default_source is not None
+            and not any(meta.get(key) for key in ("source", "document", "dataset"))):
+        meta["source"] = default_source
     return MultimodalRecord(rec_id, split, text, target, views, meta)
 
 
 def load_manifest(path, root=None):
     records = []
+    default_source = os.path.abspath(path)
     with open(path) as f:
         for idx, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
-            records.append(_record_from_json(json.loads(line), idx, root=root))
+            records.append(_record_from_json(
+                json.loads(line), idx, root=root, default_source=default_source))
     if not records:
         raise ValueError(f"{path} has no records")
     splits = {r.split for r in records}
@@ -267,6 +276,60 @@ def split_records(records):
     train = [r for r in records if r.split == "train"]
     evals = [r for r in records if r.split == "eval"]
     return train, (evals or train)
+
+
+def multimodal_record_source(rec):
+    meta = rec.meta if isinstance(rec.meta, dict) else {}
+    for key in ("source", "document", "dataset"):
+        value = meta.get(key)
+        if value is not None and str(value).strip():
+            return str(value)
+    return "__unknown__"
+
+
+def multimodal_source_counts(records):
+    counts = OrderedDict()
+    for rec in records:
+        source = multimodal_record_source(rec)
+        counts[source] = int(counts.get(source, 0)) + 1
+    return counts
+
+
+def multimodal_training_sampling_weights(
+        records, source_balance_w=MULTIMODAL_DEFAULT_SOURCE_BALANCE_W):
+    source_balance_w = float(source_balance_w)
+    if source_balance_w < 0.0:
+        raise ValueError("multimodal source balance weight must be non-negative")
+    if not records or source_balance_w <= 0.0:
+        return None
+    counts = multimodal_source_counts(records)
+    if len(counts) <= 1:
+        return None
+    weights = np.asarray([
+        1.0 / (float(counts[multimodal_record_source(rec)]) ** source_balance_w)
+        for rec in records
+    ], dtype=np.float64)
+    total = float(weights.sum())
+    if total <= 0.0 or not np.isfinite(total):
+        return None
+    return weights / total
+
+
+def multimodal_source_balance_report(records, source_balance_w, weights=None):
+    counts = multimodal_source_counts(records)
+    total = float(sum(counts.values()))
+    fracs = [
+        (float(count) / total) for count in counts.values()
+    ] if total > 0.0 else []
+    return {
+        "training_weighted_sampling": weights is not None,
+        "training_source_balance_sampling": bool(weights is not None),
+        "training_source_balance_w": float(source_balance_w),
+        "training_source_count": int(len(counts)),
+        "training_source_record_counts": dict(counts),
+        "training_max_source_record_frac": float(max(fracs) if fracs else 0.0),
+        "training_min_source_record_frac": float(min(fracs) if fracs else 0.0),
+    }
 
 
 def build_vocab(records, max_size=None):
@@ -748,6 +811,26 @@ def multimodal_learning_history_entry(report, session_index=None):
         "eval_record_count": _mm_int(manifest.get("eval_records", 0), 0),
         "view_count": _mm_int(manifest.get("view_count", 0), 0),
         "view_names": [str(name) for name in view_names[:16]],
+        "source_balance_w": _mm_float(
+            manifest.get(
+                "source_balance_w",
+                train_metrics.get("training_source_balance_w", 0.0)),
+            0.0),
+        "source_balance_sampling": bool(
+            train_metrics.get("training_source_balance_sampling", False)),
+        "source_count": _mm_int(
+            manifest.get("source_count",
+                         train_metrics.get("training_source_count", 0)), 0),
+        "max_source_record_frac": _mm_float(
+            manifest.get(
+                "max_source_record_frac",
+                train_metrics.get("training_max_source_record_frac", 0.0)),
+            0.0),
+        "min_source_record_frac": _mm_float(
+            manifest.get(
+                "min_source_record_frac",
+                train_metrics.get("training_min_source_record_frac", 0.0)),
+            0.0),
         "d": _mm_int(architecture.get("d", 0), 0),
         "layers": _mm_int(architecture.get("layers", 0), 0),
         "heads": _mm_int(architecture.get("heads", 0), 0),
@@ -1928,8 +2011,11 @@ def _batch_from_records(records, vocab, device, view_dims):
     return features, txt, target
 
 
-def _sample_records(records, n, rng):
-    idx = rng.integers(len(records), size=int(n))
+def _sample_records(records, n, rng, weights=None):
+    if weights is None:
+        idx = rng.integers(len(records), size=int(n))
+    else:
+        idx = rng.choice(len(records), size=int(n), replace=True, p=weights)
     return [records[int(i)] for i in idx]
 
 
@@ -4181,6 +4267,7 @@ def latent_multimodal_discovery_examples(
 def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           device=DEV, log_every=100, layers=3, heads=4, max_len=128,
           max_vocab=0,
+          source_balance_w=MULTIMODAL_DEFAULT_SOURCE_BALANCE_W,
           view_tokens=4, txt_tokens=8, trunk_arch="mlp",
           trunk_width=128, trunk_depth=1, text_layers=1,
           text_arch="transformer", modality_dropout=0.0, decode_w=1.0,
@@ -4316,6 +4403,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_concept_transition_w, latent_concept_cluster_w)
     if float(decode_w) < 0.0:
         raise ValueError("decoder loss weight must be non-negative")
+    source_balance_w = float(source_balance_w)
+    if source_balance_w < 0.0:
+        raise ValueError("multimodal source balance weight must be non-negative")
     representation_probe_n = int(representation_probe_n)
     if representation_probe_n < 0:
         raise ValueError(
@@ -4442,6 +4532,10 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         raise ValueError("multimodal selection insight min delta must be non-negative")
     records = load_manifest(manifest, root=root)
     train_records, eval_records = split_records(records)
+    training_sampling_weights = multimodal_training_sampling_weights(
+        train_records, source_balance_w=source_balance_w)
+    source_balance_train_report = multimodal_source_balance_report(
+        train_records, source_balance_w, weights=training_sampling_weights)
     sequence_batch = int(latent_concept_sequence_batch) or max(2, batch // 2)
     sequence_pairs, sequence_report = mine_multimodal_sequence_pairs(
         records, split="train")
@@ -4764,8 +4858,13 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             refresh_study_pool(st)
             model.train()
         batch_source = study_pool if study_pool else train_records
+        batch_weights = (
+            training_sampling_weights if batch_source is train_records
+            else multimodal_training_sampling_weights(
+                batch_source, source_balance_w=source_balance_w))
         features, txt, ids = _batch_from_records(
-            _sample_records(batch_source, batch, rng), vocab, device, view_dims)
+            _sample_records(batch_source, batch, rng, weights=batch_weights),
+            vocab, device, view_dims)
         needs_latent = bool(any(float(w) > 0.0 for w in current_latent_weights())
                             or latent_concept_memory_size > 0
                             or hard_study_enabled)
@@ -5091,6 +5190,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "agreement_loss": float(agreement.detach()),
             "self_teach_w": float(self_teach_w),
             "self_teach_history_prior_w": float(self_teach_history_prior_w),
+            **source_balance_train_report,
             "text_checkpoint_history_prior": text_checkpoint_history_prior,
             "multimodal_checkpoint_history_prior": (
                 multimodal_checkpoint_history_prior),
@@ -5490,6 +5590,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 "self_teach_reports": list(self_teach_reports),
             }
     last = dict(last) | {
+        **source_balance_train_report,
         "self_teach_history_prior_w": float(self_teach_history_prior_w),
         "text_checkpoint_history_prior": text_checkpoint_history_prior,
         "text_checkpoint_history_prior_raw": text_checkpoint_history_prior_raw,
@@ -5549,6 +5650,14 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         "view_dims": dict(view_dims),
         "view_names": list(view_dims.keys()),
         "view_count": len(view_dims),
+        "source_balance_w": float(source_balance_w),
+        "source_count": int(source_balance_train_report["training_source_count"]),
+        "source_counts": dict(
+            source_balance_train_report["training_source_record_counts"]),
+        "max_source_record_frac": float(
+            source_balance_train_report["training_max_source_record_frac"]),
+        "min_source_record_frac": float(
+            source_balance_train_report["training_min_source_record_frac"]),
     }
     return model, vocab, records, train_records, eval_records, view_dims
 
@@ -5692,6 +5801,55 @@ def selftest():
         train_records, eval_records = split_records(records)
         vocab = build_vocab(records)
         view_dims = feature_dims(records)
+        implicit_manifest = os.path.join(tmpdir, "mm_implicit_source.jsonl")
+        with open(implicit_manifest, "w") as f:
+            f.write(json.dumps({
+                "id": "implicit-source",
+                "split": "train",
+                "text": ["implicit", "source"],
+                "views": {"sensor": [1.0, 0.0]},
+                "target": ["ok"],
+            }) + "\n")
+            f.write(json.dumps({
+                "id": "top-source",
+                "split": "train",
+                "text": ["top", "source"],
+                "views": {"sensor": [0.0, 1.0]},
+                "target": ["ok"],
+                "dataset": "top-level-dataset",
+            }) + "\n")
+        implicit_records = load_manifest(implicit_manifest)
+        assert implicit_records[0].meta["source"] == os.path.abspath(
+            implicit_manifest)
+        assert implicit_records[1].meta["dataset"] == "top-level-dataset"
+        imbalanced_records = [
+            MultimodalRecord(
+                f"bulk-{i}", "train", ("bulk", str(i)), ("target",),
+                {}, {"source": "bulk"})
+            for i in range(4)
+        ] + [
+            MultimodalRecord(
+                "rare-0", "train", ("rare",), ("target",), {},
+                {"source": "rare"})
+        ]
+        assert multimodal_training_sampling_weights(
+            imbalanced_records, source_balance_w=0.0) is None
+        imbalanced_weights = multimodal_training_sampling_weights(
+            imbalanced_records, source_balance_w=1.0)
+        assert imbalanced_weights is not None
+        assert math.isclose(float(imbalanced_weights.sum()), 1.0, rel_tol=1e-6)
+        bulk_mass = float(sum(
+            weight for rec, weight in zip(imbalanced_records, imbalanced_weights)
+            if multimodal_record_source(rec) == "bulk"))
+        rare_mass = float(sum(
+            weight for rec, weight in zip(imbalanced_records, imbalanced_weights)
+            if multimodal_record_source(rec) == "rare"))
+        assert math.isclose(bulk_mass, rare_mass, rel_tol=1e-6, abs_tol=1e-6)
+        balance_report = multimodal_source_balance_report(
+            imbalanced_records, 1.0, weights=imbalanced_weights)
+        assert balance_report["training_source_balance_sampling"] is True
+        assert balance_report["training_source_count"] == 2
+        assert balance_report["training_max_source_record_frac"] == 0.8
         model = MultimodalLM(
             len(vocab), view_dims=view_dims, d=32, layers=1,
             heads=4, pad=vocab.pad, view_tokens=2, txt_tokens=4,
@@ -6456,6 +6614,33 @@ def selftest():
         assert continued_model.train_metrics["self_teach_plan"][
             "history_prior_entry_count"] >= 1
         assert continued_model.train_metrics["weight_update_changed"] is True
+        imbalanced_manifest = os.path.join(tmpdir, "mm_imbalanced_sources.jsonl")
+        imbalanced_rows = []
+        for i in range(8):
+            source = "rare" if i in (5, 7) else "bulk"
+            split = "eval" if i >= 6 else "train"
+            vec = np.zeros(3, dtype=np.float32)
+            vec[i % 3] = 1.0
+            imbalanced_rows.append({
+                "id": f"{source}-{i}",
+                "split": split,
+                "text": ["caption", source, str(i)],
+                "views": {"sensor": vec.astype(float).tolist()},
+                "target": ["source", source, "done"],
+                "meta": {"source": source, "chunk_index": i},
+            })
+        with open(imbalanced_manifest, "w") as f:
+            for row in imbalanced_rows:
+                f.write(json.dumps(row) + "\n")
+        balanced_model, *_ = train(
+            imbalanced_manifest, steps=1, batch=2, d=32, layers=1, heads=4,
+            device="cpu", log_every=10, view_tokens=2, txt_tokens=4,
+            source_balance_w=1.0)
+        assert balanced_model.train_metrics[
+            "training_source_balance_sampling"] is True
+        assert balanced_model.train_metrics["training_source_balance_w"] == 1.0
+        assert balanced_model.train_metrics["training_source_count"] == 2
+        assert balanced_model.manifest_info["source_count"] == 2
         no_target_manifest = os.path.join(tmpdir, "mm_no_target.jsonl")
         no_target_rows = []
         for i in range(6):
@@ -6600,6 +6785,11 @@ def main(argv=None):
     ap.add_argument("--max-vocab", type=int, default=0, dest="max_vocab",
                     help="cap vocabulary to the N most frequent tokens "
                          "(0 = uncapped); rest fall back to <unk>")
+    ap.add_argument("--source-balance-w", type=float,
+                    default=MULTIMODAL_DEFAULT_SOURCE_BALANCE_W,
+                    dest="source_balance_w",
+                    help=("smooth source-balanced minibatch sampling from "
+                          "manifest metadata; 0 disables"))
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--log-every", type=int, default=100, dest="log_every")
     ap.add_argument("--agreement-w", type=float, default=0.0, dest="agreement_w",
@@ -6889,6 +7079,8 @@ def main(argv=None):
             ap.error(f"{name} must be positive")
     if args.lr <= 0.0:
         ap.error("--lr must be positive")
+    if args.source_balance_w < 0.0:
+        ap.error("--source-balance-w must be non-negative")
     if args.d % args.heads != 0:
         ap.error("--dim must be divisible by --heads")
     if (args.d // args.heads) % 2 != 0:
@@ -7044,6 +7236,7 @@ def main(argv=None):
         device=args.device, eval_n=args.eval_n, checkpoint=args.checkpoint,
         out=args.out, batch=args.batch, d=args.d, lr=args.lr, layers=args.layers,
         heads=args.heads, max_len=args.max_len, max_vocab=args.max_vocab,
+        source_balance_w=args.source_balance_w,
         view_tokens=args.view_tokens,
         txt_tokens=args.txt_tokens,
         trunk_arch=args.trunk_arch, trunk_width=args.trunk_width,
