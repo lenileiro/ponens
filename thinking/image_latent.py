@@ -3832,7 +3832,8 @@ def _latent_cache_meta_path(cache_dir):
     return os.path.join(os.path.abspath(cache_dir), "meta.json")
 
 
-def load_disk_image_latent_cache(cache_dir, expected_fingerprint=None):
+def load_disk_image_latent_cache(cache_dir, expected_fingerprint=None,
+                                 require_image_targets=False):
     cache_dir = os.path.abspath(cache_dir)
     meta_path = _latent_cache_meta_path(cache_dir)
     if not os.path.exists(meta_path):
@@ -3841,6 +3842,8 @@ def load_disk_image_latent_cache(cache_dir, expected_fingerprint=None):
         meta = json.load(f)
     if expected_fingerprint and meta.get("fingerprint") != expected_fingerprint:
         return None
+    if require_image_targets and not bool(meta.get("has_image_targets", False)):
+        return None
     fmt = str(meta.get("format", ""))
     if fmt == "image_latent_cache_bucketed_v1":
         buckets = []
@@ -3848,7 +3851,9 @@ def load_disk_image_latent_cache(cache_dir, expected_fingerprint=None):
         total_shards = 0
         for bucket_meta in meta.get("buckets", []):
             key = str(bucket_meta["key"])
-            subcache = load_disk_image_latent_cache(os.path.join(cache_dir, key))
+            subcache = load_disk_image_latent_cache(
+                os.path.join(cache_dir, key),
+                require_image_targets=require_image_targets)
             if subcache is None:
                 return None
             total_bytes += int(subcache.get("bytes", 0))
@@ -3947,7 +3952,8 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                              include_image_geometry=False,
                              include_quality_targets=False, quality_stats=None,
                              hflip_prob=0.0, size_buckets=(), bucket_records=None,
-                             record_weights=None, cache_dtype="fp32"):
+                             record_weights=None, cache_dtype="fp32",
+                             require_image_targets=False):
     rows = list(records)
     if not rows:
         raise ValueError("cannot build latent cache from empty records")
@@ -3975,7 +3981,8 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
         weighted=record_weights is not None, precision=precision)
     if cache_dir:
         existing = load_disk_image_latent_cache(
-            cache_dir, expected_fingerprint=cache_fingerprint)
+            cache_dir, expected_fingerprint=cache_fingerprint,
+            require_image_targets=require_image_targets)
         if existing is not None:
             return existing
     if len(buckets) > 1:
@@ -4002,7 +4009,8 @@ def build_image_latent_cache(ae, records, prompt_vocab, caption_max_len=64, max_
                 include_quality_targets=include_quality_targets,
                 quality_stats=quality_stats,
                 crop_mode=crop_mode, hflip_prob=hflip_prob,
-                record_weights=record_weights, cache_dtype=cache_dtype)
+                record_weights=record_weights, cache_dtype=cache_dtype,
+                require_image_targets=require_image_targets)
             total_bytes += int(subcache.get("bytes", 0))
             total_records += int(subcache.get("records", 0))
             total_shards += int(subcache.get("shard_count", len(subcache.get("shards", []))))
@@ -13213,6 +13221,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         )
     )
     if flow_cache_latents:
+        flow_cache_requires_image_targets = (
+            flow_decoded_endpoint_w > 0.0 and flow_decoded_endpoint_p > 0.0)
         flow_cache = build_image_latent_cache(
             ae, image_records, prompt_vocab, caption_max_len=caption_max_len,
             max_records=flow_cache_records, batch=flow_cache_batch, seed=seed + 211,
@@ -13231,7 +13241,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             quality_stats=image_quality_score_stats,
             crop_mode=image_crop_mode, hflip_prob=image_hflip_prob,
             size_buckets=train_size_buckets, bucket_records=bucket_records,
-            record_weights=image_record_weights, cache_dtype=flow_cache_dtype)
+            record_weights=image_record_weights, cache_dtype=flow_cache_dtype,
+            require_image_targets=flow_cache_requires_image_targets)
         configure_latent_cache_runtime(
             flow_cache, max_loaded_shards=flow_cache_max_loaded_shards)
     if flow_cache is not None:
@@ -13588,6 +13599,12 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                             cache_payload, device=device)
                         decoded_endpoint_cache_target_miss = (
                             decoded_endpoint_target is None)
+                        if (decoded_endpoint_cache_target_miss
+                                and flow_cache.get("has_image_targets", False)):
+                            raise ValueError(
+                                "decoded endpoint latent cache advertises image "
+                                "targets but returned a batch without real image "
+                                "targets")
             else:
                 flow_batch = sample_bucketed_image_text_batch(
                     image_records, rng, batch=batch, size_buckets=active_size_buckets,
@@ -15034,6 +15051,41 @@ def selftest():
         assert math.isclose(
             report["flow_decoded_endpoint_patch_structure_w"], 0.1)
         assert report["flow_decoded_endpoint_patch_structure_size"] == 4
+        legacy_cache_dir = os.path.join(td, "legacy_targetless_cache")
+        os.makedirs(legacy_cache_dir, exist_ok=True)
+        with open(os.path.join(legacy_cache_dir, "meta.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({
+                "format": "image_latent_cache_v1",
+                "backend": "disk",
+                "records": 0,
+                "shards": [],
+                "fingerprint": "legacy-targetless",
+                "has_image_targets": False,
+            }, f)
+        assert load_disk_image_latent_cache(
+            legacy_cache_dir, expected_fingerprint="legacy-targetless",
+            require_image_targets=True) is None
+        cached_endpoint_dir = os.path.join(td, "decoded_endpoint_cache")
+        _cached_ae, _cached_flow, _cached_cond, _cached_vocab, cached_report = (
+            train_latent_flow(
+                ae_steps=1, flow_steps=1, batch=2, latent_ch=4, hidden=16,
+                flow_arch="dit", dit_depth=1, dit_heads=2, seed=55,
+                size=16, device="cpu", cond_mode="text", text_cond_dim=8,
+                image_manifest=manifest, image_root=td, image_split="train",
+                caption_max_len=8, image_max_records=3, sample_steps=1,
+                flow_cache_latents=True, flow_cache_dir=cached_endpoint_dir,
+                flow_cache_batch=2, flow_cache_shard_size=2,
+                flow_decoded_endpoint_w=0.01,
+                flow_decoded_endpoint_p=1.0,
+                flow_decoded_endpoint_grad_w=0.1,
+                return_conditioner=True))
+        assert cached_report["flow_cache_requested"] is True
+        assert cached_report["flow_cache_backend"] == "disk"
+        assert cached_report["flow_cache_has_image_targets"] is True
+        assert cached_report["last_flow"]["flow_decoded_endpoint_target_source"] == 1.0
+        assert cached_report["flow_decoded_endpoint_cache_target_misses"] == 0
+        assert cached_report["flow_decoded_endpoint_codec_target_microbatches"] == 0
         assert math.isclose(report["flow_equivariance_w"], 0.01)
         assert report["last_flow"]["flow_equivariance_active"] == 1.0
         assert "flow_equivariance_velocity_mse" in report["last_flow"]
