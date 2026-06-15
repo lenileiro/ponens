@@ -26,10 +26,11 @@ Checkpoints carry a bounded raw-reading replay bank selected from the model's ow
 so continuation can retain earlier concepts without a separate task-specific harness. Optional
 `--reading-study-self-teach-w` allocates extra training weight from the model's own eval deficits
 across view, context, span, closure, sequence, neighborhood, cluster, FER, and bridge signals.
-`--reading-objective-profile mastery` is the default raw-reading posture: it raises only these
-schema-free objective weights to practical floors, including self-teach, discovery, gap,
-graph, bridge, cluster, and reanalysis losses, then runs a selected-round study loop with
-patience and a mastery-score target. In `auto` study mode, each round routes to the
+`--reading-objective-profile mastery` is the default raw-reading posture: it raises these
+schema-free objective weights and study controls to practical floors, including self-teach,
+discovery, gap, graph, bridge, cluster, reanalysis, bounded hard-study mining, and periodic
+structure refreshes, then runs a selected-round study loop with patience and a mastery-score
+target. In `auto` study mode, each round routes to the
 weakest evaluated signal, such as sequence, closure, FER, or discovery, and each
 round branches from the best accepted state so rejected self-teaching attempts do not
 poison the next attempt. Concept-memory study rounds also report a model-derived
@@ -41,7 +42,16 @@ reasons such as hard-study examples or concept-insight records, and continuation
 sampling uses those priorities before falling back to uniform replay. Checkpoints also
 carry a compact reading-mastery history, so long training runs preserve each session's
 score deltas, accepted update, self-teach signal, replay priority counts, and concept
-insight evidence without task-specific labels. Use `manual` for exact low-level
+insight evidence without task-specific labels. The history also stores label-free
+representation-progress evidence over FER, bridge, sequence, neighborhood, cluster, span, and
+closure signals, plus compact sampled parameter-update evidence, including selected-round
+attempts that are rolled back, so runs can verify that reading actually moved weights and changed
+internal organization. Checkpoint study feeds prior concept-insight and representation weakness
+signals back into self-teach, so previously discovered connections can shape later reading
+updates. The default `mastery` profile also owns the practical hard-study defaults: it probes a
+bounded candidate set, caps selected hard records, and periodically refreshes neighborhood and
+cluster mining instead of requiring those controls to be repeated in every launch command. Use
+`manual` for exact low-level
 ablations.
 Optional `--latent-concept-topk` applies the shared latent-slot sparsity gate used by
 multimodal, keeping only the strongest schema-free concept slots per record so reading
@@ -53,10 +63,6 @@ python -m thinking.text --selftest
 python -m thinking.text --reading-data data/reading.jsonl \
     --steps 40000 --batch 16 --d 256 --layers 4 --heads 8 \
     --latent-concept-slots 4 --latent-concept-topk 2 --reading-memory-size 256 \
-    --reading-objective-profile mastery \
-    --reading-study-strategy auto --reading-study-probe-n 256 \
-    --reading-discovery-w 0.05 --reading-reanalysis-w 0.05 \
-    --reading-gap-w 0.05 --reading-span-completion-w 0.05 \
     --out runs/text_raw_reading.json \
     --checkpoint runs/text_raw_reading.pt
 
@@ -64,11 +70,6 @@ python -m thinking.text --reading-data data/new_reading.jsonl \
     --reading-checkpoint runs/text_raw_reading.pt \
     --reading-out-checkpoint runs/text_raw_reading_studied.pt \
     --steps 4000 --batch 16 \
-    --reading-objective-profile mastery \
-    --reading-study-strategy auto --reading-study-probe-n 256 \
-    --reading-discovery-w 0.05 --reading-reanalysis-w 0.05 \
-    --reading-gap-w 0.05 --reading-span-completion-w 0.05 \
-    --reading-replay-w 0.05 \
     --out runs/text_raw_reading_study.json
 ```
 
@@ -80,7 +81,26 @@ train partial views with the shared concept-completion objective via
 `--latent-concept-completion-w`. Discovery hard study also includes concept-completion surprise,
 so multimodal data can surface records where partial views fail to reconstruct the full latent
 state. If a dataset wants captions, extraction facts, actions, or no decoder target at all, that
-target choice lives in the manifest rather than in module code.
+target choice lives in the manifest rather than in module code. Multimodal runs can warm-start
+from `thinking.text` checkpoints, inheriting latent top-k sparsity and reading-mastery history;
+`--self-teach-history-prior-w` lets multimodal self-teach reuse prior abstract weaknesses such as
+FER, bridge, sequence, and mode-floor deficits without labels. Text checkpoint concept-insight
+events also reinforce multimodal bridge/discovery self-teach, so accepted "new connection"
+evidence can transfer across modalities. Text checkpoint representation-progress history also
+transfers as FER/bridge/sequence self-teach pressure. The warm-start report surfaces whether the
+source reading stage changed sampled weights and organization signals, giving multimodal training
+evidence that it is inheriting learned parameters rather than only configuration. For target-aware
+transfer, `--text-transfer-probe-n` probes the current multimodal manifest before and after a text
+checkpoint import; by default it probes 64 records, requires a `0.1` target-score gain, and keeps
+`--text-transfer-gate` enabled so harmful imports are rolled back and their reading-history prior
+is not trusted for self-teach. Multimodal train reports include the same
+bounded sampled parameter-update summary for the current run, including attempted selected rounds
+that are later rolled back. Optional `--representation-probe-n` records a before/after
+label-free organization report over FER, bridge, and sequence signals, so a run can distinguish
+surface task progress from better internal concept structure. `--multimodal-checkpoint`
+warm-starts compatible weights from an earlier multimodal run and converts its representation
+progress report into a self-teach prior, letting later runs continue from discovered internal
+weaknesses instead of restarting from a surface task score.
 
 ```json
 {"split":"train",
@@ -99,8 +119,19 @@ python -m thinking.multimodal --manifest data/multimodal.jsonl \
     --latent-concept-reanalysis-w 0.05 \
     --latent-concept-gap-w 0.05 \
     --latent-concept-completion-w 0.05 \
+    --representation-probe-n 128 \
     --out runs/multimodal.json \
     --checkpoint runs/multimodal.pt
+
+python -m thinking.multimodal --manifest data/multimodal_next.jsonl \
+    --text-checkpoint runs/text_raw_reading_discovery_study_smoke.pt \
+    --multimodal-checkpoint runs/multimodal.pt \
+    --steps 400 --batch 32 --dim 96 \
+    --latent-concept-slots 8 --latent-concept-memory-size 64 \
+    --self-teach-w 0.05 --self-teach-history-prior-w 1.0 \
+    --representation-probe-n 128 \
+    --out runs/multimodal_continued.json \
+    --checkpoint runs/multimodal_continued.pt
 ```
 
 ## Image

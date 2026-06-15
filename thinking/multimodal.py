@@ -106,6 +106,44 @@ MULTIMODAL_SELF_TEACH_WEIGHT_KEYS = tuple(dict.fromkeys(
     key
     for keys in MULTIMODAL_SELF_TEACH_SIGNAL_OBJECTIVES.values()
     for key in keys))
+MULTIMODAL_TEXT_HISTORY_SIGNAL_KEYS = {
+    "mode_floor": ("signal_coverage", "balanced_score", "floor_score"),
+    "fer": ("fer_score",),
+    "bridge": ("bridge_score", "bridge_connectivity"),
+    "sequence": ("sequence_score",),
+}
+MULTIMODAL_TEXT_HISTORY_TOP_SIGNAL_MAP = {
+    "view": "mode_floor",
+    "fer": "fer",
+    "bridge": "bridge",
+    "sequence": "sequence",
+}
+MULTIMODAL_REPRESENTATION_PROGRESS_KEYS = (
+    "mastery_score", "active_mean_score", "floor_score", "balanced_score",
+    "signal_coverage", "mode_floor_score", "fer_score", "bridge_score",
+    "sequence_score")
+MULTIMODAL_REPRESENTATION_SIGNAL_KEYS = (
+    "fer_score", "bridge_score", "sequence_score")
+DEFAULT_TEXT_TRANSFER_PROBE_N = 64
+DEFAULT_TEXT_TRANSFER_SCORE_MIN_DELTA = 0.1
+DEFAULT_TEXT_TRANSFER_INSIGHT_ACCEPT_W = 0.0
+
+
+def _mm_float(value, default=0.0):
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(out):
+        return float(default)
+    return float(out)
+
+
+def _mm_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
 
 
 @dataclass(frozen=True)
@@ -246,6 +284,16 @@ def load_text_checkpoint_payload(path, device="cpu"):
     return ckpt
 
 
+def load_multimodal_checkpoint_payload(path, device="cpu"):
+    ckpt = _torch_load(path, device)
+    if not isinstance(ckpt, dict) or "state_dict" not in ckpt or "vocab" not in ckpt:
+        raise ValueError(
+            f"{path} is not a multimodal checkpoint with state_dict and vocab")
+    if not isinstance(ckpt.get("model_config"), dict):
+        raise ValueError(f"{path} is missing multimodal model_config")
+    return ckpt
+
+
 def text_checkpoint_latent_config(path, device="cpu"):
     if not path:
         return {}
@@ -253,6 +301,7 @@ def text_checkpoint_latent_config(path, device="cpu"):
     return {
         "latent_concept_slots": int(ckpt.get("latent_concept_slots", 0)),
         "latent_concept_layers": int(ckpt.get("latent_concept_layers", 1)),
+        "latent_concept_topk": int(ckpt.get("latent_concept_topk", 0)),
         "latent_concept_prefix": bool(ckpt.get("latent_concept_prefix", False)),
         "latent_concept_refine": bool(ckpt.get("latent_concept_refine", False)),
         "latent_concept_refine_gate_init": float(
@@ -262,24 +311,398 @@ def text_checkpoint_latent_config(path, device="cpu"):
     }
 
 
+def text_checkpoint_reading_history(ckpt):
+    if not isinstance(ckpt, dict):
+        return {"entry_count": 0, "entries": []}
+    report = ckpt.get("report") if isinstance(ckpt.get("report"), dict) else {}
+    history = ckpt.get("reading_mastery_history")
+    if not isinstance(history, dict):
+        history = report.get("reading_mastery_history")
+    if not isinstance(history, dict):
+        return {"entry_count": 0, "entries": []}
+    entries = history.get("entries", ())
+    if not isinstance(entries, (list, tuple)):
+        entries = ()
+    entries = [entry for entry in entries if isinstance(entry, dict)]
+    return {
+        "version": _mm_int(history.get("version", 0), 0),
+        "entry_count": _mm_int(history.get("entry_count", len(entries)), len(entries)),
+        "entries": entries,
+    }
+
+
+def text_checkpoint_concept_insight_prior(ckpt, enabled=True,
+                                          max_entries=8, decay=0.75):
+    if not enabled:
+        return {
+            "enabled": False,
+            "entry_count": 0,
+            "concept_connection_signal": 0.0,
+        }
+    history = text_checkpoint_reading_history(ckpt)
+    entries = history["entries"][-max(1, int(max_entries)):]
+    decay = min(1.0, max(0.0, _mm_float(decay, 0.75)))
+    weighted_delta = 0.0
+    total_weight = 0.0
+    max_delta = 0.0
+    latest_delta = 0.0
+    selected_by_insight = 0
+    accepted_updates = 0
+    for offset, entry in enumerate(reversed(entries)):
+        delta = max(0.0, _mm_float(entry.get("max_concept_insight_delta", 0.0)))
+        if offset == 0:
+            latest_delta = delta
+        recency_weight = decay ** offset
+        weighted_delta += recency_weight * min(1.0, delta)
+        total_weight += recency_weight
+        max_delta = max(max_delta, delta)
+        if bool(entry.get("selected_by_insight", False)):
+            selected_by_insight += 1
+        if bool(entry.get("accepted_update", False)):
+            accepted_updates += 1
+    signal = weighted_delta / total_weight if total_weight > 0.0 else 0.0
+    return {
+        "enabled": True,
+        "entry_count": int(len(entries)),
+        "decay": float(decay),
+        "concept_connection_signal": float(signal),
+        "max_concept_insight_delta": float(max_delta),
+        "latest_concept_insight_delta": float(latest_delta),
+        "selected_by_insight_count": int(selected_by_insight),
+        "accepted_update_count": int(accepted_updates),
+    }
+
+
+def text_checkpoint_weight_update_summary(ckpt, max_entries=8):
+    history = text_checkpoint_reading_history(ckpt)
+    entries = history["entries"][-max(1, int(max_entries)):]
+    if not entries:
+        return {
+            "entry_count": 0,
+            "changed": False,
+            "latest_changed": False,
+            "changed_tensor_count": 0,
+            "changed_value_count": 0,
+            "max_abs_delta": 0.0,
+            "latest_max_abs_delta": 0.0,
+            "attempted_weight_update_count": 0,
+        }
+    changed = any(bool(entry.get("weight_update_changed", False))
+                  for entry in entries)
+    latest = entries[-1]
+    return {
+        "entry_count": int(len(entries)),
+        "changed": bool(changed),
+        "latest_changed": bool(latest.get("weight_update_changed", False)),
+        "changed_tensor_count": max(
+            _mm_int(entry.get("weight_update_changed_tensor_count", 0), 0)
+            for entry in entries),
+        "changed_value_count": max(
+            _mm_int(entry.get("weight_update_changed_value_count", 0), 0)
+            for entry in entries),
+        "max_abs_delta": max(
+            _mm_float(entry.get("weight_update_max_abs_delta", 0.0), 0.0)
+            for entry in entries),
+        "latest_max_abs_delta": _mm_float(
+            latest.get("weight_update_max_abs_delta", 0.0), 0.0),
+        "attempted_weight_update_count": sum(
+            _mm_int(entry.get("attempted_weight_update_count", 0), 0)
+            for entry in entries),
+    }
+
+
+def text_checkpoint_reading_representation_summary(ckpt, max_entries=8):
+    history = text_checkpoint_reading_history(ckpt)
+    entries = history["entries"][-max(1, int(max_entries)):]
+    progress_rows = [
+        entry.get("representation_progress")
+        for entry in entries
+        if isinstance(entry.get("representation_progress"), dict)
+        and bool(entry.get("representation_progress", {}).get("enabled", False))
+    ]
+    if not progress_rows:
+        return {
+            "enabled": False,
+            "entry_count": 0,
+            "insight_event_count": 0,
+            "organization_score_delta": 0.0,
+            "top_gain_signal": "",
+        }
+    latest = progress_rows[-1]
+    return {
+        "enabled": True,
+        "entry_count": int(len(progress_rows)),
+        "insight_event_count": sum(
+            1 for row in progress_rows
+            if bool(row.get("representation_insight_event", False))),
+        "organization_score_delta": max(
+            _mm_float(row.get("organization_score_delta", 0.0), 0.0)
+            for row in progress_rows),
+        "latest_organization_score_delta": _mm_float(
+            latest.get("organization_score_delta", 0.0), 0.0),
+        "top_gain_signal": str(latest.get("top_gain_signal", "")),
+        "latest": latest,
+    }
+
+
+def multimodal_text_history_self_teach_prior(ckpt, enabled=True,
+                                             max_entries=8, decay=0.75):
+    if not enabled:
+        return {"enabled": False, "entry_count": 0, "signal_deficits": {}}
+    history = text_checkpoint_reading_history(ckpt)
+    concept_prior = text_checkpoint_concept_insight_prior(
+        ckpt, enabled=True, max_entries=max_entries, decay=decay)
+    representation_summary = text_checkpoint_reading_representation_summary(
+        ckpt, max_entries=max_entries)
+    entries = history["entries"][-max(1, int(max_entries)):]
+    decay = min(1.0, max(0.0, _mm_float(decay, 0.75)))
+    weighted = {signal: 0.0 for signal in MULTIMODAL_SELF_TEACH_SIGNALS}
+    weights = {signal: 0.0 for signal in MULTIMODAL_SELF_TEACH_SIGNALS}
+    top_counts = {signal: 0 for signal in MULTIMODAL_SELF_TEACH_SIGNALS}
+    for offset, entry in enumerate(reversed(entries)):
+        score_components = entry.get("after_score_components")
+        if not isinstance(score_components, dict):
+            continue
+        recency_weight = decay ** offset
+        for signal, score_keys in MULTIMODAL_TEXT_HISTORY_SIGNAL_KEYS.items():
+            skip_key = f"{signal}_skipped"
+            if bool(score_components.get(skip_key, False)):
+                continue
+            qualities = [
+                min(1.0, max(0.0, _mm_float(score_components.get(score_key))))
+                for score_key in score_keys
+                if score_key in score_components
+            ]
+            if not qualities:
+                continue
+            quality = min(qualities)
+            weighted[signal] += recency_weight * max(0.0, 1.0 - quality)
+            weights[signal] += recency_weight
+        representation_progress = entry.get("representation_progress")
+        if (isinstance(representation_progress, dict)
+                and bool(representation_progress.get("enabled", False))):
+            signal_after = representation_progress.get("signal_after")
+            signal_after = signal_after if isinstance(signal_after, dict) else {}
+            signal_deltas = representation_progress.get("signal_deltas")
+            signal_deltas = signal_deltas if isinstance(signal_deltas, dict) else {}
+            for source_signal, value in signal_after.items():
+                signal = MULTIMODAL_TEXT_HISTORY_TOP_SIGNAL_MAP.get(
+                    str(source_signal))
+                if signal not in weights:
+                    continue
+                quality = min(1.0, max(0.0, _mm_float(value, 0.0)))
+                quality_deficit = max(0.0, 1.0 - quality)
+                regression_deficit = max(
+                    0.0, -_mm_float(signal_deltas.get(source_signal, 0.0), 0.0))
+                deficit = max(quality_deficit, regression_deficit)
+                if deficit <= 0.0:
+                    continue
+                weighted[signal] += recency_weight * deficit
+                weights[signal] += recency_weight
+        source_top = str(entry.get("self_teach_top_signal", ""))
+        top_signal = MULTIMODAL_TEXT_HISTORY_TOP_SIGNAL_MAP.get(source_top)
+        if top_signal in top_counts:
+            top_counts[top_signal] += 1
+    deficits = {
+        signal: float(weighted[signal] / weights[signal])
+        for signal in MULTIMODAL_SELF_TEACH_SIGNALS
+        if weights[signal] > 0.0 and weighted[signal] > 0.0
+    }
+    concept_signal = max(
+        0.0, _mm_float(concept_prior.get("concept_connection_signal", 0.0)))
+    if concept_signal > 0.0:
+        deficits["bridge"] = max(float(deficits.get("bridge", 0.0)),
+                                 float(concept_signal))
+    top_signal = None
+    if deficits:
+        top_signal = max(deficits.items(), key=lambda item: item[1])[0]
+    return {
+        "enabled": True,
+        "entry_count": int(len(entries)),
+        "decay": float(decay),
+        "signal_deficits": deficits,
+        "top_signal": top_signal,
+        "concept_connection_signal": float(concept_signal),
+        "concept_insight_prior": concept_prior,
+        "reading_representation_summary": representation_summary,
+        "top_signal_counts": {
+            signal: count for signal, count in top_counts.items() if count},
+    }
+
+
+def _multimodal_checkpoint_report(ckpt):
+    if not isinstance(ckpt, dict):
+        return {}
+    report = ckpt.get("report")
+    return report if isinstance(report, dict) else {}
+
+
+def multimodal_checkpoint_representation_self_teach_prior(ckpt, enabled=True):
+    if not enabled:
+        return {"enabled": False, "entry_count": 0, "signal_deficits": {}}
+    report = _multimodal_checkpoint_report(ckpt)
+    progress = report.get("representation_progress")
+    if not isinstance(progress, dict):
+        train_metrics = report.get("train_metrics")
+        if isinstance(train_metrics, dict):
+            progress = train_metrics.get("representation_progress")
+    if not isinstance(progress, dict) or not bool(progress.get("enabled", False)):
+        return {"enabled": False, "entry_count": 0, "signal_deficits": {}}
+    signal_after = (
+        progress.get("signal_after")
+        if isinstance(progress.get("signal_after"), dict) else {})
+    signal_deltas = (
+        progress.get("signal_deltas")
+        if isinstance(progress.get("signal_deltas"), dict) else {})
+    deficits = {}
+    for signal in ("fer", "bridge", "sequence"):
+        if signal not in MULTIMODAL_SELF_TEACH_SIGNALS:
+            continue
+        after_quality = min(1.0, max(0.0, _mm_float(signal_after.get(signal), 0.0)))
+        quality_deficit = max(0.0, 1.0 - after_quality)
+        regression_deficit = max(0.0, -_mm_float(signal_deltas.get(signal), 0.0))
+        deficit = max(quality_deficit, regression_deficit)
+        if deficit > 0.0:
+            deficits[signal] = float(deficit)
+    top_signal = None
+    if deficits:
+        top_signal = max(deficits.items(), key=lambda item: item[1])[0]
+    return {
+        "enabled": bool(deficits),
+        "entry_count": 1,
+        "signal_deficits": deficits,
+        "top_signal": top_signal,
+        "source": "multimodal_checkpoint_representation_progress",
+        "organization_score_before": _mm_float(
+            progress.get("organization_score_before", 0.0), 0.0),
+        "organization_score_after": _mm_float(
+            progress.get("organization_score_after", 0.0), 0.0),
+        "organization_score_delta": _mm_float(
+            progress.get("organization_score_delta", 0.0), 0.0),
+        "representation_insight_event": bool(
+            progress.get("representation_insight_event", False)),
+        "progress": progress,
+    }
+
+
+def merge_multimodal_self_teach_priors(*priors):
+    merged_deficits = {}
+    enabled = False
+    entry_count = 0
+    sources = []
+    concept_connection_signal = 0.0
+    for prior in priors:
+        if not isinstance(prior, dict):
+            continue
+        if bool(prior.get("enabled", False)):
+            enabled = True
+        entry_count += int(prior.get("entry_count", 0) or 0)
+        source = prior.get("source")
+        if source:
+            sources.append(str(source))
+        deficits = prior.get("signal_deficits")
+        if isinstance(deficits, dict):
+            for signal, value in deficits.items():
+                if signal not in MULTIMODAL_SELF_TEACH_SIGNALS:
+                    continue
+                merged_deficits[signal] = max(
+                    float(merged_deficits.get(signal, 0.0)),
+                    max(0.0, _mm_float(value, 0.0)))
+        concept_connection_signal = max(
+            concept_connection_signal,
+            max(0.0, _mm_float(prior.get("concept_connection_signal", 0.0), 0.0)))
+    if concept_connection_signal > 0.0:
+        merged_deficits["bridge"] = max(
+            float(merged_deficits.get("bridge", 0.0)),
+            float(concept_connection_signal))
+    top_signal = None
+    if merged_deficits:
+        top_signal = max(merged_deficits.items(), key=lambda item: item[1])[0]
+    return {
+        "enabled": bool(enabled or merged_deficits),
+        "entry_count": int(entry_count),
+        "signal_deficits": merged_deficits,
+        "top_signal": top_signal,
+        "concept_connection_signal": float(concept_connection_signal),
+        "sources": sources,
+    }
+
+
 def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
     """Warm-start the generic text trunk and latent concept modules by token identity."""
     ckpt = load_text_checkpoint_payload(checkpoint, device=device)
     state = ckpt["state_dict"]
     src_vocab = {tok: i for i, tok in enumerate(ckpt["vocab"])}
     dst_state = model.state_dict()
+    report_payload = ckpt.get("report") if isinstance(ckpt.get("report"), dict) else {}
+    history = text_checkpoint_reading_history(ckpt)
+    concept_prior = text_checkpoint_concept_insight_prior(ckpt)
+    weight_update = text_checkpoint_weight_update_summary(ckpt)
+    reading_representation = text_checkpoint_reading_representation_summary(ckpt)
+    latest_history = history["entries"][-1] if history["entries"] else {}
+    replay_bank = ckpt.get("reading_replay_bank")
+    if not isinstance(replay_bank, dict):
+        replay_bank = report_payload.get("reading_replay_bank")
+    if not isinstance(replay_bank, dict):
+        replay_bank = {}
     report = {
         "checkpoint": checkpoint,
-        "checkpoint_experiment": ckpt.get("report", {}).get("experiment"),
+        "checkpoint_experiment": report_payload.get("experiment"),
         "source_vocab_size": len(src_vocab),
         "target_vocab_size": len(vocab),
         "source_d": int(ckpt.get("d", 0) or 0),
         "target_d": int(model.config["d"]),
         "source_latent_concept_slots": int(ckpt.get("latent_concept_slots", 0)),
         "target_latent_concept_slots": int(model.latent_concept_slots),
+        "source_latent_concept_topk": int(ckpt.get("latent_concept_topk", 0)),
+        "target_latent_concept_topk": int(model.latent_concept_topk),
         "source_latent_concept_memory_size": int(
             ckpt.get("latent_concept_memory_size", 0)),
         "target_latent_concept_memory_size": int(model.latent_concept_memory_size),
+        "source_reading_mastery_history_count": int(
+            history.get("entry_count", 0) or 0),
+        "source_reading_mastery_latest_experiment": latest_history.get("experiment"),
+        "source_reading_mastery_latest_self_teach_signal": str(
+            latest_history.get("self_teach_top_signal", "")),
+        "source_reading_concept_connection_signal": float(
+            concept_prior.get("concept_connection_signal", 0.0)),
+        "source_reading_concept_insight_max_delta": float(
+            concept_prior.get("max_concept_insight_delta", 0.0)),
+        "source_reading_concept_insight_selected_count": int(
+            concept_prior.get("selected_by_insight_count", 0)),
+        "source_reading_concept_insight_accepted_count": int(
+            concept_prior.get("accepted_update_count", 0)),
+        "source_reading_concept_insight_prior": concept_prior,
+        "source_reading_weight_update_changed": bool(
+            weight_update.get("changed", False)),
+        "source_reading_weight_update_latest_changed": bool(
+            weight_update.get("latest_changed", False)),
+        "source_reading_weight_update_changed_tensor_count": int(
+            weight_update.get("changed_tensor_count", 0)),
+        "source_reading_weight_update_changed_value_count": int(
+            weight_update.get("changed_value_count", 0)),
+        "source_reading_weight_update_max_abs_delta": float(
+            weight_update.get("max_abs_delta", 0.0)),
+        "source_reading_weight_update_latest_max_abs_delta": float(
+            weight_update.get("latest_max_abs_delta", 0.0)),
+        "source_reading_attempted_weight_update_count": int(
+            weight_update.get("attempted_weight_update_count", 0)),
+        "source_reading_weight_update_summary": weight_update,
+        "source_reading_representation_progress_enabled": bool(
+            reading_representation.get("enabled", False)),
+        "source_reading_representation_insight_event_count": int(
+            reading_representation.get("insight_event_count", 0)),
+        "source_reading_representation_organization_delta": float(
+            reading_representation.get("organization_score_delta", 0.0)),
+        "source_reading_representation_latest_organization_delta": float(
+            reading_representation.get("latest_organization_score_delta", 0.0)),
+        "source_reading_representation_top_gain_signal": str(
+            reading_representation.get("top_gain_signal", "")),
+        "source_reading_representation_summary": reading_representation,
+        "source_reading_replay_bank_records": _mm_int(
+            replay_bank.get("record_count", 0), 0),
+        "source_reading_replay_priority_records": _mm_int(
+            replay_bank.get("priority_record_count", 0), 0),
         "copied_token_embeddings": 0,
         "overlap_tokens": 0,
         "copied_position_rows": 0,
@@ -380,6 +803,137 @@ def import_text_checkpoint(model, vocab, checkpoint, device=DEV):
         or report["copied_latent_tensor_count"]
         or report["copied_sequence_tensor_count"])
     model.text_checkpoint_transfer = report
+    return report
+
+
+def import_multimodal_checkpoint(model, vocab, checkpoint, device=DEV):
+    """Warm-start a multimodal model from compatible prior multimodal weights."""
+    ckpt = load_multimodal_checkpoint_payload(checkpoint, device=device)
+    state = ckpt["state_dict"]
+    src_vocab = {tok: i for i, tok in enumerate(ckpt["vocab"])}
+    dst_state = model.state_dict()
+    src_config = ckpt.get("model_config") if isinstance(
+        ckpt.get("model_config"), dict) else {}
+    report_payload = _multimodal_checkpoint_report(ckpt)
+    representation_prior = multimodal_checkpoint_representation_self_teach_prior(
+        ckpt, enabled=True)
+    report = {
+        "checkpoint": checkpoint,
+        "checkpoint_experiment": report_payload.get("experiment"),
+        "source_vocab_size": len(src_vocab),
+        "target_vocab_size": len(vocab),
+        "source_d": int(src_config.get("d", ckpt.get("d", 0)) or 0),
+        "target_d": int(model.config["d"]),
+        "source_view_names": list(src_config.get("view_names", [])),
+        "target_view_names": list(model.config.get("view_names", [])),
+        "source_representation_prior": representation_prior,
+        "source_representation_insight_event": bool(
+            representation_prior.get("representation_insight_event", False)),
+        "source_representation_top_signal": representation_prior.get("top_signal"),
+        "copied_token_embeddings": 0,
+        "overlap_tokens": 0,
+        "copied_feature_tensors": [],
+        "copied_exact_tensors": [],
+        "skipped_shape": [],
+        "skipped_missing": [],
+    }
+
+    copied_names = set()
+
+    def copy_token_rows(name):
+        src_val = state.get(name)
+        dst_val = dst_state.get(name)
+        if src_val is None or dst_val is None:
+            return
+        if src_val.ndim != 2 or dst_val.ndim != 2 or src_val.shape[1] != dst_val.shape[1]:
+            report["skipped_shape"].append({
+                "name": name,
+                "source": list(src_val.shape),
+                "target": list(dst_val.shape),
+            })
+            return
+        copied = 0
+        with torch.no_grad():
+            dst_param = model.state_dict()[name]
+            for tok, dst_idx in vocab.stoi.items():
+                src_idx = src_vocab.get(tok)
+                if src_idx is None or src_idx >= src_val.shape[0]:
+                    continue
+                dst_param[dst_idx].copy_(
+                    src_val[src_idx].to(
+                        device=dst_param.device, dtype=dst_param.dtype))
+                copied += 1
+        copied_names.add(name)
+        report["copied_token_embeddings"] += int(copied)
+
+    report["overlap_tokens"] = sum(1 for tok in vocab.stoi if tok in src_vocab)
+    for token_name in ("lm.tok.weight", "lm.head.weight", "txt.emb.weight"):
+        copy_token_rows(token_name)
+
+    src_view_names = [str(name) for name in src_config.get("view_names", [])]
+    dst_view_names = list(model.config.get("view_names", []))
+    dst_by_view = {str(name): i for i, name in enumerate(dst_view_names)}
+    view_prefix = "feature_readers."
+    with torch.no_grad():
+        for name, src_val in sorted(state.items()):
+            mapped_name = None
+            if name.startswith(view_prefix):
+                parts = name.split(".", 2)
+                if len(parts) >= 3:
+                    try:
+                        src_idx = int(parts[1])
+                    except ValueError:
+                        src_idx = None
+                    if src_idx is not None and src_idx < len(src_view_names):
+                        dst_idx = dst_by_view.get(src_view_names[src_idx])
+                        if dst_idx is not None:
+                            mapped_name = f"feature_readers.{dst_idx}.{parts[2]}"
+            if mapped_name is None:
+                continue
+            dst_val = dst_state.get(mapped_name)
+            if dst_val is None:
+                report["skipped_missing"].append(mapped_name)
+                continue
+            if tuple(src_val.shape) != tuple(dst_val.shape):
+                report["skipped_shape"].append({
+                    "name": mapped_name,
+                    "source": list(src_val.shape),
+                    "target": list(dst_val.shape),
+                })
+                continue
+            dst_val.copy_(src_val.to(device=dst_val.device, dtype=dst_val.dtype))
+            copied_names.add(mapped_name)
+            report["copied_feature_tensors"].append(mapped_name)
+
+        for name, src_val in sorted(state.items()):
+            if name in copied_names:
+                continue
+            if name in ("lm.tok.weight", "lm.head.weight", "txt.emb.weight"):
+                continue
+            if name.startswith(view_prefix):
+                continue
+            dst_val = dst_state.get(name)
+            if dst_val is None:
+                report["skipped_missing"].append(name)
+                continue
+            if tuple(src_val.shape) != tuple(dst_val.shape):
+                report["skipped_shape"].append({
+                    "name": name,
+                    "source": list(src_val.shape),
+                    "target": list(dst_val.shape),
+                })
+                continue
+            dst_val.copy_(src_val.to(device=dst_val.device, dtype=dst_val.dtype))
+            copied_names.add(name)
+            report["copied_exact_tensors"].append(name)
+
+    report["copied_feature_tensor_count"] = len(report["copied_feature_tensors"])
+    report["copied_exact_tensor_count"] = len(report["copied_exact_tensors"])
+    report["copied"] = bool(
+        report["copied_token_embeddings"]
+        or report["copied_feature_tensor_count"]
+        or report["copied_exact_tensor_count"])
+    model.multimodal_checkpoint_transfer = report
     return report
 
 
@@ -1956,13 +2510,27 @@ def multimodal_score_components(mode_metrics, fer_eval=None, bridge_eval=None,
             }}
 
 
-def multimodal_self_teach_weight_plan(score_components, budget=0.0):
+def multimodal_self_teach_weight_plan(score_components, budget=0.0,
+                                      history_prior=None,
+                                      history_prior_w=0.5):
     budget = float(budget)
     if budget < 0.0:
         raise ValueError("multimodal self-teach budget must be non-negative")
+    history_prior_w = float(history_prior_w)
+    if history_prior_w < 0.0:
+        raise ValueError(
+            "multimodal self-teach history prior weight must be non-negative")
+    history_prior = history_prior if isinstance(history_prior, dict) else {}
+    history_deficits = (
+        history_prior.get("signal_deficits")
+        if isinstance(history_prior.get("signal_deficits"), dict) else {})
+    concept_connection_signal = max(
+        0.0, _mm_float(history_prior.get("concept_connection_signal", 0.0)))
     extras = {key: 0.0 for key in MULTIMODAL_SELF_TEACH_WEIGHT_KEYS}
     deficits = {}
+    current_deficits = {}
     active = []
+    score_components = dict(score_components or {})
     for signal in MULTIMODAL_SELF_TEACH_SIGNALS:
         if bool(score_components.get(
                 MULTIMODAL_SELF_TEACH_SKIP_KEYS[signal], False)):
@@ -1970,7 +2538,13 @@ def multimodal_self_teach_weight_plan(score_components, budget=0.0):
         score = float(score_components.get(
             MULTIMODAL_SELF_TEACH_SCORE_KEYS[signal], 0.0))
         quality = min(1.0, max(0.0, score))
-        deficit = max(0.0, 1.0 - quality)
+        current_deficit = max(0.0, 1.0 - quality)
+        history_deficit = max(
+            0.0, _mm_float(history_deficits.get(signal, 0.0)))
+        if signal == "bridge":
+            history_deficit = max(history_deficit, concept_connection_signal)
+        deficit = max(current_deficit, history_prior_w * history_deficit)
+        current_deficits[signal] = float(current_deficit)
         deficits[signal] = float(deficit)
         if deficit > 0.0:
             active.append((signal, deficit))
@@ -1991,12 +2565,23 @@ def multimodal_self_teach_weight_plan(score_components, budget=0.0):
         "total_deficit": float(total_deficit),
         "top_signal": top_signal,
         "signal_deficits": deficits,
+        "current_signal_deficits": current_deficits,
+        "history_signal_deficits": {
+            signal: _mm_float(value)
+            for signal, value in history_deficits.items()
+            if signal in MULTIMODAL_SELF_TEACH_SIGNALS},
+        "history_prior_enabled": bool(history_prior.get("enabled", False)),
+        "history_prior_entry_count": int(history_prior.get("entry_count", 0) or 0),
+        "history_prior_top_signal": history_prior.get("top_signal"),
+        "history_prior_w": float(history_prior_w),
+        "history_concept_connection_signal": float(concept_connection_signal),
         "active_signals": [signal for signal, _deficit in active],
         "weight_extras": {key: float(value) for key, value in extras.items()},
     }
 
 
 def multimodal_self_teach_weight_maps(score_components=None, budget=0.0,
+                                      history_prior=None, history_prior_w=0.5,
                                       **base_weights):
     budget = float(budget)
     if budget < 0.0:
@@ -2017,7 +2602,9 @@ def multimodal_self_teach_weight_maps(score_components=None, budget=0.0,
     if score_components is None:
         raise ValueError(
             "multimodal self-teach needs score components when budget is positive")
-    plan = multimodal_self_teach_weight_plan(score_components, budget=budget)
+    plan = multimodal_self_teach_weight_plan(
+        score_components, budget=budget,
+        history_prior=history_prior, history_prior_w=history_prior_w)
     extras = plan["weight_extras"]
     effective = {
         key: float(base[key]) + float(extras.get(key, 0.0))
@@ -2047,6 +2634,135 @@ def multimodal_eval_bundle(model, records, vocab, view_dims, n=200, seed=1,
                 metrics, fer_eval=fer, bridge_eval=bridge,
                 sequence_eval=sequence, metric=score_metric,
                 margin_w=score_margin_w)}
+
+
+def multimodal_representation_progress_report(before_bundle, after_bundle):
+    if not isinstance(before_bundle, dict) or not isinstance(after_bundle, dict):
+        return {"enabled": False}
+    before_scores = before_bundle.get("score_components")
+    after_scores = after_bundle.get("score_components")
+    if not isinstance(before_scores, dict) or not isinstance(after_scores, dict):
+        return {"enabled": False}
+    deltas = {}
+    for key in MULTIMODAL_REPRESENTATION_PROGRESS_KEYS:
+        if key in before_scores and key in after_scores:
+            deltas[key] = float(
+                _mm_float(after_scores.get(key), 0.0)
+                - _mm_float(before_scores.get(key), 0.0))
+    active_signals = []
+    signal_before = {}
+    signal_after = {}
+    signal_deltas = {}
+    for key in MULTIMODAL_REPRESENTATION_SIGNAL_KEYS:
+        signal = key[:-len("_score")]
+        if bool(before_scores.get(f"{signal}_skipped", False)) and bool(
+                after_scores.get(f"{signal}_skipped", False)):
+            continue
+        before_value = _mm_float(before_scores.get(key), 0.0)
+        after_value = _mm_float(after_scores.get(key), 0.0)
+        active_signals.append(signal)
+        signal_before[signal] = float(before_value)
+        signal_after[signal] = float(after_value)
+        signal_deltas[signal] = float(after_value - before_value)
+    if active_signals:
+        organization_before = float(np.mean([
+            signal_before[signal] for signal in active_signals]))
+        organization_after = float(np.mean([
+            signal_after[signal] for signal in active_signals]))
+    else:
+        organization_before = 0.0
+        organization_after = 0.0
+    organization_delta = float(organization_after - organization_before)
+    top_gain_signal = None
+    top_regression_signal = None
+    if signal_deltas:
+        top_gain_signal = max(signal_deltas.items(), key=lambda item: item[1])[0]
+        top_regression_signal = min(
+            signal_deltas.items(), key=lambda item: item[1])[0]
+    positive_signal_gain = sum(
+        max(0.0, delta) for delta in signal_deltas.values())
+    negative_signal_drift = sum(
+        max(0.0, -delta) for delta in signal_deltas.values())
+    return {
+        "enabled": True,
+        "active_signals": active_signals,
+        "before": {
+            key: _mm_float(before_scores.get(key), 0.0)
+            for key in MULTIMODAL_REPRESENTATION_PROGRESS_KEYS
+            if key in before_scores
+        },
+        "after": {
+            key: _mm_float(after_scores.get(key), 0.0)
+            for key in MULTIMODAL_REPRESENTATION_PROGRESS_KEYS
+            if key in after_scores
+        },
+        "delta": deltas,
+        "signal_before": signal_before,
+        "signal_after": signal_after,
+        "signal_deltas": signal_deltas,
+        "organization_score_before": float(organization_before),
+        "organization_score_after": float(organization_after),
+        "organization_score_delta": float(organization_delta),
+        "positive_signal_gain": float(positive_signal_gain),
+        "negative_signal_drift": float(negative_signal_drift),
+        "top_gain_signal": top_gain_signal,
+        "top_regression_signal": top_regression_signal,
+        "representation_insight_event": bool(
+            organization_delta > 0.0 and positive_signal_gain > 0.0),
+    }
+
+
+def multimodal_transfer_calibration_report(
+        before_bundle, after_bundle, score_min_delta=0.0,
+        insight_accept_w=0.25, insight_min_delta=0.0, gate=True):
+    """Decide whether an imported checkpoint helps the current manifest."""
+    if not isinstance(before_bundle, dict) or not isinstance(after_bundle, dict):
+        return {"enabled": False, "accepted": True, "gate_enabled": bool(gate)}
+    before_scores = before_bundle.get("score_components")
+    after_scores = after_bundle.get("score_components")
+    if not isinstance(before_scores, dict) or not isinstance(after_scores, dict):
+        return {"enabled": False, "accepted": True, "gate_enabled": bool(gate)}
+    progress = multimodal_representation_progress_report(
+        before_bundle, after_bundle)
+    score_before = _mm_float(before_scores.get("score", 0.0), 0.0)
+    score_after = _mm_float(after_scores.get("score", 0.0), 0.0)
+    score_delta = float(score_after - score_before)
+    active_signals = progress.get("active_signals")
+    insight_gate = bool(active_signals)
+    organization_delta = _mm_float(
+        progress.get("organization_score_delta", 0.0), 0.0)
+    insight_allowed = bool(not insight_gate or organization_delta >= -1.0e-9)
+    decision = concept_round_selection_decision(
+        score_delta, score_min_delta,
+        insight_delta=organization_delta,
+        insight_allowed=insight_allowed,
+        insight_gate=insight_gate,
+        insight_accept_w=insight_accept_w,
+        insight_min_delta=insight_min_delta)
+    calibration_accept = bool(decision["selected"])
+    accepted = bool(calibration_accept or not gate)
+    return {
+        "enabled": True,
+        "gate_enabled": bool(gate),
+        "accepted": accepted,
+        "calibration_accept": calibration_accept,
+        "reverted": bool(gate and not calibration_accept),
+        "score_before": float(score_before),
+        "score_after": float(score_after),
+        "score_delta": float(score_delta),
+        "score_min_delta": float(score_min_delta),
+        "selected_by_score": bool(decision["selected_by_score"]),
+        "selected_by_insight": bool(decision["selected_by_insight"]),
+        "insight_score_boost": float(decision["insight_score_boost"]),
+        "insight_effective_delta": float(decision["insight_effective_delta"]),
+        "insight_gate": bool(insight_gate),
+        "insight_allowed": bool(insight_allowed),
+        "insight_accept_w": float(insight_accept_w),
+        "insight_min_delta": float(insight_min_delta),
+        "representation_progress": progress,
+        "before_score_components": before_scores,
+        "after_score_components": after_scores,
+    }
 
 
 def _model_state_copy(model):
@@ -2128,6 +2844,92 @@ def _compact_multimodal_train_metrics(metrics):
     }
     return {key: value for key, value in dict(metrics).items()
             if key not in omitted}
+
+
+def multimodal_weight_update_snapshot(model, max_tensors=24, max_values=8):
+    rows = []
+    max_tensors = max(0, int(max_tensors))
+    max_values = max(1, int(max_values))
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if len(rows) >= max_tensors:
+                break
+            if not param.requires_grad or param.numel() <= 0:
+                continue
+            flat = param.detach().reshape(-1)
+            sample_count = min(max_values, int(flat.numel()))
+            if sample_count <= 0:
+                continue
+            if int(flat.numel()) == sample_count:
+                indices = torch.arange(sample_count, device=flat.device)
+            else:
+                indices = torch.linspace(
+                    0, int(flat.numel()) - 1, steps=sample_count,
+                    device=flat.device).round().long()
+            values = flat.index_select(0, indices).to(
+                device="cpu", dtype=torch.float32).tolist()
+            rows.append({
+                "name": str(name),
+                "shape": [int(dim) for dim in param.shape],
+                "numel": int(param.numel()),
+                "indices": [int(idx) for idx in indices.cpu().tolist()],
+                "values": [float(value) for value in values],
+            })
+    return {"sampled_tensors": rows}
+
+
+def multimodal_weight_update_report(before_snapshot, after_snapshot, atol=1e-12):
+    before_rows = {
+        str(row.get("name", "")): row
+        for row in (before_snapshot or {}).get("sampled_tensors", ())
+        if isinstance(row, dict)
+    }
+    changed = []
+    sampled_tensor_count = 0
+    sampled_value_count = 0
+    changed_tensor_count = 0
+    changed_value_count = 0
+    max_abs_delta = 0.0
+    for after_row in (after_snapshot or {}).get("sampled_tensors", ()):
+        if not isinstance(after_row, dict):
+            continue
+        name = str(after_row.get("name", ""))
+        before_row = before_rows.get(name)
+        if not isinstance(before_row, dict):
+            continue
+        before_values = before_row.get("values", ())
+        after_values = after_row.get("values", ())
+        value_deltas = [
+            abs(float(after) - float(before))
+            for before, after in zip(before_values, after_values)
+        ]
+        if not value_deltas:
+            continue
+        sampled_tensor_count += 1
+        sampled_value_count += len(value_deltas)
+        tensor_changed_values = sum(1 for delta in value_deltas if delta > atol)
+        tensor_max_delta = max(value_deltas)
+        max_abs_delta = max(max_abs_delta, tensor_max_delta)
+        if tensor_changed_values:
+            changed_tensor_count += 1
+            changed_value_count += tensor_changed_values
+            changed.append({
+                "name": name,
+                "changed_values": int(tensor_changed_values),
+                "sampled_values": int(len(value_deltas)),
+                "max_abs_delta": float(tensor_max_delta),
+            })
+    changed.sort(key=lambda row: row["max_abs_delta"], reverse=True)
+    return {
+        "enabled": True,
+        "sampled_tensor_count": int(sampled_tensor_count),
+        "sampled_value_count": int(sampled_value_count),
+        "changed": bool(changed_value_count > 0),
+        "changed_tensor_count": int(changed_tensor_count),
+        "changed_value_count": int(changed_value_count),
+        "max_abs_delta": float(max_abs_delta),
+        "top_changed_tensors": changed[:8],
+    }
 
 
 def _multimodal_sequence_surprise_rows(
@@ -2587,7 +3389,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           trunk_width=128, trunk_depth=1, text_layers=1,
           text_arch="transformer", modality_dropout=0.0, decode_w=1.0,
           agreement_w=0.0,
-          text_checkpoint=None, concept_tokens=4, fusion_layers=1,
+          text_checkpoint=None, multimodal_checkpoint=None,
+          concept_tokens=4, fusion_layers=1,
           latent_concept_slots=0, latent_concept_layers=1,
           latent_concept_prefix=False, latent_concept_w=0.0,
           latent_concept_view_dropout=0.1,
@@ -2676,7 +3479,13 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           latent_concept_cluster_temperature=0.1,
           latent_concept_cluster_margin=0.0,
           latent_concept_cluster_min_size=2,
-          self_teach_w=0.0,
+          representation_probe_n=0,
+          text_transfer_probe_n=DEFAULT_TEXT_TRANSFER_PROBE_N,
+          text_transfer_score_min_delta=DEFAULT_TEXT_TRANSFER_SCORE_MIN_DELTA,
+          text_transfer_insight_accept_w=DEFAULT_TEXT_TRANSFER_INSIGHT_ACCEPT_W,
+          text_transfer_insight_min_delta=0.0,
+          text_transfer_gate=True,
+          self_teach_w=0.0, self_teach_history_prior_w=0.5,
           select_best=False, selection_rounds=1,
           selection_score_metric="mastery",
           selection_score_margin_w=0.1,
@@ -2691,6 +3500,9 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         if ckpt_latents.get("latent_concept_slots", 0) > 0:
             latent_concept_slots = ckpt_latents["latent_concept_slots"]
             latent_concept_layers = ckpt_latents["latent_concept_layers"]
+    if (text_checkpoint and latent_concept_topk <= 0
+            and ckpt_latents.get("latent_concept_topk", 0) > 0):
+        latent_concept_topk = ckpt_latents["latent_concept_topk"]
     if (text_checkpoint and latent_concept_memory_size <= 0
             and ckpt_latents.get("latent_concept_memory_size", 0) > 0):
         latent_concept_memory_size = ckpt_latents["latent_concept_memory_size"]
@@ -2708,9 +3520,29 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_concept_transition_w, latent_concept_cluster_w)
     if float(decode_w) < 0.0:
         raise ValueError("decoder loss weight must be non-negative")
+    representation_probe_n = int(representation_probe_n)
+    if representation_probe_n < 0:
+        raise ValueError(
+            "multimodal representation probe count must be non-negative")
+    text_transfer_probe_n = int(text_transfer_probe_n)
+    if text_transfer_probe_n < 0:
+        raise ValueError("text transfer probe count must be non-negative")
+    text_transfer_score_min_delta = float(text_transfer_score_min_delta)
+    if text_transfer_score_min_delta < 0.0:
+        raise ValueError("text transfer score min delta must be non-negative")
+    text_transfer_insight_accept_w = float(text_transfer_insight_accept_w)
+    if text_transfer_insight_accept_w < 0.0:
+        raise ValueError("text transfer insight accept weight must be non-negative")
+    text_transfer_insight_min_delta = float(text_transfer_insight_min_delta)
+    if text_transfer_insight_min_delta < 0.0:
+        raise ValueError("text transfer insight min delta must be non-negative")
     self_teach_w = float(self_teach_w)
     if self_teach_w < 0.0:
         raise ValueError("multimodal self-teach weight must be non-negative")
+    self_teach_history_prior_w = float(self_teach_history_prior_w)
+    if self_teach_history_prior_w < 0.0:
+        raise ValueError(
+            "multimodal self-teach history prior weight must be non-negative")
     if any(float(w) < 0.0 for w in latent_weights):
         raise ValueError("latent concept loss weights must be non-negative")
     if int(latent_concept_fer_probe_n) < 0:
@@ -2833,10 +3665,95 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         latent_concept_prefix=latent_concept_prefix,
         latent_concept_memory_size=latent_concept_memory_size,
         latent_concept_topk=latent_concept_topk).to(device)
+    text_transfer_pre_state = None
+    text_transfer_before_bundle = None
+    if text_checkpoint and text_transfer_probe_n > 0:
+        text_transfer_pre_state = _model_state_copy(model)
+        text_transfer_before_bundle = multimodal_eval_bundle(
+            model, eval_records, vocab, view_dims, n=text_transfer_probe_n,
+            seed=seed + 149, device=device,
+            score_metric=selection_score_metric,
+            score_margin_w=selection_score_margin_w)
     if text_checkpoint:
-        import_text_checkpoint(model, vocab, text_checkpoint, device=device)
+        text_import_report = import_text_checkpoint(
+            model, vocab, text_checkpoint, device=device)
+        if text_transfer_before_bundle is not None:
+            text_transfer_after_bundle = multimodal_eval_bundle(
+                model, eval_records, vocab, view_dims, n=text_transfer_probe_n,
+                seed=seed + 149, device=device,
+                score_metric=selection_score_metric,
+                score_margin_w=selection_score_margin_w)
+            calibration = multimodal_transfer_calibration_report(
+                text_transfer_before_bundle, text_transfer_after_bundle,
+                score_min_delta=text_transfer_score_min_delta,
+                insight_accept_w=text_transfer_insight_accept_w,
+                insight_min_delta=text_transfer_insight_min_delta,
+                gate=text_transfer_gate)
+            text_import_report["target_calibration"] = calibration
+            text_import_report["accepted"] = bool(calibration["accepted"])
+            text_import_report["reverted"] = bool(calibration["reverted"])
+            text_import_report["target_probe_n"] = int(text_transfer_probe_n)
+            if calibration["reverted"] and text_transfer_pre_state is not None:
+                model.load_state_dict(text_transfer_pre_state, strict=False)
+        else:
+            text_import_report["accepted"] = True
+            text_import_report["reverted"] = False
+            text_import_report["target_probe_n"] = 0
+            text_import_report["target_calibration"] = {
+                "enabled": False,
+                "accepted": True,
+                "gate_enabled": bool(text_transfer_gate),
+            }
+        model.text_checkpoint_transfer = text_import_report
     else:
         model.text_checkpoint_transfer = {}
+    if multimodal_checkpoint:
+        import_multimodal_checkpoint(
+            model, vocab, multimodal_checkpoint, device=device)
+    else:
+        model.multimodal_checkpoint_transfer = {}
+    text_checkpoint_history_prior = {"enabled": False, "entry_count": 0,
+                                     "signal_deficits": {}}
+    text_checkpoint_history_prior_raw = {"enabled": False, "entry_count": 0,
+                                         "signal_deficits": {}}
+    if text_checkpoint:
+        text_checkpoint_history_prior_raw = multimodal_text_history_self_teach_prior(
+            load_text_checkpoint_payload(text_checkpoint, device="cpu"),
+            enabled=self_teach_w > 0.0)
+        text_transfer_accepted = bool(
+            getattr(model, "text_checkpoint_transfer", {}).get("accepted", True))
+        if text_transfer_accepted:
+            text_checkpoint_history_prior = text_checkpoint_history_prior_raw
+        else:
+            text_checkpoint_history_prior = (
+                {
+                    "enabled": False,
+                    "entry_count": int(
+                        text_checkpoint_history_prior_raw.get("entry_count", 0) or 0),
+                    "signal_deficits": {},
+                    "top_signal": None,
+                    "concept_connection_signal": 0.0,
+                    "disabled_reason": "text_transfer_rejected_by_target_probe",
+                    "transfer_accepted": False,
+                    "raw_enabled": bool(
+                        text_checkpoint_history_prior_raw.get("enabled", False)),
+                    "raw_signal_deficits": (
+                        text_checkpoint_history_prior_raw.get(
+                            "signal_deficits", {})),
+                    "raw_top_signal": text_checkpoint_history_prior_raw.get(
+                        "top_signal"),
+                })
+    multimodal_checkpoint_history_prior = {
+        "enabled": False, "entry_count": 0, "signal_deficits": {}}
+    if multimodal_checkpoint:
+        multimodal_checkpoint_history_prior = (
+            multimodal_checkpoint_representation_self_teach_prior(
+                load_multimodal_checkpoint_payload(
+                    multimodal_checkpoint, device="cpu"),
+                enabled=self_teach_w > 0.0))
+    self_teach_history_prior = merge_multimodal_self_teach_priors(
+        text_checkpoint_history_prior, multimodal_checkpoint_history_prior)
+    weight_update_before = multimodal_weight_update_snapshot(model)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     study_pool = []
     study_reports = []
@@ -2896,7 +3813,10 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     def update_self_teach_weights(score_components=None, round_id=1):
         nonlocal self_teach_plan, self_teach_effective_weights
         plan, _base, effective = multimodal_self_teach_weight_maps(
-            score_components, budget=self_teach_w, **self_teach_base_weights)
+            score_components, budget=self_teach_w,
+            history_prior=self_teach_history_prior,
+            history_prior_w=self_teach_history_prior_w,
+            **self_teach_base_weights)
         self_teach_plan = plan
         self_teach_effective_weights = effective
         set_objective_weights(effective)
@@ -2933,11 +3853,25 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         }
 
     before_bundle = None
+    representation_before_bundle = None
+    representation_progress_probe_n = 0
+    representation_progress_seed = seed
     if select_best or self_teach_w > 0.0:
         before_bundle = multimodal_eval_bundle(
             model, eval_records, vocab, view_dims, n=selection_eval_n,
             seed=seed, device=device, score_metric=selection_score_metric,
             score_margin_w=selection_score_margin_w)
+        representation_before_bundle = before_bundle
+        representation_progress_probe_n = int(selection_eval_n)
+        representation_progress_seed = seed
+    if representation_probe_n > 0:
+        representation_before_bundle = multimodal_eval_bundle(
+            model, eval_records, vocab, view_dims, n=representation_probe_n,
+            seed=seed + 211, device=device,
+            score_metric=selection_score_metric,
+            score_margin_w=selection_score_margin_w)
+        representation_progress_probe_n = int(representation_probe_n)
+        representation_progress_seed = seed + 211
     if self_teach_w > 0.0:
         update_self_teach_weights(
             before_bundle["score_components"], round_id=1)
@@ -3360,6 +4294,11 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "token_loss": float(base_loss.detach()),
             "agreement_loss": float(agreement.detach()),
             "self_teach_w": float(self_teach_w),
+            "self_teach_history_prior_w": float(self_teach_history_prior_w),
+            "text_checkpoint_history_prior": text_checkpoint_history_prior,
+            "multimodal_checkpoint_history_prior": (
+                multimodal_checkpoint_history_prior),
+            "self_teach_history_prior": self_teach_history_prior,
             "self_teach_plan": self_teach_plan,
             "self_teach_base_weights": dict(self_teach_base_weights),
             "self_teach_effective_weights": dict(self_teach_effective_weights),
@@ -3576,6 +4515,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 seed=seed, device=device, score_metric=selection_score_metric,
                 score_margin_w=selection_score_margin_w)
             row = selection_row(round_id, round_steps, bundle)
+            round_weight_update = multimodal_weight_update_report(
+                weight_update_before, multimodal_weight_update_snapshot(model))
             score_delta_from_best = float(row["score"] - best_score)
             bridge_insight_gate = bool(
                 latent_concept_bridge_w and latent_concept_memory_size > 0)
@@ -3606,6 +4547,14 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                 "self_teach_plan": self_teach_plan,
                 "self_teach_effective_weights": dict(
                     self_teach_effective_weights),
+                "weight_update": round_weight_update,
+                "weight_update_changed": bool(round_weight_update["changed"]),
+                "weight_update_changed_tensor_count": int(
+                    round_weight_update["changed_tensor_count"]),
+                "weight_update_changed_value_count": int(
+                    round_weight_update["changed_value_count"]),
+                "weight_update_max_abs_delta": float(
+                    round_weight_update["max_abs_delta"]),
                 "train_metrics": _compact_multimodal_train_metrics(last),
             }
             rounds_report.append(row)
@@ -3655,6 +4604,10 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "selected_score": float(best_score),
             "before_score": float(rounds_report[0]["score"]),
             "selected_score_delta": float(best_score - rounds_report[0]["score"]),
+            "attempted_weight_update_count": int(
+                sum(1 for row in rounds_report
+                    if int(row.get("round", 0)) > 0
+                    and bool(row.get("weight_update_changed", False)))),
             "rounds": rounds_report,
         }
         selected_rows = [row for row in rounds_report if row["round"] == best_round]
@@ -3682,6 +4635,11 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         best_metrics = best_metrics | {
             "selection": selection,
             "self_teach_w": float(self_teach_w),
+            "self_teach_history_prior_w": float(self_teach_history_prior_w),
+            "text_checkpoint_history_prior": text_checkpoint_history_prior,
+            "multimodal_checkpoint_history_prior": (
+                multimodal_checkpoint_history_prior),
+            "self_teach_history_prior": self_teach_history_prior,
             "self_teach_plan": selected_self_teach_plan,
             "self_teach_base_weights": dict(self_teach_base_weights),
             "self_teach_effective_weights": dict(
@@ -3714,6 +4672,10 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         selection = {
             "enabled": False,
             "self_teach_w": float(self_teach_w),
+            "text_checkpoint_history_prior": text_checkpoint_history_prior,
+            "multimodal_checkpoint_history_prior": (
+                multimodal_checkpoint_history_prior),
+            "self_teach_history_prior": self_teach_history_prior,
             "self_teach_reports": list(self_teach_reports),
             "self_teach_plan": self_teach_plan,
         }
@@ -3721,11 +4683,58 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         if self_teach_plan is not None:
             last = last | {
                 "self_teach_w": float(self_teach_w),
+                "self_teach_history_prior_w": float(self_teach_history_prior_w),
+                "text_checkpoint_history_prior": text_checkpoint_history_prior,
+                "multimodal_checkpoint_history_prior": (
+                    multimodal_checkpoint_history_prior),
+                "self_teach_history_prior": self_teach_history_prior,
                 "self_teach_plan": self_teach_plan,
                 "self_teach_base_weights": dict(self_teach_base_weights),
                 "self_teach_effective_weights": dict(self_teach_effective_weights),
                 "self_teach_reports": list(self_teach_reports),
             }
+    last = dict(last) | {
+        "self_teach_history_prior_w": float(self_teach_history_prior_w),
+        "text_checkpoint_history_prior": text_checkpoint_history_prior,
+        "text_checkpoint_history_prior_raw": text_checkpoint_history_prior_raw,
+        "multimodal_checkpoint_history_prior": (
+            multimodal_checkpoint_history_prior),
+        "self_teach_history_prior": self_teach_history_prior,
+        "text_checkpoint_transfer": getattr(model, "text_checkpoint_transfer", {}),
+        "multimodal_checkpoint_transfer": getattr(
+            model, "multimodal_checkpoint_transfer", {}),
+    }
+    weight_update = multimodal_weight_update_report(
+        weight_update_before, multimodal_weight_update_snapshot(model))
+    representation_progress = {"enabled": False}
+    if representation_before_bundle is not None:
+        representation_after_bundle = multimodal_eval_bundle(
+            model, eval_records, vocab, view_dims,
+            n=representation_progress_probe_n, seed=representation_progress_seed,
+            device=device, score_metric=selection_score_metric,
+            score_margin_w=selection_score_margin_w)
+        representation_progress = multimodal_representation_progress_report(
+            representation_before_bundle, representation_after_bundle)
+    attempted_weight_update_count = 0
+    if select_best:
+        attempted_weight_update_count = sum(
+            1 for row in rounds_report
+            if int(row.get("round", 0)) > 0
+            and bool(row.get("weight_update_changed", False)))
+    elif int(steps) > 0 and bool(weight_update["changed"]):
+        attempted_weight_update_count = 1
+    last = dict(last) | {
+        "weight_update": weight_update,
+        "weight_update_changed": bool(weight_update["changed"]),
+        "weight_update_changed_tensor_count": int(
+            weight_update["changed_tensor_count"]),
+        "weight_update_changed_value_count": int(
+            weight_update["changed_value_count"]),
+        "weight_update_max_abs_delta": float(weight_update["max_abs_delta"]),
+        "attempted_weight_update_count": int(attempted_weight_update_count),
+        "representation_probe_n": int(representation_progress_probe_n),
+        "representation_progress": representation_progress,
+    }
     model.train_metrics = last
     model.latent_fer_study_reports = (
         last.get("latent_fer_study_reports", []))
@@ -3804,6 +4813,8 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         "manifest": model.manifest_info,
         "architecture": architecture,
         "train_metrics": getattr(model, "train_metrics", {}),
+        "representation_progress": getattr(model, "train_metrics", {}).get(
+            "representation_progress", {"enabled": False}),
         "selection": getattr(model, "train_metrics", {}).get(
             "selection", {"enabled": False}),
         "teacher_forced": metrics,
@@ -3815,6 +4826,8 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         "latent_bridge_probe": latent_bridge_probe,
         "latent_sequence_probe": latent_sequence_probe,
         "text_checkpoint_transfer": getattr(model, "text_checkpoint_transfer", {}),
+        "multimodal_checkpoint_transfer": getattr(
+            model, "multimodal_checkpoint_transfer", {}),
         "gate": metrics["full"]["token_acc"] >= 0.50,
     }
     if checkpoint:
@@ -3869,11 +4882,16 @@ def selftest():
             heads=4, pad=vocab.pad, view_tokens=2, txt_tokens=4,
             concept_tokens=2, latent_concept_slots=3,
             latent_concept_memory_size=8).to("cpu")
-        from .text import TextReadingLM, checkpoint_payload as text_checkpoint_payload
+        from .text import (
+            TextReadingLM,
+            checkpoint_payload as text_checkpoint_payload,
+            reading_mastery_history_with_entry,
+        )
         text_ckpt = os.path.join(tmpdir, "text_reading.pt")
         text_model = TextReadingLM(
             len(vocab), d=32, layers=1, heads=4, pad=vocab.pad,
-            latent_concept_slots=3, latent_concept_memory_size=8).to("cpu")
+            latent_concept_slots=3, latent_concept_topk=2,
+            latent_concept_memory_size=8).to("cpu")
         with torch.no_grad():
             sample_idx = vocab.stoi["sample"]
             text_model.txt.emb.weight[sample_idx].fill_(0.125)
@@ -3885,9 +4903,105 @@ def selftest():
             text_model.latent_concept_memory.filled.fill_(1)
             for param in text_model.reading_predictor.parameters():
                 param.fill_(0.03125)
+        text_report = {
+            "experiment": "text-raw-reading-selftest",
+            "latent_concept_topk": 2,
+            "reading_replay_bank": {
+                "record_count": 3,
+                "priority_record_count": 2,
+            },
+            "before_score_components": {
+                "mastery_score": 0.2,
+                "signal_coverage": 0.3,
+            },
+            "after_score_components": {
+                "mastery_score": 0.4,
+                "signal_coverage": 0.5,
+                "balanced_score": 0.45,
+                "floor_score": 0.35,
+                "fer_score": 0.9,
+                "bridge_score": 0.8,
+                "bridge_connectivity": 0.75,
+                "sequence_score": 0.0,
+                "fer_skipped": False,
+                "bridge_skipped": False,
+                "sequence_skipped": False,
+            },
+            "selection": {
+                "enabled": True,
+                "accepted_update": True,
+                "selected_round": 1,
+                "selected_by_insight": True,
+                "selected_score_delta": 0.02,
+                "attempted_weight_update_count": 1,
+                "rounds": [{
+                    "round": 1,
+                    "selected": True,
+                    "concept_insight_delta": 0.8,
+                    "selected_by_insight": True,
+                    "weight_update_changed": True,
+                    "weight_update_changed_tensor_count": 5,
+                    "weight_update_changed_value_count": 7,
+                    "weight_update_max_abs_delta": 0.02,
+                }],
+                "self_teach_reports": [{
+                    "enabled": True,
+                    "top_signal": "sequence",
+                    "active_signals": ["sequence"],
+                    "history_prior_enabled": False,
+                    "history_prior_entry_count": 0,
+                    "history_prior_top_signal": "",
+                }],
+            },
+            "representation_progress": {
+                "enabled": True,
+                "active_signals": ["fer", "bridge", "sequence"],
+                "signal_after": {"fer": 0.9, "bridge": 0.8, "sequence": 0.0},
+                "signal_deltas": {"fer": 0.1, "bridge": 0.2, "sequence": -0.3},
+                "organization_score_before": 0.25,
+                "organization_score_after": 0.55,
+                "organization_score_delta": 0.3,
+                "positive_signal_gain": 0.3,
+                "negative_signal_drift": 0.3,
+                "top_gain_signal": "bridge",
+                "top_regression_signal": "sequence",
+                "representation_insight_event": True,
+            },
+        }
+        text_report["reading_mastery_history"] = (
+            reading_mastery_history_with_entry([], text_report))
+        text_report["reading_mastery_history_count"] = (
+            text_report["reading_mastery_history"]["entry_count"])
         torch.save(text_checkpoint_payload(
-            text_model, vocab, 32, 1, 4,
-            {"experiment": "text-raw-reading-selftest"}), text_ckpt)
+            text_model, vocab, 32, 1, 4, text_report), text_ckpt)
+        text_ckpt_payload = load_text_checkpoint_payload(text_ckpt, device="cpu")
+        text_latent_config = text_checkpoint_latent_config(text_ckpt, device="cpu")
+        assert text_latent_config["latent_concept_topk"] == 2
+        text_history = text_checkpoint_reading_history(text_ckpt_payload)
+        assert text_history["entry_count"] == 1
+        text_history_prior = multimodal_text_history_self_teach_prior(
+            text_ckpt_payload, enabled=True)
+        assert text_history_prior["enabled"] is True
+        assert text_history_prior["entry_count"] == 1
+        assert text_history_prior["top_signal"] == "sequence"
+        assert text_history_prior["signal_deficits"]["sequence"] > 0.0
+        assert text_history_prior["concept_connection_signal"] > 0.0
+        assert text_history_prior["signal_deficits"]["bridge"] > 0.0
+        assert text_history_prior[
+            "reading_representation_summary"]["enabled"] is True
+        assert text_history_prior[
+            "reading_representation_summary"]["top_gain_signal"] == "bridge"
+        concept_prior = text_checkpoint_concept_insight_prior(
+            text_ckpt_payload, enabled=True)
+        assert concept_prior["concept_connection_signal"] > 0.0
+        assert concept_prior["selected_by_insight_count"] == 1
+        assert concept_prior["accepted_update_count"] == 1
+        weight_update = text_checkpoint_weight_update_summary(text_ckpt_payload)
+        assert weight_update["changed"] is True
+        assert weight_update["changed_tensor_count"] == 5
+        assert weight_update["changed_value_count"] == 7
+        assert weight_update["max_abs_delta"] == 0.02
+        assert weight_update["attempted_weight_update_count"] == 1
         transfer_model = MultimodalLM(
             len(vocab), view_dims=view_dims, d=32, layers=1,
             heads=4, pad=vocab.pad, view_tokens=2, txt_tokens=4,
@@ -3897,6 +5011,31 @@ def selftest():
             transfer_model, vocab, text_ckpt, device="cpu")
         assert transfer_report["copied"] is True
         assert transfer_report["checkpoint_experiment"] == "text-raw-reading-selftest"
+        assert transfer_report["source_latent_concept_topk"] == 2
+        assert transfer_report["source_reading_mastery_history_count"] == 1
+        assert (transfer_report["source_reading_mastery_latest_self_teach_signal"]
+                == "sequence")
+        assert transfer_report["source_reading_concept_connection_signal"] > 0.0
+        assert transfer_report["source_reading_concept_insight_max_delta"] == 0.8
+        assert transfer_report["source_reading_concept_insight_selected_count"] == 1
+        assert transfer_report["source_reading_concept_insight_accepted_count"] == 1
+        assert transfer_report["source_reading_weight_update_changed"] is True
+        assert transfer_report[
+            "source_reading_weight_update_changed_tensor_count"] == 5
+        assert transfer_report[
+            "source_reading_weight_update_changed_value_count"] == 7
+        assert transfer_report[
+            "source_reading_weight_update_max_abs_delta"] == 0.02
+        assert transfer_report[
+            "source_reading_attempted_weight_update_count"] == 1
+        assert transfer_report[
+            "source_reading_representation_progress_enabled"] is True
+        assert transfer_report[
+            "source_reading_representation_top_gain_signal"] == "bridge"
+        assert transfer_report[
+            "source_reading_representation_insight_event_count"] == 1
+        assert transfer_report["source_reading_replay_bank_records"] == 3
+        assert transfer_report["source_reading_replay_priority_records"] == 2
         assert transfer_report["copied_token_embeddings"] > 0
         assert transfer_report["copied_latent_tensor_count"] > 0
         assert transfer_report["copied_sequence_tensor_count"] > 0
@@ -4010,6 +5149,45 @@ def selftest():
         assert self_teach_plan["weight_extras"]["latent_concept_sequence_w"] > 0.0
         assert math.isclose(sum(self_teach_plan["weight_extras"].values()),
                             0.12, rel_tol=1e-6, abs_tol=1e-6)
+        history_scores = dict(synthetic_scores)
+        history_scores["mode_floor_score"] = 1.0
+        history_scores["bridge_score"] = 1.0
+        history_scores["sequence_score"] = 1.0
+        history_self_teach_plan = multimodal_self_teach_weight_plan(
+            history_scores, budget=0.08,
+            history_prior={
+                "enabled": True,
+                "entry_count": 1,
+                "top_signal": "sequence",
+                "signal_deficits": {"sequence": 1.0},
+            },
+            history_prior_w=1.0)
+        assert history_self_teach_plan["top_signal"] == "sequence"
+        assert history_self_teach_plan["history_prior_enabled"] is True
+        assert history_self_teach_plan["history_prior_entry_count"] == 1
+        assert (history_self_teach_plan["weight_extras"][
+            "latent_concept_sequence_w"] > 0.0)
+        assert math.isclose(
+            sum(history_self_teach_plan["weight_extras"].values()),
+            0.08, rel_tol=1e-6, abs_tol=1e-6)
+        concept_history_plan = multimodal_self_teach_weight_plan(
+            history_scores, budget=0.07,
+            history_prior={
+                "enabled": True,
+                "entry_count": 1,
+                "top_signal": "bridge",
+                "signal_deficits": {},
+                "concept_connection_signal": 0.9,
+            },
+            history_prior_w=1.0)
+        assert concept_history_plan["top_signal"] == "bridge"
+        assert (concept_history_plan["history_concept_connection_signal"]
+                == 0.9)
+        assert concept_history_plan["weight_extras"]["latent_concept_bridge_w"] > 0.0
+        assert concept_history_plan["weight_extras"]["latent_concept_discovery_w"] > 0.0
+        assert math.isclose(
+            sum(concept_history_plan["weight_extras"].values()),
+            0.07, rel_tol=1e-6, abs_tol=1e-6)
         positive_insight = multimodal_bridge_selection_insight(
             {"skipped": False, "bridge_score": 0.8, "bridge_connectivity": 0.2},
             {"skipped": False, "bridge_score": 0.4, "bridge_connectivity": 0.5})
@@ -4029,6 +5207,51 @@ def selftest():
             insight_allowed=negative_insight["bridge_insight_allowed"],
             insight_gate=True, insight_accept_w=1.0)
         assert negative_decision["selected"] is False
+        positive_transfer = multimodal_transfer_calibration_report(
+            {"score_components": {
+                "score": 0.50,
+                "fer_score": 0.2,
+                "bridge_score": 0.2,
+                "sequence_score": 0.2,
+                "fer_skipped": False,
+                "bridge_skipped": False,
+                "sequence_skipped": False,
+            }},
+            {"score_components": {
+                "score": 0.49,
+                "fer_score": 0.5,
+                "bridge_score": 0.5,
+                "sequence_score": 0.5,
+                "fer_skipped": False,
+                "bridge_skipped": False,
+                "sequence_skipped": False,
+            }},
+            insight_accept_w=1.0)
+        assert positive_transfer["accepted"] is True
+        assert positive_transfer["selected_by_insight"] is True
+        negative_transfer = multimodal_transfer_calibration_report(
+            {"score_components": {
+                "score": 0.50,
+                "fer_score": 0.7,
+                "bridge_score": 0.7,
+                "sequence_score": 0.7,
+                "fer_skipped": False,
+                "bridge_skipped": False,
+                "sequence_skipped": False,
+            }},
+            {"score_components": {
+                "score": 0.70,
+                "fer_score": 0.1,
+                "bridge_score": 0.1,
+                "sequence_score": 0.1,
+                "fer_skipped": False,
+                "bridge_skipped": False,
+                "sequence_skipped": False,
+            }},
+            insight_accept_w=1.0)
+        assert negative_transfer["accepted"] is False
+        assert negative_transfer["reverted"] is True
+        assert negative_transfer["insight_allowed"] is False
         graph_selected, graph_report = latent_multimodal_graph_prediction_examples(
             model, records, vocab, view_dims, n=4, device="cpu")
         assert graph_selected and graph_report["skipped"] is False
@@ -4086,7 +5309,8 @@ def selftest():
             latent_concept_sequence_batch=2,
             latent_concept_neighborhood_w=0.01,
             latent_concept_transition_w=0.01,
-            latent_concept_cluster_w=0.01)
+            latent_concept_cluster_w=0.01,
+            representation_probe_n=4)
         assert trained_model.train_metrics["latent_graph_transition_updates"] > 0
         assert trained_model.train_metrics["latent_fer_w"] == 0.01
         assert math.isfinite(trained_model.train_metrics["latent_fer_score"])
@@ -4124,13 +5348,89 @@ def selftest():
         assert math.isfinite(trained_model.train_metrics["latent_sequence_loss"])
         assert (trained_model.train_metrics[
             "latent_sequence_transition_last_batch_updates"] > 0)
+        assert trained_model.train_metrics["weight_update_changed"] is True
+        assert (trained_model.train_metrics[
+            "weight_update_changed_tensor_count"] > 0)
+        assert (trained_model.train_metrics[
+            "weight_update_changed_value_count"] > 0)
+        assert trained_model.train_metrics["weight_update_max_abs_delta"] > 0.0
+        rep_progress = trained_model.train_metrics["representation_progress"]
+        assert rep_progress["enabled"] is True
+        assert trained_model.train_metrics["representation_probe_n"] == 4
+        assert "fer" in rep_progress["active_signals"]
+        assert "bridge" in rep_progress["active_signals"]
+        assert "sequence" in rep_progress["active_signals"]
+        assert math.isfinite(rep_progress["organization_score_before"])
+        assert math.isfinite(rep_progress["organization_score_after"])
+        assert math.isfinite(rep_progress["organization_score_delta"])
+        assert isinstance(rep_progress["representation_insight_event"], bool)
+        mm_ckpt = os.path.join(tmpdir, "multimodal_continue.pt")
+        torch.save({
+            "state_dict": trained_model.state_dict(),
+            "vocab": vocab.itos,
+            "d": trained_model.lm.tok.embedding_dim,
+            "model_config": trained_model.config,
+            "manifest": trained_model.manifest_info,
+            "report": {
+                "experiment": "multimodal-selftest",
+                "train_metrics": trained_model.train_metrics,
+                "representation_progress": rep_progress,
+            },
+        }, mm_ckpt)
+        mm_payload = load_multimodal_checkpoint_payload(mm_ckpt, device="cpu")
+        mm_prior = multimodal_checkpoint_representation_self_teach_prior(
+            mm_payload, enabled=True)
+        assert mm_prior["enabled"] is True
+        assert mm_prior["entry_count"] == 1
+        assert mm_prior["signal_deficits"]
+        fresh_model = MultimodalLM(
+            len(vocab), view_dims=view_dims, d=32, layers=1,
+            heads=4, pad=vocab.pad, view_tokens=2, txt_tokens=4,
+            concept_tokens=2, latent_concept_slots=3,
+            latent_concept_memory_size=8).to("cpu")
+        mm_transfer = import_multimodal_checkpoint(
+            fresh_model, vocab, mm_ckpt, device="cpu")
+        assert mm_transfer["copied"] is True
+        assert mm_transfer["checkpoint_experiment"] == "multimodal-selftest"
+        assert mm_transfer["source_representation_prior"]["enabled"] is True
+        assert mm_transfer["copied_token_embeddings"] > 0
+        assert mm_transfer["copied_exact_tensor_count"] > 0
+        assert torch.allclose(
+            fresh_model.lm.tok.weight[sample_idx],
+            trained_model.lm.tok.weight[sample_idx])
         self_teach_model, *_ = train(
             manifest, steps=1, batch=2, d=32, layers=1, heads=4, device="cpu",
             log_every=10, view_tokens=2, txt_tokens=4,
             concept_tokens=2, latent_concept_slots=3,
-            latent_concept_memory_size=8, self_teach_w=0.05)
+            latent_concept_memory_size=8, text_checkpoint=text_ckpt,
+            self_teach_w=0.05, self_teach_history_prior_w=1.0,
+            text_transfer_probe_n=0)
+        assert self_teach_model.latent_concept_topk == 2
         assert self_teach_model.train_metrics["self_teach_w"] == 0.05
+        assert self_teach_model.train_metrics[
+            "self_teach_history_prior_w"] == 1.0
+        assert self_teach_model.train_metrics[
+            "text_checkpoint_history_prior"]["enabled"] is True
+        assert self_teach_model.train_metrics[
+            "text_checkpoint_history_prior"]["entry_count"] == 1
         assert self_teach_model.train_metrics["self_teach_plan"]["enabled"] is True
+        assert self_teach_model.train_metrics["self_teach_plan"][
+            "history_prior_enabled"] is True
+        assert self_teach_model.train_metrics["self_teach_plan"][
+            "history_prior_entry_count"] == 1
+        assert self_teach_model.train_metrics["self_teach_plan"][
+            "history_signal_deficits"]["sequence"] > 0.0
+        assert self_teach_model.train_metrics["self_teach_plan"][
+            "history_concept_connection_signal"] > 0.0
+        assert (self_teach_model.train_metrics["self_teach_plan"][
+            "weight_extras"]["latent_concept_sequence_w"] > 0.0)
+        assert self_teach_model.text_checkpoint_transfer[
+            "source_reading_mastery_history_count"] == 1
+        assert self_teach_model.text_checkpoint_transfer[
+            "source_reading_concept_connection_signal"] > 0.0
+        assert self_teach_model.text_checkpoint_transfer[
+            "source_reading_weight_update_changed"] is True
+        assert self_teach_model.train_metrics["weight_update_changed"] is True
         assert self_teach_model.train_metrics["selection"]["enabled"] is False
         assert self_teach_model.train_metrics["selection"]["self_teach_reports"]
         self_teach_extra_sum = sum(
@@ -4144,6 +5444,42 @@ def selftest():
         assert math.isclose(
             self_teach_delta, self_teach_extra_sum,
             rel_tol=1e-6, abs_tol=1e-6)
+        calibrated_transfer_model, *_ = train(
+            manifest, steps=1, batch=2, d=32, layers=1, heads=4, device="cpu",
+            log_every=10, view_tokens=2, txt_tokens=4,
+            concept_tokens=2, latent_concept_slots=3,
+            latent_concept_memory_size=8, text_checkpoint=text_ckpt,
+            self_teach_w=0.05, self_teach_history_prior_w=1.0,
+            text_transfer_probe_n=4, text_transfer_insight_accept_w=1.0)
+        calibrated_report = calibrated_transfer_model.text_checkpoint_transfer
+        assert calibrated_report["target_calibration"]["enabled"] is True
+        assert "score_delta" in calibrated_report["target_calibration"]
+        if calibrated_report["target_calibration"]["accepted"]:
+            assert calibrated_transfer_model.train_metrics[
+                "text_checkpoint_history_prior"]["enabled"] is True
+        else:
+            assert calibrated_transfer_model.train_metrics[
+                "text_checkpoint_history_prior"]["enabled"] is False
+            assert calibrated_transfer_model.train_metrics[
+                "text_checkpoint_history_prior"]["disabled_reason"] == (
+                    "text_transfer_rejected_by_target_probe")
+        continued_model, *_ = train(
+            manifest, steps=1, batch=2, d=32, layers=1, heads=4, device="cpu",
+            log_every=10, view_tokens=2, txt_tokens=4,
+            concept_tokens=2, latent_concept_slots=3,
+            latent_concept_memory_size=8, multimodal_checkpoint=mm_ckpt,
+            self_teach_w=0.05, self_teach_history_prior_w=1.0,
+            representation_probe_n=4)
+        assert continued_model.multimodal_checkpoint_transfer["copied"] is True
+        assert (continued_model.train_metrics[
+            "multimodal_checkpoint_history_prior"]["enabled"] is True)
+        assert continued_model.train_metrics[
+            "self_teach_history_prior"]["enabled"] is True
+        assert continued_model.train_metrics["self_teach_plan"][
+            "history_prior_enabled"] is True
+        assert continued_model.train_metrics["self_teach_plan"][
+            "history_prior_entry_count"] >= 1
+        assert continued_model.train_metrics["weight_update_changed"] is True
         no_target_manifest = os.path.join(tmpdir, "mm_no_target.jsonl")
         no_target_rows = []
         for i in range(6):
@@ -4255,6 +5591,14 @@ def selftest():
         assert selection["self_teach_reports"]
         assert selection["selected_self_teach_plan"]["enabled"] is True
         assert selection["rounds"][1]["self_teach_plan"]["enabled"] is True
+        assert selection["attempted_weight_update_count"] > 0
+        assert selection["rounds"][1]["weight_update_changed"] is True
+        assert (selection["rounds"][1][
+            "weight_update_changed_tensor_count"] > 0)
+        assert (selection["rounds"][1][
+            "weight_update_changed_value_count"] > 0)
+        assert selected_model.train_metrics["weight_update_changed"] is False
+        assert selected_model.train_metrics["attempted_weight_update_count"] > 0
         assert selected_model.train_metrics["latent_study_reports"] == []
         assert selected_model.train_metrics["latent_discovery_study_reports"] == []
         assert selected_model.train_metrics["latent_study_pool_size"] == 0
@@ -4285,6 +5629,10 @@ def main(argv=None):
                     help="target-token decoder loss weight; set 0 for latent-only bridge training")
     ap.add_argument("--text-checkpoint", default=None, dest="text_checkpoint",
                     help="optional thinking.text checkpoint for text/latent warm start")
+    ap.add_argument("--multimodal-checkpoint", default=None,
+                    dest="multimodal_checkpoint",
+                    help=("optional thinking.multimodal checkpoint for compatible "
+                          "warm start / continuation"))
     ap.add_argument("--concept-tokens", type=int, default=4, dest="concept_tokens",
                     help="shared latent fusion tokens")
     ap.add_argument("--fusion-layers", type=int, default=1, dest="fusion_layers",
@@ -4479,6 +5827,36 @@ def main(argv=None):
                     dest="self_teach_w",
                     help=("budget for reallocating multimodal objective weight "
                           "from the model's own eval deficits"))
+    ap.add_argument("--self-teach-history-prior-w", type=float, default=0.5,
+                    dest="self_teach_history_prior_w",
+                    help=("blend weight for text-checkpoint reading history "
+                          "inside multimodal self-teach allocation"))
+    ap.add_argument("--representation-probe-n", type=int, default=0,
+                    dest="representation_probe_n",
+                    help=("optional before/after probe count for label-free "
+                          "representation organization progress"))
+    ap.add_argument("--text-transfer-probe-n", type=int,
+                    default=DEFAULT_TEXT_TRANSFER_PROBE_N,
+                    dest="text_transfer_probe_n",
+                    help=("probe current manifest before/after text-checkpoint "
+                          "import; positive values enable target-aware transfer "
+                          "calibration"))
+    ap.add_argument("--text-transfer-score-min-delta", type=float,
+                    default=DEFAULT_TEXT_TRANSFER_SCORE_MIN_DELTA,
+                    dest="text_transfer_score_min_delta",
+                    help="minimum target score gain required to accept text transfer")
+    ap.add_argument("--text-transfer-insight-accept-w",
+                    "--text-transfer-insight-w", type=float,
+                    default=DEFAULT_TEXT_TRANSFER_INSIGHT_ACCEPT_W,
+                    dest="text_transfer_insight_accept_w",
+                    help=("accept useful representation-organization gains even "
+                          "when surface score is close"))
+    ap.add_argument("--text-transfer-insight-min-delta", type=float, default=0.0,
+                    dest="text_transfer_insight_min_delta",
+                    help="minimum organization gain for insight-based transfer")
+    ap.add_argument("--text-transfer-gate", action=argparse.BooleanOptionalAction,
+                    default=True, dest="text_transfer_gate",
+                    help="roll back text checkpoint import when target probe rejects it")
     ap.add_argument("--view-tokens", type=int, default=4, dest="view_tokens",
                     help="prefix tokens allocated to each named manifest feature view")
     ap.add_argument("--txt-tokens", type=int, default=8, dest="txt_tokens")
@@ -4563,6 +5941,18 @@ def main(argv=None):
         ap.error("decoder/agreement/latent loss weights must be non-negative")
     if args.self_teach_w < 0.0:
         ap.error("--self-teach-w must be non-negative")
+    if args.self_teach_history_prior_w < 0.0:
+        ap.error("--self-teach-history-prior-w must be non-negative")
+    if args.representation_probe_n < 0:
+        ap.error("--representation-probe-n must be non-negative")
+    if args.text_transfer_probe_n < 0:
+        ap.error("--text-transfer-probe-n must be non-negative")
+    if args.text_transfer_score_min_delta < 0.0:
+        ap.error("--text-transfer-score-min-delta must be non-negative")
+    if args.text_transfer_insight_accept_w < 0.0:
+        ap.error("--text-transfer-insight-accept-w must be non-negative")
+    if args.text_transfer_insight_min_delta < 0.0:
+        ap.error("--text-transfer-insight-min-delta must be non-negative")
     if args.latent_concept_view_dropout < 0.0 or args.latent_concept_view_dropout >= 1.0:
         ap.error("--latent-concept-view-dropout must be in [0, 1)")
     if (args.latent_concept_fer_fragmentation_w < 0.0
@@ -4681,6 +6071,7 @@ def main(argv=None):
         text_arch=args.text_arch, modality_dropout=args.modality_dropout,
         decode_w=args.decode_w, agreement_w=args.agreement_w,
         text_checkpoint=args.text_checkpoint,
+        multimodal_checkpoint=args.multimodal_checkpoint,
         concept_tokens=args.concept_tokens, fusion_layers=args.fusion_layers,
         latent_concept_slots=args.latent_concept_slots,
         latent_concept_layers=args.latent_concept_layers,
@@ -4803,7 +6194,14 @@ def main(argv=None):
         latent_concept_cluster_temperature=args.latent_concept_cluster_temperature,
         latent_concept_cluster_margin=args.latent_concept_cluster_margin,
         latent_concept_cluster_min_size=args.latent_concept_cluster_min_size,
+        representation_probe_n=args.representation_probe_n,
+        text_transfer_probe_n=args.text_transfer_probe_n,
+        text_transfer_score_min_delta=args.text_transfer_score_min_delta,
+        text_transfer_insight_accept_w=args.text_transfer_insight_accept_w,
+        text_transfer_insight_min_delta=args.text_transfer_insight_min_delta,
+        text_transfer_gate=args.text_transfer_gate,
         self_teach_w=args.self_teach_w,
+        self_teach_history_prior_w=args.self_teach_history_prior_w,
         select_best=args.select_best,
         selection_rounds=args.selection_rounds,
         selection_score_metric=args.selection_score_metric,

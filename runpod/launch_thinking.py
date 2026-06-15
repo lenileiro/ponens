@@ -1880,6 +1880,19 @@ def payload(args):
                 f"{args.multimodal_selection_insight_accept_w} "
                 f"--selection-insight-min-delta "
                 f"{args.multimodal_selection_insight_min_delta} "
+                f"--self-teach-w {args.multimodal_self_teach_w} "
+                f"--self-teach-history-prior-w "
+                f"{args.multimodal_self_teach_history_prior_w} "
+                f"--representation-probe-n "
+                f"{args.multimodal_representation_probe_n} "
+                f"--text-transfer-probe-n "
+                f"{args.multimodal_text_transfer_probe_n} "
+                f"--text-transfer-score-min-delta "
+                f"{args.multimodal_text_transfer_score_min_delta} "
+                f"--text-transfer-insight-accept-w "
+                f"{args.multimodal_text_transfer_insight_accept_w} "
+                f"--text-transfer-insight-min-delta "
+                f"{args.multimodal_text_transfer_insight_min_delta} "
                 f"--out runs/m0_multimodal.json --checkpoint runs/m0_multimodal.pt"
             )
             if args.multimodal_root:
@@ -1888,6 +1901,10 @@ def payload(args):
                 mm_cmd += (
                     f" --text-checkpoint "
                     f"{shlex_quote(args.multimodal_text_checkpoint)}")
+            mm_cmd += (
+                " --text-transfer-gate"
+                if args.multimodal_text_transfer_gate
+                else " --no-text-transfer-gate")
             mm_cmd += " --select-best" if args.multimodal_select_best else " --no-select-best"
             cmds.append(mm_cmd)
         return " && ".join(cmds)
@@ -2142,9 +2159,13 @@ def main():
     ap.add_argument("--reading-neighborhood-batch", type=int, default=0,
                     dest="reading_neighborhood_batch")
     ap.add_argument("--reading-neighborhood-probe-n", type=int, default=0,
-                    dest="reading_neighborhood_probe_n")
+                    dest="reading_neighborhood_probe_n",
+                    help=("candidate count for neighborhood mining; mastery "
+                          "profile raises 0 to its bounded default"))
     ap.add_argument("--reading-neighborhood-refresh-steps", type=int, default=0,
-                    dest="reading_neighborhood_refresh_steps")
+                    dest="reading_neighborhood_refresh_steps",
+                    help=("steps between neighborhood remine passes; mastery "
+                          "profile raises 0 to its periodic default"))
     ap.add_argument("--reading-neighborhood-temperature", type=float, default=0.1,
                     dest="reading_neighborhood_temperature")
     ap.add_argument("--reading-neighborhood-margin", type=float, default=0.0,
@@ -2162,9 +2183,13 @@ def main():
     ap.add_argument("--reading-cluster-batch", type=int, default=0,
                     dest="reading_cluster_batch")
     ap.add_argument("--reading-cluster-probe-n", type=int, default=0,
-                    dest="reading_cluster_probe_n")
+                    dest="reading_cluster_probe_n",
+                    help=("candidate count for cluster mining; mastery "
+                          "profile raises 0 to its bounded default"))
     ap.add_argument("--reading-cluster-refresh-steps", type=int, default=0,
-                    dest="reading_cluster_refresh_steps")
+                    dest="reading_cluster_refresh_steps",
+                    help=("steps between cluster remine passes; mastery "
+                          "profile raises 0 to its periodic default"))
     ap.add_argument("--reading-cluster-temperature", type=float, default=0.1,
                     dest="reading_cluster_temperature")
     ap.add_argument("--reading-cluster-margin", type=float, default=0.0,
@@ -2177,11 +2202,17 @@ def main():
                              "auto"),
                     dest="reading_study_strategy")
     ap.add_argument("--reading-study-probe-n", type=int, default=0,
-                    dest="reading_study_probe_n")
+                    dest="reading_study_probe_n",
+                    help=("candidate count for hard-study mining; mastery "
+                          "profile raises 0 to its bounded default"))
     ap.add_argument("--reading-study-hard-max", type=int, default=0,
-                    dest="reading_study_hard_max")
+                    dest="reading_study_hard_max",
+                    help=("cap on selected hard records; mastery profile "
+                          "raises 0 to its bounded default"))
     ap.add_argument("--reading-study-refresh-steps", type=int, default=0,
-                    dest="reading_study_refresh_steps")
+                    dest="reading_study_refresh_steps",
+                    help=("steps between hard-study remine passes; mastery "
+                          "profile raises 0 to its periodic default"))
     ap.add_argument("--reading-study-select-best",
                     action=argparse.BooleanOptionalAction, default=True,
                     dest="reading_study_select_best")
@@ -3718,6 +3749,35 @@ def main():
     ap.add_argument("--multimodal-text-checkpoint", default="",
                     dest="multimodal_text_checkpoint",
                     help="optional thinking.text checkpoint for multimodal warm start")
+    ap.add_argument("--multimodal-self-teach-w", type=float, default=0.0,
+                    dest="multimodal_self_teach_w",
+                    help="multimodal self-teach objective reallocation budget")
+    ap.add_argument("--multimodal-self-teach-history-prior-w", type=float,
+                    default=0.5,
+                    dest="multimodal_self_teach_history_prior_w",
+                    help="blend text/multimodal checkpoint history into self-teach")
+    ap.add_argument("--multimodal-representation-probe-n", type=int, default=0,
+                    dest="multimodal_representation_probe_n",
+                    help="before/after label-free representation progress probe count")
+    ap.add_argument("--multimodal-text-transfer-probe-n", type=int, default=64,
+                    dest="multimodal_text_transfer_probe_n",
+                    help="target manifest probe count for accepting text checkpoint import")
+    ap.add_argument("--multimodal-text-transfer-score-min-delta", type=float,
+                    default=0.1,
+                    dest="multimodal_text_transfer_score_min_delta",
+                    help="minimum target score gain required for text transfer")
+    ap.add_argument("--multimodal-text-transfer-insight-accept-w", type=float,
+                    default=0.0,
+                    dest="multimodal_text_transfer_insight_accept_w",
+                    help="weight for accepting transfer by representation gain")
+    ap.add_argument("--multimodal-text-transfer-insight-min-delta", type=float,
+                    default=0.0,
+                    dest="multimodal_text_transfer_insight_min_delta",
+                    help="minimum organization gain for insight-based transfer")
+    ap.add_argument("--multimodal-text-transfer-gate",
+                    action=argparse.BooleanOptionalAction, default=True,
+                    dest="multimodal_text_transfer_gate",
+                    help="roll back harmful text checkpoint imports after target probe")
     ap.add_argument("--multimodal-select-best", action=argparse.BooleanOptionalAction,
                     default=False, dest="multimodal_select_best",
                     help="keep the best self-scored multimodal study round")
@@ -4818,6 +4878,19 @@ def main():
                 args.multimodal_selection_insight_accept_w),
             "--multimodal-selection-insight-min-delta": (
                 args.multimodal_selection_insight_min_delta),
+            "--multimodal-self-teach-w": args.multimodal_self_teach_w,
+            "--multimodal-self-teach-history-prior-w": (
+                args.multimodal_self_teach_history_prior_w),
+            "--multimodal-representation-probe-n": (
+                args.multimodal_representation_probe_n),
+            "--multimodal-text-transfer-probe-n": (
+                args.multimodal_text_transfer_probe_n),
+            "--multimodal-text-transfer-score-min-delta": (
+                args.multimodal_text_transfer_score_min_delta),
+            "--multimodal-text-transfer-insight-accept-w": (
+                args.multimodal_text_transfer_insight_accept_w),
+            "--multimodal-text-transfer-insight-min-delta": (
+                args.multimodal_text_transfer_insight_min_delta),
         }
         bad_nonnegative = [
             name for name, value in multimodal_nonnegative.items()
@@ -4851,7 +4924,8 @@ def main():
              or args.multimodal_latent_concept_memory_size > 0
              or args.multimodal_latent_concept_fer_hard_max > 0
              or args.multimodal_latent_concept_discovery_hard_max > 0
-             or args.multimodal_latent_concept_completion_hard_max > 0)
+             or args.multimodal_latent_concept_completion_hard_max > 0
+             or args.multimodal_self_teach_w > 0.0)
                 and args.multimodal_latent_concept_slots <= 0):
             sys.exit(
                 "ERROR: multimodal latent concept options require "

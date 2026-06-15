@@ -78,6 +78,20 @@ READING_MASTERY_SCORE_KEYS = (
     "span_score", "context_closure_score", "neighborhood_score",
     "cluster_score",
 )
+READING_REPRESENTATION_PROGRESS_KEYS = (
+    "mastery_score", "active_mean_score", "floor_score", "balanced_score",
+    "signal_coverage", "fer_score", "bridge_score", "bridge_connectivity",
+    "sequence_score", "neighborhood_score", "cluster_score", "span_score",
+    "context_closure_score")
+READING_REPRESENTATION_SIGNAL_SCORES = (
+    ("fer", "fer_score"),
+    ("bridge", "bridge_score"),
+    ("sequence", "sequence_score"),
+    ("neighborhood", "neighborhood_score"),
+    ("cluster", "cluster_score"),
+    ("span", "span_score"),
+    ("closure", "context_closure_score"),
+)
 
 
 @dataclass(frozen=True)
@@ -317,6 +331,44 @@ def reading_score_digest(score_components):
     return digest
 
 
+def reading_representation_progress_digest(progress):
+    if not isinstance(progress, dict) or not bool(progress.get("enabled", False)):
+        return {"enabled": False}
+    signal_deltas = progress.get("signal_deltas")
+    signal_deltas = signal_deltas if isinstance(signal_deltas, dict) else {}
+    signal_after = progress.get("signal_after")
+    signal_after = signal_after if isinstance(signal_after, dict) else {}
+    return {
+        "enabled": True,
+        "active_signals": [
+            str(item) for item in progress.get("active_signals", ())],
+        "signal_after": {
+            str(signal): _reading_float(value)
+            for signal, value in signal_after.items()
+            if signal in READING_DISCOVERY_SIGNALS
+        },
+        "signal_deltas": {
+            str(signal): _reading_float(value)
+            for signal, value in signal_deltas.items()
+            if signal in READING_DISCOVERY_SIGNALS
+        },
+        "organization_score_before": _reading_float(
+            progress.get("organization_score_before", 0.0)),
+        "organization_score_after": _reading_float(
+            progress.get("organization_score_after", 0.0)),
+        "organization_score_delta": _reading_float(
+            progress.get("organization_score_delta", 0.0)),
+        "positive_signal_gain": _reading_float(
+            progress.get("positive_signal_gain", 0.0)),
+        "negative_signal_drift": _reading_float(
+            progress.get("negative_signal_drift", 0.0)),
+        "top_gain_signal": str(progress.get("top_gain_signal", "")),
+        "top_regression_signal": str(progress.get("top_regression_signal", "")),
+        "representation_insight_event": bool(
+            progress.get("representation_insight_event", False)),
+    }
+
+
 def reading_mastery_history_from_payload(payload):
     if not isinstance(payload, dict):
         history = None
@@ -337,6 +389,73 @@ def reading_mastery_history_from_payload(payload):
         "max_entries": READING_MASTERY_HISTORY_SIZE,
         "entry_count": len(entries),
         "entries": entries,
+    }
+
+
+def _reading_weight_update_history_summary(train_metrics, selection, rounds):
+    train_metrics = train_metrics if isinstance(train_metrics, dict) else {}
+    selection = selection if isinstance(selection, dict) else {}
+    rounds = [row for row in rounds if isinstance(row, dict)]
+
+    def row_summary(row):
+        update = row.get("weight_update")
+        update = update if isinstance(update, dict) else {}
+        changed = bool(row.get("weight_update_changed",
+                               update.get("changed", False)))
+        tensor_count = _reading_int_or_none(
+            row.get("weight_update_changed_tensor_count"))
+        if tensor_count is None:
+            tensor_count = _reading_int_or_none(
+                update.get("changed_tensor_count"))
+        value_count = _reading_int_or_none(
+            row.get("weight_update_changed_value_count"))
+        if value_count is None:
+            value_count = _reading_int_or_none(
+                update.get("changed_value_count"))
+        max_delta = _reading_float(
+            row.get("weight_update_max_abs_delta",
+                    update.get("max_abs_delta", 0.0)))
+        has_evidence = any(key in row for key in (
+            "weight_update", "weight_update_changed",
+            "weight_update_changed_tensor_count",
+            "weight_update_changed_value_count",
+            "weight_update_max_abs_delta"))
+        return {
+            "has_evidence": bool(has_evidence),
+            "changed": changed,
+            "tensor_count": int(tensor_count or 0),
+            "value_count": int(value_count or 0),
+            "max_delta": float(max_delta),
+        }
+
+    summaries = []
+    train_summary = row_summary(train_metrics)
+    if train_summary["has_evidence"]:
+        summaries.append(train_summary)
+    for row in rounds:
+        summary = row_summary(row)
+        if summary["has_evidence"]:
+            summaries.append(summary)
+
+    attempted = _reading_int_or_none(
+        selection.get("attempted_weight_update_count"))
+    if attempted is None:
+        attempted = sum(
+            1 for row in rounds
+            if int(row.get("round", 1) or 0) > 0
+            and row_summary(row)["has_evidence"])
+        if attempted == 0 and train_summary["has_evidence"]:
+            attempted = 1
+
+    return {
+        "changed": any(summary["changed"] for summary in summaries),
+        "changed_tensor_count": max(
+            (summary["tensor_count"] for summary in summaries), default=0),
+        "changed_value_count": max(
+            (summary["value_count"] for summary in summaries), default=0),
+        "max_abs_delta": max(
+            (summary["max_delta"] for summary in summaries), default=0.0),
+        "attempted_count": int(attempted or 0),
     }
 
 
@@ -367,6 +486,10 @@ def reading_mastery_history_entry(report, session_index=None):
     self_teach_reports = [
         row for row in self_teach_reports if isinstance(row, dict)
     ]
+    weight_update = _reading_weight_update_history_summary(
+        train_metrics, selection, rounds)
+    representation_progress = reading_representation_progress_digest(
+        report.get("representation_progress"))
     top_self_teach = self_teach_reports[0] if self_teach_reports else {}
     bank = report.get("reading_replay_bank")
     bank = bank if isinstance(bank, dict) else {}
@@ -410,9 +533,29 @@ def reading_mastery_history_entry(report, session_index=None):
             bool(row.get("replay_priority_sampling", False)) for row in rounds),
         "replay_priority_round_record_count": (
             max(replay_priority_counts) if replay_priority_counts else 0),
+        "weight_update_changed": bool(weight_update["changed"]),
+        "weight_update_changed_tensor_count": int(
+            weight_update["changed_tensor_count"]),
+        "weight_update_changed_value_count": int(
+            weight_update["changed_value_count"]),
+        "weight_update_max_abs_delta": float(weight_update["max_abs_delta"]),
+        "attempted_weight_update_count": int(weight_update["attempted_count"]),
+        "representation_progress": representation_progress,
+        "representation_insight_event": bool(
+            representation_progress.get("representation_insight_event", False)),
+        "representation_organization_score_delta": float(
+            representation_progress.get("organization_score_delta", 0.0)),
+        "representation_top_gain_signal": str(
+            representation_progress.get("top_gain_signal", "")),
         "self_teach_top_signal": str(top_self_teach.get("top_signal", "")),
         "self_teach_active_signals": [
             str(item) for item in top_self_teach.get("active_signals", ())],
+        "self_teach_history_prior_enabled": bool(
+            top_self_teach.get("history_prior_enabled", False)),
+        "self_teach_history_prior_entry_count": int(
+            top_self_teach.get("history_prior_entry_count", 0) or 0),
+        "self_teach_history_prior_top_signal": str(
+            top_self_teach.get("history_prior_top_signal", "")),
         "before_score_components": reading_score_digest(
             report.get("before_score_components")),
         "after_score_components": reading_score_digest(
@@ -2405,13 +2548,23 @@ READING_MASTERY_STUDY_FLOORS = {
     "study_score_patience": 2,
     "study_score_target": 0.85,
 }
+READING_MASTERY_OPERATION_FLOORS = {
+    "study_probe_n": 256,
+    "study_hard_max": 64,
+    "study_refresh_steps": 100,
+    "neighborhood_probe_n": 256,
+    "neighborhood_refresh_steps": 100,
+    "cluster_probe_n": 256,
+    "cluster_refresh_steps": 100,
+}
 READING_MASTERY_CHECKPOINT_FLOORS = {
     "replay_w": 0.05,
     "replay_retention_w": 0.25,
 }
 READING_MASTERY_PROFILE_FLOORS = (
     dict(READING_MASTERY_OBJECTIVE_FLOORS)
-    | dict(READING_MASTERY_STUDY_FLOORS))
+    | dict(READING_MASTERY_STUDY_FLOORS)
+    | dict(READING_MASTERY_OPERATION_FLOORS))
 READING_STUDY_STRATEGIES = (
     "random", "errors", "fer", "curiosity", "sequence", "closure", "graph",
     "cycle", "gap", "discovery", "auto")
@@ -2530,6 +2683,8 @@ def reading_objective_profile_kwargs(objective_profile="manual", **kwargs):
         if objective_profile == "mastery" else {},
         "study_floors": dict(READING_MASTERY_STUDY_FLOORS)
         if objective_profile == "mastery" else {},
+        "operation_floors": dict(READING_MASTERY_OPERATION_FLOORS)
+        if objective_profile == "mastery" else {},
         "updates": updates,
         "applied": bool(updates),
     }
@@ -2587,12 +2742,60 @@ def reading_profile_report_with_checkpoint(base_report, checkpoint_report):
     return report
 
 
+def reading_mastery_history_concept_insight_prior(history, enabled=True,
+                                                  max_entries=8, decay=0.75):
+    if not enabled:
+        return {
+            "enabled": False,
+            "entry_count": 0,
+            "concept_connection_signal": 0.0,
+        }
+    history = reading_mastery_history_from_payload(
+        {"reading_mastery_history": history})
+    entries = history["entries"][-max(1, int(max_entries)):]
+    decay = min(1.0, max(0.0, float(decay)))
+    weighted_delta = 0.0
+    total_weight = 0.0
+    max_delta = 0.0
+    latest_delta = 0.0
+    selected_by_insight = 0
+    accepted_updates = 0
+    for offset, entry in enumerate(reversed(entries)):
+        if not isinstance(entry, dict):
+            continue
+        delta = max(
+            0.0, _reading_float(entry.get("max_concept_insight_delta", 0.0)))
+        if offset == 0:
+            latest_delta = delta
+        recency_weight = decay ** offset
+        weighted_delta += recency_weight * min(1.0, delta)
+        total_weight += recency_weight
+        max_delta = max(max_delta, delta)
+        if bool(entry.get("selected_by_insight", False)):
+            selected_by_insight += 1
+        if bool(entry.get("accepted_update", False)):
+            accepted_updates += 1
+    signal = weighted_delta / total_weight if total_weight > 0.0 else 0.0
+    return {
+        "enabled": True,
+        "entry_count": int(len(entries)),
+        "decay": float(decay),
+        "concept_connection_signal": float(signal),
+        "max_concept_insight_delta": float(max_delta),
+        "latest_concept_insight_delta": float(latest_delta),
+        "selected_by_insight_count": int(selected_by_insight),
+        "accepted_update_count": int(accepted_updates),
+    }
+
+
 def reading_mastery_history_self_teach_prior(history, enabled=True,
                                              max_entries=8, decay=0.75):
     if not enabled:
         return {"enabled": False, "entry_count": 0, "signal_deficits": {}}
     history = reading_mastery_history_from_payload(
         {"reading_mastery_history": history})
+    concept_prior = reading_mastery_history_concept_insight_prior(
+        history, enabled=True, max_entries=max_entries, decay=decay)
     entries = history["entries"][-max(1, int(max_entries)):]
     decay = min(1.0, max(0.0, float(decay)))
     weighted = {signal: 0.0 for signal in READING_DISCOVERY_SIGNALS}
@@ -2616,6 +2819,25 @@ def reading_mastery_history_self_teach_prior(history, enabled=True,
                 score_components.get(score_key, 0.0))))
             weighted[signal] += recency_weight * max(0.0, 1.0 - quality)
             weights[signal] += recency_weight
+        representation_progress = entry.get("representation_progress")
+        if (isinstance(representation_progress, dict)
+                and bool(representation_progress.get("enabled", False))):
+            signal_after = representation_progress.get("signal_after")
+            signal_after = signal_after if isinstance(signal_after, dict) else {}
+            signal_deltas = representation_progress.get("signal_deltas")
+            signal_deltas = signal_deltas if isinstance(signal_deltas, dict) else {}
+            for signal, value in signal_after.items():
+                if signal not in READING_DISCOVERY_SIGNALS:
+                    continue
+                quality = min(1.0, max(0.0, _reading_float(value, 0.0)))
+                quality_deficit = max(0.0, 1.0 - quality)
+                regression_deficit = max(
+                    0.0, -_reading_float(signal_deltas.get(signal, 0.0)))
+                deficit = max(quality_deficit, regression_deficit)
+                if deficit <= 0.0:
+                    continue
+                weighted[signal] += recency_weight * deficit
+                weights[signal] += recency_weight
         top_signal = str(entry.get("self_teach_top_signal", ""))
         if top_signal in top_counts:
             top_counts[top_signal] += 1
@@ -2624,6 +2846,11 @@ def reading_mastery_history_self_teach_prior(history, enabled=True,
         for signal in READING_DISCOVERY_SIGNALS
         if weights[signal] > 0.0 and weighted[signal] > 0.0
     }
+    concept_signal = max(
+        0.0, _reading_float(concept_prior.get("concept_connection_signal", 0.0)))
+    if concept_signal > 0.0:
+        deficits["bridge"] = max(float(deficits.get("bridge", 0.0)),
+                                 float(concept_signal))
     top_signal = None
     if deficits:
         top_signal = max(deficits.items(), key=lambda item: item[1])[0]
@@ -2633,6 +2860,8 @@ def reading_mastery_history_self_teach_prior(history, enabled=True,
         "decay": float(decay),
         "signal_deficits": deficits,
         "top_signal": top_signal,
+        "concept_connection_signal": float(concept_signal),
+        "concept_insight_prior": concept_prior,
         "top_signal_counts": {
             signal: count for signal, count in top_counts.items() if count},
     }
@@ -2650,6 +2879,8 @@ def reading_self_teach_weight_plan(score_components, budget=0.0,
     history_deficits = (
         history_prior.get("signal_deficits")
         if isinstance(history_prior.get("signal_deficits"), dict) else {})
+    concept_connection_signal = max(
+        0.0, _reading_float(history_prior.get("concept_connection_signal", 0.0)))
     extras = {key: 0.0 for key in READING_SELF_TEACH_WEIGHT_KEYS}
     deficits = {}
     current_deficits = {}
@@ -2663,6 +2894,8 @@ def reading_self_teach_weight_plan(score_components, budget=0.0,
         current_deficit = max(0.0, 1.0 - quality)
         history_deficit = max(
             0.0, _reading_float(history_deficits.get(signal, 0.0)))
+        if signal == "bridge":
+            history_deficit = max(history_deficit, concept_connection_signal)
         deficit = max(current_deficit, history_prior_w * history_deficit)
         current_deficits[signal] = float(current_deficit)
         deficits[signal] = float(deficit)
@@ -2694,6 +2927,7 @@ def reading_self_teach_weight_plan(score_components, budget=0.0,
         "history_prior_entry_count": int(history_prior.get("entry_count", 0) or 0),
         "history_prior_top_signal": history_prior.get("top_signal"),
         "history_prior_w": float(history_prior_w),
+        "history_concept_connection_signal": float(concept_connection_signal),
         "active_signals": [signal for signal, _deficit in active],
         "weight_extras": {key: float(value) for key, value in extras.items()},
     }
@@ -2784,6 +3018,92 @@ def reading_concept_insight_report(before_score_components=None,
         "bridge_delta": float(bridge_delta),
         "bridge_allowed": bool(bridge_allowed),
         "signal_gains": gains,
+    }
+
+
+def reading_weight_update_snapshot(model, max_tensors=24, max_values=8):
+    rows = []
+    max_tensors = max(0, int(max_tensors))
+    max_values = max(1, int(max_values))
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if len(rows) >= max_tensors:
+                break
+            if not param.requires_grad or param.numel() <= 0:
+                continue
+            flat = param.detach().reshape(-1)
+            sample_count = min(max_values, int(flat.numel()))
+            if sample_count <= 0:
+                continue
+            if int(flat.numel()) == sample_count:
+                indices = torch.arange(sample_count, device=flat.device)
+            else:
+                indices = torch.linspace(
+                    0, int(flat.numel()) - 1, steps=sample_count,
+                    device=flat.device).round().long()
+            values = flat.index_select(0, indices).to(
+                device="cpu", dtype=torch.float32).tolist()
+            rows.append({
+                "name": str(name),
+                "shape": [int(dim) for dim in param.shape],
+                "numel": int(param.numel()),
+                "indices": [int(idx) for idx in indices.cpu().tolist()],
+                "values": [float(value) for value in values],
+            })
+    return {"sampled_tensors": rows}
+
+
+def reading_weight_update_report(before_snapshot, after_snapshot, atol=1e-12):
+    before_rows = {
+        str(row.get("name", "")): row
+        for row in (before_snapshot or {}).get("sampled_tensors", ())
+        if isinstance(row, dict)
+    }
+    changed = []
+    sampled_tensor_count = 0
+    sampled_value_count = 0
+    changed_tensor_count = 0
+    changed_value_count = 0
+    max_abs_delta = 0.0
+    for after_row in (after_snapshot or {}).get("sampled_tensors", ()):
+        if not isinstance(after_row, dict):
+            continue
+        name = str(after_row.get("name", ""))
+        before_row = before_rows.get(name)
+        if not isinstance(before_row, dict):
+            continue
+        before_values = before_row.get("values", ())
+        after_values = after_row.get("values", ())
+        value_deltas = [
+            abs(float(after) - float(before))
+            for before, after in zip(before_values, after_values)
+        ]
+        if not value_deltas:
+            continue
+        sampled_tensor_count += 1
+        sampled_value_count += len(value_deltas)
+        tensor_changed_values = sum(1 for delta in value_deltas if delta > atol)
+        tensor_max_delta = max(value_deltas)
+        max_abs_delta = max(max_abs_delta, tensor_max_delta)
+        if tensor_changed_values:
+            changed_tensor_count += 1
+            changed_value_count += tensor_changed_values
+            changed.append({
+                "name": name,
+                "changed_values": int(tensor_changed_values),
+                "sampled_values": int(len(value_deltas)),
+                "max_abs_delta": float(tensor_max_delta),
+            })
+    changed.sort(key=lambda row: row["max_abs_delta"], reverse=True)
+    return {
+        "enabled": True,
+        "sampled_tensor_count": int(sampled_tensor_count),
+        "sampled_value_count": int(sampled_value_count),
+        "changed": bool(changed_value_count > 0),
+        "changed_tensor_count": int(changed_tensor_count),
+        "changed_value_count": int(changed_value_count),
+        "max_abs_delta": float(max_abs_delta),
+        "top_changed_tensors": changed[:8],
     }
 
 
@@ -2983,6 +3303,81 @@ def reading_eval_bundle(model, vocab, records, device=DEV, eval_n=64, seed=0,
                 neighborhood_eval=neighborhood, cluster_eval=cluster,
                 fer_eval=fer, bridge_eval=bridge, sequence_eval=sequence,
                 span_eval=span, closure_eval=closure)}
+
+
+def reading_representation_progress_report(before_bundle, after_bundle):
+    if not isinstance(before_bundle, dict) or not isinstance(after_bundle, dict):
+        return {"enabled": False}
+    before_scores = before_bundle.get("score_components")
+    after_scores = after_bundle.get("score_components")
+    if not isinstance(before_scores, dict) or not isinstance(after_scores, dict):
+        return {"enabled": False}
+    deltas = {}
+    for key in READING_REPRESENTATION_PROGRESS_KEYS:
+        if key in before_scores and key in after_scores:
+            deltas[key] = float(
+                _reading_float(after_scores.get(key), 0.0)
+                - _reading_float(before_scores.get(key), 0.0))
+    active_signals = []
+    signal_before = {}
+    signal_after = {}
+    signal_deltas = {}
+    for signal, score_key in READING_REPRESENTATION_SIGNAL_SCORES:
+        if bool(before_scores.get(f"{signal}_skipped", False)) and bool(
+                after_scores.get(f"{signal}_skipped", False)):
+            continue
+        before_value = _reading_float(before_scores.get(score_key), 0.0)
+        after_value = _reading_float(after_scores.get(score_key), 0.0)
+        active_signals.append(signal)
+        signal_before[signal] = float(before_value)
+        signal_after[signal] = float(after_value)
+        signal_deltas[signal] = float(after_value - before_value)
+    if active_signals:
+        organization_before = float(np.mean([
+            signal_before[signal] for signal in active_signals]))
+        organization_after = float(np.mean([
+            signal_after[signal] for signal in active_signals]))
+    else:
+        organization_before = 0.0
+        organization_after = 0.0
+    organization_delta = float(organization_after - organization_before)
+    top_gain_signal = None
+    top_regression_signal = None
+    if signal_deltas:
+        top_gain_signal = max(signal_deltas.items(), key=lambda item: item[1])[0]
+        top_regression_signal = min(
+            signal_deltas.items(), key=lambda item: item[1])[0]
+    positive_signal_gain = sum(
+        max(0.0, delta) for delta in signal_deltas.values())
+    negative_signal_drift = sum(
+        max(0.0, -delta) for delta in signal_deltas.values())
+    return {
+        "enabled": True,
+        "active_signals": active_signals,
+        "before": {
+            key: _reading_float(before_scores.get(key), 0.0)
+            for key in READING_REPRESENTATION_PROGRESS_KEYS
+            if key in before_scores
+        },
+        "after": {
+            key: _reading_float(after_scores.get(key), 0.0)
+            for key in READING_REPRESENTATION_PROGRESS_KEYS
+            if key in after_scores
+        },
+        "delta": deltas,
+        "signal_before": signal_before,
+        "signal_after": signal_after,
+        "signal_deltas": signal_deltas,
+        "organization_score_before": float(organization_before),
+        "organization_score_after": float(organization_after),
+        "organization_score_delta": float(organization_delta),
+        "positive_signal_gain": float(positive_signal_gain),
+        "negative_signal_drift": float(negative_signal_drift),
+        "top_gain_signal": top_gain_signal,
+        "top_regression_signal": top_regression_signal,
+        "representation_insight_event": bool(
+            organization_delta > 0.0 and positive_signal_gain > 0.0),
+    }
 
 
 def reading_latent_bridge_graph_state(model):
@@ -4293,6 +4688,7 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     replay_priority_active = replay_sampling_weights is not None
     if int(memory_size) > 0:
         model.enable_latent_concept_memory(int(memory_size))
+    weight_update_before = reading_weight_update_snapshot(model)
     study_strategy = resolve_reading_study_strategy(
         requested_study_strategy, model)
     if association_w and getattr(model, "latent_concept_memory", None) is None:
@@ -5133,8 +5529,17 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "bridge_connectivity_gain": float(bridge_connectivity_gain),
         "record_ids": selected_id_sample(study_pool),
     }
+    weight_update = reading_weight_update_report(
+        weight_update_before, reading_weight_update_snapshot(model))
     model.reading_train_metrics = {
         "loss": last_loss,
+        "weight_update": weight_update,
+        "weight_update_changed": bool(weight_update["changed"]),
+        "weight_update_changed_tensor_count": int(
+            weight_update["changed_tensor_count"]),
+        "weight_update_changed_value_count": int(
+            weight_update["changed_value_count"]),
+        "weight_update_max_abs_delta": float(weight_update["max_abs_delta"]),
         "study_strategy_requested": requested_study_strategy,
         "study_strategy": study_strategy,
         "latent_view_loss": last_view_loss,
@@ -5757,6 +6162,15 @@ def fit_reading_concepts_select_best(
                 round_train_metrics.get("replay_priority_mean", 0.0)),
             "replay_priority_max": float(
                 round_train_metrics.get("replay_priority_max", 0.0)),
+            "weight_update": round_train_metrics.get("weight_update", {}),
+            "weight_update_changed": bool(
+                round_train_metrics.get("weight_update_changed", False)),
+            "weight_update_changed_tensor_count": int(
+                round_train_metrics.get("weight_update_changed_tensor_count", 0)),
+            "weight_update_changed_value_count": int(
+                round_train_metrics.get("weight_update_changed_value_count", 0)),
+            "weight_update_max_abs_delta": float(
+                round_train_metrics.get("weight_update_max_abs_delta", 0.0)),
             "selected_by_score": bool(decision["selected_by_score"]),
             "selected_by_insight": bool(decision["selected_by_insight"]),
             "insight_score_boost": float(decision["insight_score_boost"]),
@@ -5824,6 +6238,10 @@ def fit_reading_concepts_select_best(
         "replay_retention_w": float(replay_retention_w),
         "self_teach_w": float(study_self_teach_w),
         "self_teach_reports": self_teach_reports,
+        "attempted_weight_update_count": int(
+            sum(1 for row in rounds_report
+                if int(row.get("round", 0)) > 0
+                and bool(row.get("weight_update_changed", False)))),
         "selected_round": int(best_round),
         "accepted_update": bool(best_round > 0),
         "selected_score": float(best_score),
@@ -6747,6 +7165,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "after_bridge": after_bridge,
               "before_score_components": before_bundle["score_components"],
               "after_score_components": after_bundle["score_components"],
+              "representation_progress": reading_representation_progress_report(
+                  before_bundle, after_bundle),
               "selection": selection,
               "delta": {
                   "score": (
@@ -6979,6 +7399,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              reading_objective_profile_report=None,
                              replay_w=0.0, replay_batch=0,
                              replay_retention_w=0.0,
+                             self_teach_history_prior_w=0.5,
                              text_field="text", max_tokens=128, min_tokens=8,
                              eval_frac=0.10, eval_n=64,
                              latent_concept_slots=0, latent_concept_layers=None,
@@ -6987,6 +7408,9 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              latent_concept_refine=None,
                              latent_concept_refine_gate_init=None,
                              print_report=True):
+    self_teach_history_prior_w = float(self_teach_history_prior_w)
+    if self_teach_history_prior_w < 0.0:
+        raise ValueError("reading self-teach history prior weight must be non-negative")
     records = load_reading_records(
         data, text_field=text_field, max_tokens=max_tokens, min_tokens=min_tokens,
         eval_frac=eval_frac, seed=seed)
@@ -7153,6 +7577,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             insight_min_delta=study_insight_min_delta,
             study_self_teach_w=study_self_teach_w,
             self_teach_history_prior=self_teach_history_prior,
+            self_teach_history_prior_w=self_teach_history_prior_w,
             replay_records=replay_records,
             replay_teacher_model=replay_teacher_model,
             replay_teacher_vocab=replay_teacher_vocab,
@@ -7164,6 +7589,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             reading_self_teach_weight_maps(
                 before_bundle["score_components"], budget=study_self_teach_w,
                 history_prior=self_teach_history_prior,
+                history_prior_w=self_teach_history_prior_w,
                 factorization_w=factorization_w,
                 fer_w=fer_w,
                 discovery_w=discovery_w,
@@ -7511,6 +7937,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "after_bridge": after_bridge,
               "before_score_components": before_bundle["score_components"],
               "after_score_components": after_bundle["score_components"],
+              "representation_progress": reading_representation_progress_report(
+                  before_bundle, after_bundle),
               "before_replay": before_replay_bundle,
               "after_replay": after_replay_bundle,
               "selection": selection,
@@ -7928,6 +8356,63 @@ def selftest():
     assert self_teach_plan["weight_extras"]["bridge_w"] > 0.0
     assert math.isclose(sum(self_teach_plan["weight_extras"].values()),
                         0.12, rel_tol=1e-6, abs_tol=1e-6)
+    prior_scores = {
+        f"{name}_skipped": False for name in READING_DISCOVERY_SIGNALS}
+    for name, score_key in READING_SELF_TEACH_SCORE_KEYS.items():
+        prior_scores[score_key] = 1.0
+    prior_scores["sequence_score"] = 0.0
+    history_prior = reading_mastery_history_self_teach_prior({
+        "entries": [{
+            "after_score_components": prior_scores,
+            "self_teach_top_signal": "sequence",
+        }]
+    })
+    assert history_prior["enabled"] is True
+    assert history_prior["top_signal"] == "sequence"
+    current_scores = dict(prior_scores)
+    current_scores["sequence_score"] = 1.0
+    history_self_teach_plan = reading_self_teach_weight_plan(
+        current_scores, budget=0.09, history_prior=history_prior,
+        history_prior_w=1.0)
+    assert history_self_teach_plan["top_signal"] == "sequence"
+    assert history_self_teach_plan["history_prior_entry_count"] == 1
+    assert history_self_teach_plan["weight_extras"]["sequence_w"] > 0.0
+    assert math.isclose(sum(history_self_teach_plan["weight_extras"].values()),
+                        0.09, rel_tol=1e-6, abs_tol=1e-6)
+    representation_prior = reading_mastery_history_self_teach_prior({
+        "entries": [{
+            "after_score_components": current_scores,
+            "representation_progress": {
+                "enabled": True,
+                "signal_after": {"sequence": 0.0, "fer": 1.0},
+                "signal_deltas": {"sequence": -0.25, "fer": 0.0},
+                "organization_score_delta": -0.1,
+            },
+        }]
+    })
+    assert representation_prior["signal_deficits"]["sequence"] > 0.0
+    concept_prior = reading_mastery_history_self_teach_prior({
+        "entries": [{
+            "after_score_components": current_scores,
+            "self_teach_top_signal": "bridge",
+            "max_concept_insight_delta": 0.8,
+            "selected_by_insight": True,
+            "accepted_update": True,
+        }]
+    })
+    assert concept_prior["concept_connection_signal"] > 0.0
+    assert concept_prior["concept_insight_prior"][
+        "selected_by_insight_count"] == 1
+    concept_self_teach_plan = reading_self_teach_weight_plan(
+        current_scores, budget=0.06, history_prior=concept_prior,
+        history_prior_w=1.0)
+    assert concept_self_teach_plan["top_signal"] == "bridge"
+    assert concept_self_teach_plan["history_concept_connection_signal"] > 0.0
+    assert concept_self_teach_plan["weight_extras"]["bridge_w"] > 0.0
+    assert concept_self_teach_plan["weight_extras"]["discovery_w"] > 0.0
+    assert concept_self_teach_plan["weight_extras"]["gap_w"] > 0.0
+    assert math.isclose(sum(concept_self_teach_plan["weight_extras"].values()),
+                        0.06, rel_tol=1e-6, abs_tol=1e-6)
     concept_insight = reading_concept_insight_report(
         {"floor_score": 0.2, "signal_coverage": 0.5, "bridge_score": 0.2},
         {"floor_score": 0.3, "signal_coverage": 0.75, "bridge_score": 0.4},
@@ -7952,7 +8437,10 @@ def selftest():
         span_completion_w=0.0, context_closure_w=0.0,
         sequence_w=0.0, neighborhood_w=0.0, transition_w=0.0,
         cluster_w=0.0, study_self_teach_w=0.0, study_rounds=1,
-        study_score_patience=0, study_score_target=0.0, passthrough="kept")
+        study_score_patience=0, study_score_target=0.0,
+        study_probe_n=0, study_hard_max=0, study_refresh_steps=0,
+        neighborhood_probe_n=0, neighborhood_refresh_steps=0,
+        cluster_probe_n=0, cluster_refresh_steps=0, passthrough="kept")
     assert mastery_kwargs["reading_objective_profile"] == "mastery"
     assert mastery_kwargs["reading_objective_profile_report"]["applied"] is True
     assert mastery_kwargs["graph_predict_w"] == 0.10
@@ -7960,6 +8448,15 @@ def selftest():
     assert mastery_kwargs["study_rounds"] == 3
     assert mastery_kwargs["study_score_patience"] == 2
     assert mastery_kwargs["study_score_target"] == 0.85
+    assert mastery_kwargs["study_probe_n"] == 256
+    assert mastery_kwargs["study_hard_max"] == 64
+    assert mastery_kwargs["study_refresh_steps"] == 100
+    assert mastery_kwargs["neighborhood_probe_n"] == 256
+    assert mastery_kwargs["neighborhood_refresh_steps"] == 100
+    assert mastery_kwargs["cluster_probe_n"] == 256
+    assert mastery_kwargs["cluster_refresh_steps"] == 100
+    assert (mastery_kwargs["reading_objective_profile_report"]
+            ["operation_floors"]["study_probe_n"] == 256)
     assert mastery_kwargs["passthrough"] == "kept"
     assert (reading_self_teach_study_strategy(
         {"top_signal": "sequence"}, "auto", "discovery", reading_model)
@@ -7979,10 +8476,18 @@ def selftest():
         span_completion_w=0.0, context_closure_w=0.0,
         sequence_w=0.0, neighborhood_w=0.0, transition_w=0.0,
         cluster_w=0.0, study_self_teach_w=0.0, study_rounds=1,
-        study_score_patience=0, study_score_target=0.0)
+        study_score_patience=0, study_score_target=0.0,
+        study_probe_n=0, study_hard_max=0, study_refresh_steps=0,
+        neighborhood_probe_n=0, neighborhood_refresh_steps=0,
+        cluster_probe_n=0, cluster_refresh_steps=0)
     assert manual_kwargs["study_self_teach_w"] == 0.0
     assert manual_kwargs["study_rounds"] == 1
     assert manual_kwargs["study_score_target"] == 0.0
+    assert manual_kwargs["study_probe_n"] == 0
+    assert manual_kwargs["study_hard_max"] == 0
+    assert manual_kwargs["study_refresh_steps"] == 0
+    assert manual_kwargs["neighborhood_probe_n"] == 0
+    assert manual_kwargs["cluster_probe_n"] == 0
     assert manual_kwargs["reading_objective_profile_report"]["applied"] is False
     checkpoint_kwargs = reading_checkpoint_profile_kwargs(
         "mastery", replay_records=reading_records,
@@ -8068,6 +8573,11 @@ def selftest():
     assert math.isfinite(reading_model.reading_train_metrics["graph_cycle_loss"])
     assert math.isfinite(reading_model.reading_train_metrics["bridge_loss"])
     assert reading_model.reading_train_metrics["graph_transition_updates"] > 0
+    assert reading_model.reading_train_metrics["weight_update_changed"] is True
+    assert (reading_model.reading_train_metrics[
+        "weight_update_changed_tensor_count"] > 0)
+    assert reading_model.reading_train_metrics[
+        "weight_update_max_abs_delta"] > 0.0
     assert any(r.get("strategy") == "discovery"
                for r in reading_model.reading_study_reports)
     scored = [r.get("mean_score", 0.0) for r in reading_model.reading_study_reports
@@ -8182,6 +8692,7 @@ def selftest():
     assert helper_selection["concept_insight_gate"] is True
     assert helper_selection["self_teach_w"] == 0.05
     assert helper_selection["self_teach_reports"]
+    assert helper_selection["attempted_weight_update_count"] > 0
     assert helper_selection["self_teach_reports"][0]["branch_from_round"] == 0
     assert helper_selection["self_teach_reports"][0]["study_strategy"] in (
         READING_STUDY_STRATEGIES)
@@ -8191,6 +8702,11 @@ def selftest():
     assert "concept_insight" in helper_selection["rounds"][1]
     assert "concept_insight_delta" in helper_selection["rounds"][1]
     assert "replay_priority_sampling" in helper_selection["rounds"][1]
+    assert helper_selection["rounds"][1]["weight_update_changed"] is True
+    assert (helper_selection["rounds"][1][
+        "weight_update_changed_tensor_count"] > 0)
+    assert (helper_selection["rounds"][1][
+        "weight_update_changed_value_count"] > 0)
     if (helper_selection["rounds"][1]["study_strategy_used"]
             not in READING_BRIDGE_INSIGHT_STUDY_STRATEGIES):
         assert helper_selection["rounds"][1]["bridge_insight_gate"] is False
@@ -8240,23 +8756,46 @@ def selftest():
         "eval_records": 2,
         "reading_replay_bank": reading_replay_bank,
         "before_score_components": {"mastery_score": 0.2, "signal_coverage": 0.4},
-        "after_score_components": {"mastery_score": 0.3, "signal_coverage": 0.6},
+        "after_score_components": (
+            {"mastery_score": 0.3, "signal_coverage": 0.6}
+            | prior_scores),
         "delta": {"mastery_score": 0.1, "signal_coverage": 0.2},
         "selection": {
             "enabled": True,
             "accepted_update": True,
             "selected_round": 1,
             "selected_by_score": True,
+            "selected_by_insight": True,
             "selected_score_delta": 0.1,
+            "attempted_weight_update_count": 1,
             "rounds": [{
+                "round": 1,
                 "concept_insight_delta": 0.05,
                 "replay_priority_sampling": True,
                 "replay_priority_record_count": 1,
+                "weight_update_changed": True,
+                "weight_update_changed_tensor_count": 3,
+                "weight_update_changed_value_count": 4,
+                "weight_update_max_abs_delta": 0.01,
             }],
             "self_teach_reports": [{
                 "top_signal": "sequence",
                 "active_signals": ["sequence", "context"],
             }],
+        },
+        "representation_progress": {
+            "enabled": True,
+            "active_signals": ["fer", "bridge", "sequence"],
+            "signal_after": {"fer": 0.7, "bridge": 0.4, "sequence": 0.2},
+            "signal_deltas": {"fer": 0.1, "bridge": 0.2, "sequence": -0.1},
+            "organization_score_before": 0.3,
+            "organization_score_after": 0.5,
+            "organization_score_delta": 0.2,
+            "positive_signal_gain": 0.3,
+            "negative_signal_drift": 0.1,
+            "top_gain_signal": "bridge",
+            "top_regression_signal": "sequence",
+            "representation_insight_event": True,
         },
     }
     reading_selftest_report["reading_mastery_history"] = (
@@ -8275,6 +8814,16 @@ def selftest():
     assert first_history_entry["accepted_update"] is True
     assert first_history_entry["self_teach_top_signal"] == "sequence"
     assert (first_history_entry["replay_priority_round_record_count"] == 1)
+    assert first_history_entry["weight_update_changed"] is True
+    assert first_history_entry["weight_update_changed_tensor_count"] == 3
+    assert first_history_entry["weight_update_changed_value_count"] == 4
+    assert first_history_entry["weight_update_max_abs_delta"] == 0.01
+    assert first_history_entry["attempted_weight_update_count"] == 1
+    assert first_history_entry["representation_insight_event"] is True
+    assert (first_history_entry[
+        "representation_organization_score_delta"] == 0.2)
+    assert first_history_entry["representation_top_gain_signal"] == "bridge"
+    assert first_history_entry["representation_progress"]["enabled"] is True
     assert reading_mastery_history_from_payload({})["entry_count"] == 0
     priority_replay_bank = build_reading_replay_bank(
         reading_records,
@@ -8377,7 +8926,19 @@ def selftest():
         assert study_report["selection"]["enabled"] is False
         assert study_report["selection"]["self_teach_w"] == 0.05
         assert study_report["train_metrics"]["self_teach_w"] == 0.05
+        assert study_report["reading_mastery_history_prior"]["enabled"] is True
+        assert study_report["reading_mastery_history_prior"]["entry_count"] == 1
+        assert study_report["reading_mastery_history_prior"][
+            "concept_connection_signal"] > 0.0
         assert study_report["train_metrics"]["self_teach_plan"]["enabled"] is True
+        assert study_report["train_metrics"]["self_teach_plan"][
+            "history_prior_enabled"] is True
+        assert study_report["train_metrics"]["self_teach_plan"][
+            "history_prior_entry_count"] == 1
+        assert study_report["train_metrics"]["self_teach_plan"][
+            "history_signal_deficits"]["sequence"] > 0.0
+        assert study_report["train_metrics"]["self_teach_plan"][
+            "history_concept_connection_signal"] > 0.0
         assert sum(study_report["train_metrics"]["self_teach_plan"][
             "weight_extras"].values()) > 0.0
         assert study_report["train_metrics"]["replay_records"] > 0
@@ -8398,6 +8959,14 @@ def selftest():
         assert history_entries[1]["experiment"] == (
             "text_raw_reading_checkpoint_study")
         assert history_entries[1]["replay_bank_used"] is True
+        assert history_entries[1]["weight_update_changed"] is True
+        assert history_entries[1]["weight_update_changed_tensor_count"] > 0
+        assert history_entries[1]["weight_update_changed_value_count"] > 0
+        assert history_entries[1]["weight_update_max_abs_delta"] > 0.0
+        assert history_entries[1]["attempted_weight_update_count"] > 0
+        assert history_entries[1]["representation_progress"]["enabled"] is True
+        assert math.isfinite(
+            history_entries[1]["representation_organization_score_delta"])
         assert history_entries[1]["self_teach_top_signal"]
     print("text selftest OK")
 
@@ -8504,8 +9073,14 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-bridge-w", type=float, default=0.0)
     ap.add_argument("--reading-neighborhood-w", type=float, default=0.0)
     ap.add_argument("--reading-neighborhood-batch", type=int, default=0)
-    ap.add_argument("--reading-neighborhood-probe-n", type=int, default=0)
-    ap.add_argument("--reading-neighborhood-refresh-steps", type=int, default=0)
+    ap.add_argument(
+        "--reading-neighborhood-probe-n", type=int, default=0,
+        help=("candidate count for neighborhood mining; mastery profile "
+              "raises 0 to its bounded default"))
+    ap.add_argument(
+        "--reading-neighborhood-refresh-steps", type=int, default=0,
+        help=("steps between neighborhood remine passes; mastery profile "
+              "raises 0 to its periodic default"))
     ap.add_argument("--reading-neighborhood-temperature", type=float, default=0.1)
     ap.add_argument("--reading-neighborhood-margin", type=float, default=0.0)
     ap.add_argument("--reading-transition-w", type=float, default=0.05)
@@ -8514,16 +9089,31 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-transition-margin", type=float, default=0.0)
     ap.add_argument("--reading-cluster-w", type=float, default=0.0)
     ap.add_argument("--reading-cluster-batch", type=int, default=0)
-    ap.add_argument("--reading-cluster-probe-n", type=int, default=0)
-    ap.add_argument("--reading-cluster-refresh-steps", type=int, default=0)
+    ap.add_argument(
+        "--reading-cluster-probe-n", type=int, default=0,
+        help=("candidate count for cluster mining; mastery profile raises "
+              "0 to its bounded default"))
+    ap.add_argument(
+        "--reading-cluster-refresh-steps", type=int, default=0,
+        help=("steps between cluster remine passes; mastery profile raises "
+              "0 to its periodic default"))
     ap.add_argument("--reading-cluster-temperature", type=float, default=0.1)
     ap.add_argument("--reading-cluster-margin", type=float, default=0.0)
     ap.add_argument("--reading-cluster-min-size", type=int, default=2)
     ap.add_argument("--reading-study-strategy",
                     choices=READING_STUDY_STRATEGIES, default="auto")
-    ap.add_argument("--reading-study-probe-n", type=int, default=0)
-    ap.add_argument("--reading-study-hard-max", type=int, default=0)
-    ap.add_argument("--reading-study-refresh-steps", type=int, default=0)
+    ap.add_argument(
+        "--reading-study-probe-n", type=int, default=0,
+        help=("candidate count for hard-study mining; mastery profile "
+              "raises 0 to its bounded default"))
+    ap.add_argument(
+        "--reading-study-hard-max", type=int, default=0,
+        help=("cap on selected hard records; mastery profile raises 0 to "
+              "its bounded default"))
+    ap.add_argument(
+        "--reading-study-refresh-steps", type=int, default=0,
+        help=("steps between hard-study remine passes; mastery profile "
+              "raises 0 to its periodic default"))
     ap.add_argument("--reading-study-select-best",
                     action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--reading-study-rounds", type=int, default=1)
@@ -8537,6 +9127,9 @@ def _add_reading_args(ap):
                     type=float, default=0.25, dest="reading_study_insight_accept_w")
     ap.add_argument("--reading-study-insight-min-delta", type=float, default=0.0)
     ap.add_argument("--reading-study-self-teach-w", type=float, default=0.0)
+    ap.add_argument("--reading-self-teach-history-prior-w", type=float, default=0.5,
+                    help=("blend weight for checkpoint mastery-history deficits "
+                          "inside self-teach allocation"))
 
 
 def _reading_kwargs(args):
@@ -8696,6 +9289,8 @@ def main(argv=None):
         return
     if args.latent_concept_topk < 0:
         raise SystemExit("--latent-concept-topk must be non-negative")
+    if args.reading_self_teach_history_prior_w < 0.0:
+        raise SystemExit("--reading-self-teach-history-prior-w must be non-negative")
     if not args.reading_data:
         raise SystemExit("--reading-data is required unless --selftest is set")
     reading_common = _reading_kwargs(args)
@@ -8708,6 +9303,7 @@ def main(argv=None):
             replay_w=args.reading_replay_w,
             replay_batch=args.reading_replay_batch,
             replay_retention_w=args.reading_replay_retention_w,
+            self_teach_history_prior_w=args.reading_self_teach_history_prior_w,
             latent_concept_slots=args.latent_concept_slots,
             latent_concept_layers=args.latent_concept_layers,
             latent_concept_topk=args.latent_concept_topk,

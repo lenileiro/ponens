@@ -11,9 +11,14 @@ The current bet is that language mastery should come from reading, latent struct
 reanalysis, self-generated memory gaps, graph-closure insight, partial-context closure surprise,
 and cross-modal concept pressure, not from hand-authored task harnesses or templated phrasing
 rules. Raw-reading checkpoint continuation reuses the model's own replay bank under the mastery
-profile, so new reading can update weights without discarding earlier concepts. The code keeps
-model inputs manifest-driven: datasets provide text, feature views, image records, and optional
-target tokens; model code learns the representations.
+profile, so new reading can update weights without discarding earlier concepts. Reading and
+multimodal checkpoints carry label-free representation-progress signals, letting later self-teach
+runs reuse internal FER/bridge/sequence weaknesses rather than only surface scores. Multimodal text
+transfer is target-probed before trust: a harmful reading checkpoint can be rolled back before its
+history prior drives new training. The default reading profile also owns bounded hard-study
+probing, selected hard-record caps, and periodic structure refreshes, so normal commands do not
+need low-level study flags. The code keeps model inputs manifest-driven: datasets provide text,
+feature views, image records, and optional target tokens; model code learns the representations.
 
 ## What's here
 
@@ -221,9 +226,6 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --steps 4 --batch 16 --d 96 --layers 2 --heads 4 \
     --latent-concept-slots 6 --latent-concept-topk 3 --latent-concept-layers 1 \
     --reading-max-tokens 96 --reading-min-tokens 8 --reading-eval-n 32 \
-    --reading-objective-profile mastery \
-    --reading-study-strategy auto --reading-study-probe-n 48 \
-    --reading-study-hard-max 24 --reading-study-refresh-steps 1 \
     --reading-memory-size 64 --reading-memory-w 0.05 \
     --reading-association-w 0.05 --reading-association-transitive-steps 3 \
     --reading-association-transitive-w 0.25 \
@@ -236,17 +238,15 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --reading-gap-transitive-w 0.25 \
     --reading-context-target-w 0.1 --reading-span-completion-w 0.05 \
     --reading-neighborhood-w 0.05 \
-    --reading-neighborhood-batch 8 --reading-neighborhood-probe-n 32 \
+    --reading-neighborhood-batch 8 \
     --reading-transition-w 0.05 --reading-transition-batch 8 \
     --reading-cluster-w 0.05 --reading-cluster-batch 16 \
-    --reading-cluster-probe-n 32 \
     --out runs/text_raw_reading_discovery_study_smoke.json \
     --checkpoint runs/text_raw_reading_discovery_study_smoke.pt
 .venv/bin/python -m thinking.text --reading-data README.md \
     --reading-checkpoint runs/text_raw_reading_discovery_study_smoke.pt \
     --reading-out-checkpoint runs/text_raw_reading_discovery_study_continued.pt \
-    --steps 4 --batch 16 --reading-study-strategy auto \
-    --reading-objective-profile mastery \
+    --steps 4 --batch 16 \
     --reading-memory-size 64 --reading-memory-w 0.05 \
     --reading-association-w 0.05 --reading-gap-w 0.05 \
     --out runs/text_raw_reading_discovery_study_continued.json
@@ -271,6 +271,15 @@ RUNPOD_API_KEY=... .venv/bin/python runpod/launch_thinking.py \
     --text-checkpoint runs/text_raw_reading_discovery_study_smoke.pt \
     --out runs/m0_multimodal_discovery_study_smoke.json \
     --checkpoint runs/m0_multimodal_discovery_study_smoke.pt
+
+.venv/bin/python -m thinking.multimodal --manifest data/multimodal_manifest.jsonl \
+    --multimodal-checkpoint runs/m0_multimodal_discovery_study_smoke.pt \
+    --steps 3 --batch 4 --dim 96 --layers 1 --heads 4 --eval-n 20 \
+    --latent-concept-slots 6 --latent-concept-memory-size 64 \
+    --self-teach-w 0.05 --self-teach-history-prior-w 1.0 \
+    --representation-probe-n 20 \
+    --out runs/m0_multimodal_discovery_study_continued.json \
+    --checkpoint runs/m0_multimodal_discovery_study_continued.pt
 ```
 
 GPU runs: `runpod/launch_thinking.py` (see the package docs).
