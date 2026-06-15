@@ -35,6 +35,19 @@ READING_DEFAULT_SOURCE_BALANCE_W = 0.5
 MULTIMODAL_DEFAULT_SOURCE_BALANCE_W = 0.5
 
 
+def image_embed_model_min_flow_width(model):
+    name = str(model or "").lower()
+    if "siglip-so400m" in name or "siglip2-so400m" in name:
+        return 1152
+    if ("siglip-large" in name or "clip-vit-large" in name
+            or ("dino" in name and "large" in name)):
+        return 1024
+    if ("siglip-base" in name or "clip-vit-base" in name
+            or ("dino" in name and "base" in name)):
+        return 768
+    return 0
+
+
 def api(method, path, key, body=None):
     url = REST + path
     data = json.dumps(body).encode() if body is not None else None
@@ -284,6 +297,20 @@ def text_reading_cmd(args, py):
         f"--reading-objective-profile {args.reading_objective_profile} "
         f"--reading-lr {args.reading_lr} "
         f"--reading-lm-w {args.reading_lm_w} "
+        f"--reading-continuation-repair-w "
+        f"{args.reading_continuation_repair_w} "
+        f"--reading-continuation-repair-steps "
+        f"{args.reading_continuation_repair_steps} "
+        f"--reading-continuation-repair-prompt-frac "
+        f"{args.reading_continuation_repair_prompt_frac} "
+        f"--reading-continuation-repair-temperature "
+        f"{args.reading_continuation_repair_temperature} "
+        f"--reading-continuation-repair-top-k "
+        f"{args.reading_continuation_repair_top_k} "
+        f"--reading-repetition-unlikelihood-w "
+        f"{args.reading_repetition_unlikelihood_w} "
+        f"--reading-repetition-unlikelihood-window "
+        f"{args.reading_repetition_unlikelihood_window} "
         f"--reading-token-drop {args.reading_token_drop} "
         f"--reading-token-replace {args.reading_token_replace} "
         f"--reading-feature-dropout {args.reading_feature_dropout} "
@@ -512,6 +539,7 @@ def apply_image_quality_preset(args):
     args.image_require_image_embedding_sequences = True
     args.image_require_quality_scores = True
     args.image_require_quality_score_range = True
+    args.image_require_flow_width_for_image_embeddings = True
     args.image_clean_min_caption_tokens = max(
         int(args.image_clean_min_caption_tokens), 4 if hq else 3)
     if hq and float(args.image_clean_min_caption_unique_ratio) <= 0.0:
@@ -551,10 +579,12 @@ def apply_image_quality_preset(args):
     args.image_latent_downsample = 8
     args.image_latent_patch_size = max(int(args.image_latent_patch_size), 4 if hq else 2)
     args.image_latent_max_tokens = max(int(args.image_latent_max_tokens), 2048)
+    min_embed_flow_width = image_embed_model_min_flow_width(args.image_embed_model)
+    min_preset_flow_width = max(min_embed_flow_width, 768 if hq else 512)
     if int(args.dim or 0) <= 0:
-        args.dim = 768 if hq else 512
-    elif hq:
-        args.dim = max(int(args.dim), 768)
+        args.dim = min_preset_flow_width
+    else:
+        args.dim = max(int(args.dim), min_preset_flow_width)
     if int(args.batch) == 16:
         args.batch = 2 if hq else 4
     if int(args.train_steps or 0) <= 0:
@@ -1547,6 +1577,8 @@ def payload(args):
                 train += " --require-quality-scores"
             if args.image_require_quality_score_range:
                 train += " --require-quality-score-range"
+            if args.image_require_flow_width_for_image_embeddings:
+                train += " --require-flow-width-for-image-embeddings"
             if args.image_flow_cache_latents:
                 train += " --flow-cache-latents"
             if args.image_sample_finite_guard:
@@ -2467,6 +2499,21 @@ def main():
                     dest="reading_lm_w",
                     help=("causal next-token loss weight for raw reading; "
                           "mastery profile raises this by default"))
+    ap.add_argument("--reading-continuation-repair-w", type=float, default=0.0,
+                    dest="reading_continuation_repair_w")
+    ap.add_argument("--reading-continuation-repair-steps", type=int, default=4,
+                    dest="reading_continuation_repair_steps")
+    ap.add_argument("--reading-continuation-repair-prompt-frac", type=float,
+                    default=0.5, dest="reading_continuation_repair_prompt_frac")
+    ap.add_argument("--reading-continuation-repair-temperature", type=float,
+                    default=0.0,
+                    dest="reading_continuation_repair_temperature")
+    ap.add_argument("--reading-continuation-repair-top-k", type=int, default=0,
+                    dest="reading_continuation_repair_top_k")
+    ap.add_argument("--reading-repetition-unlikelihood-w", type=float,
+                    default=0.0, dest="reading_repetition_unlikelihood_w")
+    ap.add_argument("--reading-repetition-unlikelihood-window", type=int,
+                    default=32, dest="reading_repetition_unlikelihood_window")
     ap.add_argument("--reading-token-drop", type=float, default=0.15,
                     dest="reading_token_drop")
     ap.add_argument("--reading-token-replace", type=float, default=0.05,
@@ -3414,6 +3461,10 @@ def main():
     ap.add_argument("--image-require-quality-score-range", action="store_true",
                     dest="image_require_quality_score_range",
                     help="require non-tied quality scores for quality/ranking objectives")
+    ap.add_argument("--image-require-flow-width-for-image-embeddings", action="store_true",
+                    dest="image_require_flow_width_for_image_embeddings",
+                    help=("require image latent hidden width to be at least the image "
+                          "embedding dimension used by feature/REPA alignment"))
     ap.add_argument("--image-eval-split", default="eval", dest="image_eval_split",
                     help="manifest split used by --image-eval-sweep for real image eval")
     ap.add_argument("--image-eval-max-records", type=int, default=0,
@@ -4670,6 +4721,18 @@ def main():
             "--reading-replay-batch": args.reading_replay_batch,
             "--reading-replay-retention-w": args.reading_replay_retention_w,
             "--reading-lm-w": args.reading_lm_w,
+            "--reading-continuation-repair-w": (
+                args.reading_continuation_repair_w),
+            "--reading-continuation-repair-steps": (
+                args.reading_continuation_repair_steps),
+            "--reading-continuation-repair-temperature": (
+                args.reading_continuation_repair_temperature),
+            "--reading-continuation-repair-top-k": (
+                args.reading_continuation_repair_top_k),
+            "--reading-repetition-unlikelihood-w": (
+                args.reading_repetition_unlikelihood_w),
+            "--reading-repetition-unlikelihood-window": (
+                args.reading_repetition_unlikelihood_window),
             "--reading-context-target-w": args.reading_context_target_w,
             "--reading-span-completion-w": args.reading_span_completion_w,
             "--reading-context-closure-w": args.reading_context_closure_w,
@@ -4764,6 +4827,10 @@ def main():
             sys.exit(
                 "ERROR: raw-reading controls must be non-negative: "
                 + ", ".join(bad_text_nonnegative))
+        if (args.reading_continuation_repair_prompt_frac <= 0.0
+                or args.reading_continuation_repair_prompt_frac >= 1.0):
+            sys.exit(
+                "ERROR: --reading-continuation-repair-prompt-frac must be in (0, 1)")
         if args.reading_lr <= 0.0:
             sys.exit("ERROR: --reading-lr must be positive")
         if args.reading_eval_frac < 0.0 or args.reading_eval_frac >= 1.0:

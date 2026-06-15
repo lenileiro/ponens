@@ -1560,6 +1560,181 @@ def reading_causal_lm_loss(model, txt, pad=0):
     return token_loss(logits, txt, pad=pad)
 
 
+def reading_repetition_unlikelihood_loss(model, txt, pad=0, window=32):
+    """Penalize recent non-gold repeats that create free-generation attractors."""
+    zero = txt.float().sum() * 0.0
+    window = int(window)
+    if txt.shape[1] < 2 or window <= 0:
+        return zero, {
+            "enabled": False, "skipped": True, "skip_reason": "too_short",
+            "tokens": 0, "candidates": 0, "window": int(window),
+        }
+    logits = model.lm(txt)
+    max_steps = min(logits.shape[1] - 1, txt.shape[1] - 1)
+    if max_steps <= 0:
+        return logits.sum() * 0.0, {
+            "enabled": False, "skipped": True, "skip_reason": "too_short",
+            "tokens": 0, "candidates": 0, "window": int(window),
+        }
+    targets = txt[:, 1:1 + max_steps]
+    valid = targets.ne(int(pad))
+    if not bool(valid.any()):
+        return logits.sum() * 0.0, {
+            "enabled": False, "skipped": True, "skip_reason": "empty_targets",
+            "tokens": 0, "candidates": 0, "window": int(window),
+        }
+    probs = torch.softmax(logits[:, :max_steps].float(), dim=-1)
+    losses = []
+    candidate_any = torch.zeros_like(valid, dtype=torch.bool)
+    candidate_total = valid.new_zeros((), dtype=torch.long)
+    for back in range(max(1, window)):
+        candidates = txt.new_full(targets.shape, int(pad))
+        width = max_steps - back
+        if width <= 0:
+            break
+        candidates[:, back:] = txt[:, :width]
+        mask = valid & candidates.ne(int(pad)) & candidates.ne(targets)
+        if not bool(mask.any()):
+            continue
+        neg_probs = probs.gather(
+            -1, candidates.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+        neg_loss = -torch.log1p(
+            -neg_probs.clamp(min=1e-6, max=1.0 - 1e-6))
+        losses.append(neg_loss.masked_select(mask).mean())
+        candidate_any |= mask
+        candidate_total = candidate_total + mask.sum()
+    if not losses:
+        return logits.sum() * 0.0, {
+            "enabled": False, "skipped": True,
+            "skip_reason": "no_negative_repeats",
+            "tokens": 0, "candidates": 0, "window": int(window),
+        }
+    return sum(losses) / len(losses), {
+        "enabled": True,
+        "skipped": False,
+        "tokens": int(candidate_any.sum().detach().cpu()),
+        "candidates": int(candidate_total.detach().cpu()),
+        "window": int(window),
+    }
+
+
+def reading_continuation_repair_loss(
+        model, txt, pad=0, repair_steps=4, prompt_frac=0.5,
+        temperature=0.0, top_k=0):
+    """Train recovery from the reader's own free-running continuation errors."""
+    zero = txt.float().sum() * 0.0
+    repair_steps = int(repair_steps)
+    prompt_frac = float(prompt_frac)
+    if txt.shape[0] == 0 or txt.shape[1] < 2 or repair_steps <= 0:
+        return zero, {
+            "enabled": False, "skipped": True, "skip_reason": "too_short",
+            "tokens": 0, "generated_tokens": 0, "changed_tokens": 0,
+            "steps": int(repair_steps), "prompt_frac": float(prompt_frac),
+            "temperature": float(temperature), "top_k": int(top_k),
+        }
+    lengths = txt.ne(int(pad)).sum(dim=1).detach().cpu().tolist()
+    prompt_lens = []
+    repair_lens = []
+    for length in lengths:
+        length = int(length)
+        if length < 2:
+            prompt_lens.append(0)
+            repair_lens.append(0)
+            continue
+        prompt_len = int(round(float(length) * prompt_frac))
+        prompt_len = max(1, min(prompt_len, length - 1))
+        repair_len = min(repair_steps, length - prompt_len)
+        prompt_lens.append(prompt_len)
+        repair_lens.append(repair_len)
+    if not any(repair_lens):
+        return zero, {
+            "enabled": False, "skipped": True,
+            "skip_reason": "no_repair_targets",
+            "tokens": 0, "generated_tokens": 0, "changed_tokens": 0,
+            "steps": int(repair_steps), "prompt_frac": float(prompt_frac),
+            "temperature": float(temperature), "top_k": int(top_k),
+        }
+
+    mixed = txt.detach().clone()
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        max_repair = max(repair_lens)
+        for step in range(max_repair):
+            active_rows = [
+                i for i, repair_len in enumerate(repair_lens)
+                if step < repair_len
+            ]
+            if not active_rows:
+                continue
+            context_lens = [prompt_lens[i] + step for i in active_rows]
+            max_context = max(context_lens)
+            context = txt.new_full((len(active_rows), max_context), int(pad))
+            for out_i, row_i in enumerate(active_rows):
+                context[out_i, :context_lens[out_i]] = mixed[
+                    row_i, :context_lens[out_i]]
+            logits = model.lm(context)
+            for out_i, row_i in enumerate(active_rows):
+                next_id = _reading_generation_next_id(
+                    logits[out_i, context_lens[out_i] - 1], pad,
+                    temperature=temperature, top_k=top_k)
+                mixed[row_i, prompt_lens[row_i] + step] = next_id
+    if was_training:
+        model.train()
+
+    logits = model.lm(mixed)
+    if logits.shape[1] < 2:
+        return logits.sum() * 0.0, {
+            "enabled": False, "skipped": True,
+            "skip_reason": "too_short",
+            "tokens": 0, "generated_tokens": int(sum(repair_lens)),
+            "changed_tokens": 0,
+            "steps": int(repair_steps), "prompt_frac": float(prompt_frac),
+            "temperature": float(temperature), "top_k": int(top_k),
+        }
+    targets = txt[:, 1:]
+    raw = F.cross_entropy(
+        logits[:, :-1].reshape(-1, logits.shape[-1]),
+        targets.reshape(-1), reduction="none").view_as(targets)
+    mask = torch.zeros_like(targets, dtype=torch.bool)
+    for row_i, repair_len in enumerate(repair_lens):
+        if repair_len <= 0:
+            continue
+        start = max(0, prompt_lens[row_i] - 1)
+        end = min(targets.shape[1], prompt_lens[row_i] + repair_len - 1)
+        if end > start:
+            mask[row_i, start:end] = True
+    mask &= targets.ne(int(pad))
+    generated = int(sum(repair_lens))
+    changed = 0
+    for row_i, repair_len in enumerate(repair_lens):
+        if repair_len <= 0:
+            continue
+        start = prompt_lens[row_i]
+        end = start + repair_len
+        changed += int((mixed[row_i, start:end] != txt[row_i, start:end]).sum().cpu())
+    if not bool(mask.any()):
+        return logits.sum() * 0.0, {
+            "enabled": False, "skipped": True,
+            "skip_reason": "empty_loss_mask",
+            "tokens": 0, "generated_tokens": generated,
+            "changed_tokens": int(changed),
+            "steps": int(repair_steps), "prompt_frac": float(prompt_frac),
+            "temperature": float(temperature), "top_k": int(top_k),
+        }
+    return raw.masked_select(mask).mean(), {
+        "enabled": True,
+        "skipped": False,
+        "tokens": int(mask.sum().detach().cpu()),
+        "generated_tokens": generated,
+        "changed_tokens": int(changed),
+        "steps": int(repair_steps),
+        "prompt_frac": float(prompt_frac),
+        "temperature": float(temperature),
+        "top_k": int(top_k),
+    }
+
+
 def reading_causal_lm_eval(model, vocab, records, device=DEV, n=0, seed=0):
     candidates = [r for r in records if r.split == "eval"] or list(records)
     if not candidates:
@@ -3164,6 +3339,10 @@ READING_MASTERY_OBJECTIVE_FLOORS = {
     "transition_w": 0.05,
     "cluster_w": 0.05,
     "study_self_teach_w": 0.05,
+    "continuation_repair_w": 0.05,
+    "continuation_repair_steps": 4,
+    "repetition_unlikelihood_w": 0.05,
+    "repetition_unlikelihood_window": 32,
 }
 READING_MASTERY_STUDY_FLOORS = {
     "study_rounds": 3,
@@ -3222,7 +3401,8 @@ READING_SELF_TEACH_SCORE_KEYS = {
 }
 READING_SELF_TEACH_SIGNAL_OBJECTIVES = {
     "language": ("lm_w",),
-    "generation": ("lm_w", "sequence_w", "context_closure_w"),
+    "generation": ("lm_w", "continuation_repair_w",
+                   "repetition_unlikelihood_w"),
     "view": ("factorization_w",),
     "context": ("context_target_w",),
     "span": ("span_completion_w",),
@@ -5159,6 +5339,13 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          seed=0, device=DEV, log_every=100,
                          token_drop_p=0.15, token_replace_p=0.05,
                          feature_dropout=0.1, lm_w=0.0,
+                         continuation_repair_w=0.0,
+                         continuation_repair_steps=4,
+                         continuation_repair_prompt_frac=0.5,
+                         continuation_repair_temperature=0.0,
+                         continuation_repair_top_k=0,
+                         repetition_unlikelihood_w=0.0,
+                         repetition_unlikelihood_window=32,
                          invariance_w=25.0, variance_w=25.0,
                          covariance_w=1.0, variance_target=1.0,
                          factorization_w=0.05,
@@ -5239,6 +5426,21 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("raw reading concept training requires latent concept slots")
     if float(lm_w) < 0.0:
         raise ValueError("reading LM loss weight must be non-negative")
+    if float(continuation_repair_w) < 0.0:
+        raise ValueError("reading continuation repair weight must be non-negative")
+    if int(continuation_repair_steps) < 0:
+        raise ValueError("reading continuation repair steps must be non-negative")
+    if (float(continuation_repair_prompt_frac) <= 0.0
+            or float(continuation_repair_prompt_frac) >= 1.0):
+        raise ValueError("reading continuation repair prompt fraction must be in (0, 1)")
+    if float(continuation_repair_temperature) < 0.0:
+        raise ValueError("reading continuation repair temperature must be non-negative")
+    if int(continuation_repair_top_k) < 0:
+        raise ValueError("reading continuation repair top-k must be non-negative")
+    if float(repetition_unlikelihood_w) < 0.0:
+        raise ValueError("reading repetition unlikelihood weight must be non-negative")
+    if int(repetition_unlikelihood_window) < 0:
+        raise ValueError("reading repetition unlikelihood window must be non-negative")
     if float(context_target_w) < 0.0:
         raise ValueError("reading context-target loss weight must be non-negative")
     if float(factorization_w) < 0.0:
@@ -5584,6 +5786,19 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     last_training_priority_mean = 0.0
     last_training_priority_max = 0.0
     last_lm_loss = 0.0
+    last_continuation_repair = 0.0
+    last_continuation_repair_enabled = False
+    last_continuation_repair_skipped = True
+    last_continuation_repair_skip_reason = "not_run"
+    last_continuation_repair_tokens = 0
+    last_continuation_repair_generated_tokens = 0
+    last_continuation_repair_changed_tokens = 0
+    last_repetition_unlikelihood = 0.0
+    last_repetition_unlikelihood_enabled = False
+    last_repetition_unlikelihood_skipped = True
+    last_repetition_unlikelihood_skip_reason = "not_run"
+    last_repetition_unlikelihood_tokens = 0
+    last_repetition_unlikelihood_candidates = 0
 
     def selected_id_sample(selected, limit=16):
         return [rec.rec_id for rec in selected[:int(limit)]]
@@ -5780,6 +5995,38 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         txt = pack_reading(rec_batch, vocab, device)
         lm_loss = (reading_causal_lm_loss(model, txt, pad=vocab.pad)
                    if lm_w else txt.float().sum() * 0.0)
+        if repetition_unlikelihood_w:
+            repetition_unlikelihood, repetition_unlikelihood_metrics = (
+                reading_repetition_unlikelihood_loss(
+                    model, txt, pad=vocab.pad,
+                    window=repetition_unlikelihood_window))
+        else:
+            repetition_unlikelihood = txt.float().sum() * 0.0
+            repetition_unlikelihood_metrics = {
+                "enabled": False, "skipped": True,
+                "skip_reason": "weight_zero",
+                "tokens": 0, "candidates": 0,
+                "window": int(repetition_unlikelihood_window),
+            }
+        if continuation_repair_w:
+            continuation_repair, continuation_repair_metrics = (
+                reading_continuation_repair_loss(
+                    model, txt, pad=vocab.pad,
+                    repair_steps=continuation_repair_steps,
+                    prompt_frac=continuation_repair_prompt_frac,
+                    temperature=continuation_repair_temperature,
+                    top_k=continuation_repair_top_k))
+        else:
+            continuation_repair = txt.float().sum() * 0.0
+            continuation_repair_metrics = {
+                "enabled": False, "skipped": True,
+                "skip_reason": "weight_zero",
+                "tokens": 0, "generated_tokens": 0, "changed_tokens": 0,
+                "steps": int(continuation_repair_steps),
+                "prompt_frac": float(continuation_repair_prompt_frac),
+                "temperature": float(continuation_repair_temperature),
+                "top_k": int(continuation_repair_top_k),
+            }
         view_loss = reading_latent_view_loss(
             model, txt, vocab.pad, vocab.unk, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
@@ -6094,6 +6341,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                 replay_teacher_vocab, device=device,
                 feature_dropout=feature_dropout)
         loss = (float(lm_w) * lm_loss
+                + float(continuation_repair_w) * continuation_repair
+                + float(repetition_unlikelihood_w) * repetition_unlikelihood
                 + view_loss + float(factorization_w) * factorization_loss
                 + float(fer_w) * fer_loss
                 + float(memory_w) * memory_loss
@@ -6148,6 +6397,30 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                     feature_dropout=0.0, decay=association_decay))
         last_loss = float(loss.detach())
         last_lm_loss = float(lm_loss.detach())
+        last_continuation_repair = float(continuation_repair.detach())
+        last_continuation_repair_enabled = bool(
+            continuation_repair_metrics["enabled"])
+        last_continuation_repair_skipped = bool(
+            continuation_repair_metrics["skipped"])
+        last_continuation_repair_skip_reason = str(
+            continuation_repair_metrics.get("skip_reason", ""))
+        last_continuation_repair_tokens = int(
+            continuation_repair_metrics["tokens"])
+        last_continuation_repair_generated_tokens = int(
+            continuation_repair_metrics["generated_tokens"])
+        last_continuation_repair_changed_tokens = int(
+            continuation_repair_metrics["changed_tokens"])
+        last_repetition_unlikelihood = float(repetition_unlikelihood.detach())
+        last_repetition_unlikelihood_enabled = bool(
+            repetition_unlikelihood_metrics["enabled"])
+        last_repetition_unlikelihood_skipped = bool(
+            repetition_unlikelihood_metrics["skipped"])
+        last_repetition_unlikelihood_skip_reason = str(
+            repetition_unlikelihood_metrics.get("skip_reason", ""))
+        last_repetition_unlikelihood_tokens = int(
+            repetition_unlikelihood_metrics["tokens"])
+        last_repetition_unlikelihood_candidates = int(
+            repetition_unlikelihood_metrics["candidates"])
         last_view_loss = float(view_loss.detach())
         last_factorization = float(factorization_loss.detach())
         last_fer = float(fer_loss.detach())
@@ -6249,6 +6522,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         if st % log_every == 0 or st == steps:
             print(f"  reading {st}/{steps} loss {last_loss:.3f} "
                   f"lm {last_lm_loss:.3f} "
+                  f"repair {last_continuation_repair:.3f} "
+                  f"repeat {last_repetition_unlikelihood:.3f} "
                   f"view {last_view_loss:.3f} "
                   f"factor {last_factorization:.3f} "
                   f"fer {last_fer:.3f} "
@@ -6335,6 +6610,36 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "study_strategy": study_strategy,
         "lm_loss": last_lm_loss,
         "lm_w": float(lm_w),
+        "continuation_repair_loss": last_continuation_repair,
+        "continuation_repair_w": float(continuation_repair_w),
+        "continuation_repair_steps": int(continuation_repair_steps),
+        "continuation_repair_prompt_frac": float(
+            continuation_repair_prompt_frac),
+        "continuation_repair_temperature": float(
+            continuation_repair_temperature),
+        "continuation_repair_top_k": int(continuation_repair_top_k),
+        "continuation_repair_enabled": bool(last_continuation_repair_enabled),
+        "continuation_repair_skipped": bool(last_continuation_repair_skipped),
+        "continuation_repair_skip_reason": str(
+            last_continuation_repair_skip_reason),
+        "continuation_repair_tokens": int(last_continuation_repair_tokens),
+        "continuation_repair_generated_tokens": int(
+            last_continuation_repair_generated_tokens),
+        "continuation_repair_changed_tokens": int(
+            last_continuation_repair_changed_tokens),
+        "repetition_unlikelihood_loss": last_repetition_unlikelihood,
+        "repetition_unlikelihood_w": float(repetition_unlikelihood_w),
+        "repetition_unlikelihood_window": int(repetition_unlikelihood_window),
+        "repetition_unlikelihood_enabled": bool(
+            last_repetition_unlikelihood_enabled),
+        "repetition_unlikelihood_skipped": bool(
+            last_repetition_unlikelihood_skipped),
+        "repetition_unlikelihood_skip_reason": str(
+            last_repetition_unlikelihood_skip_reason),
+        "repetition_unlikelihood_tokens": int(
+            last_repetition_unlikelihood_tokens),
+        "repetition_unlikelihood_candidates": int(
+            last_repetition_unlikelihood_candidates),
         "latent_view_loss": last_view_loss,
         "factorization_loss": last_factorization,
         "factorization_w": float(factorization_w),
@@ -6641,6 +6946,11 @@ def fit_reading_concepts_select_best(
         seed=0, device=DEV, log_every=100,
         token_drop_p=0.15, token_replace_p=0.05,
         feature_dropout=0.1, lm_w=0.0,
+        continuation_repair_w=0.0, continuation_repair_steps=4,
+        continuation_repair_prompt_frac=0.5,
+        continuation_repair_temperature=0.0,
+        continuation_repair_top_k=0,
+        repetition_unlikelihood_w=0.0, repetition_unlikelihood_window=32,
         invariance_w=25.0, variance_w=25.0,
         covariance_w=1.0, variance_target=1.0,
         factorization_w=0.05, factorization_variance=0.05,
@@ -6862,6 +7172,17 @@ def fit_reading_concepts_select_best(
             token_drop_p=token_drop_p, token_replace_p=token_replace_p,
             feature_dropout=feature_dropout,
             lm_w=lm_w + weight_extras["lm_w"],
+            continuation_repair_w=(
+                continuation_repair_w
+                + weight_extras["continuation_repair_w"]),
+            continuation_repair_steps=continuation_repair_steps,
+            continuation_repair_prompt_frac=continuation_repair_prompt_frac,
+            continuation_repair_temperature=continuation_repair_temperature,
+            continuation_repair_top_k=continuation_repair_top_k,
+            repetition_unlikelihood_w=(
+                repetition_unlikelihood_w
+                + weight_extras["repetition_unlikelihood_w"]),
+            repetition_unlikelihood_window=repetition_unlikelihood_window,
             invariance_w=invariance_w,
             variance_w=variance_w, covariance_w=covariance_w,
             variance_target=variance_target,
@@ -6975,6 +7296,8 @@ def fit_reading_concepts_select_best(
             self_teach_plan.get("top_signal"))
         round_train_metrics["self_teach_base_weights"] = {
             "lm_w": float(lm_w),
+            "continuation_repair_w": float(continuation_repair_w),
+            "repetition_unlikelihood_w": float(repetition_unlikelihood_w),
             "factorization_w": float(factorization_w),
             "fer_w": float(fer_w),
             "discovery_w": float(discovery_w),
@@ -7265,6 +7588,13 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            lr=1e-3, seed=0, device=DEV, log_every=100,
                            token_drop_p=0.15, token_replace_p=0.05,
                            feature_dropout=0.1, lm_w=0.0,
+                           continuation_repair_w=0.0,
+                           continuation_repair_steps=4,
+                           continuation_repair_prompt_frac=0.5,
+                           continuation_repair_temperature=0.0,
+                           continuation_repair_top_k=0,
+                           repetition_unlikelihood_w=0.0,
+                           repetition_unlikelihood_window=32,
                            invariance_w=25.0, variance_w=25.0,
                            covariance_w=1.0, variance_target=1.0,
                            factorization_w=0.05, factorization_variance=0.05,
@@ -7376,6 +7706,13 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             device=device, log_every=log_every, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
             lm_w=lm_w,
+            continuation_repair_w=continuation_repair_w,
+            continuation_repair_steps=continuation_repair_steps,
+            continuation_repair_prompt_frac=continuation_repair_prompt_frac,
+            continuation_repair_temperature=continuation_repair_temperature,
+            continuation_repair_top_k=continuation_repair_top_k,
+            repetition_unlikelihood_w=repetition_unlikelihood_w,
+            repetition_unlikelihood_window=repetition_unlikelihood_window,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
             factorization_w=factorization_w,
@@ -7511,6 +7848,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             history_prior=self_teach_history_prior,
             history_prior_w=self_teach_history_prior_w,
             lm_w=lm_w,
+            continuation_repair_w=continuation_repair_w,
+            repetition_unlikelihood_w=repetition_unlikelihood_w,
             factorization_w=factorization_w,
             fer_w=fer_w,
             discovery_w=discovery_w,
@@ -7528,6 +7867,13 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         device=device, log_every=log_every, token_drop_p=token_drop_p,
         token_replace_p=token_replace_p, feature_dropout=feature_dropout,
         lm_w=train_weights["lm_w"],
+        continuation_repair_w=train_weights["continuation_repair_w"],
+        continuation_repair_steps=continuation_repair_steps,
+        continuation_repair_prompt_frac=continuation_repair_prompt_frac,
+        continuation_repair_temperature=continuation_repair_temperature,
+        continuation_repair_top_k=continuation_repair_top_k,
+        repetition_unlikelihood_w=train_weights["repetition_unlikelihood_w"],
+        repetition_unlikelihood_window=repetition_unlikelihood_window,
         invariance_w=invariance_w, variance_w=variance_w,
         covariance_w=covariance_w, variance_target=variance_target,
         factorization_w=train_weights["factorization_w"],
@@ -7651,6 +7997,13 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          lr=1e-3, seed=0, device=DEV, log_every=100,
                          token_drop_p=0.15, token_replace_p=0.05,
                          feature_dropout=0.1, lm_w=0.0,
+                         continuation_repair_w=0.0,
+                         continuation_repair_steps=4,
+                         continuation_repair_prompt_frac=0.5,
+                         continuation_repair_temperature=0.0,
+                         continuation_repair_top_k=0,
+                         repetition_unlikelihood_w=0.0,
+                         repetition_unlikelihood_window=32,
                          invariance_w=25.0, variance_w=25.0,
                          covariance_w=1.0, variance_target=1.0,
                          factorization_w=0.05, factorization_variance=0.05,
@@ -7775,6 +8128,13 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             device=device, log_every=log_every, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
             lm_w=lm_w,
+            continuation_repair_w=continuation_repair_w,
+            continuation_repair_steps=continuation_repair_steps,
+            continuation_repair_prompt_frac=continuation_repair_prompt_frac,
+            continuation_repair_temperature=continuation_repair_temperature,
+            continuation_repair_top_k=continuation_repair_top_k,
+            repetition_unlikelihood_w=repetition_unlikelihood_w,
+            repetition_unlikelihood_window=repetition_unlikelihood_window,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
             factorization_w=factorization_w,
@@ -7892,6 +8252,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             reading_self_teach_weight_maps(
                 before_bundle["score_components"], budget=study_self_teach_w,
                 lm_w=lm_w,
+                continuation_repair_w=continuation_repair_w,
+                repetition_unlikelihood_w=repetition_unlikelihood_w,
                 factorization_w=factorization_w,
                 fer_w=fer_w,
                 discovery_w=discovery_w,
@@ -7909,6 +8271,13 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             device=device, log_every=log_every, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
             lm_w=train_weights["lm_w"],
+            continuation_repair_w=train_weights["continuation_repair_w"],
+            continuation_repair_steps=continuation_repair_steps,
+            continuation_repair_prompt_frac=continuation_repair_prompt_frac,
+            continuation_repair_temperature=continuation_repair_temperature,
+            continuation_repair_top_k=continuation_repair_top_k,
+            repetition_unlikelihood_w=train_weights["repetition_unlikelihood_w"],
+            repetition_unlikelihood_window=repetition_unlikelihood_window,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
             factorization_w=train_weights["factorization_w"],
@@ -8072,6 +8441,16 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "token_replace_p": float(token_replace_p),
               "feature_dropout": float(feature_dropout),
               "lm_w": float(lm_w),
+              "continuation_repair_w": float(continuation_repair_w),
+              "continuation_repair_steps": int(continuation_repair_steps),
+              "continuation_repair_prompt_frac": float(
+                  continuation_repair_prompt_frac),
+              "continuation_repair_temperature": float(
+                  continuation_repair_temperature),
+              "continuation_repair_top_k": int(continuation_repair_top_k),
+              "repetition_unlikelihood_w": float(repetition_unlikelihood_w),
+              "repetition_unlikelihood_window": int(
+                  repetition_unlikelihood_window),
               "invariance_w": float(invariance_w),
               "variance_w": float(variance_w),
               "covariance_w": float(covariance_w),
@@ -8390,6 +8769,13 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              log_every=100, token_drop_p=0.15,
                              token_replace_p=0.05, feature_dropout=0.1,
                              lm_w=0.0,
+                             continuation_repair_w=0.0,
+                             continuation_repair_steps=4,
+                             continuation_repair_prompt_frac=0.5,
+                             continuation_repair_temperature=0.0,
+                             continuation_repair_top_k=0,
+                             repetition_unlikelihood_w=0.0,
+                             repetition_unlikelihood_window=32,
                              invariance_w=25.0, variance_w=25.0,
                              covariance_w=1.0, variance_target=1.0,
                              factorization_w=0.05, factorization_variance=0.05,
@@ -8570,6 +8956,13 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             device=device, log_every=log_every, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
             lm_w=lm_w,
+            continuation_repair_w=continuation_repair_w,
+            continuation_repair_steps=continuation_repair_steps,
+            continuation_repair_prompt_frac=continuation_repair_prompt_frac,
+            continuation_repair_temperature=continuation_repair_temperature,
+            continuation_repair_top_k=continuation_repair_top_k,
+            repetition_unlikelihood_w=repetition_unlikelihood_w,
+            repetition_unlikelihood_window=repetition_unlikelihood_window,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
             factorization_w=factorization_w,
@@ -8695,6 +9088,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                 history_prior=self_teach_history_prior,
                 history_prior_w=self_teach_history_prior_w,
                 lm_w=lm_w,
+                continuation_repair_w=continuation_repair_w,
+                repetition_unlikelihood_w=repetition_unlikelihood_w,
                 factorization_w=factorization_w,
                 fer_w=fer_w,
                 discovery_w=discovery_w,
@@ -8712,6 +9107,13 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             device=device, log_every=log_every, token_drop_p=token_drop_p,
             token_replace_p=token_replace_p, feature_dropout=feature_dropout,
             lm_w=train_weights["lm_w"],
+            continuation_repair_w=train_weights["continuation_repair_w"],
+            continuation_repair_steps=continuation_repair_steps,
+            continuation_repair_prompt_frac=continuation_repair_prompt_frac,
+            continuation_repair_temperature=continuation_repair_temperature,
+            continuation_repair_top_k=continuation_repair_top_k,
+            repetition_unlikelihood_w=train_weights["repetition_unlikelihood_w"],
+            repetition_unlikelihood_window=repetition_unlikelihood_window,
             invariance_w=invariance_w, variance_w=variance_w,
             covariance_w=covariance_w, variance_target=variance_target,
             factorization_w=train_weights["factorization_w"],
@@ -8907,6 +9309,16 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "token_replace_p": float(token_replace_p),
               "feature_dropout": float(feature_dropout),
               "lm_w": float(lm_w),
+              "continuation_repair_w": float(continuation_repair_w),
+              "continuation_repair_steps": int(continuation_repair_steps),
+              "continuation_repair_prompt_frac": float(
+                  continuation_repair_prompt_frac),
+              "continuation_repair_temperature": float(
+                  continuation_repair_temperature),
+              "continuation_repair_top_k": int(continuation_repair_top_k),
+              "repetition_unlikelihood_w": float(repetition_unlikelihood_w),
+              "repetition_unlikelihood_window": int(
+                  repetition_unlikelihood_window),
               "invariance_w": float(invariance_w),
               "variance_w": float(variance_w),
               "covariance_w": float(covariance_w),
@@ -9331,6 +9743,17 @@ def selftest():
         sparse_reading_model, reading_vocab, d=32, layers=1, heads=4,
         report={"experiment": "selftest_sparse_topk"})
     assert sparse_payload["latent_concept_topk"] == 2
+    repeat_loss, repeat_metrics = reading_repetition_unlikelihood_loss(
+        reading_model, reading_txt, pad=reading_vocab.pad, window=4)
+    assert torch.isfinite(repeat_loss)
+    assert repeat_metrics["enabled"] is True
+    assert repeat_metrics["candidates"] > 0
+    repair_loss, repair_metrics = reading_continuation_repair_loss(
+        reading_model, reading_txt, pad=reading_vocab.pad, repair_steps=2,
+        prompt_frac=0.5)
+    assert torch.isfinite(repair_loss)
+    assert repair_metrics["enabled"] is True
+    assert repair_metrics["generated_tokens"] > 0
     assert torch.isfinite(reading_latent_view_loss(
         reading_model, reading_txt, reading_vocab.pad, reading_vocab.unk,
         token_drop_p=0.1, token_replace_p=0.0))
@@ -9572,10 +9995,11 @@ def selftest():
     assert generation_plan["top_signal"] == "generation"
     assert math.isclose(generation_plan["weight_extras"]["lm_w"], 0.03,
                         rel_tol=1e-6, abs_tol=1e-6)
-    assert math.isclose(generation_plan["weight_extras"]["sequence_w"], 0.03,
-                        rel_tol=1e-6, abs_tol=1e-6)
     assert math.isclose(
-        generation_plan["weight_extras"]["context_closure_w"], 0.03,
+        generation_plan["weight_extras"]["continuation_repair_w"], 0.03,
+        rel_tol=1e-6, abs_tol=1e-6)
+    assert math.isclose(
+        generation_plan["weight_extras"]["repetition_unlikelihood_w"], 0.03,
         rel_tol=1e-6, abs_tol=1e-6)
     assert math.isclose(sum(generation_plan["weight_extras"].values()),
                         0.09, rel_tol=1e-6, abs_tol=1e-6)
@@ -9670,7 +10094,10 @@ def selftest():
         graph_cycle_w=0.0, bridge_w=0.0, context_target_w=0.0,
         span_completion_w=0.0, context_closure_w=0.0,
         sequence_w=0.0, neighborhood_w=0.0, transition_w=0.0,
-        cluster_w=0.0, study_self_teach_w=0.0, study_rounds=1,
+        cluster_w=0.0, continuation_repair_w=0.0,
+        continuation_repair_steps=0, repetition_unlikelihood_w=0.0,
+        repetition_unlikelihood_window=0, study_self_teach_w=0.0,
+        study_rounds=1,
         study_score_patience=0, study_score_target=0.0,
         study_representation_accept_w=0.0,
         study_representation_min_delta=0.0,
@@ -9682,6 +10109,10 @@ def selftest():
     assert mastery_kwargs["reading_objective_profile_report"]["applied"] is True
     assert mastery_kwargs["lm_w"] == 1.0
     assert mastery_kwargs["graph_predict_w"] == 0.10
+    assert mastery_kwargs["continuation_repair_w"] == 0.05
+    assert mastery_kwargs["continuation_repair_steps"] == 4
+    assert mastery_kwargs["repetition_unlikelihood_w"] == 0.05
+    assert mastery_kwargs["repetition_unlikelihood_window"] == 32
     assert mastery_kwargs["study_self_teach_w"] == 0.05
     assert mastery_kwargs["study_rounds"] == 3
     assert mastery_kwargs["study_score_patience"] == 2
@@ -9716,7 +10147,10 @@ def selftest():
         graph_cycle_w=0.0, bridge_w=0.0, context_target_w=0.0,
         span_completion_w=0.0, context_closure_w=0.0,
         sequence_w=0.0, neighborhood_w=0.0, transition_w=0.0,
-        cluster_w=0.0, study_self_teach_w=0.0, study_rounds=1,
+        cluster_w=0.0, continuation_repair_w=0.0,
+        continuation_repair_steps=0, repetition_unlikelihood_w=0.0,
+        repetition_unlikelihood_window=0, study_self_teach_w=0.0,
+        study_rounds=1,
         study_score_patience=0, study_score_target=0.0,
         study_representation_accept_w=0.0,
         study_representation_min_delta=0.0,
@@ -9726,6 +10160,10 @@ def selftest():
         generation_eval_n=0)
     assert manual_kwargs["study_self_teach_w"] == 0.0
     assert manual_kwargs["lm_w"] == 0.0
+    assert manual_kwargs["continuation_repair_w"] == 0.0
+    assert manual_kwargs["continuation_repair_steps"] == 0
+    assert manual_kwargs["repetition_unlikelihood_w"] == 0.0
+    assert manual_kwargs["repetition_unlikelihood_window"] == 0
     assert manual_kwargs["study_rounds"] == 1
     assert manual_kwargs["study_score_target"] == 0.0
     assert manual_kwargs["study_representation_accept_w"] == 0.0
@@ -9763,6 +10201,8 @@ def selftest():
         discovery_w=0.1, discovery_fer_w=0.1,
         reanalysis_w=0.1, reanalysis_fer_w=0.1,
         gap_w=0.1, lm_w=0.1,
+        continuation_repair_w=0.1, continuation_repair_steps=2,
+        repetition_unlikelihood_w=0.1, repetition_unlikelihood_window=4,
         sequence_w=0.1, sequence_batch=2, sequence_temperature=0.1,
         neighborhood_w=0.1, neighborhood_batch=2, neighborhood_probe_n=2,
         transition_w=0.1, transition_batch=2,
@@ -9770,6 +10210,14 @@ def selftest():
     assert reading_model.reading_train_metrics["memory_active"] > 0
     assert reading_model.reading_train_metrics["lm_w"] == 0.1
     assert math.isfinite(reading_model.reading_train_metrics["lm_loss"])
+    assert reading_model.reading_train_metrics["continuation_repair_w"] == 0.1
+    assert reading_model.reading_train_metrics["continuation_repair_enabled"] is True
+    assert reading_model.reading_train_metrics["continuation_repair_tokens"] > 0
+    assert reading_model.reading_train_metrics["repetition_unlikelihood_w"] == 0.1
+    assert reading_model.reading_train_metrics[
+        "repetition_unlikelihood_enabled"] is True
+    assert reading_model.reading_train_metrics[
+        "repetition_unlikelihood_candidates"] > 0
     assert reading_model.reading_train_metrics["consolidation_w"] == 0.1
     assert reading_model.reading_train_metrics["consolidation_fer_w"] == 0.1
     assert reading_model.reading_train_metrics["consolidation_skipped"] is False
@@ -10399,6 +10847,21 @@ def _add_reading_args(ap):
     ap.add_argument("--reading-lm-w", type=float, default=0.0,
                     help=("causal next-token loss weight over raw reading "
                           "streams; mastery profile raises this by default"))
+    ap.add_argument("--reading-continuation-repair-w", type=float, default=0.0,
+                    help=("weight for recovering gold continuations after the "
+                          "reader free-runs from a corpus prompt"))
+    ap.add_argument("--reading-continuation-repair-steps", type=int, default=4)
+    ap.add_argument("--reading-continuation-repair-prompt-frac", type=float,
+                    default=0.5)
+    ap.add_argument("--reading-continuation-repair-temperature", type=float,
+                    default=0.0)
+    ap.add_argument("--reading-continuation-repair-top-k", type=int, default=0)
+    ap.add_argument("--reading-repetition-unlikelihood-w", type=float,
+                    default=0.0,
+                    help=("weight for discouraging recent non-gold token "
+                          "repeats in raw reading continuations"))
+    ap.add_argument("--reading-repetition-unlikelihood-window", type=int,
+                    default=32)
     ap.add_argument("--reading-token-drop", type=float, default=0.15)
     ap.add_argument("--reading-token-replace", type=float, default=0.05)
     ap.add_argument("--reading-feature-dropout", type=float, default=0.1)
@@ -10544,6 +11007,19 @@ def _add_reading_args(ap):
 def _reading_kwargs(args):
     kwargs = dict(lr=args.reading_lr,
                   lm_w=args.reading_lm_w,
+                  continuation_repair_w=args.reading_continuation_repair_w,
+                  continuation_repair_steps=(
+                      args.reading_continuation_repair_steps),
+                  continuation_repair_prompt_frac=(
+                      args.reading_continuation_repair_prompt_frac),
+                  continuation_repair_temperature=(
+                      args.reading_continuation_repair_temperature),
+                  continuation_repair_top_k=(
+                      args.reading_continuation_repair_top_k),
+                  repetition_unlikelihood_w=(
+                      args.reading_repetition_unlikelihood_w),
+                  repetition_unlikelihood_window=(
+                      args.reading_repetition_unlikelihood_window),
                   token_drop_p=args.reading_token_drop,
                   token_replace_p=args.reading_token_replace,
                   feature_dropout=args.reading_feature_dropout,
@@ -10717,6 +11193,26 @@ def main(argv=None):
         raise SystemExit("--reading-source-balance-w must be non-negative")
     if args.reading_lm_w < 0.0:
         raise SystemExit("--reading-lm-w must be non-negative")
+    if args.reading_continuation_repair_w < 0.0:
+        raise SystemExit("--reading-continuation-repair-w must be non-negative")
+    if args.reading_continuation_repair_steps < 0:
+        raise SystemExit(
+            "--reading-continuation-repair-steps must be non-negative")
+    if (args.reading_continuation_repair_prompt_frac <= 0.0
+            or args.reading_continuation_repair_prompt_frac >= 1.0):
+        raise SystemExit(
+            "--reading-continuation-repair-prompt-frac must be in (0, 1)")
+    if args.reading_continuation_repair_temperature < 0.0:
+        raise SystemExit(
+            "--reading-continuation-repair-temperature must be non-negative")
+    if args.reading_continuation_repair_top_k < 0:
+        raise SystemExit("--reading-continuation-repair-top-k must be non-negative")
+    if args.reading_repetition_unlikelihood_w < 0.0:
+        raise SystemExit(
+            "--reading-repetition-unlikelihood-w must be non-negative")
+    if args.reading_repetition_unlikelihood_window < 0:
+        raise SystemExit(
+            "--reading-repetition-unlikelihood-window must be non-negative")
     if args.reading_generation_eval_n < 0:
         raise SystemExit("--reading-generation-eval-n must be non-negative")
     if args.reading_generation_prompt_tokens <= 0:
