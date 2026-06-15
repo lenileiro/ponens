@@ -8545,7 +8545,7 @@ def reference_reproduction_gate_report(
         report, prefix="reference_flow", max_pixel_mse=None, max_pixel_mae=None,
         max_structure_edge_l1=None, max_structure_multiscale_l1=None,
         max_structure_frequency_l1=None, max_structure_ssim_loss=None,
-        max_texture_stats_l1=None, max_physics_l1=None,
+        max_patch_structure_l1=None, max_texture_stats_l1=None, max_physics_l1=None,
         max_selected_score=None):
     """Return pass/fail metadata for shown-image reproduction thresholds."""
     thresholds = {
@@ -8555,6 +8555,7 @@ def reference_reproduction_gate_report(
         "max_structure_multiscale_l1": max_structure_multiscale_l1,
         "max_structure_frequency_l1": max_structure_frequency_l1,
         "max_structure_ssim_loss": max_structure_ssim_loss,
+        "max_patch_structure_l1": max_patch_structure_l1,
         "max_texture_stats_l1": max_texture_stats_l1,
         "max_physics_l1": max_physics_l1,
         "max_selected_score": max_selected_score,
@@ -8588,6 +8589,7 @@ def reference_reproduction_gate_report(
     check_max("structure_multiscale_l1", "max_structure_multiscale_l1")
     check_max("structure_frequency_l1", "max_structure_frequency_l1")
     check_max("structure_ssim_loss", "max_structure_ssim_loss")
+    check_max("patch_structure_l1", "max_patch_structure_l1")
     check_max("texture_stats_l1", "max_texture_stats_l1")
     check_max("physics_l1", "max_physics_l1")
     check_max(
@@ -8616,6 +8618,7 @@ def cli_reference_reproduction_gate_report(report, args, prefix="reference_flow"
         max_structure_frequency_l1=(
             args.sample_reference_max_structure_frequency_l1),
         max_structure_ssim_loss=args.sample_reference_max_structure_ssim_loss,
+        max_patch_structure_l1=args.sample_reference_max_patch_structure_l1,
         max_texture_stats_l1=args.sample_reference_max_texture_stats_l1,
         max_physics_l1=args.sample_reference_max_physics_l1,
         max_selected_score=args.sample_reference_max_selected_score)
@@ -8637,6 +8640,7 @@ REPRODUCTION_SCORE_METRICS = (
     "structure_multiscale_l1",
     "structure_frequency_l1",
     "structure_ssim_loss",
+    "patch_structure_l1",
     "texture_stats_l1",
     "physics_l1",
 )
@@ -8647,6 +8651,7 @@ REPRODUCTION_REPORT_METRICS = (
     "structure_multiscale_l1",
     "structure_frequency_l1",
     "structure_ssim_loss",
+    "patch_structure_l1",
     "texture_stats_l1",
     "physics_l1",
 )
@@ -8677,6 +8682,8 @@ def image_reproduction_metrics(reference, candidate, prefix="reference"):
     diff = cand - ref
     physics, physics_parts = visual_physics_loss(
         cand, ref, prefix=f"{prefix}_physics")
+    patch_structure, patch_parts = visual_patch_structure_loss(
+        cand, ref, prefix=f"{prefix}_patch_structure")
     out = {
         f"{prefix}_pixel_mse": float(diff.pow(2).mean().detach().cpu()),
         f"{prefix}_pixel_mae": float(diff.abs().mean().detach().cpu()),
@@ -8688,11 +8695,15 @@ def image_reproduction_metrics(reference, candidate, prefix="reference"):
             frequency_recon_loss(cand, ref).detach().cpu()),
         f"{prefix}_structure_ssim_loss": float(
             local_structure_loss(cand, ref).detach().cpu()),
+        f"{prefix}_patch_structure_l1": float(
+            patch_structure.detach().cpu()),
         f"{prefix}_texture_stats_l1": float(
             texture_statistics_loss(cand, ref).detach().cpu()),
         f"{prefix}_physics_l1": float(physics.detach().cpu()),
     }
     for key, value in physics_parts.items():
+        out[key] = float(value.detach().cpu())
+    for key, value in patch_parts.items():
         out[key] = float(value.detach().cpu())
     return out
 
@@ -13781,6 +13792,17 @@ def selftest():
             textured_sample, torch.roll(textured_sample, shifts=3, dims=-1))
         assert float(same_relation) < 1.0e-6
         assert float(shifted_relation) > float(same_relation)
+        patch_desc = visual_patch_structure_targets(textured_sample, patch=4)
+        assert tuple(patch_desc.shape) == (1, 16, 22)
+        same_patch, same_patch_parts = visual_patch_structure_loss(
+            textured_sample, textured_sample, patch=4, prefix="unit_patch")
+        shifted_patch, shifted_patch_parts = visual_patch_structure_loss(
+            textured_sample, torch.roll(textured_sample, shifts=3, dims=-1),
+            patch=4, prefix="unit_patch")
+        assert float(same_patch) < 1.0e-6
+        assert float(shifted_patch) > float(same_patch)
+        assert "unit_patch_physics_l1" in shifted_patch_parts
+        assert same_patch_parts["unit_patch_dim"].item() == 22.0
         blob = torch.zeros(1, 3, 16, 16)
         blob[..., 3:7, 2:6] = 1.0
         shifted_blob = torch.roll(blob, shifts=(5, 6), dims=(-2, -1))
@@ -13817,6 +13839,7 @@ def selftest():
             "reference_flow_structure_multiscale_l1": 0.10,
             "reference_flow_structure_frequency_l1": 0.15,
             "reference_flow_structure_ssim_loss": 0.20,
+            "reference_flow_patch_structure_l1": 0.04,
             "reference_flow_texture_stats_l1": 0.05,
             "reference_flow_physics_l1": 0.07,
             "sample_grid_reference_selected_denoise_score": 0.60,
@@ -13939,6 +13962,7 @@ def selftest():
             flow_spatial_relation_w=0.01, flow_endpoint_stats_w=0.01,
             flow_physics_w=0.01,
             ae_structure_w=0.1, ae_texture_w=0.1, ae_physics_w=0.1,
+            ae_patch_structure_w=0.1, ae_patch_structure_size=4,
             image_feature_align_w=0.01, flow_feature_align_w=0.01,
             flow_repa_w=0.01, flow_repa_structure_w=0.01,
             flow_repa_frac=1.0,
@@ -13958,6 +13982,8 @@ def selftest():
             flow_decoded_endpoint_structure_w=0.1,
             flow_decoded_endpoint_texture_w=0.1,
             flow_decoded_endpoint_physics_w=0.1,
+            flow_decoded_endpoint_patch_structure_w=0.1,
+            flow_decoded_endpoint_patch_structure_size=4,
             flow_equivariance_w=0.01,
             flow_equivariance_p=1.0,
             flow_equivariance_transforms=("roll",),
@@ -13983,9 +14009,12 @@ def selftest():
         assert math.isclose(report["ae_structure_w"], 0.1)
         assert math.isclose(report["ae_texture_w"], 0.1)
         assert math.isclose(report["ae_physics_w"], 0.1)
+        assert math.isclose(report["ae_patch_structure_w"], 0.1)
+        assert report["ae_patch_structure_size"] == 4
         assert "recon_structure_ssim" in report["last_ae"]
         assert "recon_texture_stats_l1" in report["last_ae"]
         assert "recon_physics_loss" in report["last_ae"]
+        assert "recon_patch_structure_loss" in report["last_ae"]
         assert math.isclose(report["flow_frequency_w"], 0.01)
         assert math.isclose(report["flow_endpoint_stats_w"], 0.01)
         assert "flow_endpoint_stats_loss" in report["last_flow"]
@@ -14026,6 +14055,10 @@ def selftest():
         assert math.isclose(report["flow_decoded_endpoint_texture_w"], 0.1)
         assert "flow_decoded_endpoint_recon_physics_loss" in report["last_flow"]
         assert math.isclose(report["flow_decoded_endpoint_physics_w"], 0.1)
+        assert "flow_decoded_endpoint_recon_patch_structure_loss" in report["last_flow"]
+        assert math.isclose(
+            report["flow_decoded_endpoint_patch_structure_w"], 0.1)
+        assert report["flow_decoded_endpoint_patch_structure_size"] == 4
         assert math.isclose(report["flow_equivariance_w"], 0.01)
         assert report["last_flow"]["flow_equivariance_active"] == 1.0
         assert "flow_equivariance_velocity_mse" in report["last_flow"]
@@ -14963,6 +14996,10 @@ def main(argv=None):
                     default=None, dest="sample_reference_max_structure_ssim_loss",
                     help=("fail after --sample-reference-grid-out if reference "
                           "SSIM-style structure loss is above this threshold"))
+    ap.add_argument("--sample-reference-max-patch-structure-l1", type=float,
+                    default=None, dest="sample_reference_max_patch_structure_l1",
+                    help=("fail after --sample-reference-grid-out if reference "
+                          "patch-structure descriptor L1 is above this threshold"))
     ap.add_argument("--sample-reference-max-texture-stats-l1", type=float,
                     default=None, dest="sample_reference_max_texture_stats_l1",
                     help=("fail after --sample-reference-grid-out if reference "
@@ -15225,6 +15262,7 @@ def main(argv=None):
         "sample_reference_max_structure_multiscale_l1",
         "sample_reference_max_structure_frequency_l1",
         "sample_reference_max_structure_ssim_loss",
+        "sample_reference_max_patch_structure_l1",
         "sample_reference_max_texture_stats_l1",
         "sample_reference_max_physics_l1",
         "sample_reference_max_selected_score",
@@ -16334,6 +16372,12 @@ def main(argv=None):
         "flow_decoded_endpoint_physics_w": report.get(
             "flow_decoded_endpoint_physics_w",
             args.flow_decoded_endpoint_physics_w),
+        "flow_decoded_endpoint_patch_structure_w": report.get(
+            "flow_decoded_endpoint_patch_structure_w",
+            args.flow_decoded_endpoint_patch_structure_w),
+        "flow_decoded_endpoint_patch_structure_size": report.get(
+            "flow_decoded_endpoint_patch_structure_size",
+            args.flow_decoded_endpoint_patch_structure_size),
         "flow_equivariance_w": report.get(
             "flow_equivariance_w", args.flow_equivariance_w),
         "flow_equivariance_p": report.get(
