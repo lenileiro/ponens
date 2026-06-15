@@ -383,7 +383,11 @@ def build_text_causal_lm_manifest(
         paths, out, text_field="text", max_tokens=128, min_tokens=8,
         stride=0, eval_frac=0.10, seed=0):
     """Build a targetless causal LM manifest from raw text/code sources."""
-    from .text import load_reading_records, write_causal_lm_manifest
+    from .text import (
+        assign_reading_eval_splits,
+        load_reading_records,
+        write_causal_lm_manifest,
+    )
 
     paths = list(paths or [])
     if not paths:
@@ -398,8 +402,10 @@ def build_text_causal_lm_manifest(
         records.extend(load_reading_records(
             path, require_train=False, require_eval=False,
             text_field=text_field, max_tokens=max_tokens,
-            min_tokens=min_tokens, eval_frac=eval_frac, seed=seed + i,
+            min_tokens=min_tokens, eval_frac=0.0, seed=seed + i,
             stride=stride))
+    records, split_report = assign_reading_eval_splits(
+        records, eval_frac=eval_frac, seed=seed)
     if not any(rec.split == "train" for rec in records):
         raise ValueError("text causal LM manifest has no train records")
     report = write_causal_lm_manifest(records, out)
@@ -411,6 +417,8 @@ def build_text_causal_lm_manifest(
         "min_tokens": int(min_tokens),
         "eval_frac": float(eval_frac),
         "objective": "causal_lm",
+        "targetless": True,
+        "split_report": split_report,
     })
     return report
 
@@ -8201,6 +8209,9 @@ def selftest():
             [code_path], causal_manifest, max_tokens=10, min_tokens=4,
             stride=5, eval_frac=0.25, seed=0)
         assert causal_report["target_records"] == 0
+        assert causal_report["targetless"] is True
+        assert causal_report["split_report"]["eval_split_policy"] == (
+            "contiguous_window")
         assert causal_report["window_stride"] == 5
         causal_records = load_manifest(causal_manifest)
         assert len(causal_records) >= 2
@@ -8211,6 +8222,33 @@ def selftest():
             causal_records, requested="auto") == "causal"
         assert multimodal_active_modes(feature_dims(causal_records),
                                        causal_records) == ("full",)
+        other_code_path = os.path.join(tmpdir, "toy_code_other.py")
+        with open(other_code_path, "w") as f:
+            f.write(
+                "class Counter:\n"
+                "    def __init__(self):\n"
+                "        self.value = 0\n"
+                "    def inc(self):\n"
+                "        self.value += 1\n")
+        source_split_manifest = os.path.join(tmpdir, "source_split_causal.jsonl")
+        source_split_report = build_text_causal_lm_manifest(
+            [code_path, other_code_path], source_split_manifest,
+            max_tokens=8, min_tokens=4, stride=4, eval_frac=0.5, seed=1)
+        assert source_split_report["target_records"] == 0
+        assert source_split_report["split_report"]["eval_split_policy"] == "source"
+        source_split_records = load_manifest(source_split_manifest)
+        assert all(not rec.target for rec in source_split_records)
+        train_sources = {
+            rec.meta["source"] for rec in source_split_records
+            if rec.split == "train"
+        }
+        eval_sources = {
+            rec.meta["source"] for rec in source_split_records
+            if rec.split == "eval"
+        }
+        assert train_sources
+        assert eval_sources
+        assert train_sources.isdisjoint(eval_sources)
         causal_model, causal_vocab, _all, _trn, causal_eval, causal_dims = train(
             causal_manifest, steps=2, batch=2, d=32, layers=1, heads=4,
             device="cpu", objective_profile="language",

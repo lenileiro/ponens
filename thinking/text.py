@@ -952,6 +952,150 @@ def _chunk_reading_tokens(tokens, max_tokens=128, min_tokens=8, stride=None,
     return chunks
 
 
+def _reading_record_with_split(rec, split, *, split_policy=None):
+    meta = dict(rec.meta or {})
+    if split_policy:
+        meta["eval_split_policy"] = str(split_policy)
+    return ReadingRecord(
+        rec_id=rec.rec_id,
+        split=str(split),
+        tokens=rec.tokens,
+        kind=rec.kind,
+        meta=meta,
+    )
+
+
+def _reading_record_token_span(rec, fallback_index=0):
+    meta = rec.meta if isinstance(rec.meta, dict) else {}
+    try:
+        start = int(meta.get("token_start"))
+    except (TypeError, ValueError):
+        start = int(fallback_index) * max(1, len(rec.tokens))
+    try:
+        end = int(meta.get("token_end"))
+    except (TypeError, ValueError):
+        end = start + len(rec.tokens)
+    return start, max(start, end)
+
+
+def _contiguous_eval_record_ids(records, eval_frac=0.10, seed=0):
+    records = list(records or ())
+    if float(eval_frac) <= 0.0 or len(records) <= 1:
+        return set()
+    rows = sorted(
+        enumerate(records),
+        key=lambda row: (
+            _reading_record_token_span(row[1], row[0])[0],
+            _reading_record_token_span(row[1], row[0])[1],
+            row[0],
+        ))
+    eval_n = max(1, int(round(len(rows) * float(eval_frac))))
+    eval_n = min(eval_n, len(rows) - 1)
+    rng = np.random.default_rng(seed)
+    block_start = int(rng.integers(0, len(rows) - eval_n + 1))
+    block = rows[block_start:block_start + eval_n]
+    eval_start = min(_reading_record_token_span(rec, pos)[0] for pos, rec in block)
+    eval_end = max(_reading_record_token_span(rec, pos)[1] for pos, rec in block)
+    eval_ids = set()
+    for pos, rec in rows:
+        start, end = _reading_record_token_span(rec, pos)
+        if start < eval_end and end > eval_start:
+            eval_ids.add(pos)
+    if len(eval_ids) >= len(records):
+        eval_ids = {pos for pos, _rec in block}
+    return eval_ids
+
+
+def assign_reading_eval_splits(records, eval_frac=0.10, seed=0):
+    """Assign leakage-resistant train/eval splits without task-specific labels."""
+    records = list(records or ())
+    if not records:
+        return [], {
+            "eval_split_policy": "empty",
+            "train_records": 0,
+            "eval_records": 0,
+            "train_sources": 0,
+            "eval_sources": 0,
+        }
+    if any(rec.split == "eval" for rec in records):
+        return records, {
+            "eval_split_policy": "preserve",
+            "train_records": sum(1 for rec in records if rec.split == "train"),
+            "eval_records": sum(1 for rec in records if rec.split == "eval"),
+            "train_sources": len({
+                reading_record_source(rec) for rec in records
+                if rec.split == "train"
+            }),
+            "eval_sources": len({
+                reading_record_source(rec) for rec in records
+                if rec.split == "eval"
+            }),
+        }
+    if float(eval_frac) <= 0.0 or len(records) <= 1:
+        assigned = [
+            _reading_record_with_split(rec, "train", split_policy="none")
+            for rec in records
+        ]
+        return assigned, {
+            "eval_split_policy": "none",
+            "train_records": len(assigned),
+            "eval_records": 0,
+            "train_sources": len({reading_record_source(rec) for rec in assigned}),
+            "eval_sources": 0,
+        }
+
+    groups = {}
+    for idx, rec in enumerate(records):
+        groups.setdefault(reading_record_source(rec), []).append((idx, rec))
+    if len(groups) > 1:
+        sources = sorted(groups)
+        eval_n = max(1, int(round(len(sources) * float(eval_frac))))
+        eval_n = min(eval_n, len(sources) - 1)
+        rng = np.random.default_rng(seed)
+        eval_sources = set(
+            sources[int(i)] for i in rng.choice(
+                len(sources), size=eval_n, replace=False))
+        assigned = [
+            _reading_record_with_split(
+                rec,
+                "eval" if reading_record_source(rec) in eval_sources else "train",
+                split_policy="source",
+            )
+            for rec in records
+        ]
+        return assigned, {
+            "eval_split_policy": "source",
+            "train_records": sum(1 for rec in assigned if rec.split == "train"),
+            "eval_records": sum(1 for rec in assigned if rec.split == "eval"),
+            "train_sources": len({
+                reading_record_source(rec) for rec in assigned
+                if rec.split == "train"
+            }),
+            "eval_sources": len(eval_sources),
+        }
+
+    eval_ids = _contiguous_eval_record_ids(records, eval_frac=eval_frac, seed=seed)
+    assigned = [
+        _reading_record_with_split(
+            rec, "eval" if idx in eval_ids else "train",
+            split_policy="contiguous_window")
+        for idx, rec in enumerate(records)
+    ]
+    return assigned, {
+        "eval_split_policy": "contiguous_window",
+        "train_records": sum(1 for rec in assigned if rec.split == "train"),
+        "eval_records": sum(1 for rec in assigned if rec.split == "eval"),
+        "train_sources": len({
+            reading_record_source(rec) for rec in assigned
+            if rec.split == "train"
+        }),
+        "eval_sources": len({
+            reading_record_source(rec) for rec in assigned
+            if rec.split == "eval"
+        }),
+    }
+
+
 def reading_records_from_text(text, source, max_tokens=128, min_tokens=8,
                               eval_frac=0.10, seed=0, stride=None):
     tokens = split_words(text)
@@ -960,14 +1104,10 @@ def reading_records_from_text(text, source, max_tokens=128, min_tokens=8,
         stride=stride, with_offsets=True)
     if not chunks:
         raise ValueError(f"{source} produced no reading chunks")
-    rng = np.random.default_rng(seed)
-    order = rng.permutation(len(chunks))
-    eval_n = max(1, int(round(len(chunks) * eval_frac))) if len(chunks) > 1 else 0
-    eval_ids = set(int(i) for i in order[:eval_n])
-    return [
+    records = [
         ReadingRecord(
             rec_id=f"{os.path.basename(str(source)) or 'reading'}-{i}",
-            split="eval" if i in eval_ids else "train",
+            split="train",
             tokens=chunk,
             kind="raw_text",
             meta={
@@ -981,6 +1121,9 @@ def reading_records_from_text(text, source, max_tokens=128, min_tokens=8,
         )
         for i, (off, chunk) in enumerate(chunks)
     ]
+    assigned, _report = assign_reading_eval_splits(
+        records, eval_frac=eval_frac, seed=seed)
+    return assigned
 
 
 def causal_lm_manifest_rows(records):
@@ -1011,6 +1154,14 @@ def write_causal_lm_manifest(records, out):
         "train_records": sum(1 for row in rows if row["split"] == "train"),
         "eval_records": sum(1 for row in rows if row["split"] == "eval"),
         "target_records": 0,
+        "train_sources": len({
+            reading_record_source(rec) for rec in records
+            if rec.split == "train"
+        }),
+        "eval_sources": len({
+            reading_record_source(rec) for rec in records
+            if rec.split == "eval"
+        }),
     }
 
 
@@ -1045,8 +1196,10 @@ def load_reading_records(path, require_train=True, require_eval=True,
             records.extend(load_reading_records(
                 p, require_train=False, require_eval=False,
                 text_field=text_field, max_tokens=max_tokens,
-                min_tokens=min_tokens, eval_frac=eval_frac, seed=seed + i,
+                min_tokens=min_tokens, eval_frac=0.0, seed=seed + i,
                 stride=stride))
+        records, _split_report = assign_reading_eval_splits(
+            records, eval_frac=eval_frac, seed=seed)
         if require_train and not any(r.split == "train" for r in records):
             raise ValueError(f"{path} has no train reading records")
         if require_eval and not any(r.split == "eval" for r in records):
@@ -10730,6 +10883,20 @@ def selftest():
                       meta={"source": "source-b"})
         for i in range(2)
     ]
+    split_records, split_report = assign_reading_eval_splits(
+        imbalanced_records, eval_frac=0.5, seed=0)
+    assert split_report["eval_split_policy"] == "source"
+    split_train_sources = {
+        reading_record_source(rec) for rec in split_records
+        if rec.split == "train"
+    }
+    split_eval_sources = {
+        reading_record_source(rec) for rec in split_records
+        if rec.split == "eval"
+    }
+    assert split_train_sources
+    assert split_eval_sources
+    assert split_train_sources.isdisjoint(split_eval_sources)
     assert reading_training_sampling_weights(
         imbalanced_records, source_balance_w=0.0) is None
     assert reading_replay_sampling_weights(

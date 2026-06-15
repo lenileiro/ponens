@@ -2125,8 +2125,25 @@ def payload(args):
         if args.multimodal:
             MM = mod("thinking.multimodal")
             mm_dim = args.multimodal_dim or args.dim or 96
+            if args.multimodal_text_data:
+                mm_source = ""
+                for path in args.multimodal_text_data:
+                    mm_source += f" --text-data {shlex_quote(path)}"
+                mm_source += (
+                    f" --text-field {shlex_quote(args.multimodal_text_field)} "
+                    f"--text-window {args.multimodal_text_window} "
+                    f"--text-stride {args.multimodal_text_stride} "
+                    f"--text-min-tokens {args.multimodal_text_min_tokens} "
+                    f"--text-eval-frac {args.multimodal_text_eval_frac}")
+                if args.multimodal_text_manifest_out:
+                    mm_source += (
+                        f" --text-manifest-out "
+                        f"{shlex_quote(args.multimodal_text_manifest_out)}")
+            else:
+                mm_source = (
+                    f" --manifest {shlex_quote(args.multimodal_manifest)}")
             mm_cmd = (
-                f"{MM} --manifest {shlex_quote(args.multimodal_manifest)} "
+                f"{MM}{mm_source} "
                 f"--steps {args.train_steps or 400} "
                 f"--batch {args.multimodal_batch} --dim {mm_dim} "
                 f"--layers {args.multimodal_layers} --heads {args.multimodal_heads} "
@@ -4272,6 +4289,29 @@ def main():
                     help="train generic manifest-driven multimodal prefix bridge")
     ap.add_argument("--multimodal-manifest", default="", dest="multimodal_manifest",
                     help="JSONL manifest passed to thinking.multimodal --manifest")
+    ap.add_argument("--multimodal-text-data", action="append", default=None,
+                    dest="multimodal_text_data",
+                    help=("raw text/code source passed to thinking.multimodal "
+                          "--text-data for targetless causal LM windows"))
+    ap.add_argument("--multimodal-text-field", default="text",
+                    dest="multimodal_text_field",
+                    help="JSON/JSONL field read by --multimodal-text-data")
+    ap.add_argument("--multimodal-text-window", type=int, default=128,
+                    dest="multimodal_text_window",
+                    help="tokens per causal LM window for --multimodal-text-data")
+    ap.add_argument("--multimodal-text-stride", type=int, default=0,
+                    dest="multimodal_text_stride",
+                    help=("stride for multimodal causal LM windows; 0 uses "
+                          "half of --multimodal-text-window"))
+    ap.add_argument("--multimodal-text-min-tokens", type=int, default=8,
+                    dest="multimodal_text_min_tokens",
+                    help="minimum tokens required for a causal LM window")
+    ap.add_argument("--multimodal-text-eval-frac", type=float, default=0.10,
+                    dest="multimodal_text_eval_frac",
+                    help="fraction of raw text/code held out for eval")
+    ap.add_argument("--multimodal-text-manifest-out", default="",
+                    dest="multimodal_text_manifest_out",
+                    help="optional path for the generated causal LM manifest")
     ap.add_argument("--multimodal-root", default="", dest="multimodal_root",
                     help="optional root for relative multimodal feature paths")
     ap.add_argument("--multimodal-dim", type=int, default=0, dest="multimodal_dim",
@@ -5721,8 +5761,23 @@ def main():
         for name, value in positive.items():
             if value <= 0:
                 sys.exit(f"ERROR: {name} must be positive")
-        if not args.multimodal_manifest:
-            sys.exit("ERROR: --multimodal requires --multimodal-manifest")
+        if args.multimodal_manifest and args.multimodal_text_data:
+            sys.exit(
+                "ERROR: --multimodal-manifest and --multimodal-text-data "
+                "are mutually exclusive")
+        if not args.multimodal_manifest and not args.multimodal_text_data:
+            sys.exit(
+                "ERROR: --multimodal requires --multimodal-manifest or "
+                "--multimodal-text-data")
+        if args.multimodal_text_window <= 1:
+            sys.exit("ERROR: --multimodal-text-window must be greater than one")
+        if args.multimodal_text_stride < 0:
+            sys.exit("ERROR: --multimodal-text-stride must be non-negative")
+        if args.multimodal_text_min_tokens <= 1:
+            sys.exit("ERROR: --multimodal-text-min-tokens must be greater than one")
+        if (args.multimodal_text_eval_frac < 0.0
+                or args.multimodal_text_eval_frac >= 1.0):
+            sys.exit("ERROR: --multimodal-text-eval-frac must be in [0, 1)")
         if args.multimodal_dim < 0:
             sys.exit("ERROR: --multimodal-dim must be non-negative")
         mm_dim = args.multimodal_dim or args.dim or 96
