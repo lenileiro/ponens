@@ -2052,6 +2052,10 @@ def payload(args):
                 f"{args.multimodal_continuation_repair_temperature} "
                 f"--continuation-repair-top-k "
                 f"{args.multimodal_continuation_repair_top_k} "
+                f"--repetition-unlikelihood-w "
+                f"{args.multimodal_repetition_unlikelihood_w} "
+                f"--repetition-unlikelihood-window "
+                f"{args.multimodal_repetition_unlikelihood_window} "
                 f"--concept-tokens {args.multimodal_concept_tokens} "
                 f"--fusion-layers {args.multimodal_fusion_layers} "
                 f"--latent-concept-slots {args.multimodal_latent_concept_slots} "
@@ -4140,6 +4144,15 @@ def main():
     ap.add_argument("--multimodal-continuation-repair-top-k", type=int, default=0,
                     dest="multimodal_continuation_repair_top_k",
                     help="optional top-k sampling cap for repair self-rollout")
+    ap.add_argument("--multimodal-repetition-unlikelihood-w",
+                    type=float, default=0.0,
+                    dest="multimodal_repetition_unlikelihood_w",
+                    help=("M-0 loss weight that discourages recent non-gold "
+                          "repeats"))
+    ap.add_argument("--multimodal-repetition-unlikelihood-window",
+                    type=int, default=32,
+                    dest="multimodal_repetition_unlikelihood_window",
+                    help="recent context window used for repeat negatives")
     ap.add_argument("--multimodal-concept-tokens", type=int, default=4,
                     dest="multimodal_concept_tokens")
     ap.add_argument("--multimodal-fusion-layers", type=int, default=1,
@@ -5490,6 +5503,10 @@ def main():
                 args.multimodal_continuation_repair_temperature),
             "--multimodal-continuation-repair-top-k": (
                 args.multimodal_continuation_repair_top_k),
+            "--multimodal-repetition-unlikelihood-w": (
+                args.multimodal_repetition_unlikelihood_w),
+            "--multimodal-repetition-unlikelihood-window": (
+                args.multimodal_repetition_unlikelihood_window),
             "--multimodal-source-balance-w": args.multimodal_source_balance_w,
             "--multimodal-latent-concept-w": args.multimodal_latent_concept_w,
             "--multimodal-latent-concept-invariance-w": (

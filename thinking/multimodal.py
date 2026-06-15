@@ -152,6 +152,8 @@ MULTIMODAL_OBJECTIVE_PROFILES = ("manual", "language", "mastery")
 MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS = {
     "continuation_repair_w": 0.05,
     "continuation_repair_steps": 4,
+    "repetition_unlikelihood_w": 0.05,
+    "repetition_unlikelihood_window": 32,
 }
 MULTIMODAL_MASTERY_OBJECTIVE_FLOORS = {
     "latent_concept_slots": MULTIMODAL_DEFAULT_LATENT_CONCEPT_SLOTS,
@@ -2553,6 +2555,77 @@ def token_loss(logits, ids, pad):
     raw = F.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]),
                           targets.reshape(-1), reduction="none").view_as(targets)
     return raw.masked_select(mask).mean()
+
+
+def repetition_unlikelihood_loss(logits_by_mode, ids, pad, window=32):
+    """Penalize recent non-gold repeats that create free-generation attractors."""
+    if not logits_by_mode:
+        zero = ids.float().sum() * 0.0
+        return zero, {
+            "enabled": False, "skipped": True, "skip_reason": "empty_logits",
+            "tokens": 0, "candidates": 0, "window": int(window),
+        }
+    first_logits = next(iter(logits_by_mode.values()))
+    zero = first_logits.sum() * 0.0
+    if ids.shape[1] < 2 or int(window) <= 0:
+        return zero, {
+            "enabled": False, "skipped": True, "skip_reason": "too_short",
+            "tokens": 0, "candidates": 0, "window": int(window),
+        }
+    targets = ids[:, 1:]
+    valid = targets.ne(int(pad))
+    if not bool(valid.any()):
+        return zero, {
+            "enabled": False, "skipped": True, "skip_reason": "empty_targets",
+            "tokens": 0, "candidates": 0, "window": int(window),
+        }
+    losses = []
+    window = max(1, int(window))
+    max_steps = logits_by_mode[next(iter(logits_by_mode))].shape[1] - 1
+    max_steps = min(max_steps, ids.shape[1] - 1)
+    if max_steps <= 0:
+        return zero, {
+            "enabled": False, "skipped": True, "skip_reason": "too_short",
+            "tokens": 0, "candidates": 0, "window": int(window),
+        }
+    targets = ids[:, 1:1 + max_steps]
+    valid = targets.ne(int(pad))
+    candidate_any = torch.zeros_like(valid, dtype=torch.bool)
+    candidate_total = valid.new_zeros((), dtype=torch.long)
+    for _mode, logits in logits_by_mode.items():
+        probs = torch.softmax(logits[:, :max_steps].float(), dim=-1)
+        mode_losses = []
+        for back in range(window):
+            candidates = ids.new_full(targets.shape, int(pad))
+            width = max_steps - back
+            if width <= 0:
+                break
+            candidates[:, back:] = ids[:, :width]
+            mask = valid & candidates.ne(int(pad)) & candidates.ne(targets)
+            if not bool(mask.any()):
+                continue
+            neg_probs = probs.gather(
+                -1, candidates.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+            neg_loss = -torch.log1p(
+                -neg_probs.clamp(min=1e-6, max=1.0 - 1e-6))
+            mode_losses.append(neg_loss.masked_select(mask).mean())
+            candidate_any |= mask
+            candidate_total = candidate_total + mask.sum()
+        if mode_losses:
+            losses.append(sum(mode_losses) / len(mode_losses))
+    if not losses:
+        return zero, {
+            "enabled": False, "skipped": True,
+            "skip_reason": "no_negative_repeats",
+            "tokens": 0, "candidates": 0, "window": int(window),
+        }
+    return sum(losses) / len(losses), {
+        "enabled": True,
+        "skipped": False,
+        "tokens": int(candidate_any.sum().detach().cpu()),
+        "candidates": int(candidate_total.detach().cpu()),
+        "window": int(window),
+    }
 
 
 def continuation_repair_loss(
@@ -4990,6 +5063,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
           continuation_repair_prompt_frac=0.5,
           continuation_repair_temperature=0.0,
           continuation_repair_top_k=0,
+          repetition_unlikelihood_w=0.0, repetition_unlikelihood_window=32,
           text_checkpoint=None, multimodal_checkpoint=None,
           concept_tokens=4, fusion_layers=1,
           latent_concept_slots=0, latent_concept_layers=1,
@@ -5111,6 +5185,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         objective_profile,
         continuation_repair_w=continuation_repair_w,
         continuation_repair_steps=continuation_repair_steps,
+        repetition_unlikelihood_w=repetition_unlikelihood_w,
+        repetition_unlikelihood_window=repetition_unlikelihood_window,
         latent_concept_slots=latent_concept_slots,
         latent_concept_memory_size=latent_concept_memory_size,
         latent_concept_factorization_w=latent_concept_factorization_w,
@@ -5147,6 +5223,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
     objective_profile_report = profile_kwargs["objective_profile_report"]
     continuation_repair_w = profile_kwargs["continuation_repair_w"]
     continuation_repair_steps = profile_kwargs["continuation_repair_steps"]
+    repetition_unlikelihood_w = profile_kwargs["repetition_unlikelihood_w"]
+    repetition_unlikelihood_window = profile_kwargs["repetition_unlikelihood_window"]
     latent_concept_slots = profile_kwargs["latent_concept_slots"]
     latent_concept_memory_size = profile_kwargs["latent_concept_memory_size"]
     latent_concept_factorization_w = profile_kwargs[
@@ -5218,6 +5296,12 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         raise ValueError("continuation repair temperature must be non-negative")
     if continuation_repair_top_k < 0:
         raise ValueError("continuation repair top-k must be non-negative")
+    repetition_unlikelihood_w = float(repetition_unlikelihood_w)
+    repetition_unlikelihood_window = int(repetition_unlikelihood_window)
+    if repetition_unlikelihood_w < 0.0:
+        raise ValueError("repetition unlikelihood loss weight must be non-negative")
+    if repetition_unlikelihood_window < 0:
+        raise ValueError("repetition unlikelihood window must be non-negative")
     source_balance_w = float(source_balance_w)
     if source_balance_w < 0.0:
         raise ValueError("multimodal source balance weight must be non-negative")
@@ -5698,7 +5782,8 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                             or latent_concept_memory_size > 0
                             or hard_study_enabled)
         needs_logits = bool(float(decode_w) > 0.0 or float(agreement_w) > 0.0
-                            or float(continuation_repair_w) > 0.0)
+                            or float(continuation_repair_w) > 0.0
+                            or float(repetition_unlikelihood_w) > 0.0)
         if decode_txt is txt or not needs_latent:
             bundles_by_mode = {
                 mode: model.mode_bundle(
@@ -5732,6 +5817,21 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
                         for logits in logits_by_mode.values()) / len(logits_by_mode)
         agreement = (logit_agreement_loss(logits_by_mode, ids, vocab.pad)
                      if agreement_w else base_loss * 0.0)
+        if repetition_unlikelihood_w:
+            repetition_unlikelihood, repetition_unlikelihood_metrics = (
+                repetition_unlikelihood_loss(
+                    logits_by_mode, ids, vocab.pad,
+                    window=repetition_unlikelihood_window))
+        else:
+            repetition_unlikelihood = base_loss * 0.0
+            repetition_unlikelihood_metrics = {
+                "enabled": False,
+                "skipped": True,
+                "skip_reason": "weight_zero",
+                "tokens": 0,
+                "candidates": 0,
+                "window": int(repetition_unlikelihood_window),
+            }
         if continuation_repair_w and decode_objective == "causal":
             continuation_repair, continuation_repair_metrics = (
                 continuation_repair_loss(
@@ -6009,6 +6109,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             if latent_concept_cluster_w else base_loss * 0.0)
         loss = (float(decode_w) * base_loss + float(agreement_w) * agreement
                 + float(continuation_repair_w) * continuation_repair
+                + float(repetition_unlikelihood_w) * repetition_unlikelihood
                 + float(latent_concept_w) * latent_concept
                 + float(latent_concept_factorization_w) * latent_factorization
                 + float(latent_concept_fer_w) * latent_fer
@@ -6070,6 +6171,20 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
             "decode_w": float(decode_w),
             "token_loss": float(base_loss.detach()),
             "agreement_loss": float(agreement.detach()),
+            "repetition_unlikelihood_loss": float(
+                repetition_unlikelihood.detach()),
+            "repetition_unlikelihood_w": float(repetition_unlikelihood_w),
+            "repetition_unlikelihood_window": int(repetition_unlikelihood_window),
+            "repetition_unlikelihood_enabled": bool(
+                repetition_unlikelihood_metrics["enabled"]),
+            "repetition_unlikelihood_skipped": bool(
+                repetition_unlikelihood_metrics["skipped"]),
+            "repetition_unlikelihood_skip_reason": str(
+                repetition_unlikelihood_metrics.get("skip_reason", "")),
+            "repetition_unlikelihood_tokens": int(
+                repetition_unlikelihood_metrics["tokens"]),
+            "repetition_unlikelihood_candidates": int(
+                repetition_unlikelihood_metrics["candidates"]),
             "continuation_repair_loss": float(continuation_repair.detach()),
             "continuation_repair_w": float(continuation_repair_w),
             "continuation_repair_steps": int(continuation_repair_steps),
@@ -6296,6 +6411,7 @@ def train(manifest, root=None, steps=400, batch=32, d=96, lr=1e-3, seed=0,
         if st % int(log_every) == 0 or st == int(steps):
             print(f"  multimodal {st}/{steps} loss {last['loss']:.3f} "
                   f"token {last['token_loss']:.3f} agree {last['agreement_loss']:.3f} "
+                  f"repeat {last['repetition_unlikelihood_loss']:.3f} "
                   f"latent {last['latent_concept_loss']:.3f} "
                   f"fer {last['latent_fer_loss']:.3f} "
                   f"memory {last['latent_memory_loss']:.3f} "
@@ -7640,8 +7756,13 @@ def selftest():
         assert language_profile["applied"] is True
         assert language_profile["updates"]["continuation_repair_w"]["to"] == (
             MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS["continuation_repair_w"])
+        assert language_profile["updates"]["repetition_unlikelihood_w"]["to"] == (
+            MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS["repetition_unlikelihood_w"])
         assert (language_profile_model.train_metrics["continuation_repair_w"]
                 == MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS["continuation_repair_w"])
+        assert (language_profile_model.train_metrics["repetition_unlikelihood_w"]
+                == MULTIMODAL_LANGUAGE_OBJECTIVE_FLOORS[
+                    "repetition_unlikelihood_w"])
         assert language_profile_model.train_metrics[
             "continuation_repair_skipped"] is True
         assert language_profile_model.latent_concept_slots == 0
@@ -7741,6 +7862,9 @@ def selftest():
         assert causal_model.train_metrics["continuation_repair_w"] > 0.0
         assert causal_model.train_metrics["continuation_repair_enabled"] is True
         assert causal_model.train_metrics["continuation_repair_tokens"] > 0
+        assert causal_model.train_metrics["repetition_unlikelihood_w"] > 0.0
+        assert causal_model.train_metrics["repetition_unlikelihood_enabled"] is True
+        assert causal_model.train_metrics["repetition_unlikelihood_candidates"] > 0
         causal_bundle = multimodal_eval_bundle(
             causal_model, causal_eval, causal_vocab, causal_dims, n=0,
             device="cpu", decode_objective="causal")
@@ -7933,6 +8057,13 @@ def main(argv=None):
     ap.add_argument("--continuation-repair-top-k", type=int, default=0,
                     dest="continuation_repair_top_k",
                     help="optional top-k sampling cap for repair self-rollout")
+    ap.add_argument("--repetition-unlikelihood-w", type=float, default=0.0,
+                    dest="repetition_unlikelihood_w",
+                    help=("loss weight that discourages assigning probability "
+                          "to recent non-gold repeats"))
+    ap.add_argument("--repetition-unlikelihood-window", type=int, default=32,
+                    dest="repetition_unlikelihood_window",
+                    help="recent context window used for repeat negatives")
     ap.add_argument("--text-checkpoint", default=None, dest="text_checkpoint",
                     help="optional thinking.text checkpoint for text/latent warm start")
     ap.add_argument("--multimodal-checkpoint", default=None,
@@ -8298,6 +8429,10 @@ def main(argv=None):
         ap.error("--continuation-repair-temperature must be non-negative")
     if args.continuation_repair_top_k < 0:
         ap.error("--continuation-repair-top-k must be non-negative")
+    if args.repetition_unlikelihood_w < 0.0:
+        ap.error("--repetition-unlikelihood-w must be non-negative")
+    if args.repetition_unlikelihood_window < 0:
+        ap.error("--repetition-unlikelihood-window must be non-negative")
     if args.self_teach_w < 0.0:
         ap.error("--self-teach-w must be non-negative")
     if args.self_teach_history_prior_w < 0.0:
@@ -8464,6 +8599,8 @@ def main(argv=None):
         continuation_repair_prompt_frac=args.continuation_repair_prompt_frac,
         continuation_repair_temperature=args.continuation_repair_temperature,
         continuation_repair_top_k=args.continuation_repair_top_k,
+        repetition_unlikelihood_w=args.repetition_unlikelihood_w,
+        repetition_unlikelihood_window=args.repetition_unlikelihood_window,
         text_checkpoint=args.text_checkpoint,
         multimodal_checkpoint=args.multimodal_checkpoint,
         concept_tokens=args.concept_tokens, fusion_layers=args.fusion_layers,
