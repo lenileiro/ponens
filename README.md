@@ -28,8 +28,9 @@ on the new reading task, so the model rereads material tied to real weight movem
 turning replay into labels. Multimodal text-checkpoint transfer also exposes that priority-study
 evidence and uses it when converting text learning events into self-teach pressure. Multimodal
 training now writes its own generic `learning_event` when applied updates move sampled weights and
-improve score, bridge insight, or internal representation organization, so multimodal checkpoints
-can also seed later self-teaching. The code keeps model inputs manifest-driven:
+improve score, bridge insight, or internal representation organization, and checkpoints preserve a
+bounded `multimodal_learning_history` so continuation can reuse a trajectory of discovered
+weaknesses rather than only the latest report. The code keeps model inputs manifest-driven:
 datasets provide text, feature views, image records, and optional target tokens; model code learns
 the representations.
 

@@ -10,8 +10,20 @@ KEYWORDS = ("extract", "fact", "done", ".")
 
 
 class Vocab:
-    def __init__(self, tokens):
-        self.itos = [PAD, UNK] + sorted(set(tokens) | set(KEYWORDS))
+    def __init__(self, tokens, max_size=None):
+        keywords = set(KEYWORDS)
+        if max_size and int(max_size) > 0:
+            # Keep the most frequent tokens (control keywords always retained);
+            # the long tail falls back to <unk>. Caps embedding-table blow-up on
+            # large corpora where most tokens appear once and never train.
+            from collections import Counter
+            budget = max(0, int(max_size) - 2 - len(keywords))  # 2 = PAD, UNK
+            counts = Counter(t for t in tokens if t not in keywords)
+            kept = {t for t, _ in counts.most_common(budget)}
+            vocab_tokens = keywords | kept
+        else:
+            vocab_tokens = set(tokens) | keywords
+        self.itos = [PAD, UNK] + sorted(vocab_tokens)
         self.stoi = {t: i for i, t in enumerate(self.itos)}
         self.pad, self.unk = 0, 1
 

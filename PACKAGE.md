@@ -109,8 +109,10 @@ top signal, kind, score, and priority-study evidence, so multimodal runs can see
 source learned by moving weights, revisiting event-linked chunks, and reorganizing concepts before
 it transferred. Multimodal train reports now write their own generic `learning_event` from applied
 weight movement, score gain, bridge insight, and representation reorganization, and multimodal
-checkpoint transfer can reuse event-only evidence for later self-teach. Multimodal train reports
-include the same
+checkpoints now persist a bounded `multimodal_learning_history` so continuation can reuse multiple
+prior learning events and representation-progress summaries for later self-teach. Multimodal
+checkpoint import reports expose the source history count, event counts, top signal/kind, and
+summary alongside the latest event. Multimodal train reports include the same
 bounded sampled parameter-update summary for the current run, including attempted selected rounds
 that are later rolled back. Optional `--representation-probe-n` records a before/after
 label-free organization report over FER, bridge, and sequence signals, so a run can distinguish

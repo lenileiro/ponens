@@ -75,6 +75,7 @@ FLOW_DISTILL_TEACHERS = ("raw", "ema", "auto")
 DEFAULT_GUIDANCE_INTERVAL = (0.0, 1.0)
 DEFAULT_CHURN_INTERVAL = (0.0, 0.8)
 LATENT_NORMALIZE_MODES = ("none", "global", "channel", "auto")
+DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE = 8
 
 
 def activation_checkpoint(fn, *args):
@@ -5181,6 +5182,103 @@ def visual_physics_loss(pred, target, prefix="visual_physics", eps=1.0e-6):
     }
 
 
+def visual_patch_structure_targets(
+        x, patch=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE, eps=1.0e-6):
+    """Per-patch category-free descriptors for local structure and physics."""
+    if x.ndim != 4:
+        raise ValueError(
+            f"patch structure targets expect BCHW tensors, got {tuple(x.shape)}")
+    p = int(patch)
+    if p <= 0:
+        raise ValueError("patch structure size must be positive")
+    data = torch.nan_to_num(x.float(), nan=0.0, posinf=1.0, neginf=-1.0)
+    bsz, channels, h, w = data.shape
+    if h <= 0 or w <= 0:
+        raise ValueError("patch structure targets require non-empty spatial dimensions")
+    pad_h = (p - h % p) % p
+    pad_w = (p - w % p) % p
+    if pad_h or pad_w:
+        data = F.pad(data, (0, pad_w, 0, pad_h), value=0.0)
+    patches = F.unfold(data, kernel_size=p, stride=p).transpose(1, 2)
+    patches = patches.reshape(bsz, -1, channels, p, p)
+    channel_mean = patches.mean(dim=(-2, -1))
+    channel_std = patches.flatten(-2).std(dim=-1, unbiased=False)
+    luminance = patches.mean(dim=2)
+    if p > 1:
+        dx = luminance[..., :, 1:] - luminance[..., :, :-1]
+        dy = luminance[..., 1:, :] - luminance[..., :-1, :]
+        edge_x = dx.abs().mean(dim=(-2, -1)).unsqueeze(-1)
+        edge_y = dy.abs().mean(dim=(-2, -1)).unsqueeze(-1)
+        dx_energy = F.pad(dx.pow(2), (0, 1), value=0.0)
+        dy_energy = F.pad(dy.pow(2), (0, 0, 0, 1), value=0.0)
+    else:
+        edge_x = luminance.new_zeros(bsz, int(patches.shape[1]), 1)
+        edge_y = luminance.new_zeros(bsz, int(patches.shape[1]), 1)
+        dx_energy = torch.zeros_like(luminance)
+        dy_energy = torch.zeros_like(luminance)
+    edge = (dx_energy + dy_energy + float(eps)).sqrt()
+    mass = patches.pow(2).mean(dim=2)
+    contrast = luminance.flatten(-2).std(dim=-1, unbiased=False).unsqueeze(-1)
+    detail = luminance - luminance.mean(dim=(-2, -1), keepdim=True)
+    detail_energy = detail.pow(2).mean(dim=(-2, -1)).sqrt().unsqueeze(-1)
+    local_y, local_x = torch.meshgrid(
+        torch.linspace(-1.0, 1.0, p, device=data.device, dtype=data.dtype),
+        torch.linspace(-1.0, 1.0, p, device=data.device, dtype=data.dtype),
+        indexing="ij")
+    flat_n = bsz * int(patches.shape[1])
+    local_x = local_x.unsqueeze(0).expand(flat_n, -1, -1)
+    local_y = local_y.unsqueeze(0).expand(flat_n, -1, -1)
+    layout = _weighted_spatial_moments(
+        (mass + edge).reshape(flat_n, p, p), local_x, local_y, eps=eps
+    ).reshape(bsz, -1, 6)
+    edge_layout = _weighted_spatial_moments(
+        edge.reshape(flat_n, p, p), local_x, local_y, eps=eps
+    ).reshape(bsz, -1, 6)
+    return torch.cat(
+        (
+            channel_mean,
+            channel_std,
+            edge_x,
+            edge_y,
+            contrast,
+            detail_energy,
+            layout,
+            edge_layout,
+        ),
+        dim=-1,
+    )
+
+
+def visual_patch_structure_loss(
+        pred, target, patch=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE,
+        prefix="patch_structure", eps=1.0e-6):
+    if pred.shape != target.shape:
+        raise ValueError(
+            f"patch structure loss shapes must match, got "
+            f"{tuple(pred.shape)} and {tuple(target.shape)}")
+    pred_desc = visual_patch_structure_targets(pred, patch=patch, eps=eps)
+    target_desc = visual_patch_structure_targets(target.detach(), patch=patch, eps=eps)
+    desc_l1 = F.l1_loss(pred_desc, target_desc)
+    channels = int(pred.shape[1])
+    color_end = channels * 2
+    color_l1 = F.l1_loss(pred_desc[..., :color_end], target_desc[..., :color_end])
+    edge_l1 = F.l1_loss(
+        pred_desc[..., color_end:color_end + 2],
+        target_desc[..., color_end:color_end + 2])
+    physics_l1 = F.l1_loss(pred_desc[..., -12:], target_desc[..., -12:])
+    return desc_l1, {
+        f"{prefix}_loss": desc_l1.detach(),
+        f"{prefix}_color_l1": color_l1.detach(),
+        f"{prefix}_edge_l1": edge_l1.detach(),
+        f"{prefix}_physics_l1": physics_l1.detach(),
+        f"{prefix}_patch_size": torch.tensor(float(int(patch)), device=pred.device),
+        f"{prefix}_patches": torch.tensor(
+            float(int(pred_desc.shape[1])), device=pred.device),
+        f"{prefix}_dim": torch.tensor(
+            float(int(pred_desc.shape[-1])), device=pred.device),
+    }
+
+
 def latent_spatial_relation_loss(
         pred, target, levels=2, offsets=((0, 1), (1, 0), (1, 1), (1, -1)),
         eps=1.0e-6):
@@ -5395,7 +5493,10 @@ def multiscale_flow_velocity_loss(pred, target, scales=(2, 4), weights=None):
 
 def reconstruction_loss_parts(pred, target, mode="mse", grad_w=0.0, ms_w=0.0,
                               fft_w=0.0, structure_w=0.0, texture_w=0.0,
-                              physics_w=0.0, latent=None, latent_reg_w=0.0):
+                              physics_w=0.0, patch_structure_w=0.0,
+                              patch_structure_size=(
+                                  DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE),
+                              latent=None, latent_reg_w=0.0):
     if mode not in AE_RECON_LOSSES:
         raise ValueError(f"unknown AE reconstruction loss {mode!r}")
     mse = F.mse_loss(pred, target)
@@ -5437,6 +5538,12 @@ def reconstruction_loss_parts(pred, target, mode="mse", grad_w=0.0, ms_w=0.0,
             pred, target, prefix="recon_physics")
         loss = loss + float(physics_w) * physics
         parts.update(physics_parts)
+    if patch_structure_w > 0.0:
+        patch_structure, patch_parts = visual_patch_structure_loss(
+            pred, target, patch=patch_structure_size,
+            prefix="recon_patch_structure")
+        loss = loss + float(patch_structure_w) * patch_structure
+        parts.update(patch_parts)
     if latent is not None and latent_reg_w > 0.0:
         lat = latent.float().pow(2).mean()
         loss = loss + float(latent_reg_w) * lat
@@ -6413,6 +6520,9 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        decoded_endpoint_structure_w=0.0,
                        decoded_endpoint_texture_w=0.0,
                        decoded_endpoint_physics_w=0.0,
+                       decoded_endpoint_patch_structure_w=0.0,
+                       decoded_endpoint_patch_structure_size=(
+                           DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE),
                        equivariance_w=0.0, equivariance_p=1.0,
                        equivariance_transforms=DEFAULT_FLOW_EQUIVARIANCE_TRANSFORMS,
                        equivariance_shift_frac=0.125,
@@ -6469,6 +6579,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     decoded_endpoint_structure_w = float(decoded_endpoint_structure_w)
     decoded_endpoint_texture_w = float(decoded_endpoint_texture_w)
     decoded_endpoint_physics_w = float(decoded_endpoint_physics_w)
+    decoded_endpoint_patch_structure_w = float(decoded_endpoint_patch_structure_w)
+    decoded_endpoint_patch_structure_size = int(decoded_endpoint_patch_structure_size)
     if decoded_endpoint_w < 0.0:
         raise ValueError("decoded_endpoint_w must be non-negative")
     if decoded_endpoint_p < 0.0 or decoded_endpoint_p > 1.0:
@@ -6477,8 +6589,11 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
             or decoded_endpoint_fft_w < 0.0
             or decoded_endpoint_structure_w < 0.0
             or decoded_endpoint_texture_w < 0.0
-            or decoded_endpoint_physics_w < 0.0):
+            or decoded_endpoint_physics_w < 0.0
+            or decoded_endpoint_patch_structure_w < 0.0):
         raise ValueError("decoded endpoint structure weights must be non-negative")
+    if decoded_endpoint_patch_structure_size <= 0:
+        raise ValueError("decoded_endpoint_patch_structure_size must be positive")
     if decoded_endpoint_w > 0.0 and ae is None:
         raise ValueError("decoded_endpoint_w requires an autoencoder")
     equivariance_w = float(equivariance_w)
@@ -6610,6 +6725,10 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
             float(decoded_endpoint_texture_w), device=z1.device),
         "flow_decoded_endpoint_physics_w": torch.tensor(
             float(decoded_endpoint_physics_w), device=z1.device),
+        "flow_decoded_endpoint_patch_structure_w": torch.tensor(
+            float(decoded_endpoint_patch_structure_w), device=z1.device),
+        "flow_decoded_endpoint_patch_structure_size": torch.tensor(
+            float(decoded_endpoint_patch_structure_size), device=z1.device),
         "flow_decoded_endpoint_active": torch.tensor(0.0, device=z1.device),
         "flow_equivariance_w": torch.tensor(float(equivariance_w), device=z1.device),
         "flow_equivariance_p": torch.tensor(float(equivariance_p), device=z1.device),
@@ -6720,7 +6839,9 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
             fft_w=decoded_endpoint_fft_w,
             structure_w=decoded_endpoint_structure_w,
             texture_w=decoded_endpoint_texture_w,
-            physics_w=decoded_endpoint_physics_w)
+            physics_w=decoded_endpoint_physics_w,
+            patch_structure_w=decoded_endpoint_patch_structure_w,
+            patch_structure_size=decoded_endpoint_patch_structure_size)
         total = total + float(decoded_endpoint_w) * decoded_loss
         parts["flow_decoded_endpoint_loss"] = decoded_loss.detach()
         parts["flow_decoded_endpoint_active"] = torch.tensor(1.0, device=z1.device)
@@ -11456,6 +11577,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       ae_hf_model="", ae_hf_subfolder="", ae_hf_scaling_factor=0.0,
                       ae_recon_loss="mse", ae_grad_w=0.0, ae_ms_w=0.0, ae_fft_w=0.0,
                       ae_structure_w=0.0, ae_texture_w=0.0, ae_physics_w=0.0,
+                      ae_patch_structure_w=0.0,
+                      ae_patch_structure_size=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE,
                       ae_latent_reg_w=0.0,
                       image_text_align_w=0.0, flow_text_align_w=0.0, text_embed_dim=128,
                       image_feature_align_w=0.0, flow_feature_align_w=0.0,
@@ -11489,6 +11612,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       flow_decoded_endpoint_structure_w=0.0,
                       flow_decoded_endpoint_texture_w=0.0,
                       flow_decoded_endpoint_physics_w=0.0,
+                      flow_decoded_endpoint_patch_structure_w=0.0,
+                      flow_decoded_endpoint_patch_structure_size=(
+                          DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE),
                       flow_equivariance_w=0.0, flow_equivariance_p=1.0,
                       flow_equivariance_transforms=DEFAULT_FLOW_EQUIVARIANCE_TRANSFORMS,
                       flow_equivariance_shift_frac=0.125,
@@ -11736,10 +11862,15 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     ae_structure_w = float(ae_structure_w)
     ae_texture_w = float(ae_texture_w)
     ae_physics_w = float(ae_physics_w)
+    ae_patch_structure_w = float(ae_patch_structure_w)
+    ae_patch_structure_size = int(ae_patch_structure_size)
     if (ae_grad_w < 0.0 or ae_ms_w < 0.0 or ae_fft_w < 0.0
             or ae_structure_w < 0.0 or ae_texture_w < 0.0
-            or ae_physics_w < 0.0 or ae_latent_reg_w < 0.0):
+            or ae_physics_w < 0.0 or ae_patch_structure_w < 0.0
+            or ae_latent_reg_w < 0.0):
         raise ValueError("AE reconstruction weights must be non-negative")
+    if ae_patch_structure_size <= 0:
+        raise ValueError("ae_patch_structure_size must be positive")
     if image_text_align_w < 0.0 or flow_text_align_w < 0.0:
         raise ValueError("image/text alignment weights must be non-negative")
     if image_feature_align_w < 0.0 or flow_feature_align_w < 0.0:
@@ -11829,6 +11960,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_decoded_endpoint_structure_w = float(flow_decoded_endpoint_structure_w)
     flow_decoded_endpoint_texture_w = float(flow_decoded_endpoint_texture_w)
     flow_decoded_endpoint_physics_w = float(flow_decoded_endpoint_physics_w)
+    flow_decoded_endpoint_patch_structure_w = float(
+        flow_decoded_endpoint_patch_structure_w)
+    flow_decoded_endpoint_patch_structure_size = int(
+        flow_decoded_endpoint_patch_structure_size)
     if flow_decoded_endpoint_w < 0.0:
         raise ValueError("flow_decoded_endpoint_w must be non-negative")
     if flow_decoded_endpoint_p < 0.0 or flow_decoded_endpoint_p > 1.0:
@@ -11837,8 +11972,11 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             or flow_decoded_endpoint_fft_w < 0.0
             or flow_decoded_endpoint_structure_w < 0.0
             or flow_decoded_endpoint_texture_w < 0.0
-            or flow_decoded_endpoint_physics_w < 0.0):
+            or flow_decoded_endpoint_physics_w < 0.0
+            or flow_decoded_endpoint_patch_structure_w < 0.0):
         raise ValueError("flow decoded endpoint component weights must be non-negative")
+    if flow_decoded_endpoint_patch_structure_size <= 0:
+        raise ValueError("flow_decoded_endpoint_patch_structure_size must be positive")
     flow_equivariance_w = float(flow_equivariance_w)
     flow_equivariance_p = float(flow_equivariance_p)
     if flow_equivariance_w < 0.0:
@@ -12199,6 +12337,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     out["recon"], x, mode=ae_recon_loss, grad_w=ae_grad_w,
                     ms_w=ae_ms_w, fft_w=ae_fft_w, structure_w=ae_structure_w,
                     texture_w=ae_texture_w, physics_w=ae_physics_w,
+                    patch_structure_w=ae_patch_structure_w,
+                    patch_structure_size=ae_patch_structure_size,
                     latent=out.get("latent"),
                     latent_reg_w=ae_latent_reg_w)
                 if text_aligner is not None and image_text_align_w > 0.0:
@@ -12753,6 +12893,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                         flow_decoded_endpoint_texture_w),
                     decoded_endpoint_physics_w=(
                         flow_decoded_endpoint_physics_w),
+                    decoded_endpoint_patch_structure_w=(
+                        flow_decoded_endpoint_patch_structure_w),
+                    decoded_endpoint_patch_structure_size=(
+                        flow_decoded_endpoint_patch_structure_size),
                     equivariance_w=flow_equivariance_w,
                     equivariance_p=flow_equivariance_p,
                     equivariance_transforms=flow_equivariance_transforms,
@@ -13146,6 +13290,8 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "ae_structure_w": float(ae_structure_w),
         "ae_texture_w": float(ae_texture_w),
         "ae_physics_w": float(ae_physics_w),
+        "ae_patch_structure_w": float(ae_patch_structure_w),
+        "ae_patch_structure_size": int(ae_patch_structure_size),
         "ae_latent_reg_w": float(ae_latent_reg_w),
         "image_text_align_w": float(image_text_align_w),
         "flow_text_align_w": float(flow_text_align_w),
@@ -13236,6 +13382,10 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
             flow_decoded_endpoint_texture_w),
         "flow_decoded_endpoint_physics_w": float(
             flow_decoded_endpoint_physics_w),
+        "flow_decoded_endpoint_patch_structure_w": float(
+            flow_decoded_endpoint_patch_structure_w),
+        "flow_decoded_endpoint_patch_structure_size": int(
+            flow_decoded_endpoint_patch_structure_size),
         "flow_equivariance_w": float(flow_equivariance_w),
         "flow_equivariance_p": float(flow_equivariance_p),
         "flow_equivariance_transforms": list(flow_equivariance_transforms),
@@ -14243,6 +14393,13 @@ def main(argv=None):
     ap.add_argument("--ae-physics-w", type=float, default=0.0,
                     dest="ae_physics_w",
                     help=("generic visual mass/edge moment reconstruction loss weight"))
+    ap.add_argument("--ae-patch-structure-w", type=float, default=0.0,
+                    dest="ae_patch_structure_w",
+                    help=("category-free patch descriptor reconstruction loss weight"))
+    ap.add_argument("--ae-patch-structure-size", type=int,
+                    default=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE,
+                    dest="ae_patch_structure_size",
+                    help="patch size for --ae-patch-structure-w")
     ap.add_argument("--ae-latent-reg-w", type=float, default=0.0, dest="ae_latent_reg_w",
                     help="latent L2 regularization weight during AE training")
     ap.add_argument("--image-text-align-w", type=float, default=0.0,
@@ -14507,6 +14664,15 @@ def main(argv=None):
     ap.add_argument("--flow-decoded-endpoint-physics-w", type=float, default=0.0,
                     dest="flow_decoded_endpoint_physics_w",
                     help=("visual mass/edge moment weight inside decoded endpoint loss"))
+    ap.add_argument("--flow-decoded-endpoint-patch-structure-w", type=float,
+                    default=0.0,
+                    dest="flow_decoded_endpoint_patch_structure_w",
+                    help=("category-free patch descriptor weight inside decoded "
+                          "endpoint loss"))
+    ap.add_argument("--flow-decoded-endpoint-patch-structure-size", type=int,
+                    default=DEFAULT_VISUAL_PATCH_STRUCTURE_SIZE,
+                    dest="flow_decoded_endpoint_patch_structure_size",
+                    help=("patch size for --flow-decoded-endpoint-patch-structure-w"))
     ap.add_argument("--flow-equivariance-w", type=float, default=0.0,
                     dest="flow_equivariance_w",
                     help=("spatial equivariance loss weight for latent flow "
@@ -15028,8 +15194,11 @@ def main(argv=None):
             or args.ae_fft_w < 0.0 or args.ae_structure_w < 0.0
             or args.ae_texture_w < 0.0
             or args.ae_physics_w < 0.0
+            or args.ae_patch_structure_w < 0.0
             or args.ae_latent_reg_w < 0.0):
         ap.error("AE reconstruction weights must be non-negative")
+    if args.ae_patch_structure_size <= 0:
+        ap.error("--ae-patch-structure-size must be positive")
     if args.flow_time_embed_dim < 0:
         ap.error("--flow-time-embed-dim must be non-negative")
     if args.flow_self_condition and args.flow_arch == "conv":
@@ -15101,8 +15270,11 @@ def main(argv=None):
             or args.flow_decoded_endpoint_fft_w < 0.0
             or args.flow_decoded_endpoint_structure_w < 0.0
             or args.flow_decoded_endpoint_texture_w < 0.0
-            or args.flow_decoded_endpoint_physics_w < 0.0):
+            or args.flow_decoded_endpoint_physics_w < 0.0
+            or args.flow_decoded_endpoint_patch_structure_w < 0.0):
         ap.error("flow decoded endpoint component weights must be non-negative")
+    if args.flow_decoded_endpoint_patch_structure_size <= 0:
+        ap.error("--flow-decoded-endpoint-patch-structure-size must be positive")
     if args.flow_equivariance_w < 0.0:
         ap.error("--flow-equivariance-w must be non-negative")
     if args.flow_equivariance_p < 0.0 or args.flow_equivariance_p > 1.0:
@@ -15574,6 +15746,8 @@ def main(argv=None):
         ae_structure_w=args.ae_structure_w,
         ae_texture_w=args.ae_texture_w,
         ae_physics_w=args.ae_physics_w,
+        ae_patch_structure_w=args.ae_patch_structure_w,
+        ae_patch_structure_size=args.ae_patch_structure_size,
         ae_latent_reg_w=args.ae_latent_reg_w,
         image_text_align_w=args.image_text_align_w,
         flow_text_align_w=args.flow_text_align_w,
@@ -15623,6 +15797,10 @@ def main(argv=None):
             args.flow_decoded_endpoint_texture_w),
         flow_decoded_endpoint_physics_w=(
             args.flow_decoded_endpoint_physics_w),
+        flow_decoded_endpoint_patch_structure_w=(
+            args.flow_decoded_endpoint_patch_structure_w),
+        flow_decoded_endpoint_patch_structure_size=(
+            args.flow_decoded_endpoint_patch_structure_size),
         flow_equivariance_w=args.flow_equivariance_w,
         flow_equivariance_p=args.flow_equivariance_p,
         flow_equivariance_transforms=flow_equivariance_transforms,
@@ -15948,6 +16126,8 @@ def main(argv=None):
         "ae_structure_w": args.ae_structure_w,
         "ae_texture_w": args.ae_texture_w,
         "ae_physics_w": args.ae_physics_w,
+        "ae_patch_structure_w": args.ae_patch_structure_w,
+        "ae_patch_structure_size": args.ae_patch_structure_size,
         "ae_latent_reg_w": args.ae_latent_reg_w,
         "image_text_align_w": args.image_text_align_w,
         "flow_text_align_w": args.flow_text_align_w,

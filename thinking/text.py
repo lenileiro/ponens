@@ -3304,9 +3304,12 @@ def reading_weight_update_snapshot(model, max_tensors=24, max_values=8):
             if int(flat.numel()) == sample_count:
                 indices = torch.arange(sample_count, device=flat.device)
             else:
+                # float32 linspace loses integer precision past 2**24, so its
+                # endpoint can round up to numel; clamp to keep index_select in range.
                 indices = torch.linspace(
                     0, int(flat.numel()) - 1, steps=sample_count,
-                    device=flat.device).round().long()
+                    device=flat.device).round().long().clamp_(
+                        0, int(flat.numel()) - 1)
             values = flat.index_select(0, indices).to(
                 device="cpu", dtype=torch.float32).tolist()
             rows.append({
