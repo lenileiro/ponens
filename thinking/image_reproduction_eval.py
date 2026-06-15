@@ -234,6 +234,8 @@ def selftest():
             "reference_flow_pixel_mse_min"]
         assert report["reference_flow_physics_l1_max"] > report[
             "reference_flow_physics_l1_min"]
+        assert report["reference_flow_patch_structure_l1_max"] > report[
+            "reference_flow_patch_structure_l1_min"]
         gate = reference_reproduction_gate_report(
             report, max_pixel_mse=report["reference_flow_pixel_mse_max"] + 0.01)
         assert gate["sample_reference_quality_gate_passed"] is True
