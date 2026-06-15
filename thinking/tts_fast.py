@@ -75,6 +75,20 @@ def mas_durations(log_align, ids_len, mel_len):
     return dur
 
 
+def uniform_durations(ids_len, tgt_len):
+    """Each real char of item b gets an equal share of that item's OWN tgt_len[b] frames (remainder
+    to the front). Collapse-proof: correct char ORDER and per-item length by construction."""
+    B = ids_len.shape[0]
+    tgt_len = tgt_len if torch.is_tensor(tgt_len) else torch.full((B,), int(tgt_len))
+    dur = torch.zeros(B, int(ids_len.max()), dtype=torch.long, device=ids_len.device)
+    for b in range(B):
+        L = max(1, int(ids_len[b].item())); Tb = int(tgt_len[b].item())
+        base, rem = divmod(Tb, L)
+        dur[b, :L] = base
+        dur[b, :rem] += 1                       # spread remainder so durations sum exactly to Tb
+    return dur
+
+
 def regulate(h, dur, T):
     """Expand char states h (B,L,d) by integer durations dur (B,L) -> (B,T,d), monotonic."""
     B, L, d = h.shape
@@ -116,20 +130,44 @@ class FastTTS(nn.Module):
         self.dec = nn.TransformerEncoder(block, layers, enable_nested_tensor=False)
         self.out = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, n_bins))
         self.dur = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))   # log frames/char
+        # Tacotron2-style postnet: residual conv refinement that sharpens the coarse spectrogram
+        pn, ch = [], 256
+        for i in range(5):
+            ci, co = (n_bins if i == 0 else ch), (n_bins if i == 4 else ch)
+            pn += [nn.Conv1d(ci, co, 5, padding=2)]
+            if i < 4:
+                pn += [nn.BatchNorm1d(co), nn.Tanh(), nn.Dropout(0.1)]
+        self.postnet = nn.Sequential(*pn)
 
     def char_states(self, ids):
         return self.enc(ids)
 
-    def soft_align(self, h, mel, ids):
+    def soft_align(self, h, mel, ids, ids_len=None, mel_len=None, prior_w=0.0):
         q = self.mel_q(mel).transpose(1, 2)                 # (B,T,d)
         k = self.key(h.transpose(1, 2)).transpose(1, 2)     # (B,L,d)
         dist = -((q[:, :, None, :] - k[:, None, :, :]) ** 2).mean(-1)   # (B,T,L) neg L2
+        if prior_w > 0:                                     # diagonal prior prevents collapse-to-char0
+            dist = dist + prior_w * self._diag_prior(dist.shape, ids_len, mel_len, dist.device)
         dist = dist.masked_fill(ids.eq(0)[:, None, :], -1e4)
         return F.log_softmax(dist, -1)
 
+    @staticmethod
+    def _diag_prior(shape, ids_len, mel_len, device):
+        """Gaussian band around the time->char diagonal (in char units), per item."""
+        B, T, L = shape
+        t = torch.arange(T, device=device).float()[None, :, None]       # (1,T,1)
+        j = torch.arange(L, device=device).float()[None, None, :]       # (1,1,L)
+        ml = mel_len.float().clamp(min=1)[:, None, None]
+        il = (ids_len.float() - 1).clamp(min=1)[:, None, None]
+        center = (t / ml) * il                              # expected char index at frame t
+        sigma = (0.1 * ids_len.float()).clamp(min=3.0)[:, None, None]
+        return -0.5 * ((j - center) / sigma) ** 2           # (B,T,L), 0 on diagonal, negative off
+
     def decode(self, h, dur, T):
         reg = regulate(h, dur, T) + self.frame_pos[:T][None]   # (B,T,d) monotonic + position
-        return self.out(self.dec(reg)).transpose(1, 2)         # (B,n_bins,T)
+        coarse = self.out(self.dec(reg)).transpose(1, 2)       # (B,n_bins,T)
+        refined = coarse + self.postnet(coarse)                # residual postnet sharpening
+        return coarse, refined
 
     def durations(self, h):
         return self.dur(h).squeeze(-1)                         # (B,L) log frames/char
@@ -161,22 +199,19 @@ def train(steps=40000, seed=0, device=DEV, batch=32, lr=3e-4, ckpt_path=None, sa
     for st in range(1, steps + 1):
         idt, mel, ids_len, mel_len, T = _batch(train_data, rng, batch, device)
         h = model.char_states(idt)
-        log_align = model.soft_align(h, mel, idt)
-        l_fs = forward_sum_loss(log_align, ids_len, mel_len)
-        dur_tgt = mas_durations(log_align.detach(), ids_len, mel_len)        # hard, non-diff
-        pred = model.decode(h, dur_tgt, T)
+        dur_tgt = uniform_durations(ids_len, mel_len)       # equal share over each item's true length
+        coarse, refined = model.decode(h, dur_tgt, T)
         mmask = (torch.arange(T, device=device)[None] < mel_len[:, None]).float()
-        l_mel = (F.l1_loss(pred, mel, reduction="none").mean(1) * mmask).sum() / mmask.sum()
+        l_mel = sum((F.l1_loss(p, mel, reduction="none").mean(1) * mmask).sum() / mmask.sum()
+                    for p in (coarse, refined))             # coarse + postnet-refined
         cmask = (~idt.eq(0)).float()
         l_dur = (F.l1_loss(model.durations(h), (dur_tgt.float() + 1).log(), reduction="none")
                  * cmask).sum() / cmask.sum()
-        (l_mel + l_fs + 0.1 * l_dur).backward()
+        (l_mel + 0.1 * l_dur).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step(); opt.zero_grad()
         if st % max(1, steps // 16) == 0 or st == steps:
-            focus = float(log_align.exp().max(-1).values.mean().detach())
-            print(f"  fast {st}/{steps} mel {l_mel.item():.3f} fs {l_fs.item():.3f} "
-                  f"dur {l_dur.item():.3f} focus {focus:.3f}", flush=True)
+            print(f"  fast {st}/{steps} mel {l_mel.item():.3f} dur {l_dur.item():.3f}", flush=True)
         if st % max(1, steps // 5) == 0 and (ckpt_path or save_dir):
             if ckpt_path:
                 torch.save({"state_dict": model.state_dict(), "frames_per_char": ratio}, ckpt_path)
@@ -198,7 +233,7 @@ def infer(model, ids, device=DEV):
     dur = (model.durations(h).exp() - 1).clamp(min=0).round().long()
     dur = dur * (~ids.eq(0)).long()
     T = int(dur.sum(-1).max().clamp(8, MAX_T).item())
-    return model.decode(h, dur, T)
+    return model.decode(h, dur, T)[1]                       # refined spectrogram
 
 
 @torch.no_grad()
@@ -222,26 +257,24 @@ def synth(model, texts, out_dir, device=DEV):
 
 def evaluate(model, data, device=DEV, n=200, seed=1):
     rng = np.random.default_rng(seed); eval_data = data[int(len(data) * 0.95):]
-    model.eval(); errs, focus = [], []
+    model.eval(); errs = []
     with torch.no_grad():
         for _ in range(min(n, len(eval_data) * 2)):
             idt, mel, ids_len, mel_len, T = _batch(eval_data, rng, 1, device)
             h = model.char_states(idt)
-            log_align = model.soft_align(h, mel, idt)
-            dur = mas_durations(log_align, ids_len, mel_len)
-            pred = model.decode(h, dur, T)
+            dur = uniform_durations(ids_len, mel_len)
+            pred = model.decode(h, dur, T)[1]
             mmask = (torch.arange(T, device=device)[None] < mel_len[:, None]).float()
             errs.append(float((F.l1_loss(pred, mel, reduction="none").mean(1) * mmask).sum() / mmask.sum()))
-            focus.append(float(log_align.exp().max(-1).values.mean()))
-    return {"heldout_spec_l1": float(np.mean(errs)), "attention_focus": float(np.mean(focus))}
+    return {"heldout_spec_l1": float(np.mean(errs))}
 
 
 def run(steps=40000, seed=0, device=DEV, save_dir="data/synth", ckpt_path="runs/tts_fast.pt"):
     model, data = train(steps=steps, seed=seed, device=device, ckpt_path=ckpt_path, save_dir=save_dir)
     ev = evaluate(model, data, device=device)
-    report = {"experiment": "tts_fastspeech_mas_ljspeech", "sr": SR, "steps": steps, **ev,
-              "frames_per_char": getattr(model, "frames_per_char", 0), "aligned": ev["attention_focus"] > 0.4}
-    print(f"\nheld-out spec L1 {ev['heldout_spec_l1']:.3f}  attention_focus {ev['attention_focus']:.3f}")
+    report = {"experiment": "tts_fastspeech_uniform_ljspeech", "sr": SR, "steps": steps, **ev,
+              "frames_per_char": getattr(model, "frames_per_char", 0)}
+    print(f"\nheld-out spec L1 {ev['heldout_spec_l1']:.3f}")
     synth(model, ["the quick brown fox jumps over the lazy dog.",
                   "hello, this is a test of the speech system.",
                   "she sells sea shells by the sea shore."], save_dir, device=device)
@@ -254,16 +287,12 @@ def selftest():
     a, b = encode_text("hello world"), encode_text("a test.")
     L = max(len(a), len(b))
     ids = torch.tensor([a + [0] * (L - len(a)), b + [0] * (L - len(b))])
-    mel = torch.randn(2, N_BINS, 40)
     ids_len = torch.tensor([len(a), len(b)]); mel_len = torch.tensor([40, 32])
     h = m.char_states(ids)
-    la = m.soft_align(h, mel, ids); assert la.shape == (2, 40, L)
-    dur = mas_durations(la, ids_len, mel_len)
-    # durations must be monotonic-valid: sum to mel_len, only on real chars
+    dur = uniform_durations(ids_len, mel_len)
     assert (dur[0].sum() == 40) and (dur[1].sum() == 32), (dur.sum(1), mel_len)
     assert dur[0, len(a):].sum() == 0, "duration leaked onto padding"
-    pred = m.decode(h, dur, 40); assert pred.shape == (2, N_BINS, 40)
-    fs = forward_sum_loss(la, ids_len, mel_len); assert torch.isfinite(fs)
+    coarse, refined = m.decode(h, dur, 40); assert refined.shape == (2, N_BINS, 40)
     out = infer(m, ids[:1]); assert out.shape[0] == 1 and out.shape[1] == N_BINS
     if os.path.exists(os.path.join(ROOT, "manifest.json")):
         data = load(); assert data
