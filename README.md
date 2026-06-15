@@ -17,9 +17,10 @@ runs reuse internal FER/bridge/sequence weaknesses rather than only surface scor
 transfer is target-probed before trust: a harmful reading checkpoint can be rolled back before its
 history prior drives new training. The default reading profile also owns bounded hard-study
 probing, selected hard-record caps, periodic structure refreshes, and a bounded raw-reading
-vocabulary, so normal commands do not need low-level study flags or an embedding table that grows
-with every one-off corpus token. Reading checkpoints now expose compact `learning_event` evidence
-when an applied update moved sampled weights and improved score, representation structure, or
+vocabulary, and source-balanced sampling, so normal commands do not need low-level study flags,
+do not let the longest source dominate, and do not grow an embedding table for every one-off corpus
+token. Reading checkpoints now expose compact `learning_event` evidence when an applied update
+moved sampled weights and improved score, representation structure, or
 concept-connection signals; continuation and multimodal transfer can use that event as self-teach
 pressure, and replay banks prioritize the study records attached to those events. Selected study
 rounds can also keep a guarded representation reorganization as a model-discovered "light bulb"

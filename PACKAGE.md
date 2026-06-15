@@ -64,6 +64,9 @@ and samples priority rows more often, while acceptance is still scored on the ne
 Raw-reading vocabularies are capped by default with frequency-based retention
 (`--reading-max-vocab`, set `0` to disable), preserving known checkpoint tokens while mapping the
 long tail to `<unk>` instead of growing the embedding table for every one-off corpus token.
+Training batches also use smooth source-balanced sampling by default
+(`--reading-source-balance-w`, set `0` to disable), so mixed reading corpora are not dominated by
+the longest source.
 Use
 `manual` for exact low-level
 ablations.

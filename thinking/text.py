@@ -72,6 +72,7 @@ READING_REPLAY_BANK_SIZE = 128
 READING_MASTERY_HISTORY_VERSION = 1
 READING_MASTERY_HISTORY_SIZE = 32
 READING_DEFAULT_MAX_VOCAB = 32768
+READING_DEFAULT_SOURCE_BALANCE_W = 0.5
 READING_MASTERY_SCORE_KEYS = (
     "score", "mastery_score", "active_mean_score", "signal_coverage",
     "balanced_score", "floor_score", "view_score", "fer_score",
@@ -679,6 +680,29 @@ def reading_mastery_history_entry(report, session_index=None):
         for row in rounds
         if "training_priority_max" in row
     ]
+    training_source_counts = [
+        _reading_int_or_none(row.get("training_source_count"))
+        for row in rounds
+    ]
+    training_source_counts = [
+        value for value in training_source_counts if value is not None
+    ]
+    training_max_source_fracs = [
+        _reading_float(row.get("training_max_source_record_frac", 0.0))
+        for row in rounds
+        if "training_max_source_record_frac" in row
+    ]
+    training_min_source_fracs = [
+        _reading_float(row.get("training_min_source_record_frac", 0.0))
+        for row in rounds
+        if "training_min_source_record_frac" in row
+    ]
+    training_min_source_frac_candidates = [
+        _reading_float(train_metrics.get("training_min_source_record_frac", 0.0))
+    ] + training_min_source_fracs
+    training_min_source_frac_candidates = [
+        value for value in training_min_source_frac_candidates if value > 0.0
+    ] or [0.0]
     self_teach_reports = selection.get("self_teach_reports", ())
     if not self_teach_reports and isinstance(train_metrics.get("self_teach_plan"), dict):
         self_teach_reports = (train_metrics["self_teach_plan"],)
@@ -754,6 +778,23 @@ def reading_mastery_history_entry(report, session_index=None):
         "training_priority_max": max(
             [_reading_float(train_metrics.get("training_priority_max", 0.0))]
             + training_priority_maxes),
+        "training_source_balance_sampling": bool(
+            train_metrics.get("training_source_balance_sampling", False)
+            or any(bool(row.get("training_source_balance_sampling", False))
+                   for row in rounds)),
+        "training_source_balance_w": max(
+            [_reading_float(train_metrics.get("training_source_balance_w", 0.0))]
+            + [_reading_float(row.get("training_source_balance_w", 0.0))
+               for row in rounds if "training_source_balance_w" in row]),
+        "training_source_count": max(
+            [_reading_int_or_none(train_metrics.get("training_source_count")) or 0]
+            + training_source_counts),
+        "training_max_source_record_frac": max(
+            [_reading_float(
+                train_metrics.get("training_max_source_record_frac", 0.0))]
+            + training_max_source_fracs),
+        "training_min_source_record_frac": min(
+            training_min_source_frac_candidates),
         "weight_update_changed": bool(weight_update["changed"]),
         "weight_update_changed_tensor_count": int(
             weight_update["changed_tensor_count"]),
@@ -815,7 +856,8 @@ def reading_mastery_history_with_entry(previous_history, report):
     }
 
 
-def normalize_reading_record(raw, default_split=None, idx=0, text_field="text"):
+def normalize_reading_record(raw, default_split=None, idx=0, text_field="text",
+                             default_source=None):
     if not isinstance(raw, dict):
         raise ValueError(f"reading record {idx} must be an object")
     split = raw.get("split", default_split or "train")
@@ -831,9 +873,12 @@ def normalize_reading_record(raw, default_split=None, idx=0, text_field="text"):
         raise ValueError(f"reading record {idx} must contain text or tokens")
     if not tokens or not all(isinstance(t, str) and t for t in tokens):
         raise ValueError(f"reading record {idx} has empty/non-string tokens")
-    meta = raw.get("meta") or {}
+    meta = dict(raw.get("meta") or {})
     if not isinstance(meta, dict):
         raise ValueError(f"reading record {idx}.meta must be an object when provided")
+    if default_source and not any(
+            key in meta for key in ("source", "document", "dataset")):
+        meta["source"] = str(default_source)
     return ReadingRecord(
         rec_id=str(raw.get("id", f"reading-{split}-{idx}")),
         split=split,
@@ -881,16 +926,19 @@ def reading_records_from_text(text, source, max_tokens=128, min_tokens=8,
 def _json_reading_records(data, source, text_field="text"):
     records = []
     if isinstance(data, list):
-        records = [normalize_reading_record(r, idx=i, text_field=text_field)
+        records = [normalize_reading_record(
+                       r, idx=i, text_field=text_field, default_source=source)
                    for i, r in enumerate(data)]
     elif isinstance(data, dict):
         if "records" in data:
-            records = [normalize_reading_record(r, idx=i, text_field=text_field)
+            records = [normalize_reading_record(
+                           r, idx=i, text_field=text_field, default_source=source)
                        for i, r in enumerate(data["records"])]
         else:
             for split in ("train", "eval"):
                 records.extend(normalize_reading_record(
-                    r, default_split=split, idx=i, text_field=text_field)
+                    r, default_split=split, idx=i, text_field=text_field,
+                    default_source=source)
                     for i, r in enumerate(data.get(split, [])))
     if not records:
         raise ValueError(f"{source} produced no reading records")
@@ -915,7 +963,8 @@ def load_reading_records(path, require_train=True, require_eval=True,
     txt = _read_text_source(path)
     if str(path).endswith(".jsonl"):
         records = [normalize_reading_record(json.loads(line), idx=i,
-                                            text_field=text_field)
+                                            text_field=text_field,
+                                            default_source=path)
                    for i, line in enumerate(txt.splitlines()) if line.strip()]
     elif str(path).endswith(".json"):
         records = _json_reading_records(json.loads(txt), path, text_field=text_field)
@@ -1300,6 +1349,18 @@ def batch_records(records, rng, batch, weights=None):
     return [records[int(i)] for i in idx]
 
 
+def reading_record_source(rec):
+    meta = getattr(rec, "meta", {}) if isinstance(
+        getattr(rec, "meta", None), dict) else {}
+    source = meta.get("source", meta.get("document", meta.get("dataset", "")))
+    return str(source or "__unknown__")
+
+
+def reading_source_counts(records):
+    from collections import Counter
+    return Counter(reading_record_source(rec) for rec in records or ())
+
+
 def reading_replay_sampling_weights(records, priority_power=1.0):
     weights = []
     for rec in records or ():
@@ -1313,8 +1374,14 @@ def reading_replay_sampling_weights(records, priority_power=1.0):
     return [float(w) / total for w in weights]
 
 
-def reading_training_sampling_weights(records, priority_power=1.0,
-                                      priority_boost=1.0):
+def reading_training_sampling_weights(
+        records, priority_power=1.0, priority_boost=1.0,
+        source_balance_w=READING_DEFAULT_SOURCE_BALANCE_W):
+    source_balance_w = float(source_balance_w)
+    if source_balance_w < 0.0:
+        raise ValueError("reading source balance weight must be non-negative")
+    counts = reading_source_counts(records)
+    balance_sources = source_balance_w > 0.0 and len(counts) > 1
     weights = []
     saw_priority = False
     for rec in records or ():
@@ -1322,10 +1389,15 @@ def reading_training_sampling_weights(records, priority_power=1.0,
         if isinstance(getattr(rec, "meta", None), dict):
             priority = float(rec.meta.get("replay_priority", 0.0) or 0.0)
         saw_priority = saw_priority or priority > 0.0
-        weights.append(1.0 + float(priority_boost) * (
-            max(0.0, priority) ** float(priority_power)))
+        source_weight = 1.0
+        if balance_sources:
+            source_weight = 1.0 / (
+                float(counts[reading_record_source(rec)]) ** source_balance_w)
+        priority_weight = 1.0 + float(priority_boost) * (
+            max(0.0, priority) ** float(priority_power))
+        weights.append(source_weight * priority_weight)
     total = float(sum(weights))
-    if not saw_priority or total <= 0.0:
+    if (not saw_priority and not balance_sources) or total <= 0.0:
         return None
     return [float(w) / total for w in weights]
 
@@ -4776,7 +4848,8 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
                          study_hard_max=0, study_refresh_steps=0,
                          replay_records=None, replay_teacher_model=None,
                          replay_teacher_vocab=None, replay_w=0.0,
-                         replay_batch=0):
+                         replay_batch=0,
+                         source_balance_w=READING_DEFAULT_SOURCE_BALANCE_W):
     if getattr(model, "latent_concepts", None) is None:
         raise ValueError("raw reading concept training requires latent concept slots")
     if float(context_target_w) < 0.0:
@@ -4953,6 +5026,9 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         raise ValueError("reading cluster min size must be at least two")
     if float(replay_w) < 0.0:
         raise ValueError("reading replay loss weight must be non-negative")
+    source_balance_w = float(source_balance_w)
+    if source_balance_w < 0.0:
+        raise ValueError("reading source balance weight must be non-negative")
     requested_study_strategy = str(study_strategy)
     if requested_study_strategy not in READING_STUDY_STRATEGIES:
         raise ValueError(
@@ -4962,12 +5038,23 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
     train_records = [r for r in records if r.split == "train"]
     if not train_records:
         raise ValueError("cannot train reading concepts without train records")
-    training_sampling_weights = reading_training_sampling_weights(train_records)
-    training_priority_active = training_sampling_weights is not None
+    training_sampling_weights = reading_training_sampling_weights(
+        train_records, source_balance_w=source_balance_w)
+    training_sampling_active = training_sampling_weights is not None
     training_priority_record_count = sum(
         1 for rec in train_records
         if isinstance(getattr(rec, "meta", None), dict)
         and float(rec.meta.get("replay_priority", 0.0) or 0.0) > 0.0)
+    training_priority_active = (
+        training_sampling_active and training_priority_record_count > 0)
+    train_source_counts = reading_source_counts(train_records)
+    training_source_balance_active = (
+        training_sampling_active and source_balance_w > 0.0
+        and len(train_source_counts) > 1)
+    train_record_count = max(1, len(train_records))
+    train_source_fracs = [
+        float(count) / float(train_record_count)
+        for count in train_source_counts.values()]
     replay_records = list(replay_records or [])
     replay_sources = [r for r in replay_records if r.split == "train"] or replay_records
     replay_sampling_weights = reading_replay_sampling_weights(replay_sources)
@@ -6019,10 +6106,19 @@ def fit_reading_concepts(model, vocab, records, steps=400, batch=32, lr=1e-3,
         "clusters": len(clusters),
         "cluster_records": sum(len(rows) for rows in clusters),
         "replay_loss": last_replay,
+        "training_weighted_sampling": bool(training_sampling_active),
         "training_priority_sampling": bool(training_priority_active),
         "training_priority_record_count": int(training_priority_record_count),
         "training_priority_mean": float(last_training_priority_mean),
         "training_priority_max": float(last_training_priority_max),
+        "training_source_balance_sampling": bool(
+            training_source_balance_active),
+        "training_source_balance_w": float(source_balance_w),
+        "training_source_count": int(len(train_source_counts)),
+        "training_max_source_record_frac": (
+            float(max(train_source_fracs)) if train_source_fracs else 0.0),
+        "training_min_source_record_frac": (
+            float(min(train_source_fracs)) if train_source_fracs else 0.0),
         "replay_w": float(replay_w),
         "replay_batch": int(replay_batch),
         "replay_records": len(replay_sources),
@@ -6195,7 +6291,8 @@ def fit_reading_concepts_select_best(
         score_min_delta=0.0, score_patience=0, score_target=0.0,
         insight_accept_w=0.25, insight_min_delta=0.0,
         representation_accept_w=0.0, representation_min_delta=0.0,
-        rounds=1, before_bundle=None, score_records=None):
+        rounds=1, before_bundle=None, score_records=None,
+        source_balance_w=READING_DEFAULT_SOURCE_BALANCE_W):
     records = list(records)
     score_records = list(score_records or records)
     schedule = _step_schedule(steps, rounds)
@@ -6227,6 +6324,9 @@ def fit_reading_concepts_select_best(
     study_self_teach_w = float(study_self_teach_w)
     if study_self_teach_w < 0.0:
         raise ValueError("reading study self-teach weight must be non-negative")
+    source_balance_w = float(source_balance_w)
+    if source_balance_w < 0.0:
+        raise ValueError("reading source balance weight must be non-negative")
     if int(memory_size) > 0:
         model.enable_latent_concept_memory(int(memory_size))
     initial_study_strategy = resolve_reading_study_strategy(
@@ -6438,7 +6538,8 @@ def fit_reading_concepts_select_best(
             replay_records=replay_records,
             replay_teacher_model=replay_teacher_model,
             replay_teacher_vocab=replay_teacher_vocab,
-            replay_w=replay_w, replay_batch=replay_batch)
+            replay_w=replay_w, replay_batch=replay_batch,
+            source_balance_w=source_balance_w)
         round_train_metrics = dict(getattr(model, "reading_train_metrics", {}))
         round_train_metrics["self_teach_plan"] = self_teach_plan
         round_train_metrics["self_teach_study_strategy"] = round_study_strategy
@@ -6535,6 +6636,8 @@ def fit_reading_concepts_select_best(
             "representation_insight_allowed": bool(
                 representation_insight_allowed),
             "representation_progress": representation_progress,
+            "training_weighted_sampling": bool(
+                round_train_metrics.get("training_weighted_sampling", False)),
             "training_priority_sampling": bool(
                 round_train_metrics.get("training_priority_sampling", False)),
             "training_priority_record_count": int(
@@ -6543,6 +6646,17 @@ def fit_reading_concepts_select_best(
                 round_train_metrics.get("training_priority_mean", 0.0)),
             "training_priority_max": float(
                 round_train_metrics.get("training_priority_max", 0.0)),
+            "training_source_balance_sampling": bool(
+                round_train_metrics.get(
+                    "training_source_balance_sampling", False)),
+            "training_source_balance_w": float(
+                round_train_metrics.get("training_source_balance_w", 0.0)),
+            "training_source_count": int(
+                round_train_metrics.get("training_source_count", 0)),
+            "training_max_source_record_frac": float(
+                round_train_metrics.get("training_max_source_record_frac", 0.0)),
+            "training_min_source_record_frac": float(
+                round_train_metrics.get("training_min_source_record_frac", 0.0)),
             "replay_priority_sampling": bool(
                 round_train_metrics.get("replay_priority_sampling", False)),
             "replay_priority_record_count": int(
@@ -6788,7 +6902,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
                            self_teach_history_prior=None,
                            self_teach_history_prior_w=0.5,
                            eval_n=64,
-                           max_vocab=READING_DEFAULT_MAX_VOCAB):
+                           max_vocab=READING_DEFAULT_MAX_VOCAB,
+                           source_balance_w=READING_DEFAULT_SOURCE_BALANCE_W):
     if int(latent_concept_slots) <= 0:
         raise ValueError("raw reading concept training requires latent_concept_slots > 0")
     torch.manual_seed(seed)
@@ -6915,7 +7030,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
             study_self_teach_w=study_self_teach_w,
             self_teach_history_prior=self_teach_history_prior,
             self_teach_history_prior_w=self_teach_history_prior_w,
-            rounds=study_rounds)
+            rounds=study_rounds,
+            source_balance_w=source_balance_w)
         return model, vocab
     self_teach_before_bundle = None
     if float(study_self_teach_w) > 0.0:
@@ -7041,7 +7157,8 @@ def train_reading_concepts(records, steps=400, batch=32, d=96, layers=3, heads=4
         cluster_margin=cluster_margin,
         cluster_min_size=cluster_min_size,
         study_strategy=study_strategy, study_probe_n=study_probe_n,
-        study_hard_max=study_hard_max, study_refresh_steps=study_refresh_steps)
+        study_hard_max=study_hard_max, study_refresh_steps=study_refresh_steps,
+        source_balance_w=source_balance_w)
     if self_teach_plan is not None:
         model.reading_train_metrics = dict(
             getattr(model, "reading_train_metrics", {})) | {
@@ -7153,6 +7270,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
                          text_field="text", max_tokens=128, min_tokens=8,
                          eval_frac=0.10, eval_n=64,
                          max_vocab=READING_DEFAULT_MAX_VOCAB,
+                         source_balance_w=READING_DEFAULT_SOURCE_BALANCE_W,
                          out=None, checkpoint=None):
     records = load_reading_records(
         data, text_field=text_field, max_tokens=max_tokens, min_tokens=min_tokens,
@@ -7287,7 +7405,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             representation_min_delta=study_representation_min_delta,
             study_self_teach_w=study_self_teach_w,
             rounds=study_rounds,
-            before_bundle=before_bundle)
+            before_bundle=before_bundle,
+            source_balance_w=source_balance_w)
     else:
         self_teach_plan, self_teach_base_weights, train_weights = (
             reading_self_teach_weight_maps(
@@ -7402,7 +7521,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
             cluster_min_size=cluster_min_size,
             study_strategy=study_strategy, study_probe_n=study_probe_n,
             study_hard_max=study_hard_max,
-            study_refresh_steps=study_refresh_steps)
+            study_refresh_steps=study_refresh_steps,
+            source_balance_w=source_balance_w)
         if self_teach_plan is not None:
             model.reading_train_metrics = dict(
                 getattr(model, "reading_train_metrics", {})) | {
@@ -7573,6 +7693,7 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "eval_records": sum(r.split == "eval" for r in records),
               "max_vocab": int(max_vocab or 0),
               "vocab_capped": bool(max_vocab and int(max_vocab) > 0),
+              "source_balance_w": float(source_balance_w),
               "vocab_size": len(vocab),
               "before": before,
               "after": after,
@@ -7840,6 +7961,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
                              text_field="text", max_tokens=128, min_tokens=8,
                              eval_frac=0.10, eval_n=64,
                              max_vocab=READING_DEFAULT_MAX_VOCAB,
+                             source_balance_w=READING_DEFAULT_SOURCE_BALANCE_W,
                              latent_concept_slots=0, latent_concept_layers=None,
                              latent_concept_topk=None,
                              latent_concept_prefix=None,
@@ -8027,7 +8149,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             replay_teacher_vocab=replay_teacher_vocab,
             replay_w=replay_w, replay_batch=replay_batch,
             replay_retention_w=replay_retention_w, rounds=study_rounds,
-            before_bundle=before_bundle, score_records=records)
+            before_bundle=before_bundle, score_records=records,
+            source_balance_w=source_balance_w)
     else:
         self_teach_plan, self_teach_base_weights, train_weights = (
             reading_self_teach_weight_maps(
@@ -8148,7 +8271,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
             replay_records=replay_records,
             replay_teacher_model=replay_teacher_model,
             replay_teacher_vocab=replay_teacher_vocab,
-            replay_w=replay_w, replay_batch=replay_batch)
+            replay_w=replay_w, replay_batch=replay_batch,
+            source_balance_w=source_balance_w)
         if self_teach_plan is not None:
             model.reading_train_metrics = dict(
                 getattr(model, "reading_train_metrics", {})) | {
@@ -8366,6 +8490,7 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
               "old_vocab_size": old_vocab_size,
               "max_vocab": int(max_vocab or 0),
               "vocab_capped": bool(max_vocab and int(max_vocab) > 0),
+              "source_balance_w": float(source_balance_w),
               "new_vocab_size": len(vocab),
               "new_tokens": max(0, len(vocab) - old_vocab_size),
               "before": before,
@@ -8584,6 +8709,15 @@ def selftest():
                       meta={"source": "selftest-eval", "chunk_index": 2}),
     ]
     reading_vocab = build_reading_vocab(reading_records)
+    default_source_rec = normalize_reading_record(
+        {"id": "default-source", "split": "train", "text": "source stamped row"},
+        default_source="source-file.jsonl")
+    assert default_source_rec.meta["source"] == "source-file.jsonl"
+    explicit_source_rec = normalize_reading_record(
+        {"id": "explicit-source", "split": "train", "text": "source kept row",
+         "meta": {"source": "manifest-source"}},
+        default_source="source-file.jsonl")
+    assert explicit_source_rec.meta["source"] == "manifest-source"
     cap_records = [
         ReadingRecord(
             "vocab-cap", "train",
@@ -9403,6 +9537,29 @@ def selftest():
     assert replay_weights is not None
     assert math.isclose(sum(replay_weights), 1.0, rel_tol=1e-6, abs_tol=1e-6)
     assert replay_weights[0] == max(replay_weights)
+    imbalanced_records = [
+        ReadingRecord(f"source-a-{i}", "train", ("shared", "alpha"),
+                      meta={"source": "source-a"})
+        for i in range(8)
+    ] + [
+        ReadingRecord(f"source-b-{i}", "train", ("shared", "beta"),
+                      meta={"source": "source-b"})
+        for i in range(2)
+    ]
+    assert reading_training_sampling_weights(
+        imbalanced_records, source_balance_w=0.0) is None
+    source_weights = reading_training_sampling_weights(
+        imbalanced_records, source_balance_w=1.0)
+    assert source_weights is not None
+    assert math.isclose(sum(source_weights), 1.0, rel_tol=1e-6, abs_tol=1e-6)
+    source_a_mass = sum(
+        weight for weight, rec in zip(source_weights, imbalanced_records)
+        if reading_record_source(rec) == "source-a")
+    source_b_mass = sum(
+        weight for weight, rec in zip(source_weights, imbalanced_records)
+        if reading_record_source(rec) == "source-b")
+    assert math.isclose(source_a_mass, source_b_mass, rel_tol=1e-6, abs_tol=1e-6)
+    assert source_weights[0] < source_weights[-1]
     training_weights = reading_training_sampling_weights(priority_records)
     assert training_weights is not None
     assert math.isclose(sum(training_weights), 1.0, rel_tol=1e-6, abs_tol=1e-6)
@@ -9454,6 +9611,7 @@ def selftest():
         assert study_report["new_vocab_size"] >= study_report["old_vocab_size"]
         assert study_report["max_vocab"] == READING_DEFAULT_MAX_VOCAB
         assert study_report["vocab_capped"] is True
+        assert study_report["source_balance_w"] == READING_DEFAULT_SOURCE_BALANCE_W
         assert study_report["new_tokens"] > 0
         assert study_report["discovery_w"] == 0.05
         assert study_report["reanalysis_w"] == 0.05
@@ -9478,6 +9636,12 @@ def selftest():
         assert study_report["train_metrics"]["reanalysis_w"] == 0.05
         assert study_report["train_metrics"]["gap_w"] >= 0.05
         assert study_report["train_metrics"]["replay_w"] == 0.05
+        assert (study_report["train_metrics"]["training_source_balance_w"]
+                == READING_DEFAULT_SOURCE_BALANCE_W)
+        assert study_report["train_metrics"]["training_source_count"] >= 1
+        if study_report["train_metrics"]["training_source_count"] > 1:
+            assert (study_report["train_metrics"][
+                "training_source_balance_sampling"] is True)
         assert study_report["selection"]["replay_retention_w"] == 0.25
         assert study_report["selection"]["enabled"] is False
         assert study_report["selection"]["self_teach_w"] == 0.05
@@ -9522,6 +9686,9 @@ def selftest():
         assert history_entries[1]["study_record_count"] > 0
         assert history_entries[1]["training_priority_sampling"] is True
         assert history_entries[1]["training_priority_record_count"] > 0
+        assert (history_entries[1]["training_source_balance_w"]
+                == READING_DEFAULT_SOURCE_BALANCE_W)
+        assert history_entries[1]["training_source_count"] >= 1
         assert history_entries[1]["weight_update_changed"] is True
         assert history_entries[1]["weight_update_changed_tensor_count"] > 0
         assert history_entries[1]["weight_update_changed_value_count"] > 0
@@ -9559,6 +9726,10 @@ def _add_reading_args(ap):
                     default=READING_DEFAULT_MAX_VOCAB,
                     help=("maximum raw-reading vocabulary size; 0 disables "
                           "frequency capping"))
+    ap.add_argument("--reading-source-balance-w", type=float,
+                    default=READING_DEFAULT_SOURCE_BALANCE_W,
+                    help=("smooth source-balanced raw-reading sampling; 0 "
+                          "keeps uniform record sampling"))
     ap.add_argument("--reading-min-tokens", type=int, default=8)
     ap.add_argument("--reading-eval-frac", type=float, default=0.10)
     ap.add_argument("--reading-eval-n", type=int, default=64)
@@ -9824,6 +9995,7 @@ def _reading_kwargs(args):
                   text_field=args.reading_text_field,
                   max_tokens=args.reading_max_tokens,
                   max_vocab=args.reading_max_vocab,
+                  source_balance_w=args.reading_source_balance_w,
                   min_tokens=args.reading_min_tokens,
                   eval_frac=args.reading_eval_frac,
                   eval_n=args.reading_eval_n)
@@ -9869,6 +10041,8 @@ def main(argv=None):
         raise SystemExit("--latent-concept-topk must be non-negative")
     if args.reading_max_vocab < 0:
         raise SystemExit("--reading-max-vocab must be non-negative")
+    if args.reading_source_balance_w < 0.0:
+        raise SystemExit("--reading-source-balance-w must be non-negative")
     if args.reading_self_teach_history_prior_w < 0.0:
         raise SystemExit("--reading-self-teach-history-prior-w must be non-negative")
     if args.reading_study_representation_accept_w < 0.0:
