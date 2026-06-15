@@ -5112,6 +5112,66 @@ def texture_statistics_loss(pred, target, levels=3, eps=1.0e-6):
     return torch.stack(losses).mean()
 
 
+def latent_spatial_relation_loss(
+        pred, target, levels=2, offsets=((0, 1), (1, 0), (1, 1), (1, -1)),
+        eps=1.0e-6):
+    """Match local neighbor relationships in latent/image space with linear cost."""
+    if pred.shape != target.shape:
+        raise ValueError(
+            f"spatial relation loss shapes must match, got "
+            f"{tuple(pred.shape)} and {tuple(target.shape)}")
+    if pred.ndim < 4:
+        raise ValueError("spatial relation loss expects BCHW-like tensors")
+    cur_pred = torch.nan_to_num(
+        pred.float(), nan=0.0, posinf=1.0, neginf=-1.0)
+    cur_target = torch.nan_to_num(
+        target.float(), nan=0.0, posinf=1.0, neginf=-1.0)
+    losses = []
+    for _level in range(max(1, int(levels))):
+        h, w = int(cur_pred.shape[-2]), int(cur_pred.shape[-1])
+        if h < 2 and w < 2:
+            break
+        for raw_dy, raw_dx in offsets:
+            dy, dx = int(raw_dy), int(raw_dx)
+            if dy == 0 and dx == 0:
+                continue
+            if abs(dy) >= h or abs(dx) >= w:
+                continue
+            y0 = max(0, -dy)
+            y1 = h - max(0, dy)
+            x0 = max(0, -dx)
+            x1 = w - max(0, dx)
+            if y1 <= y0 or x1 <= x0:
+                continue
+            pred_a = cur_pred[..., y0:y1, x0:x1]
+            pred_b = cur_pred[..., y0 + dy:y1 + dy, x0 + dx:x1 + dx]
+            target_a = cur_target[..., y0:y1, x0:x1]
+            target_b = cur_target[..., y0 + dy:y1 + dy, x0 + dx:x1 + dx]
+            pred_delta = pred_b - pred_a
+            target_delta = target_b - target_a
+            delta_loss = F.l1_loss(pred_delta, target_delta)
+            pred_energy = pred_delta.pow(2).mean(dim=1).add(float(eps)).sqrt()
+            target_energy = target_delta.pow(2).mean(dim=1).add(float(eps)).sqrt()
+            energy_loss = F.l1_loss(pred_energy, target_energy)
+            pred_cos = (
+                F.normalize(pred_a, dim=1, eps=float(eps))
+                * F.normalize(pred_b, dim=1, eps=float(eps))
+            ).sum(dim=1)
+            target_cos = (
+                F.normalize(target_a, dim=1, eps=float(eps))
+                * F.normalize(target_b, dim=1, eps=float(eps))
+            ).sum(dim=1)
+            cosine_loss = F.l1_loss(pred_cos, target_cos)
+            losses.append(delta_loss + 0.5 * energy_loss + 0.5 * cosine_loss)
+        if min(h, w) < 4:
+            break
+        cur_pred = F.avg_pool2d(cur_pred, kernel_size=2, stride=2)
+        cur_target = F.avg_pool2d(cur_target, kernel_size=2, stride=2)
+    if not losses:
+        return F.l1_loss(cur_pred, cur_target) * 0.0
+    return torch.stack(losses).mean()
+
+
 def multiscale_recon_loss(pred, target, levels=3):
     losses = []
     cur_pred, cur_target = pred, target
@@ -6269,6 +6329,7 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
                        endpoint_stats_w=0.0,
                        endpoint_stats_mean_w=1.0, endpoint_stats_std_w=1.0,
                        straightness_w=0.0,
+                       spatial_relation_w=0.0,
                        multiscale_w=0.0, multiscale_scales=(2, 4),
                        decoded_endpoint_w=0.0, decoded_endpoint_p=1.0,
                        decoded_endpoint_grad_w=0.0,
@@ -6314,6 +6375,9 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
     straightness_w = float(straightness_w)
     if straightness_w < 0.0:
         raise ValueError("straightness_w must be non-negative")
+    spatial_relation_w = float(spatial_relation_w)
+    if spatial_relation_w < 0.0:
+        raise ValueError("spatial_relation_w must be non-negative")
     multiscale_w = float(multiscale_w)
     if multiscale_w < 0.0:
         raise ValueError("multiscale_w must be non-negative")
@@ -6443,6 +6507,8 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         "flow_endpoint_stats_std_w": torch.tensor(
             float(endpoint_stats_std_w), device=z1.device),
         "flow_straightness_w": torch.tensor(float(straightness_w), device=z1.device),
+        "flow_spatial_relation_w": torch.tensor(
+            float(spatial_relation_w), device=z1.device),
         "flow_multiscale_w": torch.tensor(float(multiscale_w), device=z1.device),
         "flow_multiscale_scale_count": torch.tensor(
             float(len(multiscale_scales)), device=z1.device),
@@ -6546,6 +6612,10 @@ def latent_flow_losses(flow, z1, cond, cond_drop=0.0, ae=None,
         frequency = frequency_recon_loss(endpoint_pred, z1_model)
         total = total + float(frequency_w) * frequency
         parts["flow_endpoint_frequency_l1"] = frequency.detach()
+    if spatial_relation_w > 0.0:
+        spatial_relation = latent_spatial_relation_loss(endpoint_pred, z1_model)
+        total = total + float(spatial_relation_w) * spatial_relation
+        parts["flow_spatial_relation_loss"] = spatial_relation.detach()
     if (decoded_endpoint_w > 0.0 and decoded_endpoint_p > 0.0
             and (decoded_endpoint_p >= 1.0
                  or bool(torch.rand((), device=z1.device) < decoded_endpoint_p))):
@@ -10250,6 +10320,9 @@ def load_checkpoint(path, device=DEV, prefer_ema=True):
             report.get("flow_endpoint_stats_std_w", 1.0)) or 1.0),
         "flow_straightness_w": float(ckpt.get(
             "flow_straightness_w", report.get("flow_straightness_w", 0.0)) or 0.0),
+        "flow_spatial_relation_w": float(ckpt.get(
+            "flow_spatial_relation_w",
+            report.get("flow_spatial_relation_w", 0.0)) or 0.0),
         "flow_equivariance_w": float(ckpt.get(
             "flow_equivariance_w", report.get("flow_equivariance_w", 0.0)) or 0.0),
         "flow_equivariance_p": float(ckpt.get(
@@ -11187,6 +11260,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                       flow_endpoint_stats_mean_w=1.0,
                       flow_endpoint_stats_std_w=1.0,
                       flow_straightness_w=0.0,
+                      flow_spatial_relation_w=0.0,
                       flow_decoded_endpoint_w=0.0,
                       flow_decoded_endpoint_p=1.0,
                       flow_decoded_endpoint_grad_w=0.0,
@@ -11519,6 +11593,9 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
     flow_straightness_w = float(flow_straightness_w)
     if flow_straightness_w < 0.0:
         raise ValueError("flow_straightness_w must be non-negative")
+    flow_spatial_relation_w = float(flow_spatial_relation_w)
+    if flow_spatial_relation_w < 0.0:
+        raise ValueError("flow_spatial_relation_w must be non-negative")
     flow_decoded_endpoint_w = float(flow_decoded_endpoint_w)
     flow_decoded_endpoint_p = float(flow_decoded_endpoint_p)
     flow_decoded_endpoint_grad_w = float(flow_decoded_endpoint_grad_w)
@@ -12435,6 +12512,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
                     endpoint_stats_mean_w=flow_endpoint_stats_mean_w,
                     endpoint_stats_std_w=flow_endpoint_stats_std_w,
                     straightness_w=flow_straightness_w,
+                    spatial_relation_w=flow_spatial_relation_w,
                     decoded_endpoint_w=flow_decoded_endpoint_w,
                     decoded_endpoint_p=flow_decoded_endpoint_p,
                     decoded_endpoint_grad_w=flow_decoded_endpoint_grad_w,
@@ -12913,6 +12991,7 @@ def train_latent_flow(ae_steps=200, flow_steps=200, batch=64, latent_ch=16, hidd
         "flow_endpoint_stats_mean_w": float(flow_endpoint_stats_mean_w),
         "flow_endpoint_stats_std_w": float(flow_endpoint_stats_std_w),
         "flow_straightness_w": float(flow_straightness_w),
+        "flow_spatial_relation_w": float(flow_spatial_relation_w),
         "flow_decoded_endpoint_w": float(flow_decoded_endpoint_w),
         "flow_decoded_endpoint_p": float(flow_decoded_endpoint_p),
         "flow_decoded_endpoint_grad_w": float(flow_decoded_endpoint_grad_w),
@@ -13311,6 +13390,12 @@ def selftest():
         flat_texture = texture_statistics_loss(textured_sample, flat_sample)
         assert float(same_texture) < 1.0e-6
         assert float(flat_texture) > float(same_texture)
+        same_relation = latent_spatial_relation_loss(
+            textured_sample, textured_sample)
+        shifted_relation = latent_spatial_relation_loss(
+            textured_sample, torch.roll(textured_sample, shifts=3, dims=-1))
+        assert float(same_relation) < 1.0e-6
+        assert float(shifted_relation) > float(same_relation)
         health_scores = sample_candidate_health_scores(torch.cat([
             flat_sample, clipped_sample, textured_sample], dim=0))
         assert torch.isfinite(health_scores).all()
@@ -13440,7 +13525,7 @@ def selftest():
             sample_steps=1, flow_distill_steps=1,
             flow_guidance_distill_w=0.01, flow_ema_decay=0.9,
             flow_frequency_w=0.01, flow_straightness_w=0.01,
-            flow_endpoint_stats_w=0.01,
+            flow_spatial_relation_w=0.01, flow_endpoint_stats_w=0.01,
             ae_structure_w=0.1, ae_texture_w=0.1,
             image_feature_align_w=0.01, flow_feature_align_w=0.01,
             flow_repa_w=0.01, flow_repa_structure_w=0.01,
@@ -13506,6 +13591,8 @@ def selftest():
         assert report["image_embedding_sequence_max_len"] == 2
         assert math.isclose(report["flow_straightness_w"], 0.01)
         assert "flow_straightness_velocity_mse" in report["last_flow"]
+        assert math.isclose(report["flow_spatial_relation_w"], 0.01)
+        assert "flow_spatial_relation_loss" in report["last_flow"]
         assert math.isclose(report["flow_factorization_w"], 0.01)
         assert "flow_factorization_loss" in report["last_flow"]
         assert math.isclose(report["flow_multiscale_w"], 0.01)
@@ -14104,6 +14191,10 @@ def main(argv=None):
     ap.add_argument("--flow-straightness-w", type=float, default=0.0,
                     dest="flow_straightness_w",
                     help="same-chord velocity straightness loss weight for latent flow")
+    ap.add_argument("--flow-spatial-relation-w", type=float, default=0.0,
+                    dest="flow_spatial_relation_w",
+                    help=("local latent neighbor relation loss weight for preserving "
+                          "spatial structure"))
     ap.add_argument("--flow-decoded-endpoint-w", type=float, default=0.0,
                     dest="flow_decoded_endpoint_w",
                     help=("decoded image-space clean-endpoint loss weight for latent "
@@ -14690,6 +14781,8 @@ def main(argv=None):
         ap.error("flow endpoint statistics component weights must be non-negative")
     if args.flow_straightness_w < 0.0:
         ap.error("--flow-straightness-w must be non-negative")
+    if args.flow_spatial_relation_w < 0.0:
+        ap.error("--flow-spatial-relation-w must be non-negative")
     if args.flow_decoded_endpoint_w < 0.0:
         ap.error("--flow-decoded-endpoint-w must be non-negative")
     if args.flow_decoded_endpoint_p < 0.0 or args.flow_decoded_endpoint_p > 1.0:
@@ -15204,6 +15297,7 @@ def main(argv=None):
         flow_endpoint_stats_mean_w=args.flow_endpoint_stats_mean_w,
         flow_endpoint_stats_std_w=args.flow_endpoint_stats_std_w,
         flow_straightness_w=args.flow_straightness_w,
+        flow_spatial_relation_w=args.flow_spatial_relation_w,
         flow_decoded_endpoint_w=args.flow_decoded_endpoint_w,
         flow_decoded_endpoint_p=args.flow_decoded_endpoint_p,
         flow_decoded_endpoint_grad_w=args.flow_decoded_endpoint_grad_w,
@@ -15720,6 +15814,7 @@ def main(argv=None):
         "flow_endpoint_stats_mean_w": args.flow_endpoint_stats_mean_w,
         "flow_endpoint_stats_std_w": args.flow_endpoint_stats_std_w,
         "flow_straightness_w": args.flow_straightness_w,
+        "flow_spatial_relation_w": args.flow_spatial_relation_w,
         "flow_decoded_endpoint_w": report.get(
             "flow_decoded_endpoint_w", args.flow_decoded_endpoint_w),
         "flow_decoded_endpoint_p": report.get(
@@ -15814,6 +15909,8 @@ def main(argv=None):
         "flow_frequency_w": report.get("flow_frequency_w", args.flow_frequency_w),
         "flow_straightness_w": report.get(
             "flow_straightness_w", args.flow_straightness_w),
+        "flow_spatial_relation_w": report.get(
+            "flow_spatial_relation_w", args.flow_spatial_relation_w),
         "flow_multiscale_w": report.get("flow_multiscale_w", args.flow_multiscale_w),
         "flow_multiscale_scales": report.get(
             "flow_multiscale_scales", list(flow_multiscale_scales)),

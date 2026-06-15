@@ -574,6 +574,8 @@ def apply_image_quality_preset(args):
         float(args.image_flow_endpoint_stats_w), 0.02 if hq else 0.01)
     args.image_flow_straightness_w = max(
         float(args.image_flow_straightness_w), 0.02 if hq else 0.01)
+    args.image_flow_spatial_relation_w = max(
+        float(args.image_flow_spatial_relation_w), 0.05 if hq else 0.02)
     args.image_flow_decoded_endpoint_w = max(
         float(args.image_flow_decoded_endpoint_w), 0.05 if hq else 0.02)
     args.image_flow_decoded_endpoint_p = max(
@@ -1222,6 +1224,8 @@ def payload(args):
                      f"--flow-endpoint-stats-std-w "
                      f"{args.image_flow_endpoint_stats_std_w} "
                      f"--flow-straightness-w {args.image_flow_straightness_w} "
+                     f"--flow-spatial-relation-w "
+                     f"{args.image_flow_spatial_relation_w} "
                      f"--flow-decoded-endpoint-w "
                      f"{args.image_flow_decoded_endpoint_w} "
                      f"--flow-decoded-endpoint-p "
@@ -3245,6 +3249,9 @@ def main():
     ap.add_argument("--image-flow-straightness-w", type=float, default=0.0,
                     dest="image_flow_straightness_w",
                     help="same-chord velocity straightness loss weight for image flow")
+    ap.add_argument("--image-flow-spatial-relation-w", type=float, default=0.0,
+                    dest="image_flow_spatial_relation_w",
+                    help="local latent neighbor relation loss weight for image flow")
     ap.add_argument("--image-flow-decoded-endpoint-w", type=float, default=0.0,
                     dest="image_flow_decoded_endpoint_w",
                     help=("decoded image-space clean-endpoint loss weight for image "
@@ -4148,6 +4155,8 @@ def main():
         sys.exit("ERROR: image flow endpoint statistics component weights must be non-negative")
     if args.image_flow_straightness_w < 0.0:
         sys.exit("ERROR: --image-flow-straightness-w must be non-negative")
+    if args.image_flow_spatial_relation_w < 0.0:
+        sys.exit("ERROR: --image-flow-spatial-relation-w must be non-negative")
     if args.image_flow_decoded_endpoint_w < 0.0:
         sys.exit("ERROR: --image-flow-decoded-endpoint-w must be non-negative")
     if (args.image_flow_decoded_endpoint_p < 0.0
