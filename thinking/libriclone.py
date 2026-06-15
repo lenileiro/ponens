@@ -281,9 +281,10 @@ def train(steps_spk=8000, steps_vc=12000, steps_voc=40000, seed=0, device=DEV, b
         opt.zero_grad(); loss.backward(); opt.step()
         if st % max(1, steps_spk // 4) == 0:
             print(f"  spk {st}/{steps_spk} ge2e {loss.item():.3f}", flush=True)
-    se.eval()
     for p in se.parameters():
         p.requires_grad_(False)
+    se.train()                                            # cudnn RNN backward needs train mode;
+    #                                                       params frozen so it won't update
 
     # STAGE 2: voice converter
     print("=== stage 2: voice converter (AutoVC + spk/content consistency) ===", flush=True)
@@ -296,10 +297,11 @@ def train(steps_spk=8000, steps_vc=12000, steps_voc=40000, seed=0, device=DEV, b
         roll = torch.roll(torch.arange(ns), 1)
         ref_diff = e[roll, 0]                                   # different-speaker ref
         T = src.shape[-1]
-        spk_same = se(ref_same); spk_diff = se(ref_diff)
+        with torch.no_grad():
+            spk_same = se(ref_same); spk_diff = se(ref_diff)
         recon = F.l1_loss(dec(ce(src), spk_same, T), src)
         conv = dec(ce(src), spk_diff, T)
-        spk_consist = (1 - (se(conv) * spk_diff).sum(-1)).mean()
+        spk_consist = (1 - (se(conv) * spk_diff).sum(-1)).mean()   # se(conv) keeps grad -> decoder
         cyc = F.l1_loss(ce(conv), ce(src))                     # content cycle: words survive
         (recon + 2.0 * spk_consist + 3.0 * cyc).backward()
         optv.step(); optv.zero_grad()
