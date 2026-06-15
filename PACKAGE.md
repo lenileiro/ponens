@@ -195,7 +195,7 @@ python -m thinking.image_latent --train --cond-mode text --flow-arch mmdit \
 
 The H100 launcher exposes only supported current jobs. It does not default to a hidden legacy
 world; select the job explicitly. Raw-reading jobs pass the same bounded vocabulary default as
-`thinking.text` and accept `--reading-max-vocab 0` for uncapped ablations.
+`thinking.text` and accept `--reading-max-vocab 0` / `--reading-source-balance-w 0` for ablations.
 
 ```bash
 RUNPOD_API_KEY=... python runpod/launch_thinking.py \

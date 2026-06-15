@@ -31,6 +31,7 @@ IMAGE_MAX_TIME_MODE_SCALE = 1.75
 IMAGE_DEFAULT_TIME_U_SHAPE_SCALE = 4.0
 IMAGE_MAX_TIME_U_SHAPE_SCALE = 20.0
 READING_DEFAULT_MAX_VOCAB = 32768
+READING_DEFAULT_SOURCE_BALANCE_W = 0.5
 
 
 def api(method, path, key, body=None):
@@ -257,6 +258,7 @@ def text_reading_cmd(args, py):
         f"--reading-text-field {shlex_quote(args.reading_text_field)} "
         f"--reading-max-tokens {args.reading_max_tokens} "
         f"--reading-max-vocab {args.reading_max_vocab} "
+        f"--reading-source-balance-w {args.reading_source_balance_w} "
         f"--reading-min-tokens {args.reading_min_tokens} "
         f"--reading-eval-frac {args.reading_eval_frac} "
         f"--reading-eval-n {args.reading_eval_n} "
@@ -2290,6 +2292,11 @@ def main():
                     dest="reading_max_vocab",
                     help=("maximum raw-reading vocabulary size passed to "
                           "thinking.text; 0 disables frequency capping"))
+    ap.add_argument("--reading-source-balance-w", type=float,
+                    default=READING_DEFAULT_SOURCE_BALANCE_W,
+                    dest="reading_source_balance_w",
+                    help=("smooth source-balanced raw-reading sampling passed "
+                          "to thinking.text; 0 disables source balancing"))
     ap.add_argument("--reading-min-tokens", type=int, default=8,
                     dest="reading_min_tokens")
     ap.add_argument("--reading-eval-frac", type=float, default=0.10,
@@ -4348,6 +4355,8 @@ def main():
             sys.exit("ERROR: --reading-min-tokens cannot exceed --reading-max-tokens")
         if args.reading_max_vocab < 0:
             sys.exit("ERROR: --reading-max-vocab must be non-negative")
+        if args.reading_source_balance_w < 0.0:
+            sys.exit("ERROR: --reading-source-balance-w must be non-negative")
         if text_reading_dim % args.text_reading_heads != 0:
             sys.exit("ERROR: raw-reading width must divide --text-reading-heads")
         if (text_reading_dim // args.text_reading_heads) % 2 != 0:
