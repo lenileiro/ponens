@@ -629,7 +629,46 @@ def multimodal_hard_record_ids(study_reports):
     return ids
 
 
-def multimodal_replay_record_metadata(study_reports, learning_event=None):
+def multimodal_generation_replay_metadata(generation):
+    """Prioritize causal free-generation misses for later study/replay."""
+    if not isinstance(generation, dict) or bool(generation.get("skipped", False)):
+        return {}
+    collapsed = bool(generation.get("all_generations_identical", False))
+    meta = {}
+    for row in generation.get("samples", ()) or ():
+        if not isinstance(row, dict):
+            continue
+        rec_id = str(row.get("id", ""))
+        if not rec_id:
+            continue
+        token_acc = min(1.0, max(0.0, _mm_float(
+            row.get("token_acc", 0.0), 0.0)))
+        exact = bool(row.get("exact", False))
+        generated = tuple(row.get("generated", ()) or ())
+        severity = 1.0 - token_acc
+        reasons = []
+        if not exact or severity > 0.0:
+            reasons.append("generation_error")
+        if not generated:
+            reasons.append("generation_empty")
+        if collapsed:
+            reasons.append("generation_collapse")
+        if severity <= 0.0 and not reasons:
+            continue
+        priority = 1.0 + severity
+        if not generated:
+            priority += 0.5
+        if collapsed:
+            priority += 0.5
+        meta[rec_id] = {
+            "priority": float(priority),
+            "reasons": reasons,
+        }
+    return meta
+
+
+def multimodal_replay_record_metadata(study_reports, learning_event=None,
+                                      generation=None):
     meta = {}
 
     def bump(rec_id, reason, priority):
@@ -667,11 +706,15 @@ def multimodal_replay_record_metadata(study_reports, learning_event=None):
             bump(raw_id, f"learning_event:{event_kind}", 2.5 + event_score)
             if event_signal:
                 bump(raw_id, f"learning_signal:{event_signal}", 2.5 + event_score)
+    for rec_id, item in multimodal_generation_replay_metadata(generation).items():
+        for reason in item.get("reasons", ()) or ():
+            bump(rec_id, reason, item.get("priority", 0.0))
     return meta
 
 
 def build_multimodal_replay_bank(records, study_reports=None,
                                  learning_event=None,
+                                 generation=None,
                                  max_records=MULTIMODAL_REPLAY_BANK_SIZE):
     max_records = int(max_records)
     if max_records <= 0:
@@ -688,7 +731,7 @@ def build_multimodal_replay_bank(records, study_reports=None,
     hard_ids = multimodal_hard_record_ids(study_reports)
     hard_id_set = set(hard_ids)
     replay_meta = multimodal_replay_record_metadata(
-        study_reports, learning_event=learning_event)
+        study_reports, learning_event=learning_event, generation=generation)
     for rec in records:
         if not isinstance(getattr(rec, "meta", None), dict):
             continue
@@ -7488,6 +7531,7 @@ def run(manifest, root=None, steps=400, seed=0, device=DEV, eval_n=200,
         unique_multimodal_records_by_id(records, replay_records),
         study_reports=getattr(model, "latent_study_reports", []),
         learning_event=report.get("learning_event", {}),
+        generation=report.get("generation"),
         max_records=kwargs.get("replay_bank_size", MULTIMODAL_REPLAY_BANK_SIZE))
     previous_learning_history = {}
     previous_multimodal_checkpoint = kwargs.get("multimodal_checkpoint")
@@ -8357,6 +8401,31 @@ def selftest():
         assert any(
             float(rec.meta.get("replay_priority", 0.0) or 0.0) > 0.0
             for rec in mm_replay_records)
+        generation_rec_id = next(rec.rec_id for rec in records if rec.split == "eval")
+        mm_generation_bank = build_multimodal_replay_bank(
+            records,
+            generation={
+                "enabled": True,
+                "skipped": False,
+                "all_generations_identical": True,
+                "samples": [{
+                    "id": generation_rec_id,
+                    "generated": [],
+                    "token_acc": 0.0,
+                    "exact": False,
+                }],
+            })
+        mm_generation_rows = {
+            row["id"]: row for row in mm_generation_bank["records"]}
+        assert mm_generation_bank["priority_record_count"] >= 1
+        assert generation_rec_id in mm_generation_rows
+        assert mm_generation_rows[generation_rec_id]["replay_priority"] > 1.0
+        assert "generation_error" in mm_generation_rows[
+            generation_rec_id]["replay_reasons"]
+        assert "generation_empty" in mm_generation_rows[
+            generation_rec_id]["replay_reasons"]
+        assert "generation_collapse" in mm_generation_rows[
+            generation_rec_id]["replay_reasons"]
         mm_report["multimodal_replay_bank"] = mm_replay_bank
         mm_history = multimodal_learning_history_with_entry([], mm_report)
         mm_report["multimodal_learning_history"] = mm_history

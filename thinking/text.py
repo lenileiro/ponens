@@ -263,7 +263,46 @@ def _reading_replay_learning_event_record_ids(study_reports):
     return ids
 
 
-def reading_replay_record_metadata(study_reports, learning_event=None):
+def reading_generation_replay_metadata(generation):
+    """Prioritize free-generation misses for later study/replay."""
+    if not isinstance(generation, dict) or bool(generation.get("skipped", False)):
+        return {}
+    collapsed = bool(generation.get("all_generations_identical", False))
+    meta = {}
+    for row in generation.get("samples", ()) or ():
+        if not isinstance(row, dict):
+            continue
+        rec_id = str(row.get("id", ""))
+        if not rec_id:
+            continue
+        token_acc = min(
+            1.0, max(0.0, _reading_float(row.get("token_acc", 0.0), 0.0)))
+        exact = bool(row.get("exact", False))
+        generated = tuple(row.get("generated", ()) or ())
+        severity = 1.0 - token_acc
+        reasons = []
+        if not exact or severity > 0.0:
+            reasons.append("generation_error")
+        if not generated:
+            reasons.append("generation_empty")
+        if collapsed:
+            reasons.append("generation_collapse")
+        if severity <= 0.0 and not reasons:
+            continue
+        priority = 1.0 + severity
+        if not generated:
+            priority += 0.5
+        if collapsed:
+            priority += 0.5
+        meta[rec_id] = {
+            "priority": float(priority),
+            "reasons": reasons,
+        }
+    return meta
+
+
+def reading_replay_record_metadata(study_reports, learning_event=None,
+                                   generation=None):
     meta = {}
 
     def bump(rec_id, reason, priority):
@@ -305,11 +344,15 @@ def reading_replay_record_metadata(study_reports, learning_event=None):
         for raw_id in _reading_replay_learning_event_record_ids(study_reports):
             for reason in reasons:
                 bump(raw_id, reason, 2.5 + event_score)
+    for rec_id, item in reading_generation_replay_metadata(generation).items():
+        for reason in item.get("reasons", ()) or ():
+            bump(rec_id, reason, item.get("priority", 0.0))
     return meta
 
 
 def build_reading_replay_bank(records, study_reports=None,
                               learning_event=None,
+                              generation=None,
                               max_records=READING_REPLAY_BANK_SIZE, seed=0):
     max_records = int(max_records)
     if max_records <= 0:
@@ -319,7 +362,7 @@ def build_reading_replay_bank(records, study_reports=None,
     by_id = {rec.rec_id: rec for rec in records}
     hard_ids = reading_hard_record_ids(study_reports)
     replay_meta = reading_replay_record_metadata(
-        study_reports, learning_event=learning_event)
+        study_reports, learning_event=learning_event, generation=generation)
     for rec in records:
         if not isinstance(getattr(rec, "meta", None), dict):
             continue
@@ -8963,7 +9006,8 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
     report["learning_event"] = reading_learning_event_report(report)
     report["reading_replay_bank"] = build_reading_replay_bank(
         records, study_reports=getattr(model, "reading_study_reports", []),
-        learning_event=report["learning_event"])
+        learning_event=report["learning_event"],
+        generation=report.get("after_generation"))
     report["reading_mastery_history"] = reading_mastery_history_with_entry(
         [], report)
     report["reading_mastery_history_count"] = report[
@@ -9869,7 +9913,8 @@ def study_reading_checkpoint(checkpoint, data, out_checkpoint=None, out=None,
     report["reading_replay_bank"] = build_reading_replay_bank(
         unique_reading_records_by_id(records, replay_records),
         study_reports=getattr(model, "reading_study_reports", []),
-        learning_event=report["learning_event"])
+        learning_event=report["learning_event"],
+        generation=report.get("after_generation"))
     report["reading_mastery_history"] = reading_mastery_history_with_entry(
         reading_mastery_history_from_payload(ckpt), report)
     report["reading_mastery_history_count"] = report[
@@ -10934,6 +10979,31 @@ def selftest():
         priority_records, study_reports=[], max_records=3)
     assert carried_priority_bank["priority_record_count"] == 3
     assert carried_priority_bank["records"][0]["replay_priority"] > 0.0
+    generation_replay_bank = build_reading_replay_bank(
+        reading_records,
+        generation={
+            "enabled": True,
+            "skipped": False,
+            "all_generations_identical": True,
+            "samples": [{
+                "id": "read-eval-2",
+                "generated": [],
+                "token_acc": 0.0,
+                "exact": False,
+            }],
+        },
+        max_records=4)
+    generation_rows = {
+        row["id"]: row for row in generation_replay_bank["records"]}
+    assert generation_replay_bank["priority_record_count"] >= 1
+    assert "read-eval-2" in generation_rows
+    assert generation_rows["read-eval-2"]["replay_priority"] > 1.0
+    assert "generation_error" in generation_rows[
+        "read-eval-2"]["replay_reasons"]
+    assert "generation_empty" in generation_rows[
+        "read-eval-2"]["replay_reasons"]
+    assert "generation_collapse" in generation_rows[
+        "read-eval-2"]["replay_reasons"]
     replay_weights = reading_replay_sampling_weights(priority_records)
     assert replay_weights is not None
     assert math.isclose(sum(replay_weights), 1.0, rel_tol=1e-6, abs_tol=1e-6)
