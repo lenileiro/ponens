@@ -2045,6 +2045,47 @@ def reading_generation_eval(model, vocab, records, device=DEV, n=0, seed=0,
     }
 
 
+def reading_generation_gate(generation):
+    """Require raw-reading progress to show up in free continuation."""
+    generation = dict(generation or {})
+    if bool(generation.get("skipped", False)) or not bool(
+            generation.get("enabled", False)):
+        return {
+            "required": True,
+            "passed": False,
+            "reason": str(generation.get("skip_reason", "generation_not_run")),
+        }
+    n_records = int(generation.get("n_records", 0) or 0)
+    token_acc = float(generation.get("token_acc", 0.0) or 0.0)
+    collapsed = bool(generation.get("all_generations_identical", False))
+    empty_count = sum(
+        1 for row in generation.get("samples", ()) or ()
+        if not row.get("generated"))
+    unique_count = int(generation.get("unique_generation_count", 0) or 0)
+    passed = (
+        n_records > 0
+        and token_acc > 0.0
+        and not collapsed
+        and empty_count < n_records
+        and unique_count > 0
+    )
+    reason = "passed" if passed else (
+        "collapsed_generation" if collapsed else
+        "zero_generation_token_acc" if token_acc <= 0.0 else
+        "empty_generations" if empty_count >= n_records else
+        "no_generation_records")
+    return {
+        "required": True,
+        "passed": bool(passed),
+        "reason": reason,
+        "token_acc": float(token_acc),
+        "n_records": int(n_records),
+        "unique_generation_count": int(unique_count),
+        "empty_generation_count": int(empty_count),
+        "all_generations_identical": bool(collapsed),
+    }
+
+
 def latent_text_concept_loss(model, txt, view_dropout=0.1,
                              invariance_w=25.0, variance_w=25.0,
                              covariance_w=1.0, variance_target=1.0):
@@ -8637,6 +8678,9 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
     after_fer = after_bundle["fer"]
     before_bridge = before_bundle["bridge"]
     after_bridge = after_bundle["bridge"]
+    generation_gate = reading_generation_gate(after_bundle["generation"])
+    language_gate = bool(after_lm.get("lm_token_acc", 0.0) >= 0.50)
+    report_gate = bool(language_gate and generation_gate["passed"])
     train_metrics = getattr(model, "reading_train_metrics", {})
     resolved_study_strategy = train_metrics.get("study_strategy", study_strategy)
     requested_study_strategy = train_metrics.get(
@@ -8795,6 +8839,15 @@ def run_reading_concepts(data, steps=400, batch=32, d=96, layers=3, heads=4,
               "after_lm": after_lm,
               "before_generation": before_bundle["generation"],
               "after_generation": after_bundle["generation"],
+              "generation_gate": generation_gate,
+              "gate": report_gate,
+              "gate_report": {
+                  "lm_token_acc_min": 0.50,
+                  "language_passed": language_gate,
+                  "generation_passed": bool(generation_gate["passed"]),
+                  "generation_required": bool(generation_gate["required"]),
+                  "generation_reason": str(generation_gate["reason"]),
+              },
               "before_span_completion": before_span,
               "after_span_completion": after_span,
               "before_context_closure": before_closure,
@@ -10174,6 +10227,17 @@ def selftest():
     assert mastery_bundle["score_components"]["generation_skipped"] is False
     assert mastery_bundle["generation"]["enabled"] is True
     assert mastery_bundle["generation"]["samples"]
+    assert reading_generation_gate(
+        {"enabled": True, "skipped": False, "n_records": 1,
+         "token_acc": 0.5, "exact": 0.0, "unique_generation_count": 1,
+         "all_generations_identical": False,
+         "samples": [{"generated": ["next"]}]})["passed"] is True
+    assert reading_generation_gate(
+        {"enabled": True, "skipped": False, "n_records": 2,
+         "token_acc": 0.5, "exact": 0.0, "unique_generation_count": 1,
+         "all_generations_identical": True,
+         "samples": [{"generated": ["loop"]}, {"generated": ["loop"]}]})[
+             "reason"] == "collapsed_generation"
     assert math.isfinite(mastery_bundle["score_components"]["lm_loss"])
     assert math.isfinite(mastery_bundle["score_components"]["generation_score"])
     assert mastery_bundle["score_components"]["span_skipped"] is False
