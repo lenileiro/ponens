@@ -180,6 +180,23 @@ def animate_preset(x, style, fs=SR):
     return animate(x, pitch=p, range_=r, speed=sp_, energy=e, formant=fm, fs=fs)
 
 
+# Distinct VOICE IDENTITIES from the one single-speaker model: pitch + formant (vocal-tract size)
+# give different-sounding speakers. (Different ACCENT needs multi-accent training data, not DSP.)
+VOICES = {
+    #            pitch  range  speed  energy  formant
+    "original":  (1.00, 1.00, 1.00, 1.00, 1.00),   # the trained LJSpeech voice, untouched
+    "deep_male": (0.74, 1.00, 0.97, 1.05, 0.84),   # lower pitch + bigger tract
+    "warm":      (0.88, 1.05, 0.98, 1.02, 0.93),   # mellow, slightly lower
+    "bright":    (1.14, 1.10, 1.02, 1.00, 1.07),   # lighter, forward
+    "child":     (1.34, 1.20, 1.05, 0.98, 1.20),   # high pitch + small tract
+}
+
+
+def voice_preset(x, name, fs=SR):
+    p, r, sp_, e, fm = VOICES[name]
+    return animate(x, pitch=p, range_=r, speed=sp_, energy=e, formant=fm, fs=fs)
+
+
 # ---- synthesis-from-text bridge (uses the trained tts_fast acoustic model) ----------------------
 def speak(text, ckpt="runs/tts_ar.pt", fs=SR):
     """text -> human-voice waveform via the trained autoregressive TransformerTTS + realvoice vocoder."""
