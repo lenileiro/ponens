@@ -133,6 +133,37 @@ class TransformerTTS(nn.Module):
         return coarse + self.postnet(coarse)
 
 
+def build_cache(data):
+    """Precompute spectrograms + token ids ONCE (the STFT is the per-step bottleneck). Returns lists
+    kept on CPU; batches just index + pad + move to device, so training is GPU-bound not CPU-bound."""
+    specs = [spec_of(w, "cpu")[:, :MAX_T].contiguous() for _, w in data]
+    ids = [encode_text(t) for t, _ in data]
+    return specs, ids
+
+
+def _batch_cached(cache, rng, batch, device):
+    specs_all, ids_all = cache
+    idx = [int(rng.integers(len(specs_all))) for _ in range(batch)]
+    specs = [specs_all[j] for j in idx]
+    ids = [ids_all[j] for j in idx]
+    Lc = max(len(i) for i in ids)
+    Tt = max(s.shape[1] for s in specs)
+    Tt = ((Tt + R - 1) // R) * R
+    Tg = Tt // R
+    idt = torch.zeros(batch, Lc, dtype=torch.long, device=device)
+    mel = torch.zeros(batch, N_BINS, Tt, device=device)
+    stop = torch.zeros(batch, Tg, device=device)
+    ids_len = torch.zeros(batch, dtype=torch.long, device=device)
+    mel_len = torch.zeros(batch, dtype=torch.long, device=device)
+    grp_len = torch.zeros(batch, dtype=torch.long, device=device)
+    for b, (i, s) in enumerate(zip(ids, specs)):
+        idt[b, :len(i)] = torch.tensor(i, device=device); ids_len[b] = len(i)
+        mel[b, :, :s.shape[1]] = s.to(device); mel_len[b] = s.shape[1]
+        g = (s.shape[1] + R - 1) // R; grp_len[b] = g
+        stop[b, g - 1:] = 1.0
+    return idt, mel, stop, ids_len, mel_len, grp_len
+
+
 def _batch(data, rng, batch, device):
     items = [data[int(rng.integers(len(data)))] for _ in range(batch)]
     specs = [spec_of(w, device)[:, :MAX_T] for _, w in items]
@@ -170,10 +201,12 @@ def train(steps=60000, seed=0, device=DEV, batch=16, lr=3e-4, ckpt_path=None, sa
           d=256, layers=4, heads=4):
     torch.manual_seed(seed); rng = np.random.default_rng(seed)
     data = load(); train_data = data[:int(len(data) * 0.95)]
+    print(f"caching {len(train_data)} spectrograms (one-time STFT) ...", flush=True)
+    cache = build_cache(train_data)                          # precompute specs -> GPU-bound training
     model = TransformerTTS(d=d, layers=layers, heads=heads).to(device); model.train()
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     for st in range(1, steps + 1):
-        idt, mel, stop, ids_len, mel_len, grp_len = _batch(train_data, rng, batch, device)
+        idt, mel, stop, ids_len, mel_len, grp_len = _batch_cached(cache, rng, batch, device)
         coarse, refined, stop_logit, aligns = model.decode(idt, mel)
         mmask = (torch.arange(mel.shape[2], device=device)[None] < mel_len[:, None]).float()
         l_mel = sum((F.l1_loss(p, mel, reduction="none").mean(1) * mmask).sum() / mmask.sum()
