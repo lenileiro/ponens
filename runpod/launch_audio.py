@@ -85,6 +85,10 @@ def payload(args):
         # spec cache keeps it GPU-bound; batch 128 @ d512 ~= a few steps/s -> 30k steps in ~90 min.
         jobs.append(f"{PY}.tts_ar --train --steps 30000 --batch 128 --dim 512 --layers 6 --heads 8 "
                     f"--lr 4e-4 --out runs/tts_ar.json --checkpoint runs/tts_ar.pt --synth-out data/synth")
+    if args.job == "svs":
+        jobs.append(f"{PY}.svs --fetch")                          # download + parse CSD (singing data)
+        jobs.append(f"{PY}.svs --train --steps 30000 --batch 96 --dim 512 --layers 6 --heads 8 "
+                    f"--out runs/svs.json --checkpoint runs/svs.pt")
     # non-fatal chaining: one job's failure must not kill the rest
     return " ; ".join(jobs)
 
@@ -93,7 +97,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--go", action="store_true")
     ap.add_argument("--job", default="all",
-                    choices=("all", "sing-sweep", "polyglot", "pronounce", "mimic", "vocoder", "vocoder-gan", "vocoder24", "realvoice", "libriclone", "knnvc", "tts", "tts-fast", "tts-ar"))
+                    choices=("all", "sing-sweep", "polyglot", "pronounce", "mimic", "vocoder", "vocoder-gan", "vocoder24", "realvoice", "libriclone", "knnvc", "tts", "tts-fast", "tts-ar", "svs"))
     ap.add_argument("--gpu", default="NVIDIA H100 80GB HBM3")
     ap.add_argument("--cloud", default="SECURE")
     ap.add_argument("--disk", type=int, default=40)
@@ -112,7 +116,7 @@ def main(argv=None):
     # say-banks needed by pronounce/mimic (pods have no macOS `say`)
     need_banks = args.job in ("all", "pronounce", "mimic", "vocoder", "vocoder-gan", "vocoder24", "realvoice")
 
-    setup = "pip install -q numpy tokenizers pandas pyarrow" + (" soundfile" if args.job in ("libriclone","knnvc","tts","tts-fast","tts-ar") else "") + (" torchaudio transformers" if args.job == "knnvc" else "")
+    setup = "pip install -q numpy tokenizers pandas pyarrow" + (" soundfile" if args.job in ("libriclone","knnvc","tts","tts-fast","tts-ar","svs") else "") + (" mido librosa" if args.job == "svs" else "") + (" torchaudio transformers" if args.job == "knnvc" else "")
     remote = (f"cd {REMOTE} && rm -f /root/thinking.log && "
               f"({setup} && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && "
               f"timeout {cap}s bash -c {quote(f'cd {REMOTE} && ({run})')}) "
@@ -156,7 +160,7 @@ def main(argv=None):
         if os.path.exists(os.path.join(HERE, "thinking/crossmodal.py")):
             sh(f"tar czf - -C {quote(HERE)} thinking/crossmodal.py | {ssh} 'tar --no-same-owner -xzf - -C {REMOTE}'")
         # TTS reuses the trained realvoice vocoder (gitignored) for natural synthesis
-        if args.job in ("tts","tts-fast","tts-ar") and os.path.exists(os.path.join(HERE, "runs/realvoice.pt")):
+        if args.job in ("tts","tts-fast","tts-ar","svs") and os.path.exists(os.path.join(HERE, "runs/realvoice.pt")):
             sh(f"{ssh} 'mkdir -p {REMOTE}/runs'")
             sh(f"tar czf - -C {quote(HERE)} runs/realvoice.pt | {ssh} 'tar --no-same-owner -xzf - -C {REMOTE}'")
         if need_banks:
