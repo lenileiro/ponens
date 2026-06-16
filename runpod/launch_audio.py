@@ -81,8 +81,10 @@ def payload(args):
         jobs.append(f"{PY}.tts_fast --train --steps 30000 --out runs/tts_fast.json --checkpoint runs/tts_fast.pt --synth-out data/synth")
     if args.job == "tts-ar":
         jobs.append(f"{PY}.tts --fetch --n-clips 13100 --byte-cap-gb 3.0")   # full LJSpeech
-        jobs.append(f"{PY}.tts_ar --train --steps 28000 --batch 384 --dim 768 --layers 8 --heads 12 "
-                    f"--lr 5e-4 --out runs/tts_ar.json --checkpoint runs/tts_ar.pt --synth-out data/synth")
+        # balanced: bigger-than-original (good GPU use + quality) but light enough to CONVERGE in cap.
+        # spec cache keeps it GPU-bound; batch 128 @ d512 ~= a few steps/s -> 30k steps in ~90 min.
+        jobs.append(f"{PY}.tts_ar --train --steps 30000 --batch 128 --dim 512 --layers 6 --heads 8 "
+                    f"--lr 4e-4 --out runs/tts_ar.json --checkpoint runs/tts_ar.pt --synth-out data/synth")
     # non-fatal chaining: one job's failure must not kill the rest
     return " ; ".join(jobs)
 
