@@ -9,10 +9,21 @@ model READS by masked-LM (mask ~15% of positions, predict the originals at maske
 positions only), then ANSWERS a cloze item by placing <mask> in the blank, running
 the bidirectional forward, and scoring each option's log-prob AT the mask position.
 
-The exam items are HELD-OUT instances of the SAME grammar/vocab patterns the corpus
-teaches (subject-verb agreement, a/an articles, plurals, prepositions, grounded
-animal/color/object vocab). Passing therefore requires generalizing the rule, not
-recalling a memorized sentence -- exam sentences are disjoint from corpus sentences.
+The exam is a HARD lexeme-role / composition holdout (not a pattern-instance
+holdout). Two transfer tests:
+  - noun_transfer: HELDOUT_NOUNS (frog, owl) appear in the corpus ONLY as bare
+    noun phrases -- never conjugated with a verb, never after "is a <color>". The
+    exam tests transferring subject-verb agreement and "X is a <color>"
+    predication onto them.
+  - pair_transfer: HELDOUT_PAIRS ((cat,sings),(dog,jumps)) are removed entirely
+    from the corpus (both words seen separately); the exam tests systematic
+    RECOMBINATION.
+A third group (lexical: the a/an phonological rule) is NOT a transfer test and is
+excluded from transfer_accuracy. Passing therefore requires genuine systematic
+generalization -- exam sentences are verified disjoint from corpus sentences
+(overlap must be 0). A LEFT-ONLY ablation (same weights, right context dropped)
+proves the reader uses BIDIRECTIONAL context: on right-cued a/an items it is
+pinned at chance while the bidirectional reader is not.
 
 THE FER COMPARISON: the project bet is that a FER-style FACTORED relational
 representation generalizes from FEWER examples. "FER-on" here = ScratchpadLM with
@@ -122,22 +133,29 @@ VOWEL_NOUNS = ["apple", "egg", "owl", "ant", "ox", "ear", "elf", "igloo"]
 CONS_NOUNS = ["dog", "cat", "ball", "cup", "hat", "book", "car", "key"]
 
 # ----- HELD-OUT splits (the exam tests exactly these; the corpus must NOT) -----
-# Agreement: these (subject, verb) PAIRS are never co-occurred in training. The
-# subject's number is taught with OTHER verbs; the verb's agreement with OTHER
-# subjects -> the exam pair is a novel composition.
-HELDOUT_AGREE = [("cat", "sits"), ("dog", "runs"), ("bird", "jumps"),
-                 ("fish", "swims"), ("frog", "hops"), ("owl", "sleeps")]
-# Article: training teaches a/an in the "i see / she has" frames; the exam uses
-# a DISTINCT frame ("look at ...") that never appears in training -> the article
-# choice for the noun must transfer to a novel frame.
+# This is a HARD lexeme-role / composition holdout, NOT a pattern-instance
+# holdout. Passing requires SYSTEMATIC generalization, not new sentences of a
+# trained frame.
+#
+# (1) HELDOUT_NOUNS: these nouns appear in the corpus ONLY as BARE noun phrases
+#     (article/adjective/plural-NP contexts) -- NEVER conjugated with a verb and
+#     NEVER after "is a <color>". The exam tests transferring (a) subject-verb
+#     agreement and (b) "X is a <color>" predication onto these nouns. They still
+#     earn trained embeddings from their bare-NP occurrences.
+HELDOUT_NOUNS = ["frog", "owl"]
+# (2) HELDOUT_PAIRS: these specific (subject, verb) combinations are removed
+#     ENTIRELY from the corpus. BOTH words occur elsewhere (the subject with
+#     other verbs, the verb with other subjects), so the exam tests systematic
+#     RECOMBINATION of seen words.
+HELDOUT_PAIRS = [("cat", "sings"), ("dog", "jumps")]
+# "sings" is an extra verb used ONLY so the held-out pair (cat, sings) has both
+# members trained separately. It conjugates regularly (sings -> sing).
+EXTRA_VERBS = ["sings"]
+# Article frames. a/an is a LEXICAL (phonological) rule, NOT a transfer test.
 ARTICLE_TRAIN_FRAMES = ["i see", "she has", "we want", "he found"]
-ARTICLE_EXAM_FRAME = "look at"
-# Plural: training counts with "one/two/many"; the exam counts with "three",
-# a number word that only ever appears in the exam frame.
+ARTICLE_EXAM_FRAME = "look at"  # exposed only with the definite article in train
+# Plural counting drill word reused at exam time.
 PLURAL_EXAM_NUMBER = "three"
-# Vocab (color slot): these (color, object) pairs are held out of the
-# color-predication and color-NP frames in training.
-HELDOUT_COLOR = [("red", "ball"), ("blue", "cup"), ("green", "box"), ("black", "hat")]
 
 
 def _plural(w):
@@ -153,7 +171,8 @@ def _plural(w):
 def _verb_plural(v):
     # singular verb (3rd person -s) -> bare plural verb. drill agreement.
     table = {"sits": "sit", "runs": "run", "jumps": "jump", "sleeps": "sleep",
-             "eats": "eat", "walks": "walk", "swims": "swim", "hops": "hop"}
+             "eats": "eat", "walks": "walk", "swims": "swim", "hops": "hop",
+             "sings": "sing"}
     return table[v]
 
 
@@ -163,23 +182,30 @@ def build_corpus(seed, n=None):
     sample-efficiency sweep. Every sentence instantiates a learnable pattern."""
     rng = np.random.default_rng(seed)
     sents = []
-    heldout_agree = set(HELDOUT_AGREE)
-    heldout_color = set(HELDOUT_COLOR)
+    heldout_nouns = set(HELDOUT_NOUNS)
+    heldout_pairs = set(HELDOUT_PAIRS)
+    all_verbs = VERBS + EXTRA_VERBS
 
     # -- subject-verb agreement: "the cat sits" / "the cats sit"
-    #    SKIP held-out (subject, verb) pairs entirely; every subject still sees
-    #    other verbs and every verb still sees other subjects.
+    #    HELDOUT_NOUNS are NEVER conjugated with a verb here (they only ever
+    #    appear as bare NPs below). HELDOUT_PAIRS are skipped entirely, but both
+    #    members still occur separately (subject with other verbs; verb with
+    #    other subjects).
     for a in ANIMALS_SG:
-        for v in VERBS:
-            if (a, v) in heldout_agree:
+        if a in heldout_nouns:
+            continue
+        for v in all_verbs:
+            if (a, v) in heldout_pairs:
                 continue
             sents.append(f"the {a} {v} .")
             sents.append(f"the {_plural(a)} {_verb_plural(v)} .")
 
-    # -- articles: a/an across several TRAIN frames (never the exam frame's
-    #    a/an slot). The exam frame ("look at") IS exposed -- but only with the
-    #    definite article -- so its embedding is trained while the a/an decision
-    #    in that frame stays held out.
+    # -- articles: a/an across several TRAIN frames. a/an is a LEXICAL
+    #    phonological rule (vowel-onset -> an). HELDOUT_NOUNS may appear here as
+    #    bare NPs (this is an article context, not verb conjugation / predication)
+    #    so they earn embeddings. The exam frame ("look at") is exposed only with
+    #    the definite article so its embedding trains while its a/an slot stays
+    #    held out.
     for fr in ARTICLE_TRAIN_FRAMES:
         for w in CONS_NOUNS:
             sents.append(f"{fr} a {w} .")
@@ -188,33 +214,38 @@ def build_corpus(seed, n=None):
     for w in CONS_NOUNS + VOWEL_NOUNS:
         sents.append(f"{ARTICLE_EXAM_FRAME} the {w} .")
 
-    # -- plurals: counting drills "one cat" / "two cats" / "many cats".
-    #    The exam counts with "three". To give "three" a trained embedding we
-    #    DO use it in training -- but only with nouns that are NOT in the exam's
-    #    plural set, so the exam (three, exam-noun) combos remain held out while
-    #    the rule "three + plural" is learnable from the other nouns.
-    plural_exam_nouns = {"cat", "dog", "ball", "cup", "box", "fox", "leaf", "key"}
+    # -- plurals: counting drills "one cat" / "two cats" / "many cats" / "three..".
+    #    All bare NPs, so HELDOUT_NOUNS participate (earning embeddings) without
+    #    ever being conjugated or color-predicated.
     for w in ANIMALS_SG + OBJECTS_SG:
         sents.append(f"one {w} .")
         sents.append(f"two {_plural(w)} .")
         sents.append(f"many {_plural(w)} .")
-        if w not in plural_exam_nouns:
-            sents.append(f"{PLURAL_EXAM_NUMBER} {_plural(w)} .")
+        sents.append(f"{PLURAL_EXAM_NUMBER} {_plural(w)} .")
 
-    # -- prepositions + grounded color/object: "the red ball is on the mat"
-    #    SKIP held-out (color, object) pairs.
+    # -- prepositions + grounded color/object: "the red ball is on the mat".
+    #    Adjective NP context -- bare NP for the noun, so HELDOUT_NOUNS appear
+    #    here too (as the object), still never conjugated / predicated.
     for c in COLORS:
         for o in OBJECTS_SG:
-            if (c, o) in heldout_color:
-                continue
             p = PREPS[rng.integers(len(PREPS))]
             pl = PLACES[rng.integers(len(PLACES))]
             sents.append(f"the {c} {o} is {p} the {pl} .")
-
-    # -- color predication: "the cat is black" (teaches color words in a slot)
+    # adjective NP also over animals so held-out nouns get an adjective context
     for a in ANIMALS_SG:
         c = COLORS[rng.integers(len(COLORS))]
-        sents.append(f"the {a} is {c} .")
+        p = PREPS[rng.integers(len(PREPS))]
+        pl = PLACES[rng.integers(len(PLACES))]
+        sents.append(f"the {c} {a} is {p} the {pl} .")
+
+    # -- color PREDICATION: "the cat is a red one" teaches the "<noun> is a
+    #    <color>" frame. HELDOUT_NOUNS are EXCLUDED -- the exam tests transferring
+    #    this predication onto them.
+    for a in ANIMALS_SG:
+        if a in heldout_nouns:
+            continue
+        c = COLORS[rng.integers(len(COLORS))]
+        sents.append(f"the {a} is a {c} one .")
 
     # dedup, deterministic shuffle
     sents = sorted(set(sents))
@@ -229,51 +260,64 @@ def build_corpus(seed, n=None):
 # 3. Exam -- HELD-OUT cloze items testing the SAME patterns.
 # --------------------------------------------------------------------------- #
 def build_exam(seed):
-    """Cloze items {left, right, options, answer, cat}. Each is a HELD-OUT
-    instance of a trained pattern -- the exact (frame, word) combination never
-    occurs in build_corpus (verified disjoint by main, overlap must be 0).
+    """Cloze items {left, right, options, answer, cat, gen}. `gen` is the
+    generalization type used for the transfer breakdown:
+      - "noun_transfer": apply a rule (agreement / "is a <color>" predication) to
+        a HELDOUT_NOUN that was only ever seen as a bare NP.
+      - "pair_transfer": fill a (subject, verb) combination that was removed
+        ENTIRELY from training (both words seen separately).
+      - "lexical": the a/an phonological rule -- a lexical fact, NOT a transfer
+        test (included so transfer_accuracy can EXCLUDE it).
+    Each item's filled sentence is held out of build_corpus (overlap must be 0).
     Options are single words; chance = 1/len(options)."""
     rng = np.random.default_rng(seed + 100)
     items = []
+    # a fixed color for predication tests (any trained color works)
+    pred_colors = ["red", "blue", "green", "black"]
 
-    # --- agreement (held-out subject+verb pairs) ---
-    # "the cat ___" -> the singular verb form ; "the cats ___" -> the plural.
-    # The (cat, sits) pair was withheld from training, so a correct answer means
-    # composing cat's number (seen with other verbs) with the agreement of this
-    # verb (seen with other subjects).
-    for a, vs in HELDOUT_AGREE:
+    # === noun_transfer: HELDOUT_NOUNS only seen as bare NPs in training ===
+    for i, a in enumerate(HELDOUT_NOUNS):
+        # (a) subject-verb agreement transfer onto the held-out noun.
+        #     The verb is the OBJECT of the blank: "the frog ___ ." -> singular.
+        for vs in ["runs", "eats"]:
+            vp = _verb_plural(vs)
+            items.append(dict(cat="agreement", gen="noun_transfer",
+                              left=f"the {a}", right=".",
+                              options=[vs, vp], answer=vs))
+            items.append(dict(cat="agreement", gen="noun_transfer",
+                              left=f"the {_plural(a)}", right=".",
+                              options=[vs, vp], answer=vp))
+        # (b) "X is a <color>" predication transfer: "the frog is a ___ one ."
+        #     answer = a color; distractor = a non-color noun.
+        c = pred_colors[i % len(pred_colors)]
+        distract = rng.choice([x for x in OBJECTS_SG])
+        items.append(dict(cat="predication", gen="noun_transfer",
+                          left=f"the {a} is a", right="one .",
+                          options=[c, distract], answer=c))
+
+    # === pair_transfer: HELDOUT_PAIRS removed entirely; recombine seen words ===
+    # "the cat ___ ." -> the singular verb of the held-out pair; "the cats ___ ."
+    # -> its plural. Both cat and sings were trained, never together.
+    for a, vs in HELDOUT_PAIRS:
         vp = _verb_plural(vs)
-        items.append(dict(cat="agreement",
+        items.append(dict(cat="agreement", gen="pair_transfer",
                           left=f"the {a}", right=".",
                           options=[vs, vp], answer=vs))
-        items.append(dict(cat="agreement",
+        items.append(dict(cat="agreement", gen="pair_transfer",
                           left=f"the {_plural(a)}", right=".",
                           options=[vs, vp], answer=vp))
 
-    # --- articles a/an in a NOVEL frame ("look at ...") ---
+    # === lexical: a/an phonological rule (NOT a transfer test) ===
+    # LEFT-cued frame ("look at ___ dog") -- the cue noun is to the RIGHT, so a
+    # bidirectional reader can use it but a left-only reader cannot. This is the
+    # item type that should separate bidir from left-only.
     art = [("dog", "a"), ("apple", "an"), ("egg", "an"), ("cup", "a"),
-           ("owl", "an"), ("ball", "a"), ("ant", "an"), ("hat", "a")]
+           ("owl", "an"), ("ball", "a"), ("ant", "an"), ("hat", "a"),
+           ("ox", "an"), ("car", "a")]
     for w, ans in art:
-        items.append(dict(cat="article",
+        items.append(dict(cat="article", gen="lexical",
                           left=ARTICLE_EXAM_FRAME, right=f"{w} .",
                           options=["a", "an"], answer=ans))
-
-    # --- plurals in a NOVEL counting frame ("three ___") ---
-    plur = ["cat", "dog", "ball", "cup", "box", "fox", "leaf", "key"]
-    for w in plur:
-        items.append(dict(cat="plural",
-                          left=PLURAL_EXAM_NUMBER, right=".",
-                          options=[w, _plural(w)], answer=_plural(w)))
-
-    # --- vocab: held-out (color, object) color-slot fills ---
-    # "the ___ ball is on the mat" -- the right answer is the color; the
-    # distractor is a non-color noun. These (color, object) pairs were withheld.
-    for c, o in HELDOUT_COLOR:
-        distract = rng.choice([x for x in OBJECTS_SG if x != o] +
-                              [x for x in ANIMALS_SG])
-        items.append(dict(cat="vocab",
-                          left="the", right=f"{o} is on the mat .",
-                          options=[c, distract], answer=c))
 
     rng.shuffle(items)
     return items
@@ -371,6 +415,25 @@ def answer_cloze(model, vocab, item, device="cpu"):
 
 
 @torch.no_grad()
+def answer_cloze_leftonly(model, vocab, item, device="cpu"):
+    """LEFT-ONLY ABLATION on the SAME bidirectional weights: place <mask> in the
+    blank but DROP all right context (everything from the blank rightward), then
+    score options at the mask position. The model architecture / weights are
+    identical to answer_cloze -- only the visible context is truncated. This
+    isolates how much the comprehension reader relies on RIGHT context. On
+    right-cued items (e.g. "___ apple ." -> an) bidirectional should beat this."""
+    model.eval()
+    lp = _mask_logprobs(model, vocab, item["left"], "", device)  # no right ctx
+    best, best_lp = None, -1e30
+    for opt in item["options"]:
+        oid = vocab.stoi.get(opt, None)
+        score = lp[oid].item() if oid is not None else -1e30
+        if score > best_lp:
+            best_lp, best = score, opt
+    return best
+
+
+@torch.no_grad()
 def answer_cloze_causal(model, vocab, item, device="cpu"):
     """CONTRAST baseline: same weights, but CAUSAL forward + left-to-right option
     scoring. Score = sum of log p(token | preceding) over left + option (no
@@ -405,8 +468,14 @@ def answer_cloze_causal(model, vocab, item, device="cpu"):
 # 6. exam_accuracy
 # --------------------------------------------------------------------------- #
 def exam_accuracy(model, vocab, items, device="cpu", answer_fn=answer_cloze):
+    """Report overall accuracy, transfer_accuracy (excluding gen="lexical"
+    items), a by-generalization-type breakdown, and a by-category breakdown.
+    `passed` is judged on transfer_accuracy (the systematic-generalization
+    signal), which is the point of this hardened exam."""
     correct = 0
     cats = {}
+    gens = {}
+    transfer_correct = transfer_n = 0
     for it in items:
         pred = answer_fn(model, vocab, it, device)
         ok = pred == it["answer"]
@@ -415,11 +484,24 @@ def exam_accuracy(model, vocab, items, device="cpu", answer_fn=answer_cloze):
         cats.setdefault(c, [0, 0])
         cats[c][0] += ok
         cats[c][1] += 1
+        g = it.get("gen", "all")
+        gens.setdefault(g, [0, 0])
+        gens[g][0] += ok
+        gens[g][1] += 1
+        if g != "lexical":
+            transfer_correct += ok
+            transfer_n += 1
     acc = correct / len(items)
+    transfer_acc = (transfer_correct / transfer_n) if transfer_n else 0.0
     chance = float(np.mean([1.0 / len(it["options"]) for it in items]))
     per_cat = {c: round(n / d, 3) for c, (n, d) in sorted(cats.items())}
-    return dict(acc=round(acc, 4), chance=round(chance, 4),
-                passed=acc >= 0.80, n=len(items), per_cat=per_cat)
+    per_gen = {g: round(n / d, 3) for g, (n, d) in sorted(gens.items())}
+    return dict(acc=round(acc, 4),
+                transfer_acc=round(transfer_acc, 4),
+                chance=round(chance, 4),
+                passed=transfer_acc >= 0.80,
+                n=len(items), transfer_n=transfer_n,
+                per_cat=per_cat, per_gen=per_gen)
 
 
 # --------------------------------------------------------------------------- #
@@ -529,6 +611,7 @@ def run_once(steps, seed, d, layers, heads, arch, out_path=None, device="cpu",
     mlen = _max_len(vocab, corpus, items)
 
     overlap = _verify_disjoint(corpus, items, vocab)
+    assert overlap == 0, f"exam leaked into corpus: {overlap} overlapping items"
     if verbose:
         print(f"corpus sentences: {len(corpus)}  vocab: {len(vocab)}  max_len: {mlen}")
         print(f"exam items: {len(items)}  held-out overlap with corpus: {overlap}")
@@ -538,51 +621,66 @@ def run_once(steps, seed, d, layers, heads, arch, out_path=None, device="cpu",
               log_every=(steps // 5 if verbose else 0))
 
     res = exam_accuracy(model, vocab, items, device, answer_cloze)
+    res_left = exam_accuracy(model, vocab, items, device, answer_cloze_leftonly)
     res_causal = exam_accuracy(model, vocab, items, device, answer_cloze_causal)
 
     if verbose:
         print(f"\n== held-out exam (arch={arch}) ==")
-        print(f"comprehension (bidirectional masked fill): acc={res['acc']}  "
-              f"chance={res['chance']}  passed={res['passed']}")
-        print(f"  per-category: {res['per_cat']}")
-        print(f"causal next-token baseline (same weights):  acc={res_causal['acc']}  "
-              f"chance={res_causal['chance']}")
-        print(f"  per-category: {res_causal['per_cat']}")
+        print(f"comprehension (bidirectional masked fill):")
+        print(f"  overall acc={res['acc']}  transfer_acc={res['transfer_acc']}  "
+              f"chance={res['chance']}  passed(transfer>=0.80)={res['passed']}")
+        print(f"  by-gen:      {res['per_gen']}")
+        print(f"  by-category: {res['per_cat']}")
+        print(f"left-only ablation (same weights, right context dropped):")
+        print(f"  overall acc={res_left['acc']}  transfer_acc={res_left['transfer_acc']}")
+        print(f"  by-gen:      {res_left['per_gen']}")
+        print(f"  by-category: {res_left['per_cat']}")
+        print(f"causal next-token baseline (same weights):  acc={res_causal['acc']}")
+        print(f"  by-category: {res_causal['per_cat']}")
 
     if out_path:
         with open(out_path, "w") as f:
             json.dump(dict(arch=arch, steps=steps, seed=seed,
                            corpus=len(corpus), comprehension=res,
+                           left_only=res_left,
                            causal_baseline=res_causal, overlap=overlap), f, indent=2)
         if verbose:
             print(f"wrote {out_path}")
-    return res, res_causal
+    return res, res_left, res_causal
 
 
 def run_fer_sweep(steps, seed, d, layers, heads, device="cpu",
-                  sizes=(50, 100, 200, 400)):
-    """Sample-efficiency: FER-on (arch=relational) vs FER-off (arch=standard) at
-    several corpus sizes; report held-out exam accuracy for each. Held-out exam
-    and vocab are fixed across sizes (full vocab) so only corpus size varies."""
+                  sizes=(50, 100, 200, 400), seeds=(0, 1, 2)):
+    """Sample-efficiency on the HARDER TRANSFER test: FER-on (arch=relational) vs
+    FER-off (arch=standard) at several corpus sizes; report held-out
+    TRANSFER_ACCURACY (lexical items excluded) -- 3-seed means. Held-out exam and
+    vocab are fixed across sizes (full vocab) so only corpus size varies."""
     full = build_corpus(seed)
     items = build_exam(seed)
     vocab = WordVocab.build(full + [it["left"] + " " + it["right"] + " " +
                                     " ".join(it["options"]) for it in items])
     mlen = _max_len(vocab, full, items)
-    print(f"\n== FER sample-efficiency sweep (full corpus={len(full)}) ==")
+    assert _verify_disjoint(full, items, vocab) == 0, "exam leaked into corpus"
+    print(f"\n== FER sample-efficiency sweep on HARDER TRANSFER test "
+          f"(full corpus={len(full)}, seeds={list(seeds)}) ==")
+    print("(values = mean transfer_accuracy across seeds; lexical items excluded)")
     print(f"{'size':>6} | {'FER-off(std)':>13} | {'FER-on(rel)':>12}")
     print("-" * 40)
     table = {}
     for n in sizes:
         if n > len(full):
             continue
-        corpus = full[:n]
         accs = {}
         for arch in ("standard", "relational"):
-            m = make_model(len(vocab), mlen, arch=arch, d=d, layers=layers, heads=heads)
-            train_mlm(m, vocab, corpus, steps=steps, seed=seed, device=device)
-            r = exam_accuracy(m, vocab, items, device, answer_cloze)
-            accs[arch] = r["acc"]
+            vals = []
+            for sd in seeds:
+                corpus = build_corpus(sd)[:n]
+                m = make_model(len(vocab), mlen, arch=arch, d=d, layers=layers,
+                               heads=heads)
+                train_mlm(m, vocab, corpus, steps=steps, seed=sd, device=device)
+                r = exam_accuracy(m, vocab, items, device, answer_cloze)
+                vals.append(r["transfer_acc"])
+            accs[arch] = float(np.mean(vals))
         table[n] = accs
         print(f"{n:>6} | {accs['standard']:>13.3f} | {accs['relational']:>12.3f}")
     # verdict
