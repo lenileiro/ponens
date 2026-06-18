@@ -29,9 +29,12 @@ import torch.nn.functional as F
 
 from device import get_device
 from .realvoice import N_BINS
-from .tts import ROOT, CHARS, C2I, MAX_T, encode_text, load, spec_of
+from .tts import ROOT, CHARS, C2I, encode_text, load, spec_of
 
 DEV = get_device()
+# LJSpeech sentences run ~6-10s; TTS's MAX_T=360 (~4.2s) truncated audio while keeping the full
+# transcript -> CTC infeasible (frames < chars) -> all-blank collapse. Use the FULL clip for ASR.
+ASR_MAX_T = 1000                             # ~11.6s @ hop256/22050; /4 subsample -> 250 frames >> chars
 VOCAB = len(CHARS) + 1                       # index 0 = CTC blank; chars are 1..len(CHARS)
 I2C = {i + 1: c for i, c in enumerate(CHARS)}
 
@@ -84,7 +87,7 @@ class ASR(nn.Module):
 
 
 def build_cache(data):
-    specs = [spec_of(w, "cpu")[:, :MAX_T].contiguous() for t, w in data]
+    specs = [spec_of(w, "cpu")[:, :ASR_MAX_T].contiguous() for t, w in data]
     txts = [encode_text(t) for t, w in data]
     return specs, txts
 
@@ -144,7 +147,7 @@ def evaluate(model, data, device=DEV, n=200, show=0):
         for k in range(min(n, len(ev))):
             txt, wav = ev[k]
             ref = "".join(c for c in txt.lower() if c in C2I)
-            logp, _ = model(spec_of(wav, device)[:, :MAX_T][None])
+            logp, _ = model(spec_of(wav, device)[:, :ASR_MAX_T][None])
             hyp = decode_ids(logp[0].argmax(-1).cpu().numpy())
             wers.append(_edit(ref.split(), hyp.split())); cers.append(_edit(list(ref), list(hyp)))
             if k < show:
@@ -173,7 +176,7 @@ def build_from_ckpt(path, device=DEV):
 def transcribe(model, wav, device=DEV):
     model.eval()
     with torch.no_grad():
-        logp, _ = model(spec_of(wav, device)[:, :MAX_T][None])
+        logp, _ = model(spec_of(wav, device)[:, :ASR_MAX_T][None])
     return decode_ids(logp[0].argmax(-1).cpu().numpy())
 
 
