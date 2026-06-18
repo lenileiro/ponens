@@ -89,6 +89,10 @@ def payload(args):
         jobs.append(f"{PY}.svs --fetch")                          # download + parse CSD (singing data)
         jobs.append(f"{PY}.svs --train --steps 30000 --batch 96 --dim 512 --layers 6 --heads 8 "
                     f"--out runs/svs.json --checkpoint runs/svs.pt")
+    if args.job == "asr":                                         # LISTENING: audio -> text (own ASR)
+        jobs.append(f"{PY}.tts --fetch --n-clips 13100 --byte-cap-gb 3.0")
+        jobs.append(f"{PY}.asr --train --steps 40000 --batch 64 --dim 384 --layers 8 --heads 6 "
+                    f"--out runs/asr.json --checkpoint runs/asr.pt")
     # non-fatal chaining: one job's failure must not kill the rest
     return " ; ".join(jobs)
 
@@ -97,7 +101,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--go", action="store_true")
     ap.add_argument("--job", default="all",
-                    choices=("all", "sing-sweep", "polyglot", "pronounce", "mimic", "vocoder", "vocoder-gan", "vocoder24", "realvoice", "libriclone", "knnvc", "tts", "tts-fast", "tts-ar", "svs"))
+                    choices=("all", "sing-sweep", "polyglot", "pronounce", "mimic", "vocoder", "vocoder-gan", "vocoder24", "realvoice", "libriclone", "knnvc", "tts", "tts-fast", "tts-ar", "svs", "asr"))
     ap.add_argument("--gpu", default="NVIDIA H100 80GB HBM3")
     ap.add_argument("--cloud", default="SECURE")
     ap.add_argument("--disk", type=int, default=40)
@@ -116,7 +120,7 @@ def main(argv=None):
     # say-banks needed by pronounce/mimic (pods have no macOS `say`)
     need_banks = args.job in ("all", "pronounce", "mimic", "vocoder", "vocoder-gan", "vocoder24", "realvoice")
 
-    setup = "pip install -q numpy tokenizers pandas pyarrow" + (" soundfile" if args.job in ("libriclone","knnvc","tts","tts-fast","tts-ar","svs") else "") + (" mido librosa" if args.job == "svs" else "") + (" torchaudio transformers" if args.job == "knnvc" else "")
+    setup = "pip install -q numpy tokenizers pandas pyarrow" + (" soundfile" if args.job in ("libriclone","knnvc","tts","tts-fast","tts-ar","svs","asr") else "") + (" mido librosa" if args.job == "svs" else "") + (" torchaudio transformers" if args.job == "knnvc" else "")
     remote = (f"cd {REMOTE} && rm -f /root/thinking.log && "
               f"({setup} && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && "
               f"timeout {cap}s bash -c {quote(f'cd {REMOTE} && ({run})')}) "
