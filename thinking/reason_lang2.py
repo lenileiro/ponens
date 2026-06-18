@@ -74,7 +74,7 @@ PLACES = ["forest", "river", "valley", "mountain", "desert", "meadow", "swamp", 
           "den", "thicket", "hollow", "ravine", "gully"]                            # 30
 
 STRUCT = ["<pad>", "a", "an", "is", "can", "cannot", "has", "in", "are", "every", "all", "lives",
-          "have", "inside", "located", "true", "it", "that", "of", "part", "the",
+          "live", "have", "inside", "located", "true", "it", "that", "of", "part", "the",
           "so", "note", "answer", "yes", "no", "query", ".", "?"]
 
 # query types: transitive-relation queries + property inherit (positive) + property exclusion (negative)
