@@ -715,11 +715,14 @@ def _heldout_only_ids():
     return fids, qids
 
 
-def train_one(proof, seed, steps, lr, device, vocab):
+def train_one(proof, seed, steps, lr, device, vocab,
+              dim=192, layers=4, heads=6, batch=64, max_len=240):
     itos, stoi = vocab
+    assert dim % heads == 0, f"dim ({dim}) must be divisible by heads ({heads})"
+    assert (dim // heads) % 2 == 0, f"head dim ({dim // heads}) must be even for RoPE"
     torch.manual_seed(seed)
     rng = random.Random(seed)
-    model = ScratchpadLM(vocab=len(itos), d=192, layers=4, heads=6, max_len=240,
+    model = ScratchpadLM(vocab=len(itos), d=dim, layers=layers, heads=heads, max_len=max_len,
                          pos_mode="rope", pointer=True, tie=True).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     model.train()
@@ -727,8 +730,8 @@ def train_one(proof, seed, steps, lr, device, vocab):
     tr_fids, tr_qids = _all_ids(template_holdout=True)
     seen, last = set(), 0.0
     for step in range(steps):
-        out = make_batch(rng, stoi, proof, tr_fids, tr_qids, device, batch=64,
-                         assert_no_holdout=True)
+        out = make_batch(rng, stoi, proof, tr_fids, tr_qids, device, batch=batch,
+                         block=max_len, assert_no_holdout=True)
         ids, mask, configs, _ = out
         seen.update(configs)
         loss = loss_fn(model, ids, mask)
@@ -761,9 +764,25 @@ def main():
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--sanity", action="store_true")
     ap.add_argument("--which", choices=["A", "B", "both"], default="both")
+    # GPU + scale knobs (defaults equal the previous hardcoded values -> CPU behavior unchanged)
+    ap.add_argument("--dim", type=int, default=192)
+    ap.add_argument("--layers", type=int, default=4)
+    ap.add_argument("--heads", type=int, default=6)
+    ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--max-len", type=int, default=240)
+    ap.add_argument("--device", default="auto",
+                    help="auto -> cuda if available else cpu; or pass cpu/cuda explicitly")
+    ap.add_argument("--out", default=None, help="optional path to write per-seed JSON results")
     args = ap.parse_args()
 
-    device = "cpu"
+    assert args.dim % args.heads == 0, f"--dim ({args.dim}) must be divisible by --heads ({args.heads})"
+    assert (args.dim // args.heads) % 2 == 0, \
+        f"head dim ({args.dim // args.heads}) must be even for RoPE"
+
+    if args.device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = args.device
     # Coexist politely under a heavily-oversubscribed CPU (concurrent agents): allow capping the
     # intra-op thread pool via env (fewer threads = less thrash when all cores are already taken).
     _nt = os.environ.get("RLN_THREADS")
@@ -771,9 +790,14 @@ def main():
     vocab = build_vocab()
     itos, stoi = vocab
 
+    mk = dict(dim=args.dim, layers=args.layers, heads=args.heads, batch=args.batch,
+              max_len=args.max_len)
+
     print(f"REASON-LANG2 | broader NL | rules: isa/part_of/located_in TRANS + has_prop INHERIT + "
           f"EXCLUDE-neg | nouns={len(NOUNS)} props={len(PROPS)} parts={len(PARTS)} places={len(PLACES)} "
           f"| qtypes={QTYPES} | vocab={len(itos)} | steps={args.steps} lr={args.lr}")
+    print(f"  model: dim={args.dim} layers={args.layers} heads={args.heads} batch={args.batch} "
+          f"max_len={args.max_len} | device={device}")
     print("  template counts (fact/query): " + ", ".join(
         f"{r}:{n_fact_tpls(r)}/{n_query_tpls(r)}" for r in ["isa", "part_of", "located_in", "has_prop"]))
     print("  TEMPLATE-holdout: reserve last fact-id and last query-id per relation for TEST (unseen).")
@@ -799,32 +823,43 @@ def main():
 
     if args.sanity:
         print("\n=== SANITY GATE: PROOF must LEARN TRAIN (>0.85 overall) ===")
-        tr, cfg, tpl, ls = train_one(True, 0, args.steps, args.lr, device, vocab)
+        tr, cfg, tpl, ls = train_one(True, 0, args.steps, args.lr, device, vocab, **mk)
         print(f"PROOF seed0 TRAIN   overall {tr['OVERALL']:.3f} | per-q " +
               " ".join(f"{k} {tr[k]:.2f}" for k in QTYPES))
         print(f"PROOF seed0 CONFIG  overall {cfg['OVERALL']:.3f} | per-q " +
               " ".join(f"{k} {cfg[k]:.2f}" for k in QTYPES))
         print(f"PROOF seed0 TEMPLT  overall {tpl['OVERALL']:.3f} | per-q " +
               " ".join(f"{k} {tpl[k]:.2f}" for k in QTYPES))
-        print(f"GATE {'PASS' if tr['OVERALL'] > 0.85 else 'FAIL'} (train overall {tr['OVERALL']:.3f}) "
+        gate_pass = tr['OVERALL'] > 0.85
+        print(f"GATE {'PASS' if gate_pass else 'FAIL'} (train overall {tr['OVERALL']:.3f}) "
               f"@ {args.steps} steps")
+        if args.out:
+            _write_results(args.out, args, device, mode="sanity", payload={
+                "loss": ls, "gate_pass": gate_pass,
+                "seed0": {"train": tr, "config": cfg, "template": tpl}})
+            print(f"  wrote results -> {args.out}")
         return
 
     print(f"\n=== A (answer-only) vs B (proof) : {args.seeds}-seed, config- & template-holdout ===")
     res = {"A": {"cfg": [], "tpl": []}, "B": {"cfg": [], "tpl": []}}
     trn = {"A": [], "B": []}
+    per_seed = []                                       # for --out JSON (full A/B/train/cfg/tpl)
     for seed in range(args.seeds):
         print(f"\n-- seed {seed} --")
+        rec = {"seed": seed}
         if args.which in ("A", "both"):
-            trA, cfgA, tplA, _ = train_one(False, seed, args.steps, args.lr, device, vocab)
+            trA, cfgA, tplA, _ = train_one(False, seed, args.steps, args.lr, device, vocab, **mk)
             print(f"  (A) ANSWER train {trA['OVERALL']:.3f} | CFG {cfgA['OVERALL']:.3f} "
                   f"TPL {tplA['OVERALL']:.3f}")
             res["A"]["cfg"].append(cfgA); res["A"]["tpl"].append(tplA); trn["A"].append(trA["OVERALL"])
+            rec["A"] = {"train": trA, "config": cfgA, "template": tplA}
         if args.which in ("B", "both"):
-            trB, cfgB, tplB, _ = train_one(True, seed, args.steps, args.lr, device, vocab)
+            trB, cfgB, tplB, _ = train_one(True, seed, args.steps, args.lr, device, vocab, **mk)
             print(f"  (B) PROOF  train {trB['OVERALL']:.3f} | CFG {cfgB['OVERALL']:.3f} "
                   f"TPL {tplB['OVERALL']:.3f}")
             res["B"]["cfg"].append(cfgB); res["B"]["tpl"].append(tplB); trn["B"].append(trB["OVERALL"])
+            rec["B"] = {"train": trB, "config": cfgB, "template": tplB}
+        per_seed.append(rec)
 
     def ms(xs):
         m = sum(xs) / len(xs)
@@ -848,6 +883,28 @@ def main():
                 cells.append(f"{m:.2f}±{s:.2f}")
             print(f"  {lab:<12s} | " + " | ".join(f"{c:^11s}" for c in cells))
     print("=" * 76)
+
+    if args.out:
+        _write_results(args.out, args, device, mode="AB", payload={"per_seed": per_seed})
+        print(f"\nwrote results -> {args.out}")
+
+
+def _write_results(path, args, device, mode, payload):
+    """Persist a run's numbers so a GPU run's results are retrievable as JSON."""
+    import json
+    out = {
+        "mode": mode,
+        "config": {"steps": args.steps, "lr": args.lr, "seeds": args.seeds,
+                   "which": args.which, "dim": args.dim, "layers": args.layers,
+                   "heads": args.heads, "batch": args.batch, "max_len": args.max_len,
+                   "device": device},
+        "results": payload,
+    }
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(out, f, indent=2)
 
 
 if __name__ == "__main__":
