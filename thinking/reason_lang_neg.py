@@ -860,6 +860,9 @@ def main():
             res["B"]["cfg"].append(cfgB); res["B"]["tpl"].append(tplB); trn["B"].append(trB["OVERALL"])
             rec["B"] = {"train": trB, "config": cfgB, "template": tplB}
         per_seed.append(rec)
+        if args.out:                                  # incremental save: survive mid-run death
+            _write_results(args.out, args, device, mode="AB", payload={"per_seed": per_seed})
+            print(f"  [saved {len(per_seed)} seed(s) -> {args.out}]", flush=True)
 
     def ms(xs):
         m = sum(xs) / len(xs)
