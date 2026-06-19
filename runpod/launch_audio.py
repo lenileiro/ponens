@@ -91,7 +91,7 @@ def payload(args):
                     f"--out runs/svs.json --checkpoint runs/svs.pt")
     if args.job == "asr":                                         # LISTENING: audio -> text (own ASR)
         jobs.append(f"{PY}.tts --fetch --n-clips 13100 --byte-cap-gb 3.0")
-        jobs.append(f"{PY}.asr --train --steps 40000 --batch 64 --dim 384 --layers 8 --heads 6 "
+        jobs.append(f"{PY}.asr --train --steps 40000 --batch 64 --dim 384 --layers 6 --heads 6 "
                     f"--out runs/asr.json --checkpoint runs/asr.pt")
     # non-fatal chaining: one job's failure must not kill the rest
     return " ; ".join(jobs)
