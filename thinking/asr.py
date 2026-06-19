@@ -74,7 +74,7 @@ class ASR(nn.Module):
         f4 = ((n_bins + 1) // 2 + 1) // 2                    # freq dim after two stride-2 convs
         self.proj = nn.Linear(32 * f4, d)
         block = nn.TransformerEncoderLayer(d, heads, 4 * d, dropout=0.1, activation="gelu",
-                                           batch_first=True)
+                                           batch_first=True, norm_first=True)   # pre-norm: stable at depth
         self.enc = nn.TransformerEncoder(block, layers, enable_nested_tensor=False)
         self.head = nn.Linear(d, vocab)
 
@@ -115,7 +115,10 @@ def train(steps=40000, seed=0, device=DEV, batch=32, lr=3e-4, ckpt_path=None, d=
     cache = build_cache(td)
     model = ASR(d=d, layers=layers, heads=heads).to(device); model.train()
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    warmup = max(1, int(0.08 * steps))           # deep transformers stall from cold LR -> linear warmup
     for st in range(1, steps + 1):
+        for g in opt.param_groups:
+            g["lr"] = lr * min(1.0, st / warmup)
         mel, mel_len, targets, tgt_len = _batch(cache, rng, batch, device)
         logp, T4 = model(mel)
         in_len = (mel_len.float() * T4 / mel.shape[2]).long().clamp(1, T4)
