@@ -257,6 +257,22 @@ class KB:
                                     "term": K.show(kterm), "note": f"negation via excl_{A}_{Bcat}"}
                 return {"status": "unprovable", "detail": "no disjoint supertype to disprove isa"}
             return {"status": "unsupported", "detail": "v1 negation: only isa atoms (exclusion axioms)"}
+        if tag == "must":
+            # necessity (closed setting) = phi is kernel-provable; the proof of phi witnesses it.
+            r = self._prove_core(f[1])
+            if r["status"] == "proven":
+                return {**r, "note": "necessity = kernel-provable"}
+            return {"status": "unprovable", "detail": "not necessary (phi not provable)"}
+        if tag in ("can", "may"):
+            # possibility = NOT refutable: we cannot kernel-prove not(phi). This is a CONSISTENCY
+            # DECISION, not a constructed proof term -- a true modal proof needs possible-worlds
+            # semantics (deferred). Refutation (impossible) DOES carry a kernel disproof.
+            neg = self._prove_core(("not", f[1]))
+            if neg["status"] == "proven":
+                return {"status": "impossible", "detail": "refuted: not(phi) is kernel-proven",
+                        "disproof": neg.get("term")}
+            return {"status": "possible",
+                    "detail": "consistent: not(phi) not provable (modal decision, not a proof term)"}
         if tag == "if":
             ra = self._prove_core(f[1])
             if ra["status"] != "proven":
@@ -390,6 +406,14 @@ def selftest():
     # but a negation that ISN'T forced by disjointness is not provable this way (sound: robins DO fly)
     r = kb.prove_surface("(not (isa robin bird))")
     assert r["status"] == "unprovable", "must not disprove a TRUE isa"
+
+    # MODALITY: must = necessity (provable) ; can/may = possibility (not refutable)
+    assert kb.prove_surface("(must (isa robin animal))")["status"] == "proven", "robin must be an animal"
+    assert kb.prove_surface("(must (prop robin fly))")["status"] == "unprovable", "robin need not fly"
+    assert kb.prove_surface("(can (isa robin fish))")["status"] == "impossible", \
+        "robin can't be a fish (refuted via exclusion)"
+    assert kb.prove_surface("(can (prop robin fly))")["status"] == "possible", \
+        "robin flying is consistent (not refutable)"
     print("lota_kernel selftest OK")
 
 
