@@ -44,6 +44,45 @@ def fact_universe(kb):
     return sorted(atoms)
 
 
+def wordnet_kb(seed=0, per_cat=25):
+    """REAL grounded data: a KB from WordNet's actual hypernym (is-a) chains over real concepts. Deep,
+    irregular, messy -- but still brain-closable (is-a transitivity), so the brain still derives +
+    verifies. Meanings = real leaf concepts; facts = their real is-a ancestor sets."""
+    from nltk.corpus import wordnet as wn
+    seeds = ["animal.n.01", "plant.n.02", "food.n.01", "vehicle.n.01", "tool.n.01",
+             "furniture.n.01", "clothing.n.01", "bird.n.01"]
+    rng = np.random.default_rng(seed)
+
+    def descendants(syn, cap=400):
+        seen, frontier = set(), [syn]
+        while frontier and len(seen) < cap:
+            nxt = []
+            for s in frontier:
+                for h in s.hyponyms():
+                    if h not in seen:
+                        seen.add(h); nxt.append(h)
+            frontier = nxt
+        return seen
+    leaves = []
+    for sd in seeds:
+        desc = [s for s in descendants(wn.synset(sd)) if not s.hyponyms()]
+        rng.shuffle(desc)
+        leaves += desc[:per_cat]
+    isa, ents = set(), set()
+    combo = []
+    for lf in leaves:
+        ns = [s.name() for s in lf.hypernym_paths()[0]]      # root..leaf (full synset names)
+        for parent, child in zip(ns, ns[1:]):
+            isa.add((child, parent)); ents.add(child); ents.add(parent)
+        combo.append(ns[-1])
+    facts = [("isa", e) for e in isa]
+    rules = [(("isa", ("?x", "?z")), [("isa", ("?x", "?y")), ("isa", ("?y", "?z"))])]
+    import thinking.lota_kernel as LK
+    kb = LK.KB(sorted(ents), {"isa": 2}, facts, rules)
+    kb._combo_ents = sorted(set(combo))
+    return kb
+
+
 def rich_kb(seed=0, n_entities=200):
     """A RICHER grounded world: entities = combinations of INDEPENDENT factors (taxonomic category +
     color + size + habitat + diet). The isa-chain and inherited category-props are DERIVED by the brain
@@ -347,12 +386,13 @@ class SlotListener(nn.Module):
 
 
 def discover_run(steps, seed=0, K=16, V=16, dim=64, rich=True, verbose=True,
-                 assign_tau=1.0, ent_lam=0.0):
+                 assign_tau=1.0, ent_lam=0.0, kb=None):
     """REALISM push: discover the factorization (slot attention) instead of being given predicates;
     listener predicts the core; the BRAIN derives the rest. To CLOSE THE DISCOVERY GAP, sharpen the
     (input-independent) atom->slot partition: low assignment temperature + an ENTROPY regularizer push
-    each atom into ONE slot -> clean factor groups approaching the given-structure ceiling."""
-    kb = rich_kb(seed=seed) if rich else P.build_kb()
+    each atom into ONE slot -> clean factor groups approaching the given-structure ceiling. Pass kb to
+    ground in REAL data (WordNet)."""
+    kb = kb if kb is not None else (rich_kb(seed=seed) if rich else P.build_kb())
     full_atoms = fact_universe(kb)
     core, static = core_universe(kb)
     ents = getattr(kb, "_combo_ents", None) or entities_with_facts(kb, full_atoms)
@@ -625,6 +665,8 @@ def main(argv=None):
                     help="segmented speaker over core factors + brain derives the rest by closure")
     ap.add_argument("--discover", action="store_true",
                     help="DISCOVER the factorization (slot attention) -- predicates NOT given")
+    ap.add_argument("--wordnet", action="store_true",
+                    help="REAL grounded data: WordNet hypernym chains (brain closes is-a)")
     ap.add_argument("--slots", type=int, default=16)
     ap.add_argument("--assign-tau", type=float, default=1.0)
     ap.add_argument("--ent-lam", type=float, default=0.0)
@@ -636,6 +678,12 @@ def main(argv=None):
                      L_holistic=args.msg_len); return 0
     if args.brain_close:
         brain_close_run(args.steps, seed=args.seed, V=args.vocab, d=args.d, rich=True); return 0
+    if args.wordnet:
+        kb = wordnet_kb(seed=args.seed)
+        print(f"  REAL grounded data: WordNet | {len(kb._combo_ents)} real concepts | "
+              f"{len(kb.entities)} synsets | is-a closure derived by the brain", flush=True)
+        discover_run(args.steps, seed=args.seed, K=args.slots, V=max(32, args.vocab), kb=kb,
+                     assign_tau=args.assign_tau, ent_lam=args.ent_lam); return 0
     if args.discover:
         discover_run(args.steps, seed=args.seed, K=args.slots, V=args.vocab, rich=True,
                      assign_tau=args.assign_tau, ent_lam=args.ent_lam); return 0
