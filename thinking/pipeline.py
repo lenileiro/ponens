@@ -35,9 +35,28 @@ def _art(w):
     return "an" if w and w[0] in "aeiou" else "a"
 
 
+# Multiple natural PHRASINGS per goal type (paraphrase variety). Vocabulary overlaps across templates
+# so held-out (phrasing x content) cells recombine SEEN words -> tests paraphrase generalization, not
+# novel-word handling. The mapping to the same LOTA goal must be invariant to surface phrasing.
+ISA_PHRASINGS = [
+    lambda x, y: f"is {_art(x)} {x} {_art(y)} {y} ?",
+    lambda x, y: f"is {_art(x)} {x} a kind of {y} ?",
+    lambda x, y: f"tell me if {_art(x)} {x} is {_art(y)} {y}",
+    lambda x, y: f"{_art(x)} {x} is {_art(y)} {y} , true ?",
+    lambda x, y: f"is it true that {_art(x)} {x} is {_art(y)} {y} ?",
+]
+PROP_PHRASINGS = [
+    lambda x, p: f"can {_art(x)} {x} {p} ?",
+    lambda x, p: f"does {_art(x)} {x} {p} ?",
+    lambda x, p: f"is {_art(x)} {x} able to {p} ?",
+    lambda x, p: f"tell me if {_art(x)} {x} can {p}",
+    lambda x, p: f"is it true that {_art(x)} {x} can {p} ?",
+]
+
+
 def gen_questions(kb):
-    """Templated English questions over the KB ontology, paired with their LOTA goal. Truth is NOT
-    encoded -- the prover decides it. isa: 'is a robin a bird ?' ; prop: 'can a robin fly ?'."""
+    """English questions (multiple phrasings each) over the KB ontology, paired with their LOTA goal.
+    Truth is NOT encoded -- the prover decides it."""
     facts = list(kb.facts)
     subjects = sorted({e[0] for (p, e) in facts})
     isa_objs = sorted({e[1] for (p, e) in facts if p == "isa"})
@@ -47,13 +66,13 @@ def gen_questions(kb):
         for y in isa_objs:
             if x == y:
                 continue
-            nl = f"is {_art(x)} {x} {_art(y)} {y} ?"
-            pairs.append({"gtoks": nl.split(), "ptoks": P.goal_tokens(("isa", (x, y))),
-                          "goal": ("isa", (x, y))})
+            for ph in ISA_PHRASINGS:
+                pairs.append({"gtoks": ph(x, y).split(), "ptoks": P.goal_tokens(("isa", (x, y))),
+                              "goal": ("isa", (x, y))})
         for pv in prop_vals:
-            nl = f"can {_art(x)} {x} {pv} ?"
-            pairs.append({"gtoks": nl.split(), "ptoks": P.goal_tokens(("prop", (x, pv))),
-                          "goal": ("prop", (x, pv))})
+            for ph in PROP_PHRASINGS:
+                pairs.append({"gtoks": ph(x, pv).split(), "ptoks": P.goal_tokens(("prop", (x, pv))),
+                              "goal": ("prop", (x, pv))})
     return pairs
 
 
