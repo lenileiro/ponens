@@ -221,6 +221,11 @@ def selftest():
     assert r["faithfulness"] >= 0.0 and r["recall"] > 0.3, ("should convey some true facts", r)
     # the grounding is REAL: a conveyed fact is checked against the brain's closure (kernel-backed)
     assert ("isa", ("robin", "animal")) in kb.known, "brain derives inherited/transitive facts"
+    # structured speaker+listener round-trip (the boundary-cracking architecture) wires up
+    rk = rich_kb(seed=0); ca, _st = core_universe(rk)
+    ss = SegmentedSpeaker(ca, 8, 32); sl = SegmentedListener(build_groups(ca), len(ca), ss.spg, 8, 32)
+    xv = torch.from_numpy(np.stack([core_vec(set(rk.facts), ca, e) for e in rk._combo_ents[:4]]))
+    assert sl(ss(xv)[0]).shape == (4, len(ca)), "segmented speaker+listener shapes must align"
     print("emergent_grounded selftest OK")
 
 
@@ -294,6 +299,37 @@ def iterated_compare(steps, seed=0, L=6, V=12, d=128, reset_every=800, rich=Fals
     d_ex = out["iterated"]["heldout_exact"] - out["baseline"]["heldout_exact"]
     print(f"  delta (iterated - baseline): topsim {d_ts:+.3f}, held-out exact {d_ex:+.3f}")
     return out
+
+
+def build_groups(atoms):
+    """Ordered list of core-atom index groups, one per typed predicate (the factor structure)."""
+    groups = {}
+    for i, (pred, _obj) in enumerate(atoms):
+        groups.setdefault(pred, []).append(i)
+    return [torch.tensor(v) for v in groups.values()]
+
+
+class SegmentedListener(nn.Module):
+    """Mirrors the segmented speaker: each message SEGMENT decodes ONLY its own predicate's atoms ->
+    fully disentangled decode (no GRU entanglement), so each factor is read independently and novel
+    combinations compose. Scatters per-group logits back into the core-atom vector."""
+    def __init__(self, group_idx, n_core, spg, V, d=128):
+        super().__init__()
+        self.group_idx, self.n_core, self.spg = group_idx, n_core, spg
+        self.sym = nn.Linear(V, d, bias=False)
+        self.dec = nn.ModuleList(
+            nn.Sequential(nn.Linear(spg * d, d), nn.ReLU(), nn.Linear(d, len(idx)))
+            for idx in group_idx)
+
+    def forward(self, msg):
+        B = msg.shape[0]
+        e = self.sym(msg)
+        out = torch.zeros(B, self.n_core)
+        pos = 0
+        for idx, dec in zip(self.group_idx, self.dec):
+            out[:, idx] = dec(e[:, pos:pos + self.spg].reshape(B, -1))
+            pos += self.spg
+        return out
 
 
 class SegmentedSpeaker(nn.Module):
@@ -382,7 +418,7 @@ def brain_close_run(steps, seed=0, V=16, d=128, rich=True, verbose=True):
     tr, te = split_entities(ents, 0.25, seed)
     facts_set = set(kb.facts)
     spk = SegmentedSpeaker(core, V, d)
-    lis = ReconListener(spk.L, V, len(core), d)
+    lis = SegmentedListener(build_groups(core), len(core), spk.spg, V, d)   # structured decode
     tr_vecs = [core_vec(facts_set, core, e) for e in tr]
     train(spk, lis, tr_vecs, steps=steps, batch=64, seed=seed,
           log=(max(1, steps // 6) if verbose else 0))
