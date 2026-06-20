@@ -37,12 +37,46 @@ from thinking.emergent import Speaker  # noqa: E402
 # The grounded meaning space: entities -> derived fact vectors (from the brain's closure)
 # ===================================================================================================
 def fact_universe(kb):
-    """All atoms the entities could have, as templates: isa(_,cat) for every category, prop(_,p) for
-    every property. The entity's fact VECTOR marks which are DERIVABLE (in the closure)."""
-    cats = sorted({e[1] for (p, e) in kb.known if p == "isa"})
-    props = sorted({e[1] for (p, e) in kb.known if p == "prop"})
-    atoms = [("isa", c) for c in cats] + [("prop", pr) for pr in props]
-    return atoms
+    """All (pred, obj) templates that hold for some entity in the closure (any predicate -- isa/prop/
+    color/size/...). The entity's fact VECTOR marks which are DERIVABLE for it."""
+    ents = set(kb.entities)
+    atoms = {(p, args[1]) for (p, args) in kb.known if len(args) == 2 and args[0] in ents}
+    return sorted(atoms)
+
+
+def rich_kb(seed=0, n_entities=200):
+    """A RICHER grounded world: entities = combinations of INDEPENDENT factors (taxonomic category +
+    color + size + habitat + diet). The isa-chain and inherited category-props are DERIVED by the brain
+    (its contribution); color/size/habitat/diet are direct. Held-out entities are unseen COMBINATIONS,
+    so a compositional code must COMPOSE to convey them -- where compositionality finally bites."""
+    import itertools
+    isa_tax = [("dog", "mammal"), ("cat", "mammal"), ("cow", "mammal"),
+               ("robin", "bird"), ("eagle", "bird"), ("duck", "bird"),
+               ("salmon", "fish"), ("trout", "fish"),
+               ("mammal", "animal"), ("bird", "animal"), ("fish", "animal"), ("animal", "living")]
+    cat_props = [("animal", "move"), ("animal", "breathe"), ("mammal", "nurse"),
+                 ("bird", "fly"), ("fish", "swim"), ("living", "grow")]
+    leaves = ["dog", "cat", "cow", "robin", "eagle", "duck", "salmon", "trout"]
+    colors = ["red", "blue", "green", "brown", "white", "black"]
+    sizes = ["small", "medium", "large"]
+    habitats = ["forest", "water", "desert", "farm"]
+    diets = ["herbivore", "carnivore", "omnivore"]
+    combos = list(itertools.product(leaves, colors, sizes, habitats, diets))
+    np.random.default_rng(seed).shuffle(combos)
+    combos = combos[:n_entities]
+    ents, facts = [], [("isa", e) for e in isa_tax] + [("prop", e) for e in cat_props]
+    for i, (lf, co, sz, ha, di) in enumerate(combos):
+        e = f"e{i}"; ents.append(e)
+        facts += [("isa", (e, lf)), ("color", (e, co)), ("size", (e, sz)),
+                  ("habitat", (e, ha)), ("diet", (e, di))]
+    all_ents = sorted(set(ents) | {x for pair in isa_tax for x in pair})
+    preds = {"isa": 2, "color": 2, "size": 2, "habitat": 2, "diet": 2, "prop": 2}
+    rules = [(("isa", ("?x", "?z")), [("isa", ("?x", "?y")), ("isa", ("?y", "?z"))]),
+             (("prop", ("?x", "?p")), [("isa", ("?x", "?y")), ("prop", ("?y", "?p"))])]
+    import thinking.lota_kernel as LK
+    kb = LK.KB(all_ents, preds, facts, rules)
+    kb._combo_ents = ents                                   # the combination entities (the meanings)
+    return kb
 
 
 def entities_with_facts(kb, atoms, min_facts=3):
@@ -166,10 +200,10 @@ def topsim(spk, kb, atoms, ents, seed=2, pairs=2000):
 # ===================================================================================================
 # selftest + run
 # ===================================================================================================
-def _setup(L, V, d, seed):
-    kb = P.build_kb()
+def _setup(L, V, d, seed, rich=False):
+    kb = rich_kb(seed=seed) if rich else P.build_kb()
     atoms = fact_universe(kb)
-    ents = entities_with_facts(kb, atoms)
+    ents = getattr(kb, "_combo_ents", None) or entities_with_facts(kb, atoms)
     tr, te = split_entities(ents, 0.25, seed)
     spk = Speaker(len(atoms), 1, L, V, d=d)             # speaker input = the fact vector (n_attr*n_val
     spk.enc[0] = nn.Linear(len(atoms), d)              # ... here that product == len(atoms))
@@ -232,13 +266,17 @@ def _consolidate(spk, kb, atoms, tr, L, V, d, steps=2000, seed=0):
     return lis
 
 
-def iterated_compare(steps, seed=0, L=6, V=12, d=128, reset_every=800):
+def iterated_compare(steps, seed=0, L=6, V=12, d=128, reset_every=800, rich=False):
     """Baseline (no reset) vs ITERATED LEARNING (periodic listener reset), same total steps. The
     iterated arm then CONSOLIDATES (fresh listener trained to convergence on the compositional code)
     so held-out reconstruction reflects the code, not an undertrained decoder."""
     out = {}
     for tag, rev in [("baseline", 0), ("iterated", reset_every)]:
-        kb, atoms, ents, tr, te, spk, lis = _setup(L, V, d, seed)
+        kb, atoms, ents, tr, te, spk, lis = _setup(L, V, d, seed, rich=rich)
+        if tag == "baseline":
+            print(f"  world: {'RICH' if rich else 'toy'} | {len(ents)} meaning-entities "
+                  f"(train {len(tr)}/held-out {len(te)}) | fact-universe {len(atoms)} | L{L} V{V}",
+                  flush=True)
         mk = (lambda: ReconListener(L, V, len(atoms), d=d)) if rev else None
         train(spk, lis, [fact_vec(kb, atoms, e) for e in tr], steps=steps, batch=64, seed=seed,
               reset_every=rev, make_lis=mk)
@@ -269,12 +307,14 @@ def main(argv=None):
     ap.add_argument("--iterated", action="store_true",
                     help="compare iterated learning (listener resets) vs baseline")
     ap.add_argument("--reset-every", type=int, default=800)
+    ap.add_argument("--rich", action="store_true",
+                    help="use the richer grounded world (independent factors; large held-out)")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return 0
     if args.iterated:
         iterated_compare(args.steps, seed=args.seed, L=args.msg_len, V=args.vocab, d=args.d,
-                         reset_every=args.reset_every); return 0
+                         reset_every=args.reset_every, rich=args.rich); return 0
     run(args.steps, seed=args.seed, L=args.msg_len, V=args.vocab, d=args.d)
     return 0
 
