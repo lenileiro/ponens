@@ -296,6 +296,54 @@ def iterated_compare(steps, seed=0, L=6, V=12, d=128, reset_every=800, rich=Fals
     return out
 
 
+@torch.no_grad()
+def teacher_messages(spk, vecs):
+    spk.eval()
+    return spk(torch.from_numpy(np.stack(vecs)))[0].argmax(-1)        # (N, L) symbol ids
+
+
+def imitate(new_spk, vecs, tmsg, steps, lr=1e-3, seed=0):
+    """A fresh speaker learns the previous speaker's code on a SUBSET (the transmission bottleneck)."""
+    rng = np.random.default_rng(seed); opt = torch.optim.Adam(new_spk.parameters(), lr=lr)
+    X = torch.from_numpy(np.stack(vecs)); new_spk.train()
+    for _ in range(steps):
+        idx = rng.integers(0, len(vecs), size=min(64, len(vecs)))
+        _, logits = new_spk(X[idx], tau=1.0, hard=True)              # (B, L, V) logits
+        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tmsg[idx].reshape(-1))
+        opt.zero_grad(); loss.backward(); opt.step()
+    return new_spk
+
+
+def iterated_bottleneck(steps_per_gen, gens=5, rich=True, L=8, V=16, d=128, seed=0, frac=0.5):
+    """TRUE iterated learning (Kirby transmission bottleneck): each generation a FRESH speaker imitates
+    the previous one on a SUBSET, then plays the game. Only compositional codes survive learning from a
+    subset + generalizing. Track topsim + held-out recall across generations on the rich world."""
+    kb, atoms, ents, tr, te, spk, lis = _setup(L, V, d, seed, rich=rich)
+    tr_vecs = [fact_vec(kb, atoms, e) for e in tr]
+    print(f"  world: {'RICH' if rich else 'toy'} | {len(ents)} entities (train {len(tr)}/held {len(te)})"
+          f" | bottleneck frac {frac} | {gens} generations x {steps_per_gen} steps", flush=True)
+    train(spk, lis, tr_vecs, steps=steps_per_gen, seed=seed)
+
+    def ev():
+        r = evaluate(spk, lis, kb, atoms, te)
+        return topsim(spk, kb, atoms, ents), r["recall"], r["faithfulness"], r["exact"]
+    ts, rc, fa, ex = ev()
+    print(f"  gen 0 : topsim {ts:.3f} | held-out recall {rc:.3f} | faith {fa:.3f} | exact {ex:.3f}")
+    rng = np.random.default_rng(seed + 1)
+    for g in range(1, gens + 1):
+        k = max(2, int(frac * len(tr_vecs)))
+        sub = [tr_vecs[i] for i in rng.choice(len(tr_vecs), k, replace=False)]
+        tmsg = teacher_messages(spk, sub)
+        new = Speaker(len(atoms), 1, L, V, d=d); new.enc[0] = nn.Linear(len(atoms), d)
+        imitate(new, sub, tmsg, steps=max(1, steps_per_gen // 2), seed=seed + g)   # bottleneck
+        lis = ReconListener(L, V, len(atoms), d=d)
+        train(new, lis, tr_vecs, steps=steps_per_gen, seed=seed + g)               # game fine-tune
+        spk = new
+        ts, rc, fa, ex = ev()
+        print(f"  gen {g} : topsim {ts:.3f} | held-out recall {rc:.3f} | faith {fa:.3f} | exact {ex:.3f}")
+    return dict(topsim=ts, recall=rc, faith=fa, exact=ex)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--selftest", action="store_true")
@@ -309,9 +357,15 @@ def main(argv=None):
     ap.add_argument("--reset-every", type=int, default=800)
     ap.add_argument("--rich", action="store_true",
                     help="use the richer grounded world (independent factors; large held-out)")
+    ap.add_argument("--il-bottleneck", action="store_true",
+                    help="TRUE iterated learning (Kirby transmission bottleneck) across generations")
+    ap.add_argument("--gens", type=int, default=5)
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return 0
+    if args.il_bottleneck:
+        iterated_bottleneck(args.steps, gens=args.gens, rich=args.rich, L=args.msg_len, V=args.vocab,
+                            d=args.d, seed=args.seed); return 0
     if args.iterated:
         iterated_compare(args.steps, seed=args.seed, L=args.msg_len, V=args.vocab, d=args.d,
                          reset_every=args.reset_every, rich=args.rich); return 0
