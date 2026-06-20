@@ -167,6 +167,34 @@ class TypeChecker:
     def equiv(self, a, b):
         return self.subtype(a, b) and self.subtype(b, a)
 
+    def member(self, ent, t):
+        """Is entity `ent` necessarily of type `t`? -> its category is a subtype of t."""
+        return self.subtype(self.lit(ent), t)
+
+    def disjoint(self, a, b):
+        return self.empty(self.bdd.and_(a, b))
+
+    def query(self, s):
+        """Answer a set-theoretic category question in LOTA S-expr. Forms:
+        (subtype T1 T2) (member entity T) (disjoint T1 T2) (empty T) -- where T is a type expr
+        over categories with and/or/not. Returns bool. This is the type system exposed to the agent
+        language: compound category questions (intersections/negations) the isa/prop proof path can't
+        natively express."""
+        toks = _tok(s)
+        assert toks[0] == "(" and toks[-1] == ")", "query must be an S-expr"
+        head = toks[1]
+        # the operands are themselves type S-exprs; re-serialize the slices and parse them
+        inner = _split_args(toks[2:-1])
+        if head == "subtype":
+            return self.subtype(self.parse(inner[0]), self.parse(inner[1]))
+        if head == "member":
+            return self.member(inner[0].strip(), self.parse(inner[1]))
+        if head == "disjoint":
+            return self.disjoint(self.parse(inner[0]), self.parse(inner[1]))
+        if head == "empty":
+            return self.empty(self.parse(inner[0]))
+        raise ValueError(f"unknown query head {head}")
+
     # parse a small type S-expr: (and t..) (or t..) (not t) <category>
     def parse(self, s):
         toks, pos = _tok(s), [0]
@@ -198,6 +226,23 @@ class TypeChecker:
 
 def _tok(s):
     return s.replace("(", " ( ").replace(")", " ) ").split()
+
+
+def _split_args(toks):
+    """Split a flat token list into top-level operand STRINGS (a bare atom, or a balanced (...) group)."""
+    out, i = [], 0
+    while i < len(toks):
+        if toks[i] == "(":
+            depth, j = 0, i
+            while j < len(toks):
+                depth += (toks[j] == "(") - (toks[j] == ")")
+                j += 1
+                if depth == 0:
+                    break
+            out.append(" ".join(toks[i:j])); i = j
+        else:
+            out.append(toks[i]); i += 1
+    return out
 
 
 # ===================================================================================================
@@ -247,6 +292,14 @@ def selftest():
     assert tc.subtype(tc.lit("dog"), t) and not tc.subtype(tc.lit("salmon"), t), \
         "dog : animal and not fish ; salmon is not"
 
+    # LOTA-surface set-theoretic QUERIES (compound categories the isa/prop proof path can't express)
+    assert tc.query("(subtype (and bird (not penguin)) animal)"), "non-penguin birds are animals"
+    assert tc.query("(member robin (and animal (not plant)))"), "robin : animal and not plant"
+    assert not tc.query("(member salmon (and animal (not fish)))"), "salmon is a fish -> not"
+    assert tc.query("(disjoint bird fish)"), "bird and fish disjoint"
+    assert tc.query("(empty (and bird mammal))"), "bird and mammal empty"
+    assert not tc.query("(empty (or bird mammal))"), "bird or mammal non-empty"
+
     print("bdd_types selftest OK")
 
 
@@ -270,6 +323,13 @@ def demo():
             print(f"  [{'YES' if e else 'no ':>3}]  {label} = empty")
         else:
             print(f"  [{'YES' if not e else 'no ':>3}]  {label} is non-empty")
+    print("\n  --- LOTA-surface set-theoretic queries (compound categories) ---")
+    for q in ["(subtype (and bird (not penguin)) animal)",
+              "(member robin (and animal (not plant)))",
+              "(member salmon (and animal (not fish)))",
+              "(disjoint bird fish)",
+              "(empty (and bird mammal))"]:
+        print(f"  [{'YES' if tc.query(q) else 'no ':>3}]  {q}")
 
 
 def cross_check():
