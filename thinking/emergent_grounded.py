@@ -305,17 +305,25 @@ class SlotSpeaker(nn.Module):
     """DISCOVERS the factorization (no predicate labels given): K latent slots; atoms COMPETE to be
     assigned to slots (softmax over slots, slot-attention style), so slots self-organize into factor
     groups. Each slot -> one symbol. The factor structure is learned, not handed in."""
-    def __init__(self, n_atoms, K, V, dim=64):
+    def __init__(self, n_atoms, K, V, dim=64, assign_tau=0.5):
         super().__init__()
         self.atom_emb = nn.Embedding(n_atoms, dim)
         self.slot_q = nn.Parameter(torch.randn(K, dim) * 0.2)
         self.head = nn.Linear(dim, V)
-        self.K, self.V, self.L = K, V, K
+        self.K, self.V, self.L, self.assign_tau = K, V, K, assign_tau
         self.register_buffer("aidx", torch.arange(n_atoms))
+
+    def assignment(self):
+        E = self.atom_emb(self.aidx)
+        return torch.softmax(torch.einsum("nd,kd->nk", E, self.slot_q) / self.assign_tau, dim=-1)
+
+    def assign_entropy(self):
+        a = self.assignment().clamp_min(1e-9)
+        return (-(a * a.log()).sum(-1)).mean()                   # mean per-atom entropy (push -> hard)
 
     def forward(self, x, tau=1.0, hard=True):
         E = self.atom_emb(self.aidx)                              # (n, dim)
-        assign = torch.softmax(torch.einsum("nd,kd->nk", E, self.slot_q), dim=-1)   # (n,K) competition
+        assign = self.assignment()                               # (n,K) sharpened competition (fixed)
         w = x.unsqueeze(-1) * assign.unsqueeze(0)                 # (B,n,K) weighted by presence
         slots = torch.einsum("bnk,nd->bkd", w, E)                # (B,K,dim)
         logits = self.head(slots)                                # (B,K,V)
@@ -338,20 +346,33 @@ class SlotListener(nn.Module):
         return self.dec(self.sym(msg)).sum(1)                    # (B, n_atoms) aggregate slot assertions
 
 
-def discover_run(steps, seed=0, K=6, V=16, dim=64, rich=True, verbose=True):
+def discover_run(steps, seed=0, K=16, V=16, dim=64, rich=True, verbose=True,
+                 assign_tau=1.0, ent_lam=0.0):
     """REALISM push: discover the factorization (slot attention) instead of being given predicates;
-    listener predicts the core; the BRAIN derives the rest. Held out on never-seen combinations."""
+    listener predicts the core; the BRAIN derives the rest. To CLOSE THE DISCOVERY GAP, sharpen the
+    (input-independent) atom->slot partition: low assignment temperature + an ENTROPY regularizer push
+    each atom into ONE slot -> clean factor groups approaching the given-structure ceiling."""
     kb = rich_kb(seed=seed) if rich else P.build_kb()
     full_atoms = fact_universe(kb)
     core, static = core_universe(kb)
     ents = getattr(kb, "_combo_ents", None) or entities_with_facts(kb, full_atoms)
     tr, te = split_entities(ents, 0.25, seed)
     fs = set(kb.facts)
-    spk = SlotSpeaker(len(core), K, V, dim)
+    spk = SlotSpeaker(len(core), K, V, dim, assign_tau=assign_tau)
     lis = SlotListener(K, V, len(core), dim)
     tr_vecs = [core_vec(fs, core, e) for e in tr]
-    train(spk, lis, tr_vecs, steps=steps, batch=64, seed=seed,
-          log=(max(1, steps // 6) if verbose else 0))
+    # custom loop: BCE reconstruction + entropy regularizer on the atom->slot partition
+    rng = np.random.default_rng(seed); torch.manual_seed(seed)
+    opt = torch.optim.Adam(list(spk.parameters()) + list(lis.parameters()), lr=1e-3)
+    spk.train(); lis.train()
+    for step in range(steps):
+        x = make_batch(rng, tr_vecs, 64)
+        msg, _ = spk(x, tau=1.5, hard=True)
+        loss = F.binary_cross_entropy_with_logits(lis(msg), x) + ent_lam * spk.assign_entropy()
+        opt.zero_grad(); loss.backward(); opt.step()
+        if verbose and step % max(1, steps // 6) == 0:
+            print(f"  step {step:5d}  loss {loss.item():.3f}  assign-entropy "
+                  f"{spk.assign_entropy().item():.3f}", flush=True)
 
     def ev(es):
         spk.eval(); lis.eval()
@@ -604,6 +625,9 @@ def main(argv=None):
                     help="segmented speaker over core factors + brain derives the rest by closure")
     ap.add_argument("--discover", action="store_true",
                     help="DISCOVER the factorization (slot attention) -- predicates NOT given")
+    ap.add_argument("--slots", type=int, default=16)
+    ap.add_argument("--assign-tau", type=float, default=1.0)
+    ap.add_argument("--ent-lam", type=float, default=0.0)
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return 0
@@ -613,7 +637,8 @@ def main(argv=None):
     if args.brain_close:
         brain_close_run(args.steps, seed=args.seed, V=args.vocab, d=args.d, rich=True); return 0
     if args.discover:
-        discover_run(args.steps, seed=args.seed, V=args.vocab, rich=True); return 0
+        discover_run(args.steps, seed=args.seed, K=args.slots, V=args.vocab, rich=True,
+                     assign_tau=args.assign_tau, ent_lam=args.ent_lam); return 0
     if args.il_bottleneck:
         iterated_bottleneck(args.steps, gens=args.gens, rich=args.rich, L=args.msg_len, V=args.vocab,
                             d=args.d, seed=args.seed); return 0
