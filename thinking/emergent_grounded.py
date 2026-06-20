@@ -301,6 +301,85 @@ def iterated_compare(steps, seed=0, L=6, V=12, d=128, reset_every=800, rich=Fals
     return out
 
 
+class SlotSpeaker(nn.Module):
+    """DISCOVERS the factorization (no predicate labels given): K latent slots; atoms COMPETE to be
+    assigned to slots (softmax over slots, slot-attention style), so slots self-organize into factor
+    groups. Each slot -> one symbol. The factor structure is learned, not handed in."""
+    def __init__(self, n_atoms, K, V, dim=64):
+        super().__init__()
+        self.atom_emb = nn.Embedding(n_atoms, dim)
+        self.slot_q = nn.Parameter(torch.randn(K, dim) * 0.2)
+        self.head = nn.Linear(dim, V)
+        self.K, self.V, self.L = K, V, K
+        self.register_buffer("aidx", torch.arange(n_atoms))
+
+    def forward(self, x, tau=1.0, hard=True):
+        E = self.atom_emb(self.aidx)                              # (n, dim)
+        assign = torch.softmax(torch.einsum("nd,kd->nk", E, self.slot_q), dim=-1)   # (n,K) competition
+        w = x.unsqueeze(-1) * assign.unsqueeze(0)                 # (B,n,K) weighted by presence
+        slots = torch.einsum("bnk,nd->bkd", w, E)                # (B,K,dim)
+        logits = self.head(slots)                                # (B,K,V)
+        if self.training:
+            msg = F.gumbel_softmax(logits, tau=tau, hard=hard, dim=-1)
+        else:
+            msg = F.one_hot(logits.argmax(-1), self.V).float()
+        return msg, None
+
+
+class SlotListener(nn.Module):
+    """Each slot-symbol asserts a subset of atoms; aggregate over slots (permutation-invariant). No
+    predicate grouping given -- mirrors the discovered factorization."""
+    def __init__(self, K, V, n_atoms, dim=64):
+        super().__init__()
+        self.sym = nn.Linear(V, dim, bias=False)
+        self.dec = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, n_atoms))
+
+    def forward(self, msg):
+        return self.dec(self.sym(msg)).sum(1)                    # (B, n_atoms) aggregate slot assertions
+
+
+def discover_run(steps, seed=0, K=6, V=16, dim=64, rich=True, verbose=True):
+    """REALISM push: discover the factorization (slot attention) instead of being given predicates;
+    listener predicts the core; the BRAIN derives the rest. Held out on never-seen combinations."""
+    kb = rich_kb(seed=seed) if rich else P.build_kb()
+    full_atoms = fact_universe(kb)
+    core, static = core_universe(kb)
+    ents = getattr(kb, "_combo_ents", None) or entities_with_facts(kb, full_atoms)
+    tr, te = split_entities(ents, 0.25, seed)
+    fs = set(kb.facts)
+    spk = SlotSpeaker(len(core), K, V, dim)
+    lis = SlotListener(K, V, len(core), dim)
+    tr_vecs = [core_vec(fs, core, e) for e in tr]
+    train(spk, lis, tr_vecs, steps=steps, batch=64, seed=seed,
+          log=(max(1, steps // 6) if verbose else 0))
+
+    def ev(es):
+        spk.eval(); lis.eval()
+        x = torch.from_numpy(np.stack([core_vec(fs, core, e) for e in es]))
+        with torch.no_grad():
+            pred = (torch.sigmoid(lis(spk(x)[0])) > 0.5).numpy()
+        f_ok = f_tot = r_ok = r_tot = exact = 0
+        for r, e in enumerate(es):
+            base_pred = [(p, (e, o)) for k, (p, o) in enumerate(core) if pred[r, k]]
+            got = {(p, a[1]) for (p, a) in kb.dl.closure(static + base_pred)[0]
+                   if len(a) == 2 and a[0] == e}
+            true = {(p, o) for (p, o) in full_atoms if (p, (e, o)) in kb.known}
+            for f in got:
+                f_tot += 1; f_ok += int((f[0], (e, f[1])) in kb.known)
+            r_ok += len(got & true); r_tot += len(true); exact += int(got == true)
+        n = max(1, len(es))
+        return dict(exact=exact / n, faith=f_ok / max(1, f_tot), recall=r_ok / max(1, r_tot))
+    rtr, rte = ev(tr), ev(te)
+    if verbose:
+        print(f"\n== DISCOVERED factorization (slot attention) + brain closure ==")
+        print(f"  world: RICH | core {len(core)} | full {len(full_atoms)} | train {len(tr)}/held {len(te)}"
+              f" | {K} slots (factors NOT given)")
+        print(f"  TRAIN    : full-exact {rtr['exact']:.3f} | faith {rtr['faith']:.3f} | recall {rtr['recall']:.3f}")
+        print(f"  HELD-OUT : full-exact {rte['exact']:.3f} | faith {rte['faith']:.3f} | recall "
+              f"{rte['recall']:.3f}   (never-seen combos; factorization self-discovered)")
+    return dict(train=rtr, heldout=rte)
+
+
 def build_groups(atoms):
     """Ordered list of core-atom index groups, one per typed predicate (the factor structure)."""
     groups = {}
@@ -523,6 +602,8 @@ def main(argv=None):
                     help="compare holistic vs segmented (disentangled) speaker architecture")
     ap.add_argument("--brain-close", action="store_true",
                     help="segmented speaker over core factors + brain derives the rest by closure")
+    ap.add_argument("--discover", action="store_true",
+                    help="DISCOVER the factorization (slot attention) -- predicates NOT given")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return 0
@@ -531,6 +612,8 @@ def main(argv=None):
                      L_holistic=args.msg_len); return 0
     if args.brain_close:
         brain_close_run(args.steps, seed=args.seed, V=args.vocab, d=args.d, rich=True); return 0
+    if args.discover:
+        discover_run(args.steps, seed=args.seed, V=args.vocab, rich=True); return 0
     if args.il_bottleneck:
         iterated_bottleneck(args.steps, gens=args.gens, rich=args.rich, L=args.msg_len, V=args.vocab,
                             d=args.d, seed=args.seed); return 0
