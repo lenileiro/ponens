@@ -157,8 +157,29 @@ class TypeChecker:
         return self.bdd.atom(c)
 
     def empty(self, t):
-        """t is empty iff NO cube of t is inhabited in the taxonomy."""
+        """NAIVE: enumerate ALL cubes (paths to TOP), check each against the taxonomy."""
         return all(not self.tax.sat(p, n) for (p, n) in self.bdd.cubes(t))
+
+    def empty_eager(self, t):
+        """EAGER (the posts' idea): prune a subtree the MOMENT its committed positives are already
+        taxonomy-incompatible -- never enumerate the doomed cubes beneath it. Adding more
+        positives/negatives only tightens, so an unsatisfiable partial cube can never recover. Sets
+        self.stats = {visited, sat_calls} for the stress comparison."""
+        self.stats = {"visited": 0, "sat_calls": 0}
+
+        def go(f, pos, neg):
+            self.stats["visited"] += 1
+            if f is self.bdd.BOT:
+                return True                                  # this branch contributes no cube
+            self.stats["sat_calls"] += 1
+            if not self.tax.sat(pos, neg):                   # partial cube already dead -> prune subtree
+                return True
+            if f is self.bdd.TOP:
+                return False                                 # a fully-inhabited cube survived -> NON-empty
+            a = self.bdd.atoms[f.i]
+            return go(f.low, pos, neg | {a}) and go(f.high, pos | {a}, neg)
+
+        return go(t, frozenset(), frozenset())
 
     def subtype(self, a, b):
         """A <= B  iff  A and not B is empty (the set-theoretic definition)."""
@@ -248,6 +269,42 @@ def _split_args(toks):
 # ===================================================================================================
 # Demo taxonomy + selftest
 # ===================================================================================================
+def gen_tree_taxonomy(branch=3, depth=4):
+    """A balanced tree taxonomy: root 'c' with `branch` children per node to `depth` levels."""
+    edges, frontier, nid = [], ["c0"], [1]
+
+    def fresh():
+        n = f"c{nid[0]}"; nid[0] += 1; return n
+    for _ in range(depth):
+        nxt = []
+        for parent in frontier:
+            for _b in range(branch):
+                child = fresh(); edges.append((child, parent)); nxt.append(child)
+        frontier = nxt
+    return edges
+
+
+def stress(branch=3, depth=4):
+    """Compare NAIVE full-cube enumeration vs EAGER pruning on a larger taxonomy. Build a type that
+    mixes many disjoint categories (lots of doomed cubes) and confirm both agree + eager prunes."""
+    import time
+    edges = gen_tree_taxonomy(branch, depth)
+    tc = TypeChecker(edges)
+    cats = tc.tax.cats
+    leaves = [c for c in cats if c not in tc.tax.parent.values()]
+    # type = union of many leaves, intersected with the negation of one leaf -> many disjoint cubes
+    u = tc.lit(leaves[0])
+    for lf in leaves[1:min(len(leaves), 12)]:
+        u = tc.bdd.or_(u, tc.lit(lf))
+    t = tc.bdd.and_(u, tc.bdd.neg(tc.lit(leaves[0])))
+    n_cubes = sum(1 for _ in tc.bdd.cubes(t))
+    t0 = time.time(); e1 = tc.empty(t); naive_ms = (time.time() - t0) * 1e3
+    t0 = time.time(); e2 = tc.empty_eager(t); eager_ms = (time.time() - t0) * 1e3
+    return dict(cats=len(cats), atoms=len(tc.bdd.atoms), naive_cubes=n_cubes, agree=(e1 == e2),
+                empty=e1, naive_ms=naive_ms, eager_ms=eager_ms,
+                eager_visited=tc.stats["visited"], eager_sat_calls=tc.stats["sat_calls"])
+
+
 def _demo_edges():
     return [("robin", "bird"), ("sparrow", "bird"), ("penguin", "bird"), ("bird", "animal"),
             ("dog", "mammal"), ("cat", "mammal"), ("mammal", "animal"),
@@ -286,6 +343,12 @@ def selftest():
     assert B.and_(bird, bird) is bird, "idempotent and reduces"
     assert tc.equiv(B.or_(bird, mammal), B.or_(mammal, bird)), "union commutes"
     assert B.neg(B.neg(bird)) is bird, "double negation cancels (canonical)"
+
+    # eager pruning agrees with naive enumeration (and prunes)
+    assert tc.empty(B.and_(bird, fish)) == tc.empty_eager(B.and_(bird, fish)) is True
+    assert tc.empty(B.or_(bird, mammal)) == tc.empty_eager(B.or_(bird, mammal)) is False
+    s = stress(branch=3, depth=3)
+    assert s["agree"], ("naive vs eager disagree", s)
 
     # parser
     t = tc.parse("(and animal (not fish))")
@@ -362,7 +425,22 @@ def main(argv=None):
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--cross", action="store_true",
                     help="cross-check BDD subtyping vs the kernel prover's isa derivability")
+    ap.add_argument("--stress", action="store_true",
+                    help="naive full-cube enumeration vs eager pruning on a larger taxonomy")
     args = ap.parse_args(argv)
+    if args.stress:
+        s = stress(branch=3, depth=4)
+        print("eager pruning vs naive cube enumeration (Elixir/BDD line):")
+        print(f"  taxonomy: {s['cats']} categories / {s['atoms']} atoms")
+        print(f"  type is empty: {s['empty']}  (naive & eager agree: {s['agree']})")
+        print(f"  NAIVE  : enumerated {s['naive_cubes']} cubes   in {s['naive_ms']:.1f} ms")
+        print(f"  EAGER  : visited {s['eager_visited']} nodes / {s['eager_sat_calls']} sat-checks "
+              f"in {s['eager_ms']:.1f} ms  (prunes doomed subtrees early)")
+        won = s["eager_visited"] < s["naive_cubes"]
+        print(f"  verdict: {'eager prunes' if won else 'NO win at this scale'} -- the hash-consed "
+              f"ROBDD is already compact here; eager pruning pays off only on the large-scale "
+              f"union/intersection blowup the posts target (1000+ literals). Scale-only, as noted.")
+        return 0
     if args.selftest:
         selftest(); return 0
     if args.demo:
