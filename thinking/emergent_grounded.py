@@ -94,16 +94,24 @@ def make_batch(rng, vecs, batch):
     return torch.from_numpy(np.stack([vecs[i] for i in idx]))
 
 
-def train(spk, lis, vecs, steps, batch=64, lr=1e-3, seed=0, tau=1.5, log=0):
+def train(spk, lis, vecs, steps, batch=64, lr=1e-3, seed=0, tau=1.5, log=0,
+          reset_every=0, make_lis=None):
+    """Joint training. ITERATED LEARNING (ease-of-teaching): if reset_every>0 and make_lis is given,
+    re-initialize the LISTENER every reset_every steps -> the speaker must keep its code easy to teach
+    a fresh learner, a transmission bottleneck that favors COMPOSITIONAL (compressible) codes."""
     rng = np.random.default_rng(seed); torch.manual_seed(seed)
-    opt = torch.optim.Adam(list(spk.parameters()) + list(lis.parameters()), lr=lr)
+    opt_s = torch.optim.Adam(spk.parameters(), lr=lr)
+    opt_l = torch.optim.Adam(lis.parameters(), lr=lr)
     spk.train(); lis.train()
     for step in range(steps):
+        if reset_every and make_lis and step > 0 and step % reset_every == 0:
+            lis = make_lis(); lis.train()                       # fresh listener (new generation)
+            opt_l = torch.optim.Adam(lis.parameters(), lr=lr)
         x = make_batch(rng, vecs, batch)
         msg, _ = spk(x, tau=tau, hard=True)
         logits = lis(msg)
         loss = F.binary_cross_entropy_with_logits(logits, x)
-        opt.zero_grad(); loss.backward(); opt.step()
+        opt_s.zero_grad(); opt_l.zero_grad(); loss.backward(); opt_s.step(); opt_l.step()
         if log and (step % log == 0 or step == steps - 1):
             acc = ((logits > 0).float() == x).float().mean().item()
             print(f"  step {step:5d}  loss {loss.item():.3f}  bit-acc {acc:.3f}", flush=True)
@@ -205,6 +213,51 @@ def run(steps, seed=0, L=6, V=12, d=128, verbose=True):
     return dict(train=rtr, heldout=rte, topsim=ts)
 
 
+def _consolidate(spk, kb, atoms, tr, L, V, d, steps=2000, seed=0):
+    """Freeze the (now-compositional) speaker; train a FRESH listener to convergence on its code, so
+    held-out reconstruction reflects the code's structure, not an undertrained decoder."""
+    for p in spk.parameters():
+        p.requires_grad_(False)
+    spk.eval()
+    lis = ReconListener(L, V, len(atoms), d=d); lis.train()
+    opt = torch.optim.Adam(lis.parameters(), lr=1e-3)
+    rng = np.random.default_rng(seed + 7)
+    vecs = [fact_vec(kb, atoms, e) for e in tr]
+    for _ in range(steps):
+        x = make_batch(rng, vecs, 64)
+        with torch.no_grad():
+            msg, _ = spk(x, tau=1.0, hard=True)
+        loss = F.binary_cross_entropy_with_logits(lis(msg), x)
+        opt.zero_grad(); loss.backward(); opt.step()
+    return lis
+
+
+def iterated_compare(steps, seed=0, L=6, V=12, d=128, reset_every=800):
+    """Baseline (no reset) vs ITERATED LEARNING (periodic listener reset), same total steps. The
+    iterated arm then CONSOLIDATES (fresh listener trained to convergence on the compositional code)
+    so held-out reconstruction reflects the code, not an undertrained decoder."""
+    out = {}
+    for tag, rev in [("baseline", 0), ("iterated", reset_every)]:
+        kb, atoms, ents, tr, te, spk, lis = _setup(L, V, d, seed)
+        mk = (lambda: ReconListener(L, V, len(atoms), d=d)) if rev else None
+        train(spk, lis, [fact_vec(kb, atoms, e) for e in tr], steps=steps, batch=64, seed=seed,
+              reset_every=rev, make_lis=mk)
+        if rev:                                              # consolidate the iterated code's decoder
+            lis = _consolidate(spk, kb, atoms, tr, L, V, d, steps=2000, seed=seed)
+        rte = evaluate(spk, lis, kb, atoms, te)
+        out[tag] = dict(heldout_exact=rte["exact"], heldout_faith=rte["faithfulness"],
+                        heldout_recall=rte["recall"], topsim=topsim(spk, kb, atoms, ents))
+    print("ITERATED LEARNING (ease-of-teaching: reset listener) vs baseline:")
+    for tag in ("baseline", "iterated"):
+        o = out[tag]
+        print(f"  {tag:>9}: held-out exact {o['heldout_exact']:.3f} | faith {o['heldout_faith']:.3f} "
+              f"| recall {o['heldout_recall']:.3f} | topsim {o['topsim']:.3f}")
+    d_ts = out["iterated"]["topsim"] - out["baseline"]["topsim"]
+    d_ex = out["iterated"]["heldout_exact"] - out["baseline"]["heldout_exact"]
+    print(f"  delta (iterated - baseline): topsim {d_ts:+.3f}, held-out exact {d_ex:+.3f}")
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--selftest", action="store_true")
@@ -213,9 +266,15 @@ def main(argv=None):
     ap.add_argument("--msg-len", type=int, default=6)
     ap.add_argument("--vocab", type=int, default=12)
     ap.add_argument("--d", type=int, default=128)
+    ap.add_argument("--iterated", action="store_true",
+                    help="compare iterated learning (listener resets) vs baseline")
+    ap.add_argument("--reset-every", type=int, default=800)
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return 0
+    if args.iterated:
+        iterated_compare(args.steps, seed=args.seed, L=args.msg_len, V=args.vocab, d=args.d,
+                         reset_every=args.reset_every); return 0
     run(args.steps, seed=args.seed, L=args.msg_len, V=args.vocab, d=args.d)
     return 0
 
