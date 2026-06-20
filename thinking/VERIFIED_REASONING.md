@@ -19,6 +19,39 @@ the lead** (agent self-reports were systematically inflated and are not trusted 
   verified dead ends.
 - This is **not C2**. It is a *verified mechanism* that generalizes and scales on controlled tasks.
 
+> **2026-06-20 — this line evolved into a full verified-reasoning + typed-language stack. See
+> `thinking/STACK.md` for the complete picture; the new techniques are summarized next.**
+
+## New techniques (2026-06-20): from a validated mechanism to a verified stack
+
+The datalog mechanism below had one weakness — its closed-world gate is a **hollow verifier** ("true"
+= "not in the set"), which bit us repeatedly (e.g. a semantic-equivalence metric that didn't
+discriminate). We borrowed the *designs* of two mature systems and rebuilt the foundation, in-house:
+
+- **A sound proof KERNEL** (`kernel.py`, Lean's design): a minimal dependent type-theory kernel —
+  proofs are TERMS, checking = type-checking (Curry-Howard), predicative universes (sound) — plus a
+  logic prelude (False/And/Or/Eq/Ex as sound axioms). The kernel is the **only trusted code**;
+  datalog/the model are **untrusted proposers** re-checked by it. This *structurally* eliminates the
+  hollow-verifier bug: a claim is true only with a proof term the kernel accepts.
+- **An agent language** (`lang.py`, "LOTA"): small, expressive, *executable* S-expr (events/actions/
+  quantifiers/modality/attitudes) desugaring to a first-order core; elaborated onto the kernel
+  (`lota_kernel.py`) so datalog SEARCHES and the kernel CHECKS the proof term.
+- **Set-theoretic types** (`bdd_types.py`, Elixir's design): ROBDD (hash-consed) over categories;
+  subtyping via emptiness; cross-checked **380/380** vs the kernel prover. The two type systems
+  **compose**: disjointness (`bird⊥fish`) → kernel exclusion axioms → real **negation disproofs**
+  (replacing negation-as-failure). Modality: `must`=provable, `can`=not-refutable.
+- **Neuro-symbolic search** (`prover.py`): kernel-guided proof search (sound 0.000 on false,
+  complete-for-KB 1.000) + a learned branch-ranker → **564× fewer** search nodes, soundness unchanged.
+- **End-to-end** (`pipeline.py`): English question → learned NL→LOTA parse → search → kernel check →
+  answer + proof. Held-out **parse 1.000 / end-to-end 1.000** (paraphrase-robust, closed-vocab).
+- **An honest C2 yardstick** (`c2_eval.py`, `C2_ROADMAP.md`): first real-English contamination-clean
+  reading eval.
+
+**Open-vocab verdict (the wall to C2), now empirical:** the compositional mechanism generalizes by
+recombining SEEN words (1.000), but NOVEL words fail. GPU from-scratch probe (H100, 20k steps): word
+0.000, char 0.013 (valid structure, wrong word). **From-scratch open-vocab does not generalize even
+with char-level + scale → C2 needs a pretrained BACKBONE.** Every from-scratch avenue is closed.
+
 ## The mechanism (restored core)
 
 ```
@@ -82,7 +115,11 @@ this now-validated mechanism.
 Research artifacts (verified negative/unmeasured, uncommitted): `reason_lang_robust.py` (self-consistency),
 `reason_lang_inv.py` (failed invariance), `reason_lang_canon.py` (canonicalization, unmeasured).
 
-## Next (GPU)
-Train the verified mechanism (`reason_lang_neg`-style: engine proof-supervision + negation-as-failure
-+ pointer head) at **real capacity** (bigger model, more data diversity, more steps, multi-seed) to
-close multi-hop reliability + meaning-generalization. See `runpod/` launch prep.
+## Next (GPU) — superseded by the 2026-06-20 findings
+The original plan (scale `reason_lang_neg` to close multi-hop + meaning-generalization) was overtaken:
+GPU runs showed (a) scale closes multi-hop reliability but (b) **open-vocab / real-English meaning
+does NOT generalize from scratch even with char-level + scale** (word 0.000, char 0.013) — see the
+new-techniques section above and `thinking/STACK.md` §7. The verified mechanism is now a sound kernel +
+typed language + neuro-symbolic search. The **one remaining route to C2 is a pretrained backbone**
+(path A) as the NL front-end over this verified core; everything from-scratch is empirically closed.
+Launchers: `runpod/launch_c2.py` (C2 scaling probe), `runpod/launch_bridge.py` (open-vocab probe).

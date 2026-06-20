@@ -5,6 +5,13 @@ feature views without a synthetic English bank. The current package centers on d
 reading, latent concept discovery, memory-gap training, image generation/evaluation, and a generic
 multimodal bridge.
 
+> **Verified-reasoning + typed-language stack (2026-06-20):** a sound proof kernel (Lean's design) +
+> set-theoretic category types (Elixir's design) + the LOTA agent language + neuro-symbolic
+> proof search, wired end-to-end as *English question → kernel-verified answer*. See
+> **[`thinking/STACK.md`](thinking/STACK.md)** for the full map, **[`thinking/VERIFIED_REASONING.md`](thinking/VERIFIED_REASONING.md)**
+> for results, and **[`thinking/C2_ROADMAP.md`](thinking/C2_ROADMAP.md)** for the honest C2 gap
+> (open-vocab needs a pretrained backbone — proven empirically).
+
 ## Why
 
 The current bet is that language mastery should come from reading, latent structure, replay,
