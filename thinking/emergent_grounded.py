@@ -296,6 +296,129 @@ def iterated_compare(steps, seed=0, L=6, V=12, d=128, reset_every=800, rich=Fals
     return out
 
 
+class SegmentedSpeaker(nn.Module):
+    """Structured speaker: one message SEGMENT per typed predicate (isa/color/size/...), computed ONLY
+    from that predicate's facts -> positionally DISENTANGLED by construction, so each factor's code is
+    stable across the others and novel combinations COMPOSE. The agent still discovers the per-factor
+    code; we only give the inductive bias that the world is factored into typed relations."""
+    def __init__(self, atoms, V, d=128, syms_per_group=1):
+        super().__init__()
+        groups = {}
+        for i, (pred, _obj) in enumerate(atoms):
+            groups.setdefault(pred, []).append(i)
+        self.group_idx = [torch.tensor(v) for v in groups.values()]
+        self.V = V
+        self.L = len(self.group_idx) * syms_per_group
+        self.spg = syms_per_group
+        self.heads = nn.ModuleList(
+            nn.Sequential(nn.Linear(len(idx), d), nn.ReLU(), nn.Linear(d, syms_per_group * V))
+            for idx in self.group_idx)
+
+    def forward(self, x, tau=1.0, hard=True):
+        segs = []
+        for idx, head in zip(self.group_idx, self.heads):
+            lg = head(x[:, idx]).view(-1, self.spg, self.V)
+            if self.training:
+                segs.append(F.gumbel_softmax(lg, tau=tau, hard=hard, dim=-1))
+            else:
+                segs.append(F.one_hot(lg.argmax(-1), self.V).float())
+        msg = torch.cat(segs, dim=1)                          # (B, L, V)
+        return msg, None
+
+
+def arch_compare(steps, seed=0, V=16, d=128, rich=True, L_holistic=8):
+    """Holistic speaker (shared bottleneck) vs SEGMENTED speaker (per-predicate, disentangled) on the
+    rich world. Does structured architecture crack compositional generalization (the boundary)?"""
+    out = {}
+    kb, atoms, ents, tr, te, _, _ = _setup(L_holistic, V, d, seed, rich=rich)
+    tr_vecs = [fact_vec(kb, atoms, e) for e in tr]
+    print(f"  world: {'RICH' if rich else 'toy'} | {len(ents)} entities (train {len(tr)}/held {len(te)})"
+          f" | fact-universe {len(atoms)}", flush=True)
+    builders = {
+        "holistic": lambda: (lambda s: (s, ReconListener(L_holistic, V, len(atoms), d)))(
+            _mk_holistic(atoms, L_holistic, V, d)),
+        "segmented": lambda: (lambda s: (s, ReconListener(s.L, V, len(atoms), d)))(
+            SegmentedSpeaker(atoms, V, d)),
+    }
+    for tag, build in builders.items():
+        spk, lis = build()
+        train(spk, lis, tr_vecs, steps=steps, batch=64, seed=seed)
+        r = evaluate(spk, lis, kb, atoms, te)
+        out[tag] = dict(exact=r["exact"], faith=r["faithfulness"], recall=r["recall"],
+                        topsim=topsim(spk, kb, atoms, ents), L=spk.L)
+        print(f"  {tag:>9} (L={spk.L}): held-out exact {r['exact']:.3f} | faith {r['faithfulness']:.3f}"
+              f" | recall {r['recall']:.3f} | topsim {out[tag]['topsim']:.3f}", flush=True)
+    return out
+
+
+def _mk_holistic(atoms, L, V, d):
+    s = Speaker(len(atoms), 1, L, V, d=d)
+    s.enc[0] = nn.Linear(len(atoms), d)
+    return s
+
+
+def core_universe(kb):
+    """The IRREDUCIBLE base facts about the combo entities (directly asserted: leaf isa + attributes),
+    NOT the derived isa-chain / inherited props -- those the BRAIN derives by closure."""
+    ce = set(getattr(kb, "_combo_ents", []))
+    base = set(kb.facts)
+    core = sorted({(p, args[1]) for (p, args) in base if len(args) == 2 and args[0] in ce})
+    static = [f for f in kb.facts if not (len(f[1]) == 2 and f[1][0] in ce)]   # taxonomy + cat-props
+    return core, static
+
+
+def core_vec(kb_facts, core, e):
+    return np.array([1.0 if (p, (e, o)) in kb_facts else 0.0 for (p, o) in core], dtype=np.float32)
+
+
+def brain_close_run(steps, seed=0, V=16, d=128, rich=True, verbose=True):
+    """Segmented speaker over the IRREDUCIBLE factors; listener predicts those; the BRAIN derives the
+    rest by closure. Eval faithfulness/recall/exact on the FULL fact-set -- the derived part is exact
+    when the core is right. This leverages the provable brain to crack the 'exact' boundary."""
+    kb = rich_kb(seed=seed) if rich else P.build_kb()
+    full_atoms = fact_universe(kb)
+    core, static = core_universe(kb)
+    ents = getattr(kb, "_combo_ents", None) or entities_with_facts(kb, full_atoms)
+    tr, te = split_entities(ents, 0.25, seed)
+    facts_set = set(kb.facts)
+    spk = SegmentedSpeaker(core, V, d)
+    lis = ReconListener(spk.L, V, len(core), d)
+    tr_vecs = [core_vec(facts_set, core, e) for e in tr]
+    train(spk, lis, tr_vecs, steps=steps, batch=64, seed=seed,
+          log=(max(1, steps // 6) if verbose else 0))
+
+    def ev(es):
+        spk.eval(); lis.eval()
+        x = torch.from_numpy(np.stack([core_vec(facts_set, core, e) for e in es]))
+        with torch.no_grad():
+            pred = (torch.sigmoid(lis(spk(x)[0])) > 0.5).numpy()
+        f_ok = f_tot = r_ok = r_tot = exact = core_exact = 0
+        for r, e in enumerate(es):
+            base_pred = [(p, (e, o)) for k, (p, o) in enumerate(core) if pred[r, k]]
+            closed, _ = kb.dl.closure(static + base_pred)             # BRAIN derives the rest
+            got = {(p, a[1]) for (p, a) in closed if len(a) == 2 and a[0] == e}
+            true = {(p, o) for (p, o) in full_atoms if (p, (e, o)) in kb.known}
+            for f in got:
+                f_tot += 1; f_ok += int((f[0], (e, f[1])) in kb.known)
+            r_ok += len(got & true); r_tot += len(true); exact += int(got == true)
+            core_exact += int(set(np.where(pred[r])[0]) ==
+                              {k for k, (p, o) in enumerate(core) if (p, (e, o)) in facts_set})
+        n = max(1, len(es))
+        return dict(exact=exact / n, faith=f_ok / max(1, f_tot), recall=r_ok / max(1, r_tot),
+                    core_exact=core_exact / n)
+    rtr, rte = ev(tr), ev(te)
+    if verbose:
+        print(f"\n== SEGMENTED speaker + BRAIN CLOSURE (message conveys core factors; brain derives rest) ==")
+        print(f"  world: RICH | core factors {len(core)} | full atoms {len(full_atoms)} | "
+              f"train {len(tr)}/held {len(te)} | msg L={spk.L}")
+        print(f"  TRAIN    : full-exact {rtr['exact']:.3f} | faith {rtr['faith']:.3f} | recall "
+              f"{rtr['recall']:.3f} | core-exact {rtr['core_exact']:.3f}")
+        print(f"  HELD-OUT : full-exact {rte['exact']:.3f} | faith {rte['faith']:.3f} | recall "
+              f"{rte['recall']:.3f} | core-exact {rte['core_exact']:.3f}   (never-seen combos)")
+        print("  the DERIVED facts are exact when the core is right -- the brain computes them, proved.")
+    return dict(train=rtr, heldout=rte)
+
+
 @torch.no_grad()
 def teacher_messages(spk, vecs):
     spk.eval()
@@ -360,9 +483,18 @@ def main(argv=None):
     ap.add_argument("--il-bottleneck", action="store_true",
                     help="TRUE iterated learning (Kirby transmission bottleneck) across generations")
     ap.add_argument("--gens", type=int, default=5)
+    ap.add_argument("--arch", action="store_true",
+                    help="compare holistic vs segmented (disentangled) speaker architecture")
+    ap.add_argument("--brain-close", action="store_true",
+                    help="segmented speaker over core factors + brain derives the rest by closure")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return 0
+    if args.arch:
+        arch_compare(args.steps, seed=args.seed, V=args.vocab, d=args.d, rich=args.rich,
+                     L_holistic=args.msg_len); return 0
+    if args.brain_close:
+        brain_close_run(args.steps, seed=args.seed, V=args.vocab, d=args.d, rich=True); return 0
     if args.il_bottleneck:
         iterated_bottleneck(args.steps, gens=args.gens, rich=args.rich, L=args.msg_len, V=args.vocab,
                             d=args.d, seed=args.seed); return 0
