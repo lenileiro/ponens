@@ -45,9 +45,13 @@ def fact_universe(kb):
 
 
 def wordnet_kb(seed=0, per_cat=25):
-    """REAL grounded data: a KB from WordNet's actual hypernym (is-a) chains over real concepts. Deep,
-    irregular, messy -- but still brain-closable (is-a transitivity), so the brain still derives +
-    verifies. Meanings = real leaf concepts; facts = their real is-a ancestor sets."""
+    """REAL grounded data across MANY WordNet relational DIMENSIONS (not just is-a): a concept's meaning
+    spans is-a (hypernym), has-part (meronym), made-of (substance) and member-of (holonym). The brain
+    holds the RULES over these dimensions -- is-a transitivity PLUS has-part/made-of/member-of being
+    INHERITED down the is-a hierarchy (a bird has a wing => a robin has a wing) -- so a concept's full
+    multi-relation fact-set is DERIVED and kernel/closure-VERIFIED from a small core. Using all the
+    dimensions makes the core MULTI-HOT (not the one-hot is-a chain that collapsed precision) and gives
+    the agent real WordNet structure to learn the rules over."""
     from nltk.corpus import wordnet as wn
     seeds = ["animal.n.01", "plant.n.02", "food.n.01", "vehicle.n.01", "tool.n.01",
              "furniture.n.01", "clothing.n.01", "bird.n.01"]
@@ -68,18 +72,30 @@ def wordnet_kb(seed=0, per_cat=25):
         desc = [s for s in descendants(wn.synset(sd)) if not s.hyponyms()]
         rng.shuffle(desc)
         leaves += desc[:per_cat]
-    isa, ents = set(), set()
-    combo = []
+    # one extractor per relational DIMENSION (each maps a synset -> related synsets along that axis)
+    relmap = {"has_part": lambda s: s.part_meronyms(),
+              "made_of": lambda s: s.substance_meronyms(),
+              "member_of": lambda s: s.member_holonyms()}
+    nodes, isa = set(), set()
     for lf in leaves:
-        ns = [s.name() for s in lf.hypernym_paths()[0]]      # root..leaf (full synset names)
-        for parent, child in zip(ns, ns[1:]):
-            isa.add((child, parent)); ents.add(child); ents.add(parent)
-        combo.append(ns[-1])
+        path = lf.hypernym_paths()[0]                         # root..leaf
+        nodes.update(path)
+        for parent, child in zip(path, path[1:]):
+            isa.add((child.name(), parent.name()))
     facts = [("isa", e) for e in isa]
+    # attach each relation's edges where they HANG (ancestor or leaf) -> the brain inherits them down
+    for pred, fn in relmap.items():
+        for s in nodes:
+            for o in fn(s):
+                facts.append((pred, (s.name(), o.name())))
+    ents = {x for (_p, pair) in facts for x in pair}
+    preds = {"isa": 2, "has_part": 2, "made_of": 2, "member_of": 2}
     rules = [(("isa", ("?x", "?z")), [("isa", ("?x", "?y")), ("isa", ("?y", "?z"))])]
+    for pred in relmap:                                       # cross-dimension rule: inherit down is-a
+        rules.append(((pred, ("?x", "?p")), [("isa", ("?x", "?y")), (pred, ("?y", "?p"))]))
     import thinking.lota_kernel as LK
-    kb = LK.KB(sorted(ents), {"isa": 2}, facts, rules)
-    kb._combo_ents = sorted(set(combo))
+    kb = LK.KB(sorted(ents), preds, facts, rules)
+    kb._combo_ents = sorted({lf.name() for lf in leaves})
     return kb
 
 
@@ -449,6 +465,66 @@ def build_groups(atoms):
     return [torch.tensor(v) for v in groups.values()]
 
 
+def mandatory_groups(core, groups, ents, facts_set):
+    """A relation-dimension is MANDATORY-FUNCTIONAL if every entity has EXACTLY ONE direct value in it
+    (e.g. is-a: exactly one direct parent). Such a dimension must be decoded by ARGMAX (pick the single
+    value), not by independent thresholding -- thresholding a near-one-hot target over-predicts, and the
+    brain's closure then amplifies each false value into a whole false chain. Returns a bool per group."""
+    out = []
+    for g in groups:
+        gi = g.tolist()
+        counts = [sum(1 for k in gi if (core[k][0], (e, core[k][1])) in facts_set) for e in ents]
+        out.append(bool(counts) and min(counts) == 1 and max(counts) == 1)
+    return out
+
+
+def structured_decode(prob, groups, mand):
+    """Decode per relation-dimension: mandatory-functional groups by argmax (exactly one), the rest by
+    threshold. prob: (B, n_core). Returns a boolean prediction matrix matched to the factor structure."""
+    pred = np.zeros(prob.shape, dtype=bool)
+    rows = np.arange(prob.shape[0])
+    for g, is_mand in zip(groups, mand):
+        gi = g.numpy()
+        if is_mand:
+            pred[rows, gi[prob[:, gi].argmax(1)]] = True
+        else:
+            pred[:, gi] = prob[:, gi] > 0.5
+    return pred
+
+
+def index_closure(closed_static):
+    """Index the once-closed taxonomy for O(ancestors) per-entity derivation. Returns (anc_of, rel_of):
+    anc_of[x] = all z with isa(x,z); rel_of[pred][x] = all o with pred(x,o) (pred != isa). Because the
+    taxonomy is already a fixpoint, an entity's full fact-set composes from one is-a hop -- no re-running
+    the datalog loop per entity (which re-scans the whole graph). Equivalent to closure, far faster."""
+    anc_of, rel_of = {}, {}
+    for (p, a) in closed_static:
+        if len(a) != 2:
+            continue
+        x, o = a
+        if p == "isa":
+            anc_of.setdefault(x, set()).add(o)
+        else:
+            rel_of.setdefault(p, {}).setdefault(x, set()).add(o)
+    return anc_of, rel_of
+
+
+def derive_entity(e, base_pred, anc_of, rel_of):
+    """The BRAIN's rules applied to a leaf's predicted core: is-a transitivity + each relation inherited
+    down the is-a chain. base_pred = the predicted core atoms (pred,(e,o)). Returns the derived full
+    fact-set {(pred, o)} for e -- identical to the datalog closure, computed by composition."""
+    parents = {o for (p, (_, o)) in base_pred if p == "isa"}
+    anc = set(parents)
+    for par in parents:
+        anc |= anc_of.get(par, set())                        # isa transitivity (parent already closed)
+    got = {("isa", a) for a in anc}
+    got |= {(p, o) for (p, (_, o)) in base_pred if p != "isa"}   # the leaf's DIRECT relations
+    for pred, idx in rel_of.items():                         # inherit each relation down the is-a chain
+        for y in anc:
+            got |= {(pred, o) for o in idx.get(y, ())}
+    return got
+
+
 class SegmentedListener(nn.Module):
     """Mirrors the segmented speaker: each message SEGMENT decodes ONLY its own predicate's atoms ->
     fully disentangled decode (no GRU entanglement), so each factor is read independently and novel
@@ -547,52 +623,85 @@ def core_vec(kb_facts, core, e):
     return np.array([1.0 if (p, (e, o)) in kb_facts else 0.0 for (p, o) in core], dtype=np.float32)
 
 
-def brain_close_run(steps, seed=0, V=16, d=128, rich=True, verbose=True):
+def brain_close_run(steps, seed=0, V=16, d=128, rich=True, verbose=True, kb=None):
     """Segmented speaker over the IRREDUCIBLE factors; listener predicts those; the BRAIN derives the
     rest by closure. Eval faithfulness/recall/exact on the FULL fact-set -- the derived part is exact
-    when the core is right. This leverages the provable brain to crack the 'exact' boundary."""
-    kb = rich_kb(seed=seed) if rich else P.build_kb()
+    when the core is right. This leverages the provable brain to crack the 'exact' boundary. Pass kb to
+    ground in REAL multi-relation data (WordNet). V auto-grows to cover the largest factor's values, and
+    each dimension is decoded by its arity (functional=argmax, multi-valued=threshold)."""
+    kb = kb if kb is not None else (rich_kb(seed=seed) if rich else P.build_kb())
     full_atoms = fact_universe(kb)
     core, static = core_universe(kb)
     ents = getattr(kb, "_combo_ents", None) or entities_with_facts(kb, full_atoms)
     tr, te = split_entities(ents, 0.25, seed)
     facts_set = set(kb.facts)
-    spk = SegmentedSpeaker(core, V, d)
-    lis = SegmentedListener(build_groups(core), len(core), spk.spg, V, d)   # structured decode
+    groups = build_groups(core)
+    mand = mandatory_groups(core, groups, ents, facts_set)
+    # a high-cardinality dimension (e.g. WordNet is-a: 139 parents) needs a MULTI-SYMBOL code, not one
+    # huge categorical (untrainable under Gumbel). Size symbols/group so V**spg covers the widest factor.
+    import math
+    spg = max(1, math.ceil(math.log(max(2, max(len(g) for g in groups))) / math.log(V)))
+    spk = SegmentedSpeaker(core, V, d, syms_per_group=spg)
+    lis = SegmentedListener(groups, len(core), spk.spg, V, d)   # structured decode
     tr_vecs = [core_vec(facts_set, core, e) for e in tr]
     train(spk, lis, tr_vecs, steps=steps, batch=64, seed=seed,
           log=(max(1, steps // 6) if verbose else 0))
+    # close the SHARED taxonomy ONCE (the brain), then derive each entity by composition over it --
+    # closure is monotone+idempotent, so this equals closure(static + core_e) but is O(ancestors)/entity
+    anc_of, rel_of = index_closure(kb.dl.closure(static)[0])
+    # a held-out concept is COMMUNICABLE only if its core VALUES were seen in training (a fixed symbol
+    # code cannot encode a value it never observed) -- so split held-out by that to separate the
+    # compositional generalization from the concept-level open-vocab wall.
+    train_vals = {(p, o) for e in tr for (p, o) in core if (p, (e, o)) in facts_set}
 
-    def ev(es):
+    def records(es):
         spk.eval(); lis.eval()
         x = torch.from_numpy(np.stack([core_vec(facts_set, core, e) for e in es]))
         with torch.no_grad():
-            pred = (torch.sigmoid(lis(spk(x)[0])) > 0.5).numpy()
-        f_ok = f_tot = r_ok = r_tot = exact = core_exact = 0
+            prob = torch.sigmoid(lis(spk(x)[0])).numpy()
+        pred = structured_decode(prob, groups, mand)          # arity-aware: argmax vs threshold
+        recs = []
         for r, e in enumerate(es):
             base_pred = [(p, (e, o)) for k, (p, o) in enumerate(core) if pred[r, k]]
-            closed, _ = kb.dl.closure(static + base_pred)             # BRAIN derives the rest
-            got = {(p, a[1]) for (p, a) in closed if len(a) == 2 and a[0] == e}
+            got = derive_entity(e, base_pred, anc_of, rel_of)        # BRAIN derives the rest
             true = {(p, o) for (p, o) in full_atoms if (p, (e, o)) in kb.known}
-            for f in got:
-                f_tot += 1; f_ok += int((f[0], (e, f[1])) in kb.known)
-            r_ok += len(got & true); r_tot += len(true); exact += int(got == true)
-            core_exact += int(set(np.where(pred[r])[0]) ==
-                              {k for k, (p, o) in enumerate(core) if (p, (e, o)) in facts_set})
-        n = max(1, len(es))
-        return dict(exact=exact / n, faith=f_ok / max(1, f_tot), recall=r_ok / max(1, r_tot),
-                    core_exact=core_exact / n)
-    rtr, rte = ev(tr), ev(te)
+            tcore = {(p, o) for (p, o) in core if (p, (e, o)) in facts_set}
+            recs.append(dict(
+                exact=int(got == true), faith_ok=len(got & true), faith_tot=len(got),
+                rec_ok=len(got & true), rec_tot=len(true),
+                core_exact=int({core[k] for k in np.where(pred[r])[0]} == tcore),
+                seen=(tcore <= train_vals)))
+        return recs
+
+    def agg(recs):
+        n = max(1, len(recs))
+        return dict(n=len(recs), exact=sum(r["exact"] for r in recs) / n,
+                    faith=sum(r["faith_ok"] for r in recs) / max(1, sum(r["faith_tot"] for r in recs)),
+                    recall=sum(r["rec_ok"] for r in recs) / max(1, sum(r["rec_tot"] for r in recs)),
+                    core_exact=sum(r["core_exact"] for r in recs) / n)
+    rtr, te_recs = agg(records(tr)), records(te)
+    rte = agg(te_recs)
+    rte_seen = agg([r for r in te_recs if r["seen"]])
+    rte_unseen = agg([r for r in te_recs if not r["seen"]])
     if verbose:
         print(f"\n== SEGMENTED speaker + BRAIN CLOSURE (message conveys core factors; brain derives rest) ==")
-        print(f"  world: RICH | core factors {len(core)} | full atoms {len(full_atoms)} | "
-              f"train {len(tr)}/held {len(te)} | msg L={spk.L}")
+        dims = ", ".join(f"{p}{'*' if m else ''}" for p, m in zip(
+            dict.fromkeys(p for p, _ in core), mand))
+        is_wn = bool(kb._combo_ents) and "." in kb._combo_ents[0]
+        print(f"  world: {'WordNet' if is_wn else 'RICH'} | "
+              f"dimensions [{dims}] (*=functional->argmax) | core factors {len(core)} | "
+              f"full atoms {len(full_atoms)} | train {len(tr)}/held {len(te)} | msg L={spk.L} V={V}")
         print(f"  TRAIN    : full-exact {rtr['exact']:.3f} | faith {rtr['faith']:.3f} | recall "
               f"{rtr['recall']:.3f} | core-exact {rtr['core_exact']:.3f}")
         print(f"  HELD-OUT : full-exact {rte['exact']:.3f} | faith {rte['faith']:.3f} | recall "
-              f"{rte['recall']:.3f} | core-exact {rte['core_exact']:.3f}   (never-seen combos)")
+              f"{rte['recall']:.3f} | core-exact {rte['core_exact']:.3f}   (never-seen concepts)")
+        if rte_seen["n"] and rte_unseen["n"]:
+            print(f"    +-- core values SEEN in train (n={rte_seen['n']:3d}): exact {rte_seen['exact']:.3f}"
+                  f" | faith {rte_seen['faith']:.3f} | recall {rte_seen['recall']:.3f}   <- GENERALIZES")
+            print(f"    +-- core value UNSEEN (n={rte_unseen['n']:3d}): exact {rte_unseen['exact']:.3f}"
+                  f" | faith {rte_unseen['faith']:.3f} | recall {rte_unseen['recall']:.3f}   <- open-vocab wall")
         print("  the DERIVED facts are exact when the core is right -- the brain computes them, proved.")
-    return dict(train=rtr, heldout=rte)
+    return dict(train=rtr, heldout=rte, heldout_seen=rte_seen, heldout_unseen=rte_unseen)
 
 
 @torch.no_grad()
@@ -681,9 +790,13 @@ def main(argv=None):
     if args.wordnet:
         kb = wordnet_kb(seed=args.seed)
         print(f"  REAL grounded data: WordNet | {len(kb._combo_ents)} real concepts | "
-              f"{len(kb.entities)} synsets | is-a closure derived by the brain", flush=True)
-        discover_run(args.steps, seed=args.seed, K=args.slots, V=max(32, args.vocab), kb=kb,
-                     assign_tau=args.assign_tau, ent_lam=args.ent_lam); return 0
+              f"{len(kb.entities)} synsets | multi-relation closure derived by the brain", flush=True)
+        if args.discover:                                      # self-discover the dimensions (harder)
+            discover_run(args.steps, seed=args.seed, K=args.slots, V=max(32, args.vocab), kb=kb,
+                         assign_tau=args.assign_tau, ent_lam=args.ent_lam)
+        else:                                                  # typed dimensions + arity-aware decode
+            brain_close_run(args.steps, seed=args.seed, V=args.vocab, d=args.d, kb=kb)
+        return 0
     if args.discover:
         discover_run(args.steps, seed=args.seed, K=args.slots, V=args.vocab, rich=True,
                      assign_tau=args.assign_tau, ent_lam=args.ent_lam); return 0
