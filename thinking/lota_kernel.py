@@ -144,15 +144,18 @@ def proof_term(tree, rules):
 
 
 class KB:
-    def __init__(self, entities, preds, facts, rules):
+    def __init__(self, entities, preds, facts, rules, build_types=True, eager_closure=True):
+        # build_types/eager_closure default ON (full LOTA brain). At large scale (thousands of WordNet
+        # concepts) the O(cats^2) BDD disjointness loop and the full eager closure dominate and are
+        # UNNEEDED for tasks that only derive+verify facts (no negation/disproofs) -- turn them off then.
         self.entities, self.preds, self.facts, self.rules = entities, preds, facts, rules
         self.env = build_env(entities, preds, facts, rules)
         self.env.update(K.logic_env())                   # And/Or/Eq/Ex/False available for proofs
         self.dl = Datalog(rules)
-        self.known, self.prov = self.dl.closure(facts)
+        self.known, self.prov = self.dl.closure(facts) if eager_closure else (set(), {})
         # set-theoretic types -> disjointness -> kernel EXCLUSION axioms (so negations get real proofs)
         self.tc = self._cats = None
-        if any(p == "isa" for (p, _e) in facts):
+        if build_types and any(p == "isa" for (p, _e) in facts):
             self.tc = BT.TypeChecker.from_kb(self)
             self._cats = self.tc.tax.cats
             self._disjoint = {}

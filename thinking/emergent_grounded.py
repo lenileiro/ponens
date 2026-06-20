@@ -44,7 +44,7 @@ def fact_universe(kb):
     return sorted(atoms)
 
 
-def wordnet_kb(seed=0, per_cat=25):
+def wordnet_kb(seed=0, per_cat=25, cap=400):
     """REAL grounded data across MANY WordNet relational DIMENSIONS (not just is-a): a concept's meaning
     spans is-a (hypernym), has-part (meronym), made-of (substance) and member-of (holonym). The brain
     holds the RULES over these dimensions -- is-a transitivity PLUS has-part/made-of/member-of being
@@ -57,7 +57,7 @@ def wordnet_kb(seed=0, per_cat=25):
              "furniture.n.01", "clothing.n.01", "bird.n.01"]
     rng = np.random.default_rng(seed)
 
-    def descendants(syn, cap=400):
+    def descendants(syn, cap=cap):
         seen, frontier = set(), [syn]
         while frontier and len(seen) < cap:
             nxt = []
@@ -94,7 +94,10 @@ def wordnet_kb(seed=0, per_cat=25):
     for pred in relmap:                                       # cross-dimension rule: inherit down is-a
         rules.append(((pred, ("?x", "?p")), [("isa", ("?x", "?y")), (pred, ("?y", "?p"))]))
     import thinking.lota_kernel as LK
-    kb = LK.KB(sorted(ents), preds, facts, rules)
+    # skip the O(cats^2) BDD type machinery AND the eager full closure (both unneeded + dominate at
+    # scale): truth is derived per-concept from the cheap STATIC closure via derive_entity (proven
+    # == the full closure), so we never materialize closure over every concept's chain.
+    kb = LK.KB(sorted(ents), preds, facts, rules, build_types=False, eager_closure=False)
     kb._combo_ents = sorted({lf.name() for lf in leaves})
     return kb
 
@@ -525,6 +528,13 @@ def derive_entity(e, base_pred, anc_of, rel_of):
     return got
 
 
+def true_factset(e, core, facts_set, anc_of, rel_of):
+    """Ground-truth full fact-set for concept e: close e's TRUE core through the brain. Equals the eager
+    closure (derive_entity is proven == closure), so we never need the expensive materialized kb.known."""
+    tcore = [(p, (e, o)) for (p, o) in core if (p, (e, o)) in facts_set]
+    return derive_entity(e, tcore, anc_of, rel_of)
+
+
 class SegmentedListener(nn.Module):
     """Mirrors the segmented speaker: each message SEGMENT decodes ONLY its own predicate's atoms ->
     fully disentangled decode (no GRU entanglement), so each factor is read independently and novel
@@ -630,9 +640,8 @@ def brain_close_run(steps, seed=0, V=16, d=128, rich=True, verbose=True, kb=None
     ground in REAL multi-relation data (WordNet). V auto-grows to cover the largest factor's values, and
     each dimension is decoded by its arity (functional=argmax, multi-valued=threshold)."""
     kb = kb if kb is not None else (rich_kb(seed=seed) if rich else P.build_kb())
-    full_atoms = fact_universe(kb)
     core, static = core_universe(kb)
-    ents = getattr(kb, "_combo_ents", None) or entities_with_facts(kb, full_atoms)
+    ents = getattr(kb, "_combo_ents", None) or entities_with_facts(kb, fact_universe(kb))
     tr, te = split_entities(ents, 0.25, seed)
     facts_set = set(kb.facts)
     groups = build_groups(core)
@@ -664,7 +673,7 @@ def brain_close_run(steps, seed=0, V=16, d=128, rich=True, verbose=True, kb=None
         for r, e in enumerate(es):
             base_pred = [(p, (e, o)) for k, (p, o) in enumerate(core) if pred[r, k]]
             got = derive_entity(e, base_pred, anc_of, rel_of)        # BRAIN derives the rest
-            true = {(p, o) for (p, o) in full_atoms if (p, (e, o)) in kb.known}
+            true = true_factset(e, core, facts_set, anc_of, rel_of)  # brain-derived ground truth
             tcore = {(p, o) for (p, o) in core if (p, (e, o)) in facts_set}
             recs.append(dict(
                 exact=int(got == true), faith_ok=len(got & true), faith_tot=len(got),
@@ -687,10 +696,11 @@ def brain_close_run(steps, seed=0, V=16, d=128, rich=True, verbose=True, kb=None
         print(f"\n== SEGMENTED speaker + BRAIN CLOSURE (message conveys core factors; brain derives rest) ==")
         dims = ", ".join(f"{p}{'*' if m else ''}" for p, m in zip(
             dict.fromkeys(p for p, _ in core), mand))
-        is_wn = bool(kb._combo_ents) and "." in kb._combo_ents[0]
+        is_wn = bool(getattr(kb, "_combo_ents", None)) and "." in kb._combo_ents[0]
+        n_full = len({a for e in ents for a in true_factset(e, core, facts_set, anc_of, rel_of)})
         print(f"  world: {'WordNet' if is_wn else 'RICH'} | "
               f"dimensions [{dims}] (*=functional->argmax) | core factors {len(core)} | "
-              f"full atoms {len(full_atoms)} | train {len(tr)}/held {len(te)} | msg L={spk.L} V={V}")
+              f"full atoms {n_full} | train {len(tr)}/held {len(te)} | msg L={spk.L} V={V}")
         print(f"  TRAIN    : full-exact {rtr['exact']:.3f} | faith {rtr['faith']:.3f} | recall "
               f"{rtr['recall']:.3f} | core-exact {rtr['core_exact']:.3f}")
         print(f"  HELD-OUT : full-exact {rte['exact']:.3f} | faith {rte['faith']:.3f} | recall "
