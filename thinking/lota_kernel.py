@@ -25,7 +25,17 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import thinking.kernel as K  # noqa: E402
 import thinking.lang as L  # noqa: E402  (the LOTA surface reader/checker/desugarer)
+import thinking.bdd_types as BT  # noqa: E402  (set-theoretic types -> disjointness)
 from datalog import Datalog  # noqa: E402
+
+
+def _excl_type(A, B):
+    """The exclusion axiom type:  forall x:Ent, isa x A -> isa x B -> False  (valid iff A,B disjoint).
+    Set-theoretic types JUSTIFY this axiom (they prove A and B disjoint); the kernel then uses it to
+    prove negations -- a real disproof, replacing closed-world 'not derivable'."""
+    return K.n_pi("x", K.n_c("Ent"),
+                  K.n_arr(K.n_app(K.n_c("isa"), K.n_v("x"), K.n_c(A)),
+                          K.n_arr(K.n_app(K.n_c("isa"), K.n_v("x"), K.n_c(B)), K.n_c("False"))))
 
 ENT = K.Const("Ent")          # the type of entities
 PROP = K.Sort(0)
@@ -140,6 +150,17 @@ class KB:
         self.env.update(K.logic_env())                   # And/Or/Eq/Ex/False available for proofs
         self.dl = Datalog(rules)
         self.known, self.prov = self.dl.closure(facts)
+        # set-theoretic types -> disjointness -> kernel EXCLUSION axioms (so negations get real proofs)
+        self.tc = self._cats = None
+        if any(p == "isa" for (p, _e) in facts):
+            self.tc = BT.TypeChecker.from_kb(self)
+            self._cats = self.tc.tax.cats
+            self._disjoint = {}
+            for a in self._cats:
+                for b in self._cats:
+                    if a != b and self.tc.disjoint(self.tc.lit(a), self.tc.lit(b)):
+                        self._disjoint[(a, b)] = True
+                        self.env[f"excl_{a}_{b}"] = K.compile(_excl_type(a, b))
 
     def _atom_term(self, goal):
         """(ok, kernel Term) for an atomic goal -- the kernel-checked datalog derivation."""
@@ -214,6 +235,28 @@ class KB:
             ok = K.has_type([], kterm, ktype, self.env)                    # kernel re-checks the whole
             return {"status": "proven" if ok else "unprovable", "kterm": kterm, "ktype": ktype,
                     "term": K.show(kterm), "conjuncts": parts}
+        if tag == "not":
+            inner = f[1]
+            # NEGATION of an isa atom via an exclusion axiom: prove  isa(r,B) -> False  by finding a
+            # category A with r:A and A disjoint-from B, then  fun h:isa(r,B) => excl_A_B r <r:A> h.
+            if (inner[0] == "atom" and inner[1] == "isa" and len(inner[2]) == 2
+                    and not any(isinstance(a, str) and a.startswith("?") for a in inner[2])):
+                r, Bcat = inner[2]
+                for A in (self._cats or []):
+                    if self._disjoint.get((A, Bcat)) and f"excl_{A}_{Bcat}" in self.env:
+                        ok, pr = self._atom_term(("isa", (r, A)))
+                        if not ok:
+                            continue
+                        isaRB = K.App(K.App(K.Const("isa"), K.Const(r)), K.Const(Bcat))
+                        body = K.App(K.App(K.App(K.Const(f"excl_{A}_{Bcat}"), K.Const(r)), pr),
+                                     K.Var(0))                       # h : isa(r,B)
+                        kterm = K.Lam(isaRB, body, "h")
+                        ktype = K.Pi(isaRB, K.Const("False"), "h")   # isa(r,B) -> False  ==  not isa(r,B)
+                        if K.has_type([], kterm, ktype, self.env):
+                            return {"status": "proven", "kterm": kterm, "ktype": ktype,
+                                    "term": K.show(kterm), "note": f"negation via excl_{A}_{Bcat}"}
+                return {"status": "unprovable", "detail": "no disjoint supertype to disprove isa"}
+            return {"status": "unsupported", "detail": "v1 negation: only isa atoms (exclusion axioms)"}
         if tag == "if":
             ra = self._prove_core(f[1])
             if ra["status"] != "proven":
@@ -271,11 +314,16 @@ class KB:
 # Demo KB: is-a chain + transitivity + property inheritance (real multi-hop reasoning).
 # ---------------------------------------------------------------------------------------------------
 def _demo_kb():
-    entities = ["robin", "bird", "animal", "living_thing", "fly", "move"]
+    # a taxonomy WITH sibling branches (bird / fish / mammal under animal) so disjointness -- and thus
+    # negation via exclusion axioms -- is meaningful.
+    entities = ["robin", "sparrow", "bird", "salmon", "fish", "cat", "mammal",
+                "animal", "living_thing", "fly", "move"]
     preds = {"isa": 2, "prop": 2}
-    facts = [("isa", ("robin", "bird")), ("isa", ("bird", "animal")),
+    facts = [("isa", ("robin", "bird")), ("isa", ("sparrow", "bird")), ("isa", ("bird", "animal")),
+             ("isa", ("salmon", "fish")), ("isa", ("fish", "animal")),
+             ("isa", ("cat", "mammal")), ("isa", ("mammal", "animal")),
              ("isa", ("animal", "living_thing")),
-             ("prop", ("animal", "move"))]                # animals move
+             ("prop", ("animal", "move"))]                # animals move (inherited)
     rules = [
         (("isa", ("?x", "?z")), [("isa", ("?x", "?y")), ("isa", ("?y", "?z"))]),    # transitivity
         (("prop", ("?x", "?p")), [("isa", ("?x", "?y")), ("prop", ("?y", "?p"))]),  # inheritance
@@ -333,6 +381,15 @@ def selftest():
     # a closed-domain forall that does NOT hold for some known entity
     r = kb.prove_surface("(forall ?x (if (isa ?x animal) (isa ?x fly)))")
     assert r["status"] == "unprovable", "forall must fail when an instance fails"
+
+    # NEGATION via exclusion axioms (set-theoretic disjointness -> kernel disproof). robin is a bird;
+    # bird and fish are disjoint -> isa(robin,fish) is FALSE, with a real kernel proof.
+    r = kb.prove_surface("(not (isa robin fish))")
+    assert r["status"] == "proven", ("disjoint-based negation should prove", r)
+    assert K.has_type([], r["kterm"], r["ktype"], kb.env), "negation proof must kernel-check"
+    # but a negation that ISN'T forced by disjointness is not provable this way (sound: robins DO fly)
+    r = kb.prove_surface("(not (isa robin bird))")
+    assert r["status"] == "unprovable", "must not disprove a TRUE isa"
     print("lota_kernel selftest OK")
 
 
