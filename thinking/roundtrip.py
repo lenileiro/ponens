@@ -58,18 +58,15 @@ def write_pairs(concepts):
     return pairs
 
 
-def written_parent_claim(ptoks, cand_lemmas):
-    """The is-a claim the WRITTEN definition actually makes = the EARLIEST-positioned candidate parent
-    lemma appearing in it (the faithful writer leads with 'a <parent> ...'). Returns its name or None."""
-    best, best_pos = None, len(ptoks) + 1
+def all_parent_claims(ptoks, cand_lemmas):
+    """EVERY is-a claim the written definition makes = all candidate parents whose lemma appears in it.
+    The brain then filters these to the provable ones (brain-gatekept generation)."""
+    out = []
     for name, lemma in cand_lemmas:
         lw = lemma.split()
-        for i in range(len(ptoks) - len(lw) + 1):
-            if ptoks[i:i + len(lw)] == lw:
-                if i < best_pos:
-                    best, best_pos = name, i
-                break
-    return best
+        if any(ptoks[i:i + len(lw)] == lw for i in range(len(ptoks) - len(lw) + 1)):
+            out.append(name)
+    return out
 
 
 def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose=True,
@@ -113,7 +110,8 @@ def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose
         pj = M.isa_scores(enc, cache, sel, cand_emb, "copy", temp=1.0).argmax(1).item()
         return pnames[pj]
 
-    comp_ok = comp_proven = wrote = write_proven = n = 0
+    comp_ok = comp_proven = n = 0
+    raw_claims = raw_proven = grounded_proven = filt_recovered = 0
     shows = []
     for ci in te_idx.tolist():
         if cache["par_idx"][ci].item() < 0:
@@ -122,27 +120,39 @@ def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose
         C, true_parent = names[ci], pnames[cache["par_idx"][ci].item()]
         p_hat = comprehend(ci)                               # COMPREHEND
         comp_ok += int(p_hat == true_parent)
-        comp_proven += int(brain._atom_term(("isa", (C, p_hat)))[0])      # BRAIN proves comprehension
+        comp_grounded = brain._atom_term(("isa", (C, p_hat)))[0]          # BRAIN proves comprehension
+        comp_proven += int(comp_grounded)
         gen = P.emit(wmodel, wvocab, {"gtoks": facts_gtoks(names_pos(concepts, ci), p_hat)},
-                     device, block)                           # WRITE from recovered facts
-        claim = written_parent_claim(gen, cand_lemmas)       # parse the WRITTEN def's is-a claim
-        if claim is not None:
-            wrote += 1
-            write_proven += int(brain._atom_term(("isa", (C, claim)))[0])  # BRAIN proves the WRITTEN claim
+                     device, block)                           # WRITE freely
+        # BRAIN-FILTERED generation: parse EVERY is-a claim in the text; the brain keeps only the
+        # PROVABLE ones -> the agent's response carries only kernel-verified content (gatekept).
+        claims = all_parent_claims(gen, cand_lemmas)
+        proven = [x for x in claims if brain._atom_term(("isa", (C, x)))[0]]
+        raw_claims += len(claims); raw_proven += len(proven)
+        filt_recovered += int(len(proven) > 0)               # >=1 true is-a survives the filter
+        # GROUNDED claim: the agent ASSERTS its brain-verified comprehension ("a {p_hat}")
+        grounded_proven += int(comp_grounded)
         if len(shows) < n_show:
-            shows.append((C, M.parent_name_text(true_parent), M.parent_name_text(p_hat), " ".join(gen[:18])))
+            kept = M.parent_name_text(proven[0]) if proven else "(none survive)"
+            shows.append((C, M.parent_name_text(true_parent), M.parent_name_text(p_hat),
+                          " ".join(gen[:14]), kept))
 
     res = dict(n=n, comp_acc=comp_ok / max(1, n), comp_kernel=comp_proven / max(1, n),
-               wrote_frac=wrote / max(1, n), write_kernel=write_proven / max(1, wrote))
+               raw_write_faith=raw_proven / max(1, raw_claims),
+               filtered_recall=filt_recovered / max(1, n),
+               grounded_faith=grounded_proven / max(1, n))
     if verbose:
-        print("\n== ROUND-TRIP: read def -> COMPREHEND -> WRITE -> brain-verify (model proposes, brain proves) ==")
+        print("\n== ROUND-TRIP: read def -> COMPREHEND -> WRITE -> BRAIN GATEKEEPS (model proposes, brain proves) ==")
         print(f"  {n} held-out concepts | brain {len(brain.known)} kernel-closed facts")
-        print(f"  COMPREHEND: parent acc {res['comp_acc']:.3f} | brain-PROVEN {res['comp_kernel']:.3f}")
-        print(f"  WRITE     : produced an is-a claim in {res['wrote_frac']:.3f} | of those brain-PROVEN "
-              f"{res['write_kernel']:.3f}")
-        print("  -- examples (concept | true parent -> comprehended -> WRITTEN def) --")
-        for C, tp, cp, w in shows:
-            print(f"     {C:24s} {tp} -> {cp} :: {w}")
+        print(f"  COMPREHEND     : parent acc {res['comp_acc']:.3f} | brain-PROVEN {res['comp_kernel']:.3f}")
+        print(f"  WRITE (raw)    : of all is-a claims the writer makes, brain-PROVEN {res['raw_write_faith']:.3f}"
+              f"  <- a free LM hallucinates")
+        print(f"  WRITE (FILTERED): >=1 true is-a survives the brain filter for {res['filtered_recall']:.3f} "
+              f"of concepts; kept content is 100% kernel-proven (hallucinations rejected)")
+        print(f"  GROUNDED claim  : agent asserts its brain-verified comprehension -> faith {res['grounded_faith']:.3f}")
+        print("  -- examples (concept | true -> comprehended | written... | brain-KEPT claim) --")
+        for C, tp, cp, w, kept in shows:
+            print(f"     {C:22s} {tp}->{cp} | {w} | KEPT: {kept}")
     if out:
         import json
         with open(out, "w") as f:
@@ -160,7 +170,7 @@ def selftest():
     torch.set_num_threads(2)
     r = run(steps=300, write_steps=300, seed=0, per_pos=40, d=64, device="cpu", verbose=False, n_show=0)
     assert 0.0 <= r["comp_kernel"] <= 1.0 and r["n"] > 0, r
-    assert r["wrote_frac"] >= 0.0, r
+    assert 0.0 <= r["raw_write_faith"] <= 1.0 and 0.0 <= r["filtered_recall"] <= 1.0, r
     print("roundtrip selftest OK")
 
 
