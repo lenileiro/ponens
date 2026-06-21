@@ -167,8 +167,14 @@ class KB:
         the upfront O(cats^2) enumeration -- only the pairs a query actually touches are ever computed."""
         if (a, b) in self._disjoint:
             return self._disjoint[(a, b)]
+        # a category outside the taxonomy can't be proven disjoint from anything -> not disjoint (robust:
+        # never crash on an unknown category; the brain just declines to disprove it)
+        order = getattr(self.tc, "bdd", None) and self.tc.bdd.order
+        if not self.tc or a not in order or b not in order:
+            self._disjoint[(a, b)] = False
+            return False
         # empty_eager prunes doomed cubes -> far cheaper than the naive emptiness check
-        dis = bool(self.tc) and self.tc.empty_eager(self.tc.bdd.and_(self.tc.lit(a), self.tc.lit(b)))
+        dis = self.tc.empty_eager(self.tc.bdd.and_(self.tc.lit(a), self.tc.lit(b)))
         self._disjoint[(a, b)] = dis
         if dis:
             self.env[f"excl_{a}_{b}"] = K.compile(_excl_type(a, b))
