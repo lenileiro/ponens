@@ -151,7 +151,7 @@ def run(steps=4000, max_concepts=None, seed=0, device=None, batch=256, save=None
     t = time.time()
     rows, gloss = load_all(max_concepts=max_concepts, seed=seed)
     tr, te = split(rows, 0.1, seed)
-    emb = Embedder()
+    emb = Embedder().to(device)                              # move BEFORE zero-shot eval (device-safe)
     if verbose:
         print(f"  FULL WordNet | {len(rows)} concepts (train {len(tr)}/held {len(te)}) | "
               f"candidates {len(set(c['parent'] for c in rows))} | device {device} | load {time.time()-t:.0f}s",
