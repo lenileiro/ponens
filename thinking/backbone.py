@@ -300,6 +300,43 @@ def gate_eval(per_pos=300, seed=0, model=DEFAULT_MODEL, topk=10, device=None, ve
     return res
 
 
+def relation_gate_eval(per_pos=300, seed=0, model=DEFAULT_MODEL, rels=("isa", "has_part", "member_of"),
+                       topk=10, device=None, verbose=True):
+    """Multi-relation honesty: the brain gate guarantees 0 false-assertion for ANY relation (it passes
+    only kernel-proven facts). Report coverage (true content surfaced) + confirm FALSE-rate 0 per rel."""
+    concepts, parent, _nt, relations = M.gather(per_pos=per_pos, seed=seed)
+    tr, te = M.split(concepts, 0.25, seed)
+    brain = M.build_brain(concepts, relations)
+    bb = Backbone(model, device=device)
+    out = {}
+    if verbose:
+        print(f"\n== MULTI-RELATION GATE (per_pos={per_pos}, seed={seed}) ==", flush=True)
+    for rel in rels:
+        truth = {}
+        for (p, a) in brain.known:
+            if p == rel and len(a) == 2:
+                truth.setdefault(a[0], set()).add(a[1])
+        held = [c for c in te if truth.get(c["name"])]
+        if not held:
+            continue
+        objs = sorted({o for s in truth.values() for o in s})
+        obj_emb = bb.embed([parent_gloss(o) for o in objs])
+        sims = bb.embed([c["views"][0].replace("means ", "") for c in held]) @ obj_emb.t()
+        recovered = false = asserted = 0
+        for r, c in enumerate(held):
+            cands = [objs[j] for j in sims[r].topk(min(topk, len(objs))).indices.tolist()]
+            prov = [o for o in cands if (rel, (c["name"], o)) in brain.known]
+            asserted += len(prov)
+            false += sum((rel, (c["name"], o)) not in brain.known for o in prov)
+            recovered += int(bool(prov))
+        out[rel] = dict(n=len(held), coverage=recovered / len(held), asserted=asserted,
+                        false_rate=false / max(1, asserted))
+        if verbose:
+            print(f"  {rel:>10}: held {len(held):>4} | coverage>=1 {out[rel]['coverage']:.3f} | "
+                  f"asserted {asserted:>4} | FALSE-rate {out[rel]['false_rate']:.3f}", flush=True)
+    return out
+
+
 def selftest():
     torch.set_num_threads(2)
     r = run(per_pos=30, seed=0, verbose=False)
@@ -323,12 +360,16 @@ def main(argv=None):
     ap.add_argument("--save", default=None, help="save the agent (brain data + model names)")
     ap.add_argument("--load", default=None, help="load a saved agent")
     ap.add_argument("--gate-test", action="store_true", help="run the gate-calibration honesty test")
+    ap.add_argument("--rel-test", action="store_true", help="multi-relation gate (is-a/has_part/member_of)")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return 0
     if args.gate_test:
         gate_eval(per_pos=args.per_pos, seed=args.seed, model=args.model, topk=args.topk,
                   device=args.device); return 0
+    if args.rel_test:
+        relation_gate_eval(per_pos=args.per_pos, seed=args.seed, model=args.model, topk=args.topk,
+                           device=args.device); return 0
     if args.load or args.chat or args.ask:                   # full agent: comprehend + WRITE + chat
         agent = load_agent(args.load, device=args.device) if args.load else \
             build_agent(per_pos=args.per_pos, seed=args.seed, embed_model=args.model,
