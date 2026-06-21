@@ -116,14 +116,14 @@ def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose
         p_hat = comprehend(ci)                               # COMPREHEND
         comp_ok += int(p_hat == true_parent)
         comp_proven += int(brain._atom_term(("isa", (C, p_hat)))[0])      # BRAIN proves comprehension
-        out = P.emit(wmodel, wvocab, {"gtoks": facts_gtoks(names_pos(concepts, ci), p_hat)},
+        gen = P.emit(wmodel, wvocab, {"gtoks": facts_gtoks(names_pos(concepts, ci), p_hat)},
                      device, block)                           # WRITE from recovered facts
-        claim = written_parent_claim(out, cand_lemmas)       # parse the WRITTEN def's is-a claim
+        claim = written_parent_claim(gen, cand_lemmas)       # parse the WRITTEN def's is-a claim
         if claim is not None:
             wrote += 1
             write_proven += int(brain._atom_term(("isa", (C, claim)))[0])  # BRAIN proves the WRITTEN claim
         if len(shows) < n_show:
-            shows.append((C, M.parent_name_text(true_parent), M.parent_name_text(p_hat), " ".join(out[:18])))
+            shows.append((C, M.parent_name_text(true_parent), M.parent_name_text(p_hat), " ".join(gen[:18])))
 
     res = dict(n=n, comp_acc=comp_ok / max(1, n), comp_kernel=comp_proven / max(1, n),
                wrote_frac=wrote / max(1, n), write_kernel=write_proven / max(1, wrote))
