@@ -44,25 +44,32 @@ def facts_gtoks(pos, parent_name):
 
 
 def write_pairs(concepts):
-    """(facts -> definition) training pairs: condition on pos + true is-a parent, target the gloss."""
+    """(facts -> definition) training pairs. FAITHFUL target: lead with the explicit is-a claim
+    'a <parent> ...' then the gloss, so the written definition ASSERTS the parent it is grounded on
+    (and the claim is exactly what the brain checks) rather than burying/omitting it."""
     pairs = []
     for c in concepts:
         if not c["parent"]:
             continue
-        ptoks = def_words(c["views"][0])
-        if ptoks:
+        gloss = def_words(c["views"][0])
+        if gloss:
+            ptoks = ["a"] + M.parent_name_text(c["parent"]).split() + ["-"] + gloss
             pairs.append({"gtoks": facts_gtoks(c["pos"], c["parent"]), "ptoks": ptoks, "name": c["name"]})
     return pairs
 
 
 def written_parent_claim(ptoks, cand_lemmas):
-    """Extract the is-a claim from a WRITTEN definition: the first candidate parent lemma that appears
-    as a word (the gloss head, e.g. 'a breed of ... DOG'). Returns the candidate name or None."""
-    ws = set(ptoks)
+    """The is-a claim the WRITTEN definition actually makes = the EARLIEST-positioned candidate parent
+    lemma appearing in it (the faithful writer leads with 'a <parent> ...'). Returns its name or None."""
+    best, best_pos = None, len(ptoks) + 1
     for name, lemma in cand_lemmas:
-        if all(t in ws for t in lemma.split()):
-            return name
-    return None
+        lw = lemma.split()
+        for i in range(len(ptoks) - len(lw) + 1):
+            if ptoks[i:i + len(lw)] == lw:
+                if i < best_pos:
+                    best, best_pos = name, i
+                break
+    return best
 
 
 def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose=True,

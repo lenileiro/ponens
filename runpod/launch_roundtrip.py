@@ -34,7 +34,7 @@ HOURLY_USD = 3.29
 # tags 'copy_*' = the attention/COPY is-a probe (best-matching gloss WORD vs parent name).
 SWEEP = [
     # (tag, per_pos, d, steps). ~per_pos*4 concepts; trains comprehension + writer, brain-verified.
-    ("rt_s", 300, 384, 9000),
+    ("rt_s", 300, 384, 14000),
 ]
 
 
