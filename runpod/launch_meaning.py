@@ -34,9 +34,8 @@ HOURLY_USD = 3.29
 # tags 'copy_*' = the attention/COPY is-a probe (best-matching gloss WORD vs parent name).
 ISA_MODE = "copy"
 SWEEP = [
-    ("copy_s", 400,  384, 12000, 256),   # ~1600 concepts
-    ("copy_m", 800,  512, 16000, 384),   # ~3200 concepts
-    ("copy_l", 1500, 512, 22000, 512),   # ~6000 concepts
+    # ~1600 concepts; wider model + bigger batch to fill the H100 (now that AMP + tensor-prepad are in)
+    ("copy_s", 400,  512, 12000, 512),
 ]
 
 
