@@ -173,6 +173,86 @@ def run(steps=4000, max_concepts=None, seed=0, device=None, batch=256, save=None
     return res
 
 
+# ===================================================================================================
+# CHAT with the FINE-TUNED full-WordNet agent: comprehend (fine-tuned embedder + brain) -> write -> gate
+# ===================================================================================================
+def build_chat(embedder_path=None, max_concepts=None, device=None, gen=True, verbose=True):
+    import thinking.meaning as M
+    import thinking.backbone as BB
+    device = device or pick_device()
+    rows, gloss = load_all(max_concepts=max_concepts)
+    ancestors = {r["name"]: r["ancestors"] for r in rows}
+    cands = sorted({r["parent"] for r in rows})
+    emb = Embedder().to(device)
+    if embedder_path:
+        emb.model.load_state_dict(torch.load(embedder_path, map_location=device)["state"])
+        if verbose:
+            print(f"  loaded FINE-TUNED embedder <- {embedder_path}", flush=True)
+    emb.eval()
+    if verbose:
+        print(f"  embedding {len(cands)} candidate glosses...", flush=True)
+    cand_emb = emb.embed_all([gloss[c] for c in cands], device)
+    generator = BB.Generator(device=device) if gen else None
+    return dict(emb=emb, cand_emb=cand_emb, cands=cands, gloss=gloss, ancestors=ancestors,
+                device=device, gen=generator, M=M)
+
+
+def _resolve(text, gloss):
+    """Map a word/synset-name to a known WordNet concept (with a definition), else None (free text)."""
+    from nltk.corpus import wordnet as wn
+    key = text.strip().lower()
+    if key in gloss:
+        return key
+    try:
+        for s in wn.synsets(key.replace(" ", "_")):
+            if s.name() in gloss:
+                return s.name()
+    except Exception:
+        pass
+    return None
+
+
+@torch.no_grad()
+def chat_respond(agent, text, topk=10):
+    M = agent["M"]
+    known = _resolve(text, agent["gloss"])
+    query = agent["gloss"][known] if known else text
+    qe = agent["emb"].embed_all([query], agent["device"])
+    order = (qe @ agent["cand_emb"].t())[0].topk(min(topk, len(agent["cands"]))).indices.tolist()
+    cands = [agent["cands"][j] for j in order]
+    if known is not None:                                   # BRAIN-ASSIST: keep provable ancestors
+        anc = agent["ancestors"].get(known, set())
+        prov = [x for x in cands if x in anc]
+        pick, proven = (prov[0] if prov else cands[0]), bool(prov)
+        lemma = M.parent_name_text(known)
+    else:
+        pick, proven, lemma = cands[0], False, "this"
+    cat = M.parent_name_text(pick)
+    written = agent["gen"].write(lemma, cat) if agent["gen"] else "(no generator)"
+    anc_chain = ", ".join(M.parent_name_text(a) for a in list(agent["ancestors"].get(pick, []))[:8])
+    if known is None:
+        head = f"  (novel input -- can't kernel-verify; best guess) a {cat}"
+    elif proven:
+        head = f"  understood as : a {cat}   [VERIFIED -- {known} is-a {cat} in the WordNet brain]"
+    else:
+        head = f"  uncertain: best guess 'a {cat}', but the BRAIN CANNOT verify it for {known}"
+    return "\n".join([head, f"  my definition: {written}",
+                      f"  brain: {cat} is-a -> {anc_chain or '(root)'}"])
+
+
+def chat(agent):
+    print("\n== CHAT with the FINE-TUNED full-WordNet agent -- a word or a definition; blank to quit ==",
+          flush=True)
+    while True:
+        try:
+            line = input("you> ").strip()
+        except EOFError:
+            break
+        if not line:
+            break
+        print(chat_respond(agent, line), flush=True)
+
+
 def selftest():
     torch.set_num_threads(2)
     r = run(steps=60, max_concepts=2000, seed=0, device="cpu", batch=64, verbose=False)
@@ -190,9 +270,19 @@ def main(argv=None):
     ap.add_argument("--device", default=None)
     ap.add_argument("--save", default=None)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--load", default=None, help="load fine-tuned embedder ckpt (wn_full.pt) for chat")
+    ap.add_argument("--chat", action="store_true")
+    ap.add_argument("--ask", default=None)
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return 0
+    if args.chat or args.ask:                                # CHAT with the fine-tuned full-WordNet agent
+        agent = build_chat(embedder_path=args.load, max_concepts=args.max_concepts, device=args.device)
+        if args.ask:
+            print(chat_respond(agent, args.ask), flush=True)
+        if args.chat or not args.ask:
+            chat(agent)
+        return 0
     run(steps=args.steps, max_concepts=args.max_concepts, seed=args.seed, batch=args.batch,
         device=args.device, save=args.save, out=args.out)
     return 0
