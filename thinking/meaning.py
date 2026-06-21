@@ -147,17 +147,46 @@ def encode_texts(enc, vocab, texts, device):
     return enc(x.to(device), l)
 
 
-def isa_qk(enc, c_head, p_head, vocab, node_text, rows, device, isa_mode):
-    """Embeddings for the is-a probe. 'name' (default, stronger): match the concept's gloss to the
-    parent's NAME (which often appears in the gloss), raw embeddings. 'meaning': match concept gloss to
-    parent GLOSS through learned projection heads (reuses the contrastive space)."""
-    q_in = encode_texts(enc, vocab, [c["views"][0] for c in rows], device)
+def gloss_words(text, maxw=24):
+    return [w for w in text.lower().replace("means ", "").replace("also called ", "").split()][:maxw] \
+        or ["?"]
+
+
+def encode_words(enc, vocab, word_lists, device, maxw=24):
+    """Encode each concept's gloss WORDS individually (char-encoded -> open-vocab-safe). Returns
+    (B, maxw, d) normalized word embeddings + a (B, maxw) validity mask."""
+    flat, lens = [], []
+    for ws in word_lists:
+        ws = ws[:maxw]; lens.append(len(ws)); flat.extend(ws)
+    emb = encode_texts(enc, vocab, flat, device)             # (total_words, d)
+    out = torch.zeros(len(word_lists), maxw, emb.shape[-1], device=device)
+    mask = torch.zeros(len(word_lists), maxw, dtype=torch.bool, device=device)
+    i = 0
+    for b, n in enumerate(lens):
+        out[b, :n] = emb[i:i + n]; mask[b, :n] = True; i += n
+    return F.normalize(out, dim=-1), mask
+
+
+def parent_keys(enc, p_head, vocab, node_text, pnames, device, isa_mode):
+    """Key embeddings for candidate parents. 'meaning' -> parent gloss via p_head; else parent NAME."""
     if isa_mode == "meaning":
-        ptext = [node_text.get(c["parent"], parent_name_text(c["parent"])) for c in rows]
-        k_in = encode_texts(enc, vocab, ptext, device)
-        return F.normalize(c_head(q_in), dim=-1), F.normalize(p_head(k_in), dim=-1)
-    k_in = encode_texts(enc, vocab, [parent_name_text(c["parent"]) for c in rows], device)
-    return q_in, k_in
+        txt = [node_text.get(p, parent_name_text(p)) for p in pnames]
+        return F.normalize(p_head(encode_texts(enc, vocab, txt, device)), dim=-1)
+    return F.normalize(encode_texts(enc, vocab, [parent_name_text(p) for p in pnames], device), dim=-1)
+
+
+def concept_scores(enc, c_head, vocab, rows, keys, device, isa_mode, maxw=24):
+    """(len(rows), len(keys)) is-a scores. 'copy' (attention/copy): a parent scores as the BEST-matching
+    gloss WORD -> exploits 'the parent word appears in the gloss', which pooling+argmax cannot. 'name'/
+    'meaning': pooled concept embedding (optionally projected) dotted with the parent keys."""
+    if isa_mode == "copy":
+        we, mask = encode_words(enc, vocab, [gloss_words(c["views"][0], maxw) for c in rows], device, maxw)
+        s = torch.einsum("bwd,pd->bwp", we, keys)           # (B, W, P)
+        return s.masked_fill(~mask.unsqueeze(-1), -1e4).max(1).values    # best gloss word per parent
+    q = encode_texts(enc, vocab, [c["views"][0] for c in rows], device)
+    if isa_mode == "meaning":
+        q = F.normalize(c_head(q), dim=-1)
+    return q @ keys.t()
 
 
 def train(enc, pos_head, c_head, p_head, vocab, node_text, tr, steps, device, batch=128, lr=1e-3,
@@ -176,11 +205,11 @@ def train(enc, pos_head, c_head, p_head, vocab, node_text, tr, steps, device, ba
         logits = a @ b.t() / temp                            # InfoNCE (CLIP-style, in-batch negatives)
         labels = torch.arange(len(bc), device=device)
         loss = 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels))
-        # is-a probe: concept def -> its PARENT (keyed by name or meaning; see isa_qk), in-batch
+        # is-a probe (mode: name | meaning | copy), in-batch parents as candidates
         nv = [c for c in bc if c["parent"]]
         if nv:
-            q, k = isa_qk(enc, c_head, p_head, vocab, node_text, nv, device, isa_mode)
-            isa_logits = q @ k.t() / temp
+            keys = parent_keys(enc, p_head, vocab, node_text, [c["parent"] for c in nv], device, isa_mode)
+            isa_logits = concept_scores(enc, c_head, vocab, nv, keys, device, isa_mode) / temp
             lbl = torch.arange(len(nv), device=device)
             loss = loss + lam_isa * 0.5 * (F.cross_entropy(isa_logits, lbl)
                                            + F.cross_entropy(isa_logits.t(), lbl))
@@ -217,19 +246,14 @@ def evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, de
             seen.add(cur); cur = parent[cur]; out.add(cur)
         return out
     cand = sorted({c["parent"] for c in tr + te if c["parent"]})
-    if isa_mode == "meaning":
-        cand_text = [node_text.get(p, parent_name_text(p)) for p in cand]
-        cand_emb = F.normalize(p_head(encode_texts(enc, vocab, cand_text, device)), dim=-1)
-    else:
-        cand_emb = encode_texts(enc, vocab, [parent_name_text(p) for p in cand], device)
+    cand_emb = parent_keys(enc, p_head, vocab, node_text, cand, device, isa_mode)
     train_parents = {c["parent"] for c in tr if c["parent"]}
 
     def isa_eval(group):
         rows = [c for c in group if c["parent"]]
         if not rows:
             return None
-        q, _ = isa_qk(enc, c_head, p_head, vocab, node_text, rows, device, isa_mode)
-        pick = (q @ cand_emb.t()).argmax(1).tolist()
+        pick = concept_scores(enc, c_head, vocab, rows, cand_emb, device, isa_mode).argmax(1).tolist()
         recs = []
         for c, pi in zip(rows, pick):
             pred = cand[pi]
@@ -324,8 +348,9 @@ def main(argv=None):
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default=None)
-    ap.add_argument("--isa-mode", choices=["name", "meaning"], default="name",
-                    help="is-a probe keying: 'name' (parent name, stronger) or 'meaning' (parent gloss)")
+    ap.add_argument("--isa-mode", choices=["name", "meaning", "copy"], default="name",
+                    help="is-a probe: 'name' (pooled gloss vs parent name), 'meaning' (parent gloss), "
+                         "'copy' (attention/copy -- best-matching gloss WORD vs parent name)")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return 0
