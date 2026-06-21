@@ -189,13 +189,19 @@ def respond(agent, text, topk=10):
         p_hat, parts, lemma = cands[0], [], "this"
     cat = M.parent_name_text(p_hat)
     written = agent["gen"].write(lemma, cat, parts)          # WRITE (pretrained LM, fluent)
-    facts = brain_facts_about(brain, p_hat)
-    out = [f"  understood as : a {cat}",
-           f"  my definition: {written}",
-           f"  brain proves about '{cat}': {facts}"]
-    if known is not None:
-        ok = brain._atom_term(("isa", (known["name"], p_hat)))[0]
-        out.append(f"  [known: {known['name']}] is-a {cat} -> {'KERNEL-PROVEN' if ok else 'unproven'}")
+    # BRAIN-GATE the confidence: commit only when the brain PROVES the comprehended category; else hedge,
+    # so a fluent-but-wrong definition is never asserted as fact (model proposes, brain proves).
+    proven = (known is not None) and brain._atom_term(("isa", (known["name"], p_hat)))[0]
+    if known is None:
+        out = [f"  (novel input -- can't kernel-verify; best guess) a {cat}",
+               f"  tentative definition: {written}"]
+    elif proven:
+        out = [f"  understood as : a {cat}   [KERNEL-PROVEN]",
+               f"  my definition: {written}"]
+    else:
+        out = [f"  uncertain: my best guess is 'a {cat}', but the BRAIN CANNOT PROVE it -- not asserting",
+               f"  (tentative) {written}"]
+    out.append(f"  brain proves about '{cat}': {brain_facts_about(brain, p_hat)}")
     return "\n".join(out)
 
 
