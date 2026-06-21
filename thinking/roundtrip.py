@@ -94,6 +94,8 @@ def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose
     concepts, parent, _nt, relations = M.gather(per_pos=per_pos, seed=seed)
     tr, te = M.split(concepts, 0.25, seed)
     brain = M.build_brain(concepts, relations)
+    dfacts = direct_facts(concepts, relations)               # per-concept descriptive facts for writing
+    banc = M.brain_ancestor_index(brain)                     # node -> is-a ancestors (for top-k select)
     idx = {id(c): i for i, c in enumerate(concepts)}
     names = [c["name"] for c in concepts]
 
@@ -109,8 +111,8 @@ def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose
             log=(max(1, steps // 5) if verbose else 0))
 
     # ---- WRITER (prover.py seq2seq): recovered facts -> definition in the agent's own words ----
-    wpairs = write_pairs(tr)                                 # TRAIN only on training pairs
-    wvocab = P.Vocab.build(write_pairs(concepts))            # token inventory over all (held words encode)
+    wpairs = write_pairs(tr, dfacts)                         # TRAIN only on training pairs
+    wvocab = P.Vocab.build(write_pairs(concepts, dfacts))    # token inventory over all (held words encode)
     block = 96
     wmodel = P.build_model(len(wvocab), block, d=min(256, d), layers=4, heads=8)
     P.train(wmodel, wvocab, wpairs, steps=write_steps, device=device, batch=32, block=block,
@@ -123,13 +125,23 @@ def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose
         cand_emb = torch.nn.functional.normalize(
             M.enc_rows(enc, cache["pname_T"], torch.arange(len(pnames), device=device)), dim=-1)
 
-    @torch.no_grad()
-    def comprehend(ci):                                      # def -> predicted is-a parent (copy pointer)
-        sel = torch.tensor([ci], dtype=torch.long, device=device)
-        pj = M.isa_scores(enc, cache, sel, cand_emb, "copy", temp=1.0).argmax(1).item()
-        return pnames[pj]
+    topk = 5
 
-    comp_ok = comp_proven = n = 0
+    @torch.no_grad()
+    def comprehend(ci, C):
+        """BRAIN-ASSISTED comprehension: the model proposes its top-k parents; the BRAIN keeps the ones
+        it can prove for C and picks the MOST SPECIFIC (deepest) -> recovers a provable ancestor far
+        more often than top-1. Returns (top1, brain_pick, top1_proven, anyk_proven)."""
+        sel = torch.tensor([ci], dtype=torch.long, device=device)
+        sc = M.isa_scores(enc, cache, sel, cand_emb, "copy", temp=1.0)[0]
+        order = sc.topk(min(topk, len(pnames))).indices.tolist()
+        cands = [pnames[j] for j in order]
+        top1 = cands[0]
+        provable = [x for x in cands if brain._atom_term(("isa", (C, x)))[0]]   # brain gatekeeps
+        pick = max(provable, key=lambda x: len(banc.get(x, ()))) if provable else top1  # most specific
+        return top1, pick, top1 in provable, bool(provable)
+
+    comp_ok = comp_proven = comp_top1 = recall_k = n = 0
     raw_claims = raw_proven = grounded_proven = filt_recovered = 0
     shows = []
     for ci in te_idx.tolist():
@@ -137,19 +149,20 @@ def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose
             continue
         n += 1
         C, true_parent = names[ci], pnames[cache["par_idx"][ci].item()]
-        p_hat = comprehend(ci)                               # COMPREHEND
+        top1, p_hat, top1_proven, anyk = comprehend(ci, C)   # COMPREHEND (brain-assisted)
+        comp_top1 += int(top1_proven); recall_k += int(anyk)
         comp_ok += int(p_hat == true_parent)
-        comp_grounded = brain._atom_term(("isa", (C, p_hat)))[0]          # BRAIN proves comprehension
+        comp_grounded = brain._atom_term(("isa", (C, p_hat)))[0]
         comp_proven += int(comp_grounded)
-        gen = P.emit(wmodel, wvocab, {"gtoks": facts_gtoks(names_pos(concepts, ci), p_hat)},
-                     device, block)                           # WRITE freely
-        # BRAIN-FILTERED generation: parse EVERY is-a claim in the text; the brain keeps only the
-        # PROVABLE ones -> the agent's response carries only kernel-verified content (gatekept).
+        # RICHER faithful writing: condition the writer on the FULL brain-verified fact-set of C
+        facts = [("isa", p_hat)] + dfacts.get(C, [])
+        gen = P.emit(wmodel, wvocab, {"gtoks": facts_gtoks(names_pos(concepts, ci), facts)},
+                     device, block)                           # WRITE from the verified fact-set
+        # BRAIN-FILTERED generation: keep only the kernel-PROVABLE is-a claims (gatekept response).
         claims = all_parent_claims(gen, cand_lemmas)
         proven = [x for x in claims if brain._atom_term(("isa", (C, x)))[0]]
         raw_claims += len(claims); raw_proven += len(proven)
-        filt_recovered += int(len(proven) > 0)               # >=1 true is-a survives the filter
-        # GROUNDED claim: the agent ASSERTS its brain-verified comprehension ("a {p_hat}")
+        filt_recovered += int(len(proven) > 0)
         grounded_proven += int(comp_grounded)
         if len(shows) < n_show:
             kept = M.parent_name_text(proven[0]) if proven else "(none survive)"
@@ -157,13 +170,16 @@ def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose
                           " ".join(gen[:14]), kept))
 
     res = dict(n=n, comp_acc=comp_ok / max(1, n), comp_kernel=comp_proven / max(1, n),
+               comp_top1=comp_top1 / max(1, n), recall_at_k=recall_k / max(1, n),
                raw_write_faith=raw_proven / max(1, raw_claims),
                filtered_recall=filt_recovered / max(1, n),
                grounded_faith=grounded_proven / max(1, n))
     if verbose:
         print("\n== ROUND-TRIP: read def -> COMPREHEND -> WRITE -> BRAIN GATEKEEPS (model proposes, brain proves) ==")
         print(f"  {n} held-out concepts | brain {len(brain.known)} kernel-closed facts")
-        print(f"  COMPREHEND     : parent acc {res['comp_acc']:.3f} | brain-PROVEN {res['comp_kernel']:.3f}")
+        print(f"  COMPREHEND     : top-1 proven {res['comp_top1']:.3f} -> BRAIN-ASSISTED (top-{topk}, brain "
+              f"picks provable) {res['comp_kernel']:.3f} | recall@{topk} {res['recall_at_k']:.3f} | exact "
+              f"parent {res['comp_acc']:.3f}")
         print(f"  WRITE (raw)    : of all is-a claims the writer makes, brain-PROVEN {res['raw_write_faith']:.3f}"
               f"  <- a free LM hallucinates")
         print(f"  WRITE (FILTERED): >=1 true is-a survives the brain filter for {res['filtered_recall']:.3f} "
@@ -214,17 +230,18 @@ def load_agent(path, device="cpu"):
                                            torch.arange(len(pnames), device=device)), dim=-1)
     return dict(enc=enc, pos_head=pos_head, wmodel=wmodel, wvocab=wvocab, vocab=vocab, cache=cache,
                 brain=brain, concepts=concepts, names=[c["name"] for c in concepts], pnames=pnames,
-                cand_emb=cand_emb, block=cfg["block"], device=device)
+                cand_emb=cand_emb, block=cfg["block"], device=device,
+                dfacts=direct_facts(concepts, relations), banc=M.brain_ancestor_index(brain))
 
 
 @torch.no_grad()
-def comprehend_text(bundle, text):
-    """Free text (a prompt) -> the brain category the agent reads it as (copy pointer over gloss words)."""
+def comprehend_text(bundle, text, k=5):
+    """Free text (a prompt) -> the agent's top-k candidate brain categories (copy pointer over words)."""
     words = [bundle["vocab"].encode(w, 18) for w in M.gloss_words(text)]
     Tw, Tm = M.pad_words_to_tensor([words], bundle["device"])
     we, mask = M.enc_word_rows(bundle["enc"], Tw, Tm, torch.tensor([0], device=bundle["device"]))
-    s = torch.einsum("bwd,pd->bwp", we, bundle["cand_emb"]).masked_fill(~mask.unsqueeze(-1), -1e4).max(1).values
-    return bundle["pnames"][s.argmax(1).item()]
+    s = torch.einsum("bwd,pd->bwp", we, bundle["cand_emb"]).masked_fill(~mask.unsqueeze(-1), -1e4).max(1).values[0]
+    return [bundle["pnames"][j] for j in s.topk(min(k, len(bundle["pnames"]))).indices.tolist()]
 
 
 def brain_facts_about(brain, node, k=8):
@@ -238,12 +255,18 @@ def respond(bundle, text):
     key = text.strip().lower()
     known = next((i for i, nm in enumerate(bundle["names"])
                   if nm == key or M.parent_name_text(nm) == key), None)
-    if known is not None:                                    # a known concept: read its own gloss
-        pos = bundle["concepts"][known]["pos"]
-        p_hat = comprehend_text(bundle, bundle["concepts"][known]["views"][0])
-    else:                                                    # a free description (a prompt)
-        pos, p_hat = "n", comprehend_text(bundle, text)
-    gen = P.emit(bundle["wmodel"], bundle["wvocab"], {"gtoks": facts_gtoks(pos, p_hat)},
+    brain = bundle["brain"]
+    if known is not None:                                    # known concept: read its gloss, BRAIN-ASSIST
+        C = bundle["names"][known]; pos = bundle["concepts"][known]["pos"]
+        cands = comprehend_text(bundle, bundle["concepts"][known]["views"][0])
+        provable = [x for x in cands if brain._atom_term(("isa", (C, x)))[0]]
+        p_hat = max(provable, key=lambda x: len(bundle["banc"].get(x, ()))) if provable else cands[0]
+        facts = [("isa", p_hat)] + bundle["dfacts"].get(C, [])
+    else:                                                    # free description (novel): top-1, unverified
+        C, pos = None, "n"
+        p_hat = comprehend_text(bundle, text)[0]
+        facts = [("isa", p_hat)]
+    gen = P.emit(bundle["wmodel"], bundle["wvocab"], {"gtoks": facts_gtoks(pos, facts)},
                  bundle["device"], bundle["block"])
     cat = M.parent_name_text(p_hat)
     out = [f"  understood as : a {cat}",
