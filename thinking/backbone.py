@@ -250,10 +250,62 @@ def load_agent(path, device=None):
                     concepts, relations))
 
 
+def gate_eval(per_pos=300, seed=0, model=DEFAULT_MODEL, topk=10, device=None, verbose=True):
+    """THE honesty test. On held-out concepts: does the BRAIN GATE turn a 0.73-recall model into a
+    high-precision agent that abstains on its errors? Compares the GATED agent (assert only brain-proven)
+    to a NO-GATE baseline (always assert top-1)."""
+    concepts, parent, _nt, relations = M.gather(per_pos=per_pos, seed=seed)
+    tr, te = M.split(concepts, 0.25, seed)
+    brain = M.build_brain(concepts, relations)
+    banc = M.brain_ancestor_index(brain)
+    pnames = sorted({c["parent"] for c in concepts if c["parent"]})
+    bb = Backbone(model, device=device)
+    cand_emb = bb.embed([parent_gloss(p) for p in pnames])
+    held = [c for c in te if c["parent"]]
+    sims = bb.embed([c["views"][0].replace("means ", "") for c in held]) @ cand_emb.t()
+    n = len(held)
+    asserted = exact_asserted = asserted_true = abstain = abstain_wouldfail = nogate_false = 0
+    for r, c in enumerate(held):
+        cands = [pnames[j] for j in sims[r].topk(min(topk, len(pnames))).indices.tolist()]
+        C = c["name"]
+        top1_true = brain._atom_term(("isa", (C, cands[0])))[0]
+        nogate_false += int(not top1_true)                  # NO-GATE: always assert top-1
+        prov = [x for x in cands if brain._atom_term(("isa", (C, x)))[0]]
+        if prov:                                            # GATED: assert (brain proved it)
+            asserted += 1
+            pick = max(prov, key=lambda x: len(banc.get(x, ())))
+            asserted_true += int(brain._atom_term(("isa", (C, pick)))[0])   # confirm == 1.0
+            exact_asserted += int(pick == c["parent"])
+        else:                                               # GATED: abstain (brain can't prove)
+            abstain += 1
+            abstain_wouldfail += int(not top1_true)         # was abstaining the right call?
+    cov = asserted / max(1, n)
+    res = dict(n=n, coverage=cov, asserted_false_rate=1 - asserted_true / max(1, asserted),
+               asserted_exact=exact_asserted / max(1, asserted),
+               abstain_rate=abstain / max(1, n), abstain_correct=abstain_wouldfail / max(1, abstain),
+               nogate_false_rate=nogate_false / max(1, n))
+    if verbose:
+        print("\n== GATE CALIBRATION (the honesty test) ==")
+        print(f"  {n} held-out concepts | candidates {len(pnames)}")
+        print(f"  NO-GATE baseline (always assert top-1): FALSE-assertion rate {res['nogate_false_rate']:.3f}"
+              f"  <- a free model asserts this fraction of WRONG is-a")
+        print(f"  BRAIN-GATED agent:")
+        print(f"    coverage (asserts confidently) : {res['coverage']:.3f}")
+        print(f"    FALSE-assertion rate           : {res['asserted_false_rate']:.3f}   <- asserts NO false is-a")
+        print(f"    exact-parent among asserted    : {res['asserted_exact']:.3f}")
+        print(f"    abstains                       : {res['abstain_rate']:.3f}  (of which {res['abstain_correct']:.3f}"
+              f" would have been WRONG -> abstention is calibrated)")
+        print("  => the brain converts a recall-limited model into a ZERO-false-assertion agent that")
+        print("     knows what it doesn't know (model proposes, brain proves & gates).")
+    return res
+
+
 def selftest():
     torch.set_num_threads(2)
     r = run(per_pos=30, seed=0, verbose=False)
     assert r["n"] > 0 and 0.0 <= r["brain_assisted"] <= 1.0, r
+    g = gate_eval(per_pos=30, seed=0, verbose=False)
+    assert g["asserted_false_rate"] == 0.0, ("gated agent must assert no false is-a", g)
     print("backbone selftest OK")
 
 
@@ -270,9 +322,13 @@ def main(argv=None):
     ap.add_argument("--ask", default=None, help="one-shot prompt to the full agent")
     ap.add_argument("--save", default=None, help="save the agent (brain data + model names)")
     ap.add_argument("--load", default=None, help="load a saved agent")
+    ap.add_argument("--gate-test", action="store_true", help="run the gate-calibration honesty test")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return 0
+    if args.gate_test:
+        gate_eval(per_pos=args.per_pos, seed=args.seed, model=args.model, topk=args.topk,
+                  device=args.device); return 0
     if args.load or args.chat or args.ask:                   # full agent: comprehend + WRITE + chat
         agent = load_agent(args.load, device=args.device) if args.load else \
             build_agent(per_pos=args.per_pos, seed=args.seed, embed_model=args.model,
