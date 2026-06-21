@@ -147,8 +147,21 @@ def encode_texts(enc, vocab, texts, device):
     return enc(x.to(device), l)
 
 
+def isa_qk(enc, c_head, p_head, vocab, node_text, rows, device, isa_mode):
+    """Embeddings for the is-a probe. 'name' (default, stronger): match the concept's gloss to the
+    parent's NAME (which often appears in the gloss), raw embeddings. 'meaning': match concept gloss to
+    parent GLOSS through learned projection heads (reuses the contrastive space)."""
+    q_in = encode_texts(enc, vocab, [c["views"][0] for c in rows], device)
+    if isa_mode == "meaning":
+        ptext = [node_text.get(c["parent"], parent_name_text(c["parent"])) for c in rows]
+        k_in = encode_texts(enc, vocab, ptext, device)
+        return F.normalize(c_head(q_in), dim=-1), F.normalize(p_head(k_in), dim=-1)
+    k_in = encode_texts(enc, vocab, [parent_name_text(c["parent"]) for c in rows], device)
+    return q_in, k_in
+
+
 def train(enc, pos_head, c_head, p_head, vocab, node_text, tr, steps, device, batch=128, lr=1e-3,
-          temp=0.07, lam_isa=1.0, lam_pos=0.3, seed=0, log=0):
+          temp=0.07, lam_isa=1.0, lam_pos=0.3, seed=0, log=0, isa_mode="name"):
     rng = np.random.default_rng(seed); torch.manual_seed(seed)
     params = (list(enc.parameters()) + list(pos_head.parameters())
               + list(c_head.parameters()) + list(p_head.parameters()))
@@ -163,13 +176,10 @@ def train(enc, pos_head, c_head, p_head, vocab, node_text, tr, steps, device, ba
         logits = a @ b.t() / temp                            # InfoNCE (CLIP-style, in-batch negatives)
         labels = torch.arange(len(bc), device=device)
         loss = 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels))
-        # is-a probe: a concept's MEANING (via c_head) should match its PARENT's MEANING (via p_head) --
-        # meaning<->meaning hypernymy, reusing the contrastive space (parent keyed by its gloss, not name)
+        # is-a probe: concept def -> its PARENT (keyed by name or meaning; see isa_qk), in-batch
         nv = [c for c in bc if c["parent"]]
         if nv:
-            q = F.normalize(c_head(encode_texts(enc, vocab, [c["views"][0] for c in nv], device)), dim=-1)
-            ptext = [node_text.get(c["parent"], parent_name_text(c["parent"])) for c in nv]
-            k = F.normalize(p_head(encode_texts(enc, vocab, ptext, device)), dim=-1)
+            q, k = isa_qk(enc, c_head, p_head, vocab, node_text, nv, device, isa_mode)
             isa_logits = q @ k.t() / temp
             lbl = torch.arange(len(nv), device=device)
             loss = loss + lam_isa * 0.5 * (F.cross_entropy(isa_logits, lbl)
@@ -186,7 +196,7 @@ def train(enc, pos_head, c_head, p_head, vocab, node_text, tr, steps, device, ba
 # Eval: zero-shot retrieval + brain-verified is-a (seen/unseen parent) + POS accuracy
 # ===================================================================================================
 @torch.no_grad()
-def evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, device):
+def evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, device, isa_mode="name"):
     enc.eval(); pos_head.eval(); c_head.eval(); p_head.eval()
 
     # --- (1) zero-shot meaning retrieval: held-out definition -> its OWN synonyms among all held syn ---
@@ -207,15 +217,18 @@ def evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, de
             seen.add(cur); cur = parent[cur]; out.add(cur)
         return out
     cand = sorted({c["parent"] for c in tr + te if c["parent"]})
-    cand_text = [node_text.get(p, parent_name_text(p)) for p in cand]   # parents keyed by MEANING
-    cand_emb = F.normalize(p_head(encode_texts(enc, vocab, cand_text, device)), dim=-1)
+    if isa_mode == "meaning":
+        cand_text = [node_text.get(p, parent_name_text(p)) for p in cand]
+        cand_emb = F.normalize(p_head(encode_texts(enc, vocab, cand_text, device)), dim=-1)
+    else:
+        cand_emb = encode_texts(enc, vocab, [parent_name_text(p) for p in cand], device)
     train_parents = {c["parent"] for c in tr if c["parent"]}
 
     def isa_eval(group):
         rows = [c for c in group if c["parent"]]
         if not rows:
             return None
-        q = F.normalize(c_head(encode_texts(enc, vocab, [c["views"][0] for c in rows], device)), dim=-1)
+        q, _ = isa_qk(enc, c_head, p_head, vocab, node_text, rows, device, isa_mode)
         pick = (q @ cand_emb.t()).argmax(1).tolist()
         recs = []
         for c, pi in zip(rows, pick):
@@ -252,7 +265,8 @@ def evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, de
         pos_acc=pos_acc)
 
 
-def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose=True, out=None):
+def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose=True, out=None,
+        isa_mode="name"):
     concepts, parent, node_text = gather(per_pos=per_pos, seed=seed)
     tr, te = split(concepts, 0.25, seed)
     vocab = CharVocab([v for c in tr for v in c["views"]]
@@ -267,8 +281,8 @@ def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose
         print(f"  WordNet ALL-POS | {len(concepts)} concepts {dict(pc)} | train {len(tr)}/held {len(te)}"
               f" | char-vocab {len(vocab)} | views=def/syn/example | device {device}", flush=True)
     train(enc, pos_head, c_head, p_head, vocab, node_text, tr, steps, device, batch=batch, seed=seed,
-          log=(max(1, steps // 6) if verbose else 0))
-    r = evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, device)
+          isa_mode=isa_mode, log=(max(1, steps // 6) if verbose else 0))
+    r = evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, device, isa_mode)
     if verbose:
         print("\n== MEANING: contrastive multi-view embedding + brain-verified relational probe ==")
         print(f"  CONTRASTIVE retrieval (held-out def -> its own synonyms, {r['n_retr']} concepts): "
@@ -310,6 +324,8 @@ def main(argv=None):
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--isa-mode", choices=["name", "meaning"], default="name",
+                    help="is-a probe keying: 'name' (parent name, stronger) or 'meaning' (parent gloss)")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return 0
@@ -317,7 +333,7 @@ def main(argv=None):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     run(args.steps, seed=args.seed, per_pos=args.per_pos, d=args.d, device=device,
-        batch=args.batch, out=args.out)
+        batch=args.batch, out=args.out, isa_mode=args.isa_mode)
     return 0
 
 
