@@ -200,16 +200,19 @@ def build_chat(embedder_path=None, max_concepts=None, device=None, gen=True, ver
 def _resolve(text, gloss):
     """Map a word/synset-name to a known WordNet concept (with a definition), else None (free text)."""
     from nltk.corpus import wordnet as wn
-    key = text.strip().lower()
+    key = text.strip().lower().replace(" ", "_")
     if key in gloss:
         return key
     try:
-        for s in wn.synsets(key.replace(" ", "_")):
-            if s.name() in gloss:
-                return s.name()
+        cands = [s for s in wn.synsets(key) if s.name() in gloss]
     except Exception:
-        pass
-    return None
+        cands = []
+    if not cands:
+        return None
+    # prefer the EPONYMOUS sense -- a synset literally named for the word (e.g. whale.n.02) over senses
+    # where the word is only a synonym (e.g. giant.n.04 where 'whale' = a huge person). Avoids WSD slips.
+    named = [s for s in cands if s.name().split(".")[0] == key]
+    return (named or cands)[0].name()
 
 
 @torch.no_grad()
@@ -240,9 +243,56 @@ def chat_respond(agent, text, topk=10):
                       f"  brain: {cat} is-a -> {anc_chain or '(root)'}"])
 
 
+def _hyper_path(name):
+    """Ordered leaf..root is-a path of a synset (the brain's is-a structure for explanations)."""
+    from nltk.corpus import wordnet as wn
+    try:
+        return [x.name() for x in wn.synset(name).hypernym_paths()[0]][::-1]
+    except Exception:
+        return [name]
+
+
+def relate(agent, x, y):
+    """Answer 'is an X a Y?' AND EXPLAIN WHY, faithfully from the brain's is-a structure:
+    YES -> the is-a chain (transitivity); NO -> the disjointness witness (separate branches)."""
+    M = agent["M"]
+    C = _resolve(x, agent["gloss"]) or x
+    B = _resolve(y, agent["gloss"]) or y
+    pc, pb = _hyper_path(C), _hyper_path(B)
+    pcset, pbset = set(pc), set(pb)
+    cn, bn = M.parent_name_text(C), M.parent_name_text(B)
+    if B in pcset:                                           # YES: walk the is-a chain C -> ... -> B
+        chain = pc[:pc.index(B) + 1]
+        steps = " -> ".join(M.parent_name_text(z) for z in chain)
+        return (f"YES -- a {cn} IS a {bn}.\n"
+                f"  why: {steps}  (each is a kind of the next; is-a is transitive, so the brain proves "
+                f"a {cn} is a {bn}).")
+    if C in pbset:
+        return f"It's the other way around: a {bn} is a {cn}, not a {cn} is a {bn}."
+    lca = next((z for z in pc if z in pbset), None)          # LOWEST common ancestor
+    if lca is not None:
+        cbranch = pc[pc.index(lca) - 1] if pc.index(lca) > 0 else C   # C-side child of the LCA
+        return (f"NO -- a {cn} is NOT a {bn}.\n"
+                f"  why: a {cn} is a {M.parent_name_text(cbranch)}; under {M.parent_name_text(lca)}, a "
+                f"{M.parent_name_text(cbranch)} and a {bn} are separate, mutually exclusive kinds -- "
+                f"nothing is both -- so a {cn} cannot be a {bn}.")
+    return f"  the brain can't relate '{cn}' and '{bn}' (no shared is-a ancestry)."
+
+
+_REL = __import__("re").compile(r"is\s+(?:an?\s+)?(.+?)\s+(?:an?\s+)(.+?)\??$", __import__("re").I)
+
+
+def answer(agent, text):
+    """Dispatch: 'is a X a Y?' -> relate+explain; otherwise comprehend+define."""
+    m = _REL.match(text.strip())
+    if m:
+        return relate(agent, m.group(1).strip(), m.group(2).strip())
+    return chat_respond(agent, text)
+
+
 def chat(agent):
-    print("\n== CHAT with the FINE-TUNED full-WordNet agent -- a word or a definition; blank to quit ==",
-          flush=True)
+    print("\n== CHAT with the FINE-TUNED full-WordNet agent -- a word, a definition, or 'is a X a Y?'; "
+          "blank to quit ==", flush=True)
     while True:
         try:
             line = input("you> ").strip()
@@ -250,7 +300,7 @@ def chat(agent):
             break
         if not line:
             break
-        print(chat_respond(agent, line), flush=True)
+        print(answer(agent, line), flush=True)
 
 
 def selftest():
@@ -279,7 +329,7 @@ def main(argv=None):
     if args.chat or args.ask:                                # CHAT with the fine-tuned full-WordNet agent
         agent = build_chat(embedder_path=args.load, max_concepts=args.max_concepts, device=args.device)
         if args.ask:
-            print(chat_respond(agent, args.ask), flush=True)
+            print(answer(agent, args.ask), flush=True)
         if args.chat or not args.ask:
             chat(agent)
         return 0
