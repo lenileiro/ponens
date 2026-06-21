@@ -125,7 +125,7 @@ def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose
         cand_emb = torch.nn.functional.normalize(
             M.enc_rows(enc, cache["pname_T"], torch.arange(len(pnames), device=device)), dim=-1)
 
-    topk = 5
+    topk = 10
 
     @torch.no_grad()
     def comprehend(ci, C):
