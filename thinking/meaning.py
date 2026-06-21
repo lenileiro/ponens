@@ -68,6 +68,28 @@ def gather(per_pos=150, seed=0, max_anc=64):
             seen.add(cur); cur = parent[cur]; out.append(cur)
         return out
 
+    # MORE LANGUAGE DIMENSIONS -> relations the brain can reason over (collected for every node on the
+    # is-a paths, so inheritable relations attach at ancestors too). Synset-level + lemma-level edges.
+    RELS = {"has_part": lambda s: s.part_meronyms(), "made_of": lambda s: s.substance_meronyms(),
+            "member_of": lambda s: s.member_holonyms(), "entails": lambda s: s.entailments(),
+            "causes": lambda s: s.causes(), "similar": lambda s: s.similar_tos()}
+    relations = {k: set() for k in RELS}
+    relations["antonym"] = set(); relations["derived"] = set()
+    seen_nodes = set()
+
+    def collect(x):
+        if x.name() in seen_nodes:
+            return
+        seen_nodes.add(x.name())
+        for k, fn in RELS.items():
+            for o in fn(x):
+                relations[k].add((x.name(), o.name()))
+        for lem in x.lemmas():
+            for a in lem.antonyms():
+                relations["antonym"].add((x.name(), a.synset().name()))
+            for dform in lem.derivationally_related_forms():
+                relations["derived"].add((x.name(), dform.synset().name()))
+
     concepts = []
     for s in chosen:
         pos = "a" if s.pos() in ("a", "s") else s.pos()
@@ -77,18 +99,63 @@ def gather(per_pos=150, seed=0, max_anc=64):
             views.append(f"also called {syn}")
         if s.examples():
             views.append(f"as in {s.examples()[0]}")
-        ants = sorted({a.name() for l in s.lemmas() for a in l.antonyms()})
+        ants = sorted({a.name() for lem in s.lemmas() for a in lem.antonyms()})
         node_text.setdefault(s.name(), views[0])
+        collect(s)                                           # relations on the concept (incl. adj/adv)
+        for x in (s.hypernym_paths()[0] if s.hypernym_paths() else []):
+            collect(x)                                       # + on each is-a ancestor (for inheritance)
         concepts.append(dict(
             name=s.name(), pos=pos, syn=syn, views=views,
             parent=parent.get(s.name()), ancestors=ancestors(s.name()), antonyms=ants))
-    return concepts, parent, node_text
+    return concepts, parent, node_text, relations
 
 
 def split(concepts, held_frac=0.25, seed=0):
     idx = np.arange(len(concepts)); np.random.default_rng(seed).shuffle(idx)
     cut = int(len(concepts) * (1 - held_frac))
     return [concepts[i] for i in idx[:cut]], [concepts[i] for i in idx[cut:]]
+
+
+def build_brain(concepts, relations=None):
+    """The provable BRAIN (THE purpose of the project): datalog closure + KERNEL proofs + BDD types.
+    Many LANGUAGE DIMENSIONS map to RELATIONS + RULES the brain reasons over:
+      is-a         (hypernym)            -- TRANSITIVE
+      has_part/made_of/member_of         -- INHERITED DOWN is-a (a bird has wings => a robin has wings)
+      entails      (verb entailment)     -- TRANSITIVE (walk => move => ...)
+      causes       (verb causation)      -- direct
+      similar / antonym / derived        -- SYMMETRIC
+    Meaning counts only when the brain returns a KERNEL-CHECKED proof term; negations ("X is NOT a Y")
+    are proved from category disjointness via exclusion axioms. The model PROPOSES, the brain PROVES."""
+    import thinking.lota_kernel as LK
+    facts = []
+    for c in concepts:
+        chain = [c["name"]] + c["ancestors"]                 # name -> parent -> ... -> root
+        for ch, pa in zip(chain, chain[1:]):
+            facts.append(("isa", (ch, pa)))
+    preds = {"isa": 2}
+    rules = [(("isa", ("?x", "?z")), [("isa", ("?x", "?y")), ("isa", ("?y", "?z"))])]   # transitivity
+    for pred, edges in (relations or {}).items():
+        if not edges:
+            continue
+        preds[pred] = 2
+        facts += [(pred, e) for e in edges]
+        if pred in ("has_part", "made_of", "member_of"):     # inherited down the is-a chain
+            rules.append(((pred, ("?x", "?p")), [("isa", ("?x", "?y")), (pred, ("?y", "?p"))]))
+        elif pred == "entails":                              # transitive verb implication
+            rules.append((("entails", ("?x", "?z")), [("entails", ("?x", "?y")), ("entails", ("?y", "?z"))]))
+        elif pred in ("similar", "antonym", "derived"):      # symmetric
+            rules.append(((pred, ("?x", "?y")), [(pred, ("?y", "?x"))]))
+    ents = sorted({x for (_p, e) in facts for x in e})
+    return LK.KB(ents, preds, facts, rules, build_types=True, eager_closure=True)
+
+
+def brain_ancestor_index(brain):
+    """node -> set of is-a ancestors, read off the brain's verified closure (kb.known)."""
+    idx = {}
+    for (p, a) in brain.known:
+        if p == "isa" and len(a) == 2:
+            idx.setdefault(a[0], set()).add(a[1])
+    return idx
 
 
 def parent_name_text(name):
@@ -290,7 +357,8 @@ def train(enc, pos_head, cache, tr_idx, steps, device, batch=128, lr=1e-3,
 # Eval: zero-shot retrieval + brain-verified is-a (seen/unseen parent) + POS accuracy
 # ===================================================================================================
 @torch.no_grad()
-def evaluate(enc, pos_head, cache, tr_idx, te_idx, parent, device, isa_mode="copy"):
+def evaluate(enc, pos_head, cache, tr_idx, te_idx, parent, device, isa_mode="copy",
+             brain=None, names=None, kp_cap=200, neg_cap=60):
     enc.eval(); pos_head.eval()
     te_set = te_idx.tolist()
 
@@ -338,6 +406,37 @@ def evaluate(enc, pos_head, cache, tr_idx, te_idx, parent, device, isa_mode="cop
     unseen = [r for r in te_isa if not r["seen"]]
     agg = lambda rs, k: (sum(r[k] for r in rs) / len(rs)) if rs else 0.0
 
+    # --- (2b) BRAIN INTEGRATION: verify the model's is-a claims with KERNEL PROOFS (the project's
+    #          purpose -- model proposes, the brain proves), and PROVE negations via the BDD type
+    #          disjointness/exclusion axioms. faith here = fraction of conveyed facts the kernel proves.
+    kp = dict(proven=0, conveyed=0, recovered=0, true=0, n=0, neg_proven=0, neg_n=0)
+    if brain is not None and names is not None:
+        banc = brain_ancestor_index(brain)
+        rows = [i for i in te_set if cache["par_idx"][i].item() >= 0][:kp_cap]
+        if rows:
+            sel = torch.tensor(rows, dtype=torch.long, device=device)
+            pick = isa_scores(enc, cache, sel, cand_emb, isa_mode, temp=1.0).argmax(1).tolist()
+            kp["n"] = len(rows)
+            for ci, pj in zip(rows, pick):
+                C, P = names[ci], pnames[pj]
+                conveyed = {P} | banc.get(P, set())          # brain derives the chain above P
+                pv = [x for x in conveyed if brain._atom_term(("isa", (C, x)))[0]]   # KERNEL-checked
+                truec = banc.get(C, set())
+                kp["proven"] += len(pv); kp["conveyed"] += len(conveyed)
+                kp["recovered"] += len(set(pv) & truec); kp["true"] += len(truec)
+            # negation: prove "C is NOT B" from category disjointness (exclusion axioms)
+            allcats = sorted({a for s in banc.values() for a in s})
+            rng = np.random.default_rng(0)
+            for ci in rows[:neg_cap]:
+                C, truec = names[ci], banc.get(names[ci], set())
+                cands = [b for b in allcats if b not in truec and b != names[ci]]
+                if not cands:
+                    continue
+                B = cands[int(rng.integers(0, len(cands)))]
+                kp["neg_n"] += 1
+                st = brain._prove_core(("not", ("atom", "isa", (C, B))))
+                kp["neg_proven"] += int(st.get("status") == "proven")
+
     # --- (3) POS classification accuracy on held-out ---
     pred = pos_head(enc_rows(enc, cache["def_T"], te_idx)).argmax(1)
     pos_acc = (pred == cache["pos_lab"][te_idx]).float().mean().item()
@@ -350,18 +449,23 @@ def evaluate(enc, pos_head, cache, tr_idx, te_idx, parent, device, isa_mode="cop
                       recall=agg(seen, "recall")),
         isa_unseen=dict(n=len(unseen), parent=agg(unseen, "parent_ok"), faith=agg(unseen, "faith"),
                         recall=agg(unseen, "recall")),
-        pos_acc=pos_acc)
+        pos_acc=pos_acc,
+        kernel_faith=kp["proven"] / max(1, kp["conveyed"]),
+        kernel_recall=kp["recovered"] / max(1, kp["true"]),
+        kernel_n=kp["n"], neg_proven=kp["neg_proven"] / max(1, kp["neg_n"]), neg_n=kp["neg_n"])
 
 
 def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose=True, out=None,
         isa_mode="copy", encoder="cnn"):
-    concepts, parent, _node_text = gather(per_pos=per_pos, seed=seed)
+    concepts, parent, _node_text, relations = gather(per_pos=per_pos, seed=seed)
     tr, te = split(concepts, 0.25, seed)
     idx = {id(c): i for i, c in enumerate(concepts)}
+    names = [c["name"] for c in concepts]
     vocab = CharVocab([v for c in tr for v in c["views"]]
                       + [parent_name_text(c["parent"]) for c in tr if c["parent"]])
     # VECTORIZE: encode every text into fixed-width id TENSORS ONCE; train/eval are pure GPU indexing.
     cache = build_cache(concepts, vocab, device)
+    brain = build_brain(concepts, relations)                 # provable BRAIN: many relations + rules
     tr_idx = torch.tensor([idx[id(c)] for c in tr], dtype=torch.long, device=device)
     te_idx = torch.tensor([idx[id(c)] for c in te], dtype=torch.long, device=device)
     enc = build_encoder(encoder, len(vocab), d).to(device)
@@ -369,11 +473,14 @@ def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose
     if verbose:
         from collections import Counter
         pc = Counter(c["pos"] for c in concepts)
+        rels = ", ".join(f"{k}:{len(v)}" for k, v in relations.items() if v)
         print(f"  WordNet ALL-POS | {len(concepts)} concepts {dict(pc)} | train {len(tr)}/held {len(te)}"
               f" | char-vocab {len(vocab)} | enc={encoder} isa={isa_mode} | device {device}", flush=True)
+        print(f"  BRAIN relations->rules: [{rels}] | {len(brain.known)} kernel-closed facts", flush=True)
     train(enc, pos_head, cache, tr_idx, steps, device, batch=batch, seed=seed,
           isa_mode=isa_mode, log=(max(1, steps // 6) if verbose else 0))
-    r = evaluate(enc, pos_head, cache, tr_idx, te_idx, parent, device, isa_mode)
+    r = evaluate(enc, pos_head, cache, tr_idx, te_idx, parent, device, isa_mode,
+                 brain=brain, names=names)
     if verbose:
         print("\n== MEANING: contrastive multi-view embedding + brain-verified relational probe ==")
         print(f"  CONTRASTIVE retrieval (held-out def -> its own synonyms, {r['n_retr']} concepts): "
@@ -388,7 +495,11 @@ def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose
         if u["n"]:
             print(f"    +-- parent UNSEEN (n={u['n']:3d}): parent {u['parent']:.3f} | faith {u['faith']:.3f}"
                   f" | recall {u['recall']:.3f}   <- name-pointer vs the open-vocab wall")
-        print("  is-a facts brain-verified by closure; retrieval/POS measure captured meaning.")
+        print(f"  BRAIN (KERNEL-PROVEN, n={r['kernel_n']}): faith {r['kernel_faith']:.3f} | recall "
+              f"{r['kernel_recall']:.3f}   -- each conveyed fact carries a kernel-checked proof term")
+        print(f"  BRAIN NEGATION (n={r['neg_n']}): proved 'X is NOT a Y' in {r['neg_proven']:.3f} via BDD "
+              f"type disjointness -> exclusion axioms (understanding what things are NOT)")
+        print("  the model PROPOSES; the BRAIN PROVES (datalog closure + kernel + set-theoretic types).")
     if out:
         import json
         with open(out, "w") as f:
