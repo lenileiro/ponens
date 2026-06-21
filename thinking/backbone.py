@@ -85,6 +85,16 @@ class Generator:
         self.lm = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float32).to(self.device).eval()
 
     @torch.no_grad()
+    def say(self, prompt, max_new=70):
+        """Generic instruct generation -- used to VERBALIZE a brain proof in natural language."""
+        msg = [{"role": "user", "content": prompt}]
+        p = self.tok.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
+        enc = self.tok(p, return_tensors="pt").to(self.device)
+        ids = self.lm.generate(**enc, max_new_tokens=max_new, do_sample=False,
+                               pad_token_id=self.tok.pad_token_id)
+        return self.tok.decode(ids[0, enc.input_ids.shape[1]:], skip_special_tokens=True).strip()
+
+    @torch.no_grad()
     def write(self, lemma, parent, parts=None, max_new=48):
         facts = f"It is a kind of {parent}."
         if parts:

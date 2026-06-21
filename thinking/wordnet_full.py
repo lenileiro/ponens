@@ -261,21 +261,33 @@ def relate(agent, x, y):
     pc, pb = _hyper_path(C), _hyper_path(B)
     pcset, pbset = set(pc), set(pb)
     cn, bn = M.parent_name_text(C), M.parent_name_text(B)
+    gen = agent.get("gen")
+
+    def verbalize(verdict, facts, proof):
+        """Render the brain's proof in natural language -- the LM phrases it, using ONLY these facts."""
+        head = verdict[0].upper() + verdict[1:] + "."     # crisp verdict, always explicit
+        if not gen:
+            return f"  {head}\n  proof: {proof}"
+        nl = gen.say(f"Explain in one or two clear, natural sentences why {verdict}, using ONLY these "
+                     f"facts and adding nothing new: {facts}. Reply with only the explanation.")
+        return f"  {head}\n  {nl}\n  (proof: {proof})"
+
     if B in pcset:                                           # YES: walk the is-a chain C -> ... -> B
         chain = pc[:pc.index(B) + 1]
-        steps = " -> ".join(M.parent_name_text(z) for z in chain)
-        return (f"YES -- a {cn} IS a {bn}.\n"
-                f"  why: {steps}  (each is a kind of the next; is-a is transitive, so the brain proves "
-                f"a {cn} is a {bn}).")
+        proof = " -> ".join(M.parent_name_text(z) for z in chain)
+        facts = "; ".join(f"a {M.parent_name_text(chain[i])} is a kind of {M.parent_name_text(chain[i+1])}"
+                          for i in range(len(chain) - 1))
+        return verbalize(f"a {cn} is a {bn}", facts, proof)
     if C in pbset:
         return f"It's the other way around: a {bn} is a {cn}, not a {cn} is a {bn}."
     lca = next((z for z in pc if z in pbset), None)          # LOWEST common ancestor
     if lca is not None:
-        cbranch = pc[pc.index(lca) - 1] if pc.index(lca) > 0 else C   # C-side child of the LCA
-        return (f"NO -- a {cn} is NOT a {bn}.\n"
-                f"  why: a {cn} is a {M.parent_name_text(cbranch)}; under {M.parent_name_text(lca)}, a "
-                f"{M.parent_name_text(cbranch)} and a {bn} are separate, mutually exclusive kinds -- "
-                f"nothing is both -- so a {cn} cannot be a {bn}.")
+        cbranch = M.parent_name_text(pc[pc.index(lca) - 1] if pc.index(lca) > 0 else C)
+        ln = M.parent_name_text(lca)
+        facts = (f"a {cn} is a {cbranch}; both a {cbranch} and a {bn} are kinds of {ln}, but they are "
+                 f"separate, mutually exclusive kinds, so nothing is both a {cbranch} and a {bn}")
+        proof = f"{cn} is-a {cbranch}; {cbranch} disjoint {bn} (separate branches under {ln})"
+        return verbalize(f"a {cn} is NOT a {bn}", facts, proof)
     return f"  the brain can't relate '{cn}' and '{bn}' (no shared is-a ancestry)."
 
 
