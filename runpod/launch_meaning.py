@@ -31,10 +31,11 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOURLY_USD = 3.29
 
 # (tag, per_pos, d, steps, batch). per_pos is PER part-of-speech -> ~4x concepts. Scale grows down.
+# tags 'fix_*' = the meaning<->meaning is-a pointer (parents keyed by gloss + projection heads).
 SWEEP = [
-    ("s", 400,  384, 12000, 256),   # ~1600 concepts
-    ("m", 800,  512, 16000, 384),   # ~3200 concepts
-    ("l", 1500, 512, 22000, 512),   # ~6000 concepts
+    ("fix_s", 400,  384, 12000, 256),   # ~1600 concepts
+    ("fix_m", 800,  512, 16000, 384),   # ~3200 concepts
+    ("fix_l", 1500, 512, 22000, 512),   # ~6000 concepts
 ]
 
 
@@ -79,7 +80,7 @@ def main():
     ap.add_argument("--gpu", default="NVIDIA H100 80GB HBM3")
     ap.add_argument("--cloud", default="SECURE", choices=["COMMUNITY", "SECURE", "ALL"])
     ap.add_argument("--disk", type=int, default=40)
-    ap.add_argument("--name", default="meaning-scale-probe")
+    ap.add_argument("--name", default="meaning-fix-probe")
     ap.add_argument("--max-minutes", type=int, default=90)
     ap.add_argument("--print-payload", action="store_true")
     ap.add_argument("--go", action="store_true", help="actually create the pod (spends money)")
