@@ -66,7 +66,7 @@ def written_parent_claim(ptoks, cand_lemmas):
 
 
 def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose=True,
-        write_steps=None, n_show=6):
+        write_steps=None, n_show=6, out=None):
     write_steps = write_steps or steps
     concepts, parent, _nt, relations = M.gather(per_pos=per_pos, seed=seed)
     tr, te = M.split(concepts, 0.25, seed)
@@ -136,6 +136,12 @@ def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose
         print("  -- examples (concept | true parent -> comprehended -> WRITTEN def) --")
         for C, tp, cp, w in shows:
             print(f"     {C:24s} {tp} -> {cp} :: {w}")
+    if out:
+        import json
+        with open(out, "w") as f:
+            json.dump(dict(per_pos=per_pos, steps=steps, examples=shows, **res), f, indent=2)
+        if verbose:
+            print(f"  wrote {out}", flush=True)
     return res
 
 
@@ -161,13 +167,14 @@ def main(argv=None):
     ap.add_argument("--d", type=int, default=256)
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--device", default=None)
+    ap.add_argument("--out", default=None)
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return 0
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}", flush=True)
     run(args.steps, seed=args.seed, per_pos=args.per_pos, d=args.d, device=device, batch=args.batch,
-        write_steps=args.write_steps)
+        write_steps=args.write_steps, out=args.out)
     return 0
 
 
