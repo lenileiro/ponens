@@ -48,10 +48,17 @@ def gather(per_pos=150, seed=0, max_anc=64):
     chosen = [s for v in picked.values() for s in v]
 
     parent = {}                                              # child name -> direct is-a parent name
+    node_text = {}                                            # any synset name -> its MEANING text
+    def meaning_text(x):
+        syn = ", ".join(w.replace("_", " ") for w in x.lemma_names())
+        return f"means {x.definition()} also called {syn}"
     for s in chosen:
         paths = s.hypernym_paths()
         if paths:
-            ns = [x.name() for x in paths[0]]
+            objs = paths[0]
+            for x in objs:                                    # cache the MEANING of every node on path
+                node_text.setdefault(x.name(), meaning_text(x))
+            ns = [x.name() for x in objs]
             for ch, pa in zip(ns[1:], ns):                   # ns is root..leaf; (child, parent)
                 parent[ch] = pa
 
@@ -71,10 +78,11 @@ def gather(per_pos=150, seed=0, max_anc=64):
         if s.examples():
             views.append(f"as in {s.examples()[0]}")
         ants = sorted({a.name() for l in s.lemmas() for a in l.antonyms()})
+        node_text.setdefault(s.name(), views[0])
         concepts.append(dict(
             name=s.name(), pos=pos, syn=syn, views=views,
             parent=parent.get(s.name()), ancestors=ancestors(s.name()), antonyms=ants))
-    return concepts, parent
+    return concepts, parent, node_text
 
 
 def split(concepts, held_frac=0.25, seed=0):
@@ -139,13 +147,14 @@ def encode_texts(enc, vocab, texts, device):
     return enc(x.to(device), l)
 
 
-def train(enc, pos_head, vocab, tr, steps, device, batch=128, lr=1e-3, temp=0.07,
-          lam_isa=1.0, lam_pos=0.3, seed=0, log=0):
+def train(enc, pos_head, c_head, p_head, vocab, node_text, tr, steps, device, batch=128, lr=1e-3,
+          temp=0.07, lam_isa=1.0, lam_pos=0.3, seed=0, log=0):
     rng = np.random.default_rng(seed); torch.manual_seed(seed)
-    opt = torch.optim.Adam(list(enc.parameters()) + list(pos_head.parameters()), lr=lr,
-                           weight_decay=1e-5)
+    params = (list(enc.parameters()) + list(pos_head.parameters())
+              + list(c_head.parameters()) + list(p_head.parameters()))
+    opt = torch.optim.Adam(params, lr=lr, weight_decay=1e-5)
     multi = [c for c in tr if len(c["views"]) >= 2]
-    enc.train(); pos_head.train()
+    enc.train(); pos_head.train(); c_head.train(); p_head.train()
     for step in range(steps):
         bc = [multi[i] for i in rng.integers(0, len(multi), size=min(batch, len(multi)))]
         a = encode_texts(enc, vocab, [c["views"][0] for c in bc], device)            # definition view
@@ -154,11 +163,13 @@ def train(enc, pos_head, vocab, tr, steps, device, batch=128, lr=1e-3, temp=0.07
         logits = a @ b.t() / temp                            # InfoNCE (CLIP-style, in-batch negatives)
         labels = torch.arange(len(bc), device=device)
         loss = 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels))
-        # is-a pointer probe: concept def embedding should match its PARENT's name embedding (in-batch)
+        # is-a probe: a concept's MEANING (via c_head) should match its PARENT's MEANING (via p_head) --
+        # meaning<->meaning hypernymy, reusing the contrastive space (parent keyed by its gloss, not name)
         nv = [c for c in bc if c["parent"]]
         if nv:
-            q = encode_texts(enc, vocab, [c["views"][0] for c in nv], device)
-            k = encode_texts(enc, vocab, [parent_name_text(c["parent"]) for c in nv], device)
+            q = F.normalize(c_head(encode_texts(enc, vocab, [c["views"][0] for c in nv], device)), dim=-1)
+            ptext = [node_text.get(c["parent"], parent_name_text(c["parent"])) for c in nv]
+            k = F.normalize(p_head(encode_texts(enc, vocab, ptext, device)), dim=-1)
             isa_logits = q @ k.t() / temp
             lbl = torch.arange(len(nv), device=device)
             loss = loss + lam_isa * 0.5 * (F.cross_entropy(isa_logits, lbl)
@@ -175,8 +186,8 @@ def train(enc, pos_head, vocab, tr, steps, device, batch=128, lr=1e-3, temp=0.07
 # Eval: zero-shot retrieval + brain-verified is-a (seen/unseen parent) + POS accuracy
 # ===================================================================================================
 @torch.no_grad()
-def evaluate(enc, pos_head, vocab, tr, te, parent, device):
-    enc.eval(); pos_head.eval()
+def evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, device):
+    enc.eval(); pos_head.eval(); c_head.eval(); p_head.eval()
 
     # --- (1) zero-shot meaning retrieval: held-out definition -> its OWN synonyms among all held syn ---
     held = [c for c in te if len(c["views"]) >= 2 and c["syn"]]
@@ -196,14 +207,15 @@ def evaluate(enc, pos_head, vocab, tr, te, parent, device):
             seen.add(cur); cur = parent[cur]; out.add(cur)
         return out
     cand = sorted({c["parent"] for c in tr + te if c["parent"]})
-    cand_emb = encode_texts(enc, vocab, [parent_name_text(p) for p in cand], device)
+    cand_text = [node_text.get(p, parent_name_text(p)) for p in cand]   # parents keyed by MEANING
+    cand_emb = F.normalize(p_head(encode_texts(enc, vocab, cand_text, device)), dim=-1)
     train_parents = {c["parent"] for c in tr if c["parent"]}
 
     def isa_eval(group):
         rows = [c for c in group if c["parent"]]
         if not rows:
             return None
-        q = encode_texts(enc, vocab, [c["views"][0] for c in rows], device)
+        q = F.normalize(c_head(encode_texts(enc, vocab, [c["views"][0] for c in rows], device)), dim=-1)
         pick = (q @ cand_emb.t()).argmax(1).tolist()
         recs = []
         for c, pi in zip(rows, pick):
@@ -241,20 +253,22 @@ def evaluate(enc, pos_head, vocab, tr, te, parent, device):
 
 
 def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose=True, out=None):
-    concepts, parent = gather(per_pos=per_pos, seed=seed)
+    concepts, parent, node_text = gather(per_pos=per_pos, seed=seed)
     tr, te = split(concepts, 0.25, seed)
     vocab = CharVocab([v for c in tr for v in c["views"]]
-                      + [parent_name_text(c["parent"]) for c in tr if c["parent"]])
+                      + [node_text.get(c["parent"], "") for c in tr if c["parent"]])
     enc = Encoder(len(vocab), d=d).to(device)
     pos_head = nn.Linear(d, 4).to(device)
+    mlp = lambda: nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, d)).to(device)
+    c_head, p_head = mlp(), mlp()                            # is-a projection heads (learned hypernymy)
     if verbose:
         from collections import Counter
         pc = Counter(c["pos"] for c in concepts)
         print(f"  WordNet ALL-POS | {len(concepts)} concepts {dict(pc)} | train {len(tr)}/held {len(te)}"
               f" | char-vocab {len(vocab)} | views=def/syn/example | device {device}", flush=True)
-    train(enc, pos_head, vocab, tr, steps, device, batch=batch, seed=seed,
+    train(enc, pos_head, c_head, p_head, vocab, node_text, tr, steps, device, batch=batch, seed=seed,
           log=(max(1, steps // 6) if verbose else 0))
-    r = evaluate(enc, pos_head, vocab, tr, te, parent, device)
+    r = evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, device)
     if verbose:
         print("\n== MEANING: contrastive multi-view embedding + brain-verified relational probe ==")
         print(f"  CONTRASTIVE retrieval (held-out def -> its own synonyms, {r['n_retr']} concepts): "
