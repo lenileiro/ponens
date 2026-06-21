@@ -181,69 +181,67 @@ def gloss_words(text, maxw=24):
         or ["?"]
 
 
-def encode_words(enc, vocab, word_lists, device, maxw=24):
-    """Encode each concept's gloss WORDS individually (char-encoded -> open-vocab-safe). Returns
-    (B, maxw, d) normalized word embeddings + a (B, maxw) validity mask."""
+def enc_ids(enc, id_lists, device):
+    """Encode PRECOMPUTED char-id lists (no per-step vocab.encode). Pads the batch and runs the encoder
+    once -> the expensive char->id work is done once at setup; per step is just pad + a GPU forward."""
+    x, l = pad(id_lists)
+    return enc(x.to(device), l)
+
+
+def encode_words(enc, word_id_lists, device, maxw=24):
+    """Encode each concept's PRECOMPUTED gloss-word char-ids. All words across the batch go through the
+    encoder in ONE call (vectorized); only the cheap pad/scatter remains per step. Returns (B,maxw,d)
+    normalized word embeddings + (B,maxw) validity mask."""
     flat, lens = [], []
-    for ws in word_lists:
+    for ws in word_id_lists:
         ws = ws[:maxw]; lens.append(len(ws)); flat.extend(ws)
-    emb = encode_texts(enc, vocab, flat, device)             # (total_words, d)
-    out = torch.zeros(len(word_lists), maxw, emb.shape[-1], device=device)
-    mask = torch.zeros(len(word_lists), maxw, dtype=torch.bool, device=device)
+    emb = enc_ids(enc, flat, device)                         # (total_words, d), one batched forward
+    out = torch.zeros(len(word_id_lists), maxw, emb.shape[-1], device=device)
+    mask = torch.zeros(len(word_id_lists), maxw, dtype=torch.bool, device=device)
     i = 0
     for b, n in enumerate(lens):
         out[b, :n] = emb[i:i + n]; mask[b, :n] = True; i += n
     return F.normalize(out, dim=-1), mask
 
 
-def parent_keys(enc, p_head, vocab, node_text, pnames, device, isa_mode):
-    """Key embeddings for candidate parents. 'meaning' -> parent gloss via p_head; else parent NAME."""
-    if isa_mode == "meaning":
-        txt = [node_text.get(p, parent_name_text(p)) for p in pnames]
-        return F.normalize(p_head(encode_texts(enc, vocab, txt, device)), dim=-1)
-    return F.normalize(encode_texts(enc, vocab, [parent_name_text(p) for p in pnames], device), dim=-1)
+def parent_keys(enc, pn_ids, pnames, device):
+    """Normalized key embeddings for candidate parents (keyed by parent NAME char-ids)."""
+    return F.normalize(enc_ids(enc, [pn_ids[p] for p in pnames], device), dim=-1)
 
 
-def concept_scores(enc, c_head, vocab, rows, keys, device, isa_mode, maxw=24):
-    """(len(rows), len(keys)) is-a scores. 'copy' (attention/copy): a parent scores as the BEST-matching
-    gloss WORD -> exploits 'the parent word appears in the gloss', which pooling+argmax cannot. 'name'/
-    'meaning': pooled concept embedding (optionally projected) dotted with the parent keys."""
+def concept_scores(enc, rows, keys, device, isa_mode, maxw=24):
+    """(len(rows), len(keys)) is-a scores. 'copy' (attention/copy): parent scores as the BEST-matching
+    gloss WORD -> exploits 'the parent word appears in the gloss'. 'name': pooled gloss vs parent name."""
     if isa_mode == "copy":
-        we, mask = encode_words(enc, vocab, [gloss_words(c["views"][0], maxw) for c in rows], device, maxw)
+        we, mask = encode_words(enc, [c["_words"] for c in rows], device, maxw)
         s = torch.einsum("bwd,pd->bwp", we, keys)           # (B, W, P)
         return s.masked_fill(~mask.unsqueeze(-1), -1e4).max(1).values    # best gloss word per parent
-    q = encode_texts(enc, vocab, [c["views"][0] for c in rows], device)
-    if isa_mode == "meaning":
-        q = F.normalize(c_head(q), dim=-1)
-    return q @ keys.t()
+    return enc_ids(enc, [c["_def"] for c in rows], device) @ keys.t()
 
 
-def train(enc, pos_head, c_head, p_head, vocab, node_text, tr, steps, device, batch=128, lr=1e-3,
-          temp=0.07, lam_isa=1.0, lam_pos=0.3, seed=0, log=0, isa_mode="name"):
+def train(enc, pos_head, pn_ids, tr, steps, device, batch=128, lr=1e-3,
+          temp=0.07, lam_isa=1.0, lam_pos=0.3, seed=0, log=0, isa_mode="copy"):
     rng = np.random.default_rng(seed); torch.manual_seed(seed)
-    params = (list(enc.parameters()) + list(pos_head.parameters())
-              + list(c_head.parameters()) + list(p_head.parameters()))
-    opt = torch.optim.Adam(params, lr=lr, weight_decay=1e-5)
-    multi = [c for c in tr if len(c["views"]) >= 2]
-    enc.train(); pos_head.train(); c_head.train(); p_head.train()
+    opt = torch.optim.Adam(list(enc.parameters()) + list(pos_head.parameters()), lr=lr, weight_decay=1e-5)
+    multi = [c for c in tr if len(c["_views"]) >= 2]
+    enc.train(); pos_head.train()
     for step in range(steps):
         bc = [multi[i] for i in rng.integers(0, len(multi), size=min(batch, len(multi)))]
-        a = encode_texts(enc, vocab, [c["views"][0] for c in bc], device)            # definition view
-        b = encode_texts(enc, vocab, [c["views"][rng.integers(1, len(c["views"]))] for c in bc],
-                         device)                                                      # another view
+        a = enc_ids(enc, [c["_def"] for c in bc], device)                            # definition view
+        b = enc_ids(enc, [c["_views"][rng.integers(1, len(c["_views"]))] for c in bc], device)  # another
         logits = a @ b.t() / temp                            # InfoNCE (CLIP-style, in-batch negatives)
         labels = torch.arange(len(bc), device=device)
         loss = 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels))
-        # is-a probe (mode: name | meaning | copy), in-batch parents as candidates
+        # is-a probe (name | copy), in-batch parents as candidates
         nv = [c for c in bc if c["parent"]]
         if nv:
-            keys = parent_keys(enc, p_head, vocab, node_text, [c["parent"] for c in nv], device, isa_mode)
-            isa_logits = concept_scores(enc, c_head, vocab, nv, keys, device, isa_mode) / temp
+            keys = parent_keys(enc, pn_ids, [c["parent"] for c in nv], device)
+            isa_logits = concept_scores(enc, nv, keys, device, isa_mode) / temp
             lbl = torch.arange(len(nv), device=device)
             loss = loss + lam_isa * 0.5 * (F.cross_entropy(isa_logits, lbl)
                                            + F.cross_entropy(isa_logits.t(), lbl))
         # POS probe (word classification)
-        pos_lbl = torch.tensor([POS_IDS[c["pos"]] for c in bc], device=device)
+        pos_lbl = torch.tensor([c["_pos"] for c in bc], device=device)
         loss = loss + lam_pos * F.cross_entropy(pos_head(a), pos_lbl)
         opt.zero_grad(); loss.backward(); opt.step()
         if log and (step % log == 0 or step == steps - 1):
@@ -254,13 +252,13 @@ def train(enc, pos_head, c_head, p_head, vocab, node_text, tr, steps, device, ba
 # Eval: zero-shot retrieval + brain-verified is-a (seen/unseen parent) + POS accuracy
 # ===================================================================================================
 @torch.no_grad()
-def evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, device, isa_mode="name"):
-    enc.eval(); pos_head.eval(); c_head.eval(); p_head.eval()
+def evaluate(enc, pos_head, pn_ids, tr, te, parent, device, isa_mode="copy"):
+    enc.eval(); pos_head.eval()
 
     # --- (1) zero-shot meaning retrieval: held-out definition -> its OWN synonyms among all held syn ---
-    held = [c for c in te if len(c["views"]) >= 2 and c["syn"]]
-    defs = encode_texts(enc, vocab, [c["views"][0] for c in held], device)
-    syns = encode_texts(enc, vocab, [f"also called {c['syn']}" for c in held], device)
+    held = [c for c in te if c["_syn"] is not None]
+    defs = enc_ids(enc, [c["_def"] for c in held], device)
+    syns = enc_ids(enc, [c["_syn"] for c in held], device)
     sim = defs @ syns.t()
     rank1 = (sim.argmax(1) == torch.arange(len(held), device=device)).float().mean().item()
     ranks = (sim >= sim.gather(1, torch.arange(len(held), device=device)[:, None]).expand_as(sim)
@@ -275,14 +273,14 @@ def evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, de
             seen.add(cur); cur = parent[cur]; out.add(cur)
         return out
     cand = sorted({c["parent"] for c in tr + te if c["parent"]})
-    cand_emb = parent_keys(enc, p_head, vocab, node_text, cand, device, isa_mode)
+    cand_emb = parent_keys(enc, pn_ids, cand, device)
     train_parents = {c["parent"] for c in tr if c["parent"]}
 
     def isa_eval(group):
         rows = [c for c in group if c["parent"]]
         if not rows:
             return None
-        pick = concept_scores(enc, c_head, vocab, rows, cand_emb, device, isa_mode).argmax(1).tolist()
+        pick = concept_scores(enc, rows, cand_emb, device, isa_mode).argmax(1).tolist()
         recs = []
         for c, pi in zip(rows, pick):
             pred = cand[pi]
@@ -302,9 +300,8 @@ def evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, de
     # --- (3) POS classification accuracy on held-out ---
     pos_acc = 0.0
     if te:
-        emb = encode_texts(enc, vocab, [c["views"][0] for c in te], device)
-        pred = pos_head(emb).argmax(1).cpu().numpy()
-        gold = np.array([POS_IDS[c["pos"]] for c in te])
+        pred = pos_head(enc_ids(enc, [c["_def"] for c in te], device)).argmax(1).cpu().numpy()
+        gold = np.array([c["_pos"] for c in te])
         pos_acc = float((pred == gold).mean())
 
     return dict(
@@ -319,23 +316,30 @@ def evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, de
 
 
 def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose=True, out=None,
-        isa_mode="name", encoder="cnn"):
+        isa_mode="copy", encoder="cnn"):
     concepts, parent, node_text = gather(per_pos=per_pos, seed=seed)
     tr, te = split(concepts, 0.25, seed)
     vocab = CharVocab([v for c in tr for v in c["views"]]
-                      + [node_text.get(c["parent"], "") for c in tr if c["parent"]])
+                      + [parent_name_text(c["parent"]) for c in tr if c["parent"]])
+    # VECTORIZE: precompute every char-id encoding ONCE (def/views/gloss-words/syn + parent names),
+    # so each training step is just pad + a GPU forward -- no per-step vocab.encode (the old bottleneck).
+    for c in concepts:
+        c["_def"] = vocab.encode(c["views"][0])
+        c["_views"] = [vocab.encode(v) for v in c["views"]]
+        c["_words"] = [vocab.encode(w) for w in gloss_words(c["views"][0])]
+        c["_syn"] = vocab.encode(f"also called {c['syn']}") if c["syn"] else None
+        c["_pos"] = POS_IDS[c["pos"]]
+    pn_ids = {p: vocab.encode(parent_name_text(p)) for p in {c["parent"] for c in concepts if c["parent"]}}
     enc = build_encoder(encoder, len(vocab), d).to(device)
     pos_head = nn.Linear(d, 4).to(device)
-    mlp = lambda: nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, d)).to(device)
-    c_head, p_head = mlp(), mlp()                            # is-a projection heads (learned hypernymy)
     if verbose:
         from collections import Counter
         pc = Counter(c["pos"] for c in concepts)
         print(f"  WordNet ALL-POS | {len(concepts)} concepts {dict(pc)} | train {len(tr)}/held {len(te)}"
               f" | char-vocab {len(vocab)} | enc={encoder} isa={isa_mode} | device {device}", flush=True)
-    train(enc, pos_head, c_head, p_head, vocab, node_text, tr, steps, device, batch=batch, seed=seed,
+    train(enc, pos_head, pn_ids, tr, steps, device, batch=batch, seed=seed,
           isa_mode=isa_mode, log=(max(1, steps // 6) if verbose else 0))
-    r = evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, device, isa_mode)
+    r = evaluate(enc, pos_head, pn_ids, tr, te, parent, device, isa_mode)
     if verbose:
         print("\n== MEANING: contrastive multi-view embedding + brain-verified relational probe ==")
         print(f"  CONTRASTIVE retrieval (held-out def -> its own synonyms, {r['n_retr']} concepts): "
@@ -377,8 +381,8 @@ def main(argv=None):
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default=None)
-    ap.add_argument("--isa-mode", choices=["name", "meaning", "copy"], default="copy",
-                    help="is-a probe: 'name' (pooled gloss vs parent name), 'meaning' (parent gloss), "
+    ap.add_argument("--isa-mode", choices=["name", "copy"], default="copy",
+                    help="is-a probe: 'name' (pooled gloss vs parent name) or "
                          "'copy' (attention/copy -- best-matching gloss WORD vs parent name)")
     ap.add_argument("--encoder", choices=["cnn", "gru"], default="cnn",
                     help="text encoder: 'cnn' (parallel, fast, default) or 'gru' (sequential baseline)")
