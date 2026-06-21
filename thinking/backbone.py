@@ -24,7 +24,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import thinking.meaning as M  # noqa: E402  (gather / build_brain / brain_ancestor_index / parent_name_text)
 
-DEFAULT_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
+DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # retrieval-trained embedder (beats LM mean-pool)
 
 
 def pick_device():
