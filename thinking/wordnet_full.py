@@ -291,15 +291,36 @@ def relate(agent, x, y):
     return f"  the brain can't relate '{cn}' and '{bn}' (no shared is-a ancestry)."
 
 
-_REL = __import__("re").compile(r"is\s+(?:an?\s+)?(.+?)\s+(?:an?\s+)(.+?)\??$", __import__("re").I)
+_re = __import__("re")
+_REL = _re.compile(r"is\s+(?:an?\s+)?(.+?)\s+(?:an?\s+)(.+?)\??$", _re.I)
+_STORY = _re.compile(r".*\bstor(?:y|ies)\b.*?\b(?:about|of|on|with)\s+(?:a |an |the )?(.+?)[.?!]*$", _re.I)
+
+
+def story(agent, topic):
+    """Write a short story about a topic, GROUNDED in the brain's verified facts about it."""
+    M = agent["M"]
+    C = _resolve(topic, agent["gloss"]) or topic
+    chain = _hyper_path(C)                                   # leaf..root is-a path
+    cn = M.parent_name_text(C)
+    facts = "a " + cn + " is " + ", ".join("a " + M.parent_name_text(x) for x in chain[1:5])
+    if not agent.get("gen"):
+        return f"  (brain facts: {facts}) -- no generator loaded."
+    s = agent["gen"].say(f"Write a short, imaginative 5-sentence story about a {cn} in nature. "
+                         f"(Background, stay consistent: {facts}.) Reply with only the story.",
+                         max_new=200, sample=True)
+    return f"  [grounded in brain: {facts}]\n\n{s}"
 
 
 def answer(agent, text):
-    """Dispatch: 'is a X a Y?' -> relate+explain; otherwise comprehend+define."""
-    m = _REL.match(text.strip())
+    """Dispatch: story request -> brain-grounded story; 'is a X a Y?' -> relate+explain; else define."""
+    t = text.strip()
+    sm = _STORY.match(t)
+    if sm:
+        return story(agent, sm.group(1).strip())
+    m = _REL.match(t)
     if m:
         return relate(agent, m.group(1).strip(), m.group(2).strip())
-    return chat_respond(agent, text)
+    return chat_respond(agent, t)
 
 
 def chat(agent):

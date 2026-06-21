@@ -85,13 +85,15 @@ class Generator:
         self.lm = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float32).to(self.device).eval()
 
     @torch.no_grad()
-    def say(self, prompt, max_new=70):
-        """Generic instruct generation -- used to VERBALIZE a brain proof in natural language."""
+    def say(self, prompt, max_new=70, sample=False, temperature=0.8, top_p=0.92):
+        """Generic instruct generation. Greedy for explanations (faithful); sampled for stories (fluent)."""
         msg = [{"role": "user", "content": prompt}]
         p = self.tok.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
         enc = self.tok(p, return_tensors="pt").to(self.device)
-        ids = self.lm.generate(**enc, max_new_tokens=max_new, do_sample=False,
-                               pad_token_id=self.tok.pad_token_id)
+        kw = dict(max_new_tokens=max_new, pad_token_id=self.tok.pad_token_id)
+        kw.update(dict(do_sample=True, temperature=temperature, top_p=top_p) if sample
+                  else dict(do_sample=False))
+        ids = self.lm.generate(**enc, **kw)
         return self.tok.decode(ids[0, enc.input_ids.shape[1]:], skip_special_tokens=True).strip()
 
     @torch.no_grad()
