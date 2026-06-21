@@ -145,25 +145,34 @@ def proof_term(tree, rules):
 
 class KB:
     def __init__(self, entities, preds, facts, rules, build_types=True, eager_closure=True):
-        # build_types/eager_closure default ON (full LOTA brain). At large scale (thousands of WordNet
-        # concepts) the O(cats^2) BDD disjointness loop and the full eager closure dominate and are
-        # UNNEEDED for tasks that only derive+verify facts (no negation/disproofs) -- turn them off then.
+        # build_types/eager_closure default ON (full LOTA brain: closure + set-theoretic types ->
+        # disjointness -> kernel EXCLUSION axioms, so negations get real proofs). Both are OPTIMIZED to
+        # scale: closure is semi-naive (datalog.py); the type lattice is built cheaply and exclusion
+        # axioms are computed LAZILY on demand (no upfront O(cats^2) enumeration). Flags still allow
+        # turning either off for the leanest possible KB.
         self.entities, self.preds, self.facts, self.rules = entities, preds, facts, rules
         self.env = build_env(entities, preds, facts, rules)
         self.env.update(K.logic_env())                   # And/Or/Eq/Ex/False available for proofs
         self.dl = Datalog(rules)
         self.known, self.prov = self.dl.closure(facts) if eager_closure else (set(), {})
-        # set-theoretic types -> disjointness -> kernel EXCLUSION axioms (so negations get real proofs)
         self.tc = self._cats = None
+        self._disjoint = {}                              # (a,b) -> bool, memoized lazily
         if build_types and any(p == "isa" for (p, _e) in facts):
-            self.tc = BT.TypeChecker.from_kb(self)
+            self.tc = BT.TypeChecker.from_kb(self)       # build the lattice only; pairs done on demand
             self._cats = self.tc.tax.cats
-            self._disjoint = {}
-            for a in self._cats:
-                for b in self._cats:
-                    if a != b and self.tc.disjoint(self.tc.lit(a), self.tc.lit(b)):
-                        self._disjoint[(a, b)] = True
-                        self.env[f"excl_{a}_{b}"] = K.compile(_excl_type(a, b))
+
+    def _ensure_excl(self, a, b):
+        """LAZY disjointness + exclusion axiom for the pair (a,b): compute it the first time it is
+        needed (e.g. by a disproof), memoize, and compile the kernel axiom into env if disjoint. Avoids
+        the upfront O(cats^2) enumeration -- only the pairs a query actually touches are ever computed."""
+        if (a, b) in self._disjoint:
+            return self._disjoint[(a, b)]
+        # empty_eager prunes doomed cubes -> far cheaper than the naive emptiness check
+        dis = bool(self.tc) and self.tc.empty_eager(self.tc.bdd.and_(self.tc.lit(a), self.tc.lit(b)))
+        self._disjoint[(a, b)] = dis
+        if dis:
+            self.env[f"excl_{a}_{b}"] = K.compile(_excl_type(a, b))
+        return dis
 
     def _atom_term(self, goal):
         """(ok, kernel Term) for an atomic goal -- the kernel-checked datalog derivation."""
@@ -245,8 +254,11 @@ class KB:
             if (inner[0] == "atom" and inner[1] == "isa" and len(inner[2]) == 2
                     and not any(isinstance(a, str) and a.startswith("?") for a in inner[2])):
                 r, Bcat = inner[2]
-                for A in (self._cats or []):
-                    if self._disjoint.get((A, Bcat)) and f"excl_{A}_{Bcat}" in self.env:
+                # only the categories r ACTUALLY has can disprove isa(r,B) -> check those, lazily, not
+                # all cats (so disproof is O(|r's categories|) with on-demand disjointness)
+                cats_of_r = [A for A in (self._cats or []) if ("isa", (r, A)) in self.known]
+                for A in cats_of_r:
+                    if self._ensure_excl(A, Bcat):
                         ok, pr = self._atom_term(("isa", (r, A)))
                         if not ok:
                             continue

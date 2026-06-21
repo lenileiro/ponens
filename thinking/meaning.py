@@ -120,6 +120,7 @@ def pad(seqs):
 
 
 class Encoder(nn.Module):
+    """char bi-GRU (sequential -> under-uses the GPU; kept as a baseline option)."""
     def __init__(self, n_chars, d=256, drop=0.2):
         super().__init__()
         self.emb = nn.Embedding(n_chars, d, padding_idx=0)
@@ -134,6 +135,34 @@ class Encoder(nn.Module):
         _, h = self.gru(packed)
         z = self.proj(torch.cat([h[0], h[1]], dim=-1))
         return F.normalize(z, dim=-1)                        # unit embedding (cosine space)
+
+
+class CNNEncoder(nn.Module):
+    """char 1D-CNN: multi-width conv n-gram detectors + masked global max-pool. Fully PARALLEL (high
+    GPU utilization, much faster than the RNN) and its n-gram features suit lexical matching/copy."""
+    def __init__(self, n_chars, d=256, drop=0.2, kernels=(3, 4, 5, 7)):
+        super().__init__()
+        self.emb = nn.Embedding(n_chars, d, padding_idx=0)
+        self.drop = nn.Dropout(drop)
+        nf = max(1, d // len(kernels))
+        self.convs = nn.ModuleList([nn.Conv1d(d, nf, k, padding=k // 2) for k in kernels])
+        self.proj = nn.Linear(nf * len(kernels), d)
+
+    def forward(self, ids, lens):
+        L = ids.size(1)
+        mask = (ids != 0).unsqueeze(1)                       # (B,1,L) real-token mask
+        e = self.drop(self.emb(ids)).transpose(1, 2)         # (B, d, L)
+        feats = []
+        for c in self.convs:
+            h = F.relu(c(e))[..., :L]                        # (B, nf, L); crop (even kernels add 1)
+            h = h.masked_fill(~mask, -1e4)                   # ignore padding in the max
+            feats.append(h.max(dim=-1).values)              # global max-pool -> strongest n-gram
+        z = self.proj(torch.cat(feats, dim=-1))
+        return F.normalize(z, dim=-1)
+
+
+def build_encoder(kind, n_chars, d):
+    return CNNEncoder(n_chars, d=d) if kind == "cnn" else Encoder(n_chars, d=d)
 
 
 # ===================================================================================================
@@ -290,12 +319,12 @@ def evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, de
 
 
 def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose=True, out=None,
-        isa_mode="name"):
+        isa_mode="name", encoder="cnn"):
     concepts, parent, node_text = gather(per_pos=per_pos, seed=seed)
     tr, te = split(concepts, 0.25, seed)
     vocab = CharVocab([v for c in tr for v in c["views"]]
                       + [node_text.get(c["parent"], "") for c in tr if c["parent"]])
-    enc = Encoder(len(vocab), d=d).to(device)
+    enc = build_encoder(encoder, len(vocab), d).to(device)
     pos_head = nn.Linear(d, 4).to(device)
     mlp = lambda: nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, d)).to(device)
     c_head, p_head = mlp(), mlp()                            # is-a projection heads (learned hypernymy)
@@ -303,7 +332,7 @@ def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose
         from collections import Counter
         pc = Counter(c["pos"] for c in concepts)
         print(f"  WordNet ALL-POS | {len(concepts)} concepts {dict(pc)} | train {len(tr)}/held {len(te)}"
-              f" | char-vocab {len(vocab)} | views=def/syn/example | device {device}", flush=True)
+              f" | char-vocab {len(vocab)} | enc={encoder} isa={isa_mode} | device {device}", flush=True)
     train(enc, pos_head, c_head, p_head, vocab, node_text, tr, steps, device, batch=batch, seed=seed,
           isa_mode=isa_mode, log=(max(1, steps // 6) if verbose else 0))
     r = evaluate(enc, pos_head, c_head, p_head, vocab, node_text, tr, te, parent, device, isa_mode)
@@ -348,9 +377,11 @@ def main(argv=None):
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default=None)
-    ap.add_argument("--isa-mode", choices=["name", "meaning", "copy"], default="name",
+    ap.add_argument("--isa-mode", choices=["name", "meaning", "copy"], default="copy",
                     help="is-a probe: 'name' (pooled gloss vs parent name), 'meaning' (parent gloss), "
                          "'copy' (attention/copy -- best-matching gloss WORD vs parent name)")
+    ap.add_argument("--encoder", choices=["cnn", "gru"], default="cnn",
+                    help="text encoder: 'cnn' (parallel, fast, default) or 'gru' (sequential baseline)")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return 0
@@ -358,7 +389,7 @@ def main(argv=None):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     run(args.steps, seed=args.seed, per_pos=args.per_pos, d=args.d, device=device,
-        batch=args.batch, out=args.out, isa_mode=args.isa_mode)
+        batch=args.batch, out=args.out, isa_mode=args.isa_mode, encoder=args.encoder)
     return 0
 
 

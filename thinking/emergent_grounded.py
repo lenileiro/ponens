@@ -94,10 +94,9 @@ def wordnet_kb(seed=0, per_cat=25, cap=400):
     for pred in relmap:                                       # cross-dimension rule: inherit down is-a
         rules.append(((pred, ("?x", "?p")), [("isa", ("?x", "?y")), (pred, ("?y", "?p"))]))
     import thinking.lota_kernel as LK
-    # skip the O(cats^2) BDD type machinery AND the eager full closure (both unneeded + dominate at
-    # scale): truth is derived per-concept from the cheap STATIC closure via derive_entity (proven
-    # == the full closure), so we never materialize closure over every concept's chain.
-    kb = LK.KB(sorted(ents), preds, facts, rules, build_types=False, eager_closure=False)
+    # FULL brain: eager semi-naive closure + the BDD type lattice (disjointness/exclusion axioms are
+    # computed LAZILY on demand, so there is no O(cats^2) upfront cost). Both are now optimized to scale.
+    kb = LK.KB(sorted(ents), preds, facts, rules, build_types=True, eager_closure=True)
     kb._combo_ents = sorted({lf.name() for lf in leaves})
     return kb
 

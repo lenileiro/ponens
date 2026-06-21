@@ -83,24 +83,38 @@ class Datalog:
             if s is not None:
                 yield from self._join(rest, known, s, used + (f,))
 
+    def _join_delta(self, body, known, delta):
+        """SEMI-NAIVE join: yield (sub, used) for rule firings using AT LEAST ONE delta fact (newly
+        derived last round). Bind body atom i to delta and the rest to all-known, summed over i ->
+        exactly the firings that could be NEW, avoiding the naive re-derivation of everything."""
+        for i in range(len(body)):
+            first, rest = body[i], body[:i] + body[i + 1:]
+            for f in delta:
+                s0 = _unify(first, f, {})
+                if s0 is not None:
+                    yield from self._join(rest, known, s0, (f,))
+
     def closure(self, facts):
-        """Least fixpoint. Returns (all_facts, prov) where prov[f] = (rule_idx|None, body_facts, depth)."""
+        """Least fixpoint via SEMI-NAIVE evaluation. Returns (all_facts, prov) where
+        prov[f] = (rule_idx|None, body_facts, depth). Each round joins only firings that touch the
+        previous round's NEW facts (delta) -> avoids naive O(rounds * |known|^body) re-derivation."""
         known = set(facts)
         prov = {f: (None, (), 0) for f in known}            # EDB facts: depth 0, no rule
-        changed = True
-        while changed:
-            changed = False
+        delta = set(known)
+        while delta:
             new = []                                         # collect this round; add after (no mutation mid-join)
             for ri, (head, body) in enumerate(self.rules):
-                for sub, used in self._join(body, known, {}, ()):
+                src = self._join_delta(body, known, delta) if body else iter(())
+                for sub, used in src:
                     hf = _inst(head, sub)
                     if hf not in known:
                         new.append((hf, ri, used))
+            delta = set()
             for hf, ri, used in new:
                 if hf not in known:
                     known.add(hf)
                     prov[hf] = (ri, used, 1 + max((prov[u][2] for u in used), default=0))
-                    changed = True
+                    delta.add(hf)
         return known, prov
 
     def entails(self, facts, query):
