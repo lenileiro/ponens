@@ -70,7 +70,7 @@ def build_sweep_cmd():
         lines.append(
             f"echo '=== CONFIG {tag}: per_pos={pp} d{d} steps{steps} ==='; "
             f"python -m thinking.roundtrip --per-pos {pp} --d {d} --steps {steps} "
-            f"--device cuda --out runs/roundtrip_{tag}.json || true")
+            f"--device cuda --out runs/roundtrip_{tag}.json --save runs/roundtrip_{tag}.pt || true")
     return " ; ".join(lines)
 
 
@@ -183,7 +183,7 @@ def main():
             if "DONE" in (r.stdout or ""):
                 print("run complete")
                 break
-        tags = " ".join(f"runs/roundtrip_{t}.json" for (t, *_rest) in SWEEP)
+        tags = " ".join(f"runs/roundtrip_{t}.json runs/roundtrip_{t}.pt" for (t, *_rest) in SWEEP)
         fetch = (f"{ssh} 'cd {REMOTE} && tar czf - roundtrip.log {tags} 2>/dev/null' "
                  f"| tar xzf - -C {HERE}")
         sh(fetch)

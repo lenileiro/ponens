@@ -177,6 +177,12 @@ class CharVocab:
     def __len__(self):
         return len(self.itos)
 
+    @classmethod
+    def from_itos(cls, itos):
+        v = cls.__new__(cls)
+        v.itos = list(itos); v.stoi = {c: i for i, c in enumerate(v.itos)}
+        return v
+
 
 def pad(seqs):
     m = max(len(s) for s in seqs)

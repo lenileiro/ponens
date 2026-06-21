@@ -38,23 +38,42 @@ def def_words(text, maxw=40):
     return [w.strip("".join(STOP)) for w in text.lower().split() if w.strip("".join(STOP))][:maxw]
 
 
-def facts_gtoks(pos, parent_name):
-    """Serialize the recovered FACTS as generator input: pos tag + is-a parent lemma words."""
-    return ["pos", pos, "isa"] + M.parent_name_text(parent_name).split()
+DESC_RELS = ("has_part", "made_of", "member_of")           # descriptive relations for definitions
 
 
-def write_pairs(concepts):
-    """(facts -> definition) training pairs. FAITHFUL target: lead with the explicit is-a claim
-    'a <parent> ...' then the gloss, so the written definition ASSERTS the parent it is grounded on
-    (and the claim is exactly what the brain checks) rather than burying/omitting it."""
+def facts_gtoks(pos, facts, cap=6):
+    """Serialize the brain-verified FACT-SET as generator input: pos tag + (predicate + obj lemma) for
+    each fact. Conditioning on the FULL fact-set (parent + parts/substance/membership), not just the
+    parent, lets the writer compose a richer faithful definition."""
+    g = ["pos", pos]
+    for pred, obj in facts[:cap]:
+        g += [pred] + M.parent_name_text(obj).split()
+    return g
+
+
+def direct_facts(concepts, relations):
+    """Per-concept DIRECT descriptive facts (has_part/made_of/member_of) for writer conditioning."""
+    df = {c["name"]: [] for c in concepts}
+    for pred in DESC_RELS:
+        for (s, o) in (relations or {}).get(pred, ()):
+            if s in df:
+                df[s].append((pred, o))
+    return df
+
+
+def write_pairs(concepts, dfacts):
+    """(fact-set -> definition) training pairs. Condition on the FULL fact-set (is-a parent + direct
+    parts/substance/membership); FAITHFUL target leads with 'a <parent> -' then the gloss, so the
+    written definition asserts the grounded parent (exactly what the brain checks)."""
     pairs = []
     for c in concepts:
         if not c["parent"]:
             continue
         gloss = def_words(c["views"][0])
         if gloss:
+            facts = [("isa", c["parent"])] + dfacts.get(c["name"], [])
             ptoks = ["a"] + M.parent_name_text(c["parent"]).split() + ["-"] + gloss
-            pairs.append({"gtoks": facts_gtoks(c["pos"], c["parent"]), "ptoks": ptoks, "name": c["name"]})
+            pairs.append({"gtoks": facts_gtoks(c["pos"], facts), "ptoks": ptoks, "name": c["name"]})
     return pairs
 
 
@@ -70,7 +89,7 @@ def all_parent_claims(ptoks, cand_lemmas):
 
 
 def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose=True,
-        write_steps=None, n_show=6, out=None):
+        write_steps=None, n_show=6, out=None, save=None):
     write_steps = write_steps or steps
     concepts, parent, _nt, relations = M.gather(per_pos=per_pos, seed=seed)
     tr, te = M.split(concepts, 0.25, seed)
@@ -159,11 +178,95 @@ def run(steps=4000, seed=0, per_pos=150, d=256, device="cpu", batch=128, verbose
             json.dump(dict(per_pos=per_pos, steps=steps, examples=shows, **res), f, indent=2)
         if verbose:
             print(f"  wrote {out}", flush=True)
+    if save:
+        torch.save({"enc": enc.state_dict(), "pos_head": pos_head.state_dict(),
+                    "wmodel": wmodel.state_dict(), "vocab_itos": vocab.itos,
+                    "wvocab_itos": wvocab.itos, "concepts": concepts, "relations": relations,
+                    "parent": parent, "config": {"d": d, "wd": min(256, d), "block": block}}, save)
+        if verbose:
+            print(f"  saved chattable model -> {save}", flush=True)
     return res
 
 
 def names_pos(concepts, ci):
     return concepts[ci]["pos"]
+
+
+# ===================================================================================================
+# Load a trained model and CHAT with it (inference) -- prepared for the next training cycle
+# ===================================================================================================
+def load_agent(path, device="cpu"):
+    import torch.nn.functional as Fn
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    cfg = ckpt["config"]; d = cfg["d"]
+    concepts, relations, parent = ckpt["concepts"], ckpt["relations"], ckpt["parent"]
+    vocab = M.CharVocab.from_itos(ckpt["vocab_itos"])
+    cache = M.build_cache(concepts, vocab, device)
+    brain = M.build_brain(concepts, relations)
+    enc = M.build_encoder("cnn", len(vocab), d).to(device); enc.load_state_dict(ckpt["enc"]); enc.eval()
+    pos_head = nn.Linear(d, 4).to(device); pos_head.load_state_dict(ckpt["pos_head"]); pos_head.eval()
+    wvocab = P.Vocab(ckpt["wvocab_itos"])
+    wmodel = P.build_model(len(wvocab), cfg["block"], d=cfg["wd"], layers=4, heads=8).to(device)
+    wmodel.load_state_dict(ckpt["wmodel"]); wmodel.eval()
+    pnames = cache["pnames"]
+    with torch.no_grad():
+        cand_emb = Fn.normalize(M.enc_rows(enc, cache["pname_T"],
+                                           torch.arange(len(pnames), device=device)), dim=-1)
+    return dict(enc=enc, pos_head=pos_head, wmodel=wmodel, wvocab=wvocab, vocab=vocab, cache=cache,
+                brain=brain, concepts=concepts, names=[c["name"] for c in concepts], pnames=pnames,
+                cand_emb=cand_emb, block=cfg["block"], device=device)
+
+
+@torch.no_grad()
+def comprehend_text(bundle, text):
+    """Free text (a prompt) -> the brain category the agent reads it as (copy pointer over gloss words)."""
+    words = [bundle["vocab"].encode(w, 18) for w in M.gloss_words(text)]
+    Tw, Tm = M.pad_words_to_tensor([words], bundle["device"])
+    we, mask = M.enc_word_rows(bundle["enc"], Tw, Tm, torch.tensor([0], device=bundle["device"]))
+    s = torch.einsum("bwd,pd->bwp", we, bundle["cand_emb"]).masked_fill(~mask.unsqueeze(-1), -1e4).max(1).values
+    return bundle["pnames"][s.argmax(1).item()]
+
+
+def brain_facts_about(brain, node, k=8):
+    fs = [(p, a[1]) for (p, a) in brain.known if len(a) == 2 and a[0] == node][:k]
+    return ", ".join(f"{p} {M.parent_name_text(o)}" for p, o in fs) or "(none yet)"
+
+
+@torch.no_grad()
+def respond(bundle, text):
+    """READ the prompt -> COMPREHEND (brain category) -> WRITE a definition -> ground in PROVEN facts."""
+    key = text.strip().lower()
+    known = next((i for i, nm in enumerate(bundle["names"])
+                  if nm == key or M.parent_name_text(nm) == key), None)
+    if known is not None:                                    # a known concept: read its own gloss
+        pos = bundle["concepts"][known]["pos"]
+        p_hat = comprehend_text(bundle, bundle["concepts"][known]["views"][0])
+    else:                                                    # a free description (a prompt)
+        pos, p_hat = "n", comprehend_text(bundle, text)
+    gen = P.emit(bundle["wmodel"], bundle["wvocab"], {"gtoks": facts_gtoks(pos, p_hat)},
+                 bundle["device"], bundle["block"])
+    cat = M.parent_name_text(p_hat)
+    out = [f"  understood as : a {cat}",
+           f"  my definition: {' '.join(gen)}",
+           f"  brain proves about '{cat}': {brain_facts_about(bundle['brain'], p_hat)}"]
+    if known is not None:
+        C = bundle["names"][known]
+        ok = bundle["brain"]._atom_term(("isa", (C, p_hat)))[0]
+        out.append(f"  [known: {C}] is-a {cat} -> {'KERNEL-PROVEN' if ok else 'unproven'}")
+    return "\n".join(out)
+
+
+def chat(bundle):
+    print("\n== CHAT (model proposes, brain proves) -- type a word or a definition; blank line to quit ==",
+          flush=True)
+    while True:
+        try:
+            line = input("you> ").strip()
+        except EOFError:
+            break
+        if not line:
+            break
+        print(respond(bundle, line), flush=True)
 
 
 def selftest():
@@ -185,13 +288,26 @@ def main(argv=None):
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--save", default=None, help="save a chattable model checkpoint here after training")
+    ap.add_argument("--load", default=None, help="load a saved model (skip training)")
+    ap.add_argument("--chat", action="store_true", help="interactive chat with the loaded model")
+    ap.add_argument("--ask", default=None, help="one-shot prompt to the loaded model")
     args = ap.parse_args(argv)
     if args.selftest:
         selftest(); return 0
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}", flush=True)
+    if args.load:                                            # LOAD a trained model -> chat / ask
+        bundle = load_agent(args.load, device)
+        print(f"loaded {args.load} | {len(bundle['names'])} concepts | brain "
+              f"{len(bundle['brain'].known)} kernel-closed facts", flush=True)
+        if args.ask:
+            print(respond(bundle, args.ask), flush=True)
+        if args.chat or not args.ask:
+            chat(bundle)
+        return 0
     run(args.steps, seed=args.seed, per_pos=args.per_pos, d=args.d, device=device, batch=args.batch,
-        write_steps=args.write_steps, out=args.out)
+        write_steps=args.write_steps, out=args.out, save=args.save)
     return 0
 
 
