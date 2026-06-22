@@ -88,7 +88,7 @@ def evaluate(solver, rng, concepts, A, L, K, depths, device, n_samples, lib, n=2
     return out
 
 
-def abstract_struct(lib, verified, k_add=2, thresh=15):
+def abstract_struct(lib, verified, k_add=3, thresh=8):
     """Add up to k_add new macros = the most frequent novel op-bigrams across verified programs (MDL:
     a recurring 2-op combo that shortens the corpus). Verifier-sound by construction: a macro is just a
     named base-op sequence, so executing it is identical to executing those base ops."""
@@ -110,6 +110,24 @@ def abstract_struct(lib, verified, k_add=2, thresh=15):
     return added
 
 
+def refactor(prog, lib, D):
+    """DreamCoder's compression->retrain step: rewrite a solution to USE the library macros (greedy
+    longest-match over the base-op expansion), so it gets shorter. Training the solver on the refactored
+    (macro-using) program is what makes it ADOPT macros -- discovery alone is inert without adoption."""
+    base = [b for op in prog for b in lib.expand(op) if b != NOP]
+    macros = sorted(lib.macros.items(), key=lambda kv: -len(kv[1]))      # longest macros first
+    out, i = [], 0
+    while i < len(base):
+        for slot, seq in macros:
+            if base[i:i + len(seq)] == seq:
+                out.append(slot); i += len(seq); break
+        else:
+            out.append(base[i]); i += 1
+    if len(out) > D:                                          # too long to represent -> keep original
+        out = prog[:D]
+    return out + [NOP] * (D - len(out))
+
+
 def concepts_recovered(lib, concepts, A, L):
     """Behavioral: a concept is recovered if SOME library macro computes the same function (not nec. the
     same op-sequence) -- the solver finds behaviorally-equivalent shortcuts, which is what matters."""
@@ -124,7 +142,7 @@ def mean_sol_len(sol):
 
 
 def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=3, D=6, d=128, rounds=2500, bs=48, n_samples=16,
-             lr=1.5e-3, max_macros=16, abstract_every=200, device=None, seeds=1, verbose=True):
+             lr=1.5e-3, max_macros=16, abstract_every=100, device=None, seeds=1, verbose=True):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     res = []
     for seed in range(seeds):
@@ -146,7 +164,7 @@ def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=3, D=6, d=128, rounds=2500, b
             if sctx:
                 solver.train()
                 val, role, pos = _ctx_tensors(sctx, device)
-                tgt = torch.tensor(sprog, device=device)
+                tgt = torch.tensor([refactor(p, lib, solver.D) for p in sprog], device=device)  # ADOPT macros
                 BOS = solver.vocab
                 dec_in = torch.cat([torch.full((len(sctx), 1), BOS, device=device), tgt[:, :-1]], 1)
                 logits = solver(val, role, pos, dec_in)
