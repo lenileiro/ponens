@@ -161,6 +161,71 @@ admission** and library reuse. **Bar:** the library GROWS toward the true concep
 description-length DROPS, and **d2/d3 solve-rate climbs past 0.36 with the frontier advancing** — i.e.,
 compounding emerges precisely where the uniform-random version was mathematically forbidden from it.
 
+# The Solver — execution-guided, per-step, verified (the fix for the composition bottleneck)
+
+The `azr_struct` run validated discovery but stalled on composition: the solver emits a whole program
+blind, so depth-d is one all-or-nothing guess over an exponential, syntactically-discontinuous space and
+errors compound. 4 more surveys (execution-guided / recognition-model / type-directed / retrieval-subgoal
+synthesis) converge on the same fix — and it is exactly our own validated length-gen principle:
+**build the solution incrementally, executing and verifying each step against a sound checkable
+intermediate; never emit the whole program blind.** This turns depth-d into d single-step inductions —
+and depth-1 is what our associative-lookup solver already nails at 0.998.
+
+## Design: iterate-execute-residual (forward), verified per step
+Chosen over top-down subgoal-generation (imports a 2nd hard learning problem we lack signal for) and over
+making the flat inducer compose internally (no surveyed system gets that for free).
+
+1. **Single-step proposer** = the associative-lookup solver: given the demos + the CURRENT executed
+   state, propose the next op/library-macro (its winning regime). Condition it on **property signatures**
+   — executable predicates comparing the current state to the demo targets ("how far am I"), the
+   featurization that makes execution-guidance learnable (Odena&Sutton; BUSTLE).
+2. **Execute + verify per step (forward).** Apply the op via the executor → new intermediate state for
+   every demo; accept only verified-consistent steps (the SOUND gate — stronger than every PRM/self-
+   critique in the literature; Lightman/Uesato justify gating every step, not just the final program).
+   Recurse the inducer on (intermediate-state → goal). The interpreter manufactures the subgoals — no
+   subgoal generator needed (Execution-Guided Synthesis; Write-Execute-Assess; ExeDec turns depth-3 into
+   3× depth-1).
+3. **Shallow beam + backtrack** (ToT/HTPS-lite): expand a few candidate first steps, keep the K whose
+   executed states most reduce distance-to-goal (a Write-Execute-Assess value over states), backtrack on
+   dead ends. Depth-2/3 needs only a tiny beam; recovers from a wrong first step (greedy cannot).
+4. **Hindsight relabeling** (CodeIt/HER): every intermediate state the inducer actually produced becomes
+   a valid (state → produced-output) single-step training pair. This supplies the *intermediate-state*
+   data a single-step-only training set never contains, and is the cold-start fix for self-play sparsity
+   (the exact failure mode our earlier sparse-reward runs hit).
+5. **Type-pruned frontier** (Myth/Synquid/SuSLik): the kernel/BDD types restrict the next-op choices to
+   the well-typed ones (a strictly stronger sound prune than the liquid/SMT types those systems use — we
+   own a full dependent-type kernel). The neural proposer only ORDERS the type-legal frontier, never
+   decides correctness; CEGIS = feed the verifier's failures back as constraints.
+6. **Library growth, retrieval-keyed** (DreamCoder/Stitch/LILO + babble e-graph anti-unification): abstract
+   frequent verified op-chains into macros, each keyed by an **embedding of its I/O behavior** so the
+   associative lookup can RETRIEVE and reuse it. A recurring depth-2 chain becomes a depth-1 op next round
+   → the depth ceiling rises → compounding.
+
+## The grand unification (all session research → one architecture)
+A **verified, execution-guided, bottom-up, per-step program-synthesis self-play loop**: programs are
+hypotheses; the kernel both type-PRUNES and soundly VERIFIES; solving iterates a single-step associative
+inducer against executed intermediates with a shallow verified beam; hindsight relabeling feeds training;
+MDL/Stitch abstraction grows a retrieval-keyed library; an endogenous curriculum over a STRUCTURED task
+distribution drives difficulty; the library deepens so capability compounds. Every piece is something we
+have (kernel/types/executor/associative-inducer/library/self-play) or a small, well-charted add (per-step
+loop, beam+value, hindsight relabel, retrieval-keying). The through-line is the principle we already
+proved twice (length-gen, verified-step reasoning): **per-step against a sound checkable intermediate.**
+
+## Minimal next build
+Wire the **iterate-execute-residual** solver into `azr_struct`: replace whole-program decode with
+(propose-one-op → execute → verify → recurse on residual) + a shallow beam, the associative inducer as
+the single-step proposer, and hindsight relabeling of intermediates. **Bar:** depth-2/3 solve-rate climbs
+past the 0.36 plateau and the frontier advances — composition as interpolation over verified single steps.
+
+*Solver synthesis from 4 surveys (2026-06-23): Chen/Liu/Song Execution-Guided (ICLR'19); Ellis
+Write-Execute-Assess (NeurIPS'19); Odena BUSTLE (ICLR'21) + CrossBeam (Shi ICLR'22) + ExeDec (Shi ICLR'24);
+Odena&Sutton property signatures (ICLR'20); Butt CodeIt (ICML'24); Balog DeepCoder (ICLR'17); Devlin
+RobustFill (ICML'17); Osera Myth + Polikarpova Synquid/SuSLik; Solar-Lezama Sketch/CEGIS; Willsey egg
+(POPL'21) + Cao babble (POPL'23); Lample HTPS (NeurIPS'22); Polu GPT-f (2020); Czechowski kSubS; Zhou
+least-to-most; Andrychowicz HER.*
+
+---
+
 *Synthesis of 9 parallel literature surveys, 2026-06-22/23. Beyond-LLM + discover-and-reuse sources:
 Ellis DreamCoder (2006.08381) + Bowers Stitch (2211.16605) + Grand LILO (2310.19791); FunSearch (Nature
 2023) + AlphaEvolve (2506.13131); AlphaProof (Nature 2025) + AlphaGeometry (Nature 2024); Polu curriculum
