@@ -126,20 +126,23 @@ def solve(proposer, src, tgt, proven_edges, env, budget, beam, device, guided=Tr
     return None, budget, unsound
 
 
-def path_pairs(tree, src):
-    """Extract (cur, next) navigation supervision from a found proof tree (the chain of entities)."""
-    # walk the left-folded tree to recover the entity chain src -> ... -> tgt
-    chain = []
+def chain_of(tree):
+    """Recover the entity-id chain [src, ..., tgt] from a left-folded proof tree."""
+    edges = []
 
     def collect(t):
         if t["rule"] is None:
-            chain.append(t["fact"][1])                       # (x,y) base edge
+            edges.append(t["fact"][1])                       # (x,y) base/lemma edge
         else:
-            collect(t["from"][0]); chain.append(t["from"][1]["fact"][1])
+            collect(t["from"][0]); edges.append(t["from"][1]["fact"][1])
     collect(tree)
-    nodes = [int(chain[0][0][1:])] + [int(e[1][1:]) for e in chain]   # "e5"->5; src, then edge targets
-    # HINDSIGHT: every downstream node on the path is a valid sub-goal -> (cur, sub-goal, next-step).
-    # Densely trains the navigator even from one solved path -> fixes the cold-start bootstrap.
+    return [int(edges[0][0][1:])] + [int(e[1][1:]) for e in edges]    # "e5"->5
+
+
+def path_pairs(tree, src):
+    """HINDSIGHT navigation supervision: every downstream node on the path is a valid sub-goal ->
+    (cur, sub-goal, next-step). Densely trains the navigator from one solved path (fixes cold-start)."""
+    nodes = chain_of(tree)
     return [(nodes[k], nodes[m], nodes[k + 1])
             for k in range(len(nodes) - 1) for m in range(k + 1, len(nodes))]
 
@@ -165,13 +168,19 @@ def selfplay(N=40, branch=3, d=128, rounds=1500, bs=48, beam=4, budget=8, lr=1.5
             tgt = int(rng.choice(far)) if far else src + 1
             return src, tgt
 
+        lemmas, lemma_count = {}, {}                          # kernel-verified long-range facts (the library)
         for rnd in range(rounds):
             pairs, solved = [], 0
+            pe = {**proven_edges, **lemmas}                   # base edges + cached lemmas
             for _ in range(bs):
                 src, tgt = sample_task()
-                tree, _st, _un = solve(prop, src, tgt, proven_edges, env, budget, beam, device, guided=True)
+                tree, _st, _un = solve(prop, src, tgt, pe, env, budget, beam, device, guided=True)
                 if tree is not None:
                     solved += 1; pairs += path_pairs(tree, src)
+                    # cache long-range (>=3 base hops) solved facts as reusable LEMMAS (kernel-verified
+                    # long edges) -> shorten future proofs so deeper goals fit the step budget
+                    if len(chain_of(tree)) - 1 >= 3 and (src, tgt) not in lemmas and len(lemmas) < 4 * N:
+                        lemmas[(src, tgt)] = tree
             if pairs:
                 prop.train()
                 cur = torch.tensor([p[0] for p in pairs], device=device)
@@ -185,20 +194,26 @@ def selfplay(N=40, branch=3, d=128, rounds=1500, bs=48, beam=4, budget=8, lr=1.5
                 print(f"  s{seed} r{rnd:5d}: train-solve {solved/bs:.2f} | guided {ev['guided']:.3f} "
                       f"unguided {ev['unguided']:.3f} | unsound {ev['unsound']}", flush=True)
         ev = evaluate(prop, edges, proven_edges, env, N, budget, 1, device, n=400)
+        # COMPOUNDING: deep goals at a TIGHT budget, base edges vs base+lemmas (kernel-verified long edges)
+        pe_lem = {**proven_edges, **lemmas}
+        ev["lemmas"] = len(lemmas)
+        ev["deep_base"] = evaluate(prop, edges, proven_edges, env, N, 2, 1, device, n=200, min_depth=4)["guided"]
+        ev["deep_lem"] = evaluate(prop, edges, pe_lem, env, N, 2, 1, device, n=200, min_depth=4)["guided"]
         res.append(ev)
         if verbose:
-            print(f"  s{seed} FINAL: guided {ev['guided']:.3f} vs unguided {ev['unguided']:.3f} | "
-                  f"unsound {ev['unsound']}", flush=True)
+            print(f"  s{seed} FINAL: guided {ev['guided']:.3f} vs random {ev['unguided']:.3f} | unsound "
+                  f"{ev['unsound']} | lemmas {ev['lemmas']} | deep@budget2 base {ev['deep_base']:.3f} -> "
+                  f"+lemmas {ev['deep_lem']:.3f} (COMPOUNDING)", flush=True)
     return res
 
 
-def evaluate(prop, edges, proven_edges, env, N, budget, beam, device, n=300):
+def evaluate(prop, edges, proven_edges, env, N, budget, beam, device, n=300, min_depth=3):
     rng = np.random.default_rng(999)
     g = u = unsound = tot = 0
     for _ in range(n):
         src = int(rng.integers(0, N - 2))
         dist = reachable(edges, src)
-        far = [v for v, dd in dist.items() if dd >= 3]       # depth>=3 so navigation matters
+        far = [v for v, dd in dist.items() if dd >= min_depth]   # deep enough that navigation matters
         if not far:
             continue
         tgt = int(rng.choice(far)); tot += 1
@@ -215,9 +230,11 @@ def selftest():
     res = selfplay(N=24, branch=4, d=64, rounds=900, bs=32, beam=3, budget=6, seeds=1,
                    device="cpu", verbose=False)
     ev = res[0]
-    print(f"  selftest: guided {ev['guided']:.2f} vs unguided {ev['unguided']:.2f} | unsound {ev['unsound']}")
-    assert ev["unsound"] == 0, "kernel accepted an unsound step"
-    assert ev["guided"] > ev["unguided"] + 0.15, "learned greedy guidance did not beat unguided greedy walk"
+    print(f"  selftest: guided {ev['guided']:.2f} vs random {ev['unguided']:.2f} | unsound {ev['unsound']} | "
+          f"lemmas {ev['lemmas']} | deep@budget2 base {ev['deep_base']:.2f} -> +lemmas {ev['deep_lem']:.2f}")
+    assert ev["unsound"] == 0, "kernel accepted an unsound step (not sound)"
+    assert ev["guided"] > ev["unguided"] + 0.15, "learned guidance did not beat random (not learned)"
+    assert ev["deep_lem"] > ev["deep_base"] + 0.1, "lemmas did not enable deeper proofs (no compounding)"
     print("azr_kproof selftest OK")
     return 0
 
