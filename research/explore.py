@@ -106,3 +106,68 @@ for name, fn in [("baseline", V_baseline), ("overlap", V_overlap), ("head+overla
     t = time.time(); r = score(fn)
     print(f"  {name:>22}: metric {r['metric']:.4f} | coverage {r['coverage']:.3f} | false {r['false']:.3f}"
           f" | {time.time()-t:.1f}s", flush=True)
+
+
+# ---- iteration 3+: synonym expansion + Porter stemming ----
+from functools import lru_cache
+from nltk.corpus import wordnet as _wn
+from nltk.stem import PorterStemmer
+_ps = PorterStemmer()
+
+
+@lru_cache(maxsize=None)
+def _syns(word):
+    out = set()
+    for s in _wn.synsets(word):
+        for l in s.lemma_names():
+            out.add(l.replace("_", " ").lower())
+    return out
+
+
+# stem index: Porter-stem of each candidate lemma token -> candidates
+_STEMIDX = {}
+for c in brain.candidates:
+    for lem in brain.lemmas(c):
+        for tok in lem.split():
+            if len(tok) >= 3:
+                _STEMIDX.setdefault(_ps.stem(tok), set()).add(c)
+
+
+def syn_named(words, named_set):
+    out = set()
+    for w in words:
+        for sw in _syns(w):
+            out |= brain.parents_with_word(sw)
+    return sorted(out - named_set, key=lambda c: -brain.depth(c))
+
+
+def stem_morph(words, named_set, k=25):
+    out = set()
+    for w in words:
+        if len(w) >= 3:
+            out |= _STEMIDX.get(_ps.stem(w), set())
+    return sorted(out - named_set, key=lambda c: -brain.depth(c))[:k]
+
+
+def V_syn(gloss):       # current best (overlap+prefix-morph) + synonyms
+    w = brain.toks(gloss); nm = named(w)
+    return V_head_morph(gloss) + syn_named(w, nm)
+
+
+def V_stem(gloss):      # overlap + Porter-stem morph (replaces 4-char prefix)
+    w = brain.toks(gloss); nm = named(w)
+    return sorted(nm, key=lambda c: -brain.depth(c)) + overlap(w, nm) + stem_morph(w, nm)
+
+
+def V_syn_stem(gloss):  # everything
+    w = brain.toks(gloss); nm = named(w)
+    return (sorted(nm, key=lambda c: -brain.depth(c)) + overlap(w, nm)
+            + stem_morph(w, nm) + syn_named(w, nm))
+
+
+for name, fn in [("cur (ov+prefix)", V_head_morph), ("+syn", V_syn), ("+porter-stem", V_stem),
+                 ("+syn+stem", V_syn_stem)]:
+    import time
+    t = time.time(); r = score(fn)
+    print(f"  {name:>18}: metric {r['metric']:.4f} | coverage {r['coverage']:.3f} | false {r['false']:.3f}"
+          f" | {time.time()-t:.1f}s", flush=True)
