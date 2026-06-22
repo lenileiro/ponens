@@ -24,6 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from thinking.azr_proof import REL, RULES, base_tree, compose_tree, kernel_verify
+from thinking.azr_iter import StepProposer            # the SAME learned proposer, reused literally
 import thinking.lota_kernel as LK
 
 
@@ -59,17 +60,18 @@ def ename(i):
 
 
 # ===================================================================================================
-# Learned navigation proposer: (current node, goal node) -> distribution over next node.
+# The proposer guiding the kernel proof search IS azr_iter's StepProposer, reused literally: a proof
+# state is one "demo" (K=1) of length L=1 -- the current node -- with the goal node as the target, over
+# an alphabet/op-vocab of the N entities. StepProposer(A=N, L=1, vocab=N) then maps (current, goal) -> a
+# distribution over the next node. Same learned single-step proposer as azr_iter; the kernel verifies.
 # ===================================================================================================
 class NavProposer(nn.Module):
     def __init__(self, N, d=128):
         super().__init__()
-        self.emb = nn.Embedding(N, d)
-        self.mlp = nn.Sequential(nn.LayerNorm(2 * d), nn.Linear(2 * d, d), nn.GELU(),
-                                 nn.Linear(d, d), nn.GELU(), nn.Linear(d, N))
+        self.sp = StepProposer(A=N, L=1, vocab=N, d=d)
 
-    def forward(self, cur, tgt):
-        return self.mlp(torch.cat([self.emb(cur), self.emb(tgt)], -1))
+    def forward(self, cur, tgt):                          # cur,tgt: (B,) entity ids
+        return self.sp(cur.view(-1, 1, 1), tgt.view(-1, 1, 1))   # -> (B, N) next-node logits
 
 
 def solve(proposer, src, tgt, proven_edges, env, budget, beam, device, guided=True):
