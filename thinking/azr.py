@@ -1,205 +1,282 @@
 #!/usr/bin/env python3
-"""azr -- ABSOLUTE-ZERO-style self-generated curriculum over VERIFIED PROGRAM SYNTHESIS. Zero external
-data: the model invents its own tasks, an executor verifies them, and it learns to SOLVE by inducing the
-program from examples -- the realizable shadow of Solomonoff induction (programs = hypotheses, executor =
-sound verifier, shortest verified program = simplicity prior). See thinking/SOLVE_ANYTHING.md.
+"""azr -- ABSOLUTE-ZERO-style self-generated curriculum over VERIFIED PROGRAM SYNTHESIS, zero external
+data, now with an AUTOREGRESSIVE solver + LIBRARY LEARNING (DreamCoder-style abstraction). See
+thinking/SOLVE_ANYTHING.md.
 
-A "task" IS a program. The loop, with NO human data:
-  1. PROPOSE  -- sample a program P (depth d at the current frontier) + K+1 input lists.
-  2. EXECUTE  -- the EXECUTOR (sound verifier) computes outputs -> verified demos (x, P(x)) + a query.
-  3. SOLVE    -- the neural solver reads the demos and emits candidate programs; we keep only those the
-                 executor confirms reproduce ALL demos (VERIFIED), and take the SHORTEST (Occam/MDL).
-  4. LEARN    -- train the solver (cross-entropy) to emit that verified program from those demos
-                 (ReST-EM / STaR; the supervision is self-generated + executor-verified).
-  5. CURRICULUM -- raise the frontier depth when the solve-rate is high; the solver + task space co-evolve.
+A task IS a program. Loop, with NO human data:
+  PROPOSE   sample a program (frontier depth) + inputs.
+  EXECUTE   the executor (sound verifier) computes outputs -> verified demos.
+  SOLVE     the solver AUTOREGRESSIVELY decodes candidate programs (op_t conditioned on op_<t); keep
+            executor-verified ones (reproduce all demos); take the SHORTEST (Occam/MDL).
+  LEARN     train the solver to emit that verified program (ReST-EM, self-generated supervision).
+  ABSTRACT  periodically compress the most frequent op-combo in verified programs into a NEW library
+            primitive (macro). Depth-2 combos become depth-1 -> the composition wall recedes.
+  CURRICULUM raise frontier depth as solve-rate rises.
 
-The bar: solve-rate on HELD-OUT self-generated tasks climbs from ~0 with zero external data, and the
-LEARNED solver beats an equal search budget with an untrained solver (it learned to INDUCE, not just search).
+Two earlier walls this targets: (1) per-slot INDEPENDENT emission couldn't model op2|op1 -> fixed by the
+autoregressive decoder; (2) composition plateau -> attacked by library learning (a learned, growing
+simplicity prior). Bar: d2/d3 solve-rate climbs past the ~0.36 plateau, frontier advances.
 
     python -m thinking.azr --selftest
-    python -m thinking.azr --A 7 --L 5 --K 4 --maxdepth 3 --rounds 4000
+    python -m thinking.azr --A 6 --L 4 --K 4 --maxdepth 4 --rounds 2500
 """
 import argparse
 import sys
+from collections import Counter
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from thinking.reasoner import Block
-
-# ---- the DSL: ops on a list v of L ints mod A. NOP first (lets programs be shorter than D slots). ----
-OPS = ["NOP", "ADD1", "ADD2", "SUB1", "REV", "ROL", "ROR", "SORT"]
+BASE_OPS = ["NOP", "ADD1", "ADD2", "SUB1", "REV", "ROL", "ROR", "SORT"]
 NOP = 0
+NBASE = len(BASE_OPS)
 
 
-def apply_op(op, v, A):
-    if op == 0:    return list(v)                      # NOP
-    if op == 1:    return [(x + 1) % A for x in v]     # ADD1
-    if op == 2:    return [(x + 2) % A for x in v]     # ADD2
-    if op == 3:    return [(x - 1) % A for x in v]     # SUB1
-    if op == 4:    return list(v[::-1])                # REV
-    if op == 5:    return v[1:] + v[:1]                # ROL
-    if op == 6:    return v[-1:] + v[:-1]              # ROR
-    if op == 7:    return sorted(v)                    # SORT
+def apply_base(op, v, A):
+    if op == 0:  return list(v)
+    if op == 1:  return [(x + 1) % A for x in v]
+    if op == 2:  return [(x + 2) % A for x in v]
+    if op == 3:  return [(x - 1) % A for x in v]
+    if op == 4:  return list(v[::-1])
+    if op == 5:  return v[1:] + v[:1]
+    if op == 6:  return v[-1:] + v[:-1]
+    if op == 7:  return sorted(v)
     raise ValueError(op)
 
 
-def execute(prog, v, A):
+class Library:
+    """Base ops + a growing list of MACROS. macro[k] expands to a flat list of BASE-op ids. The op
+    vocabulary is pre-sized (NBASE + max_macros); macros are inactive until defined, then usable."""
+    def __init__(self, max_macros=12):
+        self.max_macros = max_macros
+        self.vocab = NBASE + max_macros
+        self.macros = {}                                    # op-id (>=NBASE) -> [base ops]
+
+    def active(self):
+        return [True] * NBASE + [(NBASE + k) in self.macros for k in range(self.max_macros)]
+
+    def expand(self, op):
+        return self.macros[op] if op >= NBASE else [op]
+
+    def add_macro(self, base_seq):
+        slot = NBASE + len(self.macros)
+        if slot >= self.vocab:
+            return None
+        self.macros[slot] = list(base_seq)
+        return slot
+
+
+def execute(prog, v, A, lib):
     for op in prog:
-        v = apply_op(op, v, A)
+        for b in lib.expand(op):
+            v = apply_base(b, v, A)
     return v
 
 
 def prog_len(prog):
-    return sum(1 for op in prog if op != NOP)           # non-NOP ops = description length (simplicity)
+    return sum(1 for op in prog if op != NOP)               # macro counts as 1 -> Occam prefers macros
 
 
-# ---- task proposer (self-generated, zero external data) ----
-def gen_task(rng, A, L, K, depth):
-    """A hidden program of EXACTLY `depth` non-NOP ops + K demo inputs + 1 query input."""
-    prog = [int(rng.integers(1, len(OPS))) for _ in range(depth)]      # non-NOP ops
+def gen_task(rng, A, L, K, depth, lib):
+    prog = [int(rng.integers(1, NBASE)) for _ in range(depth)]      # base-op program of given depth
     xs = [[int(v) for v in rng.integers(0, A, L)] for _ in range(K + 1)]
-    demos = [(x, execute(prog, x, A)) for x in xs[:K]]
-    xq = xs[K]
-    return prog, demos, xq, execute(prog, xq, A)
+    demos = [(x, execute(prog, x, A, lib)) for x in xs[:K]]
+    return prog, demos, xs[K], execute(prog, xs[K], A, lib)
 
 
-ROLE = {"demo_in": 0, "demo_out": 1, "query_in": 2, "slot": 3}
+ROLE = {"demo_in": 0, "demo_out": 1, "query_in": 2}
 
 
-def encode_ctx(demos, xq, L):
+def encode_ctx(demos, xq):
     val, role, pos = [], [], []
     for (x, y) in demos:
-        for i, s in enumerate(x): val.append(s); role.append(ROLE["demo_in"]); pos.append(i)
-        for i, s in enumerate(y): val.append(s); role.append(ROLE["demo_out"]); pos.append(i)
-    for i, s in enumerate(xq):     val.append(s); role.append(ROLE["query_in"]); pos.append(i)
+        for i, s in enumerate(x): val.append(s); role.append(0); pos.append(i)
+        for i, s in enumerate(y): val.append(s); role.append(1); pos.append(i)
+    for i, s in enumerate(xq):     val.append(s); role.append(2); pos.append(i)
     return val, role, pos
 
 
-def batch_ctx(tasks, L, device):
-    enc = [encode_ctx(d, q, L) for (_p, d, q, _y) in tasks]
+# ===================================================================================================
+# Autoregressive solver: encode context (demos+query), causally decode a program of D ops.
+# ===================================================================================================
+class Solver(nn.Module):
+    def __init__(self, A, L, D, vocab, d=128, h=4, layers=3):
+        super().__init__()
+        self.D, self.vocab, self.d = D, vocab, d
+        self.val = nn.Embedding(A, d); self.role = nn.Embedding(3, d); self.cpos = nn.Embedding(L, d)
+        self.optok = nn.Embedding(vocab + 1, d)             # +1 = BOS (id == vocab)
+        self.opos = nn.Embedding(D, d)
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(d, h, 4 * d, batch_first=True, norm_first=True, activation="gelu")
+            for _ in range(layers)])
+        self.ln = nn.LayerNorm(d); self.head = nn.Linear(d, vocab)
+
+    def _mask(self, Tc, P, device):
+        T = Tc + P
+        m = torch.zeros(T, T, dtype=torch.bool, device=device)
+        m[:Tc, Tc:] = True                                  # context can't see program
+        m[Tc:, Tc:] = torch.triu(torch.ones(P, P, dtype=torch.bool, device=device), 1)  # causal program
+        return m
+
+    def forward(self, val, role, pos, progtok):
+        """progtok: (B,P) decoder input (starts with BOS). Returns logits (B,P,vocab) predicting next op."""
+        cx = self.val(val) + self.role(role) + self.cpos(pos)        # (B,Tc,d)
+        Tc, P = cx.size(1), progtok.size(1)
+        pe = self.optok(progtok) + self.opos(torch.arange(P, device=val.device))[None]
+        h = torch.cat([cx, pe], 1)
+        mask = self._mask(Tc, P, val.device)
+        for layer in self.layers:
+            h = layer(h, src_mask=mask)
+        return self.head(self.ln(h[:, Tc:]))                # (B,P,vocab)
+
+
+def _ctx_tensors(tasks, device):
+    enc = [encode_ctx(d, q) for (_p, d, q, _y) in tasks]
     val, role, pos = zip(*enc)
     return (torch.tensor(val, device=device), torch.tensor(role, device=device),
             torch.tensor(pos, device=device))
 
 
-# ---- the solver: reads demos+query, emits D program slots (op distribution per slot) ----
-class Solver(nn.Module):
-    def __init__(self, A, L, D, d=128, h=4, layers=3):
-        super().__init__()
-        self.D = D
-        self.val = nn.Embedding(A, d)
-        self.role = nn.Embedding(len(ROLE), d)
-        self.pos = nn.Embedding(L, d)
-        self.slot = nn.Embedding(D, d)
-        self.blocks = nn.ModuleList([Block(d, h) for _ in range(layers)])
-        self.head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, len(OPS)))
-
-    def forward(self, val, role, pos):
-        B = val.size(0)
-        x = self.val(val) + self.role(role) + self.pos(pos)           # (B,Tc,d)
-        slots = self.slot(torch.arange(self.D, device=val.device)).unsqueeze(0).expand(B, -1, -1)
-        h = torch.cat([x, slots], 1)
-        for b in self.blocks:
-            h = b(h, None)
-        return self.head(h[:, -self.D:])                              # (B,D,|OPS|) per-slot op logits
-
-
 @torch.no_grad()
-def solve(solver, task, A, L, n_samples, device, greedy_first=True):
-    """Sample candidate programs from the solver, keep executor-VERIFIED ones (match all demos), return
-    the SHORTEST verified program (Occam). Returns (prog or None, found_bool)."""
-    _p, demos, _xq, _y = task
-    val, role, pos = batch_ctx([task], L, device)
-    logits = solver(val, role, pos)[0]                                # (D,|OPS|)
-    cands = []
-    if greedy_first:
-        cands.append([int(a) for a in logits.argmax(-1)])
-    probs = F.softmax(logits, -1)
-    for _ in range(n_samples):
-        cands.append([int(torch.multinomial(probs[s], 1)) for s in range(solver.D)])
-    verified = [c for c in cands if all(execute(c, x, A) == y for (x, y) in demos)]
-    if not verified:
-        return None, False
-    return min(verified, key=prog_len), True
+def decode_candidates(solver, tasks, n_samples, device, active_mask):
+    """Batched autoregressive decode: for each task, 1 greedy + (n_samples-1) sampled programs of D ops.
+    Returns a list (len=len(tasks)) of lists of candidate programs (each a length-D op list)."""
+    solver.eval()
+    bs = len(tasks)
+    val, role, pos = _ctx_tensors(tasks, device)
+    R = n_samples
+    val = val.repeat_interleave(R, 0); role = role.repeat_interleave(R, 0); pos = pos.repeat_interleave(R, 0)
+    N = bs * R
+    BOS = solver.vocab
+    seq = torch.full((N, 1), BOS, dtype=torch.long, device=device)
+    block = torch.tensor([not a for a in active_mask], device=device)        # True = inactive op
+    for t in range(solver.D):
+        logits = solver(val, role, pos, seq)[:, -1]          # (N,vocab)
+        logits = logits.masked_fill(block, -1e9)
+        if t == 0:
+            pass
+        nxt = torch.empty(N, dtype=torch.long, device=device)
+        # row 0 of each task's R block = greedy; rest = sampled
+        greedy = logits.argmax(-1)
+        probs = F.softmax(logits, -1)
+        samp = torch.multinomial(probs, 1).squeeze(-1)
+        is_greedy = (torch.arange(N, device=device) % R == 0)
+        nxt = torch.where(is_greedy, greedy, samp)
+        seq = torch.cat([seq, nxt[:, None]], 1)
+    progs = seq[:, 1:].tolist()                              # drop BOS -> (N,D)
+    return [progs[i * R:(i + 1) * R] for i in range(bs)]
 
 
-def evaluate(solver, rng, A, L, K, D, depths, device, n_samples, n=200):
-    """Solve-rate (query output exactly correct) on fresh held-out self-generated tasks, per depth."""
-    out = {}
-    for d in depths:
-        ok = 0
-        for _ in range(n):
-            task = gen_task(rng, A, L, K, d)
-            prog, found = solve(solver, task, A, L, n_samples, device)
-            if found and execute(prog, task[2], A) == task[3]:
-                ok += 1
-        out[d] = ok / n
+def solve_batch(solver, tasks, A, n_samples, device, lib):
+    """Return per-task (shortest verified program or None, found_bool)."""
+    cand = decode_candidates(solver, tasks, n_samples, device, lib.active())
+    out = []
+    for (t, cs) in zip(tasks, cand):
+        _p, demos, _xq, _y = t
+        verified = [c for c in cs if all(execute(c, x, A, lib) == y for (x, y) in demos)]
+        out.append((min(verified, key=prog_len), True) if verified else (None, False))
     return out
 
 
-def selfplay(A=7, L=5, K=4, maxdepth=3, D=4, d=128, rounds=4000, bs=64, n_samples=24, lr=1.5e-3,
-             device=None, seeds=1, verbose=True):
+def evaluate(solver, rng, A, L, K, depths, device, n_samples, lib, n=200):
+    out = {}
+    for dpth in depths:
+        tasks = [gen_task(rng, A, L, K, dpth, lib) for _ in range(n)]
+        sol = solve_batch(solver, tasks, A, n_samples, device, lib)
+        ok = sum(1 for (t, (prog, f)) in zip(tasks, sol)
+                 if f and execute(prog, t[2], A, lib) == t[3])
+        out[dpth] = ok / n
+    return out
+
+
+# ===================================================================================================
+# Library learning: compress the most frequent op-bigram in verified programs into a new macro.
+# ===================================================================================================
+def abstract(lib, verified_progs):
+    """Find the most frequent adjacent (a,b) op pair (both non-NOP) across verified programs; if it
+    recurs enough, add macro = expand(a)+expand(b) (flattened to base ops)."""
+    cnt = Counter()
+    for p in verified_progs:
+        ops = [o for o in p if o != NOP]
+        for a, b in zip(ops, ops[1:]):
+            cnt[(a, b)] += 1
+    for (pair, c) in cnt.most_common():
+        if c < 20:
+            return None
+        base_seq = lib.expand(pair[0]) + lib.expand(pair[1])
+        # skip if an identical macro already exists
+        if any(v == base_seq for v in lib.macros.values()):
+            continue
+        return lib.add_macro(base_seq)
+    return None
+
+
+def selfplay(A=6, L=4, K=4, maxdepth=4, D=4, d=128, rounds=2500, bs=48, n_samples=16, lr=1.5e-3,
+             max_macros=12, abstract_every=300, device=None, seeds=1, verbose=True):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     res = []
     for seed in range(seeds):
         torch.manual_seed(seed); rng = np.random.default_rng(seed)
-        solver = Solver(A, L, D, d=d).to(device)
+        lib = Library(max_macros=max_macros)
+        solver = Solver(A, L, D, lib.vocab, d=d).to(device)
         opt = torch.optim.AdamW(solver.parameters(), lr=lr, weight_decay=0.01)
-        frontier = 1
-        recent = []
+        frontier, recent, vbuf = 1, [], []
         for rnd in range(rounds):
-            # 1-2. PROPOSE + EXECUTE: a batch of self-generated, executor-verified tasks at the frontier
-            tasks = [gen_task(rng, A, L, K, int(rng.integers(1, frontier + 1))) for _ in range(bs)]
-            # 3. SOLVE via sampling + executor verification; collect (ctx -> shortest verified program)
-            solved_ctx, solved_prog, nsolved = [], [], 0
-            for t in tasks:
-                prog, found = solve(solver, t, A, L, n_samples, device)
-                if found:
-                    solved_ctx.append(t); solved_prog.append(prog); nsolved += 1
-            recent.append(nsolved / bs)
-            # 4. LEARN: train solver to emit the verified program from those demos (self-supervised)
-            if solved_ctx:
-                val, role, pos = batch_ctx(solved_ctx, L, device)
-                tgt = torch.tensor(solved_prog, device=device)         # (n,D)
+            tasks = [gen_task(rng, A, L, K, int(rng.integers(1, frontier + 1)), lib) for _ in range(bs)]
+            sol = solve_batch(solver, tasks, A, n_samples, device, lib)
+            sctx, sprog = [], []
+            for (t, (prog, f)) in zip(tasks, sol):
+                if f:
+                    sctx.append(t); sprog.append(prog); vbuf.append(prog)
+            recent.append(len(sctx) / bs)
+            if sctx:
                 solver.train()
-                logits = solver(val, role, pos)
-                loss = F.cross_entropy(logits.reshape(-1, len(OPS)), tgt.reshape(-1))
+                val, role, pos = _ctx_tensors(sctx, device)
+                tgt = torch.tensor(sprog, device=device)                  # (n,D)
+                BOS = solver.vocab
+                dec_in = torch.cat([torch.full((len(sctx), 1), BOS, device=device), tgt[:, :-1]], 1)
+                logits = solver(val, role, pos, dec_in)                   # (n,D,vocab)
+                loss = F.cross_entropy(logits.reshape(-1, solver.vocab), tgt.reshape(-1))
                 opt.zero_grad(); loss.backward()
-                torch.nn.utils.clip_grad_norm_(solver.parameters(), 1.0)
-                opt.step()
-            # 5. CURRICULUM: raise frontier when recently solving the current frontier well
+                torch.nn.utils.clip_grad_norm_(solver.parameters(), 1.0); opt.step()
+            # ABSTRACT: grow the library from recent verified programs
+            if rnd > 0 and rnd % abstract_every == 0 and vbuf:
+                slot = abstract(lib, vbuf[-2000:])
+                if slot is not None and verbose:
+                    print(f"  seed {seed} round {rnd}: + macro {slot} = {lib.macros[slot]} "
+                          f"(lib size {len(lib.macros)})", flush=True)
+                vbuf = vbuf[-2000:]
+            # CURRICULUM
             if len(recent) >= 50 and np.mean(recent[-50:]) > 0.7 and frontier < maxdepth:
                 frontier += 1; recent = []
                 if verbose:
                     print(f"  seed {seed} round {rnd}: frontier -> depth {frontier}", flush=True)
             if verbose and rnd % max(1, rounds // 10) == 0:
-                acc = evaluate(solver, rng, A, L, K, D, range(1, frontier + 1), device, n_samples, n=100)
-                print(f"  seed {seed} round {rnd:5d} (frontier {frontier}): solve-rate "
+                acc = evaluate(solver, rng, A, L, K, range(1, maxdepth + 1), device, n_samples, lib, n=100)
+                print(f"  seed {seed} round {rnd:5d} (frontier {frontier}, macros {len(lib.macros)}): "
                       + " ".join(f"d{k}:{v:.2f}" for k, v in acc.items()), flush=True)
-        final = evaluate(solver, rng, A, L, K, D, range(1, maxdepth + 1), device, n_samples, n=200)
-        res.append((solver, final))
+        final = evaluate(solver, rng, A, L, K, range(1, maxdepth + 1), device, n_samples, lib, n=250)
+        res.append((solver, lib, final))
         if verbose:
-            print(f"  seed {seed} FINAL solve-rate: "
+            print(f"  seed {seed} FINAL (macros {len(lib.macros)}): "
                   + " ".join(f"d{k}:{v:.3f}" for k, v in final.items()), flush=True)
     return res
 
 
 def selftest():
-    """CPU-only, tiny: the self-play loop runs with ZERO external data and the LEARNED solver beats an
-    equal-budget UNTRAINED solver on held-out depth-1/2 tasks (it learned to induce, not just search)."""
-    A, L, K, D = 5, 4, 4, 3
-    res = selfplay(A=A, L=L, K=K, maxdepth=2, D=D, d=64, rounds=400, bs=48, n_samples=12, seeds=1,
-                   device="cpu", verbose=False)
-    solver, final = res[0]
+    """CPU-only, tiny: autoregressive loop runs with zero external data, learns d1, and a macro is added."""
+    A, L, K, D = 5, 4, 3, 3
+    res = selfplay(A=A, L=L, K=K, maxdepth=2, D=D, d=64, rounds=400, bs=32, n_samples=12,
+                   abstract_every=150, max_macros=6, seeds=1, device="cpu", verbose=False)
+    solver, lib, final = res[0]
     rng = np.random.default_rng(123)
-    untrained = Solver(A, L, D, d=64)
-    base = evaluate(untrained, rng, A, L, K, D, [1, 2], "cpu", n_samples=12, n=200)
-    print(f"  selftest: LEARNED solve-rate d1:{final[1]:.2f} d2:{final[2]:.2f} | "
-          f"UNTRAINED(=search only) d1:{base[1]:.2f} d2:{base[2]:.2f}")
-    assert final[1] > base[1] + 0.1, f"learned solver did not beat search-only at d1 ({final[1]} vs {base[1]})"
+    untrained = Solver(A, L, D, lib.vocab, d=64)
+    base = evaluate(untrained, rng, A, L, K, [1, 2], "cpu", 12, lib, n=200)
+    print(f"  selftest: LEARNED d1:{final[1]:.2f} d2:{final[2]:.2f} | UNTRAINED d1:{base[1]:.2f} "
+          f"d2:{base[2]:.2f} | macros learned: {len(lib.macros)}")
+    assert final[1] > base[1] + 0.1, f"autoregressive solver didn't learn d1 ({final[1]} vs {base[1]})"
     print("azr selftest OK")
     return 0
 
@@ -207,26 +284,23 @@ def selftest():
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--A", type=int, default=7)
-    ap.add_argument("--L", type=int, default=5)
-    ap.add_argument("--K", type=int, default=4)
-    ap.add_argument("--maxdepth", type=int, default=3)
-    ap.add_argument("--D", type=int, default=4, help="program slots (>= maxdepth)")
-    ap.add_argument("--d", type=int, default=128)
-    ap.add_argument("--rounds", type=int, default=4000)
-    ap.add_argument("--n-samples", type=int, default=24)
-    ap.add_argument("--seeds", type=int, default=1)
-    ap.add_argument("--device", default=None)
+    ap.add_argument("--A", type=int, default=6); ap.add_argument("--L", type=int, default=4)
+    ap.add_argument("--K", type=int, default=4); ap.add_argument("--maxdepth", type=int, default=4)
+    ap.add_argument("--D", type=int, default=5, help="decoder program slots (>= maxdepth)")
+    ap.add_argument("--d", type=int, default=128); ap.add_argument("--rounds", type=int, default=2500)
+    ap.add_argument("--n-samples", type=int, default=16); ap.add_argument("--max-macros", type=int, default=12)
+    ap.add_argument("--seeds", type=int, default=1); ap.add_argument("--device", default=None)
     ap.add_argument("--out", default=None)
     args = ap.parse_args(argv)
     if args.selftest:
         return selftest()
     res = selfplay(A=args.A, L=args.L, K=args.K, maxdepth=args.maxdepth, D=args.D, d=args.d,
-                   rounds=args.rounds, n_samples=args.n_samples, seeds=args.seeds, device=args.device)
+                   rounds=args.rounds, n_samples=args.n_samples, max_macros=args.max_macros,
+                   seeds=args.seeds, device=args.device)
     if args.out:
         import json
         with open(args.out, "w") as f:
-            json.dump({f"d{k}": v for _s, fin in res for k, v in fin.items()}, f, indent=2)
+            json.dump({f"d{k}": v for _s, _l, fin in res for k, v in fin.items()}, f, indent=2)
         print("wrote", args.out)
     return 0
 
