@@ -46,6 +46,48 @@ def _ground(atom, sub):
     return (atom[0], tuple(_walk(t, sub) for t in atom[1]))
 
 
+def _bound_slots(terms, sub):
+    """(pos, value) for each body-atom position whose value is FIXED: a constant, or a var already
+    bound in `sub`. These are the slots we can index on to avoid scanning all facts."""
+    for i, t in enumerate(terms):
+        if _isvar(t):
+            if t in sub:
+                yield i, sub[t]
+        else:
+            yield i, t
+
+
+class _Index:
+    """Hash index over ground facts so a join probes only matching facts instead of scanning them all.
+    by_pred: pred -> [facts];  by_slot: (pred, position, value) -> [facts]. Turns the O(|known|) inner
+    scan in the closure into an O(1) lookup of the most-selective bound slot -- the difference between
+    a transitive closure that hangs and one that finishes in seconds."""
+    __slots__ = ("by_pred", "by_slot")
+
+    def __init__(self):
+        self.by_pred = {}
+        self.by_slot = {}
+
+    def add(self, f):
+        pred, args = f
+        self.by_pred.setdefault(pred, []).append(f)
+        for i, v in enumerate(args):
+            self.by_slot.setdefault((pred, i, v), []).append(f)
+
+    def candidates(self, pat, sub):
+        """Facts that could unify with `pat` under `sub`: the smallest bound-slot bucket (or, if no slot
+        is bound, every fact of that predicate). Empty tuple if a bound slot has no matching fact."""
+        pred = pat[0]
+        best = None
+        for i, v in _bound_slots(pat[1], sub):
+            bucket = self.by_slot.get((pred, i, v))
+            if bucket is None:
+                return ()
+            if best is None or len(bucket) < len(best):
+                best = bucket
+        return best if best is not None else self.by_pred.get(pred, ())
+
+
 def _unify2(a, b, sub):
     """General unification of two atoms (either may contain variables), under `sub`."""
     if a[0] != b[0] or len(a[1]) != len(b[1]):
@@ -72,40 +114,48 @@ class Datalog:
     def __init__(self, rules):
         self.rules = rules
 
-    def _join(self, body, known, sub, used):
-        """Conjunctive join of body atoms over `known` facts; yield (substitution, used-facts-tuple)."""
+    def _join(self, body, index, sub, used):
+        """Conjunctive join of body atoms over the fact `index`; yield (substitution, used-facts-tuple).
+        Each atom probes only the index bucket for its bound slots instead of scanning every fact."""
         if not body:
             yield sub, used
             return
         atom, rest = body[0], body[1:]
-        for f in known:
+        for f in index.candidates(atom, sub):
             s = _unify(atom, f, sub)
             if s is not None:
-                yield from self._join(rest, known, s, used + (f,))
+                yield from self._join(rest, index, s, used + (f,))
 
-    def _join_delta(self, body, known, delta):
+    def _join_delta(self, body, index, delta_index):
         """SEMI-NAIVE join: yield (sub, used) for rule firings using AT LEAST ONE delta fact (newly
-        derived last round). Bind body atom i to delta and the rest to all-known, summed over i ->
-        exactly the firings that could be NEW, avoiding the naive re-derivation of everything."""
+        derived last round). Bind body atom i to a delta fact and the rest to all-known, summed over i
+        -> exactly the firings that could be NEW, avoiding naive re-derivation of everything."""
         for i in range(len(body)):
             first, rest = body[i], body[:i] + body[i + 1:]
-            for f in delta:
+            for f in delta_index.candidates(first, {}):
                 s0 = _unify(first, f, {})
                 if s0 is not None:
-                    yield from self._join(rest, known, s0, (f,))
+                    yield from self._join(rest, index, s0, (f,))
 
     def closure(self, facts):
         """Least fixpoint via SEMI-NAIVE evaluation. Returns (all_facts, prov) where
         prov[f] = (rule_idx|None, body_facts, depth). Each round joins only firings that touch the
-        previous round's NEW facts (delta) -> avoids naive O(rounds * |known|^body) re-derivation."""
+        previous round's NEW facts (delta), indexed so each join is a lookup not a scan."""
         known = set(facts)
+        index = _Index()
+        for f in known:
+            index.add(f)
         prov = {f: (None, (), 0) for f in known}            # EDB facts: depth 0, no rule
         delta = set(known)
         while delta:
+            delta_index = _Index()
+            for f in delta:
+                delta_index.add(f)
             new = []                                         # collect this round; add after (no mutation mid-join)
             for ri, (head, body) in enumerate(self.rules):
-                src = self._join_delta(body, known, delta) if body else iter(())
-                for sub, used in src:
+                if not body:
+                    continue
+                for sub, used in self._join_delta(body, index, delta_index):
                     hf = _inst(head, sub)
                     if hf not in known:
                         new.append((hf, ri, used))
@@ -113,6 +163,7 @@ class Datalog:
             for hf, ri, used in new:
                 if hf not in known:
                     known.add(hf)
+                    index.add(hf)
                     prov[hf] = (ri, used, 1 + max((prov[u][2] for u in used), default=0))
                     delta.add(hf)
         return known, prov
