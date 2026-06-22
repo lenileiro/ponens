@@ -41,6 +41,31 @@ def gen_graph(rng, N, branch=3):
     return sorted(edges)
 
 
+def wordnet_graph(cap=600, roots=("animal.n.01", "plant.n.02", "artifact.n.01"), seed=0):
+    """The REAL WordNet is-a DAG (a neighborhood): entities = synsets, edges = direct hypernym links.
+    Proving r(child, ancestor) here = proving a real transitive is-a fact about actual concepts."""
+    from nltk.corpus import wordnet as wn
+    syns, queue = set(), [wn.synset(r) for r in roots]
+    while queue and len(syns) < cap:                          # BFS down hyponyms from the roots
+        s = queue.pop(0)
+        if s.name() in syns:
+            continue
+        syns.add(s.name())
+        queue += s.hyponyms()
+    nodes = set(syns)
+    for n in list(syns):                                      # add hypernym paths up to the roots
+        for path in wn.synset(n).hypernym_paths():
+            nodes.update(x.name() for x in path)
+    nodes = sorted(nodes)
+    idx = {n: i for i, n in enumerate(nodes)}
+    edges = set()
+    for n in nodes:
+        for h in wn.synset(n).hypernyms():
+            if h.name() in idx:
+                edges.add((idx[n], idx[h.name()]))            # child -> direct parent (is-a)
+    return len(nodes), sorted(edges), {i: n for n, i in idx.items()}
+
+
 def reachable(edges, src):
     adj = {}
     for (a, b) in edges:
@@ -148,12 +173,14 @@ def path_pairs(tree, src):
 
 
 def selfplay(N=40, branch=3, d=128, rounds=1500, bs=48, beam=4, budget=8, lr=1.5e-3,
-             device=None, seeds=1, verbose=True):
+             device=None, seeds=1, verbose=True, graph=None):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     res = []
     for seed in range(seeds):
         torch.manual_seed(seed); rng = np.random.default_rng(seed)
-        edges = gen_graph(rng, N, branch)
+        edges = graph[1] if graph is not None else gen_graph(rng, N, branch)   # real taxonomy or synthetic
+        if graph is not None:
+            N = graph[0]
         ents = [ename(i) for i in range(N)]
         base_facts = [(REL, (ename(a), ename(b))) for (a, b) in edges]
         env = LK.build_env(ents, {REL: 2}, base_facts, RULES)
@@ -246,11 +273,19 @@ def main(argv=None):
     ap.add_argument("--d", type=int, default=128); ap.add_argument("--rounds", type=int, default=1500)
     ap.add_argument("--beam", type=int, default=4); ap.add_argument("--budget", type=int, default=8)
     ap.add_argument("--seeds", type=int, default=1); ap.add_argument("--device", default=None)
+    ap.add_argument("--wordnet", action="store_true", help="run over the REAL WordNet is-a graph")
+    ap.add_argument("--cap", type=int, default=500)
     args = ap.parse_args(argv)
     if args.selftest:
         return selftest()
+    graph = None
+    if args.wordnet:
+        N, edges, names = wordnet_graph(cap=args.cap)
+        graph = (N, edges)
+        print(f"  REAL WordNet is-a graph: {N} synsets, {len(edges)} direct is-a links "
+              f"(e.g. {names[edges[0][0]]} -> {names[edges[0][1]]})", flush=True)
     selfplay(N=args.nodes, branch=args.branch, d=args.d, rounds=args.rounds, beam=args.beam,
-             budget=args.budget, seeds=args.seeds, device=args.device)
+             budget=args.budget, seeds=args.seeds, device=args.device, graph=graph)
     return 0
 
 
