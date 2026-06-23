@@ -59,6 +59,40 @@ def sh(cmd):
     return subprocess.run(cmd, shell=True).returncode
 
 
+def pod_addr(key, pid):
+    """Look up an existing pod's SSH (ip, port) from the API."""
+    st, p = api("GET", f"/pods/{pid}", key)
+    if st != 200:
+        return None, None
+    return p.get("publicIp"), (p.get("portMappings") or {}).get("22")
+
+
+def ssh_pull(ip, port, pairs, dest):
+    """ROBUST per-file fetch over SSH (decoupled from launch/terminate, binary-safe via cat). pairs =
+    list of (remote_abs_path, local_relpath). Returns the files actually retrieved (size>0)."""
+    ssh = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=20 -p {port} root@{ip}"
+    got = []
+    for remote, rel in pairs:
+        local = os.path.join(dest, rel)
+        os.makedirs(os.path.dirname(local) or ".", exist_ok=True)
+        subprocess.run(f"{ssh} 'cat {shlex_quote(remote)} 2>/dev/null' > {shlex_quote(local)}",
+                       shell=True)
+        sz = os.path.getsize(local) if os.path.exists(local) else 0
+        if sz > 0:
+            got.append((rel, sz)); print(f"  fetched {rel}: {sz:,} bytes")
+        else:
+            if os.path.exists(local):
+                os.remove(local)
+            print(f"  (skip {rel}: not present yet)")
+    return got
+
+
+# remote artifacts to retrieve (live log lives at /root; results/model in the repo runs/ dir)
+FETCH_PAIRS = [("/root/azr_win.log", "azr_win.log"),
+               (f"{REMOTE}/{RESULTS_REMOTE}", RESULTS_REMOTE),
+               (f"{REMOTE}/{SAVE_REMOTE}", SAVE_REMOTE)]
+
+
 def build_run(args):
     """The exact `python -m thinking.azr_win ...` command run on the pod (device auto-selects cuda)."""
     grpo = f"--grpo --grpo-mode {args.grpo_mode} --G {args.G} --grpo-bs {args.grpo_bs}" if args.grpo \
@@ -101,13 +135,30 @@ def main():
                     help="git ref to ship (pinned committed tree). Empty to ship working dir.")
     ap.add_argument("--print-payload", action="store_true")
     ap.add_argument("--go", action="store_true", help="actually create the pod (spends money)")
+    ap.add_argument("--fetch", default=None, metavar="POD_ID",
+                    help="SSH into an existing pod and pull results (log/json/solver) -> exit. No terminate.")
+    ap.add_argument("--terminate", default=None, metavar="POD_ID",
+                    help="delete a pod by id -> exit (cost cleanup).")
     args = ap.parse_args()
 
     assert args.d % args.heads == 0, f"--d ({args.d}) must be divisible by --heads ({args.heads})"
 
     key = os.environ.get("RUNPOD_API_KEY")
-    if not key and args.go:
+    if (args.go or args.fetch or args.terminate) and not key:
         sys.exit("ERROR: export RUNPOD_API_KEY first (do not hardcode it).")
+
+    if args.terminate:
+        st, _ = api("DELETE", f"/pods/{args.terminate}", key)
+        print(f"terminate {args.terminate}: HTTP {st}")
+        return
+    if args.fetch:
+        ip, port = pod_addr(key, args.fetch)
+        if not (ip and port):
+            sys.exit(f"pod {args.fetch} has no SSH endpoint (gone or not ready)")
+        print(f"fetching from pod {args.fetch} ({ip}:{port}) -> {HERE}")
+        got = ssh_pull(ip, port, FETCH_PAIRS, HERE)
+        print(f"done: {len(got)} file(s) fetched (pod NOT terminated; use --terminate {args.fetch})")
+        return
     pub = os.path.expanduser("~/.ssh/id_rsa.pub")
     pubkey = open(pub).read().strip() if os.path.exists(pub) else ""
 
@@ -202,10 +253,8 @@ def main():
             if "DONE" in (r.stdout or ""):
                 print("run complete")
                 break
-        fetch = (f"{ssh} 'cd {REMOTE} && tar czf - azr_win.log {RESULTS_REMOTE} {SAVE_REMOTE} 2>/dev/null' "
-                 f"| tar xzf - -C {HERE}")
-        sh(fetch)
-        print("results fetched ->", HERE)
+        got = ssh_pull(ip, port, FETCH_PAIRS, HERE)        # robust per-file pull (binary-safe, no-fail)
+        print(f"results fetched -> {HERE} ({len(got)} file(s))")
     finally:
         print("=== terminating pod (cost guard) ===")
         st, _ = api("DELETE", f"/pods/{pid}", key)
