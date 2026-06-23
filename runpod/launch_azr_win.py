@@ -68,22 +68,24 @@ def pod_addr(key, pid):
 
 
 def ssh_pull(ip, port, pairs, dest):
-    """ROBUST per-file fetch over SSH (decoupled from launch/terminate, binary-safe via cat). pairs =
-    list of (remote_abs_path, local_relpath). Returns the files actually retrieved (size>0)."""
-    ssh = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=20 -p {port} root@{ip}"
+    """ROBUST per-file fetch via scp (BINARY-SAFE -- cat-over-ssh corrupts .pt zips). pairs = list of
+    (remote_abs_path, local_relpath). Skips files not present yet. Returns the files retrieved (size>0)."""
+    sshb = f"-o StrictHostKeyChecking=no -o ConnectTimeout=20"
     got = []
     for remote, rel in pairs:
         local = os.path.join(dest, rel)
         os.makedirs(os.path.dirname(local) or ".", exist_ok=True)
-        subprocess.run(f"{ssh} 'cat {shlex_quote(remote)} 2>/dev/null' > {shlex_quote(local)}",
-                       shell=True)
+        chk = subprocess.run(f"ssh {sshb} -p {port} root@{ip} 'test -s {shlex_quote(remote)} && echo Y'",
+                             shell=True, capture_output=True, text=True)
+        if "Y" not in (chk.stdout or ""):
+            print(f"  (skip {rel}: not present yet)"); continue
+        rc = subprocess.run(f"scp {sshb} -P {port} root@{ip}:{shlex_quote(remote)} {shlex_quote(local)}",
+                            shell=True).returncode
         sz = os.path.getsize(local) if os.path.exists(local) else 0
-        if sz > 0:
+        if rc == 0 and sz > 0:
             got.append((rel, sz)); print(f"  fetched {rel}: {sz:,} bytes")
         else:
-            if os.path.exists(local):
-                os.remove(local)
-            print(f"  (skip {rel}: not present yet)")
+            print(f"  (failed {rel})")
     return got
 
 
