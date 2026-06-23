@@ -160,7 +160,7 @@ def collect_answers(prop, task, lib, A, L, max_steps, beam, device, samples=16, 
 # ===================================================================================================
 def save_model(path, prop, lib, concepts, A, L, K, d, max_macros, layers=3, heads=4):
     torch.save({"state_dict": prop.state_dict(), "A": A, "L": L, "K": K, "d": d, "layers": layers,
-                "heads": heads, "max_macros": max_macros,
+                "heads": heads, "cont": getattr(prop, "cont", False), "max_macros": max_macros,
                 "macros": {int(k): list(v) for k, v in lib.macros.items()},
                 "concepts": [list(c) for c in concepts]}, path)
 
@@ -170,7 +170,7 @@ def load_model(path, device="cpu"):
     lib = Library(max_macros=ck["max_macros"])
     lib.macros = {int(k): list(v) for k, v in ck["macros"].items()}
     prop = StepProposer(ck["A"], ck["L"], lib.vocab, d=ck["d"], h=ck.get("heads", 4),
-                        layers=ck.get("layers", 3)).to(device)
+                        layers=ck.get("layers", 3), cont=ck.get("cont", False)).to(device)
     prop.load_state_dict(ck["state_dict"]); prop.eval()
     return prop, lib, [list(c) for c in ck["concepts"]], ck["A"], ck["L"], ck["K"]
 
@@ -212,7 +212,7 @@ def solve_prompt(prop, lib, concepts, A, L, K, depth, device, beam=8, samples=16
 def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, layers=3, heads=4, rounds=3000, bs=32, beam=8,
              lr=1.5e-3, max_macros=24, abstract_every=100, collect_n=6, collect_temp=0.9,
              use_grpo=True, grpo_mode="process", G=6, grpo_bs=12, grpo_weight=1.0, save_path=None,
-             ckpt_every=0, frontier_thresh=0.7, device=None, seeds=1, verbose=True):
+             ckpt_every=0, frontier_thresh=0.7, cont=False, device=None, seeds=1, verbose=True):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     enable_tf32(device)                                          # H100: free TF32 matmul speedup
     res = []
@@ -220,7 +220,7 @@ def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, layers=3, heads=4, 
         torch.manual_seed(seed); rng = np.random.default_rng(seed)
         concepts = make_concepts(rng, n_concepts, A, L)
         lib = Library(max_macros=max_macros)
-        prop = StepProposer(A, L, lib.vocab, d=d, h=heads, layers=layers).to(device)
+        prop = StepProposer(A, L, lib.vocab, d=d, h=heads, layers=layers, cont=cont).to(device)
         opt = torch.optim.AdamW(prop.parameters(), lr=lr, weight_decay=0.01)
         frontier_depth, recent, vbuf = 1, [], []
         for rnd in range(rounds):
@@ -350,6 +350,8 @@ def main(argv=None):
                     help="checkpoint --save every N rounds (resilient to timeouts; 0 = only at end)")
     ap.add_argument("--frontier-thresh", type=float, default=0.7,
                     help="collect solve-rate to advance the curriculum depth (lower -> climbs deeper faster)")
+    ap.add_argument("--cont", action="store_true",
+                    help="GENERIC continuous frontend (ingests any numeric data, not a fixed alphabet)")
     ap.add_argument("--solve", default=None, help="path to a saved solver -> answer a prompt and exit")
     ap.add_argument("--depth", type=int, default=5, help="prompt depth for --solve")
     ap.add_argument("--prompts", type=int, default=3, help="how many prompts to answer in --solve")
@@ -370,7 +372,7 @@ def main(argv=None):
                    beam=args.beam, max_macros=args.max_macros, collect_n=args.collect_n,
                    use_grpo=args.grpo, grpo_mode=args.grpo_mode, G=args.G, grpo_bs=args.grpo_bs,
                    save_path=args.save, ckpt_every=args.ckpt_every, frontier_thresh=args.frontier_thresh,
-                   seeds=args.seeds, device=args.device)
+                   cont=args.cont, seeds=args.seeds, device=args.device)
     if args.out:
         import json
         with open(args.out, "w") as f:

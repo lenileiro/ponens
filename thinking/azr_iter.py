@@ -48,22 +48,32 @@ from thinking.azr_struct import (make_concepts, gen_task_struct, concepts_recove
 # Single-step proposer: given the K demos' CURRENT states + targets, propose the next op.
 # ===================================================================================================
 class StepProposer(nn.Module):
-    def __init__(self, A, L, vocab, d=128, h=4, layers=3):
+    """Single-step proposer with a GENERIC frontend. cont=False: discrete-symbol embedding (alphabet A, the
+    original azr_win). cont=True: a CONTINUOUS value encoder (Linear over the raw scalar) so the SAME model
+    ingests ANY numeric data, not just symbols 0..A-1 -- the frontend extension that lets azr_win's learned
+    technique (iterate-execute-residual + verified search) apply to arbitrary data sources."""
+    def __init__(self, A, L, vocab, d=128, h=4, layers=3, cont=False):
         super().__init__()
-        self.A, self.L, self.vocab = A, L, vocab
-        self.val = nn.Embedding(A, d)
+        self.A, self.L, self.vocab, self.cont = A, L, vocab, cont
+        if cont:
+            self.val_enc = nn.Sequential(nn.Linear(1, d), nn.GELU(), nn.Linear(d, d))
+        else:
+            self.val = nn.Embedding(A, d)
         self.role = nn.Embedding(2, d)                       # 0 = current state, 1 = target
         self.pos = nn.Embedding(L, d)
         self.cls = nn.Parameter(torch.zeros(1, 1, d))
         self.blocks = nn.ModuleList([Block(d, h) for _ in range(layers)])
         self.head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, vocab))
 
+    def _emb(self, x):                                       # x: (B,K,L) -> (B,K,L,d)
+        return self.val_enc(x.float().unsqueeze(-1)) if self.cont else self.val(x)
+
     def forward(self, state, target):
-        """state, target: (B, K, L) int. Returns (B, vocab) next-op logits."""
+        """state, target: (B, K, L). Returns (B, vocab) next-op logits."""
         B, K, L = state.shape
         ar = torch.arange(L, device=state.device)
-        s = self.val(state) + self.role.weight[0] + self.pos(ar)          # (B,K,L,d)
-        t = self.val(target) + self.role.weight[1] + self.pos(ar)
+        s = self._emb(state) + self.role.weight[0] + self.pos(ar)         # (B,K,L,d)
+        t = self._emb(target) + self.role.weight[1] + self.pos(ar)
         x = torch.cat([s, t], 2).reshape(B, K * 2 * L, s.size(-1))         # flatten demos
         h = torch.cat([self.cls.expand(B, -1, -1), x], 1)
         for blk in self.blocks:
