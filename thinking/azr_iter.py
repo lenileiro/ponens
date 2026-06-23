@@ -134,8 +134,21 @@ def evaluate(proposer, rng, concepts, A, L, K, depths, lib, max_steps, beam, dev
     return out
 
 
+def collect_solve(prop, t, lib, A, L, max_steps, beam, device, collect_n, collect_temp):
+    """ReST-EM collection: try greedy first, then up to collect_n-1 sampled rollouts; return the first
+    verified chain. Banks solutions to HARD tasks the model can only reach by sampling -> training on them
+    pulls those into greedy (solve@1) reach over rounds."""
+    for s in range(max(1, collect_n)):
+        chain = solve_iter(prop, t, lib, A, L, max_steps, beam, device,
+                           temp=(0.0 if s == 0 else collect_temp))
+        if chain is not None:
+            return chain
+    return None
+
+
 def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=3, d=128, rounds=1500, bs=32, beam=6,
-             lr=1.5e-3, max_macros=16, abstract_every=100, device=None, seeds=1, verbose=True):
+             lr=1.5e-3, max_macros=16, abstract_every=100, collect_n=1, collect_temp=0.9,
+             device=None, seeds=1, verbose=True):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     res = []
     for seed in range(seeds):
@@ -151,7 +164,7 @@ def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=3, d=128, rounds=1500, bs=32,
                      for _ in range(bs)]
             pairs, nsolved = [], 0
             for t in tasks:
-                chain = solve_iter(prop, t, lib, A, L, max_steps, beam, device)
+                chain = collect_solve(prop, t, lib, A, L, max_steps, beam, device, collect_n, collect_temp)
                 if chain is not None:
                     nsolved += 1; vbuf.append(chain)
                     X = [list(x) for (x, _y) in t[1]]; Y = [list(y) for (_x, y) in t[1]]
@@ -219,13 +232,15 @@ def main(argv=None):
     ap.add_argument("--maxdepth", type=int, default=3); ap.add_argument("--d", type=int, default=128)
     ap.add_argument("--rounds", type=int, default=1500); ap.add_argument("--beam", type=int, default=6)
     ap.add_argument("--max-macros", type=int, default=16); ap.add_argument("--seeds", type=int, default=1)
+    ap.add_argument("--collect-n", type=int, default=1, help="ReST-EM: best-of-N rollouts to COLLECT a "
+                    "verified solution per task during training (1 = greedy only)")
     ap.add_argument("--device", default=None); ap.add_argument("--out", default=None)
     args = ap.parse_args(argv)
     if args.selftest:
         return selftest()
     res = selfplay(A=args.A, L=args.L, K=args.K, n_concepts=args.concepts, maxdepth=args.maxdepth,
                    d=args.d, rounds=args.rounds, beam=args.beam, max_macros=args.max_macros,
-                   seeds=args.seeds, device=args.device)
+                   collect_n=args.collect_n, seeds=args.seeds, device=args.device)
     if args.out:
         import json
         with open(args.out, "w") as f:
