@@ -15,12 +15,28 @@ advances -- composition as interpolation over verified single steps.
     python -m thinking.azr_iter --A 6 --L 4 --K 4 --concepts 6 --maxdepth 3 --rounds 1500
 """
 import argparse
+import contextlib
 import sys
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def enable_tf32(device):
+    """Free ~1.5-2x on H100: allow TF32 for fp32 matmuls/cudnn. No-op on CPU."""
+    if "cuda" in str(device):
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+
+def amp(device):
+    """bf16 autocast on cuda (H100: ~2-4x + half memory), no-op on CPU. bf16 needs no GradScaler."""
+    if "cuda" in str(device):
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
 
 from thinking.azr import NBASE, NOP, Library, execute, apply_ops_np
 from thinking.reasoner import Block
@@ -213,9 +229,10 @@ def solve_iter_gpu(proposer, tasks, lib, A, L, max_steps, beam, device, w_policy
     for _step in range(max_steps):
         if bool(solved.all()):
             break
-        logp = F.log_softmax(proposer(F_.reshape(n * B, K, L),
-                                      Y[:, None].expand(n, B, K, L).reshape(n * B, K, L)), -1)
-        logp = logp.reshape(n, B, -1)[:, :, active]                                   # (n,B,nA)
+        with amp(device):                                                            # bf16 forward on cuda
+            logits = proposer(F_.reshape(n * B, K, L),
+                              Y[:, None].expand(n, B, K, L).reshape(n * B, K, L)).float()
+        logp = F.log_softmax(logits, -1).reshape(n, B, -1)[:, :, active]              # (n,B,nA)
         cand = torch.stack([_reduce_ops(expanded[j], F_, A) for j in range(nA)], 2)   # (n,B,nA,K,L)
         close = (cand == Yb[:, :, None]).reshape(n, B, nA, -1).float().mean(-1)       # (n,B,nA)
         score = (close + w_policy * logp).masked_fill(~valid[:, :, None], float("-inf"))

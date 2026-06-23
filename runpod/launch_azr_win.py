@@ -114,8 +114,8 @@ def main():
     ap.add_argument("--maxdepth", type=int, default=8)
     ap.add_argument("--d", type=int, default=512); ap.add_argument("--layers", type=int, default=8)
     ap.add_argument("--heads", type=int, default=8)
-    ap.add_argument("--bs", type=int, default=512, help="tasks/round -> thousands of frontier rows/forward")
-    ap.add_argument("--beam", type=int, default=16)
+    ap.add_argument("--bs", type=int, default=1024, help="tasks/round -> ~bs*beam frontier rows/forward")
+    ap.add_argument("--beam", type=int, default=32)
     ap.add_argument("--rounds", type=int, default=4000); ap.add_argument("--max-macros", type=int, default=48)
     ap.add_argument("--collect-n", type=int, default=8); ap.add_argument("--seeds", type=int, default=1)
     ap.add_argument("--ckpt-every", type=int, default=100,
@@ -183,6 +183,7 @@ def main():
     print(f"gpu/cloud : {args.gpu} / {args.cloud}  (disk {args.disk}GB, name {args.name})")
     print(f"task dist : A={args.A} L={args.L} K={args.K} concepts={args.concepts} maxdepth={args.maxdepth}")
     print(f"model     : d={args.d} layers={args.layers} heads={args.heads}  (BIG -> matmul feeds the GPU)")
+    print(f"precision : bf16 autocast + TF32 on cuda (~2-4x, half memory -> bigger batch)")
     print(f"batch     : bs={args.bs} tasks/round, beam={args.beam}  (~{args.bs * args.beam} frontier rows/fwd)")
     print(f"train     : rounds={args.rounds} collect-n={args.collect_n} grpo={args.grpo} seeds={args.seeds}")
     print(f"sync up   : {HERE}/ -> pod:{REMOTE}  (ref={args.ref or 'working-dir'})")

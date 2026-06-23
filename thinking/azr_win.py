@@ -29,7 +29,7 @@ from thinking.azr import NBASE, NOP, BASE_OPS, Library, execute, apply_ops_np
 from thinking.azr_struct import (make_concepts, gen_task_struct, concepts_recovered, abstract_struct,
                                  refactor)
 from thinking.azr_iter import (StepProposer, solve_iter, solve_iter_batch, solve_iter_gpu, closeness,
-                               chain_train_pairs, collect_solve, evaluate)
+                               chain_train_pairs, collect_solve, evaluate, enable_tf32, amp)
 
 
 # ===================================================================================================
@@ -214,6 +214,7 @@ def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, layers=3, heads=4, 
              use_grpo=True, grpo_mode="process", G=6, grpo_bs=12, grpo_weight=1.0, save_path=None,
              ckpt_every=0, device=None, seeds=1, verbose=True):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    enable_tf32(device)                                          # H100: free TF32 matmul speedup
     res = []
     for seed in range(seeds):
         torch.manual_seed(seed); rng = np.random.default_rng(seed)
@@ -249,7 +250,8 @@ def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, layers=3, heads=4, 
                 st = torch.tensor([p[0] for p in pairs], device=device)
                 tg = torch.tensor([p[1] for p in pairs], device=device)
                 op = torch.tensor([p[2] for p in pairs], device=device)
-                loss = F.cross_entropy(prop(st, tg), op)
+                with amp(device):                               # bf16 forward on cuda
+                    loss = F.cross_entropy(prop(st, tg), op)
                 opt.zero_grad(); loss.backward()
                 torch.nn.utils.clip_grad_norm_(prop.parameters(), 1.0); opt.step()
             # --- GRPO relative update (success+failure signal) ---
