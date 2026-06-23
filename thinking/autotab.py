@@ -219,12 +219,39 @@ def run(train_csv, target, test_csv=None, seed=0, log_target="auto"):
     return best, selected
 
 
+def submit(train_csv, target, test_csv, out, id_col, seed=0):
+    """Select the pipeline (held-out verified), refit on FULL train, predict the test set, write submission."""
+    from sklearn.ensemble import HistGradientBoostingRegressor
+    _, selected = run(train_csv, target, test_csv, seed)
+    tr = pd.read_csv(train_csv); auxs = detect_aux(train_csv); tr, _ = join_aux(tr, auxs)
+    te, _ = join_aux(pd.read_csv(test_csv), auxs)
+    cols = [c for c in tr.columns if c != target and c in te.columns]
+    roles = {c: r for c, r in ((c, infer_role(tr[c], c)) for c in cols) if r != "drop"}
+    y = tr[target].astype(float).values
+    groups = build_groups(tr, te, y, roles)                   # train feats from FULL train; test feats
+    Xt = pd.concat([groups[n][0] for n in selected], axis=1).values.astype(float)
+    Xte = pd.concat([groups[n][1] for n in selected], axis=1).values.astype(float)
+    m = HistGradientBoostingRegressor(max_iter=600, learning_rate=0.05, max_leaf_nodes=63,
+                                      l2_regularization=1.0, early_stopping=True, random_state=seed).fit(Xt, y)
+    pred = np.clip(m.predict(Xte), 0, None)
+    sub = pd.DataFrame({"Order_No": pd.read_csv(test_csv)[id_col].values,
+                        "Time from Pickup to Arrival": np.round(pred).astype(int)})
+    sub.to_csv(out, index=False)
+    print(f"\n  wrote {len(sub)} predictions -> {out}")
+    return sub
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--train", required=True); ap.add_argument("--target", required=True)
     ap.add_argument("--test", default=None); ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--submit", default=None, help="write a submission CSV of test-set predictions")
+    ap.add_argument("--id-col", default="Order No", help="id column in the test set for the submission")
     args = ap.parse_args(argv)
-    run(args.train, args.target, args.test, args.seed)
+    if args.submit:
+        submit(args.train, args.target, args.test, args.submit, args.id_col, args.seed)
+    else:
+        run(args.train, args.target, args.test, args.seed)
     return 0
 
 
