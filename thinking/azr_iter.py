@@ -65,9 +65,12 @@ def closeness(states, targets, L):
 
 
 @torch.no_grad()
-def solve_iter(proposer, task, lib, A, L, max_steps, beam, device, w_policy=0.5, temp=0.0):
+def solve_iter(proposer, task, lib, A, L, max_steps, beam, device, w_policy=0.5, temp=0.0,
+               bank=None, w_insight=1.0):
     """Beam search over single ops, execution-guided. Returns a verified op-chain (reproduces all demos)
-    or None. temp>0 samples the kept beam stochastically (for best-of-N diversity); temp=0 is greedy."""
+    or None. temp>0 samples the kept beam stochastically (for best-of-N diversity); temp=0 is greedy.
+    bank (optional): a CONTRASTIVE-INSIGHT table {prev_op -> {op -> log-odds}} added to the candidate score
+    as a non-parametric strategy prior (no weight update); START prev-op key = -1."""
     proposer.eval()
     demos = task[1]
     X = [list(x) for (x, _y) in demos]
@@ -91,10 +94,13 @@ def solve_iter(proposer, task, lib, A, L, max_steps, beam, device, w_policy=0.5,
         cands = []
         for fi in range(Fn):
             ops = frontier[fi][1]
+            pri = bank.get(ops[-1] if ops else -1, {}) if bank is not None else None
             for j, o in enumerate(active):
                 idx = fi * nA + j
-                cands.append((float(close[idx]) + w_policy * float(logp[fi, o]),
-                              nss[idx].tolist(), ops + [o]))
+                score = float(close[idx]) + w_policy * float(logp[fi, o])
+                if pri is not None:
+                    score += w_insight * pri.get(o, 0.0)       # contrastive-insight strategy prior
+                cands.append((score, nss[idx].tolist(), ops + [o]))
         if temp > 0 and cands:                               # stochastic ordering for best-of-N diversity
             sc = np.array([c[0] for c in cands], dtype=float)
             pr = np.exp((sc - sc.max()) / temp); pr /= pr.sum()
