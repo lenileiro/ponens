@@ -15,12 +15,42 @@ Transform library (per inferred role):
     python -m thinking.autotab --train Train.csv --target "Time from Pickup to Arrival" --test Test.csv
 """
 import argparse
+import glob
 import math
+import os
 import re
 import sys
 
 import numpy as np
 import pandas as pd
+
+
+def detect_aux(train_csv):
+    """Other CSVs in the dataset dir that aren't train/test/submission -> candidate auxiliary tables to join."""
+    skip = ("train", "test", "sample", "submission", "variabledefinition", "manifest")
+    out = []
+    for f in sorted(glob.glob(os.path.join(os.path.dirname(train_csv) or ".", "*.csv"))):
+        b = os.path.basename(f).lower()
+        if not any(s in b for s in skip):
+            out.append(f)
+    return out
+
+
+def join_aux(main, auxs):
+    """AUTO-JOIN: for each aux table, find the shared column with the best value-overlap as the key and
+    left-join its other columns. (Sendy: Riders.csv on 'Rider Id'.)"""
+    joined = []
+    for f in auxs:
+        a = pd.read_csv(f)
+        shared = [c for c in a.columns if c in main.columns]
+        if not shared:
+            continue
+        key = max(shared, key=lambda c: len(set(a[c]) & set(main[c])))
+        if len(set(a[key]) & set(main[key])) == 0:
+            continue
+        main = main.merge(a.drop_duplicates(key), on=key, how="left", suffixes=("", "_aux"))
+        joined.append((os.path.basename(f), key, [c for c in a.columns if c != key]))
+    return main, joined
 
 TIME_RE = re.compile(r"^\s*\d{1,2}:\d{2}:\d{2}\s*(AM|PM)\s*$", re.I)
 
@@ -131,23 +161,28 @@ def build_groups(tr, va, y_tr, roles):
     return groups
 
 
-def rmse_with(groups, names, y_tr, y_va, seed):
+def rmse_with(groups, names, y_tr_fit, y_va, inv, seed):
+    """Fit on the (possibly log-transformed) target y_tr_fit, score RMSE in ORIGINAL units via inv()."""
     from sklearn.ensemble import HistGradientBoostingRegressor
     Xt = pd.concat([groups[n][0] for n in names], axis=1).values.astype(float)
     Xv = pd.concat([groups[n][1] for n in names], axis=1).values.astype(float)
     m = HistGradientBoostingRegressor(max_iter=400, learning_rate=0.06, max_leaf_nodes=63,
-                                      l2_regularization=1.0, early_stopping=True, random_state=seed).fit(Xt, y_tr)
-    return math.sqrt(((m.predict(Xv) - y_va) ** 2).mean())
+                                      l2_regularization=1.0, early_stopping=True,
+                                      random_state=seed).fit(Xt, y_tr_fit)
+    return math.sqrt(((inv(m.predict(Xv)) - y_va) ** 2).mean())
 
 
-def run(train_csv, target, test_csv=None, seed=0):
+def run(train_csv, target, test_csv=None, seed=0, log_target="auto"):
     tr = pd.read_csv(train_csv)
+    auxs = detect_aux(train_csv)
+    tr, joined = join_aux(tr, auxs)
+    for nm, key, addc in joined:
+        print(f"  auto-join: {nm} on '{key}' (+{len(addc)} cols)")
     cols = [c for c in tr.columns if c != target]
     if test_csv:                                              # use only columns present in test -> drop leakage
-        te = pd.read_csv(test_csv)
-        common = [c for c in cols if c in te.columns]
+        te, _ = join_aux(pd.read_csv(test_csv), auxs)
         dropped = [c for c in cols if c not in te.columns]
-        cols = common
+        cols = [c for c in cols if c in te.columns]
         if dropped:
             print(f"  leakage-guard: dropped {len(dropped)} cols absent from test (e.g. {dropped[:2]})")
     y = tr[target].astype(float).values
@@ -157,23 +192,30 @@ def run(train_csv, target, test_csv=None, seed=0):
           for r in sorted(set(roles.values()))))
     rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); cut = int(0.85 * len(y))
     tri, vai = idx[:cut], idx[cut:]
-    trd, vad = tr.iloc[tri], tr.iloc[vai]
-    groups = build_groups(trd, vad, y[tri], roles)
+    ident = lambda p: p
+    groups = build_groups(tr.iloc[tri], tr.iloc[vai], y[tri], roles)   # TE on original target (a feature)
     print(f"  transform library produced {len(groups)} feature groups: {list(groups)}")
-    # GREEDY FORWARD SELECTION verified by held-out RMSE
-    selected, remaining = [], list(groups)
+    selected, remaining = [], list(groups)                    # greedy forward selection, held-out verified
     best = math.sqrt(((y[tri].mean() - y[vai]) ** 2).mean())
     print(f"  baseline (predict-mean) RMSE: {best:.0f}")
     while remaining:
-        scored = [(rmse_with(groups, selected + [g], y[tri], y[vai], seed), g) for g in remaining]
+        scored = [(rmse_with(groups, selected + [g], y[tri], y[vai], ident, seed), g) for g in remaining]
         r, g = min(scored)
         if r < best - 1.0:
             selected.append(g); remaining.remove(g); best = r
             print(f"  + discovered '{g}' -> held-out RMSE {r:.0f}")
         else:
             break
-    print(f"\n  DISCOVERED PIPELINE: {selected}")
-    print(f"  final held-out RMSE: {best:.0f} sec  (vs hand-engineered 734)")
+    # VERIFY the target transform too: try log-target on the selected pipeline, keep it only if it helps
+    used_log = False
+    if selected and (y > 0).all() and (log_target in (True, "auto")):
+        r_log = rmse_with(groups, selected, np.log1p(y[tri]), y[vai], lambda p: np.expm1(p), seed)
+        print(f"  verify target-transform: log {r_log:.0f} vs raw {best:.0f} -> "
+              f"{'LOG kept' if r_log < best else 'raw kept'}")
+        if r_log < best:
+            best, used_log = r_log, True
+    print(f"\n  DISCOVERED PIPELINE: {selected}{' + log-target' if used_log else ''}")
+    print(f"  final held-out RMSE: {best:.0f}")
     return best, selected
 
 
