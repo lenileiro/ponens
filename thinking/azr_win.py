@@ -158,9 +158,10 @@ def collect_answers(prop, task, lib, A, L, max_steps, beam, device, samples=16, 
 # ===================================================================================================
 # Persist / load the trained solver (proposer weights + discovered library + concepts) and ANSWER a prompt.
 # ===================================================================================================
-def save_model(path, prop, lib, concepts, A, L, K, d, max_macros):
-    torch.save({"state_dict": prop.state_dict(), "A": A, "L": L, "K": K, "d": d,
-                "max_macros": max_macros, "macros": {int(k): list(v) for k, v in lib.macros.items()},
+def save_model(path, prop, lib, concepts, A, L, K, d, max_macros, layers=3, heads=4):
+    torch.save({"state_dict": prop.state_dict(), "A": A, "L": L, "K": K, "d": d, "layers": layers,
+                "heads": heads, "max_macros": max_macros,
+                "macros": {int(k): list(v) for k, v in lib.macros.items()},
                 "concepts": [list(c) for c in concepts]}, path)
 
 
@@ -168,7 +169,8 @@ def load_model(path, device="cpu"):
     ck = torch.load(path, map_location=device)
     lib = Library(max_macros=ck["max_macros"])
     lib.macros = {int(k): list(v) for k, v in ck["macros"].items()}
-    prop = StepProposer(ck["A"], ck["L"], lib.vocab, d=ck["d"]).to(device)
+    prop = StepProposer(ck["A"], ck["L"], lib.vocab, d=ck["d"], h=ck.get("heads", 4),
+                        layers=ck.get("layers", 3)).to(device)
     prop.load_state_dict(ck["state_dict"]); prop.eval()
     return prop, lib, [list(c) for c in ck["concepts"]], ck["A"], ck["L"], ck["K"]
 
@@ -207,7 +209,7 @@ def solve_prompt(prop, lib, concepts, A, L, K, depth, device, beam=8, samples=16
           flush=True)
 
 
-def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, rounds=3000, bs=32, beam=8,
+def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, layers=3, heads=4, rounds=3000, bs=32, beam=8,
              lr=1.5e-3, max_macros=24, abstract_every=100, collect_n=6, collect_temp=0.9,
              use_grpo=True, grpo_mode="process", G=6, grpo_bs=12, grpo_weight=1.0, save_path=None,
              device=None, seeds=1, verbose=True):
@@ -217,7 +219,7 @@ def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, rounds=3000, bs=32,
         torch.manual_seed(seed); rng = np.random.default_rng(seed)
         concepts = make_concepts(rng, n_concepts, A, L)
         lib = Library(max_macros=max_macros)
-        prop = StepProposer(A, L, lib.vocab, d=d).to(device)
+        prop = StepProposer(A, L, lib.vocab, d=d, h=heads, layers=layers).to(device)
         opt = torch.optim.AdamW(prop.parameters(), lr=lr, weight_decay=0.01)
         frontier_depth, recent, vbuf = 1, [], []
         for rnd in range(rounds):
@@ -278,7 +280,7 @@ def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, rounds=3000, bs=32,
         rec = concepts_recovered(lib, concepts, A, L)
         res.append((final, rec, len(lib.macros), bestN))
         if save_path and seed == 0:
-            save_model(save_path, prop, lib, concepts, A, L, K, d, max_macros)
+            save_model(save_path, prop, lib, concepts, A, L, K, d, max_macros, layers=layers, heads=heads)
             if verbose:
                 print(f"  saved trained solver -> {save_path}", flush=True)
         if verbose:
@@ -309,6 +311,8 @@ def main(argv=None):
     ap.add_argument("--A", type=int, default=6); ap.add_argument("--L", type=int, default=4)
     ap.add_argument("--K", type=int, default=4); ap.add_argument("--concepts", type=int, default=6)
     ap.add_argument("--maxdepth", type=int, default=5); ap.add_argument("--d", type=int, default=160)
+    ap.add_argument("--layers", type=int, default=3); ap.add_argument("--heads", type=int, default=4)
+    ap.add_argument("--bs", type=int, default=32, help="tasks per round (massive batch -> feeds the GPU)")
     ap.add_argument("--rounds", type=int, default=3000); ap.add_argument("--beam", type=int, default=8)
     ap.add_argument("--max-macros", type=int, default=24); ap.add_argument("--collect-n", type=int, default=6)
     ap.add_argument("--grpo", dest="grpo", action="store_true", default=True,
@@ -335,9 +339,10 @@ def main(argv=None):
             solve_prompt(prop, lib, concepts, A, L, K, args.depth, dev, beam=args.beam, seed=100 + i)
         return 0
     res = selfplay(A=args.A, L=args.L, K=args.K, n_concepts=args.concepts, maxdepth=args.maxdepth,
-                   d=args.d, rounds=args.rounds, beam=args.beam, max_macros=args.max_macros,
-                   collect_n=args.collect_n, use_grpo=args.grpo, grpo_mode=args.grpo_mode, G=args.G,
-                   grpo_bs=args.grpo_bs, save_path=args.save, seeds=args.seeds, device=args.device)
+                   d=args.d, layers=args.layers, heads=args.heads, bs=args.bs, rounds=args.rounds,
+                   beam=args.beam, max_macros=args.max_macros, collect_n=args.collect_n,
+                   use_grpo=args.grpo, grpo_mode=args.grpo_mode, G=args.G, grpo_bs=args.grpo_bs,
+                   save_path=args.save, seeds=args.seeds, device=args.device)
     if args.out:
         import json
         with open(args.out, "w") as f:
