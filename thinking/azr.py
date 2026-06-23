@@ -75,6 +75,32 @@ def execute(prog, v, A, lib):
     return v
 
 
+def apply_base_np(op, s, A):
+    """Vectorized apply_base over a (..., L) int array (same semantics as apply_base)."""
+    if op == 0:  return s
+    if op == 1:  return (s + 1) % A
+    if op == 2:  return (s + 2) % A
+    if op == 3:  return (s - 1) % A
+    if op == 4:  return s[..., ::-1]
+    if op == 5:  return np.roll(s, -1, axis=-1)
+    if op == 6:  return np.roll(s, 1, axis=-1)
+    if op == 7:  return np.sort(s, axis=-1)
+    raise ValueError(op)
+
+
+def apply_ops_np(states, ops, lib, A):
+    """states: (B,K,L) int; ops: (B,) op-ids (one per row, macros expanded). Returns new (B,K,L). Applies
+    each distinct op once to its rows (vectorized) -> no Python per-element loop."""
+    out = states.copy()
+    for op in np.unique(ops):
+        rows = np.where(ops == op)[0]
+        sub = out[rows]
+        for b in lib.expand(int(op)):
+            sub = apply_base_np(b, sub, A)
+        out[rows] = sub
+    return out
+
+
 def prog_len(prog):
     return sum(1 for op in prog if op != NOP)               # macro counts as 1 -> Occam prefers macros
 

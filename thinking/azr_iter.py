@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from thinking.azr import NBASE, NOP, Library, execute
+from thinking.azr import NBASE, NOP, Library, execute, apply_ops_np
 from thinking.reasoner import Block
 from thinking.azr_struct import (make_concepts, gen_task_struct, concepts_recovered, abstract_struct,
                                  refactor, _IDLIB)
@@ -80,13 +80,21 @@ def solve_iter(proposer, task, lib, A, L, max_steps, beam, device, w_policy=0.5,
                 return ops
         st = torch.tensor([states for states, _ in frontier], device=device)
         tg = torch.tensor([Y] * len(frontier), device=device)
-        logp = F.log_softmax(proposer(st, tg), -1)           # (F, vocab)
+        logp = F.log_softmax(proposer(st, tg), -1).detach().cpu().numpy()   # (F, vocab)
+        Yarr = np.array(Y)
+        aops = np.array(active)
+        nA, Fn = len(active), len(frontier)
+        # apply EVERY active op to EVERY frontier node's states in one grouped-by-op vectorized pass
+        tiled = np.repeat(np.array([s for s, _ in frontier]), nA, axis=0)   # (Fn*nA, K, L)
+        nss = apply_ops_np(tiled, np.tile(aops, Fn), lib, A)
+        close = (nss == Yarr).reshape(Fn * nA, -1).mean(1)
         cands = []
-        for fi, (states, ops) in enumerate(frontier):
-            for o in active:
-                ns = [execute([o], s, A, lib) for s in states]
-                score = closeness(ns, Y, L) + w_policy * float(logp[fi, o])
-                cands.append((score, ns, ops + [o]))
+        for fi in range(Fn):
+            ops = frontier[fi][1]
+            for j, o in enumerate(active):
+                idx = fi * nA + j
+                cands.append((float(close[idx]) + w_policy * float(logp[fi, o]),
+                              nss[idx].tolist(), ops + [o]))
         if temp > 0 and cands:                               # stochastic ordering for best-of-N diversity
             sc = np.array([c[0] for c in cands], dtype=float)
             pr = np.exp((sc - sc.max()) / temp); pr /= pr.sum()

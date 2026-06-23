@@ -25,7 +25,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from thinking.azr import NBASE, NOP, BASE_OPS, Library, execute
+from thinking.azr import NBASE, NOP, BASE_OPS, Library, execute, apply_ops_np
 from thinking.azr_struct import (make_concepts, gen_task_struct, concepts_recovered, abstract_struct,
                                  refactor)
 from thinking.azr_iter import (StepProposer, solve_iter, closeness, chain_train_pairs, collect_solve,
@@ -79,59 +79,65 @@ def grpo_step(prop, tasks, lib, A, L, max_steps, device, G=6, temp=1.0):
     return torch.stack(terms).mean(), float(np.mean(solves))
 
 
-def grpo_rollout_process(prop, task, lib, A, L, max_steps, device, temp=1.0):
-    """Per-step PROCESS rollout: same stochastic rollout, but record an executor-grounded reward AT EACH STEP
-    = the change in closeness-to-target from applying that op (the verifier's per-step progress signal), plus
-    a terminal +1 on the last step if it solves. Returns (per-step logps, per-step rewards, solved)."""
-    demos = task[1]
-    states = [list(x) for (x, _y) in demos]
-    Y = [list(y) for (_x, y) in demos]
-    active = [op for op, a in enumerate(lib.active()) if a and op != NOP]
-    amask = torch.full((prop.vocab,), float("-inf"), device=device)
-    amask[active] = 0.0
-    tg = torch.tensor([Y], device=device)
-    prev = closeness(states, Y, L)
-    logps, rewards = [], []
-    for _ in range(max_steps):
-        if all(states[i] == Y[i] for i in range(len(Y))):
-            break
-        st = torch.tensor([states], device=device)
-        lp = F.log_softmax(prop(st, tg)[0] / temp + amask, -1)
-        op = int(torch.distributions.Categorical(logits=lp).sample())
-        logps.append(lp[op])
-        states = [execute([op], s, A, lib) for s in states]
-        now = closeness(states, Y, L)
-        rewards.append(now - prev)                                     # per-step process reward (Δcloseness)
-        prev = now
-    solved = all(states[i] == Y[i] for i in range(len(Y)))
-    if solved and rewards:
-        rewards[-1] += 1.0                                             # terminal solve bonus
-    return logps, rewards, solved
-
-
 def grpo_step_process(prop, tasks, lib, A, L, max_steps, device, G=6, temp=1.0):
-    """Dr.GRPO with the PER-STEP PROCESS REWARD. For each step we use the RETURN-TO-GO (sum of future per-step
-    process rewards incl. the terminal solve bonus -> a necessary 'detour' op still gets credit from the later
-    solve) and a PER-STEP group baseline (mean return-to-go across the G rollouts at that step index; Dr.GRPO:
-    mean baseline, no std/length norm). Per-step credit assignment -> lower variance than outcome-only GRPO."""
+    """Dr.GRPO with the PER-STEP PROCESS REWARD -- BATCHED. All B = len(tasks)*G rollouts advance together in
+    ONE proposer forward per step (vs B=1 per step per rollout); states/ops are applied with vectorized numpy.
+    Per-step reward = executor-grounded Δcloseness (the verifier's progress signal) + terminal solve bonus;
+    per-step credit via RETURN-TO-GO with a PER-STEP, PER-TASK group baseline (mean baseline, no std/length
+    norm). A 'detour' op still gets credit from the later solve. ~50x fewer forward passes than the naive loop.
+    """
+    Xs, Ys, owner = [], [], []
+    for ti, t in enumerate(tasks):
+        demos = t[1]
+        X = [list(x) for (x, _y) in demos]; Y = [list(y) for (_x, y) in demos]
+        for _ in range(G):
+            Xs.append(X); Ys.append(Y); owner.append(ti)
+    B = len(Xs)
+    states = np.array(Xs); targets = np.array(Ys)                      # (B,K,L)
+    flatY = targets.reshape(B, -1)
+    tg = torch.tensor(targets, device=device)
+    active = [op for op, a in enumerate(lib.active()) if a and op != NOP]
+    amask = torch.full((prop.vocab,), float("-inf"), device=device); amask[active] = 0.0
+    arangeB = torch.arange(B, device=device)
+    done = (states.reshape(B, -1) == flatY).all(1)
+    prev = (states.reshape(B, -1) == flatY).mean(1)                    # closeness per row
+    logps = [[] for _ in range(B)]; rewards = [[] for _ in range(B)]
+    for _step in range(max_steps):
+        if done.all():
+            break
+        st = torch.tensor(states, device=device)
+        lp = F.log_softmax(prop(st, tg) / temp + amask, -1)            # (B, vocab) -- ONE forward, all rollouts
+        ops_t = torch.distributions.Categorical(logits=lp).sample()    # (B,)
+        chosen = lp[arangeB, ops_t]                                    # (B,) keeps grad
+        ops = ops_t.detach().cpu().numpy()
+        states = apply_ops_np(states, ops, lib, A)
+        now = (states.reshape(B, -1) == flatY).mean(1)
+        for b in range(B):
+            if not done[b]:
+                logps[b].append(chosen[b]); rewards[b].append(float(now[b] - prev[b]))
+        prev = now
+        done = (states.reshape(B, -1) == flatY).all(1)
+    solved = (states.reshape(B, -1) == flatY).all(1)
+    for b in range(B):
+        if solved[b] and rewards[b]:
+            rewards[b][-1] += 1.0                                      # terminal solve bonus
     terms, solves = [], []
-    for t in tasks:
-        rolls = [grpo_rollout_process(prop, t, lib, A, L, max_steps, device, temp) for _ in range(G)]
-        solves.append(np.mean([float(s) for (_lp, _r, s) in rolls]))
-        rtg = []                                                       # return-to-go per rollout
-        for (_logps, rewards, _s) in rolls:
-            g, acc = [0.0] * len(rewards), 0.0
-            for k in reversed(range(len(rewards))):
-                acc += rewards[k]; g[k] = acc
-            rtg.append(g)
-        maxT = max((len(g) for g in rtg), default=0)
-        baseline = [float(np.mean([rtg[i][k] for i in range(len(rolls)) if k < len(rtg[i])]))
-                    for k in range(maxT)]
-        for i, (logps, _rewards, _s) in enumerate(rolls):
-            for k in range(len(logps)):
-                adv = rtg[i][k] - baseline[k]
+    for ti in range(len(tasks)):
+        idxs = [b for b in range(B) if owner[b] == ti]
+        solves.append(float(np.mean([float(solved[b]) for b in idxs])))
+        rtg = {}
+        for b in idxs:
+            g, acc = [0.0] * len(rewards[b]), 0.0
+            for k in reversed(range(len(rewards[b]))):
+                acc += rewards[b][k]; g[k] = acc
+            rtg[b] = g
+        maxT = max((len(rtg[b]) for b in idxs), default=0)
+        baseline = [float(np.mean([rtg[b][k] for b in idxs if k < len(rtg[b])])) for k in range(maxT)]
+        for b in idxs:
+            for k in range(len(logps[b])):
+                adv = rtg[b][k] - baseline[k]
                 if abs(adv) > 1e-8:
-                    terms.append(-adv * logps[k])
+                    terms.append(-adv * logps[b][k])
     if not terms:
         return None, float(np.mean(solves)) if solves else 0.0
     return torch.stack(terms).mean(), float(np.mean(solves))
