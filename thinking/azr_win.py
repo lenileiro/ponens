@@ -228,13 +228,28 @@ def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, layers=3, heads=4, 
             tasks = [gen_task_struct(rng, concepts, A, L, K, int(rng.integers(1, frontier_depth + 1)))
                      for _ in range(bs)]
             # --- ReST-EM SFT on verified chains (positive signal); batched greedy + sampled fallback ---
-            gsolve = solve_iter_gpu if "cuda" in str(device) else solve_iter_batch
+            on_cuda = "cuda" in str(device)
+            gsolve = solve_iter_gpu if on_cuda else solve_iter_batch
             greedy = gsolve(prop, tasks, lib, A, L, max_steps, beam, device)
+            if on_cuda and collect_n > 1:                               # BATCHED fallback (all unsolved at once)
+                un = [ti for ti in range(len(tasks)) if greedy[ti] is None]
+                for _s in range(collect_n - 1):
+                    if not un:
+                        break
+                    res = solve_iter_gpu(prop, [tasks[ti] for ti in un], lib, A, L, max_steps, beam,
+                                         device, temp=collect_temp)
+                    nxt = []
+                    for j, ti in enumerate(un):
+                        if res[j] is not None:
+                            greedy[ti] = res[j]
+                        else:
+                            nxt.append(ti)
+                    un = nxt
             pairs, nsolved = [], 0
             for ti, t in enumerate(tasks):
                 chain = greedy[ti]
-                if chain is None:
-                    for _s in range(max(0, collect_n - 1)):             # ReST-EM: sample for hard tasks
+                if chain is None and not on_cuda:                       # CPU: per-task sampled fallback
+                    for _s in range(max(0, collect_n - 1)):
                         chain = solve_iter(prop, t, lib, A, L, max_steps, beam, device, temp=collect_temp)
                         if chain is not None:
                             break

@@ -203,12 +203,13 @@ def _apply_base_torch(op, s, A):
 
 
 @torch.no_grad()
-def solve_iter_gpu(proposer, tasks, lib, A, L, max_steps, beam, device, w_policy=0.5):
-    """FULLY TENSORIZED greedy beam search (keeps the GPU fed): the executor runs as torch ops on-device, and
+def solve_iter_gpu(proposer, tasks, lib, A, L, max_steps, beam, device, w_policy=0.5, temp=0.0):
+    """FULLY TENSORIZED beam search (keeps the GPU fed): the executor runs as torch ops on-device, and
     candidate-expand -> score -> top-beam are batched tensor ops -- NO Python per-candidate loop and NO
     per-step GPU->CPU sync. Fixed (n, beam) frontier (padded/masked). Skips exact state-dedup (top-k by score
-    instead), which slightly lowers beam diversity but removes the Python that starved the GPU. Returns a list
-    of verified op-chains (or None) aligned with `tasks` -- matches solve_iter_batch's solve set closely."""
+    instead), which slightly lowers beam diversity but removes the Python that starved the GPU. temp>0 selects
+    the beam STOCHASTICALLY (Gumbel-top-k) -> batched best-of-N for the collect/eval fallback across ALL
+    unsolved tasks at once (vs per-task Python). Returns op-chains (or None) aligned with `tasks`."""
     proposer.eval()
     n = len(tasks); B = beam; K = len(tasks[0][1])
     X = torch.tensor([[list(x) for (x, _y) in t[1]] for t in tasks], device=device)   # (n,K,L)
@@ -236,7 +237,13 @@ def solve_iter_gpu(proposer, tasks, lib, A, L, max_steps, beam, device, w_policy
         cand = torch.stack([_reduce_ops(expanded[j], F_, A) for j in range(nA)], 2)   # (n,B,nA,K,L)
         close = (cand == Yb[:, :, None]).reshape(n, B, nA, -1).float().mean(-1)       # (n,B,nA)
         score = (close + w_policy * logp).masked_fill(~valid[:, :, None], float("-inf"))
-        topv, topi = score.reshape(n, B * nA).topk(B, dim=1)                          # (n,B)
+        flat = score.reshape(n, B * nA)
+        if temp > 0:                                                                  # stochastic (Gumbel-top-k)
+            g = -torch.log(-torch.log(torch.rand_like(flat).clamp_min(1e-9)).clamp_min(1e-9))
+            _, topi = (flat / temp + g).topk(B, dim=1)
+            topv = flat.gather(1, topi)                                               # real scores (validity)
+        else:
+            topv, topi = flat.topk(B, dim=1)                                          # (n,B) greedy
         parent, opj = topi // nA, topi % nA
         F_ = cand[arn, parent, opj]                                                   # (n,B,K,L)
         chains = chains[arn, parent].clone()
@@ -276,16 +283,27 @@ def evaluate(proposer, rng, concepts, A, L, K, depths, lib, max_steps, beam, dev
     out = {}
     for d in depths:
         tasks = [gen_task_struct(rng, concepts, A, L, K, d) for _ in range(n)]
-        gsolve = solve_iter_gpu if "cuda" in str(device) else solve_iter_batch
+        on_cuda = "cuda" in str(device)
+        gsolve = solve_iter_gpu if on_cuda else solve_iter_batch
         greedy = gsolve(proposer, tasks, lib, A, L, max_steps, beam, device)            # s=0 greedy, batched
-        ok = 0
-        for ti, t in enumerate(tasks):
-            if greedy[ti] is not None:
-                ok += 1; continue
-            for _s in range(samples - 1):                               # best-of-N: sampled fallback
-                if solve_iter(proposer, t, lib, A, L, max_steps, beam, device, temp=temp) is not None:
-                    ok += 1; break
-        out[d] = ok / n
+        if on_cuda:                                                     # BATCHED best-of-N over unsolved
+            un = [ti for ti in range(n) if greedy[ti] is None]
+            for _s in range(samples - 1):
+                if not un:
+                    break
+                res = solve_iter_gpu(proposer, [tasks[ti] for ti in un], lib, A, L, max_steps, beam,
+                                     device, temp=temp)
+                un = [un[j] for j in range(len(un)) if res[j] is None]
+            out[d] = (n - len(un)) / n
+        else:
+            ok = sum(greedy[ti] is not None for ti in range(n))
+            for ti, t in enumerate(tasks):
+                if greedy[ti] is not None:
+                    continue
+                for _s in range(samples - 1):                           # CPU: per-task sampled fallback
+                    if solve_iter(proposer, t, lib, A, L, max_steps, beam, device, temp=temp) is not None:
+                        ok += 1; break
+            out[d] = ok / n
     return out
 
 
