@@ -25,7 +25,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from thinking.azr import NBASE, NOP, Library, execute
+from thinking.azr import NBASE, NOP, BASE_OPS, Library, execute
 from thinking.azr_struct import (make_concepts, gen_task_struct, concepts_recovered, abstract_struct,
                                  refactor)
 from thinking.azr_iter import (StepProposer, solve_iter, closeness, chain_train_pairs, collect_solve,
@@ -79,6 +79,64 @@ def grpo_step(prop, tasks, lib, A, L, max_steps, device, G=6, temp=1.0):
     return torch.stack(terms).mean(), float(np.mean(solves))
 
 
+def grpo_rollout_process(prop, task, lib, A, L, max_steps, device, temp=1.0):
+    """Per-step PROCESS rollout: same stochastic rollout, but record an executor-grounded reward AT EACH STEP
+    = the change in closeness-to-target from applying that op (the verifier's per-step progress signal), plus
+    a terminal +1 on the last step if it solves. Returns (per-step logps, per-step rewards, solved)."""
+    demos = task[1]
+    states = [list(x) for (x, _y) in demos]
+    Y = [list(y) for (_x, y) in demos]
+    active = [op for op, a in enumerate(lib.active()) if a and op != NOP]
+    amask = torch.full((prop.vocab,), float("-inf"), device=device)
+    amask[active] = 0.0
+    tg = torch.tensor([Y], device=device)
+    prev = closeness(states, Y, L)
+    logps, rewards = [], []
+    for _ in range(max_steps):
+        if all(states[i] == Y[i] for i in range(len(Y))):
+            break
+        st = torch.tensor([states], device=device)
+        lp = F.log_softmax(prop(st, tg)[0] / temp + amask, -1)
+        op = int(torch.distributions.Categorical(logits=lp).sample())
+        logps.append(lp[op])
+        states = [execute([op], s, A, lib) for s in states]
+        now = closeness(states, Y, L)
+        rewards.append(now - prev)                                     # per-step process reward (Δcloseness)
+        prev = now
+    solved = all(states[i] == Y[i] for i in range(len(Y)))
+    if solved and rewards:
+        rewards[-1] += 1.0                                             # terminal solve bonus
+    return logps, rewards, solved
+
+
+def grpo_step_process(prop, tasks, lib, A, L, max_steps, device, G=6, temp=1.0):
+    """Dr.GRPO with the PER-STEP PROCESS REWARD. For each step we use the RETURN-TO-GO (sum of future per-step
+    process rewards incl. the terminal solve bonus -> a necessary 'detour' op still gets credit from the later
+    solve) and a PER-STEP group baseline (mean return-to-go across the G rollouts at that step index; Dr.GRPO:
+    mean baseline, no std/length norm). Per-step credit assignment -> lower variance than outcome-only GRPO."""
+    terms, solves = [], []
+    for t in tasks:
+        rolls = [grpo_rollout_process(prop, t, lib, A, L, max_steps, device, temp) for _ in range(G)]
+        solves.append(np.mean([float(s) for (_lp, _r, s) in rolls]))
+        rtg = []                                                       # return-to-go per rollout
+        for (_logps, rewards, _s) in rolls:
+            g, acc = [0.0] * len(rewards), 0.0
+            for k in reversed(range(len(rewards))):
+                acc += rewards[k]; g[k] = acc
+            rtg.append(g)
+        maxT = max((len(g) for g in rtg), default=0)
+        baseline = [float(np.mean([rtg[i][k] for i in range(len(rolls)) if k < len(rtg[i])]))
+                    for k in range(maxT)]
+        for i, (logps, _rewards, _s) in enumerate(rolls):
+            for k in range(len(logps)):
+                adv = rtg[i][k] - baseline[k]
+                if abs(adv) > 1e-8:
+                    terms.append(-adv * logps[k])
+    if not terms:
+        return None, float(np.mean(solves)) if solves else 0.0
+    return torch.stack(terms).mean(), float(np.mean(solves))
+
+
 def collect_answers(prop, task, lib, A, L, max_steps, beam, device, samples=16, temp=0.9):
     """MULTIPLE ANSWERS: return every DISTINCT executor-verified program found over N rollouts (sound -- each
     truly reproduces all demos). Greedy first, then sampled for diversity."""
@@ -91,9 +149,62 @@ def collect_answers(prop, task, lib, A, L, max_steps, beam, device, samples=16, 
     return list(found.values())
 
 
+# ===================================================================================================
+# Persist / load the trained solver (proposer weights + discovered library + concepts) and ANSWER a prompt.
+# ===================================================================================================
+def save_model(path, prop, lib, concepts, A, L, K, d, max_macros):
+    torch.save({"state_dict": prop.state_dict(), "A": A, "L": L, "K": K, "d": d,
+                "max_macros": max_macros, "macros": {int(k): list(v) for k, v in lib.macros.items()},
+                "concepts": [list(c) for c in concepts]}, path)
+
+
+def load_model(path, device="cpu"):
+    ck = torch.load(path, map_location=device)
+    lib = Library(max_macros=ck["max_macros"])
+    lib.macros = {int(k): list(v) for k, v in ck["macros"].items()}
+    prop = StepProposer(ck["A"], ck["L"], lib.vocab, d=ck["d"]).to(device)
+    prop.load_state_dict(ck["state_dict"]); prop.eval()
+    return prop, lib, [list(c) for c in ck["concepts"]], ck["A"], ck["L"], ck["K"]
+
+
+def render(prog, lib):
+    """op-id program -> readable base-op names (macros expanded)."""
+    base = [b for op in prog if op != NOP for b in lib.expand(op)]
+    return " ".join(BASE_OPS[b] for b in base) or "(identity)"
+
+
+def solve_prompt(prop, lib, concepts, A, L, K, depth, device, beam=8, samples=16, seed=0):
+    """ANSWER A PROMPT: a prompt = K input->output examples of a hidden transformation. The model INDUCES the
+    program (iterate-execute-residual + best-of-N, sound-verified), returns every distinct verified program
+    (multiple answers), and APPLIES each to a fresh query input -> predicted output."""
+    rng = np.random.default_rng(seed)
+    prog, demos, xq, yq = gen_task_struct(rng, concepts, A, L, K, depth)
+    task = (prog, demos, xq, yq)
+    answers = collect_answers(prop, task, lib, A, L, depth * 2 + 2, beam, device, samples=samples)
+    print(f"\n== PROMPT (depth-{depth} hidden transformation; {K} examples) ==", flush=True)
+    for (x, y) in demos:
+        print(f"   {x}  ->  {y}", flush=True)
+    print(f"   QUERY: {xq}  ->  ?", flush=True)
+    if not answers:
+        print("   (the solver could not find a verified program -- abstaining)", flush=True)
+        return
+    print(f"\n   model found {len(answers)} VERIFIED program(s) (each reproduces all {K} examples):", flush=True)
+    preds = set()
+    for i, chain in enumerate(answers):
+        pred = execute([o for o in chain if o != NOP], list(xq), A, lib)
+        preds.add(tuple(pred))
+        tag = "  <- uses discovered macro(s)" if any(o >= NBASE for o in chain) else ""
+        print(f"     [{i+1}] {render(chain, lib)}   =>  query {xq} -> {pred}{tag}", flush=True)
+    answer = list(list(preds)[0]) if len(preds) == 1 else "(programs disagree on query)"
+    print(f"\n   ANSWER: {xq} -> {answer}   [{'CORRECT' if answer == yq else 'vs truth ' + str(yq)}]", flush=True)
+    print(f"   (sound: every program above truly reproduces the examples; true hidden prog = {render(prog, lib)})",
+          flush=True)
+
+
 def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, rounds=3000, bs=32, beam=8,
              lr=1.5e-3, max_macros=24, abstract_every=100, collect_n=6, collect_temp=0.9,
-             use_grpo=True, G=6, grpo_bs=12, grpo_weight=1.0, device=None, seeds=1, verbose=True):
+             use_grpo=True, grpo_mode="process", G=6, grpo_bs=12, grpo_weight=1.0, save_path=None,
+             device=None, seeds=1, verbose=True):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     res = []
     for seed in range(seeds):
@@ -131,7 +242,8 @@ def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, rounds=3000, bs=32,
                 gtasks = [gen_task_struct(rng, concepts, A, L, K, int(rng.integers(1, frontier_depth + 1)))
                           for _ in range(grpo_bs)]
                 prop.train()
-                gloss, _gsolve = grpo_step(prop, gtasks, lib, A, L, max_steps, device, G=G)
+                gfn = grpo_step_process if grpo_mode == "process" else grpo_step
+                gloss, _gsolve = gfn(prop, gtasks, lib, A, L, max_steps, device, G=G)
                 if gloss is not None:
                     opt.zero_grad(); (grpo_weight * gloss).backward()
                     torch.nn.utils.clip_grad_norm_(prop.parameters(), 1.0); opt.step()
@@ -153,6 +265,10 @@ def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, rounds=3000, bs=32,
                          maxdepth * 2 + 2, beam, device, n=200, samples=16, temp=0.9)
         rec = concepts_recovered(lib, concepts, A, L)
         res.append((final, rec, len(lib.macros), bestN))
+        if save_path and seed == 0:
+            save_model(save_path, prop, lib, concepts, A, L, K, d, max_macros)
+            if verbose:
+                print(f"  saved trained solver -> {save_path}", flush=True)
         if verbose:
             tag = "COMBINED (SFT+GRPO)" if use_grpo else "SFT-only"
             print(f"  s{seed} FINAL [{tag}]: concepts {rec}/{len(concepts)}, macros {len(lib.macros)}", flush=True)
@@ -186,16 +302,30 @@ def main(argv=None):
     ap.add_argument("--grpo", dest="grpo", action="store_true", default=True,
                     help="enable the GRPO relative update (the combined winner; on by default)")
     ap.add_argument("--no-grpo", dest="grpo", action="store_false", help="SFT-only baseline (for comparison)")
+    ap.add_argument("--grpo-mode", choices=["process", "outcome"], default="process",
+                    help="process = per-step Dr.GRPO process reward (default); outcome = trajectory-level")
     ap.add_argument("--G", type=int, default=6); ap.add_argument("--grpo-bs", type=int, default=12)
     ap.add_argument("--seeds", type=int, default=1)
+    ap.add_argument("--save", default=None, help="path to save the trained solver weights")
+    ap.add_argument("--solve", default=None, help="path to a saved solver -> answer a prompt and exit")
+    ap.add_argument("--depth", type=int, default=5, help="prompt depth for --solve")
+    ap.add_argument("--prompts", type=int, default=3, help="how many prompts to answer in --solve")
     ap.add_argument("--device", default=None); ap.add_argument("--out", default=None)
     args = ap.parse_args(argv)
     if args.selftest:
         return selftest()
+    if args.solve:
+        dev = args.device or "cpu"
+        prop, lib, concepts, A, L, K = load_model(args.solve, dev)
+        print(f"  loaded solver: {len(lib.macros)} discovered macros, {len(concepts)} concepts "
+              f"(A={A}, L={L}, K={K})", flush=True)
+        for i in range(args.prompts):
+            solve_prompt(prop, lib, concepts, A, L, K, args.depth, dev, beam=args.beam, seed=100 + i)
+        return 0
     res = selfplay(A=args.A, L=args.L, K=args.K, n_concepts=args.concepts, maxdepth=args.maxdepth,
                    d=args.d, rounds=args.rounds, beam=args.beam, max_macros=args.max_macros,
-                   collect_n=args.collect_n, use_grpo=args.grpo, G=args.G, grpo_bs=args.grpo_bs,
-                   seeds=args.seeds, device=args.device)
+                   collect_n=args.collect_n, use_grpo=args.grpo, grpo_mode=args.grpo_mode, G=args.G,
+                   grpo_bs=args.grpo_bs, save_path=args.save, seeds=args.seeds, device=args.device)
     if args.out:
         import json
         with open(args.out, "w") as f:
