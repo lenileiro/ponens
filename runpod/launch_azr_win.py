@@ -104,7 +104,8 @@ def build_run(args):
         f"--A {args.A} --L {args.L} --K {args.K} --concepts {args.concepts} --maxdepth {args.maxdepth} "
         f"--d {args.d} --layers {args.layers} --heads {args.heads} --bs {args.bs} --beam {args.beam} "
         f"--rounds {args.rounds} --max-macros {args.max_macros} --collect-n {args.collect_n} {grpo} "
-        f"--seeds {args.seeds} --save {SAVE_REMOTE} --ckpt-every {args.ckpt_every} --out {RESULTS_REMOTE}"
+        f"--seeds {args.seeds} --save {SAVE_REMOTE} --ckpt-every {args.ckpt_every} "
+        f"--frontier-thresh {args.frontier_thresh} --out {RESULTS_REMOTE}"
     )
 
 
@@ -122,6 +123,8 @@ def main():
     ap.add_argument("--collect-n", type=int, default=8); ap.add_argument("--seeds", type=int, default=1)
     ap.add_argument("--ckpt-every", type=int, default=100,
                     help="checkpoint the model every N rounds -> always fetchable, survives timeout")
+    ap.add_argument("--frontier-thresh", type=float, default=0.6,
+                    help="collect solve-rate to advance curriculum depth (lower climbs deeper for deep runs)")
     ap.add_argument("--grpo", dest="grpo", action="store_true", default=False,
                     help="add the GRPO term (default OFF: bake-off showed SFT+best-of-N is the winner)")
     ap.add_argument("--grpo-mode", choices=["process", "outcome"], default="process")

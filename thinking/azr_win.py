@@ -212,7 +212,7 @@ def solve_prompt(prop, lib, concepts, A, L, K, depth, device, beam=8, samples=16
 def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, layers=3, heads=4, rounds=3000, bs=32, beam=8,
              lr=1.5e-3, max_macros=24, abstract_every=100, collect_n=6, collect_temp=0.9,
              use_grpo=True, grpo_mode="process", G=6, grpo_bs=12, grpo_weight=1.0, save_path=None,
-             ckpt_every=0, device=None, seeds=1, verbose=True):
+             ckpt_every=0, frontier_thresh=0.7, device=None, seeds=1, verbose=True):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     enable_tf32(device)                                          # H100: free TF32 matmul speedup
     res = []
@@ -281,7 +281,7 @@ def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, layers=3, heads=4, 
                     torch.nn.utils.clip_grad_norm_(prop.parameters(), 1.0); opt.step()
             if rnd > 0 and rnd % abstract_every == 0 and vbuf:
                 abstract_struct(lib, vbuf[-3000:]); vbuf = vbuf[-3000:]
-            if len(recent) >= 40 and np.mean(recent[-40:]) > 0.7 and frontier_depth < maxdepth:
+            if len(recent) >= 40 and np.mean(recent[-40:]) > frontier_thresh and frontier_depth < maxdepth:
                 frontier_depth += 1; recent = []
                 if verbose:
                     print(f"  s{seed} r{rnd}: frontier -> {frontier_depth}", flush=True)
@@ -348,6 +348,8 @@ def main(argv=None):
     ap.add_argument("--save", default=None, help="path to save the trained solver weights")
     ap.add_argument("--ckpt-every", type=int, default=0,
                     help="checkpoint --save every N rounds (resilient to timeouts; 0 = only at end)")
+    ap.add_argument("--frontier-thresh", type=float, default=0.7,
+                    help="collect solve-rate to advance the curriculum depth (lower -> climbs deeper faster)")
     ap.add_argument("--solve", default=None, help="path to a saved solver -> answer a prompt and exit")
     ap.add_argument("--depth", type=int, default=5, help="prompt depth for --solve")
     ap.add_argument("--prompts", type=int, default=3, help="how many prompts to answer in --solve")
@@ -367,7 +369,8 @@ def main(argv=None):
                    d=args.d, layers=args.layers, heads=args.heads, bs=args.bs, rounds=args.rounds,
                    beam=args.beam, max_macros=args.max_macros, collect_n=args.collect_n,
                    use_grpo=args.grpo, grpo_mode=args.grpo_mode, G=args.G, grpo_bs=args.grpo_bs,
-                   save_path=args.save, ckpt_every=args.ckpt_every, seeds=args.seeds, device=args.device)
+                   save_path=args.save, ckpt_every=args.ckpt_every, frontier_thresh=args.frontier_thresh,
+                   seeds=args.seeds, device=args.device)
     if args.out:
         import json
         with open(args.out, "w") as f:
