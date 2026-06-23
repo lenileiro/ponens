@@ -115,6 +115,58 @@ def solve_iter(proposer, task, lib, A, L, max_steps, beam, device, w_policy=0.5,
     return None
 
 
+@torch.no_grad()
+def solve_iter_batch(proposer, tasks, lib, A, L, max_steps, beam, device, w_policy=0.5):
+    """GREEDY (temp=0) beam search for MANY tasks at once: all tasks' frontier nodes go through ONE proposer
+    forward per step (B = sum of beam sizes) instead of one forward per task. Same scoring/dedup/beam as
+    solve_iter's greedy path. Returns a list of verified op-chains (or None) aligned with `tasks`."""
+    proposer.eval()
+    n = len(tasks)
+    Xs = [[list(x) for (x, _y) in t[1]] for t in tasks]
+    Ys = [[list(y) for (_x, y) in t[1]] for t in tasks]
+    active = [op for op, a in enumerate(lib.active()) if a and op != NOP]
+    aops = np.array(active); nA = len(active)
+    frontiers = [[(Xs[i], [])] for i in range(n)]
+    sol = [None] * n
+    for i in range(n):
+        if all(Xs[i][k] == Ys[i][k] for k in range(len(Ys[i]))):
+            sol[i] = []
+    for _step in range(max_steps):
+        rows = [(i, fi) for i in range(n) if sol[i] is None
+                for fi in range(len(frontiers[i]))]
+        if not rows:
+            break
+        statemat = [frontiers[i][fi][0] for (i, fi) in rows]
+        targmat = [Ys[i] for (i, _fi) in rows]
+        st = torch.tensor(np.array(statemat), device=device)
+        tg = torch.tensor(np.array(targmat), device=device)
+        logp = F.log_softmax(proposer(st, tg), -1).detach().cpu().numpy()   # (R, vocab)
+        R = len(rows)
+        nss = apply_ops_np(np.repeat(np.array(statemat), nA, axis=0), np.tile(aops, R), lib, A)
+        close = (nss == np.repeat(np.array(targmat), nA, axis=0)).reshape(R * nA, -1).mean(1)
+        bytask = {i: [] for (i, _fi) in rows}
+        for r, (i, fi) in enumerate(rows):
+            ops = frontiers[i][fi][1]
+            for j, o in enumerate(active):
+                idx = r * nA + j
+                bytask[i].append((float(close[idx]) + w_policy * float(logp[r, o]),
+                                  nss[idx].tolist(), ops + [o]))
+        for i, cands in bytask.items():
+            seen, newf = set(), []
+            for score, ns, ops in sorted(cands, key=lambda c: -c[0]):
+                key = tuple(tuple(s) for s in ns)
+                if key in seen:
+                    continue
+                seen.add(key); newf.append((ns, ops))
+                if len(newf) >= beam:
+                    break
+            frontiers[i] = newf
+            for states, ops in newf:
+                if sol[i] is None and all(states[k] == Ys[i][k] for k in range(len(Ys[i]))):
+                    sol[i] = ops
+    return sol
+
+
 def chain_train_pairs(X, Y, chain, lib, A):
     """A verified chain -> per-step (state, target, next-op) training tuples (state before each op)."""
     pairs, states = [], [list(x) for x in X]
@@ -130,13 +182,14 @@ def evaluate(proposer, rng, concepts, A, L, K, depths, lib, max_steps, beam, dev
     Sound: solve_iter only returns executor-verified chains, so pass@N IS accuracy (no false positives)."""
     out = {}
     for d in depths:
+        tasks = [gen_task_struct(rng, concepts, A, L, K, d) for _ in range(n)]
+        greedy = solve_iter_batch(proposer, tasks, lib, A, L, max_steps, beam, device)   # s=0 greedy, batched
         ok = 0
-        for _ in range(n):
-            task = gen_task_struct(rng, concepts, A, L, K, d)
-            for s in range(samples):
-                chain = solve_iter(proposer, task, lib, A, L, max_steps, beam, device,
-                                   temp=(0.0 if s == 0 else temp))      # 1st greedy, rest sampled
-                if chain is not None:
+        for ti, t in enumerate(tasks):
+            if greedy[ti] is not None:
+                ok += 1; continue
+            for _s in range(samples - 1):                               # best-of-N: sampled fallback
+                if solve_iter(proposer, t, lib, A, L, max_steps, beam, device, temp=temp) is not None:
                     ok += 1; break
         out[d] = ok / n
     return out

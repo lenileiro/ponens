@@ -28,8 +28,8 @@ import torch.nn.functional as F
 from thinking.azr import NBASE, NOP, BASE_OPS, Library, execute, apply_ops_np
 from thinking.azr_struct import (make_concepts, gen_task_struct, concepts_recovered, abstract_struct,
                                  refactor)
-from thinking.azr_iter import (StepProposer, solve_iter, closeness, chain_train_pairs, collect_solve,
-                               evaluate)
+from thinking.azr_iter import (StepProposer, solve_iter, solve_iter_batch, closeness, chain_train_pairs,
+                               collect_solve, evaluate)
 
 
 # ===================================================================================================
@@ -224,10 +224,16 @@ def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, rounds=3000, bs=32,
             max_steps = frontier_depth * 2 + 2
             tasks = [gen_task_struct(rng, concepts, A, L, K, int(rng.integers(1, frontier_depth + 1)))
                      for _ in range(bs)]
-            # --- ReST-EM SFT on verified chains (positive signal) ---
+            # --- ReST-EM SFT on verified chains (positive signal); batched greedy + sampled fallback ---
+            greedy = solve_iter_batch(prop, tasks, lib, A, L, max_steps, beam, device)
             pairs, nsolved = [], 0
-            for t in tasks:
-                chain = collect_solve(prop, t, lib, A, L, max_steps, beam, device, collect_n, collect_temp)
+            for ti, t in enumerate(tasks):
+                chain = greedy[ti]
+                if chain is None:
+                    for _s in range(max(0, collect_n - 1)):             # ReST-EM: sample for hard tasks
+                        chain = solve_iter(prop, t, lib, A, L, max_steps, beam, device, temp=collect_temp)
+                        if chain is not None:
+                            break
                 if chain is not None:
                     nsolved += 1; vbuf.append(chain)
                     X = [list(x) for (x, _y) in t[1]]; Y = [list(y) for (_x, y) in t[1]]
