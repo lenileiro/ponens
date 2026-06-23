@@ -65,9 +65,9 @@ def closeness(states, targets, L):
 
 
 @torch.no_grad()
-def solve_iter(proposer, task, lib, A, L, max_steps, beam, device, w_policy=0.5):
+def solve_iter(proposer, task, lib, A, L, max_steps, beam, device, w_policy=0.5, temp=0.0):
     """Beam search over single ops, execution-guided. Returns a verified op-chain (reproduces all demos)
-    or None. Each frontier node carries the executed states for every demo + the op-chain so far."""
+    or None. temp>0 samples the kept beam stochastically (for best-of-N diversity); temp=0 is greedy."""
     proposer.eval()
     demos = task[1]
     X = [list(x) for (x, _y) in demos]
@@ -87,8 +87,14 @@ def solve_iter(proposer, task, lib, A, L, max_steps, beam, device, w_policy=0.5)
                 ns = [execute([o], s, A, lib) for s in states]
                 score = closeness(ns, Y, L) + w_policy * float(logp[fi, o])
                 cands.append((score, ns, ops + [o]))
+        if temp > 0 and cands:                               # stochastic ordering for best-of-N diversity
+            sc = np.array([c[0] for c in cands], dtype=float)
+            pr = np.exp((sc - sc.max()) / temp); pr /= pr.sum()
+            ordered = [cands[i] for i in np.random.choice(len(cands), size=len(cands), replace=False, p=pr)]
+        else:
+            ordered = sorted(cands, key=lambda c: -c[0])     # greedy (temp=0)
         seen, frontier = set(), []
-        for score, ns, ops in sorted(cands, key=lambda c: -c[0]):
+        for score, ns, ops in ordered:
             key = tuple(tuple(s) for s in ns)
             if key in seen:
                 continue
@@ -110,15 +116,20 @@ def chain_train_pairs(X, Y, chain, lib, A):
     return pairs
 
 
-def evaluate(proposer, rng, concepts, A, L, K, depths, lib, max_steps, beam, device, n=150):
+def evaluate(proposer, rng, concepts, A, L, K, depths, lib, max_steps, beam, device, n=150,
+             samples=1, temp=0.9):
+    """solve-rate per depth. samples>1 = BEST-OF-N: try N stochastic rollouts, succeed if ANY verifies.
+    Sound: solve_iter only returns executor-verified chains, so pass@N IS accuracy (no false positives)."""
     out = {}
     for d in depths:
         ok = 0
         for _ in range(n):
             task = gen_task_struct(rng, concepts, A, L, K, d)
-            chain = solve_iter(proposer, task, lib, A, L, max_steps, beam, device)
-            if chain is not None:
-                ok += 1
+            for s in range(samples):
+                chain = solve_iter(proposer, task, lib, A, L, max_steps, beam, device,
+                                   temp=(0.0 if s == 0 else temp))      # 1st greedy, rest sampled
+                if chain is not None:
+                    ok += 1; break
         out[d] = ok / n
     return out
 
@@ -174,11 +185,15 @@ def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=3, d=128, rounds=1500, bs=32,
                       + " ".join(f"d{k}:{v:.2f}" for k, v in acc.items()), flush=True)
         final = evaluate(prop, rng, concepts, A, L, K, range(1, maxdepth + 1), lib,
                          maxdepth * 2 + 2, beam, device, n=200)
+        bestN = evaluate(prop, rng, concepts, A, L, K, range(1, maxdepth + 1), lib,
+                         maxdepth * 2 + 2, beam, device, n=200, samples=16, temp=0.9)
         rec = concepts_recovered(lib, concepts, A, L)
-        res.append((final, rec, len(lib.macros)))
+        res.append((final, rec, len(lib.macros), bestN))
         if verbose:
-            print(f"  s{seed} FINAL: concepts {rec}/{len(concepts)}, macros {len(lib.macros)} | "
-                  + " ".join(f"d{k}:{v:.3f}" for k, v in final.items()), flush=True)
+            print(f"  s{seed} FINAL: concepts {rec}/{len(concepts)}, macros {len(lib.macros)}", flush=True)
+            print("    solve@1   : " + " ".join(f"d{k}:{v:.3f}" for k, v in final.items()), flush=True)
+            print("    best-of-16: " + " ".join(f"d{k}:{v:.3f}" for k, v in bestN.items())
+                  + "   (verifier-sound test-time scaling)", flush=True)
     return res
 
 
@@ -187,9 +202,11 @@ def selftest():
     composition the whole-program decoder plateaued on."""
     res = selfplay(A=5, L=4, K=4, n_concepts=3, maxdepth=2, d=64, rounds=300, bs=24, beam=5,
                    max_macros=6, abstract_every=120, seeds=1, device="cpu", verbose=False)
-    final, rec, nmac = res[0]
-    print(f"  selftest: concepts {rec}/3, macros {nmac} | d1:{final[1]:.2f} d2:{final[2]:.2f}")
+    final, rec, nmac, bestN = res[0]
+    print(f"  selftest: concepts {rec}/3, macros {nmac} | solve@1 d2:{final[2]:.2f} | "
+          f"best-of-16 d2:{bestN[2]:.2f} (verifier-sound test-time scaling)")
     assert final[2] > 0.4, f"iterate-execute-residual failed to compose depth-2 ({final[2]:.2f})"
+    assert bestN[2] >= final[2], "best-of-N should not hurt (it can only add verified solutions)"
     print("azr_iter selftest OK")
     return 0
 
@@ -212,8 +229,9 @@ def main(argv=None):
     if args.out:
         import json
         with open(args.out, "w") as f:
-            json.dump([{"final": {f"d{k}": v for k, v in fin.items()}, "concepts": rec, "macros": m}
-                       for (fin, rec, m) in res], f, indent=2)
+            json.dump([{"solve_at_1": {f"d{k}": v for k, v in fin.items()},
+                        "best_of_16": {f"d{k}": v for k, v in bN.items()}, "concepts": rec, "macros": m}
+                       for (fin, rec, m, bN) in res], f, indent=2)
         print("wrote", args.out)
     return 0
 
