@@ -175,6 +175,25 @@ def evaluate(proposer, facts, eid, env, concepts, budget, beam, device, n=120, g
     return dict(solve=solved / max(1, tot), checks=checks / max(1, tot), unsound=unsound)
 
 
+def full_closure(facts, env, max_rounds=12):
+    """ONE kernel-verified deductive closure of the KB: every derivable atom + its proof tree. All goals'
+    proofs come from this single closure -> O(closure) instead of O(goals x closure) for training data."""
+    proven = {f: base_tree(f) for f in facts}
+    for _ in range(max_rounds):
+        newly = {}
+        for ri, (head, body) in enumerate(RULES):
+            for sub, subtrees in _match_body(body, proven):
+                hf = _inst(head, sub)
+                if hf not in proven and hf not in newly:
+                    tree = {"fact": hf, "rule": ri, "from": subtrees}
+                    if kernel_verify(tree, env):
+                        newly[hf] = tree
+        if not newly:
+            break
+        proven.update(newly)
+    return proven
+
+
 def exhaustive_prove(goal, facts, env, max_rounds=10):
     """The COMPLETE teacher: semi-naive forward chaining, kernel-verifying every derived atom, until the
     goal is proven. Sound but does ALL the work; used only to generate training proofs for the proposer."""
@@ -208,19 +227,20 @@ def selfplay(facts, ents, concepts, d=128, rounds=600, bs=64, beam=2, budget=6, 
     base_set = set(facts)
     goalpool = [(c, g) for c in concepts for g in goals_for(facts, c)]
 
-    # EXPERT-ITERATION BOOTSTRAP: the complete prover teaches proof-relevance (no cold-start). For each
-    # goal, its proof's DERIVED atoms are positives; other derivable atoms (from the same closure) are
-    # negatives. The proposer learns to score goal-relevant derivations high.
+    # EXPERT-ITERATION BOOTSTRAP: the complete prover teaches proof-relevance (no cold-start). Compute the
+    # kernel-verified closure ONCE; every goal's proof tree is already in it. For each goal, its proof's
+    # DERIVED atoms are positives; other derivable atoms are negatives.
+    closure = full_closure(facts, env)                       # one closure for all goals (the speedup)
+    derivable = [a for a in closure if a not in base_set]
     examples, lemmas = [], {}
     for (c, g) in goalpool:
-        tree, closure = exhaustive_prove(g, facts, env)
-        if tree is None:
+        if g not in closure:
             continue
-        patoms = set(); tree_atoms(tree, patoms)
+        patoms = set(); tree_atoms(closure[g], patoms)
         pos = {a for a in patoms if a not in base_set}
-        if tree["rule"] is not None and g not in lemmas and len(lemmas) < 3 * len(ents):
-            lemmas[g] = tree
-        negs = [a for a in closure if a not in base_set and a not in pos]
+        if closure[g]["rule"] is not None and g not in lemmas and len(lemmas) < 3 * len(ents):
+            lemmas[g] = closure[g]
+        negs = [a for a in derivable if a not in pos]
         random.Random(hash(g) & 0xffff).shuffle(negs)
         for a in list(pos) + negs[:max(4, 3 * len(pos))]:
             examples.append((PID[a[0]], [eid[a[1][0]], eid[a[1][1]]],
