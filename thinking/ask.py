@@ -59,9 +59,9 @@ def proof_chain(tree):
     return " ; ".join(parts)
 
 
-def answer(query, solve_fn, facts, ents):
-    """solve_fn(goal) -> (proof_tree|None, kernel_checks). Works with either the learned-guided solver or
-    the exhaustive (complete) prover -- both kernel-sound."""
+def answer(query, solve_fn, facts, ents, disprove_fn=None):
+    """solve_fn(goal) -> (proof_tree|None, kernel_checks). disprove_fn(x,y) -> reason-str|None (kernel
+    disproof of isa(x,y) via category disjointness). YES (proof) / NO (disproof) / abstain."""
     rel, x, y = parse(query)
     if rel is None:
         return f"  Q: {query}\n  (couldn't parse -- try 'is a X a Y' / 'does a X have Y' / 'what is a X')"
@@ -92,7 +92,13 @@ def answer(query, solve_fn, facts, ents):
         verb = "is a" if rel == "isa" else "has a"
         return (f"  Q: {query}\n  A: YES -- a {x} {verb} {y}.  [kernel-verified proof, {ck} checks]\n"
                 f"     proof: {proof_chain(tree)}")
-    return (f"  Q: {query}\n  A: I can't prove that -- abstaining (not asserting the unprovable).")
+    # couldn't PROVE it -> try to DISPROVE it via category disjointness (kernel exclusion axiom)
+    if rel == "isa" and disprove_fn is not None:
+        why = disprove_fn(sx, sy)
+        if why:
+            return (f"  Q: {query}\n  A: NO -- a {x} is not a {y}.  [kernel disproof: "
+                    f"{why}, and those categories are disjoint]")
+    return (f"  Q: {query}\n  A: I can't determine that -- abstaining (neither proved nor disproved).")
 
 
 def setup(cap=90, rounds=350, d=96, device="cpu", verbose=True):
@@ -118,6 +124,19 @@ def main(argv=None):
     facts, ents, concepts = wordnet_kb(cap=args.cap, roots=("robin.n.01", "dog.n.01", "bird.n.01"))
     env = LK.build_env(ents, PREDS, facts, RULES)
     print(f"  meaning KB: {len(facts)} facts over {len(ents)} real WordNet concepts", flush=True)
+    # a typed KB (BDD set-theoretic types) for DISPROOF via category disjointness
+    isa_facts = [f for f in facts if f[0] == "isa"]
+    isa_rule = (("isa", ("?x", "?z")), [("isa", ("?x", "?y")), ("isa", ("?y", "?z"))])
+    kb = LK.KB(ents, {"isa": 2}, isa_facts, [isa_rule], build_types=True, eager_closure=True)
+
+    def disprove_fn(sx, sy):
+        res = kb._prove_core(("not", ("atom", "isa", (sx, sy))))
+        if res.get("status") != "proven":
+            return None
+        for (p, a) in kb.known:                              # name a witnessing disjoint ancestor of sx
+            if p == "isa" and len(a) == 2 and a[0] == sx and kb._ensure_excl(a[1], sy):
+                return f"a {sx.split('.')[0]} is a {a[1].split('.')[0]}"
+        return f"{sx.split('.')[0]} and {sy.split('.')[0]} are disjoint"
     if args.exhaustive:
         def solve_fn(goal):
             t, _closure = exhaustive_prove(goal, facts, env)
@@ -134,11 +153,11 @@ def main(argv=None):
         mode = "learned-guided kernel-sound prover"
     queries = [args.ask] if args.ask else [
         "is a robin a bird", "is a robin an animal", "does a robin have a feather",
-        "is a robin a mammal", "what is a robin",
+        "is a robin a mammal", "is a dog a bird", "what is a robin",
     ]
-    print(f"\n== ASK ({mode}; answers only with a kernel-verified proof, else abstains) ==", flush=True)
+    print(f"\n== ASK ({mode}; YES with a kernel proof / NO with a kernel disproof / abstain) ==", flush=True)
     for q in queries:
-        print(answer(q, solve_fn, facts, ents), flush=True)
+        print(answer(q, solve_fn, facts, ents, disprove_fn=disprove_fn), flush=True)
     return 0
 
 
