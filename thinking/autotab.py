@@ -161,18 +161,27 @@ def build_groups(tr, va, y_tr, roles):
     return groups
 
 
-def rmse_with(groups, names, y_tr_fit, y_va, inv, seed):
-    """Fit on the (possibly log-transformed) target y_tr_fit, score RMSE in ORIGINAL units via inv()."""
-    from sklearn.ensemble import HistGradientBoostingRegressor
+def make_model(kind, seed):
+    """The predictor. Default = OUR from-scratch gradient-boosted trees (thinking/ourtree.GBT); 'sklearn'
+    only for comparison."""
+    if kind == "sklearn":
+        from sklearn.ensemble import HistGradientBoostingRegressor
+        return HistGradientBoostingRegressor(max_iter=500, learning_rate=0.05, max_leaf_nodes=63,
+                                             l2_regularization=1.0, early_stopping=True, random_state=seed)
+    from thinking.ourtree import GBT
+    return GBT(n_estimators=500, lr=0.05, max_depth=5, min_leaf=30, seed=seed)
+
+
+def rmse_with(groups, names, y_tr_fit, y_va, inv, mk):
+    """Fit OUR model on the (possibly log-transformed) target, score RMSE in ORIGINAL units via inv()."""
     Xt = pd.concat([groups[n][0] for n in names], axis=1).values.astype(float)
     Xv = pd.concat([groups[n][1] for n in names], axis=1).values.astype(float)
-    m = HistGradientBoostingRegressor(max_iter=400, learning_rate=0.06, max_leaf_nodes=63,
-                                      l2_regularization=1.0, early_stopping=True,
-                                      random_state=seed).fit(Xt, y_tr_fit)
+    m = mk().fit(Xt, y_tr_fit)
     return math.sqrt(((inv(m.predict(Xv)) - y_va) ** 2).mean())
 
 
-def run(train_csv, target, test_csv=None, seed=0, log_target="auto"):
+def run(train_csv, target, test_csv=None, seed=0, log_target="auto", model="ours"):
+    mk = lambda: make_model(model, seed)
     tr = pd.read_csv(train_csv)
     auxs = detect_aux(train_csv)
     tr, joined = join_aux(tr, auxs)
@@ -198,8 +207,9 @@ def run(train_csv, target, test_csv=None, seed=0, log_target="auto"):
     selected, remaining = [], list(groups)                    # greedy forward selection, held-out verified
     best = math.sqrt(((y[tri].mean() - y[vai]) ** 2).mean())
     print(f"  baseline (predict-mean) RMSE: {best:.0f}")
+    print(f"  predictor: {'OUR gradient-boosted trees (ourtree.GBT)' if model=='ours' else 'sklearn GBM'}")
     while remaining:
-        scored = [(rmse_with(groups, selected + [g], y[tri], y[vai], ident, seed), g) for g in remaining]
+        scored = [(rmse_with(groups, selected + [g], y[tri], y[vai], ident, mk), g) for g in remaining]
         r, g = min(scored)
         if r < best - 1.0:
             selected.append(g); remaining.remove(g); best = r
@@ -209,7 +219,7 @@ def run(train_csv, target, test_csv=None, seed=0, log_target="auto"):
     # VERIFY the target transform too: try log-target on the selected pipeline, keep it only if it helps
     used_log = False
     if selected and (y > 0).all() and (log_target in (True, "auto")):
-        r_log = rmse_with(groups, selected, np.log1p(y[tri]), y[vai], lambda p: np.expm1(p), seed)
+        r_log = rmse_with(groups, selected, np.log1p(y[tri]), y[vai], lambda p: np.expm1(p), mk)
         print(f"  verify target-transform: log {r_log:.0f} vs raw {best:.0f} -> "
               f"{'LOG kept' if r_log < best else 'raw kept'}")
         if r_log < best:
@@ -219,10 +229,9 @@ def run(train_csv, target, test_csv=None, seed=0, log_target="auto"):
     return best, selected
 
 
-def submit(train_csv, target, test_csv, out, id_col, seed=0):
-    """Select the pipeline (held-out verified), refit on FULL train, predict the test set, write submission."""
-    from sklearn.ensemble import HistGradientBoostingRegressor
-    _, selected = run(train_csv, target, test_csv, seed)
+def submit(train_csv, target, test_csv, out, id_col, seed=0, model="ours"):
+    """Select the pipeline (held-out verified), refit OUR model on FULL train, predict the test set, write."""
+    _, selected = run(train_csv, target, test_csv, seed, model=model)
     tr = pd.read_csv(train_csv); auxs = detect_aux(train_csv); tr, _ = join_aux(tr, auxs)
     te, _ = join_aux(pd.read_csv(test_csv), auxs)
     cols = [c for c in tr.columns if c != target and c in te.columns]
@@ -231,8 +240,7 @@ def submit(train_csv, target, test_csv, out, id_col, seed=0):
     groups = build_groups(tr, te, y, roles)                   # train feats from FULL train; test feats
     Xt = pd.concat([groups[n][0] for n in selected], axis=1).values.astype(float)
     Xte = pd.concat([groups[n][1] for n in selected], axis=1).values.astype(float)
-    m = HistGradientBoostingRegressor(max_iter=600, learning_rate=0.05, max_leaf_nodes=63,
-                                      l2_regularization=1.0, early_stopping=True, random_state=seed).fit(Xt, y)
+    m = make_model(model, seed).fit(Xt, y)
     pred = np.clip(m.predict(Xte), 0, None)
     sub = pd.DataFrame({"Order_No": pd.read_csv(test_csv)[id_col].values,
                         "Time from Pickup to Arrival": np.round(pred).astype(int)})
@@ -247,11 +255,13 @@ def main(argv=None):
     ap.add_argument("--test", default=None); ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--submit", default=None, help="write a submission CSV of test-set predictions")
     ap.add_argument("--id-col", default="Order No", help="id column in the test set for the submission")
+    ap.add_argument("--model", default="ours", choices=["ours", "sklearn"],
+                    help="predictor: 'ours' = from-scratch GBT (ourtree.GBT); 'sklearn' for comparison")
     args = ap.parse_args(argv)
     if args.submit:
-        submit(args.train, args.target, args.test, args.submit, args.id_col, args.seed)
+        submit(args.train, args.target, args.test, args.submit, args.id_col, args.seed, args.model)
     else:
-        run(args.train, args.target, args.test, args.seed)
+        run(args.train, args.target, args.test, args.seed, model=args.model)
     return 0
 
 
