@@ -145,7 +145,9 @@ def build_groups(tr, va, y_tr, roles):
             freq = tr[c].value_counts(normalize=True)
             ft[f"{c}__freq"] = tr[c].map(freq).values; fv[f"{c}__freq"] = va[c].map(freq).fillna(0).values
         add("categorical", ft, fv)
-    ids = [c for c, r in roles.items() if r == "id"]
+    # target-encode high-card ids -- but SKIP near-unique row identifiers (e.g. Order No): their TE just
+    # memorizes the target -> leakage. Keep only ids whose cardinality is well below the row count.
+    ids = [c for c, r in roles.items() if r == "id" and tr[c].nunique() < 0.5 * len(tr)]
     if ids:
         ft, fv = pd.DataFrame(), pd.DataFrame()
         gmean = y_tr.mean()
