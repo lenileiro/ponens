@@ -173,6 +173,76 @@ def solve_iter_batch(proposer, tasks, lib, A, L, max_steps, beam, device, w_poli
     return sol
 
 
+def _apply_base_torch(op, s, A):
+    """Vectorized base op on a torch int tensor (..., L) -- same semantics as apply_base, ON DEVICE."""
+    if op == 0:  return s
+    if op == 1:  return (s + 1) % A
+    if op == 2:  return (s + 2) % A
+    if op == 3:  return (s - 1) % A
+    if op == 4:  return torch.flip(s, [-1])
+    if op == 5:  return torch.roll(s, -1, dims=-1)
+    if op == 6:  return torch.roll(s, 1, dims=-1)
+    if op == 7:  return torch.sort(s, dim=-1).values
+    raise ValueError(op)
+
+
+@torch.no_grad()
+def solve_iter_gpu(proposer, tasks, lib, A, L, max_steps, beam, device, w_policy=0.5):
+    """FULLY TENSORIZED greedy beam search (keeps the GPU fed): the executor runs as torch ops on-device, and
+    candidate-expand -> score -> top-beam are batched tensor ops -- NO Python per-candidate loop and NO
+    per-step GPU->CPU sync. Fixed (n, beam) frontier (padded/masked). Skips exact state-dedup (top-k by score
+    instead), which slightly lowers beam diversity but removes the Python that starved the GPU. Returns a list
+    of verified op-chains (or None) aligned with `tasks` -- matches solve_iter_batch's solve set closely."""
+    proposer.eval()
+    n = len(tasks); B = beam; K = len(tasks[0][1])
+    X = torch.tensor([[list(x) for (x, _y) in t[1]] for t in tasks], device=device)   # (n,K,L)
+    Y = torch.tensor([[list(y) for (_x, y) in t[1]] for t in tasks], device=device)
+    active = [op for op, a in enumerate(lib.active()) if a and op != NOP]
+    nA = len(active)
+    op_ids = torch.tensor(active, device=device)                                      # (nA,)
+    expanded = [lib.expand(o) for o in active]                                        # base-seq per op
+    F_ = X[:, None].expand(n, B, K, L).clone()                                        # (n,B,K,L) frontier
+    valid = torch.zeros(n, B, dtype=torch.bool, device=device); valid[:, 0] = True
+    chains = torch.full((n, B, max_steps), -1, dtype=torch.long, device=device)
+    clen = torch.zeros(n, B, dtype=torch.long, device=device)
+    solved = (X == Y).reshape(n, -1).all(1)
+    sol = [[] if solved[i] else None for i in range(n)]
+    arn = torch.arange(n, device=device)[:, None].expand(n, B)
+    arB = torch.arange(B, device=device)[None, :].expand(n, B)
+    Yb = Y[:, None]                                                                   # (n,1,K,L)
+    for _step in range(max_steps):
+        if bool(solved.all()):
+            break
+        logp = F.log_softmax(proposer(F_.reshape(n * B, K, L),
+                                      Y[:, None].expand(n, B, K, L).reshape(n * B, K, L)), -1)
+        logp = logp.reshape(n, B, -1)[:, :, active]                                   # (n,B,nA)
+        cand = torch.stack([_reduce_ops(expanded[j], F_, A) for j in range(nA)], 2)   # (n,B,nA,K,L)
+        close = (cand == Yb[:, :, None]).reshape(n, B, nA, -1).float().mean(-1)       # (n,B,nA)
+        score = (close + w_policy * logp).masked_fill(~valid[:, :, None], float("-inf"))
+        topv, topi = score.reshape(n, B * nA).topk(B, dim=1)                          # (n,B)
+        parent, opj = topi // nA, topi % nA
+        F_ = cand[arn, parent, opj]                                                   # (n,B,K,L)
+        chains = chains[arn, parent].clone()
+        clen = clen[arn, parent].clone()
+        chains[arn, arB, clen.clamp(max=max_steps - 1)] = op_ids[opj]
+        clen = clen + 1
+        valid = topv > float("-inf")
+        match = (F_ == Yb).reshape(n, B, -1).all(-1) & valid                          # (n,B)
+        newly = (~solved) & match.any(1)
+        if bool(newly.any()):
+            first = match.float().argmax(1)                                           # first matching slot
+            for i in torch.nonzero(newly).flatten().tolist():
+                b = int(first[i]); sol[i] = chains[i, b, :int(clen[i, b])].tolist()
+            solved = solved | newly
+    return sol
+
+
+def _reduce_ops(seq, s, A):
+    for b in seq:
+        s = _apply_base_torch(b, s, A)
+    return s
+
+
 def chain_train_pairs(X, Y, chain, lib, A):
     """A verified chain -> per-step (state, target, next-op) training tuples (state before each op)."""
     pairs, states = [], [list(x) for x in X]
@@ -189,7 +259,8 @@ def evaluate(proposer, rng, concepts, A, L, K, depths, lib, max_steps, beam, dev
     out = {}
     for d in depths:
         tasks = [gen_task_struct(rng, concepts, A, L, K, d) for _ in range(n)]
-        greedy = solve_iter_batch(proposer, tasks, lib, A, L, max_steps, beam, device)   # s=0 greedy, batched
+        gsolve = solve_iter_gpu if "cuda" in str(device) else solve_iter_batch
+        greedy = gsolve(proposer, tasks, lib, A, L, max_steps, beam, device)            # s=0 greedy, batched
         ok = 0
         for ti, t in enumerate(tasks):
             if greedy[ti] is not None:

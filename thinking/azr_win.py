@@ -28,8 +28,8 @@ import torch.nn.functional as F
 from thinking.azr import NBASE, NOP, BASE_OPS, Library, execute, apply_ops_np
 from thinking.azr_struct import (make_concepts, gen_task_struct, concepts_recovered, abstract_struct,
                                  refactor)
-from thinking.azr_iter import (StepProposer, solve_iter, solve_iter_batch, closeness, chain_train_pairs,
-                               collect_solve, evaluate)
+from thinking.azr_iter import (StepProposer, solve_iter, solve_iter_batch, solve_iter_gpu, closeness,
+                               chain_train_pairs, collect_solve, evaluate)
 
 
 # ===================================================================================================
@@ -227,7 +227,8 @@ def selfplay(A=6, L=4, K=4, n_concepts=6, maxdepth=5, d=160, layers=3, heads=4, 
             tasks = [gen_task_struct(rng, concepts, A, L, K, int(rng.integers(1, frontier_depth + 1)))
                      for _ in range(bs)]
             # --- ReST-EM SFT on verified chains (positive signal); batched greedy + sampled fallback ---
-            greedy = solve_iter_batch(prop, tasks, lib, A, L, max_steps, beam, device)
+            gsolve = solve_iter_gpu if "cuda" in str(device) else solve_iter_batch
+            greedy = gsolve(prop, tasks, lib, A, L, max_steps, beam, device)
             pairs, nsolved = [], 0
             for ti, t in enumerate(tasks):
                 chain = greedy[ti]
