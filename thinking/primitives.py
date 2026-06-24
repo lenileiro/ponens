@@ -222,23 +222,63 @@ def _build_features(df, base_cols, chosen_names):
     return _featmat(df, base_cols, derived)
 
 
-def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, seed=0, verbose=True):
-    """Capstone: one call on any BINARY tabular dataset. Trains the primitive-ranker via self-play (if not
-    given), proposes+verifies derived primitives, reasons a verified two-sided rule (exhaustive+compress),
-    and returns the rule, held-out coverage/accuracy, and per-row explanations -- zero training on the data,
-    abstaining where it can't prove an answer."""
+def _class_confidence(pos, X):
+    """For a one-vs-rest 'is-class' rule: per-row (fired?, confidence = max firing-clause precision)."""
+    fired = np.zeros(len(X), bool); conf = np.zeros(len(X))
+    for c in pos:
+        m = apply_rule([c], X).astype(bool)
+        fired |= m; conf = np.maximum(conf, m * float(c.get("prec", 1.0)))
+    return fired, conf
+
+
+def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99, seed=0, verbose=True):
+    """Capstone: one call on any tabular CLASSIFICATION dataset (binary or multiclass). Trains the
+    primitive-ranker via self-play (if not given), proposes+verifies derived primitives, reasons verified
+    rules (two-sided for binary; one-vs-rest for multiclass), and returns the rule(s), held-out
+    coverage/accuracy, and (binary) per-row explanations -- zero training on the data, abstaining where it
+    can't prove an answer (no firing rule, or a multiclass tie)."""
+    df = df.reset_index(drop=True)
     base_cols = [c for c in df.columns if c not in (target, id_col)]
     classes = sorted(pd.unique(df[target].dropna()).tolist(), key=lambda x: str(x))
-    if len(classes) != 2:
-        raise ValueError(f"solve_any handles binary targets; got {len(classes)} classes: {classes}")
-    df = df.reset_index(drop=True)
+    if len(classes) < 2:
+        raise ValueError(f"need >=2 classes; got {classes}")
     rng = np.random.default_rng(seed); idx = rng.permutation(len(df)); cut = int((1 - test_frac) * len(df))
     tri, tei = idx[:cut], idx[cut:]
     if ranker is None:
         if verbose:
             print("  [learn-to-rank] training primitive-ranker via self-play (zero data)...")
         ranker = selfplay_rank(steps=150, seed=seed, verbose=False)
-    if verbose:
+
+    if len(classes) > 2:                                              # ---- multiclass: one-vs-rest ----
+        if verbose:
+            print(f"  [multiclass] {len(classes)} classes, one-vs-rest verified rules...")
+        names_chosen = []
+        for c in classes:                                            # discover primitives per class, union
+            dfc = df.copy(); dfc["__y__"] = (df[target].values == c).astype(int)
+            ch, _ = propose(dfc.iloc[tri].reset_index(drop=True), "__y__", base_cols, ranker=ranker,
+                            rounds=1, verbose=False)
+            names_chosen += [x[0] for x in ch if x[0] not in names_chosen]
+        Xfull, names = _build_features(df, base_cols, names_chosen)
+        Xtr, Xte = Xfull[tri], Xfull[tei]
+        rules = {}; conf = np.zeros((len(tei), len(classes)))
+        for ci, c in enumerate(classes):
+            yc = (df[target].values == c).astype(int)
+            pos, _ = reason_selective_cv(Xtr, yc[tri], proposer=None, seed=seed, folds=5, exhaustive=True,
+                                         compress=True, min_prec_pos=min_prec, min_prec_neg=min_prec,
+                                         build=dict(max_lit=3, max_lits=60, binary_presence_only=True), verbose=False)
+            rules[c] = pos
+            _, cf = _class_confidence(pos, Xte); conf[:, ci] = cf
+        fired = conf.max(1) > 0
+        pred = np.array(classes, dtype=object)[conf.argmax(1)]
+        yte = df[target].values[tei]
+        ans = fired
+        acc = float((pred[ans] == yte[ans]).mean()) if ans.any() else 0.0
+        return {"task": f"{len(classes)}-class classification", "classes": classes,
+                "discovered_primitives": names_chosen, "coverage": float(ans.mean()),
+                "accuracy_on_answered": acc, "n_clauses_per_class": {c: len(rules[c]) for c in classes},
+                "rules": {c: _render(rules[c], names) for c in classes}}
+
+    if verbose:                                                      # ---- binary: two-sided + explanations ----
         print("  [propose] verified primitive discovery...")
     chosen, _ = propose(df.iloc[tri].reset_index(drop=True), target, base_cols, ranker=ranker, verbose=verbose)
     names_chosen = [c[0] for c in chosen]
@@ -249,7 +289,7 @@ def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, seed=0, verbo
     if verbose:
         print("  [reason] verified two-sided rule (exhaustive + compress)...")
     pos, neg = reason_selective_cv(Xtr, ytr, proposer=None, seed=seed, folds=5, exhaustive=True, compress=True,
-                                   min_prec_pos=0.99, min_prec_neg=0.99,
+                                   min_prec_pos=min_prec, min_prec_neg=min_prec,
                                    build=dict(max_lit=3, max_lits=60, binary_presence_only=True), verbose=False)
     dec = predict_selective(pos, neg, Xte); a = dec >= 0
     return {"task": "binary classification", "classes": classes, "discovered_primitives": names_chosen,
