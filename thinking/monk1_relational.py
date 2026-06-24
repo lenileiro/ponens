@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from thinking.azr_win import _conj, apply_rule, predict_selective, reason_selective_cv
-from thinking.primitives import propose, _featmat
+from thinking.primitives import propose, _featmat, candidate_primitives, rank_score, selfplay_rank
 
 ATTRS = ["attr1", "attr2", "attr3", "attr4", "attr5", "attr6"]
 
@@ -32,8 +32,14 @@ def main():
           f"{df['class'].mean():.3f}")
     print("  (raw attribute-value rules CAN express attr5==1 but CANNOT express attr1==attr2)")
 
-    print("\n[propose] verified feature discovery over raw attributes:")
-    chosen, score = propose(df, "class", ATTRS, rounds=3)
+    print("\n[learn-to-rank] training PrimitiveRanker via self-play (zero Monk data)...")
+    ranker = selfplay_rank(steps=150, seed=0, verbose=False)
+    y0 = df["class"].values.astype(int)
+    top = sorted(candidate_primitives(df, ATTRS), key=lambda c: -rank_score(ranker, c[1], y0))[:4]
+    print("  learned-ranker top-4 on Monk-1: " + ", ".join(f"{nm}={rank_score(ranker, s, y0):.2f}" for nm, s in top))
+
+    print("\n[propose] verified feature discovery using the LEARNED ranker:")
+    chosen, score = propose(df, "class", ATTRS, rounds=3, ranker=ranker)
     print(f"\n  discovered primitives: {[c[0] for c in chosen]}")
 
     y = df["class"].values.astype(int)

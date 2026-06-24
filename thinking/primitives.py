@@ -14,6 +14,8 @@ from itertools import combinations
 
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
 
 from thinking.azr_win import predict_selective, reason_selective_cv
 
@@ -62,6 +64,80 @@ def _cheap_score(col, y, min_count=5, bins=12):
     return best
 
 
+# ---- learned primitive-ranker: trained by self-play to predict (from cheap stats) a primitive's usefulness ----
+def _mi(f, y):
+    n = len(y); mi = 0.0
+    for v in np.unique(f):
+        for c in (0, 1):
+            pxy = float(((f == v) & (y == c)).mean())
+            if pxy > 0:
+                mi += pxy * np.log(pxy / ((f == v).mean() * (y == c).mean() + 1e-12) + 1e-12)
+    return float(mi)
+
+
+def _descriptor(col, y, bins=12):
+    """Fixed-length, dataset-agnostic stats of (feature, label) -> the learned ranker's input."""
+    f = np.asarray(col, dtype=float)
+    if len(np.unique(f)) > bins:
+        f = np.digitize(f, np.quantile(f, np.linspace(0, 1, bins + 1))[1:-1])
+    base = float(y.mean()); shifts, covs, purs = [], [], []
+    for v in np.unique(f):
+        m = f == v; nn_ = int(m.sum())
+        if nn_ >= 3:
+            p = float(y[m].mean()); shifts.append(abs(p - base)); covs.append(nn_ / len(f)); purs.append(max(p, 1 - p))
+    wpur = float(np.average(purs, weights=covs)) if covs else base   # coverage-weighted single-feature-rule acc
+    return np.array([max(shifts or [0]), float(np.mean(shifts or [0])), max(purs or [0]), wpur,
+                     max(covs or [0]), len(np.unique(f)) / len(f), _mi(f, y)], dtype=np.float32)
+
+
+class PrimitiveRanker(nn.Module):
+    def __init__(self, nin=7, d=32):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(nin, d), nn.GELU(), nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+def selfplay_rank(steps=120, seed=0, verbose=True):
+    """Train the ranker on SELF-GENERATED concept tasks (counting / relational / parity / plain). Target =
+    the EXPENSIVE signal (a single derived feature's verified-rule score); input = the cheap descriptor. The
+    ranker learns to predict which primitives are worth full evaluation -- learn-to-reason at the feature level,
+    zero training on any real dataset."""
+    torch.manual_seed(seed); rng = np.random.default_rng(seed)
+    rk = PrimitiveRanker(); opt = torch.optim.AdamW(rk.parameters(), lr=2e-3)
+    for step in range(steps):
+        F = int(rng.integers(4, 6)); alpha = int(rng.integers(2, 5)); n = 160
+        cols = [f"c{i}" for i in range(F)]
+        df = pd.DataFrame({c: rng.integers(0, alpha, n) for c in cols})
+        kind = rng.choice(["count", "relational", "parity"])
+        if kind == "count":
+            v = int(rng.integers(0, alpha)); k = int(rng.integers(1, F))
+            y = ((df.values == v).sum(1) == k).astype(int)
+        elif kind == "relational":
+            i, j = rng.choice(F, 2, replace=False)
+            y = (df[cols[i]].values == df[cols[j]].values).astype(int)
+        else:
+            v = int(rng.integers(0, alpha)); y = ((df.values == v).sum(1) % 2).astype(int)
+        if y.mean() in (0.0, 1.0):
+            continue
+        cands = candidate_primitives(df, cols)
+        X, T = [], []
+        for nm, ser in cands:
+            X.append(_descriptor(ser, y)); T.append(_score(np.asarray(ser, float).reshape(-1, 1), y)[0])
+        Xt = torch.tensor(np.stack(X)); Tt = torch.tensor(np.array(T, np.float32))
+        rk.train(); pred = rk(Xt); loss = nn.functional.mse_loss(pred, Tt)
+        opt.zero_grad(); loss.backward(); opt.step()
+        if verbose and step % max(1, steps // 5) == 0:
+            print(f"    selfplay-rank step {step}: usefulness-prediction MSE {loss.item():.4f}", flush=True)
+    return rk
+
+
+def rank_score(ranker, col, y):
+    with torch.no_grad():
+        return float(ranker(torch.tensor(_descriptor(col, y)).unsqueeze(0))[0])
+
+
 def _featmat(df, base_cols, derived):
     X = df[base_cols].apply(lambda c: pd.factorize(c)[0] if c.dtype == object else c).values.astype(float)
     names = list(base_cols)
@@ -82,14 +158,16 @@ def _score(X, y, seed=0):
     return float(((dec >= 0) & (dec == y[va])).mean()), (pos, neg)
 
 
-def propose(df, target, base_cols, rounds=3, topk=8, verbose=True):
+def propose(df, target, base_cols, rounds=3, topk=8, ranker=None, verbose=True):
     """Greedily add the primitive that most improves held-out confident-correctness; stop when none helps.
-    Each round CHEAP-pre-ranks the whole library and only full-evaluates (verified rule search) the top-K --
-    so the library can grow without the eval cost exploding."""
+    Each round pre-ranks the whole library and only full-evaluates (verified rule search) the top-K -- so the
+    library can grow without the eval cost exploding. Pre-rank uses the LEARNED ranker if given, else the
+    cheap heuristic."""
     y = df[target].values.astype(int)
     cands = candidate_primitives(df, base_cols)
+    prank = (lambda c: rank_score(ranker, c, y)) if ranker is not None else (lambda c: _cheap_score(c, y))
     if verbose:
-        print(f"  library: {len(cands)} candidate primitives")
+        print(f"  library: {len(cands)} candidate primitives  (pre-rank: {'learned' if ranker else 'heuristic'})")
     chosen = []
     Xcur, _ = _featmat(df, base_cols, chosen)
     best, _ = _score(Xcur, y)
@@ -99,7 +177,7 @@ def propose(df, target, base_cols, rounds=3, topk=8, verbose=True):
         pool = [(nm, ser) for nm, ser in cands if nm not in [c[0] for c in chosen]]
         if not pool:
             break
-        ranked = sorted(pool, key=lambda p: -_cheap_score(p[1], y))[:topk]   # cheap pre-rank -> top-K
+        ranked = sorted(pool, key=lambda p: -prank(p[1]))[:topk]             # pre-rank -> top-K
         scored = []
         for nm, ser in ranked:
             X2, _ = _featmat(df, base_cols, chosen + [(nm, ser)])
@@ -123,9 +201,20 @@ def propose(df, target, base_cols, rounds=3, topk=8, verbose=True):
 def main():
     df = pd.read_csv("kaggle_data/monk/monk.csv")
     attrs = ["'attr1'", "'attr2'", "'attr3'", "'attr4'", "'attr5'", "'attr6'"]
-    print("Monk-2 ('exactly two of 6 attrs == 1') -- can the proposer DISCOVER the right primitive itself?")
-    print("\n[propose] verified feature discovery over raw attributes:")
-    chosen, score = propose(df, "'class'", attrs, rounds=3)
+    y = df["'class'"].values.astype(int)
+    print("Monk-2 ('exactly two of 6 attrs == 1') -- LEARNED ranker proposes the primitive (zero Monk data).")
+
+    print("\n[learn-to-rank] training PrimitiveRanker via self-play on synthetic concept tasks...")
+    ranker = selfplay_rank(steps=150, seed=0)
+
+    cands = candidate_primitives(df, attrs)                               # what does the learned ranker prefer?
+    top = sorted(cands, key=lambda c: -rank_score(ranker, c[1], y))[:5]
+    print("  learned-ranker top-5 candidates on Monk-2:")
+    for nm, ser in top:
+        print(f"    {nm:<16} learned-score {rank_score(ranker, ser, y):.3f}")
+
+    print("\n[propose] verified feature discovery using the LEARNED ranker:")
+    chosen, score = propose(df, "'class'", attrs, rounds=3, ranker=ranker)
     print(f"\n  discovered primitives: {[c[0] for c in chosen]}")
     # final: full verified rule using raw + discovered primitives, report held-out accuracy
     y = df["'class'"].values.astype(int)
