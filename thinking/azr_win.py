@@ -337,13 +337,12 @@ def selftest():
 # LEARNED-TO-REASON proposer (RuleProposer scores which condition to propose next). Runtime = pure reasoning,
 # zero training on the problem; the proposer is trained once on SELF-GENERATED rule tasks (learn the skill).
 # ===================================================================================================
-def _lits(X, max_eq=4, nq=9, binary_presence_only=False):
-    """Candidate conditions. Categorical (<=max_eq uniques) -> equality; continuous -> nq rounded thresholds.
-    nq is a 'think harder' lever: more thresholds = finer search over continuous features.
-    binary_presence_only: for one-hot {0,1} columns emit ONLY '==1' (presence). The '==0' literal of a one-hot
-    level means 'NOT that level' -- a disjunctive confound that lets greedy search find spurious shortcuts
-    instead of true positive-presence conjunctions; drop it when features are one-hot."""
-    L = []
+def _lits(X, max_eq=4, nq=9, binary_presence_only=False, y=None):
+    """Candidate conditions. Categorical (<=max_eq uniques) -> equality; continuous -> nq rounded thresholds
+    PLUS, when y is given, the CART-optimal split threshold (native tree split-finding -> a label-adapted,
+    optimal cut, sharper than fixed quantiles). nq is a 'think harder' lever. binary_presence_only: for one-hot
+    {0,1} columns emit ONLY '==1' (presence; drop the '==0' disjunctive confound)."""
+    L = []; yc = (y - y.mean()).astype(float) if y is not None else None
     for j in range(X.shape[1]):
         u = np.unique(X[:, j])
         if binary_presence_only and set(u.tolist()) <= {0.0, 1.0}:
@@ -351,8 +350,12 @@ def _lits(X, max_eq=4, nq=9, binary_presence_only=False):
         elif len(u) <= max_eq:
             L += [(j, "==", float(t)) for t in u]
         else:
-            qs = np.quantile(u, np.linspace(0.1, 0.9, nq))
-            for t in np.unique(np.round(qs, 2)):
+            ts = list(np.round(np.quantile(u, np.linspace(0.1, 0.9, nq)), 2))
+            if yc is not None:                                       # CART-optimal threshold for this feature
+                s = _best_split(X[:, [j]], yc)
+                if s is not None:
+                    ts.append(round(s[2], 4))
+            for t in np.unique(ts):
                 L += [(j, ">", float(t)), (j, "<=", float(t))]
     return L
 
@@ -400,7 +403,7 @@ def reason_rule(X, y, proposer=None, device="cpu", holdout=0.3, topk=12, max_dis
     rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); c = int((1 - holdout) * len(y))
     fit, ver = idx[:c], idx[c:]
     Xf, yf, Xv, yv = X[fit], y[fit], X[ver], y[ver]
-    lits = _lits(Xf, nq=nq, binary_presence_only=binary_presence_only)
+    lits = _lits(Xf, nq=nq, binary_presence_only=binary_presence_only, y=yf)   # CART-optimal thresholds too
     rules = []
     base = (apply_rule([], Xv) == yv).mean()
     if trace:
@@ -684,7 +687,7 @@ def reason_selective_cv(X, y, proposer=None, device="cpu", seed=0, folds=5, buil
     fid = np.empty(len(y), int); fid[idx] = np.arange(len(y)) % folds              # fold id per row
     cand_pos, cand_neg = {}, {}
     if exhaustive:                                  # DISCOVER ONCE on full data (CV-verify below gives robustness)
-        lits = _lits(X, nq=build.get("nq", 9), binary_presence_only=build.get("binary_presence_only", False))
+        lits = _lits(X, nq=build.get("nq", 9), binary_presence_only=build.get("binary_presence_only", False), y=y)
         lits = _prefilter_lits(X, y, lits, build.get("max_lits", None))
         mlit = build.get("max_lit", 3)
         for conj in _enum_pure_conjuncts(X, y, lits, mlit, min_prec_pos, min_support):
