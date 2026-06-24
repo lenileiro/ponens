@@ -851,6 +851,17 @@ def _tree_pred(tree, X):
     return out
 
 
+def _newton_leaves(tree, X, g, h, lam):
+    """Re-weight a tree's leaves with the Newton-optimal step w = -sum(g)/(sum(h)+lambda) (XGBoost-style 2nd
+    order). The CART splits give the partition; this corrects each leaf's MAGNITUDE by the local curvature
+    (Hessian) -- big confident steps where the loss is flat, small steps where it's sharp."""
+    if tree[0] == "leaf":
+        return ("leaf", float(-g.sum() / (h.sum() + lam))) if len(g) else tree
+    _, j, t, lt, rt = tree; m = X[:, j] <= t
+    return ("node", j, t, _newton_leaves(lt, X[m], g[m], h[m], lam),
+            _newton_leaves(rt, X[~m], g[~m], h[~m], lam))
+
+
 def reason_boost(X, y, holdout=0.3, lr=0.05, n_terms=700, depth=3, min_leaf=20, sub=0.7, mf=0.7,
                  patience=30, seed=0):
     """Verified STOCHASTIC rule-boosting: iterate-on-residual, each term a shallow CART tree fit on a random
@@ -931,11 +942,13 @@ def reason_tree_rule(X, y, depth=4, min_leaf=20, min_purity=0.9, min_support=10,
 
 
 def reason_boost_clf(X, y, holdout=0.3, lr=0.1, n_terms=700, depth=3, min_leaf=20, sub=0.7, mf=0.7,
-                     patience=30, seed=0):
-    """Verified LOGISTIC rule-boosting (binary): iterate on the logistic residual (y - sigmoid(F)), each term a
-    shallow CART tree fit on a random row+feature subsample, KEPT only while it improves HELD-OUT log-loss
-    (early stop = the verifier). Full coverage + calibrated probability + interpretable (render_boost) -- the
-    accuracy-focused complement to reason_tree_rule's abstaining DNF. Returns (base_logit, lr, trees). In-house."""
+                     patience=30, newton=True, lam=1.0, seed=0):
+    """Verified LOGISTIC rule-boosting (binary): iterate on the logistic residual, each term a shallow CART tree
+    fit on a random row+feature subsample, KEPT only while it improves HELD-OUT log-loss (early stop = the
+    verifier). With newton=True (XGBoost-style 2nd order) each leaf gets the Newton-optimal weight
+    -sum(g)/(sum(h)+lambda) using the logistic Hessian h=p(1-p) -- properly scaled steps (big where the loss is
+    flat, small where it's sharp), which closes the gap to GBM on overlapping data. Full coverage + calibrated
+    probability + interpretable (render_boost). Returns (base_logit, lr, trees). In-house."""
     rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); c = int((1 - holdout) * len(y))
     fit, ver = idx[:c], idx[c:]
     Xf, yf, Xv, yv = X[fit], y[fit].astype(float), X[ver], y[ver].astype(float)
@@ -949,8 +962,10 @@ def reason_boost_clf(X, y, holdout=0.3, lr=0.1, n_terms=700, depth=3, min_leaf=2
     for _ in range(n_terms):
         s = rm.random(len(fit)) < sub                                # stochastic row subsample
         feats = rm.choice(D, nfeat, replace=False)                   # stochastic feature subsample
-        resid = yf - 1.0 / (1.0 + np.exp(-Ff))                       # negative gradient of log-loss
-        t = _fit_tree(Xf[s], resid[s], depth, min_leaf, feats)
+        pf = 1.0 / (1.0 + np.exp(-Ff))
+        t = _fit_tree(Xf[s], (yf - pf)[s], depth, min_leaf, feats)   # CART partition on the negative gradient
+        if newton:                                                   # 2nd-order leaf weights (Hessian-scaled)
+            t = _newton_leaves(t, Xf[s], (pf - yf)[s], (pf * (1 - pf))[s], lam)
         Ff = Ff + lr * _tree_pred(t, Xf); Fv = Fv + lr * _tree_pred(t, Xv); trees.append(t)
         r = _ll(Fv, yv)
         if r < best - 1e-6:
