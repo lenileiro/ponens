@@ -281,11 +281,18 @@ def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99
         Xfull, names = _build_features(df, base_cols, names_chosen)
         Xtr, Xte = Xfull[tri], Xfull[tei]
         rules = {}; conf = np.zeros((len(tei), len(classes)))
+        vsel = np.random.default_rng(seed + 5).permutation(len(tri))[int(0.7 * len(tri)):]   # held-out selector
         for ci, c in enumerate(classes):
             yc = (df[target].values == c).astype(int)
-            pos, _ = reason_selective_cv(Xtr, yc[tri], proposer=None, seed=seed, folds=5, exhaustive=True,
-                                         compress=True, min_prec_pos=min_prec, min_prec_neg=min_prec,
-                                         build=dict(max_lit=3, max_lits=60, binary_presence_only=True), verbose=False)
+            pos_d, _ = reason_selective_cv(Xtr, yc[tri], proposer=None, seed=seed, folds=5, exhaustive=True,
+                                           compress=True, min_prec_pos=min_prec, min_prec_neg=min_prec,
+                                           build=dict(max_lit=3, max_lits=60, binary_presence_only=True), verbose=False)
+            ml = max(4, len(tri) // 100)                            # small leaves for tiny/imbalanced classes
+            pos_t = reason_tree_rule(Xtr, yc[tri], depth=4, min_leaf=ml, min_purity=0.75,
+                                     min_support=max(3, ml // 2), seed=seed)
+            acc_d = (apply_rule(pos_d, Xtr[vsel]) == yc[tri][vsel]).mean()
+            acc_t = (apply_rule(pos_t, Xtr[vsel]) == yc[tri][vsel]).mean()
+            pos = pos_t if acc_t >= acc_d else pos_d                 # pick the better one-vs-rest rule per class
             rules[c] = pos
             _, cf = _class_confidence(pos, Xte); conf[:, ci] = cf
         fired = conf.max(1) > 0
