@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 
 from thinking.azr_win import (_conj, apply_rule, explain_selective, predict_selective,  # noqa
-                              reason_selective_cv)
+                              reason_selective_cv, reason_tree_rule)
 
 
 def candidate_primitives(df, cols):
@@ -311,8 +311,21 @@ def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99
     pos, neg = reason_selective_cv(Xtr, ytr, proposer=None, seed=seed, folds=5, exhaustive=True, compress=True,
                                    min_prec_pos=min_prec, min_prec_neg=min_prec,
                                    build=dict(max_lit=3, max_lits=60, binary_presence_only=True), verbose=False)
+    pos_t = reason_tree_rule(Xtr, ytr, seed=seed)                     # CART tree-path DNF (helps continuous feats)
+    neg_t = reason_tree_rule(Xtr, 1 - ytr, seed=seed)
+    vsel = np.random.default_rng(seed + 5).permutation(len(tri))[int(0.7 * len(tri)):]   # held-out selector
+
+    def _cc(p, n):
+        d = predict_selective(p, n, Xtr[vsel]); ans = d >= 0
+        return float((d[ans] == ytr[vsel][ans]).sum()) / len(vsel)    # confident-correct fraction
+    rule_mode = "dnf"
+    if _cc(pos_t, neg_t) > _cc(pos, neg):
+        pos, neg, rule_mode = pos_t, neg_t, "tree-paths"
+    if verbose:
+        print(f"  rule source: {rule_mode}")
     dec = predict_selective(pos, neg, Xte); a = dec >= 0
     return {"task": "binary classification", "classes": classes, "discovered_primitives": names_chosen,
+            "rule_mode": rule_mode,
             "rule_positive": _render(pos, names), "rule_negative": _render(neg, names),
             "coverage": float(a.mean()),
             "accuracy_on_answered": float((dec[a] == yte[a]).mean()) if a.any() else 0.0,

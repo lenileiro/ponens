@@ -853,15 +853,15 @@ def reason_tree_rule(X, y, depth=4, min_leaf=20, min_purity=0.9, min_support=10,
     for cond, _ in _tree_paths(tree):
         if not cond:
             continue
-        m = apply_rule([list(cond)], Xf).astype(bool)
-        if int(m.sum()) >= min_support and yf[m].mean() >= min_purity:
-            cands.append((float(yf[m].mean()), list(cond)))
+        m = apply_rule([list(cond)], Xf).astype(bool); s = int(m.sum())
+        if s >= min_support and yf[m].mean() >= min_purity:
+            cands.append((float(yf[m].mean()), s, list(cond)))
     cands.sort(key=lambda p: -p[0])                                   # purest paths first
     rules = []; base = (apply_rule([], Xv) == yv).mean()
-    for _, conj in cands:                                             # held-out-gated disjuncts
+    for purity, sup, conj in cands:                                  # held-out-gated disjuncts
         g = (apply_rule(rules + [conj], Xv) == yv).mean()
         if g > base + 1e-9:
-            rules.append(conj); base = g
+            rules.append({"conj": conj, "prec": purity, "support": sup}); base = g   # dict form (carries stats)
     return rules
 
 
