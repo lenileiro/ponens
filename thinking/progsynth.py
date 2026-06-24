@@ -122,15 +122,21 @@ def _complexity(e):
     return 1 + _complexity(e[1]) + _complexity(e[2])
 
 
+def _err(pred, yv, metric):
+    if metric == "rmse":
+        return math.sqrt(((pred - yv) ** 2).mean())
+    return float(((pred > 0.5).astype(int) != yv).mean())            # classification error rate (linear-prob)
+
+
 def beam_synthesize(X, y, base_names, policy=None, beam=4, maxterms=16, topk=10, mdl=0.002,
-                    holdout=0.3, seed=0, verbose=False):
+                    holdout=0.3, metric="rmse", seed=0, verbose=False):
     """Beam search over additive programs with an Occam/MDL penalty. Keep the top-`beam` partial programs (not
-    just greedy-best), ranked by held-out RMSE + mdl*baseline*complexity, so a complex expression must earn its
-    keep. A backward-elimination prune at the end drops terms whose removal doesn't hurt held-out."""
+    just greedy-best), ranked by held-out error + mdl*baseline*complexity, so a complex expression must earn its
+    keep. metric='rmse' (regression) or 'acc' (classification error rate). Backward-prune at the end."""
     rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); cut = int((1 - holdout) * len(y))
     fit, ver = idx[:cut], idx[cut:]
     Xs, mu, sd = _std(X); B = {nm: Xs[:, j] for j, nm in enumerate(base_names)}
-    yf, yv = y[fit], y[ver]; rmse0 = math.sqrt(((yf.mean() - yv) ** 2).mean())
+    yf, yv = y[fit], y[ver]; rmse0 = _err(np.full(len(ver), yf.mean()), yv, metric)
     init = {"prog": [("const", float(yf.mean()))], "pf": np.full(len(fit), yf.mean()),
             "pv": np.full(len(ver), yf.mean()), "chosen": [], "rmse": rmse0}
     states, best = [init], init
@@ -152,7 +158,7 @@ def beam_synthesize(X, y, base_names, policy=None, beam=4, maxterms=16, topk=10,
                 if vv < 1e-9 or not np.isfinite(vv):
                     continue
                 coef = float(vf @ res) / vv
-                pv2 = st["pv"] + coef * v[ver]; r = math.sqrt(((pv2 - yv) ** 2).mean())
+                pv2 = st["pv"] + coef * v[ver]; r = _err(pv2, yv, metric)
                 if r < st["rmse"] - 1e-6:                            # must improve its parent
                     pool.append({"prog": st["prog"] + [(e, coef)], "pf": st["pf"] + coef * vf,
                                  "pv": pv2, "chosen": st["chosen"] + [e], "rmse": r,
@@ -170,25 +176,25 @@ def beam_synthesize(X, y, base_names, policy=None, beam=4, maxterms=16, topk=10,
             best = cb
         if verbose:
             print(f"    step {step}: best held-out RMSE {best['rmse']:.3f} (beam {len(states)})")
-    prog = _prune(best["prog"], B, fit, ver, yv, mdl, rmse0)
+    prog = _prune(best["prog"], B, fit, ver, yv, mdl, rmse0, metric)
     return prog, (mu, sd, base_names)
 
 
-def _prune(prog, B, fit, ver, yv, mdl, rmse0):
-    """Backward elimination: drop any term whose removal doesn't worsen held-out RMSE beyond its MDL credit."""
+def _prune(prog, B, fit, ver, yv, mdl, rmse0, metric="rmse"):
+    """Backward elimination: drop any term whose removal doesn't worsen held-out error beyond its MDL credit."""
     terms = prog[1:]; const = prog[0]
     def vpred(ts):
         o = np.full(len(ver), const[1])
         for e, c in ts:
             o += c * ev(e, B)[ver]
         return o
-    cur = math.sqrt(((vpred(terms) - yv) ** 2).mean())
+    cur = _err(vpred(terms), yv, metric)
     changed = True
     while changed and terms:
         changed = False
         for k in range(len(terms)):
             trial = terms[:k] + terms[k + 1:]
-            r = math.sqrt(((vpred(trial) - yv) ** 2).mean())
+            r = _err(vpred(trial), yv, metric)
             if r <= cur + mdl * rmse0 * _complexity(terms[k][0]):     # removal is free within MDL credit
                 terms = trial; cur = r; changed = True; break
     return [const] + terms
@@ -316,6 +322,29 @@ def solve(df, target, test_frac=0.3, policy=None, seed=0, verbose=True):
     rmse = math.sqrt(((pred - y[tei]) ** 2).mean())
     return {"rmse": round(rmse, 3), "n_terms": len(prog) - 1, "program": render(prog),
             "baseline": round(math.sqrt(((y[tri].mean() - y[tei]) ** 2).mean()), 3)}
+
+
+def solve_clf(df, target, test_frac=0.3, policy=None, abstain=0.15, seed=0, verbose=True):
+    """Program synthesis for BINARY classification: synthesize an additive discriminant over operator-tree
+    expressions (verified by held-out error), threshold at 0.5, abstain near it. aggregate-by becomes
+    P(y=1|category). The program IS the classifier -- discovers interactions/aggregations itself."""
+    import pandas as pd
+    df = df.reset_index(drop=True)
+    classes = sorted(pd.unique(df[target].dropna()).tolist(), key=str)
+    if len(classes) != 2:
+        raise ValueError(f"binary only; got {classes}")
+    yb = (df[target].values == classes[1]).astype(int)
+    dfx = df.drop(columns=[target]).copy(); dfx["__y__"] = yb
+    rng = np.random.default_rng(seed); idx = rng.permutation(len(df)); cut = int((1 - test_frac) * len(df))
+    tri, tei = idx[:cut], idx[cut:]
+    X, names, y = build_base(dfx, "__y__", tri)
+    prog, ctx = beam_synthesize(X[tri], y[tri], names, policy=policy, metric="acc", seed=seed, verbose=verbose)
+    score = predict(prog, X[tei], ctx)
+    conf = np.abs(score - 0.5) >= abstain
+    pred = (score > 0.5).astype(int)
+    acc = float((pred[conf] == y[tei][conf]).mean()) if conf.any() else 0.0
+    return {"coverage": round(float(conf.mean()), 3), "accuracy_on_answered": round(acc, 3),
+            "n_terms": len(prog) - 1, "program": "P(%s) ~ %s" % (classes[1], render(prog))}
 
 
 def main():
