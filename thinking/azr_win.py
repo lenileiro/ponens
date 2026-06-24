@@ -738,6 +738,91 @@ def render_rule(rules, names):
     return "  OR  ".join("(" + " AND ".join(f"{names[j]}{o}{t:g}" for j, o, t in c) + ")" for c in rules)
 
 
+# ===================================================================================================
+# TREE TECHNIQUE, NATIVE (no library). A decision tree IS a verified-rule discoverer -- a root->leaf path
+# is one of azr_win's conjunctions. We take the ONE thing trees do better than precision-greedy literal
+# picking: CART split-finding (the feature+threshold that maximally reduces residual variance), found
+# in-house by a single sort + cumulative-sum scan. Boosting = azr_win's iterate-on-residual; each added
+# term is a SHALLOW, held-out-VERIFIED if-then rule. Stays interpretable (shallow + few + rendered), not a
+# black-box forest. This sharpens conditions (optimal thresholds) and captures interactions natively.
+# ===================================================================================================
+def _best_split(X, r, min_leaf=20):
+    """CART split: the (feature, threshold) that maximally reduces residual variance. Pure numpy, O(d n log n)."""
+    n = len(r); g0 = r.sum() ** 2 / n; best = (0.0, None, None, None, None)   # (gain, j, thr, left_mean, right_mean)
+    for j in range(X.shape[1]):
+        o = np.argsort(X[:, j], kind="stable"); xs = X[o, j]; rs = r[o]
+        cs = np.cumsum(rs); tot = cs[-1]; i = np.arange(1, n)
+        SL = cs[:-1]; nL = i; SR = tot - SL; nR = n - i
+        valid = (xs[1:] > xs[:-1]) & (nL >= min_leaf) & (nR >= min_leaf)
+        gain = np.where(valid, SL ** 2 / nL + SR ** 2 / nR - g0, -np.inf)
+        k = int(gain.argmax())
+        if gain[k] > best[0]:
+            best = (float(gain[k]), j, float((xs[k] + xs[k + 1]) / 2), float(SL[k] / nL[k]), float(SR[k] / nR[k]))
+    return best if best[1] is not None else None
+
+
+def _fit_tree(X, r, depth=2, min_leaf=20):
+    """A shallow regression tree on the residual -> nested (feature, threshold, left, right); leaf = value.
+    Each root->leaf path is a verified conjunction; depth>1 captures interactions."""
+    if depth == 0 or len(r) < 2 * min_leaf:
+        return ("leaf", float(r.mean()))
+    s = _best_split(X, r, min_leaf)
+    if s is None:
+        return ("leaf", float(r.mean()))
+    _, j, t, _, _ = s; m = X[:, j] <= t
+    return ("node", j, t, _fit_tree(X[m], r[m], depth - 1, min_leaf), _fit_tree(X[~m], r[~m], depth - 1, min_leaf))
+
+
+def _tree_pred(tree, X):
+    if tree[0] == "leaf":
+        return np.full(len(X), tree[1])
+    _, j, t, lt, rt = tree; out = np.empty(len(X)); m = X[:, j] <= t
+    out[m] = _tree_pred(lt, X[m]); out[~m] = _tree_pred(rt, X[~m])
+    return out
+
+
+def reason_boost(X, y, holdout=0.3, lr=0.1, n_terms=400, depth=2, min_leaf=20, patience=25, seed=0):
+    """Verified rule-boosting: iterate-on-residual, each term a shallow CART tree kept while it improves the
+    HELD-OUT split (early stop = the verifier). Returns a model (base, lr, trees) -- an additive program of
+    interpretable if-then rules. In-house: 'azr_win grows small verified decision rules.'"""
+    rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); c = int((1 - holdout) * len(y))
+    fit, ver = idx[:c], idx[c:]
+    Xf, yf, Xv, yv = X[fit], y[fit], X[ver], y[ver]
+    base = float(yf.mean()); pf = np.full(len(fit), base); pv = np.full(len(ver), base)
+    best = math.sqrt(((pv - yv) ** 2).mean()); trees = []; keep = 0; bad = 0
+    for _ in range(n_terms):
+        t = _fit_tree(Xf, yf - pf, depth, min_leaf)
+        pf = pf + lr * _tree_pred(t, Xf); pv = pv + lr * _tree_pred(t, Xv); trees.append(t)
+        r = math.sqrt(((pv - yv) ** 2).mean())
+        if r < best - 1e-6:
+            best = r; keep = len(trees); bad = 0
+        else:
+            bad += 1
+            if bad >= patience:
+                break
+    return (base, lr, trees[:keep])
+
+
+def boost_predict(model, X):
+    base, lr, trees = model
+    return base + lr * sum((_tree_pred(t, X) for t in trees), np.zeros(len(X)))
+
+
+def render_boost(model, names, k=4):
+    """Render the first few boosted rules as if-then text (the explanation)."""
+    base, lr, trees = model
+    def paths(t, cond):
+        if t[0] == "leaf":
+            return [(cond, t[1])]
+        _, j, th, lt, rt = t
+        return paths(lt, cond + [f"{names[j]}<={th:.2f}"]) + paths(rt, cond + [f"{names[j]}>{th:.2f}"])
+    out = [f"base {base:.1f} (+{len(trees)} verified rules @ lr {lr})"]
+    for t in trees[:k]:
+        for cond, val in paths(t, []):
+            out.append(f"  IF {' AND '.join(cond)}: {lr * val:+.1f}")
+    return "\n".join(out)
+
+
 def _gen_rule_task(rng, F, n):
     X = np.stack([rng.normal(0, 1, n) if rng.random() < 0.6 else rng.integers(0, 3, n) for _ in range(F)], 1).astype(np.float32)
     nd = int(rng.integers(1, 4)); y = np.zeros(n, bool)
