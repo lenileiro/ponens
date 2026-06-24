@@ -19,10 +19,12 @@ condition: combined > SFT-only at depth 5 (higher solve@1, so best-of-N multipli
     python -m thinking.azr_win --maxdepth 5 --concepts 6 --rounds 3000 --grpo
 """
 import argparse
+import math
 import sys
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from thinking.azr import NBASE, NOP, BASE_OPS, Library, execute, apply_ops_np
@@ -326,6 +328,451 @@ def selftest():
     assert bestN[2] >= final[2], "best-of-N (multiple answers) should not hurt"
     print("azr_win selftest OK")
     return 0
+
+
+# ===================================================================================================
+# REASONING over real data: azr_win's verified search synthesizes an explainable RULE from a prompt. Same
+# paradigm (propose -> verify -> keep -> iterate), now with a HELD-OUT verifier (a condition is kept only if
+# it improves accuracy on held-out prompt rows -> "verified" = GENERALIZES, not memorizes) and a self-play
+# LEARNED-TO-REASON proposer (RuleProposer scores which condition to propose next). Runtime = pure reasoning,
+# zero training on the problem; the proposer is trained once on SELF-GENERATED rule tasks (learn the skill).
+# ===================================================================================================
+def _lits(X, max_eq=4, nq=9, binary_presence_only=False):
+    """Candidate conditions. Categorical (<=max_eq uniques) -> equality; continuous -> nq rounded thresholds.
+    nq is a 'think harder' lever: more thresholds = finer search over continuous features.
+    binary_presence_only: for one-hot {0,1} columns emit ONLY '==1' (presence). The '==0' literal of a one-hot
+    level means 'NOT that level' -- a disjunctive confound that lets greedy search find spurious shortcuts
+    instead of true positive-presence conjunctions; drop it when features are one-hot."""
+    L = []
+    for j in range(X.shape[1]):
+        u = np.unique(X[:, j])
+        if binary_presence_only and set(u.tolist()) <= {0.0, 1.0}:
+            L += [(j, "==", 1.0)]
+        elif len(u) <= max_eq:
+            L += [(j, "==", float(t)) for t in u]
+        else:
+            qs = np.quantile(u, np.linspace(0.1, 0.9, nq))
+            for t in np.unique(np.round(qs, 2)):
+                L += [(j, ">", float(t)), (j, "<=", float(t))]
+    return L
+
+
+def _sat(lit, X):
+    j, o, t = lit
+    return X[:, j] > t if o == ">" else (X[:, j] <= t if o == "<=" else X[:, j] == t)
+
+
+def _lit_feats(lit, X, y, mask, covered):
+    """Per-candidate features for the proposer (its current effect) -> learned-to-reason scoring."""
+    m = mask & _sat(lit, X)
+    nm = max(1, m.sum())
+    prec = (y[m] == 1).mean() if m.any() else 0.0
+    prec0 = (y[mask] == 1).mean() if mask.any() else 0.0
+    newpos = (m & (y == 1) & ~covered).sum() / max(1, (~covered & (y == 1)).sum())
+    foil = (m & (y == 1)).sum() * (math.log(prec + 1e-6) - math.log(prec0 + 1e-6))
+    return np.array([prec, prec - prec0, newpos, m.sum() / len(X), foil / max(1, len(X)),
+                     1.0 if lit[1] == "==" else 0.0], np.float32)
+
+
+class RuleProposer(nn.Module):
+    """Learns (via self-play) to score a candidate condition by how well it advances a generalizing rule."""
+    def __init__(self, nin=6, d=64):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(nin, d), nn.GELU(), nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
+
+    def forward(self, feats):
+        return self.net(feats).squeeze(-1)
+
+
+def reason_rule(X, y, proposer=None, device="cpu", holdout=0.3, topk=12, max_disj=8, max_lit=4, seed=0,
+                nq=9, min_precision=0.0, min_support=1, binary_presence_only=False, names=None, trace=False):
+    """Verified DNF rule synthesis. Builds disjuncts on a FIT split; accepts each disjunct ONLY if it improves
+    accuracy on a held-out VERIFY split AND its own held-out precision >= min_precision (verified = generalizes
+    AND is a confident reason). proposer (optional) ranks candidate literals; without it, evaluate all.
+    Returns the rule (list of conjunctions of literals). min_precision=1.0 keeps only PURE clauses (so impure
+    regions abstain rather than guess); raise it for the safety-critical class.
+    max_disj/max_lit/nq/topk are 'think harder' levers (more disjuncts/deeper conjunctions/finer/less pruning).
+    trace=True narrates the propose -> verify -> keep/reject reasoning (pass names for readable literals)."""
+    def lname(lit):                                                    # readable literal (one-hot aware)
+        j, o, t = lit; nm = names[j] if names else f"x{j}"
+        return nm if (o == "==" and t == 1) else (f"NOT {nm}" if (o == "==" and t == 0) else f"{nm}{o}{t:g}")
+
+    rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); c = int((1 - holdout) * len(y))
+    fit, ver = idx[:c], idx[c:]
+    Xf, yf, Xv, yv = X[fit], y[fit], X[ver], y[ver]
+    lits = _lits(Xf, nq=nq, binary_presence_only=binary_presence_only)
+    rules = []
+    base = (apply_rule([], Xv) == yv).mean()
+    if trace:
+        print(f"  reasoning over {len(fit)} fit / {len(ver)} held-out rows; {len(lits)} candidate conditions; "
+              f"start held-out acc {base:.4f}")
+    for d in range(max_disj):
+        covered = apply_rule(rules, Xf).astype(bool)
+        if not ((yf == 1) & ~covered).any():
+            if trace:
+                print(f"  round {d + 1}: all positives covered -> stop")
+            break
+        # build ONE conjunction by PRECISION-greedy on the fit split (so conjunctive rules like
+        # contract&charges are found -- a literal good only in combination still gets added on its way to purity)
+        mask = np.ones(len(yf), bool); conj = []
+        for _ in range(max_lit):
+            cand = [lit for lit in lits if (mask & _sat(lit, Xf)).sum() not in (0, mask.sum())
+                    and (mask & _sat(lit, Xf) & (yf == 1) & ~covered).sum() >= 1]
+            if not cand:
+                break
+            if proposer is not None:                                   # learned-to-reason prunes the candidates
+                feats = torch.tensor(np.stack([_lit_feats(l, Xf, yf, mask, covered) for l in cand]), device=device)
+                with torch.no_grad():
+                    order = torch.argsort(-proposer(feats)).cpu().numpy()
+                cand = [cand[i] for i in order[:topk]]
+            def q(lit):
+                m = mask & _sat(lit, Xf)
+                return ((yf[m] == 1).mean(), int((m & (yf == 1) & ~covered).sum()))   # precision, then coverage
+            lit = max(cand, key=q)
+            mask = mask & _sat(lit, Xf); conj.append(lit)
+            if trace:
+                m = mask
+                print(f"      propose {lname(lit):<32} precision {(yf[m] == 1).mean():.3f} on "
+                      f"{int(m.sum())} rows ({int((m & (yf == 1) & ~covered).sum())} new poisonous)")
+            if (yf[mask] == 1).all():
+                break
+        firedv = apply_rule([conj], Xv).astype(bool)                   # this disjunct's OWN held-out evidence
+        nfired = int(firedv.sum())
+        precv = (yv[firedv] == 1).mean() if nfired else 0.0
+        g = (apply_rule(rules + [conj], Xv) == yv).mean()
+        # GATE on held-out accuracy gain AND purity AND enough support (pure-on-2-rows is not verified)
+        if not conj or g <= base + 1e-9 or precv < min_precision or nfired < min_support:
+            if trace:
+                why = ("no generalizing gain" if (not conj or g <= base + 1e-9) else
+                       (f"only {nfired} held-out rows (<{min_support}) -> unverified" if nfired < min_support
+                        else f"impure (held-out precision {precv:.3f} < {min_precision:.3f}) -> abstain region"))
+                print(f"  round {d + 1}: disjunct ({' AND '.join(lname(l) for l in conj) or '-'}) -> "
+                      f"held-out {g:.4f}  REJECTED ({why}) -> stop")
+            break
+        rules.append(conj); base = g
+        if trace:
+            print(f"  round {d + 1}: KEEP ({' AND '.join(lname(l) for l in conj)})  -> "
+                  f"held-out {g:.4f}, precision {precv:.3f} ✓")
+    return rules
+
+
+def _conj(c):
+    return c["conj"] if isinstance(c, dict) else c                     # clauses may carry stats {conj, prec, support}
+
+
+def apply_rule(rules, X):
+    p = np.zeros(len(X), int)
+    for c in rules:
+        m = np.ones(len(X), bool)
+        for lit in _conj(c):
+            m &= _sat(lit, X)
+        p[m] = 1
+    return p
+
+
+# ---- selective prediction: reason BOTH classes, abstain when there's no verified reason (or a conflict) ----
+def reason_two_sided(X, y, proposer=None, device="cpu", seed=0, min_prec_pos=1.0, min_prec_neg=1.0, **kw):
+    """Verified DNF for class 1 AND for class 0. A firing clause = positive evidence; 'nothing fired' is
+    absence of evidence, not evidence of absence -- so we need both sides to know when to abstain. The two
+    purities can differ: raise the bar for the safety-critical class (a false 'edible' is worse than a false
+    'poisonous')."""
+    pos = reason_rule(X, y, proposer, device, seed=seed, min_precision=min_prec_pos, **kw)
+    neg = reason_rule(X, 1 - y, proposer, device, seed=seed, min_precision=min_prec_neg, **kw)
+    return pos, neg
+
+
+def predict_selective(pos, neg, X):
+    """Return per-row decision: 1 / 0 / -1(ABSTAIN). Answer only when exactly one side has a verified reason;
+    abstain on no-evidence (neither fires) and on conflict (both fire)."""
+    pf = apply_rule(pos, X).astype(bool); nf = apply_rule(neg, X).astype(bool)
+    out = np.full(len(X), -1, int)
+    out[pf & ~nf] = 1
+    out[nf & ~pf] = 0
+    return out
+
+
+def _filter_clauses(rules, X, is_class, min_precision, min_support):
+    """Verify-harder: keep only disjuncts that stay pure on an INDEPENDENT validation set (with enough
+    support). Each kept clause carries its verified {prec, support} -- that precision IS the confidence we
+    report when it fires. Drops clauses pure-by-luck on the build split -- the cure for verifier-overfit."""
+    kept = []
+    for c in rules:
+        conj = _conj(c)
+        m = apply_rule([conj], X).astype(bool); n = int(m.sum())
+        if n >= min_support and (is_class[m]).mean() >= min_precision:
+            kept.append({"conj": conj, "prec": float(is_class[m].mean()), "support": n})
+    return kept
+
+
+def _render_conj(conj, names):
+    return " AND ".join((names[j] if (o == "==" and t == 1) else
+                         (f"NOT {names[j]}" if o == "==" else f"{names[j]}{o}{t:g}")) for j, o, t in conj)
+
+
+def explain_selective(pos, neg, X, names, pos_label="class1", neg_label="class0"):
+    """Per-row decision WITH a why + confidence. For an answer, confidence = the firing clause's verified
+    precision. For an abstention, we say WHICH kind (no-evidence vs conflict) and show the closest near-miss
+    on each side, so 'I don't know' is itself explained. Returns a list of dicts."""
+    def fired(clauses, row):
+        return [c for c in clauses if all(_sat(l, row[None, :])[0] for l in c["conj"])]
+
+    def nearest(clauses, row):                                         # closest clause + which conditions it missed
+        best = None
+        for c in clauses:
+            sat = [bool(_sat(l, row[None, :])[0]) for l in c["conj"]]
+            frac = sum(sat) / len(sat)
+            if best is None or frac > best[0]:
+                miss = [c["conj"][i] for i, s in enumerate(sat) if not s]
+                best = (frac, c, miss)
+        return best
+
+    out = []
+    for i in range(len(X)):
+        row = X[i]
+        pf, nf = fired(pos, row), fired(neg, row)
+        if pf and not nf:
+            c = max(pf, key=lambda c: c["prec"])
+            out.append({"decision": pos_label, "confidence": c["prec"], "reason_type": "verified",
+                        "why": f"fires {pos_label} clause ({_render_conj(c['conj'], names)}) "
+                               f"-- verified pure on {c['support']} held-out rows (precision {c['prec']:.3f})"})
+        elif nf and not pf:
+            c = max(nf, key=lambda c: c["prec"])
+            out.append({"decision": neg_label, "confidence": c["prec"], "reason_type": "verified",
+                        "why": f"fires {neg_label} clause ({_render_conj(c['conj'], names)}) "
+                               f"-- verified pure on {c['support']} held-out rows (precision {c['prec']:.3f})"})
+        elif pf and nf:
+            cp = max(pf, key=lambda c: c["prec"]); cn = max(nf, key=lambda c: c["prec"])
+            out.append({"decision": "ABSTAIN", "confidence": 0.0, "reason_type": "conflict",
+                        "why": f"CONFLICT: {pos_label} clause ({_render_conj(cp['conj'], names)}) AND "
+                               f"{neg_label} clause ({_render_conj(cn['conj'], names)}) both fire"})
+        else:
+            npos, nneg = nearest(pos, row), nearest(neg, row)
+            lean = pos_label if (npos and (not nneg or npos[0] >= nneg[0])) else neg_label
+            near = npos if lean == pos_label else nneg
+            hint = (f"closest is a {lean} clause ({_render_conj(near[1]['conj'], names)}) "
+                    f"missing only [{_render_conj(near[2], names)}]") if near else "no clause came close"
+            out.append({"decision": "ABSTAIN", "confidence": 0.0, "reason_type": "no_evidence",
+                        "why": f"no verified condition matches; {hint}"})
+    return out
+
+
+def reason_selective_iter(X, y, proposer=None, device="cpu", seed=0, stages=None, holdout=0.4,
+                          min_prec_pos=0.99, min_prec_neg=1.0, min_support=15, acc_floor=0.999, verbose=True):
+    """Think harder until confident. Escalate the search budget stage by stage; at each stage BUILD both rules
+    liberally on a fit split, then VERIFY HARDER -- keep only disjuncts that stay pure on an INDEPENDENT
+    validation fold (the cure for verifier-overfit). A higher-budget stage is ADOPTED only if it keeps held-out
+    accuracy >= acc_floor, so thinking harder buys coverage and NEVER trades away safety. Purity is asymmetric:
+    the safety-critical class (neg / 'edible') must be perfectly pure. Returns (pos, neg, history)."""
+    stages = stages or [dict(max_disj=8, max_lit=1, nq=5, topk=8),
+                        dict(max_disj=16, max_lit=2, nq=9, topk=14),
+                        dict(max_disj=32, max_lit=4, nq=17, topk=24)]
+    rng = np.random.default_rng(seed); idx = rng.permutation(len(y))
+    c = int((1 - holdout) * len(y)); h = (len(y) - c) // 2
+    fit, val, sel = idx[:c], idx[c:c + h], idx[c + h:]                  # build / verify-clauses / select-stage
+    best = None; best_cov = -1.0; fallback = None; fb_acc = -1.0; history = []
+    for s, cfg in enumerate(stages):
+        pos, neg = reason_two_sided(X[fit], y[fit], proposer, device, seed=seed,            # build liberally
+                                    min_prec_pos=0.9, min_prec_neg=0.9, min_support=3, **cfg)
+        pos = _filter_clauses(pos, X[val], (y[val] == 1), min_prec_pos, min_support)        # verify harder
+        neg = _filter_clauses(neg, X[val], (y[val] == 0), min_prec_neg, min_support)
+        dec = predict_selective(pos, neg, X[sel]); ans = dec >= 0
+        cov = float(ans.mean()); acc = float((dec[ans] == y[sel][ans]).mean()) if ans.any() else 0.0
+        history.append({"stage": s, "effort": cfg, "coverage": cov, "acc_on_answered": acc})
+        if verbose:
+            adopt = "adopt" if (acc >= acc_floor and cov > best_cov) else "keep previous"
+            print(f"  think-harder stage {s} (disj{cfg['max_disj']}/lit{cfg['max_lit']}/nq{cfg['nq']}): "
+                  f"coverage {cov:.3f}  accuracy-on-answered {acc:.4f}  abstained {int((~ans).sum())}  -> {adopt}")
+        if acc >= acc_floor and cov > best_cov:                         # adopt ONLY if it stays safe
+            best, best_cov = (pos, neg), cov
+        if acc > fb_acc:
+            fallback, fb_acc = (pos, neg), acc
+        if best_cov >= 0.999:
+            break
+    return (best or fallback)[0], (best or fallback)[1], history
+
+
+def _enum_pure_conjuncts(X, y, lits, max_lit=3, min_precision=1.0, min_support=15):
+    """COMPLETE search for short rules where greedy fails (e.g. tic-tac-toe lines): level-wise enumerate
+    conjunctions up to max_lit, pruning by support (monotone), and keep the MINIMAL ones that are pure
+    (precision >= min_precision). Unlike greedy, this can reach a pure conjunction none of whose sub-clauses
+    is predictive. Returns a list of conjunctions (each a list of literals)."""
+    yb = (y == 1)
+    masks = [_sat(l, X).astype(bool) for l in lits]
+    base = [i for i in range(len(lits)) if masks[i].sum() >= min_support]
+    current = {frozenset([i]): masks[i] for i in base}                  # support-frequent sets at this level
+    pure_sets, pure = [], []
+    for L in range(1, max_lit + 1):
+        survivors = {}
+        for s, m in current.items():
+            sup = int(m.sum())
+            if sup < min_support:
+                continue
+            if any(ps <= s for ps in pure_sets):                        # minimal only: a pure subset already covers it
+                continue
+            if yb[m].mean() >= min_precision:
+                pure_sets.append(s); pure.append([lits[i] for i in s])
+            elif L < max_lit:
+                survivors[s] = m
+        nxt = {}
+        for s, m in survivors.items():                                  # extend by one frequent literal
+            for i in base:
+                if i in s:
+                    continue
+                ns = s | {i}
+                if len(ns) != L + 1 or ns in nxt:
+                    continue
+                nm = m & masks[i]
+                if nm.sum() >= min_support:
+                    nxt[ns] = nm
+        current = nxt
+        if not current:
+            break
+    return pure
+
+
+def compress_rules(rules, X, is_class):
+    """Set-cover compression: from a (possibly huge) pool of verified-pure clauses, greedily keep the SMALLEST
+    subset that still fires on every target-class row the full pool fired on. Exhaustive search maximizes
+    coverage but sprawls (many redundant pure clauses); this restores a compact, readable rule with the same
+    coverage. Clauses are kept in decreasing marginal-coverage order (the most useful reasons first)."""
+    if not rules:
+        return rules
+    masks = [apply_rule([c], X).astype(bool) & is_class for c in rules]
+    target = np.zeros(len(X), bool)
+    for m in masks:
+        target |= m
+    chosen, covered = [], np.zeros(len(X), bool)
+    order = list(range(len(rules)))
+    while True:
+        remaining = target & ~covered
+        if not remaining.any():
+            break
+        gains = [(int((masks[i] & remaining).sum()), i) for i in order]
+        g, i = max(gains)
+        if g == 0:
+            break
+        chosen.append(rules[i]); covered |= masks[i]; order.remove(i)
+    return chosen
+
+
+def _prefilter_lits(X, y, lits, keep):
+    """Speed: keep only the `keep` most informative literals before the combinatorial search (univariate
+    |P(y|lit)-P(y)| weighted by sqrt(support)). Symmetric in y vs 1-y, so one ranking serves both classes.
+    Caveat: prunes literals with zero marginal signal -- fine when conjunction parts are individually
+    informative (chess/mushroom/ttt), but would hurt pure-XOR concepts; pass keep=None to disable."""
+    if not keep or len(lits) <= keep:
+        return lits
+    p = float(y.mean()); score = []
+    for l in lits:
+        m = _sat(l, X).astype(bool); s = int(m.sum())
+        score.append(abs(float(y[m].mean()) - p) * (s ** 0.5) if s else 0.0)
+    keep_idx = sorted(np.argsort(score)[::-1][:keep])
+    return [lits[i] for i in keep_idx]
+
+
+def reason_selective_cv(X, y, proposer=None, device="cpu", seed=0, folds=5, build=None,
+                        min_prec_pos=0.99, min_prec_neg=1.0, min_support=15, exhaustive=False,
+                        compress=False, verbose=True):
+    """Raise the safe-coverage ceiling with MULTI-FOLD (bagged) verification. (1) DISCOVER candidate clauses
+    from every fold's training portion (union -> more of the space found). (2) VERIFY each candidate across
+    ALL folds: keep it only if it stays pure (>= min_precision) in every fold it fires in, fires in >=2 folds,
+    and has enough POOLED support. Pooling support is what lifts coverage -- a genuinely-pure-but-rare clause
+    that a single 20% fold drops for thin support survives once support is summed across folds; requiring
+    purity in every fold preserves safety. Purity is asymmetric (the safety-critical class must be perfect)."""
+    build = build or dict(max_disj=32, max_lit=4, nq=17, topk=24)
+    rng = np.random.default_rng(seed); idx = rng.permutation(len(y))
+    fid = np.empty(len(y), int); fid[idx] = np.arange(len(y)) % folds              # fold id per row
+    cand_pos, cand_neg = {}, {}
+    if exhaustive:                                  # DISCOVER ONCE on full data (CV-verify below gives robustness)
+        lits = _lits(X, nq=build.get("nq", 9), binary_presence_only=build.get("binary_presence_only", False))
+        lits = _prefilter_lits(X, y, lits, build.get("max_lits", None))
+        mlit = build.get("max_lit", 3)
+        for conj in _enum_pure_conjuncts(X, y, lits, mlit, min_prec_pos, min_support):
+            cand_pos[tuple(conj)] = conj
+        for conj in _enum_pure_conjuncts(X, 1 - y, lits, mlit, min_prec_neg, min_support):
+            cand_neg[tuple(conj)] = conj
+    else:
+        for k in range(folds):
+            tr = fid != k
+            pos, neg = reason_two_sided(X[tr], y[tr], proposer, device, seed=seed,
+                                        min_prec_pos=0.9, min_prec_neg=0.9, min_support=3, **build)
+            for c in pos:
+                cand_pos[tuple(_conj(c))] = _conj(c)
+            for c in neg:
+                cand_neg[tuple(_conj(c))] = _conj(c)
+    if verbose:
+        print(f"  cv-discover ({folds} folds): {len(cand_pos)} candidate poison / {len(cand_neg)} candidate "
+              f"edible clauses")
+
+    def verify(conj, is_class, min_precision):
+        firedall = apply_rule([conj], X).astype(bool); total = 0; nfolds = 0; worst = 1.0
+        for k in range(folds):
+            m = firedall & (fid == k); s = int(m.sum())
+            if s == 0:
+                continue
+            worst = min(worst, float(is_class[m].mean())); total += s; nfolds += 1
+        ok = total >= min_support and nfolds >= 2 and worst >= min_precision
+        prec = float(is_class[firedall].mean()) if firedall.any() else 0.0
+        return ok, total, prec
+
+    pos, neg = [], []
+    for conj in cand_pos.values():
+        ok, sup, prec = verify(conj, (y == 1), min_prec_pos)
+        if ok:
+            pos.append({"conj": conj, "prec": prec, "support": sup})
+    for conj in cand_neg.values():
+        ok, sup, prec = verify(conj, (y == 0), min_prec_neg)
+        if ok:
+            neg.append({"conj": conj, "prec": prec, "support": sup})
+    if compress:
+        np0, nn0 = len(pos), len(neg)
+        pos = compress_rules(pos, X, (y == 1)); neg = compress_rules(neg, X, (y == 0))
+        if verbose:
+            print(f"  set-cover compression: {np0}->{len(pos)} poison clauses, {nn0}->{len(neg)} edible clauses")
+    return pos, neg
+
+
+def render_rule(rules, names):
+    if not rules:
+        return "(always 0)"
+    return "  OR  ".join("(" + " AND ".join(f"{names[j]}{o}{t:g}" for j, o, t in c) + ")" for c in rules)
+
+
+def _gen_rule_task(rng, F, n):
+    X = np.stack([rng.normal(0, 1, n) if rng.random() < 0.6 else rng.integers(0, 3, n) for _ in range(F)], 1).astype(np.float32)
+    nd = int(rng.integers(1, 4)); y = np.zeros(n, bool)
+    for _ in range(nd):
+        m = np.ones(n, bool)
+        for _ in range(int(rng.integers(1, 3))):
+            j = int(rng.integers(0, F))
+            m &= (X[:, j] > rng.normal()) if rng.random() < 0.7 else (X[:, j] == int(rng.integers(0, 3)))
+        y |= m
+    return X, y.astype(int)
+
+
+def selfplay_reason(steps=3000, device="cpu", lr=1e-3, seed=0, verbose=True):
+    """Train RuleProposer on SELF-GENERATED rule tasks: learn to score a literal by the held-out gain it
+    yields (learn-to-reason). No external data."""
+    torch.manual_seed(seed); rng = np.random.default_rng(seed)
+    prop = RuleProposer().to(device); opt = torch.optim.AdamW(prop.parameters(), lr=lr)
+    for step in range(steps):
+        F_ = int(rng.integers(3, 8)); X, y = _gen_rule_task(rng, F_, 200)
+        ci = rng.permutation(len(y)); c = int(0.7 * len(y)); fit, ver = ci[:c], ci[c:]
+        Xf, yf, Xv, yv = X[fit], y[fit], X[ver], y[ver]
+        lits = _lits(Xf); covered = np.zeros(len(yf), bool); mask = np.ones(len(yf), bool)
+        cand = [l for l in lits if (mask & _sat(l, Xf)).sum() not in (0, mask.sum())]
+        if len(cand) < 4:
+            continue
+        feats = np.stack([_lit_feats(l, Xf, yf, mask, covered) for l in cand])
+        # target = held-out accuracy of the single-literal rule (generalizing gain)
+        tgt = np.array([(apply_rule([[l]], Xv) == yv).mean() for l in cand], np.float32)
+        prop.train()
+        pred = prop(torch.tensor(feats, device=device))
+        loss = F.mse_loss(pred, torch.tensor(tgt, device=device))
+        opt.zero_grad(); loss.backward(); opt.step()
+        if verbose and step % max(1, steps // 6) == 0:
+            print(f"  selfplay-reason step {step}: literal-quality MSE {loss.item():.4f}", flush=True)
+    return prop
 
 
 def main(argv=None):

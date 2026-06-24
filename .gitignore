@@ -7,6 +7,7 @@ __pycache__/
 .claude/
 
 # heavy generated artifacts (regenerable)
+kaggle_data/
 *.pt
 *.log
 *.tgz
