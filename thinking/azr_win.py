@@ -749,6 +749,57 @@ def reason_selective_cv(X, y, proposer=None, device="cpu", seed=0, folds=5, buil
     return pos, neg
 
 
+def reason_adaptive(X, y, ladder=None, min_prec_pos=0.99, min_prec_neg=0.99, holdout=0.3,
+                    seed_pos=None, seed_neg=None, seed=0, names=None, verbose=False):
+    """ADAPTIVE TEST-TIME SEARCH ('think harder where it abstains'). Run a cheap verified pass, then ESCALATE
+    the search budget (finer thresholds -> deeper conjunctions -> exhaustive enumeration) but ONLY on the
+    RESIDUAL: the rows the current rule leaves uncovered (= where predict_selective would abstain). Each rung
+    enumerates pure conjuncts over {residual-positives + all-negatives} so the hard subproblem stays small and
+    even max_lit=5 exhaustive is cheap; every added clause is still HELD-OUT-VERIFIED pure. Result: coverage
+    rises at FIXED precision, and we only pay the expensive search on the instances that need it.
+
+    Distinct from `tau`: tau RELAXES the precision bar to answer more; this SPENDS SEARCH to find genuinely
+    verified rules for the hard region. Returns two-sided (pos, neg) rules in azr_win's standard clause format."""
+    if ladder is None:
+        ladder = [dict(nq=9,  max_lit=3, max_lits=40, min_support=10),    # cheap pass
+                  dict(nq=17, max_lit=4, max_lits=60, min_support=5),     # escalate: finer + deeper
+                  dict(nq=29, max_lit=5, max_lits=60, min_support=3)]     # exhaustive on the small residual
+    rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); c = int((1 - holdout) * len(y))
+    fit, ver = idx[:c], idx[c:]
+    Xf, yf, Xv, yv = X[fit], y[fit], X[ver], y[ver]
+    pos = list(seed_pos) if seed_pos else []                         # start from the cheap pass -> only ADD (monotone)
+    neg = list(seed_neg) if seed_neg else []
+    for stage, cfg in enumerate(ladder):
+        added = 0
+        for is_one, store, minp in [(1, pos, min_prec_pos), (0, neg, min_prec_neg)]:
+            ys = (yf == is_one).astype(int); yvs = (yv == is_one).astype(int)
+            cov = apply_rule(store, Xf).astype(bool)                      # rows this side already explains
+            resid = (ys == 1) & ~cov                                     # the abstained positives = the residual
+            if not resid.any():
+                continue
+            sub = resid | (ys == 0)                                       # residual positives + all negatives
+            Xs, yss = Xf[sub], ys[sub]
+            lits = _prefilter_lits(Xs, yss, _lits(Xs, nq=cfg["nq"], y=yss), cfg["max_lits"])
+            for conj in _enum_pure_conjuncts(Xs, yss, lits, cfg["max_lit"], minp, cfg["min_support"]):
+                firef = apply_rule([conj], Xf).astype(bool)
+                if not (firef & resid).any():                            # must explain NEW residual rows
+                    continue
+                firev = apply_rule([conj], Xv).astype(bool); nv = int(firev.sum())
+                precv = float(yvs[firev].mean()) if nv else 0.0
+                if nv >= 2 and precv >= minp:                            # held-out-verified -> precision held
+                    store.append({"conj": conj, "prec": precv, "support": nv})
+                    cov = cov | firef; resid = (ys == 1) & ~cov; added += 1
+        if verbose:
+            rp = int(((yf == 1) & ~apply_rule(pos, Xf).astype(bool)).sum())
+            rn = int(((yf == 0) & ~apply_rule(neg, Xf).astype(bool)).sum())
+            print(f"  stage {stage} (nq={cfg['nq']}, max_lit={cfg['max_lit']}): +{added} verified clauses; "
+                  f"residual uncovered pos {rp} / neg {rn}")
+        if added == 0 and stage > 0:                                     # escalation found nothing new -> signal exhausted
+            break
+    pos = compress_rules(pos, X, (y == 1)); neg = compress_rules(neg, X, (y == 0))
+    return pos, neg
+
+
 def render_rule(rules, names):
     if not rules:
         return "(always 0)"

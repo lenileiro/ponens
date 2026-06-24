@@ -18,8 +18,8 @@ import torch
 import torch.nn as nn
 
 from thinking.azr_win import (_conj, apply_rule, boost_clf_proba, boost_multi_predict, explain_selective,  # noqa
-                              predict_calibrated, predict_selective, reason_boost_clf, reason_boost_multi,
-                              reason_selective_cv, reason_tree_rule, render_boost)
+                              predict_calibrated, predict_selective, reason_adaptive, reason_boost_clf,
+                              reason_boost_multi, reason_selective_cv, reason_tree_rule, render_boost)
 
 
 def candidate_primitives(df, cols):
@@ -252,7 +252,7 @@ def _class_confidence(pos, X):
     return fired, conf
 
 
-def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99, compose=True, tau=None, clf=None, seed=0, verbose=True):
+def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99, compose=True, tau=None, clf=None, adaptive=False, seed=0, verbose=True):
     """Capstone: one call on any tabular CLASSIFICATION dataset (binary or multiclass). Trains the
     primitive-ranker via self-play (if not given), proposes+verifies derived primitives, reasons verified
     rules (two-sided for binary; one-vs-rest for multiclass), and returns the rule(s), held-out
@@ -350,6 +350,12 @@ def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99
     rule_mode = "dnf"
     if _cc(pos_t, neg_t) > _cc(pos, neg):
         pos, neg, rule_mode = pos_t, neg_t, "tree-paths"
+    if adaptive:                                                      # think-harder: escalate search on the residual
+        if verbose:
+            print("  [adaptive] escalating search budget on the abstained residual (cheap pass then deeper)...")
+        pos, neg = reason_adaptive(Xtr, ytr, seed_pos=pos, seed_neg=neg, min_prec_pos=min_prec,
+                                   min_prec_neg=min_prec, seed=seed, names=names, verbose=verbose)
+        rule_mode = "adaptive"
     if tau is not None:                                              # calibrated mode: relaxed rules + tau gate
         ml = max(4, len(tri) // 100)
         pos_c = reason_tree_rule(Xtr, ytr, depth=4, min_leaf=ml, min_purity=0.55, min_support=4, seed=seed)
