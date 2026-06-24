@@ -29,6 +29,7 @@ def _std(A, B):
 
 def _ops(F, rng, n=60):
     return ([("lin", j) for j in range(F)]
+            + [("sub", int(rng.integers(0, F)), int(rng.integers(0, F))) for _ in range(n)]   # diff op -> auto-gaps
             + [("mul", int(rng.integers(0, F)), int(rng.integers(0, F))) for _ in range(n)]
             + [("thr", int(rng.integers(0, F)), float(rng.uniform(-1.5, 1.5))) for _ in range(n)]
             + [("rat", int(rng.integers(0, F)), int(rng.integers(0, F))) for _ in range(n)])
@@ -36,6 +37,7 @@ def _ops(F, rng, n=60):
 
 def _ev(o, X):
     if o[0] == "lin": return X[:, o[1]]
+    if o[0] == "sub": return X[:, o[1]] - X[:, o[2]]
     if o[0] == "mul": return X[:, o[1]] * X[:, o[2]]
     if o[0] == "thr": return (X[:, o[1]] > o[2]).astype(float)
     return X[:, o[1]] / (np.abs(X[:, o[2]]) + 1.0)
@@ -43,6 +45,7 @@ def _ev(o, X):
 
 def _name(o, names):
     if o[0] == "lin": return names[o[1]]
+    if o[0] == "sub": return f"({names[o[1]]}-{names[o[2]]})"
     if o[0] == "mul": return f"{names[o[1]]}*{names[o[2]]}"
     if o[0] == "thr": return f"({names[o[1]]}>thr)"
     return f"{names[o[1]]}/{names[o[2]]}"
@@ -93,16 +96,51 @@ def _rmse(a, b):
     return math.sqrt(((np.asarray(a) - np.asarray(b)) ** 2).mean())
 
 
+def _oof_te(col, y, tri, k=30):
+    """Out-of-fold target-encode (no train leakage): tri rows get 5-fold OOF means, the rest get tri means."""
+    col = np.asarray(col); out = np.full(len(col), y[tri].mean(), float); g = float(y[tri].mean())
+    folds = np.array_split(tri, 5)
+    for i in range(5):
+        rest = np.concatenate([folds[j] for j in range(5) if j != i])
+        m = pd.DataFrame({"k": col[rest], "y": y[rest]}).groupby("k")["y"].agg(["mean", "count"])
+        sm = (m["mean"] * m["count"] + g * k) / (m["count"] + k)
+        out[folds[i]] = pd.Series(col[folds[i]]).map(sm).fillna(g).values
+    mask = np.ones(len(col), bool); mask[tri] = False                # non-train rows -> full-train means
+    m = pd.DataFrame({"k": col[tri], "y": y[tri]}).groupby("k")["y"].agg(["mean", "count"])
+    sm = (m["mean"] * m["count"] + g * k) / (m["count"] + k)
+    out[mask] = pd.Series(col[mask]).map(sm).fillna(g).values
+    return out
+
+
+def _reg_features(df, base, y, tri):
+    """Auto feature space (no manual FE): low-card -> one-hot + count/relational primitives; high-card numerics
+    -> raw (the diff/mul/ratio ops form gaps & interactions); high-card categoricals -> AUTO target-encode
+    (verifier keeps useful ones); near-unique id columns skipped."""
+    num = [c for c in base if pd.api.types.is_numeric_dtype(df[c]) and df[c].nunique() > 12]
+    low = [c for c in base if df[c].nunique() <= 12]
+    hc = [c for c in base if c not in num and c not in low and df[c].nunique() < 0.5 * len(df)]
+    blocks, names = [], []
+    if low:
+        prims = candidate_primitives(df, low)
+        Xl, nl = _featmat(df, low, prims); blocks.append(Xl); names += nl
+    if num:
+        blocks.append(df[num].fillna(df[num].mean()).values.astype(float)); names += list(num)
+    for c in hc:                                                      # auto target-encode high-card categoricals
+        blocks.append(_oof_te(df[c].astype(str).values, y, tri).reshape(-1, 1)); names.append(f"te({c})")
+    X = np.concatenate(blocks, axis=1).astype(float) if blocks else np.zeros((len(df), 0))
+    return X, names
+
+
 def solve_regression(df, target, id_col=None, test_frac=0.3, ensemble=15, seed=0, verbose=True):
     df = df.reset_index(drop=True)
     base = [c for c in df.columns if c not in (target, id_col)]
-    prims = candidate_primitives(df, base)                            # primitive library as extra features
-    X, names = _featmat(df, base, prims); X = X.astype(float)
     y = df[target].astype(float).values
     rng = np.random.default_rng(seed); idx = rng.permutation(len(df)); cut = int((1 - test_frac) * len(df))
     tri, tei = idx[:cut], idx[cut:]; yte = y[tei]
+    X, names = _reg_features(df, base, y, tri)                        # auto features incl. target-encoding
     if verbose:
-        print(f"  {len(df)} rows, {len(names)} features ({len(prims)} derived primitives); "
+        nte = sum(1 for n in names if n.startswith("te("))
+        print(f"  {len(df)} rows, {len(names)} features ({nte} auto target-encoded); "
               f"target mean {y.mean():.1f} std {y.std():.1f}")
         print("  [reason] bagged verified feature-expression program (held-out-RMSE gated)...")
     pr, psd, ex = _bag(X[tri], y[tri], X[tei], ensemble, seed)
