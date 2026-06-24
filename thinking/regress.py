@@ -185,6 +185,14 @@ def solve_regression(df, target, id_col=None, test_frac=0.3, ensemble=15, seed=0
     gbm = HistGradientBoostingRegressor(max_iter=300, learning_rate=0.05, early_stopping=True,
                                         random_state=seed).fit(X[tri], y[tri]).predict(X[tei])
     cand = {"reasoning": pr, "reasoning_trees": prt, "ridge": ridge, "gbm": gbm}
+    try:                                                             # 3rd reasoning mode: program synthesis
+        from thinking import progsynth
+        if verbose:
+            print("  [reason-progsynth] neural-guided verified program synthesis...")
+        cand["reasoning_progsynth"], _ = progsynth.fit_predict(df, target, tri, tei, seed=seed)
+    except Exception as e:  # noqa
+        if verbose:
+            print(f"  (progsynth skipped: {e})")
     rmse = {k: _rmse(v, yte) for k, v in cand.items()}
     winner = min(rmse, key=rmse.get)
     conf = psd <= np.quantile(psd, 0.8)                              # confident = bottom-80% ensemble disagreement

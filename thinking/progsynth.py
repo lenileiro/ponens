@@ -23,6 +23,7 @@ def ev(e, B):
     if e[0] == "mul": return ev(e[1], B) * ev(e[2], B)
     if e[0] == "diff": return ev(e[1], B) - ev(e[2], B)
     if e[0] == "ratio": return ev(e[1], B) / (np.abs(ev(e[2], B)) + 1.0)
+    if e[0] == "gt":  return (ev(e[1], B) > ev(e[2], B)).astype(float)   # comparison op
     if e[0] == "thr": return (ev(e[1], B) > e[2]).astype(float)
     raise ValueError(e)
 
@@ -30,6 +31,7 @@ def ev(e, B):
 def re(e):
     if e[0] == "b": return e[1]
     if e[0] == "thr": return f"({re(e[1])}>{e[2]:.2f})"
+    if e[0] == "gt": return f"({re(e[1])}>{re(e[2])})"
     return f"({re(e[1])}{ {'mul':'*','diff':'-','ratio':'/'}[e[0]] }{re(e[2])})"
 
 
@@ -40,7 +42,7 @@ def candidates(base_names, chosen, rng, n=90):
     cands = [("b", nm) for nm in base_names]
     for _ in range(n):
         a = pool[rng.integers(len(pool))]; b = pool[rng.integers(len(pool))]
-        cands.append((rng.choice(["mul", "diff", "ratio"]), a, b))
+        cands.append((rng.choice(["mul", "diff", "ratio", "gt"]), a, b))
     for _ in range(n // 2):
         a = pool[rng.integers(len(pool))]; cands.append(("thr", a, float(rng.normal())))
     seen, out = set(), []
@@ -224,9 +226,23 @@ def _oof_te(col, y, tri, k=30):
     return out
 
 
+def _kmeans(X, k, iters=12, seed=0):
+    """In-house k-means (no sklearn) over standardized columns -> cluster labels (discovers regimes)."""
+    rng = np.random.default_rng(seed); c = X[rng.choice(len(X), k, replace=False)].copy()
+    lab = np.zeros(len(X), int)
+    for _ in range(iters):
+        lab = ((X[:, None, :] - c[None, :, :]) ** 2).sum(2).argmin(1)
+        for j in range(k):
+            m = lab == j
+            if m.any():
+                c[j] = X[m].mean(0)
+    return lab
+
+
 def build_base(df, target, tri):
-    """Base columns = raw numerics + aggregate-by(categorical) [OOF target mean]. The synthesizer composes
-    these via the DSL; the 'aggregate' operator is the only data-summarizing primitive, applied generically."""
+    """Base columns = raw numerics + aggregate-by(categorical) [OOF target mean] + aggregate-by-CLUSTER (an
+    in-house k-means over numerics discovers regimes, then target-encodes them). The 'aggregate' and 'cluster'
+    operators are general data-summarizers; the synthesizer composes everything via the DSL."""
     import pandas as pd
     y = df[target].astype(float).values
     cols = [c for c in df.columns if c != target]
@@ -237,7 +253,18 @@ def build_base(df, target, tri):
         names.append(c); blocks.append(df[c].fillna(df[c].mean()).values.astype(float))
     for c in cat:
         names.append(f"agg({c})"); blocks.append(_oof_te(df[c].values, y, tri))
+    if len(num) >= 2:                                                # clustering-as-operator -> regime encoding
+        Xn = np.stack([df[c].fillna(df[c].mean()).values.astype(float) for c in num], 1)
+        Xn, _, _ = _std(Xn); lab = _kmeans(Xn, k=min(20, max(2, len(df) // 200)))
+        names.append("agg(cluster)"); blocks.append(_oof_te(lab.astype(str), y, tri))
     return np.stack(blocks, 1).astype(float), names, y
+
+
+def fit_predict(df, target, tri, tei, policy=None, beam=3, maxterms=12, seed=0):
+    """Synthesize a program on tri, predict tei -- for use as a reasoning mode inside run-both."""
+    X, names, y = build_base(df, target, tri)
+    prog, ctx = beam_synthesize(X[tri], y[tri], names, policy=policy, beam=beam, maxterms=maxterms, seed=seed)
+    return predict(prog, X[tei], ctx), render(prog)
 
 
 def selfplay_expr(steps=400, seed=0, verbose=True):
