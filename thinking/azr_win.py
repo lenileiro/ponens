@@ -494,6 +494,20 @@ def predict_selective(pos, neg, X):
     return out
 
 
+def predict_calibrated(class_rules, X, tau=0.0):
+    """Soft verification: instead of commit-iff-pure / abstain, each class's firing clause votes with its
+    held-out PRECISION as a calibrated probability. Predict argmax calibrated confidence; abstain only when the
+    best confidence < tau. Raises coverage on overlapping/weak-signal data with honest per-row uncertainty.
+    class_rules: {class_label: [clause-dicts with 'prec']}. Returns (pred, confidence, answered_mask)."""
+    classes = list(class_rules); conf = np.zeros((len(X), len(classes)))
+    for ci, c in enumerate(classes):
+        for clause in class_rules[c]:
+            m = apply_rule([clause], X).astype(bool)
+            conf[m, ci] = np.maximum(conf[m, ci], float(clause.get("prec", 1.0) if isinstance(clause, dict) else 1.0))
+    best = conf.max(1); pred = np.array(classes, dtype=object)[conf.argmax(1)]
+    return pred, best, best >= tau
+
+
 def _filter_clauses(rules, X, is_class, min_precision, min_support):
     """Verify-harder: keep only disjuncts that stay pure on an INDEPENDENT validation set (with enough
     support). Each kept clause carries its verified {prec, support} -- that precision IS the confidence we
