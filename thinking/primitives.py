@@ -19,20 +19,47 @@ from thinking.azr_win import predict_selective, reason_selective_cv
 
 
 def candidate_primitives(df, cols):
-    """Generate derived-feature candidates (name, int/float Series) from the feature library."""
+    """Generate derived-feature candidates (name, float array) from the feature library:
+    count(==v) across columns, parity of a count, column-equality, row n-distinct, numeric pair sum/diff."""
     cands = []
     discrete = [c for c in cols if df[c].nunique() <= 12]
     numeric = [c for c in cols if pd.api.types.is_numeric_dtype(df[c]) and df[c].nunique() > 12]
     if len(discrete) >= 2:
-        vals = sorted(set().union(*[set(pd.unique(df[c])) for c in discrete]))
-        for v in vals:                                              # count(== v) across all discrete columns
-            cands.append((f"count(=={v})", (df[discrete] == v).sum(axis=1).astype(float)))
+        Dv, vals = _coded_discrete(df, discrete)
+        for i, v in enumerate(vals):
+            cnt = (Dv == i).sum(axis=1).astype(float)               # count(== v) across all discrete columns
+            cands.append((f"count(=={v})", cnt))
+            if cnt.max() > 1:
+                cands.append((f"count(=={v})%2", (cnt % 2)))          # parity of a count (parity concepts)
         for a, b in combinations(discrete, 2):                       # relational: col_i == col_j
             cands.append((f"({a}=={b})", (df[a].values == df[b].values).astype(float)))
+        cands.append(("row_ndistinct", np.array([len(set(r)) for r in Dv], dtype=float)))
     for a, b in combinations(numeric, 2):                            # numeric pair sums/diffs
-        cands.append((f"({a}-{b})", (df[a] - df[b]).astype(float)))
-        cands.append((f"({a}+{b})", (df[a] + df[b]).astype(float)))
+        cands.append((f"({a}-{b})", (df[a] - df[b]).astype(float).values))
+        cands.append((f"({a}+{b})", (df[a] + df[b]).astype(float).values))
     return cands
+
+
+def _coded_discrete(df, discrete):
+    """Map all discrete columns onto a SHARED value->code space so cross-column counts are meaningful."""
+    vals = sorted(set().union(*[set(pd.unique(df[c])) for c in discrete]), key=lambda x: str(x))
+    m = {v: i for i, v in enumerate(vals)}
+    return pd.DataFrame({c: df[c].map(m) for c in discrete}).values, vals
+
+
+def _cheap_score(col, y, min_count=5, bins=12):
+    """Cheap proxy (no rule search): strongest single-value class shift this feature induces. Used to
+    pre-rank candidates so only the most promising get the expensive verified-rule evaluation."""
+    f = np.asarray(col, dtype=float)
+    if len(np.unique(f)) > bins:
+        edges = np.quantile(f, np.linspace(0, 1, bins + 1))
+        f = np.digitize(f, edges[1:-1])
+    base = float(y.mean()); best = 0.0
+    for v in np.unique(f):
+        m = f == v
+        if int(m.sum()) >= min_count:
+            best = max(best, abs(float(y[m].mean()) - base))
+    return best
 
 
 def _featmat(df, base_cols, derived):
@@ -55,25 +82,29 @@ def _score(X, y, seed=0):
     return float(((dec >= 0) & (dec == y[va])).mean()), (pos, neg)
 
 
-def propose(df, target, base_cols, rounds=3, verbose=True):
-    """Greedily add the primitive that most improves held-out confident-correctness; stop when none helps."""
+def propose(df, target, base_cols, rounds=3, topk=8, verbose=True):
+    """Greedily add the primitive that most improves held-out confident-correctness; stop when none helps.
+    Each round CHEAP-pre-ranks the whole library and only full-evaluates (verified rule search) the top-K --
+    so the library can grow without the eval cost exploding."""
     y = df[target].values.astype(int)
     cands = candidate_primitives(df, base_cols)
+    if verbose:
+        print(f"  library: {len(cands)} candidate primitives")
     chosen = []
     Xcur, _ = _featmat(df, base_cols, chosen)
     best, _ = _score(Xcur, y)
     if verbose:
         print(f"  baseline (raw features only): confident-correct {best:.3f}")
     for r in range(rounds):
+        pool = [(nm, ser) for nm, ser in cands if nm not in [c[0] for c in chosen]]
+        if not pool:
+            break
+        ranked = sorted(pool, key=lambda p: -_cheap_score(p[1], y))[:topk]   # cheap pre-rank -> top-K
         scored = []
-        for nm, ser in cands:
-            if nm in [c[0] for c in chosen]:
-                continue
+        for nm, ser in ranked:
             X2, _ = _featmat(df, base_cols, chosen + [(nm, ser)])
             s, _ = _score(X2, y)
             scored.append((s, nm, ser))
-        if not scored:
-            break
         scored.sort(key=lambda t: -t[0])
         bs, bnm, bser = scored[0]
         if bs <= best + 1e-9:
@@ -82,7 +113,8 @@ def propose(df, target, base_cols, rounds=3, verbose=True):
             break
         chosen.append((bnm, bser)); best = bs
         if verbose:
-            print(f"  round {r + 1}: PROPOSE {bnm:<16} -> confident-correct {bs:.3f}  (verified gain) KEEP")
+            print(f"  round {r + 1}: PROPOSE {bnm:<16} (full-eval top {len(ranked)} of {len(pool)}) "
+                  f"-> confident-correct {bs:.3f}  KEEP")
         if best >= 0.999:
             break
     return chosen, best
