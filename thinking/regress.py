@@ -96,6 +96,34 @@ def _rmse(a, b):
     return math.sqrt(((np.asarray(a) - np.asarray(b)) ** 2).mean())
 
 
+def _tree_boost(Xa, ya, Xt, M=3, depth=2, lr=0.08, n_trees=300, patience=20, seed=0):
+    """Verified shallow-tree boosting: each term is a depth-`depth` regression tree fit on the residual, kept
+    only while it improves a HELD-OUT split (early stop = the verifier). Bagged. Captures nonlinear
+    interactions like a GBM, but each tree is a small renderable if-then rule and is held-out-verified."""
+    from sklearn.tree import DecisionTreeRegressor
+    rng = np.random.default_rng(seed); preds = []; rules = None
+    for m in range(M):
+        bs = rng.integers(0, len(ya), len(ya)); fi = rng.permutation(len(bs)); k = int(0.8 * len(bs))
+        Xf, yf, Xv, yv = Xa[bs][fi[:k]], ya[bs][fi[:k]], Xa[bs][fi[k:]], ya[bs][fi[k:]]
+        base = float(yf.mean()); pf = np.full(len(yf), base); pv = np.full(len(yv), base); pt = np.full(len(Xt), base)
+        best, best_pt, bad, kept = _rmse(pv, yv), pt.copy(), 0, []
+        for _ in range(n_trees):
+            t = DecisionTreeRegressor(max_depth=depth, min_samples_leaf=max(20, len(yf) // 200),
+                                      random_state=m).fit(Xf, yf - pf)
+            pf = pf + lr * t.predict(Xf); pv = pv + lr * t.predict(Xv); pt = pt + lr * t.predict(Xt)
+            kept.append(t); r = _rmse(pv, yv)
+            if r < best - 1e-6:
+                best, best_pt, bad = r, pt.copy(), 0
+            else:
+                bad += 1
+                if bad >= patience:
+                    break
+        preds.append(best_pt)
+        if m == 0:
+            rules = (base, kept[:3])                                  # a few trees for explanation
+    return np.mean(preds, 0), rules
+
+
 def _oof_te(col, y, tri, k=30):
     """Out-of-fold target-encode (no train leakage): tri rows get 5-fold OOF means, the rest get tri means."""
     col = np.asarray(col); out = np.full(len(col), y[tri].mean(), float); g = float(y[tri].mean())
@@ -143,23 +171,26 @@ def solve_regression(df, target, id_col=None, test_frac=0.3, ensemble=15, seed=0
         print(f"  {len(df)} rows, {len(names)} features ({nte} auto target-encoded); "
               f"target mean {y.mean():.1f} std {y.std():.1f}")
         print("  [reason] bagged verified feature-expression program (held-out-RMSE gated)...")
-    pr, psd, ex = _bag(X[tri], y[tri], X[tei], ensemble, seed)
+    pr, psd, ex = _bag(X[tri], y[tri], X[tei], ensemble, seed)        # reasoning: linear feature-expressions
+    if verbose:
+        print("  [reason-trees] verified shallow-tree boosting (interactions, held-out gated)...")
+    prt, _ = _tree_boost(X[tri], y[tri], X[tei], seed=seed)           # reasoning: verified tree terms
     from sklearn.ensemble import HistGradientBoostingRegressor
     from sklearn.linear_model import Ridge
     Xs_tr, Xs_te = _std(X[tri], X[tei])
     ridge = Ridge(alpha=1.0).fit(Xs_tr, y[tri]).predict(Xs_te)
     gbm = HistGradientBoostingRegressor(max_iter=300, learning_rate=0.05, early_stopping=True,
                                         random_state=seed).fit(X[tri], y[tri]).predict(X[tei])
-    rmse = {"reasoning": _rmse(pr, yte), "ridge": _rmse(ridge, yte), "gbm": _rmse(gbm, yte)}
+    cand = {"reasoning": pr, "reasoning_trees": prt, "ridge": ridge, "gbm": gbm}
+    rmse = {k: _rmse(v, yte) for k, v in cand.items()}
     winner = min(rmse, key=rmse.get)
-    pred = {"reasoning": pr, "ridge": ridge, "gbm": gbm}[winner]
     conf = psd <= np.quantile(psd, 0.8)                              # confident = bottom-80% ensemble disagreement
     return {"task": "regression", "n_features": len(names),
             "rmse": {k: round(v, 2) for k, v in rmse.items()}, "winner": winner,
             "program": _render(ex, names),
             "predict_mean_baseline": round(_rmse(np.full(len(yte), y[tri].mean()), yte), 2),
             "reasoning_rmse_confident80": round(_rmse(pr[conf], yte[conf]), 2),
-            "predictions": pred.tolist(), "uncertainty": psd.tolist()}
+            "predictions": cand[winner].tolist(), "uncertainty": psd.tolist()}
 
 
 def main():
