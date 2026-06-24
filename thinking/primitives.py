@@ -17,8 +17,9 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from thinking.azr_win import (_conj, apply_rule, explain_selective, predict_calibrated,  # noqa
-                              predict_selective, reason_selective_cv, reason_tree_rule)
+from thinking.azr_win import (_conj, apply_rule, boost_clf_proba, boost_multi_predict, explain_selective,  # noqa
+                              predict_calibrated, predict_selective, reason_boost_clf, reason_boost_multi,
+                              reason_selective_cv, reason_tree_rule, render_boost)
 
 
 def candidate_primitives(df, cols):
@@ -251,7 +252,7 @@ def _class_confidence(pos, X):
     return fired, conf
 
 
-def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99, compose=True, tau=None, seed=0, verbose=True):
+def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99, compose=True, tau=None, clf=None, seed=0, verbose=True):
     """Capstone: one call on any tabular CLASSIFICATION dataset (binary or multiclass). Trains the
     primitive-ranker via self-play (if not given), proposes+verifies derived primitives, reasons verified
     rules (two-sided for binary; one-vs-rest for multiclass), and returns the rule(s), held-out
@@ -280,6 +281,12 @@ def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99
             names_chosen += [x[0] for x in ch if x[0] not in names_chosen]
         Xfull, names = _build_features(df, base_cols, names_chosen)
         Xtr, Xte = Xfull[tri], Xfull[tei]
+        if clf == "boost":                                          # full-coverage boosted-rule (no abstention)
+            models = reason_boost_multi(Xtr, df[target].values[tri], classes=classes, seed=seed)
+            pred, _, _ = boost_multi_predict(models, Xte); yte = df[target].values[tei]
+            return {"task": f"{len(classes)}-class classification", "classes": classes, "clf": "boost",
+                    "coverage": 1.0, "accuracy_on_answered": float((pred == yte).mean()),
+                    "n_rules_per_class": {c: len(models[c][2]) for c in classes}}
         if tau is not None:                                          # calibrated mode: relaxed rules + tau gate
             ml = max(4, len(tri) // 100)
             cr = {c: reason_tree_rule(Xtr, (df[target].values[tri] == c).astype(int), depth=4, min_leaf=ml,
@@ -323,6 +330,11 @@ def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99
     Xtr, Xte = Xfull[tri], Xfull[tei]
     yfull = (df[target].values == classes[1]).astype(int)
     ytr, yte = yfull[tri], yfull[tei]
+    if clf == "boost":                                              # full-coverage boosted-rule (no abstention)
+        m = reason_boost_clf(Xtr, ytr, seed=seed); pred = (boost_clf_proba(m, Xte) > 0.5).astype(int)
+        return {"task": "binary classification", "classes": classes, "clf": "boost", "coverage": 1.0,
+                "accuracy_on_answered": float((pred == yte).mean()), "n_rules": len(m[2]),
+                "rules": render_boost(m, names)}
     if verbose:
         print("  [reason] verified two-sided rule (exhaustive + compress)...")
     pos, neg = reason_selective_cv(Xtr, ytr, proposer=None, seed=seed, folds=5, exhaustive=True, compress=True,

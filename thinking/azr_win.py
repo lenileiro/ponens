@@ -879,6 +879,57 @@ def reason_tree_rule(X, y, depth=4, min_leaf=20, min_purity=0.9, min_support=10,
     return rules
 
 
+def reason_boost_clf(X, y, holdout=0.3, lr=0.1, n_terms=700, depth=3, min_leaf=20, sub=0.7, mf=0.7,
+                     patience=30, seed=0):
+    """Verified LOGISTIC rule-boosting (binary): iterate on the logistic residual (y - sigmoid(F)), each term a
+    shallow CART tree fit on a random row+feature subsample, KEPT only while it improves HELD-OUT log-loss
+    (early stop = the verifier). Full coverage + calibrated probability + interpretable (render_boost) -- the
+    accuracy-focused complement to reason_tree_rule's abstaining DNF. Returns (base_logit, lr, trees). In-house."""
+    rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); c = int((1 - holdout) * len(y))
+    fit, ver = idx[:c], idx[c:]
+    Xf, yf, Xv, yv = X[fit], y[fit].astype(float), X[ver], y[ver].astype(float)
+    D = X.shape[1]; nfeat = max(1, int(mf * D)); rm = np.random.default_rng(seed * 17 + 1)
+    p0 = float(np.clip(yf.mean(), 1e-6, 1 - 1e-6)); base = math.log(p0 / (1 - p0))
+    Ff = np.full(len(fit), base); Fv = np.full(len(ver), base)
+    def _ll(F, t):
+        p = np.clip(1.0 / (1.0 + np.exp(-F)), 1e-9, 1 - 1e-9)
+        return -(t * np.log(p) + (1 - t) * np.log(1 - p)).mean()
+    best = _ll(Fv, yv); trees = []; keep = 0; bad = 0
+    for _ in range(n_terms):
+        s = rm.random(len(fit)) < sub                                # stochastic row subsample
+        feats = rm.choice(D, nfeat, replace=False)                   # stochastic feature subsample
+        resid = yf - 1.0 / (1.0 + np.exp(-Ff))                       # negative gradient of log-loss
+        t = _fit_tree(Xf[s], resid[s], depth, min_leaf, feats)
+        Ff = Ff + lr * _tree_pred(t, Xf); Fv = Fv + lr * _tree_pred(t, Xv); trees.append(t)
+        r = _ll(Fv, yv)
+        if r < best - 1e-6:
+            best = r; keep = len(trees); bad = 0
+        else:
+            bad += 1
+            if bad >= patience:
+                break
+    return (base, lr, trees[:keep])
+
+
+def boost_clf_proba(model, X):
+    base, lr, trees = model
+    F = base + lr * sum((_tree_pred(t, X) for t in trees), np.zeros(len(X)))
+    return 1.0 / (1.0 + np.exp(-F))
+
+
+def reason_boost_multi(X, y, classes=None, **kw):
+    """One-vs-rest logistic rule-boosting for multiclass. Returns {class: binary boosted model}."""
+    classes = list(classes) if classes is not None else sorted(set(np.asarray(y).tolist()))
+    return {c: reason_boost_clf(X, (np.asarray(y) == c).astype(int), **kw) for c in classes}
+
+
+def boost_multi_predict(models, X):
+    """Argmax-of-one-vs-rest-probability prediction + confidence. Full coverage, calibrated."""
+    classes = list(models); P = np.stack([boost_clf_proba(models[c], X) for c in classes], 1)
+    P = P / np.clip(P.sum(1, keepdims=True), 1e-9, None)             # normalise OVR scores -> confidence
+    return np.array(classes, dtype=object)[P.argmax(1)], P.max(1), P
+
+
 def _gen_rule_task(rng, F, n):
     X = np.stack([rng.normal(0, 1, n) if rng.random() < 0.6 else rng.integers(0, 3, n) for _ in range(F)], 1).astype(np.float32)
     nd = int(rng.integers(1, 4)); y = np.zeros(n, bool)
