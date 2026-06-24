@@ -17,8 +17,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from thinking.azr_win import (_conj, apply_rule, explain_selective, predict_selective,  # noqa
-                              reason_selective_cv, reason_tree_rule)
+from thinking.azr_win import (_conj, apply_rule, explain_selective, predict_calibrated,  # noqa
+                              predict_selective, reason_selective_cv, reason_tree_rule)
 
 
 def candidate_primitives(df, cols):
@@ -251,7 +251,7 @@ def _class_confidence(pos, X):
     return fired, conf
 
 
-def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99, compose=True, seed=0, verbose=True):
+def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99, compose=True, tau=None, seed=0, verbose=True):
     """Capstone: one call on any tabular CLASSIFICATION dataset (binary or multiclass). Trains the
     primitive-ranker via self-play (if not given), proposes+verifies derived primitives, reasons verified
     rules (two-sided for binary; one-vs-rest for multiclass), and returns the rule(s), held-out
@@ -280,6 +280,16 @@ def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99
             names_chosen += [x[0] for x in ch if x[0] not in names_chosen]
         Xfull, names = _build_features(df, base_cols, names_chosen)
         Xtr, Xte = Xfull[tri], Xfull[tei]
+        if tau is not None:                                          # calibrated mode: relaxed rules + tau gate
+            ml = max(4, len(tri) // 100)
+            cr = {c: reason_tree_rule(Xtr, (df[target].values[tri] == c).astype(int), depth=4, min_leaf=ml,
+                                      min_purity=0.55, min_support=4, seed=seed) for c in classes}
+            pred, _, ans = predict_calibrated(cr, Xte, tau)
+            yte = df[target].values[tei]
+            acc = float((pred[ans] == yte[ans]).mean()) if ans.any() else 0.0
+            return {"task": f"{len(classes)}-class classification", "classes": classes, "tau": tau,
+                    "coverage": float(ans.mean()), "accuracy_on_answered": acc,
+                    "n_clauses_per_class": {c: len(cr[c]) for c in classes}}
         rules = {}; conf = np.zeros((len(tei), len(classes)))
         vsel = np.random.default_rng(seed + 5).permutation(len(tri))[int(0.7 * len(tri)):]   # held-out selector
         for ci, c in enumerate(classes):
@@ -328,6 +338,15 @@ def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99
     rule_mode = "dnf"
     if _cc(pos_t, neg_t) > _cc(pos, neg):
         pos, neg, rule_mode = pos_t, neg_t, "tree-paths"
+    if tau is not None:                                              # calibrated mode: relaxed rules + tau gate
+        ml = max(4, len(tri) // 100)
+        pos_c = reason_tree_rule(Xtr, ytr, depth=4, min_leaf=ml, min_purity=0.55, min_support=4, seed=seed)
+        neg_c = reason_tree_rule(Xtr, 1 - ytr, depth=4, min_leaf=ml, min_purity=0.55, min_support=4, seed=seed)
+        predc, _, ansc = predict_calibrated({classes[0]: neg_c, classes[1]: pos_c}, Xte, tau)
+        ytec = df[target].values[tei]
+        return {"task": "binary classification", "classes": classes, "tau": tau,
+                "coverage": float(ansc.mean()),
+                "accuracy_on_answered": float((predc[ansc] == ytec[ansc]).mean()) if ansc.any() else 0.0}
     if verbose:
         print(f"  rule source: {rule_mode}")
     dec = predict_selective(pos, neg, Xte); a = dec >= 0
