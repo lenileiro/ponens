@@ -47,7 +47,8 @@ def main():
     rng = np.random.default_rng(1); idx = rng.permutation(len(y)); cut = int(0.6 * len(y))
     tr, te = idx[:cut], idx[cut:]
     pos, neg = reason_selective_cv(X[tr], y[tr], proposer=None, seed=0, folds=4, exhaustive=True, compress=True,
-                                   min_prec_pos=1.0, min_prec_neg=1.0, build=dict(max_lit=2), verbose=False)
+                                   min_prec_pos=1.0, min_prec_neg=1.0,
+                                   build=dict(max_lit=2, binary_presence_only=True), verbose=False)
     rend = " OR ".join("(" + " AND ".join(f"{names[j]}{o}{t:g}" for j, o, t in _conj(c)) + ")" for c in pos)
     acc = (apply_rule(pos, X[te]) == y[te]).mean()
     print(f"  final rule POSITIVE when: {rend}")

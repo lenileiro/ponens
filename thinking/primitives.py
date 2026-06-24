@@ -17,7 +17,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from thinking.azr_win import predict_selective, reason_selective_cv
+from thinking.azr_win import (_conj, apply_rule, explain_selective, predict_selective,  # noqa
+                              reason_selective_cv)
 
 
 def candidate_primitives(df, cols):
@@ -139,10 +140,19 @@ def rank_score(ranker, col, y):
 
 
 def _featmat(df, base_cols, derived):
-    X = df[base_cols].apply(lambda c: pd.factorize(c)[0] if c.dtype == object else c).values.astype(float)
-    names = list(base_cols)
+    """One-hot categorical/low-card base cols (-> per-value presence literals, the right form for rule
+    learning at any cardinality), keep high-card numerics as-is, append derived primitive columns."""
+    cat = [c for c in base_cols if (not pd.api.types.is_numeric_dtype(df[c])) or df[c].nunique() <= 12]
+    num = [c for c in base_cols if c not in cat]
+    blocks, names = [], []
+    if cat:
+        oh = pd.get_dummies(df[cat].astype(str))
+        blocks.append(oh.values.astype(float)); names += [str(c).replace("_", "=") for c in oh.columns]
+    if num:
+        blocks.append(df[num].values.astype(float)); names += list(num)
     for nm, ser in derived:
-        X = np.concatenate([X, np.asarray(ser).reshape(-1, 1)], axis=1); names.append(nm)
+        blocks.append(np.asarray(ser, dtype=float).reshape(-1, 1)); names.append(nm)
+    X = np.concatenate(blocks, axis=1) if blocks else np.zeros((len(df), 0), dtype=float)
     return X, names
 
 
@@ -153,7 +163,8 @@ def _score(X, y, seed=0):
     tr, va = idx[:cut], idx[cut:]
     pos, neg = reason_selective_cv(X[tr], y[tr], proposer=None, device="cpu", seed=seed, folds=4,
                                    min_prec_pos=0.97, min_prec_neg=0.97, min_support=4, exhaustive=True,
-                                   compress=True, build=dict(max_lit=2, max_lits=40), verbose=False)
+                                   compress=True, build=dict(max_lit=2, max_lits=40, binary_presence_only=True),
+                                   verbose=False)
     dec = predict_selective(pos, neg, X[va])
     return float(((dec >= 0) & (dec == y[va])).mean()), (pos, neg)
 
@@ -163,7 +174,7 @@ def propose(df, target, base_cols, rounds=3, topk=8, ranker=None, verbose=True):
     Each round pre-ranks the whole library and only full-evaluates (verified rule search) the top-K -- so the
     library can grow without the eval cost exploding. Pre-rank uses the LEARNED ranker if given, else the
     cheap heuristic."""
-    y = df[target].values.astype(int)
+    y = (df[target].values == sorted(pd.unique(df[target]), key=str)[-1]).astype(int)   # binarize any 2-class target
     cands = candidate_primitives(df, base_cols)
     prank = (lambda c: rank_score(ranker, c, y)) if ranker is not None else (lambda c: _cheap_score(c, y))
     if verbose:
@@ -198,36 +209,69 @@ def propose(df, target, base_cols, rounds=3, topk=8, ranker=None, verbose=True):
     return chosen, best
 
 
+def _render(rules, names):
+    if not rules:
+        return "(none)"
+    return " OR ".join("(" + " AND ".join(f"{names[j]}{o}{t:g}" for j, o, t in _conj(c)) + ")" for c in rules)
+
+
+def _build_features(df, base_cols, chosen_names):
+    """Rebuild raw + chosen-derived feature matrix on ANY df with the same columns (for fit and predict)."""
+    by = {nm: ser for nm, ser in candidate_primitives(df, base_cols)}
+    derived = [(nm, by[nm]) for nm in chosen_names if nm in by]
+    return _featmat(df, base_cols, derived)
+
+
+def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, seed=0, verbose=True):
+    """Capstone: one call on any BINARY tabular dataset. Trains the primitive-ranker via self-play (if not
+    given), proposes+verifies derived primitives, reasons a verified two-sided rule (exhaustive+compress),
+    and returns the rule, held-out coverage/accuracy, and per-row explanations -- zero training on the data,
+    abstaining where it can't prove an answer."""
+    base_cols = [c for c in df.columns if c not in (target, id_col)]
+    classes = sorted(pd.unique(df[target].dropna()).tolist(), key=lambda x: str(x))
+    if len(classes) != 2:
+        raise ValueError(f"solve_any handles binary targets; got {len(classes)} classes: {classes}")
+    df = df.reset_index(drop=True)
+    rng = np.random.default_rng(seed); idx = rng.permutation(len(df)); cut = int((1 - test_frac) * len(df))
+    tri, tei = idx[:cut], idx[cut:]
+    if ranker is None:
+        if verbose:
+            print("  [learn-to-rank] training primitive-ranker via self-play (zero data)...")
+        ranker = selfplay_rank(steps=150, seed=seed, verbose=False)
+    if verbose:
+        print("  [propose] verified primitive discovery...")
+    chosen, _ = propose(df.iloc[tri].reset_index(drop=True), target, base_cols, ranker=ranker, verbose=verbose)
+    names_chosen = [c[0] for c in chosen]
+    Xfull, names = _build_features(df, base_cols, names_chosen)        # build on FULL df -> consistent columns
+    Xtr, Xte = Xfull[tri], Xfull[tei]
+    yfull = (df[target].values == classes[1]).astype(int)
+    ytr, yte = yfull[tri], yfull[tei]
+    if verbose:
+        print("  [reason] verified two-sided rule (exhaustive + compress)...")
+    pos, neg = reason_selective_cv(Xtr, ytr, proposer=None, seed=seed, folds=5, exhaustive=True, compress=True,
+                                   min_prec_pos=0.99, min_prec_neg=0.99,
+                                   build=dict(max_lit=3, max_lits=60, binary_presence_only=True), verbose=False)
+    dec = predict_selective(pos, neg, Xte); a = dec >= 0
+    return {"task": "binary classification", "classes": classes, "discovered_primitives": names_chosen,
+            "rule_positive": _render(pos, names), "rule_negative": _render(neg, names),
+            "coverage": float(a.mean()),
+            "accuracy_on_answered": float((dec[a] == yte[a]).mean()) if a.any() else 0.0,
+            "n_clauses": (len(pos), len(neg)),
+            "explanations": explain_selective(pos, neg, Xte, names, str(classes[1]), str(classes[0]))}
+
+
 def main():
     df = pd.read_csv("kaggle_data/monk/monk.csv")
-    attrs = ["'attr1'", "'attr2'", "'attr3'", "'attr4'", "'attr5'", "'attr6'"]
-    y = df["'class'"].values.astype(int)
-    print("Monk-2 ('exactly two of 6 attrs == 1') -- LEARNED ranker proposes the primitive (zero Monk data).")
-
-    print("\n[learn-to-rank] training PrimitiveRanker via self-play on synthetic concept tasks...")
-    ranker = selfplay_rank(steps=150, seed=0)
-
-    cands = candidate_primitives(df, attrs)                               # what does the learned ranker prefer?
-    top = sorted(cands, key=lambda c: -rank_score(ranker, c[1], y))[:5]
-    print("  learned-ranker top-5 candidates on Monk-2:")
-    for nm, ser in top:
-        print(f"    {nm:<16} learned-score {rank_score(ranker, ser, y):.3f}")
-
-    print("\n[propose] verified feature discovery using the LEARNED ranker:")
-    chosen, score = propose(df, "'class'", attrs, rounds=3, ranker=ranker)
-    print(f"\n  discovered primitives: {[c[0] for c in chosen]}")
-    # final: full verified rule using raw + discovered primitives, report held-out accuracy
-    y = df["'class'"].values.astype(int)
-    X, names = _featmat(df, attrs, chosen)
-    rng = np.random.default_rng(1); idx = rng.permutation(len(y)); cut = int(0.6 * len(y))
-    tr, te = idx[:cut], idx[cut:]
-    from thinking.azr_win import apply_rule, _conj
-    pos, neg = reason_selective_cv(X[tr], y[tr], proposer=None, seed=0, folds=4, exhaustive=True, compress=True,
-                                   min_prec_pos=1.0, min_prec_neg=1.0, build=dict(max_lit=2), verbose=False)
-    rend = " OR ".join("(" + " AND ".join(f"{names[j]}{o}{t:g}" for j, o, t in _conj(c)) + ")" for c in pos)
-    acc = (apply_rule(pos, X[te]) == y[te]).mean()
-    print(f"  final rule POSITIVE when: {rend}")
-    print(f"  held-out accuracy with discovered primitive: {acc:.3f}")
+    print("CAPSTONE -- solve_any(df, target): one call, any binary tabular dataset (here Monk-2).\n")
+    res = solve_any(df, "'class'", verbose=True)
+    print(f"\n  discovered primitives : {res['discovered_primitives']}")
+    print(f"  POSITIVE when         : {res['rule_positive']}")
+    print(f"  coverage              : {res['coverage']:.3f}")
+    print(f"  accuracy-on-answered  : {res['accuracy_on_answered']:.3f}")
+    print(f"  clauses (pos,neg)     : {res['n_clauses']}")
+    print("  sample explanations:")
+    for e in res["explanations"][:3]:
+        print(f"    {e['decision']:<10} ({e['reason_type']}) -- {e['why'][:80]}")
 
 
 if __name__ == "__main__":
