@@ -749,10 +749,11 @@ def render_rule(rules, names):
 # term is a SHALLOW, held-out-VERIFIED if-then rule. Stays interpretable (shallow + few + rendered), not a
 # black-box forest. This sharpens conditions (optimal thresholds) and captures interactions natively.
 # ===================================================================================================
-def _best_split(X, r, min_leaf=20):
-    """CART split: the (feature, threshold) that maximally reduces residual variance. Pure numpy, O(d n log n)."""
+def _best_split(X, r, min_leaf=20, feats=None):
+    """CART split: the (feature, threshold) that maximally reduces residual variance. Pure numpy, O(d n log n).
+    feats restricts the search to a feature subset (stochastic boosting)."""
     n = len(r); g0 = r.sum() ** 2 / n; best = (0.0, None, None, None, None)   # (gain, j, thr, left_mean, right_mean)
-    for j in range(X.shape[1]):
+    for j in (range(X.shape[1]) if feats is None else feats):
         o = np.argsort(X[:, j], kind="stable"); xs = X[o, j]; rs = r[o]
         cs = np.cumsum(rs); tot = cs[-1]; i = np.arange(1, n)
         SL = cs[:-1]; nL = i; SR = tot - SL; nR = n - i
@@ -764,16 +765,17 @@ def _best_split(X, r, min_leaf=20):
     return best if best[1] is not None else None
 
 
-def _fit_tree(X, r, depth=2, min_leaf=20):
+def _fit_tree(X, r, depth=2, min_leaf=20, feats=None):
     """A shallow regression tree on the residual -> nested (feature, threshold, left, right); leaf = value.
-    Each root->leaf path is a verified conjunction; depth>1 captures interactions."""
+    Each root->leaf path is a verified conjunction; depth>1 captures interactions. feats = feature subset."""
     if depth == 0 or len(r) < 2 * min_leaf:
         return ("leaf", float(r.mean()))
-    s = _best_split(X, r, min_leaf)
+    s = _best_split(X, r, min_leaf, feats)
     if s is None:
         return ("leaf", float(r.mean()))
     _, j, t, _, _ = s; m = X[:, j] <= t
-    return ("node", j, t, _fit_tree(X[m], r[m], depth - 1, min_leaf), _fit_tree(X[~m], r[~m], depth - 1, min_leaf))
+    return ("node", j, t, _fit_tree(X[m], r[m], depth - 1, min_leaf, feats),
+            _fit_tree(X[~m], r[~m], depth - 1, min_leaf, feats))
 
 
 def _tree_pred(tree, X):
@@ -784,17 +786,21 @@ def _tree_pred(tree, X):
     return out
 
 
-def reason_boost(X, y, holdout=0.3, lr=0.1, n_terms=400, depth=2, min_leaf=20, patience=25, seed=0):
-    """Verified rule-boosting: iterate-on-residual, each term a shallow CART tree kept while it improves the
-    HELD-OUT split (early stop = the verifier). Returns a model (base, lr, trees) -- an additive program of
-    interpretable if-then rules. In-house: 'azr_win grows small verified decision rules.'"""
+def reason_boost(X, y, holdout=0.3, lr=0.05, n_terms=700, depth=3, min_leaf=20, sub=0.7, mf=0.7,
+                 patience=30, seed=0):
+    """Verified STOCHASTIC rule-boosting: iterate-on-residual, each term a shallow CART tree fit on a random
+    row (sub) + feature (mf) subsample, kept while it improves the HELD-OUT split (early stop = the verifier).
+    Returns a model (base, lr, trees) -- an additive program of interpretable if-then rules. In-house."""
     rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); c = int((1 - holdout) * len(y))
     fit, ver = idx[:c], idx[c:]
     Xf, yf, Xv, yv = X[fit], y[fit], X[ver], y[ver]
+    D = X.shape[1]; nfeat = max(1, int(mf * D)); rm = np.random.default_rng(seed * 17 + 1)
     base = float(yf.mean()); pf = np.full(len(fit), base); pv = np.full(len(ver), base)
     best = math.sqrt(((pv - yv) ** 2).mean()); trees = []; keep = 0; bad = 0
     for _ in range(n_terms):
-        t = _fit_tree(Xf, yf - pf, depth, min_leaf)
+        s = rm.random(len(fit)) < sub                                # stochastic row subsample
+        feats = rm.choice(D, nfeat, replace=False)                   # stochastic feature subsample
+        t = _fit_tree(Xf[s], (yf - pf)[s], depth, min_leaf, feats)
         pf = pf + lr * _tree_pred(t, Xf); pv = pv + lr * _tree_pred(t, Xv); trees.append(t)
         r = math.sqrt(((pv - yv) ** 2).mean())
         if r < best - 1e-6:
