@@ -94,37 +94,6 @@ def _rmse(a, b):
     return math.sqrt(((np.asarray(a) - np.asarray(b)) ** 2).mean())
 
 
-def _tree_boost(Xa, ya, Xt, M=3, depth=3, lr=0.05, n_trees=700, patience=35, sub=0.7, mf=0.7, seed=0):
-    """Verified STOCHASTIC tree boosting: each term is a depth-`depth` regression tree fit on a random
-    row/feature subsample of the residual, kept only while it improves a HELD-OUT split (early stop = the
-    verifier). Bagged. Stochastic depth-3 trees + subsampling make it match/beat a tuned GBM on noisy data,
-    while each tree stays a held-out-verified if-then rule."""
-    from sklearn.tree import DecisionTreeRegressor
-    ii = np.random.default_rng(seed).permutation(len(ya)); k = int(0.85 * len(ya))   # fixed early-stop split
-    Xf, yf, Xv, yv = Xa[ii[:k]], ya[ii[:k]], Xa[ii[k:]], ya[ii[k:]]
-    preds = []; rules = None
-    for m in range(M):
-        rm = np.random.default_rng(seed * 131 + m)                   # stochastic subsampling only (no bootstrap)
-        base = float(yf.mean()); pf = np.full(len(yf), base); pv = np.full(len(yv), base); pt = np.full(len(Xt), base)
-        best, best_pt, bad, kept = _rmse(pv, yv), pt.copy(), 0, []
-        for _ in range(n_trees):
-            s = rm.random(len(yf)) < sub                              # stochastic row subsample
-            t = DecisionTreeRegressor(max_depth=depth, min_samples_leaf=max(20, len(yf) // 200),
-                                      max_features=mf, random_state=int(rm.integers(1 << 30))).fit(Xf[s], (yf - pf)[s])
-            pf = pf + lr * t.predict(Xf); pv = pv + lr * t.predict(Xv); pt = pt + lr * t.predict(Xt)
-            kept.append(t); r = _rmse(pv, yv)
-            if r < best - 1e-6:
-                best, best_pt, bad = r, pt.copy(), 0
-            else:
-                bad += 1
-                if bad >= patience:
-                    break
-        preds.append(best_pt)
-        if m == 0:
-            rules = (base, kept[:3])                                  # a few trees for explanation
-    return np.mean(preds, 0), rules
-
-
 def _oof_te(col, y, tri, k=30):
     """Out-of-fold target-encode (no train leakage): tri rows get 5-fold OOF means, the rest get tri means."""
     col = np.asarray(col); out = np.full(len(col), y[tri].mean(), float); g = float(y[tri].mean())
@@ -160,77 +129,31 @@ def _reg_features(df, base, y, tri):
     return X, names
 
 
-def _stack_weights(P, yv, steps=1200):
-    """In-house non-negative stacking: weights >=0 summing to 1 minimizing held-out MSE of the blend."""
-    import torch
-    th = torch.zeros(P.shape[1], requires_grad=True); opt = torch.optim.Adam([th], lr=0.05)
-    Pt = torch.tensor(P, dtype=torch.float32); yt = torch.tensor(yv, dtype=torch.float32)
-    for _ in range(steps):
-        w = torch.nn.functional.softplus(th); pred = (Pt @ w) / (w.sum() + 1e-9)
-        loss = ((pred - yt) ** 2).mean(); opt.zero_grad(); loss.backward(); opt.step()
-    w = torch.nn.functional.softplus(th); return (w / w.sum()).detach().numpy()
-
-
-def _mode_preds(X, Xstd, y, names, df, target, fit, pred, seed, ensemble):
-    """All REASONING predictors fit on `fit`, predicting `pred` (no statistical baselines -- reasoning only).
-    Returns (dict, program, ensemble_std)."""
-    pr, psd, ex = _bag(X[fit], y[fit], X[pred], ensemble, seed)
-    d = {"reasoning": pr, "reasoning_trees": _tree_boost(X[fit], y[fit], X[pred], seed=seed)[0]}
-    try:
-        from thinking import progsynth
-        d["reasoning_progsynth"] = progsynth.fit_predict(df, target, fit, pred, seed=seed)[0]
-    except Exception:  # noqa
-        pass
-    try:
-        from thinking import reason_modes
-        y32 = y.astype(np.float32)
-        d["reasoning_analogy"] = reason_modes.fit_analogy(Xstd, y32, fit, pred, names, seed=seed)[0]
-        d["reasoning_regime"] = reason_modes.fit_regime(Xstd, y32, fit, pred, seed=seed)
-    except Exception:  # noqa
-        pass
-    return d, ex, psd
-
-
-def solve_regression(df, target, id_col=None, test_frac=0.3, ensemble=15, stack=True, seed=0, verbose=True):
+def solve_regression(df, target, id_col=None, test_frac=0.3, ensemble=15, seed=0, verbose=True):
     df = df.reset_index(drop=True)
     base = [c for c in df.columns if c not in (target, id_col)]
     y = df[target].astype(float).values
     rng = np.random.default_rng(seed); idx = rng.permutation(len(df)); cut = int((1 - test_frac) * len(df))
     tri, tei = idx[:cut], idx[cut:]; yte = y[tei]
     X, names = _reg_features(df, base, y, tri)
-    mu = X[tri].mean(0); sd = X[tri].std(0); sd[sd < 1e-6] = 1.0; Xstd = ((X - mu) / sd).astype(np.float32)
     if verbose:
-        print(f"  {len(df)} rows, {len(names)} features; running 5 reasoning modes + reasoning-only stack...")
-    cand, ex, psd = _mode_preds(X, Xstd, y, names, df, target, tri, tei, seed, ensemble)
-    weights = None
-    if stack and len(cand) > 1:                                       # reasoning-only stacked ensemble
-        ii = np.random.default_rng(seed + 1).permutation(len(tri)); c = int(0.8 * len(tri))
-        a, v = tri[ii[:c]], tri[ii[c:]]
-        Pv, _, _ = _mode_preds(X, Xstd, y, names, df, target, a, v, seed, ensemble)
-        modes = [m for m in cand if m in Pv]
-        W = _stack_weights(np.stack([Pv[m] for m in modes], 1), y[v])
-        cand["ensemble"] = sum(W[i] * cand[m] for i, m in enumerate(modes))
-        weights = {m: round(float(W[i]), 3) for i, m in enumerate(modes) if W[i] > 0.005}
-    rmse = {k: _rmse(v, yte) for k, v in cand.items()}
-    winner = min(rmse, key=rmse.get)
-    conf = psd <= np.quantile(psd, 0.8)
+        print(f"  {len(df)} rows, {len(names)} features; verified feature-expression reasoning...")
+    pr, psd, ex = _bag(X[tri], y[tri], X[tei], ensemble, seed)        # the verified additive program (bagged)
+    conf = psd <= np.quantile(psd, 0.8)                              # abstain where the bagged programs disagree
     return {"task": "regression", "n_features": len(names),
-            "rmse": {k: round(v, 2) for k, v in rmse.items()}, "winner": winner, "stack_weights": weights,
-            "program": _render(ex, names),
+            "rmse": round(_rmse(pr, yte), 2), "program": _render(ex, names),
             "predict_mean_baseline": round(_rmse(np.full(len(yte), y[tri].mean()), yte), 2),
-            "reasoning_rmse_confident80": round(_rmse(cand["reasoning"][conf], yte[conf]), 2),
-            "predictions": cand[winner].tolist()}
+            "rmse_confident80": round(_rmse(pr[conf], yte[conf]), 2),
+            "predictions": pr.tolist()}
 
 
 def main():
     df = pd.read_csv("kaggle_data/delivery/Food_Delivery_Times.csv").drop(columns=["Order_ID"])
-    print("solve_regression on Food-Delivery-Times (Sendy analog):")
+    print("solve_regression (verified feature-expression reasoning) on Food-Delivery-Times:")
     r = solve_regression(df, "Delivery_Time_min", verbose=True)
-    print(f"\n  held-out RMSE: {r['rmse']}  ->  winner: {r['winner']}")
-    print(f"  predict-mean baseline: {r['predict_mean_baseline']}")
-    print(f"  reasoning PROGRAM (the explanation): {r['program']}")
-    print(f"  reasoning RMSE all {r['rmse']['reasoning']} -> confident-80% subset {r['reasoning_rmse_confident80']} "
-          f"(abstention: lower error where the programs agree)")
+    print(f"\n  held-out RMSE: {r['rmse']}   (predict-mean baseline {r['predict_mean_baseline']})")
+    print(f"  PROGRAM (the explanation): {r['program']}")
+    print(f"  confident-80% subset RMSE: {r['rmse_confident80']} (abstention: lower error where programs agree)")
 
 
 if __name__ == "__main__":
