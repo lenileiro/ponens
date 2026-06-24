@@ -114,6 +114,84 @@ def synthesize(X, y, base_names, policy=None, holdout=0.3, maxterms=14, topk=12,
     return prog, (mu, sd, base_names)
 
 
+def _complexity(e):
+    if e[0] == "b": return 1
+    if e[0] == "thr": return 1 + _complexity(e[1])
+    return 1 + _complexity(e[1]) + _complexity(e[2])
+
+
+def beam_synthesize(X, y, base_names, policy=None, beam=4, maxterms=16, topk=10, mdl=0.002,
+                    holdout=0.3, seed=0, verbose=False):
+    """Beam search over additive programs with an Occam/MDL penalty. Keep the top-`beam` partial programs (not
+    just greedy-best), ranked by held-out RMSE + mdl*baseline*complexity, so a complex expression must earn its
+    keep. A backward-elimination prune at the end drops terms whose removal doesn't hurt held-out."""
+    rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); cut = int((1 - holdout) * len(y))
+    fit, ver = idx[:cut], idx[cut:]
+    Xs, mu, sd = _std(X); B = {nm: Xs[:, j] for j, nm in enumerate(base_names)}
+    yf, yv = y[fit], y[ver]; rmse0 = math.sqrt(((yf.mean() - yv) ** 2).mean())
+    init = {"prog": [("const", float(yf.mean()))], "pf": np.full(len(fit), yf.mean()),
+            "pv": np.full(len(ver), yf.mean()), "chosen": [], "rmse": rmse0}
+    states, best = [init], init
+    for step in range(maxterms):
+        pool = []
+        for st in states:
+            res = yf - st["pf"]
+            cands = candidates(base_names, st["chosen"], rng)
+            cols = {re(e): ev(e, B) for e in cands}
+            if policy is not None:
+                feats = np.stack([descriptor(cols[re(e)][fit], res) for e in cands])
+                with torch.no_grad():
+                    order = torch.argsort(-policy(torch.tensor(feats))).numpy()
+            else:
+                order = np.argsort([-(abs(np.corrcoef(cols[re(e)][fit], res)[0, 1]) if cols[re(e)][fit].std() > 0
+                                      else 0) for e in cands])
+            for i in order[:topk]:
+                e = cands[i]; v = cols[re(e)]; vf = v[fit]; vv = float(vf @ vf)
+                if vv < 1e-9 or not np.isfinite(vv):
+                    continue
+                coef = float(vf @ res) / vv
+                pv2 = st["pv"] + coef * v[ver]; r = math.sqrt(((pv2 - yv) ** 2).mean())
+                if r < st["rmse"] - 1e-6:                            # must improve its parent
+                    pool.append({"prog": st["prog"] + [(e, coef)], "pf": st["pf"] + coef * vf,
+                                 "pv": pv2, "chosen": st["chosen"] + [e], "rmse": r,
+                                 "score": r + mdl * rmse0 * _complexity(e)})
+        if not pool:
+            break
+        seen = set(); uniq = []
+        for p in sorted(pool, key=lambda p: p["score"]):
+            k = tuple(re(e) for e, _ in p["prog"][1:])
+            if k not in seen:
+                seen.add(k); uniq.append(p)
+        states = uniq[:beam]
+        cb = min(states, key=lambda p: p["rmse"])
+        if cb["rmse"] < best["rmse"] - 1e-6:
+            best = cb
+        if verbose:
+            print(f"    step {step}: best held-out RMSE {best['rmse']:.3f} (beam {len(states)})")
+    prog = _prune(best["prog"], B, fit, ver, yv, mdl, rmse0)
+    return prog, (mu, sd, base_names)
+
+
+def _prune(prog, B, fit, ver, yv, mdl, rmse0):
+    """Backward elimination: drop any term whose removal doesn't worsen held-out RMSE beyond its MDL credit."""
+    terms = prog[1:]; const = prog[0]
+    def vpred(ts):
+        o = np.full(len(ver), const[1])
+        for e, c in ts:
+            o += c * ev(e, B)[ver]
+        return o
+    cur = math.sqrt(((vpred(terms) - yv) ** 2).mean())
+    changed = True
+    while changed and terms:
+        changed = False
+        for k in range(len(terms)):
+            trial = terms[:k] + terms[k + 1:]
+            r = math.sqrt(((vpred(trial) - yv) ** 2).mean())
+            if r <= cur + mdl * rmse0 * _complexity(terms[k][0]):     # removal is free within MDL credit
+                terms = trial; cur = r; changed = True; break
+    return [const] + terms
+
+
 def predict(prog, X, ctx):
     mu, sd, base_names = ctx
     Xs = (X - mu) / sd
@@ -206,10 +284,10 @@ def solve(df, target, test_frac=0.3, policy=None, seed=0, verbose=True):
     rng = np.random.default_rng(seed); idx = rng.permutation(len(df)); cut = int((1 - test_frac) * len(df))
     tri, tei = idx[:cut], idx[cut:]
     X, names, y = build_base(df, target, tri)
-    prog, ctx = synthesize(X[tri], y[tri], names, policy=policy, seed=seed, verbose=verbose)
+    prog, ctx = beam_synthesize(X[tri], y[tri], names, policy=policy, seed=seed, verbose=verbose)
     pred = predict(prog, X[tei], ctx)
     rmse = math.sqrt(((pred - y[tei]) ** 2).mean())
-    return {"rmse": round(rmse, 3), "program": render(prog),
+    return {"rmse": round(rmse, 3), "n_terms": len(prog) - 1, "program": render(prog),
             "baseline": round(math.sqrt(((y[tri].mean() - y[tei]) ** 2).mean()), 3)}
 
 
