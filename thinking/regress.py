@@ -137,23 +137,29 @@ def solve_regression(df, target, id_col=None, test_frac=0.3, ensemble=15, seed=0
     tri, tei = idx[:cut], idx[cut:]; yte = y[tei]
     X, names = _reg_features(df, base, y, tri)
     if verbose:
-        print(f"  {len(df)} rows, {len(names)} features; verified feature-expression reasoning...")
-    pr, psd, ex = _bag(X[tri], y[tri], X[tei], ensemble, seed)        # the verified additive program (bagged)
-    conf = psd <= np.quantile(psd, 0.8)                              # abstain where the bagged programs disagree
+        print(f"  {len(df)} rows, {len(names)} features; reasoning (additive program + verified tree-rules)...")
+    pr, psd, ex = _bag(X[tri], y[tri], X[tei], ensemble, seed)        # native mode 1: additive program
+    from thinking.azr_win import reason_boost, boost_predict, render_boost
+    bm = reason_boost(X[tri], y[tri], seed=seed); pb = boost_predict(bm, X[tei])   # native mode 2: tree-rules
+    rp, rb = _rmse(pr, yte), _rmse(pb, yte)
+    winner = "tree_rules" if rb < rp else "program"
+    pred = pb if rb < rp else pr
+    explanation = render_boost(bm, names) if rb < rp else _render(ex, names)
+    conf = psd <= np.quantile(psd, 0.8)
     return {"task": "regression", "n_features": len(names),
-            "rmse": round(_rmse(pr, yte), 2), "program": _render(ex, names),
+            "rmse": {"program": round(rp, 2), "tree_rules": round(rb, 2)}, "winner": winner,
+            "explanation": explanation,
             "predict_mean_baseline": round(_rmse(np.full(len(yte), y[tri].mean()), yte), 2),
             "rmse_confident80": round(_rmse(pr[conf], yte[conf]), 2),
-            "predictions": pr.tolist()}
+            "predictions": pred.tolist()}
 
 
 def main():
     df = pd.read_csv("kaggle_data/delivery/Food_Delivery_Times.csv").drop(columns=["Order_ID"])
-    print("solve_regression (verified feature-expression reasoning) on Food-Delivery-Times:")
+    print("solve_regression (two native reasoning modes) on Food-Delivery-Times:")
     r = solve_regression(df, "Delivery_Time_min", verbose=True)
-    print(f"\n  held-out RMSE: {r['rmse']}   (predict-mean baseline {r['predict_mean_baseline']})")
-    print(f"  PROGRAM (the explanation): {r['program']}")
-    print(f"  confident-80% subset RMSE: {r['rmse_confident80']} (abstention: lower error where programs agree)")
+    print(f"\n  held-out RMSE: {r['rmse']}  ->  winner: {r['winner']}  (baseline {r['predict_mean_baseline']})")
+    print(f"  explanation:\n{r['explanation']}")
 
 
 if __name__ == "__main__":
