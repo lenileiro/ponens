@@ -832,6 +832,39 @@ def render_boost(model, names, k=4):
     return "\n".join(out)
 
 
+def _tree_paths(tree, cond=()):
+    """Yield (conjunction-of-literals, leaf_value) for every root->leaf path. A path = a DNF clause."""
+    if tree[0] == "leaf":
+        yield cond, tree[1]; return
+    _, j, t, lt, rt = tree
+    yield from _tree_paths(lt, cond + ((j, "<=", float(t)),))
+    yield from _tree_paths(rt, cond + ((j, ">", float(t)),))
+
+
+def reason_tree_rule(X, y, depth=4, min_leaf=20, min_purity=0.9, min_support=10, holdout=0.3, seed=0):
+    """DNF from CART tree-PATHS: fit a shallow tree on the binary label, take root->leaf paths to class-1-pure
+    leaves as conjunctions (tree-discovered, with optimal splits + interactions), and keep each only if it
+    improves HELD-OUT accuracy (verified). Returns rules in azr_win's standard format (works with apply_rule)."""
+    rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); c = int((1 - holdout) * len(y))
+    fit, ver = idx[:c], idx[c:]
+    Xf, yf, Xv, yv = X[fit], y[fit].astype(float), X[ver], y[ver]
+    tree = _fit_tree(Xf, yf, depth, min_leaf)                         # leaves = class-1 proportion
+    cands = []
+    for cond, _ in _tree_paths(tree):
+        if not cond:
+            continue
+        m = apply_rule([list(cond)], Xf).astype(bool)
+        if int(m.sum()) >= min_support and yf[m].mean() >= min_purity:
+            cands.append((float(yf[m].mean()), list(cond)))
+    cands.sort(key=lambda p: -p[0])                                   # purest paths first
+    rules = []; base = (apply_rule([], Xv) == yv).mean()
+    for _, conj in cands:                                             # held-out-gated disjuncts
+        g = (apply_rule(rules + [conj], Xv) == yv).mean()
+        if g > base + 1e-9:
+            rules.append(conj); base = g
+    return rules
+
+
 def _gen_rule_task(rng, F, n):
     X = np.stack([rng.normal(0, 1, n) if rng.random() < 0.6 else rng.integers(0, 3, n) for _ in range(F)], 1).astype(np.float32)
     nd = int(rng.integers(1, 4)); y = np.zeros(n, bool)
