@@ -96,20 +96,23 @@ def _rmse(a, b):
     return math.sqrt(((np.asarray(a) - np.asarray(b)) ** 2).mean())
 
 
-def _tree_boost(Xa, ya, Xt, M=3, depth=2, lr=0.08, n_trees=300, patience=20, seed=0):
-    """Verified shallow-tree boosting: each term is a depth-`depth` regression tree fit on the residual, kept
-    only while it improves a HELD-OUT split (early stop = the verifier). Bagged. Captures nonlinear
-    interactions like a GBM, but each tree is a small renderable if-then rule and is held-out-verified."""
+def _tree_boost(Xa, ya, Xt, M=3, depth=3, lr=0.05, n_trees=700, patience=35, sub=0.7, mf=0.7, seed=0):
+    """Verified STOCHASTIC tree boosting: each term is a depth-`depth` regression tree fit on a random
+    row/feature subsample of the residual, kept only while it improves a HELD-OUT split (early stop = the
+    verifier). Bagged. Stochastic depth-3 trees + subsampling make it match/beat a tuned GBM on noisy data,
+    while each tree stays a held-out-verified if-then rule."""
     from sklearn.tree import DecisionTreeRegressor
-    rng = np.random.default_rng(seed); preds = []; rules = None
+    ii = np.random.default_rng(seed).permutation(len(ya)); k = int(0.85 * len(ya))   # fixed early-stop split
+    Xf, yf, Xv, yv = Xa[ii[:k]], ya[ii[:k]], Xa[ii[k:]], ya[ii[k:]]
+    preds = []; rules = None
     for m in range(M):
-        bs = rng.integers(0, len(ya), len(ya)); fi = rng.permutation(len(bs)); k = int(0.8 * len(bs))
-        Xf, yf, Xv, yv = Xa[bs][fi[:k]], ya[bs][fi[:k]], Xa[bs][fi[k:]], ya[bs][fi[k:]]
+        rm = np.random.default_rng(seed * 131 + m)                   # stochastic subsampling only (no bootstrap)
         base = float(yf.mean()); pf = np.full(len(yf), base); pv = np.full(len(yv), base); pt = np.full(len(Xt), base)
         best, best_pt, bad, kept = _rmse(pv, yv), pt.copy(), 0, []
         for _ in range(n_trees):
+            s = rm.random(len(yf)) < sub                              # stochastic row subsample
             t = DecisionTreeRegressor(max_depth=depth, min_samples_leaf=max(20, len(yf) // 200),
-                                      random_state=m).fit(Xf, yf - pf)
+                                      max_features=mf, random_state=int(rm.integers(1 << 30))).fit(Xf[s], (yf - pf)[s])
             pf = pf + lr * t.predict(Xf); pv = pv + lr * t.predict(Xv); pt = pt + lr * t.predict(Xt)
             kept.append(t); r = _rmse(pv, yv)
             if r < best - 1e-6:
