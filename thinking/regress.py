@@ -162,60 +162,71 @@ def _reg_features(df, base, y, tri):
     return X, names
 
 
-def solve_regression(df, target, id_col=None, test_frac=0.3, ensemble=15, seed=0, verbose=True):
+def _stack_weights(P, yv, steps=1200):
+    """In-house non-negative stacking: weights >=0 summing to 1 minimizing held-out MSE of the blend."""
+    import torch
+    th = torch.zeros(P.shape[1], requires_grad=True); opt = torch.optim.Adam([th], lr=0.05)
+    Pt = torch.tensor(P, dtype=torch.float32); yt = torch.tensor(yv, dtype=torch.float32)
+    for _ in range(steps):
+        w = torch.nn.functional.softplus(th); pred = (Pt @ w) / (w.sum() + 1e-9)
+        loss = ((pred - yt) ** 2).mean(); opt.zero_grad(); loss.backward(); opt.step()
+    w = torch.nn.functional.softplus(th); return (w / w.sum()).detach().numpy()
+
+
+def _mode_preds(X, Xstd, y, names, df, target, fit, pred, seed, ensemble):
+    """All candidate predictors fit on `fit`, predicting `pred`. Returns (dict, program, ensemble_std)."""
+    from sklearn.ensemble import HistGradientBoostingRegressor
+    from sklearn.linear_model import Ridge
+    pr, psd, ex = _bag(X[fit], y[fit], X[pred], ensemble, seed)
+    d = {"reasoning": pr, "reasoning_trees": _tree_boost(X[fit], y[fit], X[pred], seed=seed)[0]}
+    Xf, Xp = _std(X[fit], X[pred])
+    d["ridge"] = Ridge(alpha=1.0).fit(Xf, y[fit]).predict(Xp)
+    d["gbm"] = HistGradientBoostingRegressor(max_iter=300, learning_rate=0.05, early_stopping=True,
+                                             random_state=seed).fit(X[fit], y[fit]).predict(X[pred])
+    try:
+        from thinking import progsynth
+        d["reasoning_progsynth"] = progsynth.fit_predict(df, target, fit, pred, seed=seed)[0]
+    except Exception:  # noqa
+        pass
+    try:
+        from thinking import reason_modes
+        y32 = y.astype(np.float32)
+        d["reasoning_analogy"] = reason_modes.fit_analogy(Xstd, y32, fit, pred, names, seed=seed)[0]
+        d["reasoning_regime"] = reason_modes.fit_regime(Xstd, y32, fit, pred, seed=seed)
+    except Exception:  # noqa
+        pass
+    return d, ex, psd
+
+
+def solve_regression(df, target, id_col=None, test_frac=0.3, ensemble=15, stack=True, seed=0, verbose=True):
     df = df.reset_index(drop=True)
     base = [c for c in df.columns if c not in (target, id_col)]
     y = df[target].astype(float).values
     rng = np.random.default_rng(seed); idx = rng.permutation(len(df)); cut = int((1 - test_frac) * len(df))
     tri, tei = idx[:cut], idx[cut:]; yte = y[tei]
-    X, names = _reg_features(df, base, y, tri)                        # auto features incl. target-encoding
+    X, names = _reg_features(df, base, y, tri)
+    mu = X[tri].mean(0); sd = X[tri].std(0); sd[sd < 1e-6] = 1.0; Xstd = ((X - mu) / sd).astype(np.float32)
     if verbose:
-        nte = sum(1 for n in names if n.startswith("te("))
-        print(f"  {len(df)} rows, {len(names)} features ({nte} auto target-encoded); "
-              f"target mean {y.mean():.1f} std {y.std():.1f}")
-        print("  [reason] bagged verified feature-expression program (held-out-RMSE gated)...")
-    pr, psd, ex = _bag(X[tri], y[tri], X[tei], ensemble, seed)        # reasoning: linear feature-expressions
-    if verbose:
-        print("  [reason-trees] verified shallow-tree boosting (interactions, held-out gated)...")
-    prt, _ = _tree_boost(X[tri], y[tri], X[tei], seed=seed)           # reasoning: verified tree terms
-    from sklearn.ensemble import HistGradientBoostingRegressor
-    from sklearn.linear_model import Ridge
-    Xs_tr, Xs_te = _std(X[tri], X[tei])
-    ridge = Ridge(alpha=1.0).fit(Xs_tr, y[tri]).predict(Xs_te)
-    gbm = HistGradientBoostingRegressor(max_iter=300, learning_rate=0.05, early_stopping=True,
-                                        random_state=seed).fit(X[tri], y[tri]).predict(X[tei])
-    cand = {"reasoning": pr, "reasoning_trees": prt, "ridge": ridge, "gbm": gbm}
-    try:                                                             # 3rd reasoning mode: program synthesis
-        from thinking import progsynth
-        if verbose:
-            print("  [reason-progsynth] neural-guided verified program synthesis...")
-        cand["reasoning_progsynth"], _ = progsynth.fit_predict(df, target, tri, tei, seed=seed)
-    except Exception as e:  # noqa
-        if verbose:
-            print(f"  (progsynth skipped: {e})")
-    try:                                                             # 4th/5th: analogy + discovered regimes
-        from thinking import reason_modes
-        mu_ = X[tri].mean(0); sd_ = X[tri].std(0); sd_[sd_ < 1e-6] = 1.0
-        Xstd = ((X - mu_) / sd_).astype(np.float32); y32 = y.astype(np.float32)
-        if verbose:
-            print("  [reason-analogy/regime] learned-metric analogy + discovered regimes...")
-        cand["reasoning_analogy"], _ = reason_modes.fit_analogy(Xstd, y32, tri, tei, names, seed=seed)
-        cand["reasoning_regime"] = reason_modes.fit_regime(Xstd, y32, tri, tei, seed=seed)
-    except Exception as e:  # noqa
-        if verbose:
-            print(f"  (analogy/regime skipped: {e})")
-    rmodes = [k for k in cand if k.startswith("reasoning")]          # ENSEMBLE of all reasoning modes
-    if len(rmodes) > 1:
-        cand["reasoning_ensemble"] = np.mean([cand[k] for k in rmodes], 0)
+        print(f"  {len(df)} rows, {len(names)} features; running 5 reasoning modes + ridge + gbm + stack...")
+    cand, ex, psd = _mode_preds(X, Xstd, y, names, df, target, tri, tei, seed, ensemble)
+    weights = None
+    if stack and len(cand) > 1:                                       # stacked ensemble: weights from inner split
+        ii = np.random.default_rng(seed + 1).permutation(len(tri)); c = int(0.8 * len(tri))
+        a, v = tri[ii[:c]], tri[ii[c:]]
+        Pv, _, _ = _mode_preds(X, Xstd, y, names, df, target, a, v, seed, ensemble)
+        modes = [m for m in cand if m in Pv]
+        W = _stack_weights(np.stack([Pv[m] for m in modes], 1), y[v])
+        cand["ensemble"] = sum(W[i] * cand[m] for i, m in enumerate(modes))
+        weights = {m: round(float(W[i]), 3) for i, m in enumerate(modes) if W[i] > 0.005}
     rmse = {k: _rmse(v, yte) for k, v in cand.items()}
     winner = min(rmse, key=rmse.get)
-    conf = psd <= np.quantile(psd, 0.8)                              # confident = bottom-80% ensemble disagreement
+    conf = psd <= np.quantile(psd, 0.8)
     return {"task": "regression", "n_features": len(names),
-            "rmse": {k: round(v, 2) for k, v in rmse.items()}, "winner": winner,
+            "rmse": {k: round(v, 2) for k, v in rmse.items()}, "winner": winner, "stack_weights": weights,
             "program": _render(ex, names),
             "predict_mean_baseline": round(_rmse(np.full(len(yte), y[tri].mean()), yte), 2),
-            "reasoning_rmse_confident80": round(_rmse(pr[conf], yte[conf]), 2),
-            "predictions": cand[winner].tolist(), "uncertainty": psd.tolist()}
+            "reasoning_rmse_confident80": round(_rmse(cand["reasoning"][conf], yte[conf]), 2),
+            "predictions": cand[winner].tolist()}
 
 
 def main():
