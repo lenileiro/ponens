@@ -4,12 +4,10 @@ interpretable additive program (intercept + sum of feature-expression terms: lin
 / ratio), iterate on the residual, KEEP a term only if it lowers HELD-OUT RMSE (the noisy-data verifier),
 bagged for low variance. Auto-includes the primitive library (count/relational/...) as extra base features.
 
-Honest 'run both, hand over the winner': also fits Ridge and a GBM, reports all three held-out RMSEs, predicts
-with whichever wins -- but the reasoning PROGRAM is always the explanation. Regression abstention = flag rows
-where the bagged programs DISAGREE (high ensemble variance); accuracy on the confident subset is reported.
-
-(Decision context: on a Sendy-analog delivery dataset, 5-fold CV RMSE was reasoning 10.72 / Ridge 10.47 /
-GBM 11.17 -- reasoning beats trees and ties the best model class when structure is discoverable.)
+REASONING ONLY -- no statistical baselines. solve_regression runs FIVE in-house reasoning modes (linear
+feature-expressions, verified tree-boosting, neural program synthesis, learned-metric analogy, discovered
+regimes) and a reasoning-only STACKED ensemble (non-negative weights fit on an inner split), picks the winner.
+The reasoning PROGRAM is always the explanation; abstention flags rows where the bagged programs DISAGREE.
 """
 import math
 import sys
@@ -174,15 +172,10 @@ def _stack_weights(P, yv, steps=1200):
 
 
 def _mode_preds(X, Xstd, y, names, df, target, fit, pred, seed, ensemble):
-    """All candidate predictors fit on `fit`, predicting `pred`. Returns (dict, program, ensemble_std)."""
-    from sklearn.ensemble import HistGradientBoostingRegressor
-    from sklearn.linear_model import Ridge
+    """All REASONING predictors fit on `fit`, predicting `pred` (no statistical baselines -- reasoning only).
+    Returns (dict, program, ensemble_std)."""
     pr, psd, ex = _bag(X[fit], y[fit], X[pred], ensemble, seed)
     d = {"reasoning": pr, "reasoning_trees": _tree_boost(X[fit], y[fit], X[pred], seed=seed)[0]}
-    Xf, Xp = _std(X[fit], X[pred])
-    d["ridge"] = Ridge(alpha=1.0).fit(Xf, y[fit]).predict(Xp)
-    d["gbm"] = HistGradientBoostingRegressor(max_iter=300, learning_rate=0.05, early_stopping=True,
-                                             random_state=seed).fit(X[fit], y[fit]).predict(X[pred])
     try:
         from thinking import progsynth
         d["reasoning_progsynth"] = progsynth.fit_predict(df, target, fit, pred, seed=seed)[0]
@@ -207,10 +200,10 @@ def solve_regression(df, target, id_col=None, test_frac=0.3, ensemble=15, stack=
     X, names = _reg_features(df, base, y, tri)
     mu = X[tri].mean(0); sd = X[tri].std(0); sd[sd < 1e-6] = 1.0; Xstd = ((X - mu) / sd).astype(np.float32)
     if verbose:
-        print(f"  {len(df)} rows, {len(names)} features; running 5 reasoning modes + ridge + gbm + stack...")
+        print(f"  {len(df)} rows, {len(names)} features; running 5 reasoning modes + reasoning-only stack...")
     cand, ex, psd = _mode_preds(X, Xstd, y, names, df, target, tri, tei, seed, ensemble)
     weights = None
-    if stack and len(cand) > 1:                                       # stacked ensemble: weights from inner split
+    if stack and len(cand) > 1:                                       # reasoning-only stacked ensemble
         ii = np.random.default_rng(seed + 1).permutation(len(tri)); c = int(0.8 * len(tri))
         a, v = tri[ii[:c]], tri[ii[c:]]
         Pv, _, _ = _mode_preds(X, Xstd, y, names, df, target, a, v, seed, ensemble)
