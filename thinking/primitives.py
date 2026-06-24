@@ -169,16 +169,36 @@ def _score(X, y, seed=0):
     return float(((dec >= 0) & (dec == y[va])).mean()), (pos, neg)
 
 
-def propose(df, target, base_cols, rounds=3, topk=8, ranker=None, verbose=True):
+def _compose(df, base_cols, cands, prank, m=6):
+    """Cross the composition-myopia wall: feed the top-m level-1 derived features back in as columns and
+    regenerate primitives over them -> level-2 candidates like (count(==1)==count(==2)) appear as SINGLE
+    candidates. So a primitive whose intermediate is useless alone can still be discovered as a composition,
+    without greedy ever having to add the useless intermediate."""
+    top = sorted(cands, key=lambda p: -prank(p[1]))[:m]
+    if not top:
+        return cands
+    df2 = df.copy()
+    for nm, ser in top:
+        df2[nm] = np.asarray(ser)
+    seen = {nm for nm, _ in cands}
+    composed = [(nm, ser) for nm, ser in candidate_primitives(df2, base_cols + [nm for nm, _ in top])
+                if nm not in seen]
+    return cands + composed
+
+
+def propose(df, target, base_cols, rounds=3, topk=8, ranker=None, compose=False, verbose=True):
     """Greedily add the primitive that most improves held-out confident-correctness; stop when none helps.
     Each round pre-ranks the whole library and only full-evaluates (verified rule search) the top-K -- so the
     library can grow without the eval cost exploding. Pre-rank uses the LEARNED ranker if given, else the
-    cheap heuristic."""
+    cheap heuristic. compose=True also generates level-2 (primitive-of-a-primitive) candidates."""
     y = (df[target].values == sorted(pd.unique(df[target]), key=str)[-1]).astype(int)   # binarize any 2-class target
     cands = candidate_primitives(df, base_cols)
     prank = (lambda c: rank_score(ranker, c, y)) if ranker is not None else (lambda c: _cheap_score(c, y))
+    if compose:
+        cands = _compose(df, base_cols, cands, prank)
     if verbose:
-        print(f"  library: {len(cands)} candidate primitives  (pre-rank: {'learned' if ranker else 'heuristic'})")
+        print(f"  library: {len(cands)} candidate primitives  (pre-rank: {'learned' if ranker else 'heuristic'}"
+              f"{', +composition' if compose else ''})")
     chosen = []
     Xcur, _ = _featmat(df, base_cols, chosen)
     best, _ = _score(Xcur, y)
@@ -231,7 +251,7 @@ def _class_confidence(pos, X):
     return fired, conf
 
 
-def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99, seed=0, verbose=True):
+def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99, compose=True, seed=0, verbose=True):
     """Capstone: one call on any tabular CLASSIFICATION dataset (binary or multiclass). Trains the
     primitive-ranker via self-play (if not given), proposes+verifies derived primitives, reasons verified
     rules (two-sided for binary; one-vs-rest for multiclass), and returns the rule(s), held-out
@@ -256,7 +276,7 @@ def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99
         for c in classes:                                            # discover primitives per class, union
             dfc = df.copy(); dfc["__y__"] = (df[target].values == c).astype(int)
             ch, _ = propose(dfc.iloc[tri].reset_index(drop=True), "__y__", base_cols, ranker=ranker,
-                            rounds=1, verbose=False)
+                            rounds=1, compose=compose, verbose=False)
             names_chosen += [x[0] for x in ch if x[0] not in names_chosen]
         Xfull, names = _build_features(df, base_cols, names_chosen)
         Xtr, Xte = Xfull[tri], Xfull[tei]
@@ -280,7 +300,7 @@ def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99
 
     if verbose:                                                      # ---- binary: two-sided + explanations ----
         print("  [propose] verified primitive discovery...")
-    chosen, _ = propose(df.iloc[tri].reset_index(drop=True), target, base_cols, ranker=ranker, verbose=verbose)
+    chosen, _ = propose(df.iloc[tri].reset_index(drop=True), target, base_cols, ranker=ranker, compose=compose, verbose=verbose)
     names_chosen = [c[0] for c in chosen]
     Xfull, names = _build_features(df, base_cols, names_chosen)        # build on FULL df -> consistent columns
     Xtr, Xte = Xfull[tri], Xfull[tei]
