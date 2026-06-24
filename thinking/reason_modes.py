@@ -36,8 +36,9 @@ def _split_std(df, target, test_frac, seed):
 
 
 # ---- (1) reasoning-by-analogy with a learned verified metric ----
-def solve_analogy(df, target, test_frac=0.3, R=1500, steps=400, seed=0, verbose=True):
-    Xs, y, tri, tei, names = _split_std(df, target, test_frac, seed)
+def fit_analogy(Xs, y, tri, tei, names=None, R=1500, steps=400, seed=0, verbose=False):
+    """Learn a diagonal metric over standardized columns; predict tei as a metric-weighted avg of train rows.
+    Returns (pred_tei, top_features). Shared-split version for run-both integration."""
     torch.manual_seed(seed); rng = np.random.default_rng(seed)
     Xtr = torch.tensor(Xs[tri]); ytr = torch.tensor(y[tri])
     perm = rng.permutation(len(tri)); nref = min(R, len(tri) // 2)    # keep half for queries -> metric trains
@@ -63,11 +64,16 @@ def solve_analogy(df, target, test_frac=0.3, R=1500, steps=400, seed=0, verbose=
                 d = ((Xt[i:i + chunk][:, None, :] - Xr[None, :, :]) ** 2 * F.softplus(w)).sum(-1)
                 out.append((torch.softmax(-d / torch.exp(logT), 1) @ yr).numpy())
         return np.concatenate(out)
-    rmse = math.sqrt(((pred(Xs[tei]) - y[tei]) ** 2).mean())
     wv = F.softplus(w).detach().numpy()
-    top = sorted(zip(names, wv), key=lambda t: -t[1])[:6]
-    return {"rmse": round(rmse, 3), "baseline": round(math.sqrt(((y[tri].mean() - y[tei]) ** 2).mean()), 3),
-            "learned_metric_top": [(n, round(float(v), 2)) for n, v in top]}
+    top = sorted(zip(names or range(len(wv)), wv), key=lambda t: -t[1])[:6]
+    return pred(Xs[tei]), [(n, round(float(v), 2)) for n, v in top]
+
+
+def solve_analogy(df, target, test_frac=0.3, R=1500, steps=400, seed=0, verbose=True):
+    Xs, y, tri, tei, names = _split_std(df, target, test_frac, seed)
+    pred, top = fit_analogy(Xs, y, tri, tei, names, R, steps, seed, verbose)
+    return {"rmse": round(math.sqrt(((pred - y[tei]) ** 2).mean()), 3),
+            "baseline": round(math.sqrt(((y[tri].mean() - y[tei]) ** 2).mean()), 3), "learned_metric_top": top}
 
 
 # ---- (2) discovered regimes: mixture-of-linear-experts (gate finds the breakpoints) ----
@@ -80,8 +86,9 @@ class MoE(nn.Module):
         return (torch.softmax(self.gate(X), 1) * self.exp(X)).sum(1)
 
 
-def solve_regime(df, target, K=6, test_frac=0.3, steps=1500, seed=0, verbose=True):
-    Xs, y, tri, tei, names = _split_std(df, target, test_frac, seed)
+def fit_regime(Xs, y, tri, tei, K=6, steps=1500, seed=0):
+    """Mixture-of-linear-experts: gate discovers regimes, linear model per regime. Returns pred_tei.
+    Shared-split version for run-both integration."""
     torch.manual_seed(seed); rng = np.random.default_rng(seed)
     ii = rng.permutation(len(tri)); c = int(0.85 * len(tri)); a, v = tri[ii[:c]], tri[ii[c:]]
     ym = float(y[a].mean()); ys = float(y[a].std()) + 1e-6
@@ -106,11 +113,13 @@ def solve_regime(df, target, K=6, test_frac=0.3, steps=1500, seed=0, verbose=Tru
     if best_state:
         model.load_state_dict(best_state)
     with torch.no_grad():
-        pred = model(Xte).numpy() * ys + ym
-        reg = torch.softmax(model.gate(torch.tensor(Xs[tri])), 1).argmax(1).numpy()
-    rmse = math.sqrt(((pred - y[tei]) ** 2).mean())
-    sizes = np.bincount(reg, minlength=K)
-    return {"rmse": round(rmse, 3), "K": K, "regime_sizes": sizes.tolist(),
+        return model(Xte).numpy() * ys + ym
+
+
+def solve_regime(df, target, K=6, test_frac=0.3, steps=1500, seed=0, verbose=True):
+    Xs, y, tri, tei, names = _split_std(df, target, test_frac, seed)
+    pred = fit_regime(Xs, y, tri, tei, K, steps, seed)
+    return {"rmse": round(math.sqrt(((pred - y[tei]) ** 2).mean()), 3), "K": K,
             "baseline": round(math.sqrt(((y[tri].mean() - y[tei]) ** 2).mean()), 3)}
 
 

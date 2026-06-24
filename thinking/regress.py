@@ -193,6 +193,20 @@ def solve_regression(df, target, id_col=None, test_frac=0.3, ensemble=15, seed=0
     except Exception as e:  # noqa
         if verbose:
             print(f"  (progsynth skipped: {e})")
+    try:                                                             # 4th/5th: analogy + discovered regimes
+        from thinking import reason_modes
+        mu_ = X[tri].mean(0); sd_ = X[tri].std(0); sd_[sd_ < 1e-6] = 1.0
+        Xstd = ((X - mu_) / sd_).astype(np.float32); y32 = y.astype(np.float32)
+        if verbose:
+            print("  [reason-analogy/regime] learned-metric analogy + discovered regimes...")
+        cand["reasoning_analogy"], _ = reason_modes.fit_analogy(Xstd, y32, tri, tei, names, seed=seed)
+        cand["reasoning_regime"] = reason_modes.fit_regime(Xstd, y32, tri, tei, seed=seed)
+    except Exception as e:  # noqa
+        if verbose:
+            print(f"  (analogy/regime skipped: {e})")
+    rmodes = [k for k in cand if k.startswith("reasoning")]          # ENSEMBLE of all reasoning modes
+    if len(rmodes) > 1:
+        cand["reasoning_ensemble"] = np.mean([cand[k] for k in rmodes], 0)
     rmse = {k: _rmse(v, yte) for k, v in cand.items()}
     winner = min(rmse, key=rmse.get)
     conf = psd <= np.quantile(psd, 0.8)                              # confident = bottom-80% ensemble disagreement
