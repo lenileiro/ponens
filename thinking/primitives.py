@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 
 from thinking.azr_win import (_conj, apply_rule, boost_clf_proba, boost_multi_predict, explain_selective,  # noqa
-                              predict_calibrated, predict_selective, reason_adaptive_ucb, reason_boost_clf,
+                              predict_calibrated, predict_selective, reason_adaptive, reason_boost_clf,
                               reason_boost_multi, reason_selective_cv, reason_tree_rule, render_boost)
 
 
@@ -395,11 +395,11 @@ def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99
     rule_mode = "dnf"
     if _cc(pos_t, neg_t) > _cc(pos, neg):
         pos, neg, rule_mode = pos_t, neg_t, "tree-paths"
-    if adaptive:                                                      # think-harder: UCB-budgeted escalation on residual
+    if adaptive:                                                      # think-harder: complete escalation on the residual
         if verbose:
-            print("  [adaptive] UCB-budgeted search escalation on the abstained residual...")
-        pos, neg = reason_adaptive_ucb(Xtr, ytr, seed_pos=pos, seed_neg=neg, min_prec_pos=min_prec,
-                                       min_prec_neg=min_prec, seed=seed, names=names, verbose=verbose)
+            print("  [adaptive] escalating complete verified search on the abstained residual...")
+        pos, neg = reason_adaptive(Xtr, ytr, seed_pos=pos, seed_neg=neg, min_prec_pos=min_prec,
+                                   min_prec_neg=min_prec, seed=seed, names=names, verbose=verbose)
         rule_mode = "adaptive"
     if tau is not None:                                              # calibrated mode: relaxed rules + tau gate
         ml = max(4, len(tri) // 100)
