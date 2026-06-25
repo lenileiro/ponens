@@ -31,12 +31,41 @@ def _top_var(df, cols, k):
     return sorted(cols, key=lambda c: -v[c])[:k]
 
 
+def _column_groups(df, cols, max_card=15):
+    """Group columns that share the same value DOMAIN -- parallel measurements (card ranks, suits, dice faces,
+    Likert survey items). Counts/multiplicities WITHIN such a group are meaningful (a 'pair' = a value appearing
+    in 2 of the group's columns), whereas counting across unrelated columns conflates incomparable values."""
+    groups = {}
+    for c in cols:
+        u = df[c].dropna().unique()
+        if 2 <= len(u) <= max_card:
+            key = frozenset(np.round(u.astype(float), 4)) if pd.api.types.is_numeric_dtype(df[c]) else frozenset(map(str, u))
+            groups.setdefault(key, []).append(c)
+    return [g for g in groups.values() if len(g) >= 2]
+
+
+def _group_primitives(df, cols):
+    """GROUP-AWARE counts: within each same-domain column group, count(==v), within-group n-distinct, and max
+    multiplicity (the largest count any single value attains in a row). max-multiplicity is the general
+    pair/trips/quad detector (poker: rank-group maxmult=2/3/4; suit-group count==5 / ndistinct==1 = flush)."""
+    cands = []
+    for g in _column_groups(df, cols):
+        M = df[g].values; vals = list(pd.unique(M.ravel()))[:15]; tag = f"{g[0]}..{g[-1]}"
+        cnts = np.stack([(M == v).sum(1) for v in vals], 1)             # (n, |vals|) value-counts per row
+        for j, v in enumerate(vals):
+            cands.append((f"grpcount({tag}=={v})", cnts[:, j].astype(float)))
+        cands.append((f"grpmaxmult({tag})", cnts.max(1).astype(float)))   # pair=2, trips=3, quad=4
+        cands.append((f"grpndistinct({tag})", (cnts > 0).sum(1).astype(float)))
+    return cands
+
+
 def candidate_primitives(df, cols, max_pair_cols=40):
     """Generate derived-feature candidates (name, float array) from the feature library:
-    count(==v) across columns, parity of a count, column-equality, row n-distinct, numeric pair sum/diff.
-    Pairwise primitives (O(D^2)) are capped to the top-`max_pair_cols` columns by variance so the library stays
-    bounded on wide data; the O(D) count/parity/ndistinct primitives still range over all columns."""
-    cands = []
+    count(==v) across columns, parity of a count, column-equality, row n-distinct, numeric pair sum/diff, and
+    GROUP-AWARE counts/multiplicities over same-domain column groups (parallel measurements; the pair/trips/
+    flush detectors). Pairwise primitives (O(D^2)) are capped to the top-`max_pair_cols` columns by variance so
+    the library stays bounded on wide data; the O(D) count/parity/ndistinct primitives still range over all."""
+    cands = list(_group_primitives(df, cols))
     discrete = [c for c in cols if df[c].nunique() <= 12]
     numeric = [c for c in cols if pd.api.types.is_numeric_dtype(df[c]) and df[c].nunique() > 12]
     if len(discrete) >= 2:
