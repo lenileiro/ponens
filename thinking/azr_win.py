@@ -749,53 +749,74 @@ def reason_selective_cv(X, y, proposer=None, device="cpu", seed=0, folds=5, buil
     return pos, neg
 
 
-def reason_adaptive(X, y, ladder=None, min_prec_pos=0.99, min_prec_neg=0.99, holdout=0.3,
-                    seed_pos=None, seed_neg=None, seed=0, names=None, verbose=False):
-    """ADAPTIVE TEST-TIME SEARCH ('think harder where it abstains'). Run a cheap verified pass, then ESCALATE
-    the search budget (finer thresholds -> deeper conjunctions -> exhaustive enumeration) but ONLY on the
-    RESIDUAL: the rows the current rule leaves uncovered (= where predict_selective would abstain). Each rung
-    enumerates pure conjuncts over {residual-positives + all-negatives} so the hard subproblem stays small and
-    even max_lit=5 exhaustive is cheap; every added clause is still HELD-OUT-VERIFIED pure. Result: coverage
-    rises at FIXED precision, and we only pay the expensive search on the instances that need it.
-
-    Distinct from `tau`: tau RELAXES the precision bar to answer more; this SPENDS SEARCH to find genuinely
-    verified rules for the hard region. Returns two-sided (pos, neg) rules in azr_win's standard clause format."""
-    if ladder is None:
-        ladder = [dict(nq=9,  max_lit=3, max_lits=40, min_support=10),    # cheap pass
-                  dict(nq=17, max_lit=4, max_lits=60, min_support=5),     # escalate: finer + deeper
-                  dict(nq=29, max_lit=5, max_lits=60, min_support=3)]     # exhaustive on the small residual
-    rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); c = int((1 - holdout) * len(y))
-    fit, ver = idx[:c], idx[c:]
+def reason_adaptive_ucb(X, y, budget=40, max_depth=5, keep_arms=12, min_prec_pos=0.99, min_prec_neg=0.99,
+                        holdout=0.3, c=1.4, seed_pos=None, seed_neg=None, seed=0, names=None, verbose=False):
+    """ADAPTIVE TEST-TIME SEARCH ('think harder where it abstains') with a UCB budget allocator. Escalate
+    verified search on the abstained RESIDUAL (rows the current rule leaves uncovered) at FIXED precision, but
+    instead of escalating UNIFORMLY across the whole residual it treats each promising SEED LITERAL (per side)
+    as a bandit ARM. A 'pull' runs a small exhaustive search restricted to that literal's region (rows where it
+    holds) and returns reward = newly-covered residual; UCB1
+    concentrates the budget on seeds that pay off and starves barren ones, and a productive arm escalates its
+    depth on repeated pulls. Completeness is preserved WITHIN each arm's local exhaustive (combination-locks
+    reachable from a productive seed are still found); we just stop paying exhaustive on dead residual. Returns
+    two-sided (pos, neg). budget = max exhaustive pulls (the speed knob)."""
+    rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); cc = int((1 - holdout) * len(y))
+    fit, ver = idx[:cc], idx[cc:]
     Xf, yf, Xv, yv = X[fit], y[fit], X[ver], y[ver]
-    pos = list(seed_pos) if seed_pos else []                         # start from the cheap pass -> only ADD (monotone)
-    neg = list(seed_neg) if seed_neg else []
-    for stage, cfg in enumerate(ladder):
-        added = 0
-        for is_one, store, minp in [(1, pos, min_prec_pos), (0, neg, min_prec_neg)]:
-            ys = (yf == is_one).astype(int); yvs = (yv == is_one).astype(int)
-            cov = apply_rule(store, Xf).astype(bool)                      # rows this side already explains
-            resid = (ys == 1) & ~cov                                     # the abstained positives = the residual
-            if not resid.any():
+    pos = list(seed_pos) if seed_pos else []; neg = list(seed_neg) if seed_neg else []
+    store = {1: pos, 0: neg}; minp = {1: min_prec_pos, 0: min_prec_neg}
+
+    def residual(is_one):
+        return (yf == is_one) & ~apply_rule(store[is_one], Xf).astype(bool)
+
+    arms = []                                                        # seed-literal arms across BOTH sides
+    for is_one in (1, 0):
+        ys = (yf == is_one).astype(int); res = residual(is_one)
+        if not res.any():
+            continue
+        lits = _lits(Xf, nq=15, y=ys)
+        for L in _prefilter_lits(Xf, ys, lits, keep_arms):           # top seed literals by univariate signal
+            if int((_sat(L, Xf) & res).sum()) >= 2:
+                arms.append({"side": is_one, "lit": L, "n": 0, "rew": 0.0, "d": 2, "dead": False})
+
+    def pull(a):
+        is_one = a["side"]; ys = (yf == is_one).astype(int); yvs = (yv == is_one).astype(int); mp = minp[is_one]
+        res = residual(is_one); Lm = _sat(a["lit"], Xf)
+        sub = (res & Lm) | ((ys == 0) & Lm)                          # this seed's region: its residual pos + its negs
+        a["d"] = min(max_depth, a["d"] + (1 if a["n"] else 0))       # escalate depth on repeat pulls
+        if not res.any() or int(sub.sum()) < 6:
+            a["dead"] = True; return 0.0
+        Xs, yss = Xf[sub], ys[sub]
+        lits = _prefilter_lits(Xs, yss, _lits(Xs, nq=15, y=yss), 30)
+        gained = 0; found = 0
+        for conj in _enum_pure_conjuncts(Xs, yss, lits, a["d"], mp, 3):
+            clause = [a["lit"]] + [l for l in conj if l != a["lit"]]   # the global clause = seed AND conjunct
+            firef = apply_rule([clause], Xf).astype(bool); new = firef & res
+            if not new.any():
                 continue
-            sub = resid | (ys == 0)                                       # residual positives + all negatives
-            Xs, yss = Xf[sub], ys[sub]
-            lits = _prefilter_lits(Xs, yss, _lits(Xs, nq=cfg["nq"], y=yss), cfg["max_lits"])
-            for conj in _enum_pure_conjuncts(Xs, yss, lits, cfg["max_lit"], minp, cfg["min_support"]):
-                firef = apply_rule([conj], Xf).astype(bool)
-                if not (firef & resid).any():                            # must explain NEW residual rows
-                    continue
-                firev = apply_rule([conj], Xv).astype(bool); nv = int(firev.sum())
-                precv = float(yvs[firev].mean()) if nv else 0.0
-                if nv >= 2 and precv >= minp:                            # held-out-verified -> precision held
-                    store.append({"conj": conj, "prec": precv, "support": nv})
-                    cov = cov | firef; resid = (ys == 1) & ~cov; added += 1
-        if verbose:
-            rp = int(((yf == 1) & ~apply_rule(pos, Xf).astype(bool)).sum())
-            rn = int(((yf == 0) & ~apply_rule(neg, Xf).astype(bool)).sum())
-            print(f"  stage {stage} (nq={cfg['nq']}, max_lit={cfg['max_lit']}): +{added} verified clauses; "
-                  f"residual uncovered pos {rp} / neg {rn}")
-        if added == 0 and stage > 0:                                     # escalation found nothing new -> signal exhausted
+            firev = apply_rule([clause], Xv).astype(bool); nv = int(firev.sum())
+            precv = float(yvs[firev].mean()) if nv else 0.0
+            if nv >= 2 and precv >= mp:                              # held-out-verified -> precision held
+                store[is_one].append({"conj": clause, "prec": precv, "support": nv})
+                gained += int(new.sum()); found += 1; res = residual(is_one)
+        if found == 0 and a["n"] > 0:
+            a["dead"] = True
+        return gained / max(1, int((yf == is_one).sum()))           # reward = fraction of side-positives newly covered
+
+    pulls = 0
+    for a in arms:                                                   # UCB1 seeding: one pull per arm (budget allowing)
+        if pulls >= budget:
             break
+        a["rew"] += pull(a); a["n"] = 1; pulls += 1
+    while pulls < budget:
+        live = [a for a in arms if not a["dead"]]
+        if not live:
+            break
+        tot = sum(a["n"] for a in arms)
+        a = max(live, key=lambda a: a["rew"] / a["n"] + c * math.sqrt(math.log(tot + 1) / a["n"]))
+        a["rew"] += pull(a); a["n"] += 1; pulls += 1
+    if verbose:
+        print(f"  ucb: {pulls} pulls over {len(arms)} seed-arms -> {len(pos)} pos / {len(neg)} neg clauses")
     pos = compress_rules(pos, X, (y == 1)); neg = compress_rules(neg, X, (y == 0))
     return pos, neg
 
