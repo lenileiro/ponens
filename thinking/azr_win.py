@@ -698,7 +698,7 @@ def _prefilter_lits(X, y, lits, keep):
 
 def reason_selective_cv(X, y, proposer=None, device="cpu", seed=0, folds=5, build=None,
                         min_prec_pos=0.99, min_prec_neg=1.0, min_support=15, exhaustive=False,
-                        compress=False, verbose=True):
+                        compress=False, disc_cap=40000, verbose=True):
     """Raise the safe-coverage ceiling with MULTI-FOLD (bagged) verification. (1) DISCOVER candidate clauses
     from every fold's training portion (union -> more of the space found). (2) VERIFY each candidate across
     ALL folds: keep it only if it stays pure (>= min_precision) in every fold it fires in, fires in >=2 folds,
@@ -709,13 +709,18 @@ def reason_selective_cv(X, y, proposer=None, device="cpu", seed=0, folds=5, buil
     rng = np.random.default_rng(seed); idx = rng.permutation(len(y))
     fid = np.empty(len(y), int); fid[idx] = np.arange(len(y)) % folds              # fold id per row
     cand_pos, cand_neg = {}, {}
-    if exhaustive:                                  # DISCOVER ONCE on full data (CV-verify below gives robustness)
-        lits = _lits(X, nq=build.get("nq", 9), binary_presence_only=build.get("binary_presence_only", False), y=y)
-        lits = _prefilter_lits(X, y, lits, build.get("max_lits", None))
+    if exhaustive:                                  # DISCOVER on a row SAMPLE (big n), then CV-VERIFY on FULL data
+        if len(y) > disc_cap:                       # cap the O(candidates x n) enumeration; verify() still uses full n
+            ds = rng.choice(len(y), disc_cap, replace=False); Xd, yd = X[ds], y[ds]
+            ms = max(2, int(min_support * disc_cap / len(y)))   # scale support to the sample (verify enforces full)
+        else:
+            Xd, yd, ms = X, y, min_support
+        lits = _lits(Xd, nq=build.get("nq", 9), binary_presence_only=build.get("binary_presence_only", False), y=yd)
+        lits = _prefilter_lits(Xd, yd, lits, build.get("max_lits", None))
         mlit = build.get("max_lit", 3)
-        for conj in _enum_pure_conjuncts(X, y, lits, mlit, min_prec_pos, min_support):
+        for conj in _enum_pure_conjuncts(Xd, yd, lits, mlit, min_prec_pos, ms):
             cand_pos[tuple(conj)] = conj
-        for conj in _enum_pure_conjuncts(X, 1 - y, lits, mlit, min_prec_neg, min_support):
+        for conj in _enum_pure_conjuncts(Xd, 1 - yd, lits, mlit, min_prec_neg, ms):
             cand_neg[tuple(conj)] = conj
     else:
         for k in range(folds):
