@@ -183,10 +183,15 @@ def rank_score(ranker, col, y):
 
 def _featmat(df, base_cols, derived):
     """One-hot categorical/low-card base cols (-> per-value presence literals, the right form for rule
-    learning at any cardinality), keep high-card numerics as-is, append derived primitive columns."""
-    cat = [c for c in base_cols if (not pd.api.types.is_numeric_dtype(df[c])) or df[c].nunique() <= 12]
-    num = [c for c in base_cols if c not in cat]
+    learning at any cardinality), keep high-card numerics as-is, append derived primitive columns. Already-binary
+    {0,1} columns (e.g. bag-of-words presence) are kept AS-IS -- one-hot would double them into redundant
+    col=0/col=1 pairs and mangle rule names; a single presence column reads cleanly ('has_free==1')."""
+    binary = [c for c in base_cols if pd.api.types.is_numeric_dtype(df[c]) and set(pd.unique(df[c].dropna())) <= {0, 1}]
+    cat = [c for c in base_cols if c not in binary and ((not pd.api.types.is_numeric_dtype(df[c])) or df[c].nunique() <= 12)]
+    num = [c for c in base_cols if c not in cat and c not in binary]
     blocks, names = [], []
+    if binary:
+        blocks.append(df[binary].values.astype(float)); names += list(binary)   # presence already -> keep single col
     if cat:
         oh = pd.get_dummies(df[cat].astype(str))
         blocks.append(oh.values.astype(float)); names += [str(c).replace("_", "=") for c in oh.columns]
