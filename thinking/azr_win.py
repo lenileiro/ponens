@@ -995,6 +995,54 @@ def boost_multi_predict(models, X):
     return np.array(classes, dtype=object)[P.argmax(1)], P.max(1), P
 
 
+def _softmax(F):
+    e = np.exp(F - F.max(1, keepdims=True)); return e / e.sum(1, keepdims=True)
+
+
+def reason_boost_softmax(X, y, classes=None, holdout=0.3, lr=0.2, rounds=150, depth=3, min_leaf=20,
+                         sub=0.7, mf=0.7, patience=25, lam=1.0, seed=0):
+    """MULTINOMIAL (softmax) gradient boosting -- the many-class fix for one-vs-rest. Each round fits ONE shallow
+    CART tree PER CLASS to the COUPLED softmax residual (y_onehot - softmax(F)): because p_k depends on every
+    class's score, the gradients are jointly normalized and the trees correct each other across classes (vs
+    independent OVR models). Newton leaf weights use the multinomial Hessian p(1-p). Held-out multiclass
+    log-loss early-stop = the verifier. Returns (base[K], lr, trees=[(k,tree)...], classes). In-house."""
+    classes = list(classes) if classes is not None else sorted(set(np.asarray(y).tolist()))
+    K = len(classes); ci = {c: i for i, c in enumerate(classes)}
+    yi = np.array([ci[v] for v in np.asarray(y).tolist()])
+    rng = np.random.default_rng(seed); idx = rng.permutation(len(yi)); c = int((1 - holdout) * len(yi))
+    fit, ver = idx[:c], idx[c:]
+    Xf, yf, Xv, yv = X[fit], yi[fit], X[ver], yi[ver]
+    D = X.shape[1]; nfeat = max(1, int(mf * D)); rm = np.random.default_rng(seed * 17 + 1)
+    cnt = np.bincount(yf, minlength=K).astype(float); base = np.log(np.clip(cnt / cnt.sum(), 1e-6, 1))
+    Ff = np.tile(base, (len(fit), 1)); Fv = np.tile(base, (len(ver), 1)); Yf = np.eye(K)[yf]
+    def ll(F, yidx):
+        p = np.clip(_softmax(F), 1e-9, 1); return float(-np.log(p[np.arange(len(yidx)), yidx]).mean())
+    best = ll(Fv, yv); trees = []; keep = 0; bad = 0
+    for _ in range(rounds):
+        pf = _softmax(Ff); s = rm.random(len(fit)) < sub; feats = rm.choice(D, nfeat, replace=False)
+        for k in range(K):
+            t = _fit_tree(Xf[s], (Yf[:, k] - pf[:, k])[s], depth, min_leaf, feats)   # negative gradient
+            t = _newton_leaves(t, Xf[s], (pf[:, k] - Yf[:, k])[s], (pf[:, k] * (1 - pf[:, k]))[s], lam)
+            Ff[:, k] += lr * _tree_pred(t, Xf); Fv[:, k] += lr * _tree_pred(t, Xv); trees.append((k, t))
+        r = ll(Fv, yv)
+        if r < best - 1e-6:
+            best = r; keep = len(trees); bad = 0
+        else:
+            bad += 1
+            if bad >= patience:
+                break
+    return (base, lr, trees[:keep], classes)
+
+
+def boost_softmax_predict(model, X):
+    """Argmax-softmax prediction + calibrated confidence. Full coverage."""
+    base, lr, trees, classes = model; F = np.tile(base, (len(X), 1))
+    for k, t in trees:
+        F[:, k] += lr * _tree_pred(t, X)
+    P = _softmax(F)
+    return np.array(classes, dtype=object)[F.argmax(1)], P.max(1), P
+
+
 def _gen_rule_task(rng, F, n):
     X = np.stack([rng.normal(0, 1, n) if rng.random() < 0.6 else rng.integers(0, 3, n) for _ in range(F)], 1).astype(np.float32)
     nd = int(rng.integers(1, 4)); y = np.zeros(n, bool)
