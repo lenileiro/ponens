@@ -26,23 +26,39 @@ import torch.nn.functional as F
 POOL = [f"w{i}" for i in range(400)]
 READABLE = "Trent Cairo Lima Berlin poet sailor banker 1931 1955 1908 five three seven Maria".split()  # held-out, readable demo
 POOL_TR, POOL_TE = POOL[:300], POOL[300:] + READABLE
-FRAME = "was born in during worked as a had children where when what did do how many have ? .".split()
+
+# Each fact has MULTIPLE passage templates (paraphrase) and MULTIPLE question phrasings; a per-fact distinctive
+# preposition (in / during / as / had) keeps place vs year vs job vs count answerable with random tokens, while
+# everything else varies -> the model must learn the QUESTION->ROLE mapping, not a single frame.
+TEMPLATES = {
+    "place": (["{e} was born in {v} .", "{e} grew up in {v} .", "{e} settled in {v} ."],
+              ["where was {e} born ?", "what is the birthplace of {e} ?", "where did {e} grow up ?"]),
+    "year":  (["{e} was born during {v} .", "{e} was alive during {v} ."],
+              ["when was {e} born ?", "in what year was {e} born ?", "when did {e} live ?"]),
+    "job":   (["{e} worked as a {v} .", "{e} served as a {v} .", "{e} trained as a {v} ."],
+              ["what did {e} do ?", "what was the job of {e} ?", "what profession did {e} have ?"]),
+    "count": (["{e} had {v} children .", "{e} raised {v} children ."],
+              ["how many children did {e} have ?", "what was the number of children of {e} ?"]),
+}
+FRAME = sorted({w for pt, qt in TEMPLATES.values() for s in pt + qt for w in s.split()
+                if not w.startswith("{")} | {"?", "."})
 
 
-def gen_example(rng, test=False):
-    """A passage about an entity (place/year/job/count facts) in RANDOM sentence order + (question, answer)
-    pairs. All slot values are random generic tokens, so the answer can only be found by frame structure."""
+def gen_example(rng, test=False, n_entities=1):
+    """A passage about SEVERAL entities (each with place/year/job/count facts), sentences shuffled together +
+    (question, answer) pairs. The question must be matched to the RIGHT entity AND the right fact frame; all
+    values are random tokens so only structure + entity-matching can answer. Paraphrased questions/sentences."""
     pool = POOL_TE if test else POOL_TR
-    name, place, year, job, n = (pool[i] for i in rng.choice(len(pool), 5, replace=False))
-    facts = {                                                    # structurally DISTINCT frames (in/during/as/had)
-        "born_place": (f"{name} was born in {place} .", place, f"where was {name} born ?"),
-        "born_year":  (f"{name} was born during {year} .", year,  f"when was {name} born ?"),
-        "job":        (f"{name} worked as a {job} .", job,    f"what did {name} do ?"),
-        "children":   (f"{name} had {n} children .", n,       f"how many children did {name} have ?"),
-    }
-    keys = list(facts); order = rng.permutation(len(keys))
-    passage = " ".join(facts[keys[i]][0] for i in order)
-    qa = [(facts[k][2].split(), facts[k][1]) for k in keys]
+    idxs = rng.choice(len(pool), n_entities * 5, replace=False); toks = [pool[i] for i in idxs]
+    sents, qa = [], []
+    for e in range(n_entities):
+        name = toks[e * 5]; vals = toks[e * 5 + 1:e * 5 + 5]
+        for ft, v in zip(("place", "year", "job", "count"), vals):
+            ptemps, qtemps = TEMPLATES[ft]
+            sents.append(ptemps[rng.integers(len(ptemps))].format(e=name, v=v))
+            qa.append((qtemps[rng.integers(len(qtemps))].format(e=name).split(), v))
+    order = rng.permutation(len(sents))
+    passage = " ".join(sents[i] for i in order)
     return passage.split(), qa
 
 
@@ -55,26 +71,29 @@ def build_vocab():
 
 
 class SpanReader(nn.Module):
-    """Bidirectional transformer encoder + a per-position pointer score. Reads [question [SEP] passage] and
-    scores every PASSAGE position; softmax over positions = where the answer is. Pure learned attention --
-    no lexical rules."""
-    def __init__(self, vocab, d=96, layers=2, heads=4, max_len=80):
+    """Bidirectional transformer encoder + a QUESTION-CONDITIONED pointer (pointer-network attention): the
+    question is summarized into a query vector, and each PASSAGE position is scored by learned compatibility
+    (query . key) with it. This lets the model COMPARE each candidate to what the question asks -- needed to
+    bind the answer to the RIGHT entity in a multi-entity passage. Pure learned attention, no lexical rules."""
+    def __init__(self, vocab, d=128, layers=4, heads=4, max_len=96):
         super().__init__()
         self.emb = nn.Embedding(vocab, d, padding_idx=0)
         self.pos = nn.Embedding(max_len, d)
         layer = nn.TransformerEncoderLayer(d, heads, dim_feedforward=4 * d, batch_first=True, dropout=0.0)
         self.enc = nn.TransformerEncoder(layer, layers)
-        self.ptr = nn.Linear(d, 1)
+        self.q_proj = nn.Linear(d, d); self.k_proj = nn.Linear(d, d); self.scale = d ** 0.5
 
     def forward(self, ids, pad_mask, pass_mask):
         x = self.emb(ids) + self.pos(torch.arange(ids.shape[1], device=ids.device))[None]
         h = self.enc(x, src_key_padding_mask=~pad_mask)
-        score = self.ptr(h).squeeze(-1)                          # (B, L) per-position pointer logit
-        score = score.masked_fill(~pass_mask, -1e9)             # only passage positions are valid answers
-        return score
+        qmask = (pad_mask & ~pass_mask).float()[..., None]      # question tokens (incl SEP), not passage/pad
+        qsum = (h * qmask).sum(1) / qmask.sum(1).clamp(min=1.0)  # (B, d) question summary
+        q = self.q_proj(qsum)[:, None]; k = self.k_proj(h)      # (B,1,d), (B,L,d)
+        score = (q * k).sum(-1) / self.scale                    # (B, L) question-conditioned pointer logit
+        return score.masked_fill(~pass_mask, -1e9)              # only passage positions are valid answers
 
 
-def _encode(qtoks, ptoks, vocab, max_len=80):
+def _encode(qtoks, ptoks, vocab, max_len=96):
     ids = [vocab.get(t, 0) for t in qtoks] + [vocab["[SEP]"]] + [vocab.get(t, 0) for t in ptoks]
     pstart = len(qtoks) + 1
     passpos = list(range(pstart, pstart + len(ptoks)))
@@ -82,7 +101,7 @@ def _encode(qtoks, ptoks, vocab, max_len=80):
     return ids, pstart, passpos
 
 
-def _batch(rng, vocab, bs, test=False, max_len=80):
+def _batch(rng, vocab, bs, test=False, max_len=96):
     IDS, PAD, PASS, GOLD = [], [], [], []
     for _ in range(bs):
         ptoks, qa = gen_example(rng, test)
@@ -139,12 +158,12 @@ def answer(model, vocab, passage, question):
 
 
 def selftest():
-    model, vocab = train(steps=1500, d=64, seed=0, verbose=False)
+    model, vocab = train(steps=2500, d=96, seed=0, verbose=False)
     seen = evaluate(model, vocab, n=200, test=False)
-    held = evaluate(model, vocab, n=200, test=True)           # disjoint names/places/years -> structure, not memory
-    print(f"qa selftest: train-pool {seen:.3f} | HELD-OUT pool {held:.3f} (chance ~0.25-0.5)")
+    held = evaluate(model, vocab, n=200, test=True)           # disjoint pool -> structure+paraphrase, not memory
+    print(f"qa selftest: train-pool {seen:.3f} | HELD-OUT pool {held:.3f} (chance ~0.3)")
     assert held > 0.85, f"held-out QA too low: {held}"
-    print("qa selftest OK (learned to point to the answer span; generalizes to unseen tokens, no hardcoded rules)")
+    print("qa selftest OK (learned to answer paraphrased questions on unseen tokens; no hardcoded rules)")
     return 0
 
 
@@ -157,9 +176,10 @@ def main(argv=None):
     model, vocab = train(steps=a.steps)
     print(f"\nheld-out-pool QA accuracy: {evaluate(model, vocab, test=True):.3f}")
     # answer a fresh passage (unseen entity), to show it reads + answers
-    p = "Maria was born in Lima . Maria worked as a banker . Maria had three children . Maria was born during 1955 ."
+    p = "Maria settled in Lima . Maria served as a banker . Maria raised three children . Maria was alive during 1955 ."
     print("\nPASSAGE (held-out entity/words, never seen in training): " + p)
-    for q in ["where was Maria born ?", "what did Maria do ?", "how many children did Maria have ?", "when was Maria born ?"]:
+    for q in ["what is the birthplace of Maria ?", "what profession did Maria have ?",
+              "how many children did Maria have ?", "in what year was Maria born ?"]:   # paraphrased questions
         print(f"  Q: {q}\n  A: {answer(model, vocab, p, q)}")
     return 0
 
