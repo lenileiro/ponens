@@ -339,6 +339,7 @@ def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99
             print(f"  [select] {len(base_cols)} of many columns kept (top |corr| with target)")
     rng = np.random.default_rng(seed); idx = rng.permutation(len(df)); cut = int((1 - test_frac) * len(df))
     tri, tei = idx[:cut], idx[cut:]
+    trip = tri if len(tri) <= 60000 else rng.choice(tri, 60000, replace=False)   # cap rows for feature discovery
     if ranker is None:
         if verbose:
             print("  [learn-to-rank] training primitive-ranker via self-play (zero data)...")
@@ -350,7 +351,7 @@ def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99
         names_chosen = []
         for c in classes:                                            # discover primitives per class, union
             dfc = df.copy(); dfc["__y__"] = (df[target].values == c).astype(int)
-            ch, _ = propose(dfc.iloc[tri].reset_index(drop=True), "__y__", base_cols, ranker=ranker,
+            ch, _ = propose(dfc.iloc[trip].reset_index(drop=True), "__y__", base_cols, ranker=ranker,
                             rounds=1, compose=compose, verbose=False)
             names_chosen += [x[0] for x in ch if x[0] not in names_chosen]
         Xfull, names = _build_features(df, base_cols, names_chosen)
@@ -398,7 +399,7 @@ def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99
 
     if verbose:                                                      # ---- binary: two-sided + explanations ----
         print("  [propose] verified primitive discovery...")
-    chosen, _ = propose(df.iloc[tri].reset_index(drop=True), target, base_cols, ranker=ranker, compose=compose, verbose=verbose)
+    chosen, _ = propose(df.iloc[trip].reset_index(drop=True), target, base_cols, ranker=ranker, compose=compose, verbose=verbose)
     names_chosen = [c[0] for c in chosen]
     Xfull, names = _build_features(df, base_cols, names_chosen)        # build on FULL df -> consistent columns
     Xtr, Xte = Xfull[tri], Xfull[tei]

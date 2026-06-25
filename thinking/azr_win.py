@@ -866,11 +866,22 @@ def _newton_leaves(tree, X, g, h, lam):
             _newton_leaves(rt, X[~m], g[~m], h[~m], lam))
 
 
+def _cap_rows(X, y, cap, seed):
+    """Subsample to `cap` rows for boosting on big data. _best_split sorts every feature per node (O(n log n)),
+    so multi-million-row fitting is impractical; a large representative sample generalizes fine for the
+    full-coverage boosted predictor (the smooth additive boundary needs far fewer than millions of points)."""
+    if cap is None or len(y) <= cap:
+        return X, y
+    s = np.random.default_rng(seed * 7 + 3).choice(len(y), cap, replace=False)
+    return X[s], y[s]
+
+
 def reason_boost(X, y, holdout=0.3, lr=0.05, n_terms=700, depth=3, min_leaf=20, sub=0.7, mf=0.7,
-                 patience=30, seed=0):
+                 patience=30, fit_cap=150000, seed=0):
     """Verified STOCHASTIC rule-boosting: iterate-on-residual, each term a shallow CART tree fit on a random
     row (sub) + feature (mf) subsample, kept while it improves the HELD-OUT split (early stop = the verifier).
     Returns a model (base, lr, trees) -- an additive program of interpretable if-then rules. In-house."""
+    X, y = _cap_rows(X, y, fit_cap, seed)                            # bound fitting cost on big data
     rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); c = int((1 - holdout) * len(y))
     fit, ver = idx[:c], idx[c:]
     Xf, yf, Xv, yv = X[fit], y[fit], X[ver], y[ver]
@@ -921,10 +932,11 @@ def _tree_paths(tree, cond=()):
     yield from _tree_paths(rt, cond + ((j, ">", float(t)),))
 
 
-def reason_tree_rule(X, y, depth=4, min_leaf=20, min_purity=0.9, min_support=10, holdout=0.3, seed=0):
+def reason_tree_rule(X, y, depth=4, min_leaf=20, min_purity=0.9, min_support=10, holdout=0.3, fit_cap=150000, seed=0):
     """DNF from CART tree-PATHS: fit a shallow tree on the binary label, take root->leaf paths to class-1-pure
     leaves as conjunctions (tree-discovered, with optimal splits + interactions), and keep each only if it
     improves HELD-OUT accuracy (verified). Returns rules in azr_win's standard format (works with apply_rule)."""
+    X, y = _cap_rows(X, np.asarray(y), fit_cap, seed)                # bound the CART sort on big data
     rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); c = int((1 - holdout) * len(y))
     fit, ver = idx[:c], idx[c:]
     Xf, yf, Xv, yv = X[fit], y[fit].astype(float), X[ver], y[ver]
@@ -946,13 +958,14 @@ def reason_tree_rule(X, y, depth=4, min_leaf=20, min_purity=0.9, min_support=10,
 
 
 def reason_boost_clf(X, y, holdout=0.3, lr=0.1, n_terms=700, depth=3, min_leaf=20, sub=0.7, mf=0.7,
-                     patience=30, newton=True, lam=1.0, seed=0):
+                     patience=30, newton=True, lam=1.0, fit_cap=150000, seed=0):
     """Verified LOGISTIC rule-boosting (binary): iterate on the logistic residual, each term a shallow CART tree
     fit on a random row+feature subsample, KEPT only while it improves HELD-OUT log-loss (early stop = the
     verifier). With newton=True (XGBoost-style 2nd order) each leaf gets the Newton-optimal weight
     -sum(g)/(sum(h)+lambda) using the logistic Hessian h=p(1-p) -- properly scaled steps (big where the loss is
     flat, small where it's sharp), which closes the gap to GBM on overlapping data. Full coverage + calibrated
     probability + interpretable (render_boost). Returns (base_logit, lr, trees). In-house."""
+    X, y = _cap_rows(X, y, fit_cap, seed)                            # bound fitting cost on big data
     rng = np.random.default_rng(seed); idx = rng.permutation(len(y)); c = int((1 - holdout) * len(y))
     fit, ver = idx[:c], idx[c:]
     Xf, yf, Xv, yv = X[fit], y[fit].astype(float), X[ver], y[ver].astype(float)
@@ -1005,13 +1018,14 @@ def _softmax(F):
 
 
 def reason_boost_softmax(X, y, classes=None, holdout=0.3, lr=0.2, rounds=150, depth=3, min_leaf=20,
-                         sub=0.7, mf=0.7, patience=25, lam=1.0, seed=0):
+                         sub=0.7, mf=0.7, patience=25, lam=1.0, fit_cap=150000, seed=0):
     """MULTINOMIAL (softmax) gradient boosting -- the many-class fix for one-vs-rest. Each round fits ONE shallow
     CART tree PER CLASS to the COUPLED softmax residual (y_onehot - softmax(F)): because p_k depends on every
     class's score, the gradients are jointly normalized and the trees correct each other across classes (vs
     independent OVR models). Newton leaf weights use the multinomial Hessian p(1-p). Held-out multiclass
     log-loss early-stop = the verifier. Returns (base[K], lr, trees=[(k,tree)...], classes). In-house."""
     classes = list(classes) if classes is not None else sorted(set(np.asarray(y).tolist()))
+    X, y = _cap_rows(X, np.asarray(y), fit_cap, seed)                # bound fitting cost on big data
     K = len(classes); ci = {c: i for i, c in enumerate(classes)}
     yi = np.array([ci[v] for v in np.asarray(y).tolist()])
     rng = np.random.default_rng(seed); idx = rng.permutation(len(yi)); c = int((1 - holdout) * len(yi))
