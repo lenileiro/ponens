@@ -22,9 +22,20 @@ from thinking.azr_win import (_conj, apply_rule, boost_clf_proba, boost_multi_pr
                               reason_boost_multi, reason_selective_cv, reason_tree_rule, render_boost)
 
 
-def candidate_primitives(df, cols):
+def _top_var(df, cols, k):
+    """The k highest-variance columns (deterministic) -- bounds the O(D^2) pairwise primitive generation to
+    O(k^2) on wide data without dropping the informative columns."""
+    if len(cols) <= k:
+        return cols
+    v = {c: float(pd.to_numeric(df[c], errors="coerce").var() or 0.0) for c in cols}
+    return sorted(cols, key=lambda c: -v[c])[:k]
+
+
+def candidate_primitives(df, cols, max_pair_cols=40):
     """Generate derived-feature candidates (name, float array) from the feature library:
-    count(==v) across columns, parity of a count, column-equality, row n-distinct, numeric pair sum/diff."""
+    count(==v) across columns, parity of a count, column-equality, row n-distinct, numeric pair sum/diff.
+    Pairwise primitives (O(D^2)) are capped to the top-`max_pair_cols` columns by variance so the library stays
+    bounded on wide data; the O(D) count/parity/ndistinct primitives still range over all columns."""
     cands = []
     discrete = [c for c in cols if df[c].nunique() <= 12]
     numeric = [c for c in cols if pd.api.types.is_numeric_dtype(df[c]) and df[c].nunique() > 12]
@@ -35,10 +46,10 @@ def candidate_primitives(df, cols):
             cands.append((f"count(=={v})", cnt))
             if cnt.max() > 1:
                 cands.append((f"count(=={v})%2", (cnt % 2)))          # parity of a count (parity concepts)
-        for a, b in combinations(discrete, 2):                       # relational: col_i == col_j
+        for a, b in combinations(_top_var(df, discrete, max_pair_cols), 2):   # relational: col_i == col_j (capped)
             cands.append((f"({a}=={b})", (df[a].values == df[b].values).astype(float)))
         cands.append(("row_ndistinct", np.array([len(set(r)) for r in Dv], dtype=float)))
-    for a, b in combinations(numeric, 2):                            # numeric pair sums/diffs
+    for a, b in combinations(_top_var(df, numeric, max_pair_cols), 2):        # numeric pair sums/diffs (capped)
         cands.append((f"({a}-{b})", (df[a] - df[b]).astype(float).values))
         cands.append((f"({a}+{b})", (df[a] + df[b]).astype(float).values))
     return cands
@@ -243,6 +254,35 @@ def _build_features(df, base_cols, chosen_names):
     return _featmat(df, base_cols, derived)
 
 
+def _select_cols(df, target, base_cols, k, regression=False):
+    """Cheap verified-ish feature SELECTION for wide data: rank raw columns by max |correlation| with the
+    target (class indicators for classification, or the value itself for regression) -- vectorized over all
+    numeric columns at once -- and keep the top-k. This is the reasoner choosing which columns are worth
+    considering -- O(D*n), so the O(D^2) primitive/rule machinery downstream only ever sees a bounded column
+    set. Returns the kept column names (original order preserved)."""
+    if len(base_cols) <= k:
+        return base_cols
+    if regression:
+        yv = pd.to_numeric(df[target], errors="coerce").fillna(0.0).values.astype(float)
+        Y = (yv - yv.mean()).reshape(-1, 1)
+    else:
+        codes = df[target].astype("category").cat.codes.values
+        Y = np.eye(int(codes.max()) + 1)[codes]; Y = Y - Y.mean(0)            # centered class indicators
+    num = [c for c in base_cols if pd.api.types.is_numeric_dtype(df[c])]
+    score = {c: 0.0 for c in base_cols}
+    if num:
+        M = df[num].apply(pd.to_numeric, errors="coerce").fillna(0.0).values.astype(float)
+        M = (M - M.mean(0)) / (M.std(0) + 1e-9)
+        corr = np.abs(M.T @ Y) / len(df)                                      # (n_num, n_target_cols)
+        for c, s in zip(num, corr.max(1)):
+            score[c] = float(s)
+    for c in (set(base_cols) - set(num)):                                     # few categoricals: per-column proxy
+        codes = df[target].astype("category").cat.codes.values
+        score[c] = _cheap_score(df[c].astype("category").cat.codes.values, (codes == np.bincount(codes).argmax()).astype(int))
+    keep = set(sorted(base_cols, key=lambda c: -score[c])[:k])
+    return [c for c in base_cols if c in keep]                                # preserve original column order
+
+
 def _class_confidence(pos, X):
     """For a one-vs-rest 'is-class' rule: per-row (fired?, confidence = max firing-clause precision)."""
     fired = np.zeros(len(X), bool); conf = np.zeros(len(X))
@@ -252,7 +292,7 @@ def _class_confidence(pos, X):
     return fired, conf
 
 
-def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99, compose=True, tau=None, clf=None, adaptive=False, seed=0, verbose=True):
+def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99, compose=True, tau=None, clf=None, adaptive=False, max_cols=200, seed=0, verbose=True):
     """Capstone: one call on any tabular CLASSIFICATION dataset (binary or multiclass). Trains the
     primitive-ranker via self-play (if not given), proposes+verifies derived primitives, reasons verified
     rules (two-sided for binary; one-vs-rest for multiclass), and returns the rule(s), held-out
@@ -263,6 +303,10 @@ def solve_any(df, target, id_col=None, ranker=None, test_frac=0.3, min_prec=0.99
     classes = sorted(pd.unique(df[target].dropna()).tolist(), key=lambda x: str(x))
     if len(classes) < 2:
         raise ValueError(f"need >=2 classes; got {classes}")
+    if max_cols and len(base_cols) > max_cols:                       # wide data: select informative columns first
+        base_cols = _select_cols(df, target, base_cols, max_cols)
+        if verbose:
+            print(f"  [select] {len(base_cols)} of many columns kept (top |corr| with target)")
     rng = np.random.default_rng(seed); idx = rng.permutation(len(df)); cut = int((1 - test_frac) * len(df))
     tri, tei = idx[:cut], idx[cut:]
     if ranker is None:

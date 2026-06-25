@@ -129,9 +129,14 @@ def _reg_features(df, base, y, tri):
     return X, names
 
 
-def solve_regression(df, target, id_col=None, test_frac=0.3, ensemble=15, seed=0, verbose=True):
+def solve_regression(df, target, id_col=None, test_frac=0.3, ensemble=15, max_cols=200, seed=0, verbose=True):
     df = df.reset_index(drop=True)
     base = [c for c in df.columns if c not in (target, id_col)]
+    if max_cols and len(base) > max_cols:                            # wide data: select informative columns first
+        from thinking.primitives import _select_cols
+        base = _select_cols(df, target, base, max_cols, regression=True)
+        if verbose:
+            print(f"  [select] {len(base)} of many columns kept (top |corr| with target)")
     y = df[target].astype(float).values
     rng = np.random.default_rng(seed); idx = rng.permutation(len(df)); cut = int((1 - test_frac) * len(df))
     tri, tei = idx[:cut], idx[cut:]; yte = y[tei]
