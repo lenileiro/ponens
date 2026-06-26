@@ -105,13 +105,13 @@ def evaluate(m, depth, marker_slots, n=300, seed=999, device="cpu"):
     return ok / n
 
 
-def corners(m, device="cpu"):
+def corners(m, device="cpu", deep=12):
     held = (HELDOUT_SLOT,)
     return {
         "trained (seen order, depth5)": evaluate(m, 5, TRAIN_SLOTS, device=device),
         "unseen order (depth5)": evaluate(m, 5, held, device=device),
-        "deep (seen order, depth12)": evaluate(m, 12, TRAIN_SLOTS, device=device),
-        "BOTH (unseen order + depth12)": evaluate(m, 12, held, device=device),
+        f"deep (seen order, depth{deep})": evaluate(m, deep, TRAIN_SLOTS, device=device),
+        f"BOTH (unseen order + depth{deep})": evaluate(m, deep, held, device=device),
     }
 
 
@@ -128,18 +128,36 @@ def selftest():
     return 0
 
 
+def run(steps, d=128, h=4, bs=64, lr=1e-3, seed=0, device="cpu", deep=16):
+    m = train(steps, d=d, h=h, bs=bs, lr=lr, seed=seed, device=device)
+    c = corners(m, device=device, deep=deep)
+    return {"steps": steps, "d": d, "heads": h, "seed": seed, "train_depth": "3-5",
+            "train_slots": list(TRAIN_SLOTS), "heldout_slot": HELDOUT_SLOT, "deep_test_depth": deep,
+            "corners": {k: round(v, 4) for k, v in c.items()}}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--steps", type=int, default=16000)
+    ap.add_argument("--steps", type=int, default=20000)
+    ap.add_argument("--d", type=int, default=128)
+    ap.add_argument("--heads", type=int, default=4)
+    ap.add_argument("--bs", type=int, default=64)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--deep", type=int, default=16, help="depth for the length-gen corner")
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--out", default=None, help="write result JSON here")
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
-    m = train(a.steps, device=a.device)
-    print("capstone -- four robustness corners (train depth 3-5, marker slots {0,1,2,4,5,6}):")
-    for k, v in corners(m, device=a.device).items():
-        print(f"  {k:34s}: {v:.3f}")
+    import json
+    res = run(a.steps, d=a.d, h=a.heads, bs=a.bs, lr=a.lr, seed=a.seed, device=a.device, deep=a.deep)
+    print(json.dumps(res, indent=2))
+    if a.out:
+        with open(a.out, "w") as f:
+            json.dump(res, f, indent=2)
+        print(f"wrote {a.out}")
     return 0
 
 
