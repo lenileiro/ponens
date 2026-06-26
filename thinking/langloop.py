@@ -112,15 +112,15 @@ def lengthgen(steps=8000, lo=3, hi=5, test_max=15, d=128, h=4, device="cpu"):
 
 
 def selftest():
-    m = train(5000, lo=3, hi=5, d=128, h=4, device="cpu")
-    d5 = eval_depth(m, 5, device="cpu")                          # trained
+    m = train(8000, lo=3, hi=5, d=128, h=4, device="cpu")
+    d5 = eval_depth(m, 5, device="cpu")                          # trained max
     d10 = eval_depth(m, 10, device="cpu")                        # 2x deepest trained
-    d14 = eval_depth(m, 14, device="cpu")                        # ~3x
-    print(f"langloop selftest: depth5(train) {d5:.3f} | depth10 {d10:.3f} | depth14 {d14:.3f} "
+    d16 = eval_depth(m, 16, device="cpu")                        # ~3x -- the autoregressive walk is ~0.04 here
+    print(f"langloop selftest: depth5(train) {d5:.3f} | depth10 {d10:.3f} | depth16 {d16:.3f} "
           f"(autoregressive walk cliffs to ~0.04 past train depth)")
-    assert d5 > 0.9, f"failed in-train depth: {d5}"
-    assert d10 > 0.6, f"did NOT length-generalize (depth10 {d10:.3f}); the looped fix did not crack the wall"
-    print("langloop selftest OK (looped block + input injection length-generalizes the multi-hop walk)")
+    assert d5 > 0.95, f"failed in-train depth: {d5}"
+    assert d16 > 0.85, f"did NOT length-generalize (depth16 {d16:.3f}); the looped fix did not crack the wall"
+    print("langloop selftest OK (looped block + input injection length-generalizes the walk FLAT to 3x depth)")
     return 0
 
 
