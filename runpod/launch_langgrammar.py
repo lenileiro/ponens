@@ -32,10 +32,11 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOURLY_USD = 3.29
 
 # Scaling sweep: (tag, d, layers, heads, steps, batch, seed). head dim (d//heads) must be EVEN for RoPE.
+# Experiment (A): fixed-grammar position-invariance. Smallest first for a fast early signal (kill if not learning).
 SWEEP = [
-    ("s", 256, 6, 8, 40000, 64, 0),     # base scale
-    ("m", 384, 8, 8, 80000, 96, 0),     # +width/depth +steps
-    ("l", 512, 8, 8, 120000, 128, 0),   # +more (find where the held-out metrics move)
+    ("s", 256, 6, 8, 30000, 64, 0),     # fast first signal (~20 min)
+    ("m", 384, 8, 8, 60000, 96, 0),     # +width/depth +steps
+    ("l", 512, 8, 8, 90000, 128, 0),    # +more
 ]
 
 

@@ -10,14 +10,19 @@ facts, REASON (isa chain + inherited property -- two relations), and PRODUCE the
 order. Facts are shuffled with a variable count, so absolute position is uninformative: the query is located by
 its marker, not its index.
 
-Two held-out robustness tests (reported separately):
-  * unseen-grammar  : train on a subset of word orders, test on a word order NEVER trained -> the rule was
-                      learned per-prompt, not memorized as a fixed positional template (parse AND produce it).
-  * random-position : seen word orders but LONGER prompts / more distractors than training -> absolute positions
-                      shift beyond the trained range; staying correct proves marker/role binding, not indexing.
+GPU run 1 finding (runs/langgrammar_s.json): MIXING word orders in-context defeats the positional copy/induction
+head even in-distribution at d256/40k (response ~0.01) -- inferring a VARIABLE word order per-prompt is an
+architectural wall, not a scale problem. So this module now runs experiment (A): a FIXED word order (no in-context
+grammar inference) with heavily RANDOMIZED positions, which directly tests the scalable concern -- not leaning on
+a fixed global position. Metrics (reported separately):
+  * in_distribution : fixed grammar, variable fact counts (the query is found by its MARKER, not its index).
+  * random_position : same grammar, LONGER prompts / more distractors -> absolute positions shift beyond the
+                      trained range; staying correct proves marker/role binding, not indexing.
+  * cross_grammar   : a never-trained word order -> expected to fail (documents the open frontier (B): variable
+                      word-order inference, which needs a different mechanism than positional copy).
 
-  grammar g=1 (marker BETWEEN args), facts shuffled:   a I b .  b I c .  c P p .  x I y .  y P q .   query: a
-  THINK (isa-walk a->b->c, then c's property):  b c p     RESPOND in the SAME grammar (a P p):  a P p
+  fixed grammar g=0 (marker FIRST), facts shuffled, variable count:  I a b .  I x y .  I b c .  P c p .  query: a
+  THINK (isa-walk a->b->c, then c's property):  b c p     RESPOND in the same grammar (P a p):  P a p
 
   python -m thinking.langgrammar --selftest                       # CPU correctness gate
   python -m thinking.langgrammar --steps 60000 --device cuda --out runs/langgrammar.json
@@ -132,32 +137,37 @@ def evaluate(m, grammars, extra=(0, 4), n=400, seed=999, device="cpu"):
     return resp_ok / n, prop_ok / n
 
 
-def run(steps, d=256, layers=6, heads=8, bs=64, lr=1e-3, seed=0, device="cpu", n_eval=400):
-    """Train on a SUBSET of grammars, then report in-distribution + the two held-out robustness metrics."""
-    train_g = (0, 2); heldout_g = (1,)                              # marker-first/last trained; marker-between held out
-    m = train(steps, train_g, d=d, layers=layers, heads=heads, bs=bs, lr=lr, seed=seed, device=device)
-    in_dist = evaluate(m, train_g, extra=(0, 4), n=n_eval, device=device)
-    unseen_grammar = evaluate(m, heldout_g, extra=(0, 4), n=n_eval, device=device)
-    random_position = evaluate(m, train_g, extra=(6, 12), n=n_eval, device=device)   # longer prompts, shifted positions
+def run(steps, d=256, layers=6, heads=8, bs=64, lr=1e-3, seed=0, device="cpu", n_eval=400, grammar=0):
+    """Experiment (A): POSITION-INVARIANCE with a FIXED grammar. The word order is fixed (no in-context grammar
+    inference -- that defeated the positional copy head, see langgrammar_s.json), but absolute POSITIONS are
+    heavily randomized via a variable number of distractor facts, and the query is located by its MARKER, not its
+    index. The robustness question: does staying correct hold when prompts are LONGER than trained (positions
+    shifted past the trained range)? A cross-grammar probe documents that a never-trained word order still fails
+    (the open frontier (B))."""
+    g = (grammar,); cross = ((grammar + 1) % len(GRAMMARS),)
+    m = train(steps, g, d=d, layers=layers, heads=heads, bs=bs, lr=lr, seed=seed, device=device,
+              max_len=224, extra=(0, 6))
+    in_dist = evaluate(m, g, extra=(0, 6), n=n_eval, device=device)
+    random_position = evaluate(m, g, extra=(10, 16), n=n_eval, device=device)        # longer prompts, shifted positions
+    cross_grammar = evaluate(m, cross, extra=(0, 6), n=n_eval, device=device)         # never-trained word order (probe)
     res = {
         "steps": steps, "d": d, "layers": layers, "heads": heads, "seed": seed,
-        "train_grammars": list(train_g), "heldout_grammar": list(heldout_g),
+        "train_grammar": grammar, "cross_grammar_probe": cross[0],
         "in_distribution": {"response": in_dist[0], "property": in_dist[1]},
-        "unseen_grammar": {"response": unseen_grammar[0], "property": unseen_grammar[1]},
         "random_position": {"response": random_position[0], "property": random_position[1]},
+        "cross_grammar": {"response": cross_grammar[0], "property": cross_grammar[1]},
     }
     return res
 
 
 def selftest():
     device = "cpu"
-    m = train(2500, grammars=(0, 2), d=96, layers=3, heads=4, bs=48, max_len=160, device=device)
-    resp, prop = evaluate(m, (0, 2), n=200, device=device)
-    print(f"langgrammar selftest (tiny/CPU, in-distribution): response {resp:.3f} | property {prop:.3f} "
-          f"(chance ~0.25)")
-    assert prop > 0.5, f"did not learn above chance: {prop}"
-    print("langgrammar selftest OK (infers grammar by marker recurrence, composes two relations; "
-          "full robustness run is for GPU)")
+    m = train(3000, grammars=(0,), d=128, layers=3, heads=4, bs=48, max_len=192, extra=(0, 6), device=device)
+    resp, prop = evaluate(m, (0,), extra=(0, 6), n=200, device=device)
+    print(f"langgrammar selftest (tiny/CPU, fixed-grammar position-invariance): response {resp:.3f} | "
+          f"property {prop:.3f} (chance ~0.25)")
+    assert prop > 0.45, f"did not learn above chance: {prop}"
+    print("langgrammar selftest OK (composes two relations under randomized positions; full run is for GPU)")
     return 0
 
 
@@ -171,12 +181,14 @@ def main(argv=None):
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--grammar", type=int, default=0, help="the single fixed word order to train on")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--out", default=None, help="write result JSON here")
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
-    res = run(a.steps, d=a.d, layers=a.layers, heads=a.heads, bs=a.bs, lr=a.lr, seed=a.seed, device=a.device)
+    res = run(a.steps, d=a.d, layers=a.layers, heads=a.heads, bs=a.bs, lr=a.lr, seed=a.seed,
+              device=a.device, grammar=a.grammar)
     print(json.dumps(res, indent=2))
     if a.out:
         with open(a.out, "w") as f:
