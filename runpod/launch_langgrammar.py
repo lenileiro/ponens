@@ -149,10 +149,14 @@ def main():
             sys.exit("pod never exposed SSH within cap; terminating.")
         time.sleep(25)
         ssh = f"ssh -o StrictHostKeyChecking=no -p {port} root@{ip}"
-        up = (f"COPYFILE_DISABLE=1 tar czf - --exclude './.venv*' --exclude '*/__pycache__' "
+        # NOTE: exclude BOTH ./.venv* AND ./venv* -- a 30k-file venv/ in the repo root otherwise makes the
+        # upload take ~40min over SSH while the GPU sits idle and billed. Only thinking/ + repo .py are needed.
+        up = (f"COPYFILE_DISABLE=1 tar czf - --exclude './.venv*' --exclude './venv*' "
+              f"--exclude '*/__pycache__' "
               f"--exclude './results_gpu' --exclude '*.zip' --exclude './data' --exclude '*.pt' "
               f"--exclude '*.log' --exclude './runs' --exclude './experiments' "
               f"--exclude './tooling' --exclude './artifacts' --exclude './.git' "
+              f"--exclude './kaggle_data' --exclude './aqua_data' "
               f"--exclude '*.tgz' -C {HERE} . "
               f"| {ssh} 'mkdir -p {REMOTE} && tar --no-same-owner -xzf - -C {REMOTE}'")
         sh(up)
