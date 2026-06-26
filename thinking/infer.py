@@ -5,12 +5,14 @@ relations, no synthetic templates, no training, no example text.
 Idea: in a longer text the STRUCTURAL words (the connectives like 'is a') recur across many sentences, while
 the ENTITIES vary. So we DISCOVER the connectives statistically (high document-frequency tokens), treat the
 remaining varying tokens as entities, and read each sentence as an EDGE entity->entity. The discovered relation
-graph is closed transitively by the datalog engine, and a question is answered by whether its two entities are
-connected -- chaining the patterns the text itself revealed.
+graph is closed transitively by the datalog engine, and a wh-question is answered by RETURNING the set of
+entities connected to its known entity -- 'what is Rex?' -> dog, mammal, animal -- which scales far beyond
+yes/no (open-ended retrieval, not naming pairs to check). Direction is read off the graph: things the entity
+relates TO (its categories) or things that relate to it (its members).
 
 The longer / more repetitive the text, the more reliably the patterns separate connectives from entities.
 
-  python -m thinking.infer "A robin is a bird. A bird is an animal. Rex is a dog. A dog is a mammal. A mammal is an animal." "Is Rex an animal?"
+  python -m thinking.infer "A robin is a bird. A bird is an animal. Rex is a dog. A dog is a mammal. A mammal is an animal." "What is Rex?"
   python -m thinking.infer --selftest
 """
 import argparse
@@ -53,53 +55,65 @@ def _engine(edges):
     return facts, rules
 
 
+def _by_distance(e, targets, edges, forward):
+    """Order an answer set by graph distance from e (most specific / closest first)."""
+    adj = {}
+    for a, b in edges:
+        adj.setdefault(a if forward else b, []).append(b if forward else a)
+    dist = {e: 0}; q = [e]
+    while q:
+        u = q.pop(0)
+        for v in adj.get(u, []):
+            if v not in dist:
+                dist[v] = dist[u] + 1; q.append(v)
+    return sorted(targets, key=lambda t: dist.get(t, 1e9))
+
+
 def answer(text, question, verbose=False):
-    """Answer by discovering the text's relation graph and checking if the question's two entities connect."""
+    """Answer a wh-question with the SET of entities related to the question's known entity (scales beyond
+    yes/no): forward gives 'what X is' (its categories), backward gives 'what is an X' (its members). The
+    relation graph + transitive closure are discovered from the text; the answer is read off the closure."""
     edges, ents, conn = discover(_sents(text))
-    qc = [w for w in _toks(question) if w not in conn]               # question entities = its non-connective tokens
-    if len(qc) < 2:
-        return "?", None
-    a, b = qc[0], qc[-1]                                             # first->last (an unknown target -> 'no')
+    known = [w for w in _toks(question) if w in ents]                # the entity the question is ABOUT
+    if not known:
+        return [], None
+    e = known[0]
     facts, rules = _engine(edges)
-    dl = Datalog(rules); closure, prov = dl.closure(facts)
-    yes = ("r", (a, b)) in closure
-    proof = dl.proof_tree(prov, ("r", (a, b))) if (yes and verbose) else None
+    closure, _ = Datalog(rules).closure(facts)
+    fwd = [f[1][1] for f in closure if f[0] == "r" and f[1][0] == e]   # things e relates TO (categories)
+    bwd = [f[1][0] for f in closure if f[0] == "r" and f[1][1] == e]   # things that relate to e (members)
+    res = _by_distance(e, fwd, edges, True) if fwd else _by_distance(e, bwd, edges, False)
     if verbose:
-        print(f"  discovered connectives: {sorted(conn)}")
-        print(f"  discovered edges: {edges}")
-    return ("yes" if yes else "no"), proof
+        print(f"  discovered connectives: {sorted(conn)}  | about: {e}  | direction: {'categories' if fwd else 'members'}")
+    return res, None
 
 
 def _gen_text(rng):
-    """A random, longer taxonomy text (a chain with branches) + (question, gold). Random terms -> verification
-    only, not example content."""
-    depth = rng.integers(3, 6)
+    """A random, longer taxonomy text (a chain with branches) + a wh-question + the expected ANSWER SET.
+    Random terms -> verification only, not example content."""
+    depth = int(rng.integers(3, 6))
     chain = [f"k{rng.integers(99999)}" for _ in range(depth)]
     stmts = [f"a {chain[i]} is a {chain[i + 1]}" for i in range(depth - 1)]
     insts = []
-    for _ in range(rng.integers(3, 6)):                              # several instances hung off the chain -> longer
-        e = f"E{rng.integers(99999)}"; lvl = rng.integers(depth)
+    for _ in range(int(rng.integers(3, 6))):                         # several instances -> longer
+        e = f"E{rng.integers(99999)}"; lvl = int(rng.integers(depth))
         stmts.append(f"{e} is a {chain[lvl]}"); insts.append((e, lvl))
-    for _ in range(rng.integers(2, 5)):                             # sibling branches -> longer, varied
-        stmts.append(f"a x{rng.integers(99999)} is a {chain[rng.integers(depth)]}")
+    for _ in range(int(rng.integers(2, 5))):                         # sibling branches -> longer, varied
+        stmts.append(f"a x{rng.integers(99999)} is a {chain[int(rng.integers(depth))]}")
     rng.shuffle(stmts)
-    e, lvl = insts[rng.integers(len(insts))]
-    if rng.random() < 0.5:
-        tgt = chain[rng.integers(lvl, depth)]; gold = "yes"        # reachable ancestor
-    else:
-        tgt = f"z{rng.integers(99999)}"; gold = "no"               # unrelated
-    return ". ".join(stmts) + " .", f"is {e} a {tgt} ?", gold
+    e, lvl = insts[int(rng.integers(len(insts)))]
+    return ". ".join(stmts) + " .", f"what is {e} ?", set(chain[lvl:])   # answer = e's categories up the chain
 
 
 def selftest():
     rng = __import__("numpy").random.default_rng(0); ok = 0; n = 300
     for _ in range(n):
-        text, q, gold = _gen_text(rng)
-        ok += (answer(text, q)[0] == gold)
+        text, q, expect = _gen_text(rng)
+        ok += (set(answer(text, q)[0]) == expect)
     acc = ok / n
-    print(f"infer selftest: {acc:.3f} on {n} random longer-text problems (patterns discovered, datalog-chained)")
+    print(f"infer selftest: {acc:.3f} on {n} random longer-text problems (answer SET, not yes/no)")
     assert acc > 0.95, f"too low: {acc}"
-    print("infer selftest OK (discovers connectives from the text, chains by reachability; no hardcoded words)")
+    print("infer selftest OK (discovers patterns from the text, RETURNS the related-entity set; no hardcoded words)")
     return 0
 
 
@@ -110,10 +124,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.selftest or not (a.text and a.question):
         return selftest()
-    ans, proof = answer(a.text, a.question, verbose=True)
-    print(f"A: {ans}")
-    if proof:
-        print(f"proof: {proof}")
+    ans, _ = answer(a.text, a.question, verbose=True)
+    print(f"A: {', '.join(ans) if ans else '(nothing the text supports)'}")
     return 0
 
 
