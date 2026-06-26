@@ -82,6 +82,44 @@ def evaluate(m, n=400, seed=999):
     return top_ok / n, chain_ok / n
 
 
+def train_range(steps, lo, hi, d=128, layers=3, heads=4, seed=0, max_len=96):
+    """Train on chains whose depth is sampled from [lo, hi] (so deeper test chains are length-generalization)."""
+    torch.manual_seed(seed); rng = np.random.default_rng(seed)
+    m = ScratchpadLM(VOCAB, d=d, layers=layers, heads=heads, max_len=max_len, pad=PAD,
+                     pos_mode="rope", causal=True, pointer=True, tie=True)
+    opt = torch.optim.AdamW(m.parameters(), lr=1e-3)
+    for _ in range(steps):
+        eps = [gen(rng, int(rng.integers(lo, hi + 1))) for _ in range(64)]; L = max(len(s) for s, _, _ in eps)
+        x = torch.full((64, L), PAD, dtype=torch.long)
+        for i, (s, _, _) in enumerate(eps):
+            x[i, :len(s)] = torch.tensor(s)
+        out = m(x)
+        loss = F.nll_loss(out[:, :-1].reshape(-1, VOCAB), x[:, 1:].reshape(-1), ignore_index=PAD)
+        opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
+    return m
+
+
+def eval_depth(m, depth, n=300, seed=999):
+    """Reach-correct-conclusion accuracy at a FIXED chain depth (walks the full chain)."""
+    rng = np.random.default_rng(seed + depth); m.eval(); top = 0
+    with torch.no_grad():
+        for _ in range(n):
+            seq, qstart, chain = gen(rng, depth)
+            got = walk(m, seq, qstart, max_steps=depth + 3)
+            top += (bool(got) and got[-1] == chain[-1])
+    return top / n
+
+
+def lengthgen(steps=7000, lo=3, hi=5, test_max=14):
+    """Train shallow (depth lo..hi), test DEEPER -> proves the reasoning is structural, not memorized to a depth."""
+    m = train_range(steps, lo, hi)
+    print(f"length-gen: trained on depth {lo}-{hi}, reach-conclusion vs depth (unseen random languages):")
+    for depth in range(lo, test_max + 1):
+        tag = "  (train)" if depth <= hi else "  (extrapolation)"
+        print(f"  depth {depth:2d}: {eval_depth(m, depth):.3f}{tag}")
+    return 0
+
+
 def selftest():
     m = train(steps=4000)
     top, full = evaluate(m, 400)
@@ -92,10 +130,15 @@ def selftest():
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(); ap.add_argument("--selftest", action="store_true"); ap.add_argument("--steps", type=int, default=6000)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--lengthgen", action="store_true")
+    ap.add_argument("--steps", type=int, default=6000)
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
+    if a.lengthgen:
+        return lengthgen(steps=a.steps)
     m = train(steps=a.steps)
     top, full = evaluate(m)
     print(f"multi-hop on unseen random languages -> reached correct conclusion {top:.3f}, full chain {full:.3f}")
