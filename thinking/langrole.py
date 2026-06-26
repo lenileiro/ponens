@@ -73,10 +73,10 @@ class Reader(nn.Module):
     """Reads facts+query, predicts the queried object. arch='pos' = token+absolute-position (baseline that keys on
     where the marker sits). arch='rel' = a content-only RELATIONAL pass first (each token mixes with SAME-VALUE
     tokens -> markers, which recur across facts, get tagged by recurrence) THEN position -> parses any grammar."""
-    def __init__(self, arch="pos", d=128, h=4, layers=3, max_len=64):
+    def __init__(self, arch="pos", d=128, h=4, layers=3, max_len=64, vocab=VOCAB):
         super().__init__()
         self.arch = arch
-        self.tok = nn.Embedding(VOCAB, d, padding_idx=PAD)
+        self.tok = nn.Embedding(vocab, d, padding_idx=PAD)
         self.pos = nn.Embedding(max_len, d)
         if arch == "rel":
             self.rel_q = nn.Linear(d, d, bias=False)       # content-keyed relation pass: attend to same-value tokens
@@ -85,7 +85,7 @@ class Reader(nn.Module):
             self.rel_ln = nn.LayerNorm(d)
             self.gate = nn.Parameter(torch.zeros(1))       # ZERO-INIT: start as the working baseline, learn to use recurrence
         self.blocks = nn.ModuleList([Attn(d, h) for _ in range(layers)])
-        self.head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, VOCAB))
+        self.head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, vocab))
 
     def forward(self, x):
         kpm = (x == PAD)
@@ -103,6 +103,77 @@ class Reader(nn.Module):
         for b in self.blocks:
             h = b(h, kpm)
         return self.head(h[:, -1])                          # readout at the query-subject position -> predict object
+
+
+FILL = 3                                                   # constant filler token (distinct from PAD/SEP/QSEP)
+WV0 = 4                                                     # first real symbol id in the windowed task
+WVOCAB = WV0 + NSYM
+
+
+def gen_window(rng, marker_slots, K=7, nfacts=None):
+    """FORCING task: each fact is a K-slot window with the marker at one of `marker_slots` and the two entities at
+    two other random slots (subject before object), rest FILLER. The marker slot varies, so NO fixed position
+    identifies it -- the only grammar-invariant cue is RECURRENCE (the marker value repeats across facts). Query a
+    subject; answer its object = the other entity in its window. Train on most slots, hold one out."""
+    nfacts = nfacts or int(rng.integers(3, 6))
+    pool = (rng.permutation(NSYM) + WV0).tolist()
+    M = pool.pop()
+    ents = pool[:2 * nfacts]
+    facts = [(ents[2 * i], ents[2 * i + 1]) for i in range(nfacts)]
+    rng.shuffle(facts)
+    seq = []
+    for s, o in facts:
+        m_slot = int(marker_slots[int(rng.integers(len(marker_slots)))])
+        rest = [j for j in range(K) if j != m_slot]
+        a, b = sorted(rng.choice(rest, 2, replace=False).tolist())   # subject slot < object slot
+        win = [FILL] * K
+        win[m_slot] = M; win[a] = s; win[b] = o
+        seq += win + [SEP]
+    qi = int(rng.integers(nfacts)); qsubj, qobj = facts[qi]
+    seq += [QSEP, qsubj]
+    return seq, qobj
+
+
+def _batch_window(rng, bs, marker_slots, device):
+    eps = [gen_window(rng, marker_slots) for _ in range(bs)]; L = max(len(s) for s, _ in eps)
+    x = torch.full((bs, L), PAD, dtype=torch.long); ans = torch.zeros(bs, dtype=torch.long)
+    for i, (s, a) in enumerate(eps):
+        x[i, :len(s)] = torch.tensor(s); ans[i] = a
+    return x.to(device), ans.to(device)
+
+
+def train_w(arch, steps, marker_slots, d=128, h=4, layers=3, bs=64, lr=1e-3, seed=0, device="cpu"):
+    torch.manual_seed(seed); rng = np.random.default_rng(seed)
+    m = Reader(arch, d=d, h=h, layers=layers, max_len=80, vocab=WVOCAB).to(device)
+    opt = torch.optim.AdamW(m.parameters(), lr=lr)
+    for _ in range(steps):
+        x, ans = _batch_window(rng, bs, marker_slots, device)
+        loss = F.cross_entropy(m(x), ans)
+        opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
+    return m
+
+
+def eval_w(m, marker_slots, n=400, seed=999, device="cpu"):
+    rng = np.random.default_rng(seed); m.eval(); ok = 0
+    with torch.no_grad():
+        for _ in range(0, n, 100):
+            b = min(100, n - _)
+            x, ans = _batch_window(rng, b, marker_slots, device)
+            ok += int((m(x).argmax(-1) == ans).sum())
+    return ok / n
+
+
+def experiment_forced(steps=12000, device="cpu", K=7, heldout=3):
+    train_slots = tuple(j for j in range(K) if j != heldout)
+    print(f"  forcing: marker slot varies; train slots {train_slots}, HELD-OUT slot {heldout}")
+    out = {}
+    for arch in ("pos",):
+        m = train_w(arch, steps, train_slots, device=device)
+        seen = eval_w(m, train_slots, device=device)
+        held = eval_w(m, (heldout,), device=device)
+        out[arch] = (seen, held)
+        print(f"  {arch:3s}: trained slots {seen:.3f} | HELD-OUT slot {held:.3f}", flush=True)
+    return out
 
 
 def train(arch, steps, grammars=(0, 2), d=128, h=4, layers=3, bs=64, lr=1e-3, seed=0, device="cpu"):
@@ -138,20 +209,21 @@ def experiment(steps=12000, device="cpu"):
 
 
 def selftest():
-    out = experiment(steps=7000, device="cpu")
-    pos_ind, pos_cross = out["pos"]; rel_ind, rel_cross = out["rel"]
-    print(f"langrole selftest: pos in-dist {pos_ind:.3f} cross {pos_cross:.3f} | "
-          f"rel in-dist {rel_ind:.3f} cross {rel_cross:.3f}")
-    # Robust, reproducible characterization: the WALL exists -- a reader that solves the trained word orders
-    # perfectly collapses on the unseen one. (The recurrence channel lifts cross above the positional baseline
-    # but does not yet fully solve it: training on 2 discrete grammars rewards a binary position-classifier over
-    # the general 'marker = recurring token' rule, so the gate to the recurrence path collapses. A full fix needs
-    # a stronger relational bias or grammar diversity that makes the positional shortcut infeasible.)
-    assert pos_ind > 0.9, f"positional reader failed in-distribution: {pos_ind}"
-    assert pos_cross < 0.1, f"expected the wall (cross near chance) but got {pos_cross}"
-    assert rel_cross >= pos_cross, "recurrence channel should not be below the positional baseline cross"
-    print("langrole selftest OK (reproduces the variable-word-order wall; recurrence is the right but "
-          "not-yet-sufficient cue)")
+    # (1) THE WALL: train two discrete word orders -> perfect in-distribution, collapse on the unseen third.
+    mw = train("pos", 7000, grammars=(0, 2), device="cpu")
+    wall_ind = evaluate(mw, (0, 2), device="cpu"); wall_cross = evaluate(mw, (1,), device="cpu")
+    # (2) THE FIX (force recurrence): train the SAME plain reader on MANY marker positions so the position
+    # shortcut is infeasible -> it must learn 'marker = recurring token' -> generalizes to a held-out position.
+    # (Needs enough steps: the general rule emerges via a LATE phase transition, like arXiv:2505.20896's phase 3.)
+    train_slots = (0, 1, 2, 4, 5, 6)
+    mf = train_w("pos", 12000, train_slots, device="cpu")
+    seen = eval_w(mf, train_slots, device="cpu"); held = eval_w(mf, (3,), device="cpu")
+    print(f"langrole selftest: WALL train2-orders in-dist {wall_ind:.3f} / unseen-order {wall_cross:.3f}  ||  "
+          f"FIX train-6-positions seen {seen:.3f} / HELD-OUT position {held:.3f}")
+    assert wall_ind > 0.9 and wall_cross < 0.1, f"wall did not reproduce: ind {wall_ind} cross {wall_cross}"
+    assert held > 0.75, f"forcing-recurrence fix did not generalize to the held-out position: {held}"
+    print("langrole selftest OK (the variable-word-order wall is an artifact of too-few training orders; "
+          "marker-position DIVERSITY forces the recurrence rule and generalizes to an unseen order)")
     return 0
 
 
