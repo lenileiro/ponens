@@ -117,6 +117,35 @@ def eval_depth(m, depth, n=300, seed=999, device="cpu", n_dist=0):
     return ok / n
 
 
+def self_train(d=128, h=4, device="cpu", lo=3, start_hi=6, target=32, stage_steps=1200,
+               promote_thresh=0.85, dist_max=6, seed=0, verbose=True):
+    """RECURSIVE SELF-TRAINING / expanding-horizon ratchet (arXiv:2511.07378): train at depths [lo, cur_hi]; once
+    the model already EXTRAPOLATES to cur_hi+1 above threshold (the reusable per-hop step makes one-step
+    extrapolation cheap), promote cur_hi -> cur_hi+1 and consolidate it. The horizon ratchets up one hop at a time,
+    so it can climb far past a fixed curriculum. Returns (model, reached_depth)."""
+    torch.manual_seed(seed); rng = np.random.default_rng(seed)
+    m = LoopWalk(NSYM, d=d, h=h).to(device)
+    opt = torch.optim.AdamW(m.parameters(), lr=1e-3)
+    cur_hi = start_hi
+    stage = 0
+    while cur_hi < target and stage < 4 * (target - start_hi) + 20:
+        for _ in range(stage_steps):
+            depth = int(rng.integers(lo, cur_hi + 1))
+            n_dist = int(rng.integers(0, dist_max + 1))
+            edges, query, chain = _batch(rng, 64, depth, n_dist, device)
+            outs = m(edges, query, T=depth - 1, all_steps=True)
+            loss = sum(F.cross_entropy(outs[t], chain[:, t + 1]) for t in range(depth - 1)) / (depth - 1)
+            opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
+        nxt = eval_depth(m, cur_hi + 1, n=200, device=device)            # can it already do one deeper?
+        if verbose:
+            print(f"  stage {stage:2d}: horizon {cur_hi:2d} -> probe d{cur_hi+1}: {nxt:.3f}"
+                  f"{'  PROMOTE' if nxt >= promote_thresh else ''}", flush=True)
+        if nxt >= promote_thresh:
+            cur_hi += 1                                                   # ratchet the horizon up by one
+        stage += 1
+    return m, cur_hi
+
+
 def lengthgen(steps=10000, lo=3, hi=8, test_max=30, d=128, h=4, device="cpu"):
     m = train(steps, lo, hi, d=d, h=h, device=device)
     print(f"depth-recurrent walk: trained depth {lo}-{hi} (curriculum + per-hop supervision), reach-conclusion "
@@ -144,6 +173,8 @@ def selftest():
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--selftrain", action="store_true", help="recursive self-training (expanding-horizon ratchet)")
+    ap.add_argument("--target", type=int, default=32)
     ap.add_argument("--steps", type=int, default=10000)
     ap.add_argument("--d", type=int, default=128)
     ap.add_argument("--heads", type=int, default=4)
@@ -152,6 +183,12 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
+    if a.selftrain:
+        m, reached = self_train(d=a.d, h=a.heads, device=a.device, target=a.target)
+        print(f"self-training reached horizon depth {reached}; final length-gen curve:")
+        for depth in range(5, a.test_max + 1, 3):
+            print(f"  depth {depth:2d}: {eval_depth(m, depth, device=a.device):.3f}")
+        return 0
     lengthgen(steps=a.steps, test_max=a.test_max, d=a.d, h=a.heads, device=a.device)
     return 0
 
