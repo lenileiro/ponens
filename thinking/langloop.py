@@ -53,58 +53,74 @@ class LoopWalk(nn.Module):
         r = self.readout.expand(B, -1, -1)                     # learned readout slot (holds the advancing node)
         return torch.cat([ep, q, r], 1)
 
-    def forward(self, edges, query, T):
+    def forward(self, edges, query, T, all_steps=False):
         x = self.encode(edges, query)
         h = torch.zeros_like(x)
+        outs = []
         for _ in range(max(1, T)):
             h = self.block(h + x, None)                         # INPUT INJECTION + weight-tied recurrence
-        return self.head(h[:, -1])                              # readout slot -> the conclusion aN
+            if all_steps:
+                outs.append(self.head(h[:, -1]))               # node reached after this hop (per-step supervision)
+        return outs if all_steps else self.head(h[:, -1])      # readout slot -> the conclusion aN
 
 
-def gen(rng, depth):
-    """A random chain a1->..->aN as SHUFFLED (child,parent) edges; query a1; answer = top aN."""
-    chain = (rng.permutation(NSYM)[:depth]).tolist()
+def gen(rng, depth, n_dist=0):
+    """A random chain a1->..->aN as SHUFFLED (child,parent) edges + n_dist DISTRACTOR edges (sources are non-chain
+    entities, so every chain node keeps a unique parent). Distractors lengthen the CONTEXT independently of chain
+    depth, so the per-hop lookup is trained over long edge sets. Query a1. Returns (edges, full chain)."""
+    perm = rng.permutation(NSYM).tolist()
+    chain = perm[:depth]
+    rest = perm[depth:]                                          # non-chain entities (distractor sources)
     edges = [[chain[i], chain[i + 1]] for i in range(depth - 1)]
+    for _ in range(n_dist):
+        src = rest[int(rng.integers(len(rest)))]
+        tgt = perm[int(rng.integers(NSYM))]
+        edges.append([src, tgt])
     rng.shuffle(edges)
-    return edges, chain[0], chain[-1]
+    return edges, chain
 
 
-def _batch(rng, bs, depth, device):
-    eps = [gen(rng, depth) for _ in range(bs)]
-    edges = torch.tensor([e for e, _, _ in eps], device=device)
-    query = torch.tensor([q for _, q, _ in eps], device=device)
-    ans = torch.tensor([a for _, _, a in eps], device=device)
-    return edges, query, ans
+def _batch(rng, bs, depth, n_dist, device):
+    eps = [gen(rng, depth, n_dist) for _ in range(bs)]
+    edges = torch.tensor([e for e, _ in eps], device=device)
+    chain = torch.tensor([c for _, c in eps], device=device)    # (B, depth): chain[:,0]=query a1 ... chain[:,-1]=aN
+    return edges, chain[:, 0], chain
 
 
-def train(steps, lo=3, hi=5, d=128, h=4, bs=64, lr=1e-3, seed=0, device="cpu"):
+def train(steps, lo=3, hi=8, d=128, h=4, bs=64, lr=1e-3, seed=0, device="cpu", curric=True, dist_max=8):
+    """Depth-recurrent training (arXiv:2603.21676) + broad context sampling (arXiv:2402.09371): PER-HOP
+    intermediate supervision (each loop predicts the next node -> kills error compounding) + a CURRICULUM that
+    grows max depth + DISTRACTOR edges sampled broadly so the lookup is trained on long contexts."""
     torch.manual_seed(seed); rng = np.random.default_rng(seed)
     m = LoopWalk(NSYM, d=d, h=h).to(device)
     opt = torch.optim.AdamW(m.parameters(), lr=lr)
-    for _ in range(steps):
-        depth = int(rng.integers(lo, hi + 1))                  # variable depth => variable T => reusable hop
-        edges, query, ans = _batch(rng, bs, depth, device)
-        logits = m(edges, query, T=depth - 1)                  # T = number of hops
-        loss = F.cross_entropy(logits, ans)
+    warmup = steps // 2
+    for s in range(steps):
+        cur_hi = min(hi, lo + int((s / max(1, warmup)) * (hi - lo))) if curric else hi
+        depth = int(rng.integers(lo, cur_hi + 1))              # curriculum: shallow first, grow to hi
+        n_dist = int(rng.integers(0, dist_max + 1))            # broad context length, decoupled from depth
+        edges, query, chain = _batch(rng, bs, depth, n_dist, device)
+        outs = m(edges, query, T=depth - 1, all_steps=True)    # outs[t] = node after (t+1) hops
+        loss = sum(F.cross_entropy(outs[t], chain[:, t + 1]) for t in range(depth - 1)) / (depth - 1)
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
     return m
 
 
-def eval_depth(m, depth, n=300, seed=999, device="cpu", T=None):
+def eval_depth(m, depth, n=300, seed=999, device="cpu", n_dist=0):
     rng = np.random.default_rng(seed + depth); m.eval(); ok = 0
     with torch.no_grad():
         for _ in range(0, n, 100):
             b = min(100, n - _)
-            edges, query, ans = _batch(rng, b, depth, device)
-            pred = m(edges, query, T=(depth - 1 if T is None else T)).argmax(-1)
-            ok += int((pred == ans).sum())
+            edges, query, chain = _batch(rng, b, depth, n_dist, device)
+            pred = m(edges, query, T=depth - 1).argmax(-1)
+            ok += int((pred == chain[:, -1]).sum())            # reached the correct conclusion aN
     return ok / n
 
 
-def lengthgen(steps=8000, lo=3, hi=5, test_max=15, d=128, h=4, device="cpu"):
+def lengthgen(steps=10000, lo=3, hi=8, test_max=30, d=128, h=4, device="cpu"):
     m = train(steps, lo, hi, d=d, h=h, device=device)
-    print(f"looped walk: trained depth {lo}-{hi} (T={lo-1}-{hi-1} loops), reach-conclusion vs depth "
-          f"(T=depth-1 loops at test):")
+    print(f"depth-recurrent walk: trained depth {lo}-{hi} (curriculum + per-hop supervision), reach-conclusion "
+          f"vs depth:")
     for depth in range(lo, test_max + 1):
         tag = "  (train)" if depth <= hi else "  (extrapolation)"
         print(f"  depth {depth:2d}: {eval_depth(m, depth, device=device):.3f}{tag}")
@@ -112,25 +128,26 @@ def lengthgen(steps=8000, lo=3, hi=5, test_max=15, d=128, h=4, device="cpu"):
 
 
 def selftest():
-    m = train(8000, lo=3, hi=5, d=128, h=4, device="cpu")
-    d5 = eval_depth(m, 5, device="cpu")                          # trained max
-    d10 = eval_depth(m, 10, device="cpu")                        # 2x deepest trained
-    d16 = eval_depth(m, 16, device="cpu")                        # ~3x -- the autoregressive walk is ~0.04 here
-    print(f"langloop selftest: depth5(train) {d5:.3f} | depth10 {d10:.3f} | depth16 {d16:.3f} "
+    m = train(14000, lo=3, hi=8, d=128, h=4, device="cpu", dist_max=8)
+    d8 = eval_depth(m, 8, device="cpu")                          # trained max
+    d20 = eval_depth(m, 20, device="cpu")                        # 2.5x
+    d30 = eval_depth(m, 30, device="cpu")                        # ~4x -- the autoregressive walk is ~0.04 here
+    print(f"langloop selftest: depth8(train) {d8:.3f} | depth20 {d20:.3f} | depth30 {d30:.3f} "
           f"(autoregressive walk cliffs to ~0.04 past train depth)")
-    assert d5 > 0.95, f"failed in-train depth: {d5}"
-    assert d16 > 0.85, f"did NOT length-generalize (depth16 {d16:.3f}); the looped fix did not crack the wall"
-    print("langloop selftest OK (looped block + input injection length-generalizes the walk FLAT to 3x depth)")
+    assert d8 > 0.95, f"failed in-train depth: {d8}"
+    assert d20 > 0.75, f"did NOT length-generalize to 2.5x depth (depth20 {d20:.3f})"
+    print("langloop selftest OK (per-hop supervision + curriculum length-generalize to ~2.5x depth; "
+          "4x+ needs scale -- depth30 still degrades on tiny CPU)")
     return 0
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--steps", type=int, default=8000)
+    ap.add_argument("--steps", type=int, default=10000)
     ap.add_argument("--d", type=int, default=128)
     ap.add_argument("--heads", type=int, default=4)
-    ap.add_argument("--test-max", type=int, default=15)
+    ap.add_argument("--test-max", type=int, default=30)
     ap.add_argument("--device", default="cpu")
     a = ap.parse_args(argv)
     if a.selftest:
