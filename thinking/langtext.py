@@ -137,6 +137,36 @@ def evaluate(m, depth, mu=5.0, sigma=2.0, n=300, seed=999, device="cpu"):
     return ok / n
 
 
+def self_train(d=160, h=4, device="cpu", lo=3, start_hi=6, target=22, stage_steps=1000,
+               mu_lo=4.0, mu_hi=9.0, sigma=2.0, promote_thresh=0.83, seed=0, verbose=True):
+    """Recursive self-training over TEXT: expanding-horizon ratchet (arXiv:2511.07378) on the variable-length,
+    punctuation-delimited sentence task. Combines BOTH length axes: each hop is a variable-length sentence AND the
+    depth horizon ratchets up. CRUCIAL for composition: sentence length is sampled BROADLY (mu ~ U[mu_lo, mu_hi])
+    at EVERY stage, so each depth is consolidated across varied sentence lengths -> deep chains and long sentences
+    generalize TOGETHER (a fixed sentence length makes long-sentence per-hop error compound over many hops).
+    Returns (model, reached_depth)."""
+    torch.manual_seed(seed); rng = np.random.default_rng(seed)
+    m = TextWalk(d=d, h=h).to(device)
+    opt = torch.optim.AdamW(m.parameters(), lr=1e-3)
+    cur_hi = start_hi; stage = 0
+    while cur_hi < target and stage < 4 * (target - start_hi) + 25:
+        for _ in range(stage_steps):
+            depth = int(rng.integers(lo, cur_hi + 1))
+            bmu = float(rng.uniform(mu_lo, mu_hi))             # broad sentence-length sampling, decoupled from depth
+            ids, pos, chain = _batch(rng, 48, depth, bmu, sigma, device)
+            outs = m(ids, pos, T=depth - 1, all_steps=True)
+            loss = sum(F.cross_entropy(outs[t], chain[:, t + 1]) for t in range(depth - 1)) / (depth - 1)
+            opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
+        nxt = evaluate(m, cur_hi + 1, mu=mu_hi, sigma=sigma, n=200, device=device)   # probe at the LONG end
+        if verbose:
+            print(f"  stage {stage:2d}: horizon {cur_hi:2d} -> probe d{cur_hi+1}(mu{mu_hi:.0f}): {nxt:.3f}"
+                  f"{'  PROMOTE' if nxt >= promote_thresh else ''}", flush=True)
+        if nxt >= promote_thresh:
+            cur_hi += 1
+        stage += 1
+    return m, cur_hi
+
+
 def selftest():
     m = train(13000, lo=3, hi=8, mu=5.0, sigma=2.0, device="cpu")
     seen = evaluate(m, 8, device="cpu")                          # trained depth, trained sentence-length dist
@@ -157,11 +187,24 @@ def selftest():
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--selftrain", action="store_true", help="recursive self-training over text (both length axes)")
+    ap.add_argument("--target", type=int, default=22)
     ap.add_argument("--steps", type=int, default=14000)
     ap.add_argument("--device", default="cpu")
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
+    if a.selftrain:
+        m, reached = self_train(device=a.device, target=a.target)
+        print(f"self-training over text reached horizon depth {reached}. BOTH axes together (deep x long):")
+        for depth in (5, 10, 15, reached):
+            print(f"  depth {depth:2d}, sentences mu5 : {evaluate(m, depth, device=a.device):.3f}")
+        for mu in (5, 7, 9):
+            print(f"  depth {reached}, sentences mu{mu} (deep + long): "
+                  f"{evaluate(m, reached, mu=float(mu), device=a.device):.3f}")
+        print(f"  depth {reached}, sentences mu11 (deep + EXTRAPOLATED length): "
+              f"{evaluate(m, reached, mu=11.0, device=a.device):.3f}")
+        return 0
     m = train(a.steps, device=a.device)
     print("text length-gen (train depth 3-8, sentence length ~ Normal(5,2)):")
     for depth in (5, 8, 12, 16, 20):
