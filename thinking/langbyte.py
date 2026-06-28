@@ -57,13 +57,14 @@ class ByteEncoder(nn.Module):
         return F.normalize(self.proj(v), dim=-1)
 
 
-def load_sentences(path, max_len=96, min_chars=20):
-    """path may be comma-separated to MIX corpora (e.g. cosmopedia + tinystories -- the latter carries more
-    emotional language, which textbook-style cosmopedia lacks)."""
+def load_sentences(path, max_len=96, min_chars=15):
+    """path may be comma-separated to MIX corpora. Splits on newlines OR periods, so it handles both one-unit-per-
+    line corpora (tweets) and continuous text (cosmopedia)."""
+    import re
     sents = []
     for p in str(path).split(","):
         txt = open(p.strip(), encoding="utf-8", errors="ignore").read()
-        sents += [s.strip() for s in txt.replace("\n", " ").split(".") if len(s.strip()) >= min_chars]
+        sents += [u.strip() for u in re.split(r"[\n.]", txt) if len(u.strip()) >= min_chars]
     return [encode_bytes(s, max_len) for s in sents]
 
 
@@ -141,13 +142,14 @@ def main(argv=None):
     ap.add_argument("--steps", type=int, default=40000)
     ap.add_argument("--d", type=int, default=256)
     ap.add_argument("--layers", type=int, default=4)
+    ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--device", default="cpu")
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
     sents = load_sentences(a.corpus)
-    print(f"corpus sentences {len(sents)}; SimCSE contrastive pretraining {a.steps} steps on bytes ...")
-    m = train(a.steps, sents, d=a.d, layers=a.layers, device=a.device)
+    print(f"corpus sentences {len(sents)}; SimCSE contrastive pretraining {a.steps} steps (bs {a.bs}) on bytes ...")
+    m = train(a.steps, sents, d=a.d, layers=a.layers, bs=a.bs, device=a.device)
     by = by_text(EMO, "text", "label")
     nef = _neural_embed(m, a.device)
     print("EMOTIONS zero-shot (no training on it): byte-SimCSE-semantic vs char-n-gram")
