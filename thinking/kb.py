@@ -139,6 +139,29 @@ def noun_supersense(word):
 
 
 @functools.lru_cache(maxsize=50000)
+def noun_supersense_set(word):
+    """ALL coarse supersenses of a noun, unioned over its synsets -- tolerates polysemy: 'country' spans noun.group
+    (a political body) AND noun.location (its territory) -> {group, location}, so the entity 'France' (location)
+    matches. Pure WordNet, no word list."""
+    wn = _wn()
+    out = set()
+    for s in wn.synsets(word, pos=wn.NOUN):
+        b = _coarse(s.lexname(), _is_geo(s))
+        if b:
+            out.add(b)
+    return frozenset(out)
+
+
+@functools.lru_cache(maxsize=50000)
+def known_name(text):
+    """Does WordNet store this (multi-word) PROPER noun? Used to bridge internal lowercase particles in a name span:
+    'Leonardo_da_Vinci'/'United_States_of_America' resolve, so the particle belongs to the name; 'Blair_in_Paris'
+    does not, so 'in' is NOT absorbed. The underscore-name lexicon is a KB, not a hand gazetteer."""
+    wn = _wn()
+    return bool(wn.synsets(text.replace(" ", "_")))
+
+
+@functools.lru_cache(maxsize=50000)
 def entity_supersense(name):
     """Coarse type of a PROPER-NOUN candidate span, by majority supersense over the INSTANCE-hypernym classes of all
     its senses ('Paris'->location, 'Orwell'->person). Multi-word names are typed by the whole name then each token
@@ -207,6 +230,9 @@ def selftest():
     assert noun_supersense("city") == "location" and noun_supersense("author") == "person"
     assert entity_supersense("Paris") == "location" and entity_supersense("Shakespeare") == "person"
     assert entity_supersense("Nile") in (None, "location")   # geo-feature fallback (river under noun.object)
+    assert noun_supersense_set("country") >= {"location", "group"}   # polysemy union (territory + political body)
+    assert known_name("Leonardo da Vinci") and known_name("United States of America")  # multi-word names in WordNet
+    assert not known_name("Tony Blair in Paris")             # a non-name span does NOT resolve (no over-merge)
     print("kb selftest OK (runtime meaning lookup + meaning-based matching; no pretraining, no hardcoded words)")
     return 0
 

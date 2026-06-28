@@ -124,6 +124,9 @@ def read_squad(path):
                 at = answer_type(qt)                          # LAT: 'quantity'|'time'|'person'|'location'|'group'|'entity'
                 if at:
                     e["want_type"] = at
+                    foc = lat_focus(qt)                       # keep the focus NOUN for precise supersense-union matching
+                    if foc and foc[1] == "NN" and at != "quantity":
+                        e["focus_word"] = foc[0]
                 out.append(e)
     return out
 
@@ -162,6 +165,24 @@ def _entity_supersense(name):
         return kb.entity_supersense(name)
     except Exception:
         return None
+
+
+@functools.lru_cache(maxsize=50000)
+def _noun_supersense_set(word):
+    try:
+        from thinking import kb
+        return kb.noun_supersense_set(word)
+    except Exception:
+        return frozenset()
+
+
+@functools.lru_cache(maxsize=50000)
+def _known_name(text):
+    try:
+        from thinking import kb
+        return kb.known_name(text)
+    except Exception:
+        return False
 
 
 def build_idf(exs):
@@ -211,11 +232,17 @@ def answer(ex, idf, idf_default, max_len=8):
     wt = ex.get("want_type")                                 # 'quantity'|'time'|'person'|'location'|'group'|'entity'|None
     want_num = wt in ("quantity", "time")                    # a NUMBER (measure, year/date)
     want_ent = wt in ("person", "location", "group", "entity")  # a PROPER NOUN
-    ent_bucket = wt if wt in ("person", "location", "group") else None  # the specific supersense to match candidates to
-    # NER by ORTHOGRAPHY (no model, no name list): a mid-sentence Capitalized run is a proper-noun phrase. A phrase
-    # that CONTAINS a question word is the question's OWN named entity (e.g. 'Eiffel Tower' for '...the tower...'),
-    # so it merely restates the subject -> excluded; the answer is a DIFFERENT name ('Paris'). Each surviving phrase
-    # is TYPE-tagged by its WordNet supersense so we can prefer the one matching the asked type (person/location/...).
+    if ex.get("focus_word"):                                 # entity-noun focus: ALL supersenses of the noun (polysemy:
+        want_buckets = _noun_supersense_set(ex["focus_word"])   # country -> {group, location}, so France matches)
+    elif wt in ("person", "location", "group"):              # bare who/where: the single mapped bucket
+        want_buckets = frozenset([wt])
+    else:
+        want_buckets = frozenset()
+    # NER by ORTHOGRAPHY (no model, no name list): a mid-sentence Capitalized run is a proper-noun phrase. An internal
+    # lowercase particle ('Leonardo da Vinci', 'United States of America') is absorbed ONLY when the joined name
+    # resolves in WordNet (so 'Tony Blair in Paris' does NOT over-merge). A phrase CONTAINING a question word is the
+    # question's OWN named entity ('Eiffel Tower' for '...the tower...') -> excluded as restatement. Each surviving
+    # phrase is TYPE-tagged by its WordNet supersense to prefer the one matching the asked type (person/location/...).
     proper_pos, excl_pos, bucket_at = set(), set(), {}
     if want_ent:
         start_pos = set()
@@ -228,12 +255,23 @@ def answer(ex, idf, idf_default, max_len=8):
         k = 0
         while k < n:
             if _isname(k):
-                j = k
-                while j < n and _isname(j):
-                    j += 1
+                j = k + 1
+                while j < n:
+                    if _isname(j):
+                        j += 1
+                    elif word[j]:                            # lowercase token -> bridge only if WordNet knows the name
+                        p = j
+                        while p < n and word[p] and not _isname(p):
+                            p += 1
+                        if p < n and _isname(p) and _known_name(" ".join(c[k:p + 1])):
+                            j = p + 1
+                        else:
+                            break
+                    else:
+                        break
                 own = any(cl[m] in qset for m in range(k, j))
-                b = _entity_supersense(" ".join(c[k:j])) if (ent_bucket and not own) else None
-                for m in range(k, j):
+                b = _entity_supersense(" ".join(c[k:j])) if (want_buckets and not own) else None
+                for m in range(k, j):                        # whole span (incl. bridged particles) IS the name
                     proper_pos.add(m)
                     if own:
                         excl_pos.add(m)
@@ -260,7 +298,7 @@ def answer(ex, idf, idf_default, max_len=8):
             if want_num:                                     # quantity/time question: the answer IS the measured value
                 sc = (mass * 3.0) if has_digit else sc * 0.4 # the number wins wherever it sits (distance-independent)
             elif want_ent:                                   # entity question: the answer IS a (new) proper noun;
-                if has_name and any(bucket_at.get(k) == ent_bucket for k in range(i, j)):
+                if has_name and any(bucket_at.get(k) in want_buckets for k in range(i, j)):
                     sc = mass * 4.0                          # ...best if its supersense MATCHES the asked type
                 elif has_name:
                     sc = mass * 3.0                          # ...else any new name (soft fallback: no regression)
@@ -283,7 +321,7 @@ def answer(ex, idf, idf_default, max_len=8):
         blocks = [[pcore[0]]]                                # keep the one whose supersense MATCHES the asked type
         for k in pcore[1:]:                                  # ('George Orwell' for who, not the title 'Four')
             (blocks[-1].append(k) if k == blocks[-1][-1] + 1 else blocks.append([k]))
-        match = [b for b in blocks if ent_bucket and any(bucket_at.get(k) == ent_bucket for k in b)]
+        match = [b for b in blocks if want_buckets and any(bucket_at.get(k) in want_buckets for k in b)]
         blk = match[0] if match else blocks[0]
         bi, bj = blk[0], blk[-1] + 1
     elif core:
