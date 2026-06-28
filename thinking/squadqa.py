@@ -26,6 +26,24 @@ def toks(text):
     return re.findall(r"\w+|[^\w\s]", text)
 
 
+import functools
+
+
+@functools.lru_cache(maxsize=50000)
+def _in_kb(w):
+    try:
+        from nltk.corpus import wordnet as wn
+    except Exception:
+        return True
+    return bool(wn.synsets(w))
+
+
+def _specific(w):
+    """A factoid answer tends to be a SPECIFIC token: a number (digit) or a name (a word the KB doesn't know).
+    Character class + KB membership -- no word list, no type map, no training."""
+    return bool(re.search(r"\d", w)) or (w.isalpha() and len(w) > 1 and not _in_kb(w))
+
+
 def sentences(ctoks):
     """Split token list into sentence spans. A '.' after a SINGLE-letter token is treated as an abbreviation
     (U.S., A.B.) and does NOT end a sentence -- a general rule, no hardcoded abbreviation list."""
@@ -104,6 +122,8 @@ def answer(ex, idf, idf_default, max_len=8):
             mass = sum(w(cl[k]) for k in range(i, j))
             d = min((min(abs(i - p), abs(j - 1 - p)) for p in qpos), default=0)
             sc = mass / (1.0 + 0.25 * d)
+            if any(_specific(cl[k]) for k in range(i, j)):   # answers are specific (numbers/names): mild prior
+                sc *= 1.8
             if sc > best:
                 best, bi, bj = sc, i, j
             i = j
