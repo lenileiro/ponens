@@ -91,11 +91,9 @@ def answer(question, passage, prune_first=True, use_kb=True):
             if re.match(r"[a-z]", w.lower()):
                 redundant |= {s for s in KB.related(w.lower()) if " " not in s}
         ex["redundant"] = redundant
-        at = Q.answer_type(qtoks)                            # GROUNDED LAT (WordNet, no word list): what type of answer?
-        if at == "quantity":                                # 'how long/tall/far', 'what year' -> a NUMERIC value
-            ex["want_quantity"] = True
-        elif at == "entity":                                # 'which city', 'what country/author' -> a PROPER NOUN
-            ex["want_entity"] = True
+        at = Q.answer_type(qtoks)                            # LAT: 'quantity'/'time' -> number; 'person'/'location'/
+        if at:                                              # 'group'/'entity' -> proper noun; structural + minimal wh-map
+            ex["want_type"] = at
     return Q.answer(ex, {}, 1.0)
 
 

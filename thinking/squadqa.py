@@ -5,12 +5,14 @@ model solves any prompt at runtime; it never trains on the dataset.)
 For each (passage, question) we reason out the answer span: the answer is the stretch of text where the question's
 informative words CLUSTER in the passage, but which is NOT itself made of question words (the answer is the new
 information the question is pointing at). Word informativeness = IDF computed at runtime over the passage
-collection (the recurrence principle -- common words like 'the' carry no signal; no hardcoded stoplist). The one
-answer-type signal is a GROUNDED LAT (not a hardcoded 'when->date' table), read from WordNet:
-  - measurable-property focus ('how LONG/TALL/FAR/OLD', 'what YEAR') -> a NUMERIC span wins wherever it sits;
-  - entity-noun focus ('which CITY', 'what COUNTRY/AUTHOR') -> a PROPER NOUN (mid-sentence Capitalized run); the
-    question's OWN named entity (a phrase containing a question word, e.g. 'Eiffel Tower') is excluded as restatement.
-No model, no fitting, no hardcoded word lists. Metric: SQuAD EM / token-F1.
+collection (the recurrence principle -- common words like 'the' carry no signal; no hardcoded stoplist). The
+answer-type signal is a GROUNDED LAT (not a hardcoded 'when->date' table), read STRUCTURALLY from WordNet:
+  - measurable-property focus ('how LONG/TALL/FAR/OLD') -> a NUMERIC span wins wherever it sits;
+  - entity-noun focus ('which CITY', 'what AUTHOR') -> the focus noun's SUPERSENSE (location/person/...) is matched
+    against each candidate proper noun's supersense (via instance_hypernyms); the question's OWN named entity (a
+    Capitalized phrase containing a question word, e.g. 'Eiffel Tower') is excluded as restatement;
+  - bare who/where/when (untypable in WordNet) -> a minimal grammatical wh->type map (the only hand mapping).
+No model, no fitting. Metric: SQuAD EM / token-F1.
 
   python -m thinking.squadqa --selftest
   python -m thinking.squadqa --dev /tmp/squad/dev-v1.1.json
@@ -65,18 +67,36 @@ def lat_focus(qtoks):
     return None
 
 
+# Bare interrogative pronouns who/where/when carry NO usable WordNet sense (verified: wn.synsets('where')==[]),
+# so -- and ONLY here -- the expected type is read from a MINIMAL closed-class grammatical map keyed by the wh-word
+# lemma (selected via the POS tagger's WP/WRB classes). This is the one place a small hand mapping is unavoidable;
+# everything else (focus nouns, candidate entities) is typed structurally from WordNet supersenses.
+_WH_TYPE = {"who": "person", "whom": "person", "where": "location", "when": "time"}
+
+
 def answer_type(qtoks):
-    """Map the question to an expected answer type via the GROUNDED LAT (WordNet, no word lists): 'quantity' (the
-    focus is a measurable property/quantity -> a number), 'entity' (the focus is a noun naming a kind with named
-    instances -> a proper noun), or None (no usable focus -> fall back to plain span scoring)."""
+    """Map the question to an expected answer type. STRUCTURAL where possible (WordNet, no word lists):
+      - measurable-property focus ('how LONG', 'what AGE') -> 'quantity' (a number);
+      - entity-noun focus -> its WordNet SUPERSENSE bucket ('which CITY'->location, 'what AUTHOR'->person,
+        'what COUNTRY'->group), or generic 'entity' if it has named instances but no clean supersense.
+    For BARE who/where/when (no focus noun, untypable in WordNet) -> the minimal grammatical map above. None if
+    no signal (fall back to plain span scoring)."""
     f = lat_focus(qtoks)
-    if not f:
+    if f:
+        word, pos2 = f
+        if _expects_quantity(word):
+            return "quantity"
+        if pos2 == "NN":
+            return _noun_supersense(word) or ("entity" if _is_entity_type(word) else None)
         return None
-    word, pos2 = f
-    if _expects_quantity(word):
-        return "quantity"
-    if pos2 == "NN" and _is_entity_type(word):
-        return "entity"
+    try:
+        import nltk
+        tags = nltk.pos_tag([t.lower() for t in qtoks])
+    except Exception:
+        return None
+    for w, t in tags:
+        if t in ("WP", "WRB"):                               # who/whom/where/when -- grammatical class, then lemma map
+            return _WH_TYPE.get(w)
     return None
 
 
@@ -101,11 +121,9 @@ def read_squad(path):
             for qa in para["qas"]:
                 qt = toks(qa["question"])
                 e = {"q": qt, "c": ct, "golds": [a["text"] for a in qa["answers"]]}
-                at = answer_type(qt)                          # GROUNDED LAT (WordNet, no word list)
-                if at == "quantity":                         # 'how long/tall', 'what year' -> a number
-                    e["want_quantity"] = True
-                elif at == "entity":                         # 'which city', 'what country' -> a proper noun
-                    e["want_entity"] = True
+                at = answer_type(qt)                          # LAT: 'quantity'|'time'|'person'|'location'|'group'|'entity'
+                if at:
+                    e["want_type"] = at
                 out.append(e)
     return out
 
@@ -126,6 +144,24 @@ def _is_entity_type(word):
         return kb.is_entity_type(word)
     except Exception:
         return False
+
+
+@functools.lru_cache(maxsize=50000)
+def _noun_supersense(word):
+    try:
+        from thinking import kb
+        return kb.noun_supersense(word)
+    except Exception:
+        return None
+
+
+@functools.lru_cache(maxsize=50000)
+def _entity_supersense(name):
+    try:
+        from thinking import kb
+        return kb.entity_supersense(name)
+    except Exception:
+        return None
 
 
 def build_idf(exs):
@@ -172,12 +208,15 @@ def answer(ex, idf, idf_default, max_len=8):
             return 0.0
         return max(matched) + 0.3 * sum(matched)            # a distinctive match dominates many generic ones
     bs, be = max(sents, key=sscore)
-    want_qty = bool(ex.get("want_quantity"))                 # LAT: question expects a NUMERIC answer ('how long/tall')
-    want_ent = bool(ex.get("want_entity")) and not want_qty  # LAT: question expects a PROPER NOUN ('which city/author')
+    wt = ex.get("want_type")                                 # 'quantity'|'time'|'person'|'location'|'group'|'entity'|None
+    want_num = wt in ("quantity", "time")                    # a NUMBER (measure, year/date)
+    want_ent = wt in ("person", "location", "group", "entity")  # a PROPER NOUN
+    ent_bucket = wt if wt in ("person", "location", "group") else None  # the specific supersense to match candidates to
     # NER by ORTHOGRAPHY (no model, no name list): a mid-sentence Capitalized run is a proper-noun phrase. A phrase
     # that CONTAINS a question word is the question's OWN named entity (e.g. 'Eiffel Tower' for '...the tower...'),
-    # so it merely restates the subject -> excluded; the answer is a DIFFERENT name ('Paris').
-    proper_pos, excl_pos = set(), set()
+    # so it merely restates the subject -> excluded; the answer is a DIFFERENT name ('Paris'). Each surviving phrase
+    # is TYPE-tagged by its WordNet supersense so we can prefer the one matching the asked type (person/location/...).
+    proper_pos, excl_pos, bucket_at = set(), set(), {}
     if want_ent:
         start_pos = set()
         for s, e in sents:
@@ -193,10 +232,13 @@ def answer(ex, idf, idf_default, max_len=8):
                 while j < n and _isname(j):
                     j += 1
                 own = any(cl[m] in qset for m in range(k, j))
+                b = _entity_supersense(" ".join(c[k:j])) if (ent_bucket and not own) else None
                 for m in range(k, j):
                     proper_pos.add(m)
                     if own:
                         excl_pos.add(m)
+                    elif b:
+                        bucket_at[m] = b
                 k = j
             else:
                 k += 1
@@ -215,10 +257,15 @@ def answer(ex, idf, idf_default, max_len=8):
             sc = mass / (1.0 + 0.25 * d)
             if any(_specific(cl[k]) for k in range(i, j)):   # answers are specific (numbers/names): mild prior
                 sc *= 1.8
-            if want_qty:                                     # quantity question: the answer IS the measured value --
+            if want_num:                                     # quantity/time question: the answer IS the measured value
                 sc = (mass * 3.0) if has_digit else sc * 0.4 # the number wins wherever it sits (distance-independent)
-            elif want_ent:                                   # entity question: the answer IS a (new) proper noun
-                sc = (mass * 3.0) if has_name else sc * 0.4
+            elif want_ent:                                   # entity question: the answer IS a (new) proper noun;
+                if has_name and any(bucket_at.get(k) == ent_bucket for k in range(i, j)):
+                    sc = mass * 4.0                          # ...best if its supersense MATCHES the asked type
+                elif has_name:
+                    sc = mass * 3.0                          # ...else any new name (soft fallback: no regression)
+                else:
+                    sc *= 0.4
             if sc > best:
                 best, bi, bj = sc, i, j
             i = j
@@ -227,18 +274,17 @@ def answer(ex, idf, idf_default, max_len=8):
     # trim the span to its high-IDF CORE: drop low-information edge words (e.g. 'champion', 'defeated') so the
     # answer is the informative entity, not its surrounding filler.
     core = [k for k in range(bi, bj) if word[k]]
-    if want_qty and any(re.search(r"\d", cl[k]) for k in core):
-        while core and not re.search(r"\d", cl[core[0]]):    # a quantity reads as NUMBER+unit ('5 business days',
-            core = core[1:]                                  # '330 metres'): start the answer at the number
+    if want_num and any(re.search(r"\d", cl[k]) for k in core):
+        while core and not re.search(r"\d", cl[core[0]]):    # a quantity/date reads as NUMBER+unit ('5 business days',
+            core = core[1:]                                  # '330 metres', '1889'): start the answer at the number
         bi, bj = core[0], core[-1] + 1
-    elif want_ent and any(k in proper_pos for k in core):    # an entity answer IS the proper-noun phrase: keep the
-        pcore = [k for k in core if k in proper_pos]         # first contiguous Capitalized block ('George Orwell')
-        blk = [pcore[0]]
-        for k in pcore[1:]:
-            if k == blk[-1] + 1:
-                blk.append(k)
-            else:
-                break
+    elif want_ent and any(k in proper_pos for k in core):    # an entity answer IS the proper-noun phrase: split the
+        pcore = [k for k in core if k in proper_pos]         # span's Capitalized tokens into contiguous blocks and
+        blocks = [[pcore[0]]]                                # keep the one whose supersense MATCHES the asked type
+        for k in pcore[1:]:                                  # ('George Orwell' for who, not the title 'Four')
+            (blocks[-1].append(k) if k == blocks[-1][-1] + 1 else blocks.append([k]))
+        match = [b for b in blocks if ent_bucket and any(bucket_at.get(k) == ent_bucket for k in b)]
+        blk = match[0] if match else blocks[0]
         bi, bj = blk[0], blk[-1] + 1
     elif core:
         ws = [w(cl[k]) for k in core]
@@ -289,10 +335,10 @@ def selftest():
     em, f1 = evaluate(exs, n=1500)
     print(f"squadqa selftest: SQuAD dev (RUNTIME reasoning, ZERO training) -- EM {em:.3f} | token-F1 {f1:.3f} "
           f"(unsupervised sliding-window baseline range ~0.13-0.20)")
-    assert f1 > 0.17, f"runtime span reasoning too weak: {f1}"
-    print("squadqa selftest OK (extractive QA by pure runtime reasoning -- no training, no model; the only "
-          "answer-type signal is a GROUNDED LAT from WordNet: measurable-property focus -> a number; "
-          "entity-noun focus -> a proper noun. No hardcoded word lists.)")
+    assert f1 > 0.24, f"runtime span reasoning too weak: {f1}"
+    print("squadqa selftest OK (extractive QA by pure runtime reasoning -- no training, no model. Answer-type (LAT) "
+          "is read STRUCTURALLY from WordNet: measurable focus -> a number; entity-noun focus -> the matching "
+          "proper-noun SUPERSENSE (person/location/...); bare who/where/when use a minimal grammatical wh-map.)")
     return 0
 
 

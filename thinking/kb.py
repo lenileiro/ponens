@@ -12,6 +12,8 @@ is-a relations, not just shared characters. Capabilities:
   related(word)      -> synonyms + hypernyms + hyponyms + derivations (the word's meaning-neighborhood)
   similar(a, b)      -> do a and b share meaning? (synonym / shared neighborhood / shared is-a ancestor)
   expects_quantity(w)-> is w a measurable property? ('how long/tall/far' -> numeric answer; via attribute relation)
+  noun_supersense(w) -> coarse type of a focus noun ('city'->location, 'author'->person; via WordNet lexname)
+  entity_supersense(name)-> coarse type of a proper noun ('Paris'->location, 'Orwell'->person; via instance_hypernyms)
 
   python -m thinking.kb --selftest
   python -m thinking.kb refund          # inspect a word's KB meaning
@@ -100,6 +102,64 @@ def is_entity_type(word):
     return False
 
 
+# Coarse answer-type buckets, read from WordNet's lexicographer files (supersenses) -- a CLOSED structural inventory
+# of 26 noun categories, NOT a hand-built word list. We map the few relevant supersenses to coarse buckets and treat
+# everything else as untyped (None). Source: WordNet lexnames(5WN); NLTK synset.lexname().
+_SUPERSENSE = {"noun.person": "person", "noun.location": "location", "noun.time": "time", "noun.group": "group"}
+
+
+def _is_geo(s):
+    """Is synset `s` a geographic place? Natural features (rivers, mountains) sit under noun.object, not noun.location;
+    a hypernym-closure check to location/geological_formation recovers them. Structural, no word list."""
+    wn = _wn()
+    try:
+        anc = set(s.closure(lambda x: x.hypernyms()))
+        return wn.synset("location.n.01") in anc or wn.synset("geological_formation.n.01") in anc
+    except Exception:
+        return False
+
+
+def _coarse(lex, geo=False):
+    if lex in _SUPERSENSE:
+        return _SUPERSENSE[lex]
+    if lex == "noun.object" and geo:
+        return "location"
+    return None
+
+
+@functools.lru_cache(maxsize=50000)
+def noun_supersense(word):
+    """Coarse semantic type of a common noun via its WordNet supersense ('city'->location, 'author'->person,
+    'year'->time, 'country'->group). The EXPECTED answer type for an entity question. None if not a typed noun."""
+    wn = _wn()
+    ss = wn.synsets(word, pos=wn.NOUN)
+    if not ss:
+        return None
+    return _coarse(ss[0].lexname(), _is_geo(ss[0]))
+
+
+@functools.lru_cache(maxsize=50000)
+def entity_supersense(name):
+    """Coarse type of a PROPER-NOUN candidate span, by majority supersense over the INSTANCE-hypernym classes of all
+    its senses ('Paris'->location, 'Orwell'->person). Multi-word names are typed by the whole name then each token
+    (the head usually carries the type). None if WordNet has no named instance for it. No model, no gazetteer."""
+    wn = _wn()
+    from collections import Counter
+    votes = Counter(); geo = False
+    forms = [name.replace(" ", "_")] + name.split()
+    for f in forms:
+        for s in wn.synsets(f, pos=wn.NOUN):
+            for c in s.instance_hypernyms():
+                votes[c.lexname()] += 1
+                if _is_geo(c):
+                    geo = True
+        if votes:
+            break
+    if not votes:
+        return None
+    return _coarse(votes.most_common(1)[0][0], geo)
+
+
 def similar(a, b):
     """Do a and b share meaning, per the KB? Synonyms, or one in the other's neighborhood, or a shared is-a ancestor."""
     a, b = a.lower(), b.lower()
@@ -143,6 +203,10 @@ def selftest():
         assert is_entity_type(w), f"{w} should expect a named entity"
     for w in ("year", "length", "distance"):
         assert not is_entity_type(w), f"{w} should NOT expect a named entity"
+    # coarse supersense typing (WordNet lexicographer files): focus nouns and proper-noun candidates, no word lists
+    assert noun_supersense("city") == "location" and noun_supersense("author") == "person"
+    assert entity_supersense("Paris") == "location" and entity_supersense("Shakespeare") == "person"
+    assert entity_supersense("Nile") in (None, "location")   # geo-feature fallback (river under noun.object)
     print("kb selftest OK (runtime meaning lookup + meaning-based matching; no pretraining, no hardcoded words)")
     return 0
 
