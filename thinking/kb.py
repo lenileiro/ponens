@@ -71,14 +71,32 @@ def meaning(word):
 
 @functools.lru_cache(maxsize=50000)
 def expects_quantity(word):
-    """Is `word` a gradable/MEASURABLE property -- so a question focused on it ('how LONG/TALL/FAR/OLD/HEAVY') expects
-    a NUMERIC answer? Grounded in WordNet's attribute relation (long->duration/length, tall->stature, far->distance,
-    old->age), NOT a hardcoded adjective list: an adjective is measurable iff it is the ATTRIBUTE of some noun.
-    Entities/qualities (city, color, book) have no attribute noun -> False."""
+    """Does a question focused on `word` expect a NUMERIC answer? Read PURELY from WordNet's ATTRIBUTE relation --
+    no hardcoded words, no category list. A word is a measurable DIMENSION iff it participates in the attribute
+    relation (which is symmetric in WordNet): adjectives grade a dimension ('how LONG/TALL/FAR/OLD' -> the synset
+    has an attribute noun), and the dimension noun points back ('what LENGTH/AGE/DISTANCE/SIZE/SPEED' -> the noun
+    synset has attribute adjectives). Plain qualities (good, red) and entity nouns (city, author) participate in no
+    attribute relation -> False (the answer is a name, not a number)."""
     wn = _wn()
-    for s in wn.synsets(word, pos=wn.ADJ) + wn.synsets(word, pos=wn.ADV):
+    for s in wn.synsets(word):                                # any POS
         if s.attributes():
             return True
+    return False
+
+
+@functools.lru_cache(maxsize=50000)
+def is_entity_type(word):
+    """Is `word` a noun-type with NAMED instances, so a question on it expects a PROPER NOUN ('which CITY/COUNTRY/
+    AUTHOR' -> Paris/France/Orwell)? Read PURELY from WordNet's INSTANCE relation -- no hardcoded list: True iff the
+    type (or one of its kinds) has instance_hyponyms (proper-named individuals). city/author/river have them;
+    year/number/length/color do not."""
+    wn = _wn()
+    for s in wn.synsets(word, pos=wn.NOUN)[:3]:
+        if s.instance_hyponyms():
+            return True
+        for h in s.hyponyms():
+            if h.instance_hyponyms():
+                return True
     return False
 
 
@@ -115,11 +133,16 @@ def selftest():
     # the agent uses kb_match to find meaning beyond surface: 'physician' matches a doc mentioning 'doctor'
     assert kb_match("physician", ["the", "doctor", "examined", "her"])
     assert not kb_match("rocket", ["the", "doctor", "examined", "her"])
-    # measurable-property typing (grounded in WordNet's attribute relation, not a hardcoded adjective list)
-    for w in ("long", "tall", "far", "old", "wide"):
+    # answer-typing read PURELY from WordNet relations (no hardcoded word/category lists):
+    # quantity = participates in the ATTRIBUTE relation (gradable dimension); entity = has named INSTANCES.
+    for w in ("long", "tall", "far", "old", "wide", "length", "age", "distance"):
         assert expects_quantity(w), f"{w} should expect a numeric answer"
-    for w in ("city", "color", "book"):
+    for w in ("city", "author", "country"):
         assert not expects_quantity(w), f"{w} should NOT expect a numeric answer"
+    for w in ("city", "author", "country", "river"):
+        assert is_entity_type(w), f"{w} should expect a named entity"
+    for w in ("year", "length", "distance"):
+        assert not is_entity_type(w), f"{w} should NOT expect a named entity"
     print("kb selftest OK (runtime meaning lookup + meaning-based matching; no pretraining, no hardcoded words)")
     return 0
 

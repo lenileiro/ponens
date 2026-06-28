@@ -6,9 +6,11 @@ For each (passage, question) we reason out the answer span: the answer is the st
 informative words CLUSTER in the passage, but which is NOT itself made of question words (the answer is the new
 information the question is pointing at). Word informativeness = IDF computed at runtime over the passage
 collection (the recurrence principle -- common words like 'the' carry no signal; no hardcoded stoplist). The one
-answer-type signal is a GROUNDED LAT (not a hardcoded 'when->date' table): WordNet's attribute relation tells us
-the question's focus is a measurable property ('how LONG/TALL/FAR/OLD' -> duration/stature/distance/age), so a
-NUMERIC span is expected -- the measured value wins wherever it sits. No model, no fitting. Metric: EM / token-F1.
+answer-type signal is a GROUNDED LAT (not a hardcoded 'when->date' table), read from WordNet:
+  - measurable-property focus ('how LONG/TALL/FAR/OLD', 'what YEAR') -> a NUMERIC span wins wherever it sits;
+  - entity-noun focus ('which CITY', 'what COUNTRY/AUTHOR') -> a PROPER NOUN (mid-sentence Capitalized run); the
+    question's OWN named entity (a phrase containing a question word, e.g. 'Eiffel Tower') is excluded as restatement.
+No model, no fitting, no hardcoded word lists. Metric: SQuAD EM / token-F1.
 
   python -m thinking.squadqa --selftest
   python -m thinking.squadqa --dev /tmp/squad/dev-v1.1.json
@@ -47,9 +49,9 @@ def _specific(w):
 
 
 def lat_focus(qtoks):
-    """Lexical-Answer-Type focus: the word signalling the expected answer type. Found via POS tags (grammatical
-    categories from the tagger -- NOT a hardcoded wh-word list): the content word right after an interrogative
-    (how LONG, which CITY, what YEAR). None if there's no such focus."""
+    """Lexical-Answer-Type focus: the (word, coarse-POS) signalling the expected answer type. Found via POS tags
+    (grammatical categories from the tagger -- NOT a hardcoded wh-word list): the content word right after an
+    interrogative (how LONG, which CITY, what YEAR). None if there's no such focus."""
     try:
         import nltk
         tags = nltk.pos_tag([t.lower() for t in qtoks])      # lowercase: a capitalized leading 'Which' mis-tags as JJ
@@ -59,7 +61,22 @@ def lat_focus(qtoks):
         if t in ("WDT", "WP", "WP$", "WRB") and i + 1 < len(tags):
             w2, t2 = tags[i + 1]                              # ONLY the immediately-adjacent word: 'how LONG',
             if t2[:2] in ("NN", "JJ", "RB"):                 # 'which CITY', 'what YEAR'. 'when/who/where was ...'
-                return w2.lower()                            # have no adjacent type-word -> no focus (use base scoring)
+                return (w2.lower(), t2[:2])                  # have no adjacent type-word -> no focus (use base scoring)
+    return None
+
+
+def answer_type(qtoks):
+    """Map the question to an expected answer type via the GROUNDED LAT (WordNet, no word lists): 'quantity' (the
+    focus is a measurable property/quantity -> a number), 'entity' (the focus is a noun naming a kind with named
+    instances -> a proper noun), or None (no usable focus -> fall back to plain span scoring)."""
+    f = lat_focus(qtoks)
+    if not f:
+        return None
+    word, pos2 = f
+    if _expects_quantity(word):
+        return "quantity"
+    if pos2 == "NN" and _is_entity_type(word):
+        return "entity"
     return None
 
 
@@ -84,9 +101,11 @@ def read_squad(path):
             for qa in para["qas"]:
                 qt = toks(qa["question"])
                 e = {"q": qt, "c": ct, "golds": [a["text"] for a in qa["answers"]]}
-                foc = lat_focus(qt)                          # LAT (grounded, no word list): does the question
-                if foc and _expects_quantity(foc):           # focus on a measurable property -> expect a number?
+                at = answer_type(qt)                          # GROUNDED LAT (WordNet, no word list)
+                if at == "quantity":                         # 'how long/tall', 'what year' -> a number
                     e["want_quantity"] = True
+                elif at == "entity":                         # 'which city', 'what country' -> a proper noun
+                    e["want_entity"] = True
                 out.append(e)
     return out
 
@@ -96,6 +115,15 @@ def _expects_quantity(word):
     try:
         from thinking import kb
         return kb.expects_quantity(word)
+    except Exception:
+        return False
+
+
+@functools.lru_cache(maxsize=50000)
+def _is_entity_type(word):
+    try:
+        from thinking import kb
+        return kb.is_entity_type(word)
     except Exception:
         return False
 
@@ -145,22 +173,52 @@ def answer(ex, idf, idf_default, max_len=8):
         return max(matched) + 0.3 * sum(matched)            # a distinctive match dominates many generic ones
     bs, be = max(sents, key=sscore)
     want_qty = bool(ex.get("want_quantity"))                 # LAT: question expects a NUMERIC answer ('how long/tall')
+    want_ent = bool(ex.get("want_entity")) and not want_qty  # LAT: question expects a PROPER NOUN ('which city/author')
+    # NER by ORTHOGRAPHY (no model, no name list): a mid-sentence Capitalized run is a proper-noun phrase. A phrase
+    # that CONTAINS a question word is the question's OWN named entity (e.g. 'Eiffel Tower' for '...the tower...'),
+    # so it merely restates the subject -> excluded; the answer is a DIFFERENT name ('Paris').
+    proper_pos, excl_pos = set(), set()
+    if want_ent:
+        start_pos = set()
+        for s, e in sents:
+            for k in range(s, e):
+                if word[k]:
+                    start_pos.add(k); break
+        def _isname(k):
+            return bool(re.match(r"[A-Z][a-z]", c[k])) and k not in start_pos
+        k = 0
+        while k < n:
+            if _isname(k):
+                j = k
+                while j < n and _isname(j):
+                    j += 1
+                own = any(cl[m] in qset for m in range(k, j))
+                for m in range(k, j):
+                    proper_pos.add(m)
+                    if own:
+                        excl_pos.add(m)
+                k = j
+            else:
+                k += 1
     qpos = [k for k in range(bs, be) if cl[k] in qset]
     best, bi, bj = -1.0, bs, bs
     i = bs
     while i < be:
-        if word[i] and cl[i] not in excluded:               # answer = NEW info: not a question word, not KB-redundant with it
-            j = i
-            while j < be and word[j] and cl[j] not in excluded and (j - i) < max_len:
+        if word[i] and cl[i] not in excluded and i not in excl_pos:  # answer = NEW info: not a question word, not
+            j = i                                            # KB-redundant with it, not the question's own named entity
+            while j < be and word[j] and cl[j] not in excluded and j not in excl_pos and (j - i) < max_len:
                 j += 1
             mass = sum(w(cl[k]) for k in range(i, j))
             d = min((min(abs(i - p), abs(j - 1 - p)) for p in qpos), default=0)
             has_digit = any(re.search(r"\d", cl[k]) for k in range(i, j))
+            has_name = any(k in proper_pos for k in range(i, j))
             sc = mass / (1.0 + 0.25 * d)
             if any(_specific(cl[k]) for k in range(i, j)):   # answers are specific (numbers/names): mild prior
                 sc *= 1.8
             if want_qty:                                     # quantity question: the answer IS the measured value --
                 sc = (mass * 3.0) if has_digit else sc * 0.4 # the number wins wherever it sits (distance-independent)
+            elif want_ent:                                   # entity question: the answer IS a (new) proper noun
+                sc = (mass * 3.0) if has_name else sc * 0.4
             if sc > best:
                 best, bi, bj = sc, i, j
             i = j
@@ -173,6 +231,15 @@ def answer(ex, idf, idf_default, max_len=8):
         while core and not re.search(r"\d", cl[core[0]]):    # a quantity reads as NUMBER+unit ('5 business days',
             core = core[1:]                                  # '330 metres'): start the answer at the number
         bi, bj = core[0], core[-1] + 1
+    elif want_ent and any(k in proper_pos for k in core):    # an entity answer IS the proper-noun phrase: keep the
+        pcore = [k for k in core if k in proper_pos]         # first contiguous Capitalized block ('George Orwell')
+        blk = [pcore[0]]
+        for k in pcore[1:]:
+            if k == blk[-1] + 1:
+                blk.append(k)
+            else:
+                break
+        bi, bj = blk[0], blk[-1] + 1
     elif core:
         ws = [w(cl[k]) for k in core]
         thr = 0.55 * max(ws)
@@ -222,9 +289,10 @@ def selftest():
     em, f1 = evaluate(exs, n=1500)
     print(f"squadqa selftest: SQuAD dev (RUNTIME reasoning, ZERO training) -- EM {em:.3f} | token-F1 {f1:.3f} "
           f"(unsupervised sliding-window baseline range ~0.13-0.20)")
-    assert f1 > 0.16, f"runtime span reasoning too weak: {f1}"
+    assert f1 > 0.17, f"runtime span reasoning too weak: {f1}"
     print("squadqa selftest OK (extractive QA by pure runtime reasoning -- no training, no model; the only "
-          "answer-type signal is a GROUNDED LAT: WordNet says the focus is a measurable property -> expect a number)")
+          "answer-type signal is a GROUNDED LAT from WordNet: measurable-property focus -> a number; "
+          "entity-noun focus -> a proper noun. No hardcoded word lists.)")
     return 0
 
 
