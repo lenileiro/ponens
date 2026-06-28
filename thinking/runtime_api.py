@@ -21,17 +21,32 @@ from collections import Counter
 
 import numpy as np
 
+import re
+
 import thinking.langzero as Z
 import thinking.squadqa as Q
 import thinking.summ as SU
 import thinking.prune as PR
+import thinking.kb as KB
 
 
-def classify(query, examples):
+def _kb_expand(text):
+    """Expand text with KB synonyms so matching bridges MEANING (car~automobile), not just surface. Runtime KB
+    lookup -- no pretraining, no hardcoded words."""
+    ws = re.findall(r"[a-z]+", text.lower())
+    extra = set()
+    for w in ws:
+        extra |= {s for s in KB.synonyms(w) if " " not in s}
+    return text + " " + " ".join(extra)
+
+
+def classify(query, examples, use_kb=False):
     """Label `query` by nearest class over the caller's (text, label) examples -- char-n-gram TF-IDF (IDF from the
-    examples), language-agnostic, zero training."""
+    examples), language-agnostic, zero training. use_kb=True consults the runtime knowledge base to also match by
+    MEANING (synonyms), bridging paraphrases that share no characters."""
     labels = sorted(set(l for _, l in examples))
-    cnts = [(Z.ngram_counts(t), l) for t, l in examples]
+    prep = _kb_expand if use_kb else (lambda t: t)
+    cnts = [(Z.ngram_counts(prep(t)), l) for t, l in examples]
     df = {}
     for c, _ in cnts:
         for b in c:
@@ -47,7 +62,7 @@ def classify(query, examples):
     protos = {}
     for l in labels:
         protos[l] = np.mean([tfidf(c) for c, ll in cnts if ll == l], axis=0)
-    qv = tfidf(Z.ngram_counts(query))
+    qv = tfidf(Z.ngram_counts(prep(query)))
     return max(labels, key=lambda l: float(qv @ (protos[l] / (np.linalg.norm(protos[l]) + 1e-9))))
 
 
