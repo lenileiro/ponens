@@ -68,12 +68,13 @@ def load_sentences(path, max_len=96, min_chars=15):
     return [encode_bytes(s, max_len) for s in sents]
 
 
-def train(steps, sents, d=256, layers=4, heads=8, bs=64, lr=3e-4, temp=0.05, seed=0, device="cpu", max_len=96):
+def train(steps, sents, d=256, layers=4, heads=8, bs=64, lr=3e-4, temp=0.05, seed=0, device="cpu", max_len=96,
+          eval_cb=None, eval_every=4000):
     torch.manual_seed(seed); rng = np.random.default_rng(seed)
     m = ByteEncoder(d=d, layers=layers, heads=heads, max_len=max_len).to(device); m.train()
     opt = torch.optim.AdamW(m.parameters(), lr=lr)
     S = torch.tensor(sents)
-    for _ in range(steps):
+    for step in range(steps):
         bi = rng.integers(0, len(S), bs)
         x = S[bi].to(device)
         z1 = m(x); z2 = m(x)                                # two dropout views -> positive pair
@@ -81,6 +82,8 @@ def train(steps, sents, d=256, layers=4, heads=8, bs=64, lr=3e-4, temp=0.05, see
         lbl = torch.arange(len(x), device=device)
         loss = 0.5 * (F.cross_entropy(sim, lbl) + F.cross_entropy(sim.T, lbl))
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
+        if eval_cb and (step + 1) % eval_every == 0:        # periodic eval -> progress survives a timeout
+            m.eval(); print(f"  step {step+1}/{steps} loss {loss.item():.4f} | {eval_cb(m)}", flush=True); m.train()
     m.eval(); return m
 
 
@@ -143,20 +146,25 @@ def main(argv=None):
     ap.add_argument("--d", type=int, default=256)
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--bs", type=int, default=64)
+    ap.add_argument("--cap", type=int, default=600000, help="max sentences (cap corpus for faster preprocessing)")
     ap.add_argument("--device", default="cpu")
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
-    sents = load_sentences(a.corpus)
-    print(f"corpus sentences {len(sents)}; SimCSE contrastive pretraining {a.steps} steps (bs {a.bs}) on bytes ...")
-    m = train(a.steps, sents, d=a.d, layers=a.layers, bs=a.bs, device=a.device)
+    sents = load_sentences(a.corpus)[:a.cap]
+    print(f"corpus sentences {len(sents)} (cap {a.cap}); SimCSE {a.steps} steps (bs {a.bs}) on bytes ...", flush=True)
     by = by_text(EMO, "text", "label")
+    char3 = zeroshot(by, _charngram_embed, C=3, k=5, n=300)   # fixed baseline reference
+    def eval_cb(m):
+        s = zeroshot(by, _neural_embed(m, a.device), C=3, k=5, n=200)
+        return f"EMOTIONS 3-way: semantic {s:.3f} (char-n-gram {char3:.3f}, chance 0.333)"
+    m = train(a.steps, sents, d=a.d, layers=a.layers, bs=a.bs, device=a.device, eval_cb=eval_cb, eval_every=4000)
     nef = _neural_embed(m, a.device)
-    print("EMOTIONS zero-shot (no training on it): byte-SimCSE-semantic vs char-n-gram")
+    print("FINAL EMOTIONS zero-shot (no training on it): byte-SimCSE-semantic vs char-n-gram", flush=True)
     for C in (3, 6):
         s = zeroshot(by, nef, C=C, k=5, n=300)
         c = zeroshot(by, _charngram_embed, C=C, k=5, n=300)
-        print(f"  {C}-way (chance {1/C:.3f}): semantic {s:.3f} | char-n-gram {c:.3f}")
+        print(f"  {C}-way (chance {1/C:.3f}): semantic {s:.3f} | char-n-gram {c:.3f}", flush=True)
     return 0
 
 

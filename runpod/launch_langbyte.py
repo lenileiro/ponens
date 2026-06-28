@@ -27,8 +27,8 @@ IMAGE = "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
 REMOTE = "/workspace/llm"
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOURLY_USD = 3.29
-RUN = ("python -m thinking.langbyte --corpus data/sentiment140_text.txt "
-       "--steps 60000 --d 384 --layers 6 --bs 256 --device cuda")
+RUN = ("python -u -m thinking.langbyte --corpus data/sentiment140_text.txt "
+       "--steps 40000 --d 384 --layers 6 --bs 256 --cap 600000 --device cuda")   # -u: unbuffered; periodic eval logs
 
 
 def api(method, path, key, body=None):
