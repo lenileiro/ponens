@@ -5,8 +5,10 @@ model solves any prompt at runtime; it never trains on the dataset.)
 For each (passage, question) we reason out the answer span: the answer is the stretch of text where the question's
 informative words CLUSTER in the passage, but which is NOT itself made of question words (the answer is the new
 information the question is pointing at). Word informativeness = IDF computed at runtime over the passage
-collection (the recurrence principle -- common words like 'the' carry no signal; no hardcoded stoplist). The
-answer-type signal is a GROUNDED LAT (not a hardcoded 'when->date' table), read STRUCTURALLY from WordNet:
+collection (the recurrence principle -- common words like 'the' carry no signal; no hardcoded stoplist). Candidates
+are NOUN-PHRASE chunks (rule-based POS chunking -- SQuAD answers are NPs), ranked by IDF mass and proximity to the
+question's RAREST (most distinctive) matched word. The answer-type signal is a GROUNDED LAT (not a hardcoded
+'when->date' table), read STRUCTURALLY from WordNet:
   - measurable-property focus ('how LONG/TALL/FAR/OLD') -> a NUMERIC span wins wherever it sits;
   - entity-noun focus ('which CITY', 'what AUTHOR') -> the focus noun's SUPERSENSE (location/person/...) is matched
     against each candidate proper noun's supersense (via instance_hypernyms); the question's OWN named entity (a
@@ -200,11 +202,39 @@ def build_idf(exs):
     return {w: np.log((docs + 1) / (c + 1)) + 1.0 for w, c in df.items()}, np.log(docs + 1) + 1.0
 
 
+# A noun-phrase chunk grammar over Penn-Treebank POS tags (rule-based, NO training -- unlike nltk.ne_chunk's maxent
+# model): an optional determiner, then adjectives/gerunds/nouns/numbers, ending in a noun or number. SQuAD answers
+# are overwhelmingly noun phrases, so these are the natural answer candidates (far cleaner spans than IDF runs).
+_NP_GRAMMAR = r"NP: {<DT|PRP\$>?<CD>*<JJ.*|VBG|NN.*|NNP.*|CD|POS>*<NN.*|NNP.*|CD>}"
+_NP_CHUNKER = None
+
+
+def _np_spans(seg, base):
+    """Noun-phrase chunk spans (absolute token indices offset by `base`) over a token list. Falls back to one whole
+    span if the tagger/parser is unavailable."""
+    global _NP_CHUNKER
+    try:
+        import nltk
+        if _NP_CHUNKER is None:
+            from nltk import RegexpParser
+            _NP_CHUNKER = RegexpParser(_NP_GRAMMAR)
+        tree = _NP_CHUNKER.parse(nltk.pos_tag(seg))
+        spans = []; pos = base
+        for node in tree:
+            if hasattr(node, "leaves"):
+                ln = len(node.leaves()); spans.append((pos, pos + ln)); pos += ln
+            else:
+                pos += 1
+        return spans
+    except Exception:
+        return [(base, base + len(seg))]
+
+
 def answer(ex, idf, idf_default, max_len=8):
     """Runtime reasoning, no training: (1) pick the SENTENCE where the question's informative (high-IDF) words
-    concentrate; (2) within it, the highest-IDF contiguous run of non-question content tokens (the answer the
-    question points at), discounted by distance to the question's words. (Char-n-gram fuzzy matching was tried and
-    slightly hurt -- loose matches add sentence/span-selection noise -- so exact IDF-weighted matching is used.)"""
+    concentrate; (2) score each NOUN-PHRASE chunk in it (rule-based POS chunking -- SQuAD answers are NPs) by its
+    IDF mass, proximity to the question's RAREST (most distinctive) matched word, and answer-type (LAT) fit, and
+    return the best. The rare-word anchor + NP boundaries are what lift this well above an IDF-run baseline."""
     c = ex["c"]; cl = [t.lower() for t in c]
     qset = set(t.lower() for t in ex["q"])
     excluded = qset | set(ex.get("redundant", ()))           # question words + words the KB says merely restate them
@@ -281,34 +311,32 @@ def answer(ex, idf, idf_default, max_len=8):
             else:
                 k += 1
     qpos = [k for k in range(bs, be) if cl[k] in qset]
+    # ANCHOR = the question's RAREST matched word (its most distinctive term): the answer clusters around THAT, not
+    # around generic shared words. Distance to this single anchor ranks candidates far better than distance to any qword.
+    apos = [max(qpos, key=lambda k: w(cl[k]))] if qpos else []
     best, bi, bj = -1.0, bs, bs
-    i = bs
-    while i < be:
-        if word[i] and cl[i] not in excluded and i not in excl_pos:  # answer = NEW info: not a question word, not
-            j = i                                            # KB-redundant with it, not the question's own named entity
-            while j < be and word[j] and cl[j] not in excluded and j not in excl_pos and (j - i) < max_len:
-                j += 1
-            mass = sum(w(cl[k]) for k in range(i, j))
-            d = min((min(abs(i - p), abs(j - 1 - p)) for p in qpos), default=0)
-            has_digit = any(re.search(r"\d", cl[k]) for k in range(i, j))
-            has_name = any(k in proper_pos for k in range(i, j))
-            sc = mass / (1.0 + 0.25 * d)
-            if any(_specific(cl[k]) for k in range(i, j)):   # answers are specific (numbers/names): mild prior
-                sc *= 1.8
-            if want_num:                                     # quantity/time question: the answer IS the measured value
-                sc = (mass * 3.0) if has_digit else sc * 0.4 # the number wins wherever it sits (distance-independent)
-            elif want_ent:                                   # entity question: the answer IS a (new) proper noun;
-                if has_name and any(bucket_at.get(k) in want_buckets for k in range(i, j)):
-                    sc = mass * 4.0                          # ...best if its supersense MATCHES the asked type
-                elif has_name:
-                    sc = mass * 3.0                          # ...else any new name (soft fallback: no regression)
-                else:
-                    sc *= 0.4
-            if sc > best:
-                best, bi, bj = sc, i, j
-            i = j
-        else:
-            i += 1
+    for (a, b) in _np_spans(c[bs:be], bs):                    # candidate = each noun-phrase chunk in the chosen sentence
+        span = [k for k in range(a, b) if word[k] and cl[k] not in excluded and k not in excl_pos]
+        if not span:                                         # all-question-words / the question's own entity -> skip
+            continue
+        mass = sum(w(cl[k]) for k in span)
+        d = min((min(abs(span[0] - p), abs(span[-1] - p)) for p in apos), default=0)
+        has_digit = any(re.search(r"\d", cl[k]) for k in span)
+        has_name = any(k in proper_pos for k in span)
+        sc = mass / (1.0 + 0.7 * d)
+        if any(_specific(cl[k]) for k in span):              # answers are specific (numbers/names): mild prior
+            sc *= 1.8
+        if want_num:                                         # quantity/time question: the answer IS the measured value
+            sc = (mass * 3.0) if has_digit else sc * 0.4
+        elif want_ent:                                       # entity question: the answer IS a (new) proper noun;
+            if has_name and any(bucket_at.get(k) in want_buckets for k in span):
+                sc = mass * 4.0                              # ...best if its supersense MATCHES the asked type
+            elif has_name:
+                sc = mass * 3.0                              # ...else any new name (soft fallback: no regression)
+            else:
+                sc *= 0.4
+        if sc > best:
+            best, bi, bj = sc, span[0], span[-1] + 1
     # trim the span to its high-IDF CORE: drop low-information edge words (e.g. 'champion', 'defeated') so the
     # answer is the informative entity, not its surrounding filler.
     core = [k for k in range(bi, bj) if word[k]]
@@ -373,10 +401,10 @@ def selftest():
     em, f1 = evaluate(exs, n=1500)
     print(f"squadqa selftest: SQuAD dev (RUNTIME reasoning, ZERO training) -- EM {em:.3f} | token-F1 {f1:.3f} "
           f"(unsupervised sliding-window baseline range ~0.13-0.20)")
-    assert f1 > 0.24, f"runtime span reasoning too weak: {f1}"
-    print("squadqa selftest OK (extractive QA by pure runtime reasoning -- no training, no model. Answer-type (LAT) "
-          "is read STRUCTURALLY from WordNet: measurable focus -> a number; entity-noun focus -> the matching "
-          "proper-noun SUPERSENSE (person/location/...); bare who/where/when use a minimal grammatical wh-map.)")
+    assert f1 > 0.31, f"runtime span reasoning too weak: {f1}"
+    print("squadqa selftest OK (extractive QA by pure runtime reasoning -- no training, no model. Candidates are "
+          "NOUN-PHRASE chunks (rule-based POS) ranked by IDF mass + proximity to the question's RAREST word + a "
+          "WordNet-grounded answer type (number / person / location / ... ; bare who/where/when via a minimal wh-map).)")
     return 0
 
 
