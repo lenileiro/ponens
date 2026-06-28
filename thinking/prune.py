@@ -22,13 +22,7 @@ from thinking import squadqa as Q
 
 
 def _sentences(ctoks):
-    sents = []; start = 0
-    for i, t in enumerate(ctoks):
-        if t in (".", "?", "!"):
-            sents.append((start, i + 1)); start = i + 1
-    if start < len(ctoks):
-        sents.append((start, len(ctoks)))
-    return sents or [(0, len(ctoks))]
+    return Q.sentences(ctoks)                               # abbreviation-aware shared splitter
 
 
 def relevance(ex, idf, idf_default):

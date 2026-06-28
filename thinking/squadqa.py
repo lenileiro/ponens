@@ -26,6 +26,18 @@ def toks(text):
     return re.findall(r"\w+|[^\w\s]", text)
 
 
+def sentences(ctoks):
+    """Split token list into sentence spans. A '.' after a SINGLE-letter token is treated as an abbreviation
+    (U.S., A.B.) and does NOT end a sentence -- a general rule, no hardcoded abbreviation list."""
+    sents = []; start = 0
+    for i, t in enumerate(ctoks):
+        if t in (".", "?", "!") and i > 0 and len(ctoks[i - 1]) >= 2:
+            sents.append((start, i + 1)); start = i + 1
+    if start < len(ctoks):
+        sents.append((start, len(ctoks)))
+    return sents or [(0, len(ctoks))]
+
+
 def read_squad(path):
     data = json.load(open(path))["data"]
     out = []
@@ -63,14 +75,7 @@ def answer(ex, idf, idf_default, max_len=8):
     if n == 0:
         return ""
     word = [bool(re.match(r"\w", t)) for t in c]
-    sents = []; start = 0
-    for i, t in enumerate(c):
-        if t in (".", "?", "!"):
-            sents.append((start, i + 1)); start = i + 1
-    if start < n:
-        sents.append((start, n))
-    if not sents:
-        sents = [(0, n)]
+    sents = sentences(c)
     # PASSAGE-LEVEL discriminativeness (recurrence within this doc): a word in MANY sentences of the passage is
     # non-discriminative ('Super Bowl', 'NFL' here) and is down-weighted, so the question's DISTINCTIVE word
     # ('AFC') selects the right sentence -- combined with the global IDF.
