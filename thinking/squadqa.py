@@ -62,8 +62,6 @@ def answer(ex, idf, idf_default, max_len=8):
     n = len(c)
     if n == 0:
         return ""
-    def w(t):
-        return idf.get(t, idf_default)
     word = [bool(re.match(r"\w", t)) for t in c]
     sents = []; start = 0
     for i, t in enumerate(c):
@@ -73,9 +71,21 @@ def answer(ex, idf, idf_default, max_len=8):
         sents.append((start, n))
     if not sents:
         sents = [(0, n)]
+    # PASSAGE-LEVEL discriminativeness (recurrence within this doc): a word in MANY sentences of the passage is
+    # non-discriminative ('Super Bowl', 'NFL' here) and is down-weighted, so the question's DISTINCTIVE word
+    # ('AFC') selects the right sentence -- combined with the global IDF.
+    msent = len(sents); sdf = Counter()
+    for s, e in sents:
+        for t in set(cl[s:e]):
+            sdf[t] += 1
+    def w(t):
+        return (np.log((msent + 1) / (sdf.get(t, 0) + 1)) + 1.0) * idf.get(t, idf_default)
     def sscore(se):
         s, e = se
-        return sum(w(t) for t in set(cl[s:e]) if t in qset)
+        matched = [w(t) for t in set(cl[s:e]) if t in qset]
+        if not matched:
+            return 0.0
+        return max(matched) + 0.3 * sum(matched)            # a distinctive match dominates many generic ones
     bs, be = max(sents, key=sscore)
     qpos = [k for k in range(bs, be) if cl[k] in qset]
     best, bi, bj = -1.0, bs, bs
@@ -93,6 +103,17 @@ def answer(ex, idf, idf_default, max_len=8):
             i = j
         else:
             i += 1
+    # trim the span to its high-IDF CORE: drop low-information edge words (e.g. 'champion', 'defeated') so the
+    # answer is the informative entity, not its surrounding filler.
+    core = [k for k in range(bi, bj) if word[k]]
+    if core:
+        ws = [w(cl[k]) for k in core]
+        thr = 0.55 * max(ws)
+        while len(core) > 1 and w(cl[core[0]]) < thr:
+            core = core[1:]
+        while len(core) > 1 and w(cl[core[-1]]) < thr:
+            core = core[:-1]
+        bi, bj = core[0], core[-1] + 1
     span = c[bi:bj]
     while span and not re.match(r"\w", span[0]):
         span = span[1:]
