@@ -91,6 +91,9 @@ def answer(question, passage, prune_first=True, use_kb=True):
             if re.match(r"[a-z]", w.lower()):
                 redundant |= {s for s in KB.related(w.lower()) if " " not in s}
         ex["redundant"] = redundant
+        focus = Q.lat_focus(qtoks)                          # LAT: the word signalling the expected answer type
+        if focus and KB.expects_quantity(focus):            # 'how long/tall/far/old' -> a NUMERIC answer is expected
+            ex["want_quantity"] = True                      # (grounded in WordNet's attribute relation, no word list)
     return Q.answer(ex, {}, 1.0)
 
 

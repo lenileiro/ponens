@@ -5,8 +5,10 @@ model solves any prompt at runtime; it never trains on the dataset.)
 For each (passage, question) we reason out the answer span: the answer is the stretch of text where the question's
 informative words CLUSTER in the passage, but which is NOT itself made of question words (the answer is the new
 information the question is pointing at). Word informativeness = IDF computed at runtime over the passage
-collection (the recurrence principle -- common words like 'the' carry no signal; no hardcoded stoplist). No
-answer-type rules (no 'when->date'), no model, no fitting -- just runtime scoring. Metric: SQuAD EM / token-F1.
+collection (the recurrence principle -- common words like 'the' carry no signal; no hardcoded stoplist). The one
+answer-type signal is a GROUNDED LAT (not a hardcoded 'when->date' table): WordNet's attribute relation tells us
+the question's focus is a measurable property ('how LONG/TALL/FAR/OLD' -> duration/stature/distance/age), so a
+NUMERIC span is expected -- the measured value wins wherever it sits. No model, no fitting. Metric: EM / token-F1.
 
   python -m thinking.squadqa --selftest
   python -m thinking.squadqa --dev /tmp/squad/dev-v1.1.json
@@ -44,6 +46,23 @@ def _specific(w):
     return bool(re.search(r"\d", w)) or (w.isalpha() and len(w) > 1 and not _in_kb(w))
 
 
+def lat_focus(qtoks):
+    """Lexical-Answer-Type focus: the word signalling the expected answer type. Found via POS tags (grammatical
+    categories from the tagger -- NOT a hardcoded wh-word list): the content word right after an interrogative
+    (how LONG, which CITY, what YEAR). None if there's no such focus."""
+    try:
+        import nltk
+        tags = nltk.pos_tag([t.lower() for t in qtoks])      # lowercase: a capitalized leading 'Which' mis-tags as JJ
+    except Exception:
+        return None
+    for i, (w, t) in enumerate(tags):
+        if t in ("WDT", "WP", "WP$", "WRB") and i + 1 < len(tags):
+            w2, t2 = tags[i + 1]                              # ONLY the immediately-adjacent word: 'how LONG',
+            if t2[:2] in ("NN", "JJ", "RB"):                 # 'which CITY', 'what YEAR'. 'when/who/where was ...'
+                return w2.lower()                            # have no adjacent type-word -> no focus (use base scoring)
+    return None
+
+
 def sentences(ctoks):
     """Split token list into sentence spans. A '.' after a SINGLE-letter token is treated as an abbreviation
     (U.S., A.B.) and does NOT end a sentence -- a general rule, no hardcoded abbreviation list."""
@@ -63,8 +82,22 @@ def read_squad(path):
         for para in art["paragraphs"]:
             ct = toks(para["context"])
             for qa in para["qas"]:
-                out.append({"q": toks(qa["question"]), "c": ct, "golds": [a["text"] for a in qa["answers"]]})
+                qt = toks(qa["question"])
+                e = {"q": qt, "c": ct, "golds": [a["text"] for a in qa["answers"]]}
+                foc = lat_focus(qt)                          # LAT (grounded, no word list): does the question
+                if foc and _expects_quantity(foc):           # focus on a measurable property -> expect a number?
+                    e["want_quantity"] = True
+                out.append(e)
     return out
+
+
+@functools.lru_cache(maxsize=50000)
+def _expects_quantity(word):
+    try:
+        from thinking import kb
+        return kb.expects_quantity(word)
+    except Exception:
+        return False
 
 
 def build_idf(exs):
@@ -111,6 +144,7 @@ def answer(ex, idf, idf_default, max_len=8):
             return 0.0
         return max(matched) + 0.3 * sum(matched)            # a distinctive match dominates many generic ones
     bs, be = max(sents, key=sscore)
+    want_qty = bool(ex.get("want_quantity"))                 # LAT: question expects a NUMERIC answer ('how long/tall')
     qpos = [k for k in range(bs, be) if cl[k] in qset]
     best, bi, bj = -1.0, bs, bs
     i = bs
@@ -121,9 +155,12 @@ def answer(ex, idf, idf_default, max_len=8):
                 j += 1
             mass = sum(w(cl[k]) for k in range(i, j))
             d = min((min(abs(i - p), abs(j - 1 - p)) for p in qpos), default=0)
+            has_digit = any(re.search(r"\d", cl[k]) for k in range(i, j))
             sc = mass / (1.0 + 0.25 * d)
             if any(_specific(cl[k]) for k in range(i, j)):   # answers are specific (numbers/names): mild prior
                 sc *= 1.8
+            if want_qty:                                     # quantity question: the answer IS the measured value --
+                sc = (mass * 3.0) if has_digit else sc * 0.4 # the number wins wherever it sits (distance-independent)
             if sc > best:
                 best, bi, bj = sc, i, j
             i = j
@@ -132,7 +169,11 @@ def answer(ex, idf, idf_default, max_len=8):
     # trim the span to its high-IDF CORE: drop low-information edge words (e.g. 'champion', 'defeated') so the
     # answer is the informative entity, not its surrounding filler.
     core = [k for k in range(bi, bj) if word[k]]
-    if core:
+    if want_qty and any(re.search(r"\d", cl[k]) for k in core):
+        while core and not re.search(r"\d", cl[core[0]]):    # a quantity reads as NUMBER+unit ('5 business days',
+            core = core[1:]                                  # '330 metres'): start the answer at the number
+        bi, bj = core[0], core[-1] + 1
+    elif core:
         ws = [w(cl[k]) for k in core]
         thr = 0.55 * max(ws)
         while len(core) > 1 and w(cl[core[0]]) < thr:
@@ -181,9 +222,9 @@ def selftest():
     em, f1 = evaluate(exs, n=1500)
     print(f"squadqa selftest: SQuAD dev (RUNTIME reasoning, ZERO training) -- EM {em:.3f} | token-F1 {f1:.3f} "
           f"(unsupervised sliding-window baseline range ~0.13-0.20)")
-    assert f1 > 0.14, f"runtime span reasoning too weak: {f1}"
-    print("squadqa selftest OK (extractive QA by pure runtime reasoning -- no training, no model, no hardcoded "
-          "answer-type rules)")
+    assert f1 > 0.16, f"runtime span reasoning too weak: {f1}"
+    print("squadqa selftest OK (extractive QA by pure runtime reasoning -- no training, no model; the only "
+          "answer-type signal is a GROUNDED LAT: WordNet says the focus is a measurable property -> expect a number)")
     return 0
 
 

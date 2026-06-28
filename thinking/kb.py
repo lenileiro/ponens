@@ -11,6 +11,7 @@ is-a relations, not just shared characters. Capabilities:
   isa(word)          -> hypernym (is-a) chain  [types/categories, from the KB hierarchy, not a hand list]
   related(word)      -> synonyms + hypernyms + hyponyms + derivations (the word's meaning-neighborhood)
   similar(a, b)      -> do a and b share meaning? (synonym / shared neighborhood / shared is-a ancestor)
+  expects_quantity(w)-> is w a measurable property? ('how long/tall/far' -> numeric answer; via attribute relation)
 
   python -m thinking.kb --selftest
   python -m thinking.kb refund          # inspect a word's KB meaning
@@ -68,6 +69,19 @@ def meaning(word):
     return ss[0].definition() if ss else None
 
 
+@functools.lru_cache(maxsize=50000)
+def expects_quantity(word):
+    """Is `word` a gradable/MEASURABLE property -- so a question focused on it ('how LONG/TALL/FAR/OLD/HEAVY') expects
+    a NUMERIC answer? Grounded in WordNet's attribute relation (long->duration/length, tall->stature, far->distance,
+    old->age), NOT a hardcoded adjective list: an adjective is measurable iff it is the ATTRIBUTE of some noun.
+    Entities/qualities (city, color, book) have no attribute noun -> False."""
+    wn = _wn()
+    for s in wn.synsets(word, pos=wn.ADJ) + wn.synsets(word, pos=wn.ADV):
+        if s.attributes():
+            return True
+    return False
+
+
 def similar(a, b):
     """Do a and b share meaning, per the KB? Synonyms, or one in the other's neighborhood, or a shared is-a ancestor."""
     a, b = a.lower(), b.lower()
@@ -101,6 +115,11 @@ def selftest():
     # the agent uses kb_match to find meaning beyond surface: 'physician' matches a doc mentioning 'doctor'
     assert kb_match("physician", ["the", "doctor", "examined", "her"])
     assert not kb_match("rocket", ["the", "doctor", "examined", "her"])
+    # measurable-property typing (grounded in WordNet's attribute relation, not a hardcoded adjective list)
+    for w in ("long", "tall", "far", "old", "wide"):
+        assert expects_quantity(w), f"{w} should expect a numeric answer"
+    for w in ("city", "color", "book"):
+        assert not expects_quantity(w), f"{w} should NOT expect a numeric answer"
     print("kb selftest OK (runtime meaning lookup + meaning-based matching; no pretraining, no hardcoded words)")
     return 0
 
