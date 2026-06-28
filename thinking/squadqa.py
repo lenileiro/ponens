@@ -53,9 +53,10 @@ def build_idf(exs):
 
 
 def answer(ex, idf, idf_default, max_len=8):
-    """Runtime reasoning in two steps: (1) pick the SENTENCE where the question's informative (high-IDF) words
-    concentrate; (2) within it, return the most informative contiguous span that is NOT made of question words
-    -- the new information the question points at. No training, no answer-type rules."""
+    """Runtime reasoning, no training: (1) pick the SENTENCE where the question's informative (high-IDF) words
+    concentrate; (2) within it, the highest-IDF contiguous run of non-question content tokens (the answer the
+    question points at), discounted by distance to the question's words. (Char-n-gram fuzzy matching was tried and
+    slightly hurt -- loose matches add sentence/span-selection noise -- so exact IDF-weighted matching is used.)"""
     c = ex["c"]; cl = [t.lower() for t in c]
     qset = set(t.lower() for t in ex["q"])
     n = len(c)
@@ -64,7 +65,6 @@ def answer(ex, idf, idf_default, max_len=8):
     def w(t):
         return idf.get(t, idf_default)
     word = [bool(re.match(r"\w", t)) for t in c]
-    # sentence spans
     sents = []; start = 0
     for i, t in enumerate(c):
         if t in (".", "?", "!"):
@@ -73,13 +73,10 @@ def answer(ex, idf, idf_default, max_len=8):
         sents.append((start, n))
     if not sents:
         sents = [(0, n)]
-    # (1) best sentence = sum of IDF of the DISTINCT question words it contains
     def sscore(se):
         s, e = se
         return sum(w(t) for t in set(cl[s:e]) if t in qset)
     bs, be = max(sents, key=sscore)
-    # (2) within it, the contiguous run of non-question content tokens with the highest IDF mass, PREFERRING runs
-    # near the question's words (the answer sits beside what the question mentions).
     qpos = [k for k in range(bs, be) if cl[k] in qset]
     best, bi, bj = -1.0, bs, bs
     i = bs
@@ -90,7 +87,7 @@ def answer(ex, idf, idf_default, max_len=8):
                 j += 1
             mass = sum(w(cl[k]) for k in range(i, j))
             d = min((min(abs(i - p), abs(j - 1 - p)) for p in qpos), default=0)
-            sc = mass / (1.0 + 0.25 * d)                       # IDF mass, discounted by distance to question words
+            sc = mass / (1.0 + 0.25 * d)
             if sc > best:
                 best, bi, bj = sc, i, j
             i = j
