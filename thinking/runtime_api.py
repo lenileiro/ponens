@@ -74,15 +74,23 @@ def _prune_context(question, passage, tau=0.4):
     return kept
 
 
-def answer(question, passage, prune_first=True):
+def answer(question, passage, prune_first=True, use_kb=True):
     """Extract the answer span `question` points at within `passage` (runtime span reasoning, per-passage IDF).
-    Internally PRUNES the passage to the relevant sentences first (focuses reasoning, and reduces long/multi-passage
-    contexts) -- prune is an internal stage, not called by the user."""
+    Internally PRUNES the passage to the relevant sentences first. use_kb consults the runtime KB to exclude words
+    that merely RESTATE the question (synonyms/hypernyms of question words, e.g. 'payment' for 'refund') -- the
+    answer is the NEW information, so those redundant words are not candidate answers. No hardcoding, no training."""
     if prune_first:
         focused = _prune_context(question, passage, tau=0.4)
         if focused.strip():
             passage = focused
-    ex = {"q": Q.toks(question), "c": Q.toks(passage)}
+    qtoks = Q.toks(question)
+    ex = {"q": qtoks, "c": Q.toks(passage)}
+    if use_kb:
+        redundant = set()
+        for w in qtoks:
+            if re.match(r"[a-z]", w.lower()):
+                redundant |= {s for s in KB.related(w.lower()) if " " not in s}
+        ex["redundant"] = redundant
     return Q.answer(ex, {}, 1.0)
 
 

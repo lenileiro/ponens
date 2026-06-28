@@ -71,6 +71,7 @@ def answer(ex, idf, idf_default, max_len=8):
     slightly hurt -- loose matches add sentence/span-selection noise -- so exact IDF-weighted matching is used.)"""
     c = ex["c"]; cl = [t.lower() for t in c]
     qset = set(t.lower() for t in ex["q"])
+    excluded = qset | set(ex.get("redundant", ()))           # question words + words the KB says merely restate them
     n = len(c)
     if n == 0:
         return ""
@@ -96,9 +97,9 @@ def answer(ex, idf, idf_default, max_len=8):
     best, bi, bj = -1.0, bs, bs
     i = bs
     while i < be:
-        if word[i] and cl[i] not in qset:
+        if word[i] and cl[i] not in excluded:               # answer = NEW info: not a question word, not KB-redundant with it
             j = i
-            while j < be and word[j] and cl[j] not in qset and (j - i) < max_len:
+            while j < be and word[j] and cl[j] not in excluded and (j - i) < max_len:
                 j += 1
             mass = sum(w(cl[k]) for k in range(i, j))
             d = min((min(abs(i - p), abs(j - 1 - p)) for p in qpos), default=0)
