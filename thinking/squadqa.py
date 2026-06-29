@@ -205,6 +205,37 @@ def _is_a(word, focus):
         return False
 
 
+@functools.lru_cache(maxsize=200000)
+def _vlem(word):
+    try:
+        from nltk.stem import WordNetLemmatizer
+        return WordNetLemmatizer().lemmatize(word, "v")
+    except Exception:
+        return word
+
+
+@functools.lru_cache(maxsize=20000)
+def _agent_pred(qtoks):
+    """If the wh-word is the AGENT/subject of the question's predicate ('who WROTE', 'what CAUSED'), return that
+    predicate's lemma; else None. Parser-free (POS + word order): a WP/WDT wh-word with NO noun between it and the
+    last verb is that verb's subject. 'who did X invent' has a noun (X) between -> object -> None (rule won't fire)."""
+    try:
+        import nltk
+        tags = nltk.pos_tag([t.lower() for t in qtoks])
+    except Exception:
+        return None
+    whi = next((i for i, (wd, tg) in enumerate(tags) if tg in ("WP", "WDT")), None)
+    if whi is None:
+        return None
+    verbs = [i for i, (wd, tg) in enumerate(tags) if tg.startswith("VB")]
+    if not verbs or verbs[-1] <= whi:
+        return None
+    pi = verbs[-1]
+    if any(tg.startswith("NN") for wd, tg in tags[whi + 1:pi]):
+        return None
+    return _vlem(tags[pi][0])
+
+
 @functools.lru_cache(maxsize=100000)
 def _related(word):
     """The word's WordNet meaning-neighborhood (plus itself) -- the SEMANTIC matcher's expansion set: a passage word
@@ -354,6 +385,24 @@ def answer(ex, idf, idf_default, max_len=8):
     # of matched question words (IDF-weighted, exponential decay), not just the single nearest/rarest one. This is
     # the proximity signal; it ranks candidate NPs and breaks ties among same-type candidates.
     maxqw = max((w(cl[k]) for k in qpos), default=1.0)
+    # HIGH-PRECISION PASSIVE-AGENT rule (AutoSlog template #14, parser-free): for an agent question ('who wrote'),
+    # if the chosen sentence has the predicate as a passive participle (VBN) followed by 'by', the NP after 'by' IS
+    # the agent -> the answer ('X was written by [George Orwell]'). Narrow + precise; no general subject/object rules.
+    agent_start = None
+    pred = _agent_pred(tuple(ex["q"]))
+    if pred:
+        try:
+            import nltk
+            seg = [t.lower() for t in c[bs:be]]; stags = nltk.pos_tag(seg)
+            for i2, (wd, tg) in enumerate(stags):
+                if tg == "VBN" and _vlem(wd) == pred:
+                    for j2 in range(i2 + 1, min(i2 + 6, len(seg))):
+                        if seg[j2] == "by":
+                            agent_start = bs + j2 + 1; break
+                    if agent_start is not None:
+                        break
+        except Exception:
+            agent_start = None
     # Candidates = noun-phrase chunks, PLUS (answer-type-driven, Pasca-Harabagiu/POSTECH style) any single token that
     # IS-A the focus noun looked up POS-AGNOSTICALLY -- so an answer the chunker misses because the tagger called it an
     # adjective ('Portuguese' for 'what language') is still proposed. WordNet says portuguese.n.01 is-a language.
@@ -387,6 +436,8 @@ def answer(ex, idf, idf_default, max_len=8):
                 sc = mass * 3.0 * tie                        # ...else any new name (soft fallback: no regression)
             else:
                 sc *= 0.4
+        if agent_start is not None and span[0] == agent_start:  # the passive 'by' agent -- high-confidence answer
+            sc = mass * 6.0
         if sc > best:
             best, bi, bj = sc, span[0], span[-1] + 1
     # trim the span to its high-IDF CORE: drop low-information edge words (e.g. 'champion', 'defeated') so the
