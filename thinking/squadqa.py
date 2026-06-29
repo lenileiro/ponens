@@ -354,8 +354,14 @@ def answer(ex, idf, idf_default, max_len=8):
     # of matched question words (IDF-weighted, exponential decay), not just the single nearest/rarest one. This is
     # the proximity signal; it ranks candidate NPs and breaks ties among same-type candidates.
     maxqw = max((w(cl[k]) for k in qpos), default=1.0)
+    # Candidates = noun-phrase chunks, PLUS (answer-type-driven, Pasca-Harabagiu/POSTECH style) any single token that
+    # IS-A the focus noun looked up POS-AGNOSTICALLY -- so an answer the chunker misses because the tagger called it an
+    # adjective ('Portuguese' for 'what language') is still proposed. WordNet says portuguese.n.01 is-a language.
+    cands = list(_np_spans(c[bs:be], bs))
+    if fw:
+        cands += [(k, k + 1) for k in range(bs, be) if word[k] and cl[k] not in excluded and _is_a(cl[k], fw)]
     best, bi, bj = -1.0, bs, bs
-    for (a, b) in _np_spans(c[bs:be], bs):                    # candidate = each noun-phrase chunk in the chosen sentence
+    for (a, b) in cands:                                      # candidate = each noun-phrase chunk in the chosen sentence
         span = [k for k in range(a, b) if word[k] and cl[k] not in excluded and k not in excl_pos]
         if not span:                                         # all-question-words / the question's own entity -> skip
             continue

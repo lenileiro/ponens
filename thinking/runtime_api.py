@@ -92,8 +92,11 @@ def answer(question, passage, prune_first=True, use_kb=True):
                 redundant |= {s for s in KB.related(w.lower()) if " " not in s}
         ex["redundant"] = redundant
         at = Q.answer_type(qtoks)                            # LAT: 'quantity'/'time' -> number; 'person'/'location'/
-        if at:                                              # 'group'/'entity' -> proper noun; structural + minimal wh-map
+        if at:                                              # 'group'/'entity'/'isa' -> proper noun / is-a candidate
             ex["want_type"] = at
+            foc = Q.lat_focus(qtoks)                          # focus NOUN -> is-a matching + POS-agnostic candidates
+            if foc and foc[1] == "NN" and at != "quantity":
+                ex["focus_word"] = foc[0]
     return Q.answer(ex, {}, 1.0)
 
 
