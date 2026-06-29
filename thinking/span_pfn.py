@@ -20,6 +20,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from device import get_device
+except Exception:                                              # fallback if device.py unavailable
+    def get_device():
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 V = 20            # token vocab (content tokens 2..V-1; 0=pad reserved)
 S = 12            # length of each example
 K = 4             # support examples per episode
@@ -131,7 +137,8 @@ HELDIN = ["delim", "after", "before", "firstk", "gt", "lt", "eq"]   # train on 7
 HELDOUT = ["lastk", "band"]                                          # ...hold out 2 structurally-related ones
 
 
-def _episode_tensors(rng, bs, mask_support=False, family="delim"):
+def _episode_tensors(rng, bs, mask_support=False, family="delim", dev=None):
+    dev = dev or torch.device("cpu")
     T = (K + 1) * S
     toks = np.zeros((bs, T), int); flags = np.zeros((bs, T), int)
     segs = np.zeros((bs, T), int); poss = np.zeros((bs, T), int); y = np.zeros((bs, S))
@@ -145,8 +152,8 @@ def _episode_tensors(rng, bs, mask_support=False, family="delim"):
                 flags[b, sl] = 0 if mask_support else fl[e]
             else:                                              # query: flag = UNKNOWN; target = its gold span
                 flags[b, sl] = 2; y[b] = fl[e]
-    t = lambda a: torch.tensor(a)
-    return t(toks), t(flags), t(segs), t(poss), torch.tensor(y, dtype=torch.float32)
+    t = lambda a: torch.tensor(a).to(dev)
+    return t(toks), t(flags), t(segs), t(poss), torch.tensor(y, dtype=torch.float32).to(dev)
 
 
 def _query_logits(model, toks, flags, segs, poss):
@@ -154,10 +161,10 @@ def _query_logits(model, toks, flags, segs, poss):
     return z[:, K * S:(K + 1) * S]                             # logits on the QUERY positions
 
 
-def train(model, steps=3000, bs=64, lr=2e-3, seed=0, family="delim"):
+def train(model, steps=3000, bs=64, lr=2e-3, seed=0, family="delim", dev=None):
     rng = np.random.default_rng(seed); opt = torch.optim.Adam(model.parameters(), lr=lr)
     for st in range(steps):
-        toks, flags, segs, poss, y = _episode_tensors(rng, bs, family=family)
+        toks, flags, segs, poss, y = _episode_tensors(rng, bs, family=family, dev=dev)
         loss = F.binary_cross_entropy_with_logits(_query_logits(model, toks, flags, segs, poss), y)
         opt.zero_grad(); loss.backward(); opt.step()
         if st % 500 == 0:
@@ -166,9 +173,9 @@ def train(model, steps=3000, bs=64, lr=2e-3, seed=0, family="delim"):
 
 
 @torch.no_grad()
-def evaluate(model, n=400, seed=123, mask_support=False, family="delim"):
+def evaluate(model, n=400, seed=123, mask_support=False, family="delim", dev=None):
     rng = np.random.default_rng(seed)
-    toks, flags, segs, poss, y = _episode_tensors(rng, n, mask_support=mask_support, family=family)
+    toks, flags, segs, poss, y = _episode_tensors(rng, n, mask_support=mask_support, family=family, dev=dev)
     pred = (_query_logits(model, toks, flags, segs, poss) > 0).float()
     tok_acc = (pred == y).float().mean().item()
     exact = (pred == y).all(dim=1).float().mean().item()       # whole query span exactly right
@@ -209,19 +216,41 @@ def multitest(steps=9000):
     return 0
 
 
+def train_scaled(d, layers, heads, bs, steps, k, save):
+    """Scaled broad-prior meta-training (for GPU): big model + many synthetic episodes + larger support, to test
+    whether scale lets the model learn the BROAD 7-family mix that stalled at small/CPU scale."""
+    global K
+    K = k
+    dev = get_device()
+    torch.manual_seed(0)
+    model = SpanPFN(d=d, layers=layers, heads=heads).to(dev)
+    print(f"scaled PFN: d{d} L{layers} H{heads} bs{bs} steps{steps} K{k} | families {HELDIN} | device {dev}", flush=True)
+    train(model, steps=steps, bs=bs, family="mix", dev=dev)
+    if save:
+        torch.save({"state": model.state_dict(), "cfg": (d, layers, heads, k)}, save)
+    hi = float(np.mean([evaluate(model, family=f, dev=dev)[1] for f in HELDIN]))
+    print(f"RESULT scaled broad-prior: held-IN mean exact-span {hi:.3f}", flush=True)
+    for f in HELDOUT:
+        print(f"  held-OUT {f:6} exact-span {evaluate(model, family=f, dev=dev)[1]:.3f}", flush=True)
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--multitest", action="store_true")
-    ap.add_argument("--steps", type=int, default=3000)
+    ap.add_argument("--train", action="store_true")
+    ap.add_argument("--d", type=int, default=256); ap.add_argument("--layers", type=int, default=6)
+    ap.add_argument("--heads", type=int, default=8); ap.add_argument("--bs", type=int, default=256)
+    ap.add_argument("--steps", type=int, default=40000); ap.add_argument("--k", type=int, default=8)
+    ap.add_argument("--save", default="/tmp/span_pfn.pt")
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
     if a.multitest:
         return multitest()
-    model = SpanPFN()
-    train(model, steps=a.steps)
-    print("eval:", evaluate(model))
+    if a.train:
+        return train_scaled(a.d, a.layers, a.heads, a.bs, a.steps, a.k, a.save)
     return 0
 
 
