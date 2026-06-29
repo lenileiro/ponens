@@ -339,17 +339,18 @@ def answer(ex, idf, idf_default, max_len=8):
         has_digit = any(re.search(r"\d", cl[k]) for k in span)
         has_name = any(k in proper_pos for k in span)
         sc = mass / (1.0 + 0.7 * d)
+        tie = 1.0 / (1.0 + 0.35 * d)                         # among same-TYPE candidates, the one nearest the anchor wins
         if any(_specific(cl[k]) for k in span):              # answers are specific (numbers/names): mild prior
             sc *= 1.8
         if want_num:                                         # quantity/time question: the answer IS the measured value
-            sc = (mass * 3.0) if has_digit else sc * 0.4
+            sc = (mass * 3.0 * tie) if has_digit else sc * 0.4
         elif fw and any(_is_a(cl[k], fw) for k in span):     # candidate IS-A the focus noun ('French' is-a language,
-            sc = mass * 4.0                                  # 'Paris' is-a city) -- the strongest, most precise match
+            sc = mass * 4.0 * tie                            # 'Paris' is-a city) -- the strongest, most precise match
         elif want_ent:                                       # entity question: the answer IS a (new) proper noun;
             if has_name and any(bucket_at.get(k) in want_buckets for k in span):
-                sc = mass * 4.0                              # ...best if its supersense MATCHES the asked type
+                sc = mass * 4.0 * tie                        # ...best if its supersense MATCHES the asked type
             elif has_name:
-                sc = mass * 3.0                              # ...else any new name (soft fallback: no regression)
+                sc = mass * 3.0 * tie                        # ...else any new name (soft fallback: no regression)
             else:
                 sc *= 0.4
         if sc > best:
@@ -418,7 +419,7 @@ def selftest():
     em, f1 = evaluate(exs, n=1500)
     print(f"squadqa selftest: SQuAD dev (RUNTIME reasoning, ZERO training) -- EM {em:.3f} | token-F1 {f1:.3f} "
           f"(unsupervised sliding-window baseline range ~0.13-0.20)")
-    assert f1 > 0.32, f"runtime span reasoning too weak: {f1}"
+    assert f1 > 0.34, f"runtime span reasoning too weak: {f1}"
     print("squadqa selftest OK (extractive QA by pure runtime reasoning -- no training, no model. Candidates are "
           "NOUN-PHRASE chunks (rule-based POS) ranked by IDF mass + proximity to the question's RAREST word + a "
           "WordNet-grounded answer type (number / person / location / ... ; bare who/where/when via a minimal wh-map).)")
