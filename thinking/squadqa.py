@@ -77,19 +77,24 @@ _WH_TYPE = {"who": "person", "whom": "person", "where": "location", "when": "tim
 
 
 def answer_type(qtoks):
-    """Map the question to an expected answer type. STRUCTURAL where possible (WordNet, no word lists):
-      - measurable-property focus ('how LONG', 'what AGE') -> 'quantity' (a number);
-      - entity-noun focus -> its WordNet SUPERSENSE bucket ('which CITY'->location, 'what AUTHOR'->person,
-        'what COUNTRY'->group), or generic 'entity' if it has named instances but no clean supersense.
-    For BARE who/where/when (no focus noun, untypable in WordNet) -> the minimal grammatical map above. None if
-    no signal (fall back to plain span scoring)."""
+    """Map the question to an expected answer type. STRUCTURAL (WordNet, no word lists):
+      - measurable ADJECTIVE/ADVERB focus ('how LONG/TALL/FAR') -> 'quantity' (a number). Restricted to adj/adv
+        because the attribute relation also fires on non-numeric qualities ('what COLOR') -- those are nouns;
+      - NOUN focus -> 'time' for noun.time ('what YEAR' -> a number/date), the SUPERSENSE bucket for
+        person/location/group ('which CITY'->location), else 'isa' (a general is-a match: 'what LANGUAGE'->French);
+      - BARE who/where/when (no focus noun, untypable in WordNet) -> the minimal grammatical map. None otherwise."""
     f = lat_focus(qtoks)
     if f:
         word, pos2 = f
-        if _expects_quantity(word):
+        if pos2 in ("JJ", "RB") and _expects_quantity(word):
             return "quantity"
         if pos2 == "NN":
-            return _noun_supersense(word) or ("entity" if _is_entity_type(word) else None)
+            b = _noun_supersense(word)
+            if b == "time":
+                return "time"
+            if b in ("person", "location", "group"):
+                return b
+            return "isa"                                     # general noun focus -> rank by is-a(candidate, focus)
         return None
     try:
         import nltk
@@ -123,10 +128,10 @@ def read_squad(path):
             for qa in para["qas"]:
                 qt = toks(qa["question"])
                 e = {"q": qt, "c": ct, "golds": [a["text"] for a in qa["answers"]]}
-                at = answer_type(qt)                          # LAT: 'quantity'|'time'|'person'|'location'|'group'|'entity'
+                at = answer_type(qt)                          # LAT: 'quantity'|'time'|'person'|'location'|'group'|'isa'
                 if at:
                     e["want_type"] = at
-                    foc = lat_focus(qt)                       # keep the focus NOUN for precise supersense-union matching
+                    foc = lat_focus(qt)                       # keep the focus NOUN for is-a / supersense-union matching
                     if foc and foc[1] == "NN" and at != "quantity":
                         e["focus_word"] = foc[0]
                 out.append(e)
@@ -183,6 +188,15 @@ def _known_name(text):
     try:
         from thinking import kb
         return kb.known_name(text)
+    except Exception:
+        return False
+
+
+@functools.lru_cache(maxsize=200000)
+def _is_a(word, focus):
+    try:
+        from thinking import kb
+        return kb.is_a(word, focus)
     except Exception:
         return False
 
@@ -259,12 +273,13 @@ def answer(ex, idf, idf_default, max_len=8):
             return 0.0
         return max(matched) + 0.3 * sum(matched)            # a distinctive match dominates many generic ones
     bs, be = max(sents, key=sscore)
-    wt = ex.get("want_type")                                 # 'quantity'|'time'|'person'|'location'|'group'|'entity'|None
+    wt = ex.get("want_type")                                 # 'quantity'|'time'|'person'|'location'|'group'|'isa'|None
+    fw = ex.get("focus_word")                                # the focus NOUN ('city','language',...) for is-a matching
     want_num = wt in ("quantity", "time")                    # a NUMBER (measure, year/date)
-    want_ent = wt in ("person", "location", "group", "entity")  # a PROPER NOUN
-    if ex.get("focus_word"):                                 # entity-noun focus: ALL supersenses of the noun (polysemy:
-        want_buckets = _noun_supersense_set(ex["focus_word"])   # country -> {group, location}, so France matches)
-    elif wt in ("person", "location", "group"):              # bare who/where: the single mapped bucket
+    want_ent = wt in ("person", "location", "group", "entity")  # a PROPER NOUN (named entity)
+    if fw:                                                   # entity-noun focus: ALL supersenses of the noun (polysemy:
+        want_buckets = _noun_supersense_set(fw)              # country -> {group, location}, so France matches)
+    elif wt in ("person", "location", "group"):             # bare who/where: the single mapped bucket
         want_buckets = frozenset([wt])
     else:
         want_buckets = frozenset()
@@ -328,6 +343,8 @@ def answer(ex, idf, idf_default, max_len=8):
             sc *= 1.8
         if want_num:                                         # quantity/time question: the answer IS the measured value
             sc = (mass * 3.0) if has_digit else sc * 0.4
+        elif fw and any(_is_a(cl[k], fw) for k in span):     # candidate IS-A the focus noun ('French' is-a language,
+            sc = mass * 4.0                                  # 'Paris' is-a city) -- the strongest, most precise match
         elif want_ent:                                       # entity question: the answer IS a (new) proper noun;
             if has_name and any(bucket_at.get(k) in want_buckets for k in span):
                 sc = mass * 4.0                              # ...best if its supersense MATCHES the asked type
@@ -401,7 +418,7 @@ def selftest():
     em, f1 = evaluate(exs, n=1500)
     print(f"squadqa selftest: SQuAD dev (RUNTIME reasoning, ZERO training) -- EM {em:.3f} | token-F1 {f1:.3f} "
           f"(unsupervised sliding-window baseline range ~0.13-0.20)")
-    assert f1 > 0.31, f"runtime span reasoning too weak: {f1}"
+    assert f1 > 0.32, f"runtime span reasoning too weak: {f1}"
     print("squadqa selftest OK (extractive QA by pure runtime reasoning -- no training, no model. Candidates are "
           "NOUN-PHRASE chunks (rule-based POS) ranked by IDF mass + proximity to the question's RAREST word + a "
           "WordNet-grounded answer type (number / person / location / ... ; bare who/where/when via a minimal wh-map).)")

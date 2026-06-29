@@ -152,6 +152,24 @@ def noun_supersense_set(word):
     return frozenset(out)
 
 
+@functools.lru_cache(maxsize=200000)
+def is_a(word, focus):
+    """Is `word` a KIND of `focus` -- does word's is-a chain (hypernyms + instance-hypernyms) pass through any synset
+    of focus? Grounds 'what LANGUAGE/COLOR/SPORT/ANIMAL' -> French/red/soccer/dog and 'which CITY' -> Paris in one
+    WordNet relation (more general than supersense buckets, and precise). Pure WordNet, no word list."""
+    wn = _wn()
+    fs = set(wn.synsets(focus, pos=wn.NOUN))
+    if not fs:
+        return False
+    for s in wn.synsets(word, pos=wn.NOUN):
+        anc = {s} | set(s.closure(lambda x: x.hypernyms()))
+        for ih in s.instance_hypernyms():
+            anc.add(ih); anc |= set(ih.closure(lambda x: x.hypernyms()))
+        if anc & fs:
+            return True
+    return False
+
+
 @functools.lru_cache(maxsize=50000)
 def known_name(text):
     """Does WordNet store this (multi-word) PROPER noun? Used to bridge internal lowercase particles in a name span:
@@ -233,6 +251,8 @@ def selftest():
     assert noun_supersense_set("country") >= {"location", "group"}   # polysemy union (territory + political body)
     assert known_name("Leonardo da Vinci") and known_name("United States of America")  # multi-word names in WordNet
     assert not known_name("Tony Blair in Paris")             # a non-name span does NOT resolve (no over-merge)
+    assert is_a("French", "language") and is_a("Paris", "city") and is_a("soccer", "sport")  # is-a focus matching
+    assert not is_a("Paris", "language") and not is_a("red", "animal")
     print("kb selftest OK (runtime meaning lookup + meaning-based matching; no pretraining, no hardcoded words)")
     return 0
 
