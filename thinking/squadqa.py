@@ -11,10 +11,7 @@ word whose WordNet meaning-neighborhood contains a passage word, with no shared 
 sentence with 'author') that cracks the wall where the answer sentence shares no distinctive word with the question.
 Candidates are NOUN-PHRASE chunks (rule-based POS chunking -- SQuAD answers are NPs), ranked by IDF mass and
 GRAVITY -- closeness to the whole CLUSTER of matched question words (IDF-weighted, exponential decay) -- so the
-answer is the NP where the question's content concentrates, not merely the one nearest a single term. If a
-pretrained dependency parser is available (OPTIONAL: `pip install spacy && python -m spacy download en_core_web_sm`),
-the NP holding the same grammatical ROLE to the question's predicate as the wh-word (who->subject/agent of the verb,
-what->object) is boosted -- labeled relations only, never tree distance; gracefully skipped if spaCy is absent. The answer-type signal is a GROUNDED LAT (not a hardcoded
+answer is the NP where the question's content concentrates, not merely the one nearest a single term. The answer-type signal is a GROUNDED LAT (not a hardcoded
 'when->date' table), read STRUCTURALLY from WordNet:
   - measurable-property focus ('how LONG/TALL/FAR/OLD') -> a NUMERIC span wins wherever it sits;
   - entity-noun focus ('which CITY', 'what AUTHOR') -> the focus noun's SUPERSENSE (location/person/...) is matched
@@ -208,59 +205,6 @@ def _is_a(word, focus):
         return False
 
 
-# OPTIONAL labeled-dependency role matching (Punyakanok/Roth/Yih style). A PRETRAINED dependency parser (same class
-# of tool as the POS tagger -- not trained on our data) used ONLY via relation LABELS, never tree distance (which was
-# tested and failed). Gracefully disabled if spaCy/the model is not installed -- it is a pure enhancement.
-_SPACY = None
-# Voice-normalized roles: the AGENT (the doer) is the active subject; the PASSIVE subject (nsubjpass) is the PATIENT
-# = active object. So 'who wrote X' (SUBJ/doer) must match the 'by Y' agent of 'X was written by Y', NOT X itself.
-_SUBJ = {"nsubj", "agent"}; _OBJ = {"dobj", "nsubjpass", "attr", "oprd", "dative", "acomp"}
-_OBL = {"prep", "pobj", "advmod", "npadvmod", "pcomp"}
-
-
-def _spacy():
-    global _SPACY
-    if _SPACY is None:
-        try:
-            import spacy
-            _SPACY = spacy.load("en_core_web_sm", disable=["ner"])
-        except Exception:
-            _SPACY = False
-    return _SPACY or None
-
-
-def _coarse_role(dep):                                        # dependency LABELS -> coarse role (grammatical, no words)
-    return "SUBJ" if dep in _SUBJ else "OBJ" if dep in _OBJ else "OBL" if dep in _OBL else None
-
-
-@functools.lru_cache(maxsize=20000)
-def _q_role(qtext):
-    """The question's expected answer role + predicate, from the wh-word's dependency relation: 'who WROTE'->(write,
-    SUBJ), 'what did X WRITE'->(write, OBJ), 'where IS'->(be, OBL). (None, None) if no parser / no wh-word."""
-    nlp = _spacy()
-    if not nlp:
-        return (None, None)
-    doc = nlp(qtext)
-    for t in doc:
-        if t.tag_ in ("WP", "WP$", "WRB", "WDT"):
-            return (t.head.lemma_.lower(), _coarse_role(t.dep_))
-    return (None, None)
-
-
-def _role_of(nph, pred):
-    """Coarse grammatical role of a noun-phrase head token relative to the predicate token (voice-normalized: the
-    'by X' agent of a passive counts as SUBJ). Looks one hop through a preposition/agent."""
-    if nph.head == pred:
-        return _coarse_role(nph.dep_)
-    if nph.head.head == pred:
-        if nph.head.dep_ == "agent":
-            return "SUBJ"
-        if nph.head.dep_ == "prep":
-            return "OBL"
-        return _coarse_role(nph.head.dep_)
-    return None
-
-
 @functools.lru_cache(maxsize=100000)
 def _related(word):
     """The word's WordNet meaning-neighborhood (plus itself) -- the SEMANTIC matcher's expansion set: a passage word
@@ -405,20 +349,6 @@ def answer(ex, idf, idf_default, max_len=8):
                 k = j
             else:
                 k += 1
-    # OPTIONAL: parse the question + chosen sentence to boost the NP holding the same grammatical ROLE to the shared
-    # predicate as the wh-word (labeled relations only; skipped entirely if no parser).
-    seg2sp = {}; pred_tok = None; exp_role = None
-    if _spacy() is not None:
-        pred_lemma, exp_role = _q_role(" ".join(ex["q"]))
-        if pred_lemma and exp_role:
-            seg = c[bs:be]; doc = _spacy()(" ".join(seg)); byoff = {st.idx: st for st in doc}
-            off = 0
-            for i2, tok in enumerate(seg):
-                if off in byoff:
-                    seg2sp[bs + i2] = byoff[off]
-                off += len(tok) + 1
-            cand = [st for st in doc if st.lemma_.lower() == pred_lemma or st.text.lower() in _related(pred_lemma)]
-            pred_tok = cand[0] if cand else None
     qpos = [k for k in range(bs, be) if cl[k] in qset]
     # GRAVITY anchor: the answer sits where the question's content words CONCENTRATE -- closeness to the whole CLUSTER
     # of matched question words (IDF-weighted, exponential decay), not just the single nearest/rarest one. This is
@@ -434,13 +364,10 @@ def answer(ex, idf, idf_default, max_len=8):
         prox = grav / (1.0 + maxqw) if qpos else 1.0         # no q-word in sentence -> rank by mass alone
         has_digit = any(re.search(r"\d", cl[k]) for k in span)
         has_name = any(k in proper_pos for k in span)
-        rolematch = False                                    # does this NP hold the wh-word's grammatical role of the predicate?
-        if pred_tok is not None and exp_role:                # ('who wrote'->agent-of-write; voice-normalized)
-            rolematch = exp_role in set(filter(None, (_role_of(seg2sp[k], pred_tok) for k in span if k in seg2sp)))
         sc = mass * prox
-        # tie = proximity tiebreak among same-type candidates, FLOORED so a typed answer far from the q-words still
-        # beats a near non-answer; a ROLE match is trusted strongly (high floor -> overrides mere proximity).
-        tie = max(prox, 0.8 if rolematch else 0.15)
+        # tie = proximity tiebreak among same-type candidates, FLOORED so a typed answer far from the q-words (e.g.
+        # a number at the end of the sentence) still beats a near non-answer.
+        tie = max(prox, 0.15)
         if any(_specific(cl[k]) for k in span):              # answers are specific (numbers/names): mild prior
             sc *= 1.8
         if want_num:                                         # quantity/time question: the answer IS the measured value
@@ -454,8 +381,6 @@ def answer(ex, idf, idf_default, max_len=8):
                 sc = mass * 3.0 * tie                        # ...else any new name (soft fallback: no regression)
             else:
                 sc *= 0.4
-        elif rolematch:                                      # untyped question, but the NP is in the asked role
-            sc *= 1.8
         if sc > best:
             best, bi, bj = sc, span[0], span[-1] + 1
     # trim the span to its high-IDF CORE: drop low-information edge words (e.g. 'champion', 'defeated') so the
@@ -526,8 +451,7 @@ def selftest():
     print("squadqa selftest OK (extractive QA by pure runtime reasoning -- no training, no model. TWO fused matchers "
           "for sentence selection (lexical IDF overlap + a WordNet-relation matcher for the no-surface-overlap wall, "
           "'wrote'~'author'); candidates are NOUN-PHRASE chunks ranked by mass + GRAVITY to the question-word cluster "
-          "+ a WordNet-grounded answer type (number/person/location/...; bare who/where/when via a minimal wh-map) "
-          "+ an OPTIONAL labeled-dependency role match (boosts the NP in the wh-word's grammatical role; needs spaCy).)")
+          "+ a WordNet-grounded answer type (number/person/location/...; bare who/where/when via a minimal wh-map).)")
     return 0
 
 
