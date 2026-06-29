@@ -290,11 +290,14 @@ def _np_spans(seg, base):
         return [(base, base + len(seg))]
 
 
-def answer(ex, idf, idf_default, max_len=8):
+def answer(ex, idf, idf_default, max_len=8, trace=None):
     """Runtime reasoning, no training: (1) pick the SENTENCE where the question's informative (high-IDF) words
     concentrate; (2) score each NOUN-PHRASE chunk in it (rule-based POS chunking -- SQuAD answers are NPs) by its
     IDF mass, proximity to the question's RAREST (most distinctive) matched word, and answer-type (LAT) fit, and
-    return the best. The rare-word anchor + NP boundaries are what lift this well above an IDF-run baseline."""
+    return the best. The rare-word anchor + NP boundaries are what lift this well above an IDF-run baseline.
+
+    If `trace` is a dict, it is filled with the decision rationale (selected sentence, answer-type, which signals the
+    winning span satisfies) -- the audit trail behind the answer."""
     c = ex["c"]; cl = [t.lower() for t in c]
     qset = set(t.lower() for t in ex["q"])
     excluded = qset | set(ex.get("redundant", ()))           # question words + words the KB says merely restate them
@@ -338,6 +341,9 @@ def answer(ex, idf, idf_default, max_len=8):
         want_buckets = frozenset([wt])
     else:
         want_buckets = frozenset()
+    if trace is not None:
+        trace["sentence"] = " ".join(c[bs:be])
+        trace["answer_type"] = wt; trace["focus_word"] = fw
     # NER by ORTHOGRAPHY (no model, no name list): a mid-sentence Capitalized run is a proper-noun phrase. An internal
     # lowercase particle ('Leonardo da Vinci', 'United States of America') is absorbed ONLY when the joined name
     # resolves in WordNet (so 'Tony Blair in Paris' does NOT over-merge). A phrase CONTAINING a question word is the
@@ -468,6 +474,16 @@ def answer(ex, idf, idf_default, max_len=8):
         span = span[1:]
     while span and not re.match(r"\w", span[-1]):
         span = span[:-1]
+    if trace is not None:                                    # which signals the winning span satisfies (the rationale)
+        wspan = [k for k in range(bi, bj) if word[k]]
+        trace["answer"] = " ".join(span)
+        trace["signals"] = {
+            "is_number": any(re.search(r"\d", cl[k]) for k in wspan),
+            "is_proper_noun": any(k in proper_pos for k in wspan),
+            "is_a_focus": bool(fw) and any(_is_a(cl[k], fw) for k in wspan),
+            "supersense_match": any(bucket_at.get(k) in want_buckets for k in wspan),
+            "passive_agent": agent_start is not None and bi == agent_start,
+        }
     return " ".join(span)
 
 

@@ -74,11 +74,7 @@ def _prune_context(question, passage, tau=0.4):
     return kept
 
 
-def answer(question, passage, prune_first=True, use_kb=True):
-    """Extract the answer span `question` points at within `passage` (runtime span reasoning, per-passage IDF).
-    Internally PRUNES the passage to the relevant sentences first. use_kb consults the runtime KB to exclude words
-    that merely RESTATE the question (synonyms/hypernyms of question words, e.g. 'payment' for 'refund') -- the
-    answer is the NEW information, so those redundant words are not candidate answers. No hardcoding, no training."""
+def _build_ex(question, passage, prune_first=True, use_kb=True):
     if prune_first:
         focused = _prune_context(question, passage, tau=0.4)
         if focused.strip():
@@ -97,7 +93,34 @@ def answer(question, passage, prune_first=True, use_kb=True):
             foc = Q.lat_focus(qtoks)                          # focus NOUN -> is-a matching + POS-agnostic candidates
             if foc and foc[1] == "NN" and at != "quantity":
                 ex["focus_word"] = foc[0]
+    return ex
+
+
+def answer(question, passage, prune_first=True, use_kb=True, model=None):
+    """Extract the answer span `question` points at within `passage` (runtime span reasoning, per-passage IDF).
+    Internally PRUNES the passage to the relevant sentences first. use_kb consults the runtime KB to exclude words
+    that merely RESTATE the question (synonyms/hypernyms of question words, e.g. 'payment' for 'refund') -- the
+    answer is the NEW information, so those redundant words are not candidate answers. No hardcoding, no training.
+
+    `model` (optional): a pre-trained reranker loaded via squad_rank.load_model -- trained ONCE on public data and
+    shipped as weights; if given, it scores the candidates instead of the hand-tuned formula (the customer never
+    trains). None -> the pure rule pipeline."""
+    ex = _build_ex(question, passage, prune_first, use_kb)
+    if model is not None:
+        from thinking import squad_rank as R
+        return R.predict(ex, model, {}, 1.0)
     return Q.answer(ex, {}, 1.0)
+
+
+def explain(question, passage, prune_first=True, use_kb=True):
+    """Like `answer`, but returns (answer, trace) -- an AUDIT TRAIL of why: the sentence chosen, the grounded
+    answer-type the question was mapped to, and which signals the winning span satisfied (number / proper-noun /
+    is-a-the-focus / supersense-match / passive-agent). This interpretability is the differentiator over an LLM."""
+    tr = {}
+    ans = Q.answer(_build_ex(question, passage, prune_first, use_kb), {}, 1.0, trace=tr)
+    fired = [k for k, v in tr.get("signals", {}).items() if v]
+    return ans, {"answer": ans, "expected_type": tr.get("answer_type"), "focus": tr.get("focus_word"),
+                 "chosen_sentence": tr.get("sentence"), "why": fired or ["nearest high-IDF noun phrase (no type signal)"]}
 
 
 def _doc_idf(sents_tok):
