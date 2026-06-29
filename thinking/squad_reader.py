@@ -137,15 +137,19 @@ def _batch(exs, stoi, dev):
 def train(model, data, stoi, dev, epochs=3, bs=32, lr=1e-3):
     opt = torch.optim.Adam([w for w in model.parameters() if w.requires_grad], lr=lr)
     rng = np.random.default_rng(0)
+    import time
+    nb = max(1, len(data) // bs)
     for ep in range(epochs):
-        rng.shuffle(data); tot = 0.0
-        for i in range(0, len(data), bs):
+        rng.shuffle(data); tot = 0.0; t0 = time.time()
+        for bi, i in enumerate(range(0, len(data), bs)):
             chunk = data[i:i + bs]
             X, (gs, ge) = _batch(chunk, stoi, dev)
             s, e = model(*X)
             loss = F.cross_entropy(s, gs) + F.cross_entropy(e, ge)
             opt.zero_grad(); loss.backward(); opt.step(); tot += loss.item()
-        print(f"  epoch {ep + 1}/{epochs} loss {tot / max(1, len(data) // bs):.3f}")
+            if bi % 100 == 0:
+                print(f"  ep{ep + 1} batch {bi}/{nb} loss {loss.item():.2f} ({(time.time() - t0) / (bi + 1) * 1000:.0f} ms/b)", flush=True)
+        print(f"  epoch {ep + 1}/{epochs} loss {tot / nb:.3f} ({time.time() - t0:.0f}s)", flush=True)
     return model
 
 
@@ -203,6 +207,7 @@ def main(argv=None):
     ap.add_argument("--eval", action="store_true")
     ap.add_argument("--n", type=int, default=40000); ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--dim", type=int, default=100); ap.add_argument("--hidden", type=int, default=128)
+    ap.add_argument("--evaln", type=int, default=1500, help="eval on a dev subset for fast feedback (0=full)")
     ap.add_argument("--save", default="/tmp/reader.pt")
     a = ap.parse_args(argv)
     if a.selftest:
@@ -211,19 +216,19 @@ def main(argv=None):
     if a.train:
         tr = read_spans(TRAIN, n=a.n); de = read_spans(DEV)
         stoi, emb = load_glove(a.dim, _vocab_words([tr, de]))
-        print(f"train {len(tr)} (span-aligned) | vocab {len(stoi)} | device {dev}")
+        print(f"train {len(tr)} (span-aligned) | dev {len(de)} | vocab {len(stoi)} | device {dev}", flush=True)
         model = Reader(emb, a.hidden).to(dev)
         train(model, tr, stoi, dev, epochs=a.epochs)
         torch.save({"state": model.state_dict(), "stoi": stoi, "emb_shape": emb.shape, "hidden": a.hidden}, a.save)
-        em, f1 = evaluate(model, de, stoi, dev)
-        print(f"SQuAD dev -- reader: EM {em:.3f} | F1 {f1:.3f}")
+        em, f1 = evaluate(model, de, stoi, dev, n=a.evaln or None)
+        print(f"SQuAD dev (n={a.evaln or len(de)}) -- reader: EM {em:.3f} | F1 {f1:.3f}", flush=True)
     if a.eval and not a.train:
         ck = torch.load(a.save, map_location=dev)
         de = read_spans(DEV); stoi = ck["stoi"]
         model = Reader(np.zeros(ck["emb_shape"], dtype=np.float32), ck["hidden"]).to(dev)
         model.load_state_dict(ck["state"])
-        em, f1 = evaluate(model, de, stoi, dev)
-        print(f"SQuAD dev -- reader: EM {em:.3f} | F1 {f1:.3f}")
+        em, f1 = evaluate(model, de, stoi, dev, n=a.evaln or None)
+        print(f"SQuAD dev (n={a.evaln or len(de)}) -- reader: EM {em:.3f} | F1 {f1:.3f}")
     return 0
 
 
