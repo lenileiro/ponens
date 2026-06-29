@@ -25,19 +25,56 @@ S = 12            # length of each example
 K = 4             # support examples per episode
 
 
-def gen_episode(rng, k=K, s=S):
-    """One task (A,B drawn fresh); k support examples + 1 query, all sharing the rule 'span between A and B'."""
-    a, b = rng.choice(range(2, V), size=2, replace=False)
-    toks, flags = [], []
-    for _ in range(k + 1):
-        i, j = sorted(rng.choice(range(s), size=2, replace=False))
-        while j - i < 2:                                       # ensure a non-empty between-span
-            i, j = sorted(rng.choice(range(s), size=2, replace=False))
-        seq = rng.choice([t for t in range(2, V) if t not in (a, b)], size=s).tolist()
-        seq[i] = a; seq[j] = b
-        fl = [1 if i < p < j else 0 for p in range(s)]         # in-span = strictly between A and B
-        toks.append(seq); flags.append(fl)
-    return np.array(toks), np.array(flags)                     # (k+1, s) tokens, (k+1, s) gold in-span
+FAMILIES = ["delim", "after", "gt", "eq"]                      # diverse rule TYPES (eq held out by default)
+
+
+def _apply_rule(seq, fam, p):
+    s = len(seq)
+    if fam == "delim":                                         # tokens strictly between A and B
+        a, b = p; ia = seq.index(a) if a in seq else 0; ib = seq.index(b) if b in seq else s - 1
+        i, j = min(ia, ib), max(ia, ib)
+        return [1 if i < q < j else 0 for q in range(s)]
+    if fam == "after":                                         # the L tokens after the first marker M
+        m, L = p; i = seq.index(m) if m in seq else s
+        return [1 if i < q <= i + L else 0 for q in range(s)]
+    if fam == "gt":                                            # all tokens with value > T
+        return [1 if seq[q] > p else 0 for q in range(s)]
+    if fam == "eq":                                            # all tokens equal to X
+        return [1 if seq[q] == p else 0 for q in range(s)]
+    raise ValueError(fam)
+
+
+def gen_episode(rng, k=K, s=S, family="delim"):
+    """One task (params drawn fresh) from `family`; k support + 1 query sharing the SAME rule. The model must infer
+    the rule (and its params) from the support answer-flags and apply it to the query."""
+    for _ in range(50):
+        if family == "delim":
+            p = tuple(rng.choice(range(2, V), size=2, replace=False))
+        elif family == "after":
+            p = (int(rng.integers(2, V)), int(rng.integers(1, 4)))
+        elif family == "gt":
+            p = int(rng.integers(V // 2, V - 2))
+        else:  # eq
+            p = int(rng.integers(2, V))
+        toks, flags, ok = [], [], True
+        for _ in range(k + 1):
+            seq = rng.integers(2, V, size=s).tolist()
+            if family == "delim":
+                i, j = sorted(rng.choice(range(s), size=2, replace=False))
+                seq[i], seq[j] = int(p[0]), int(p[1])
+            elif family == "after":
+                seq[int(rng.integers(0, s - 1))] = p[0]
+            elif family == "eq":                              # plant the target value so the span is non-empty
+                seq[int(rng.integers(0, s))] = int(p)
+            elif family == "gt":                              # plant a token above threshold
+                seq[int(rng.integers(0, s))] = int(rng.integers(p + 1, V))
+            fl = _apply_rule(seq, family, p)
+            if sum(fl) == 0:                                   # require a non-empty answer span
+                ok = False; break
+            toks.append(seq); flags.append(fl)
+        if ok:
+            return np.array(toks), np.array(flags)
+    return np.array(toks), np.array(flags)
 
 
 class SpanPFN(nn.Module):
@@ -57,12 +94,16 @@ class SpanPFN(nn.Module):
         return self.out(h).squeeze(-1)                         # (B, T) in-span logits
 
 
-def _episode_tensors(rng, bs, mask_support=False):
+HELDIN = ["delim", "after", "gt"]; HELDOUT = "eq"              # train on 3 rule families, hold one out
+
+
+def _episode_tensors(rng, bs, mask_support=False, family="delim"):
     T = (K + 1) * S
     toks = np.zeros((bs, T), int); flags = np.zeros((bs, T), int)
     segs = np.zeros((bs, T), int); poss = np.zeros((bs, T), int); y = np.zeros((bs, S))
     for b in range(bs):
-        tk, fl = gen_episode(rng)
+        fam = rng.choice(HELDIN) if family == "mix" else family
+        tk, fl = gen_episode(rng, family=fam)
         for e in range(K + 1):
             sl = slice(e * S, (e + 1) * S)
             toks[b, sl] = tk[e]; segs[b, sl] = e; poss[b, sl] = np.arange(S)
@@ -79,10 +120,10 @@ def _query_logits(model, toks, flags, segs, poss):
     return z[:, K * S:(K + 1) * S]                             # logits on the QUERY positions
 
 
-def train(model, steps=3000, bs=64, lr=2e-3, seed=0):
+def train(model, steps=3000, bs=64, lr=2e-3, seed=0, family="delim"):
     rng = np.random.default_rng(seed); opt = torch.optim.Adam(model.parameters(), lr=lr)
     for st in range(steps):
-        toks, flags, segs, poss, y = _episode_tensors(rng, bs)
+        toks, flags, segs, poss, y = _episode_tensors(rng, bs, family=family)
         loss = F.binary_cross_entropy_with_logits(_query_logits(model, toks, flags, segs, poss), y)
         opt.zero_grad(); loss.backward(); opt.step()
         if st % 500 == 0:
@@ -91,9 +132,9 @@ def train(model, steps=3000, bs=64, lr=2e-3, seed=0):
 
 
 @torch.no_grad()
-def evaluate(model, n=400, seed=123, mask_support=False):
+def evaluate(model, n=400, seed=123, mask_support=False, family="delim"):
     rng = np.random.default_rng(seed)
-    toks, flags, segs, poss, y = _episode_tensors(rng, n, mask_support=mask_support)
+    toks, flags, segs, poss, y = _episode_tensors(rng, n, mask_support=mask_support, family=family)
     pred = (_query_logits(model, toks, flags, segs, poss) > 0).float()
     tok_acc = (pred == y).float().mean().item()
     exact = (pred == y).all(dim=1).float().mean().item()       # whole query span exactly right
@@ -116,13 +157,32 @@ def selftest():
     return 0
 
 
+def multitest(steps=6000):
+    """Train on a MIX of rule families (delim/after/gt); test in-context generalization to (a) NEW PARAMS of seen
+    families [in-distribution] and (b) a HELD-OUT family [out-of-distribution] -- the real test of 'handle any new
+    span task from a few examples'."""
+    torch.manual_seed(0)
+    model = SpanPFN(d=96, layers=3, heads=4)
+    train(model, steps=steps, bs=64, family="mix")
+    print("span_pfn MULTI-FAMILY (meta-trained on delim/after/gt, in-context, zero weight updates):")
+    for fam in HELDIN:
+        _, ex = evaluate(model, family=fam); print(f"  held-IN  {fam:6} new-params exact-span {ex:.3f}")
+    _, exo = evaluate(model, family=HELDOUT)
+    print(f"  held-OUT {HELDOUT:6} (NEVER trained on this rule type) exact-span {exo:.3f}")
+    print("  -> strong in-distribution = generalizes to new params of seen task types; held-out shows the prior's reach.")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--multitest", action="store_true")
     ap.add_argument("--steps", type=int, default=3000)
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
+    if a.multitest:
+        return multitest()
     model = SpanPFN()
     train(model, steps=a.steps)
     print("eval:", evaluate(model))
