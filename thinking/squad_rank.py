@@ -27,7 +27,8 @@ TRAIN = "/tmp/squad/train-v1.1.json"
 # Ordered feature names -- the model is interpretable: weight[i] is the learned importance of FEATS[i].
 FEATS = ["mass", "logmass", "prox", "invd", "has_digit", "has_name", "specific", "isa", "bucket",
          "agent", "nplen", "startfrac", "qty_digit", "ent_bucket", "ent_name", "isa_match",
-         "ctx", "left_q", "right_q", "maxidf"]
+         "ctx", "left_q", "right_q", "maxidf", "redund",
+         "r_mass", "r_prox", "r_ctx", "r_maxidf"]      # last 4 = WITHIN-QUESTION ranks (learning-to-rank signal)
 
 
 def _featurize(ex, idf, idd):
@@ -40,6 +41,7 @@ def _featurize(ex, idf, idd):
     n = len(c)
     if n == 0:
         return []
+    pass_counts = Counter(cl)                                 # full-passage token counts -> answer REDUNDANCY (AskMSR)
     word = [bool(re.match(r"\w", t)) for t in c]
     sents = Q.sentences(c); msent = len(sents); sdf = Counter()
     for s, e in sents:
@@ -151,17 +153,25 @@ def _featurize(ex, idf, idd):
             left_q = float(span[0] - 1 >= bs and cl[span[0] - 1] in qset)
             right_q = float(span[-1] + 1 < be and cl[span[-1] + 1] in qset)
             maxidf = max((w(cl[k]) for k in span), default=0.0)
+            redund = np.log1p(max((pass_counts[cl[k]] for k in span), default=0))  # repeats across passage (AskMSR)
             fv = np.array([
                 mass, np.log1p(mass), prox, 1.0 / (1.0 + d), has_digit, has_name, specific, isa, bucket,
                 agent, nplen, startfrac,
                 float(want_num) * has_digit, float(want_ent) * bucket, float(want_ent) * has_name, isa,
-                ctx, left_q, right_q, maxidf,
+                ctx, left_q, right_q, maxidf, redund,
             ], dtype=np.float64)
             toks = list(span)                                # light trim: start a quantity at the number
             if want_num and any(re.search(r"\d", cl[k]) for k in toks):
                 while toks and not re.search(r"\d", cl[toks[0]]):
                     toks = toks[1:]
             out.append((" ".join(c[k] for k in toks), fv))
+    # WITHIN-QUESTION ranks (learning-to-rank): each candidate's relative standing on mass/prox/ctx/maxidf among this
+    # question's candidates -- lets the model pick the BEST candidate, not just classify each in isolation.
+    if out:
+        M = np.array([fv for _, fv in out]); m = max(1, len(out) - 1)
+        ranks = {col: M[:, col].argsort().argsort() / m for col in (0, 2, 16, 19)}   # mass, prox, ctx, maxidf
+        out = [(txt, np.concatenate([fv, [ranks[0][i], ranks[2][i], ranks[16][i], ranks[19][i]]]))
+               for i, (txt, fv) in enumerate(out)]
     return out
 
 
