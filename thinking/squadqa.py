@@ -212,7 +212,9 @@ def _is_a(word, focus):
 # of tool as the POS tagger -- not trained on our data) used ONLY via relation LABELS, never tree distance (which was
 # tested and failed). Gracefully disabled if spaCy/the model is not installed -- it is a pure enhancement.
 _SPACY = None
-_SUBJ = {"nsubj", "nsubjpass", "agent"}; _OBJ = {"dobj", "attr", "oprd", "dative", "acomp"}
+# Voice-normalized roles: the AGENT (the doer) is the active subject; the PASSIVE subject (nsubjpass) is the PATIENT
+# = active object. So 'who wrote X' (SUBJ/doer) must match the 'by Y' agent of 'X was written by Y', NOT X itself.
+_SUBJ = {"nsubj", "agent"}; _OBJ = {"dobj", "nsubjpass", "attr", "oprd", "dative", "acomp"}
 _OBL = {"prep", "pobj", "advmod", "npadvmod", "pcomp"}
 
 
@@ -432,8 +434,13 @@ def answer(ex, idf, idf_default, max_len=8):
         prox = grav / (1.0 + maxqw) if qpos else 1.0         # no q-word in sentence -> rank by mass alone
         has_digit = any(re.search(r"\d", cl[k]) for k in span)
         has_name = any(k in proper_pos for k in span)
+        rolematch = False                                    # does this NP hold the wh-word's grammatical role of the predicate?
+        if pred_tok is not None and exp_role:                # ('who wrote'->agent-of-write; voice-normalized)
+            rolematch = exp_role in set(filter(None, (_role_of(seg2sp[k], pred_tok) for k in span if k in seg2sp)))
         sc = mass * prox
-        tie = prox                                           # same-TYPE candidates: the one in the q-word cluster wins
+        # tie = proximity tiebreak among same-type candidates, FLOORED so a typed answer far from the q-words still
+        # beats a near non-answer; a ROLE match is trusted strongly (high floor -> overrides mere proximity).
+        tie = max(prox, 0.8 if rolematch else 0.15)
         if any(_specific(cl[k]) for k in span):              # answers are specific (numbers/names): mild prior
             sc *= 1.8
         if want_num:                                         # quantity/time question: the answer IS the measured value
@@ -447,10 +454,8 @@ def answer(ex, idf, idf_default, max_len=8):
                 sc = mass * 3.0 * tie                        # ...else any new name (soft fallback: no regression)
             else:
                 sc *= 0.4
-        if pred_tok is not None and exp_role:                # holds the asked grammatical role of the predicate?
-            roles = set(filter(None, (_role_of(seg2sp[k], pred_tok) for k in span if k in seg2sp)))
-            if exp_role in roles:
-                sc *= 1.8                                     # e.g. agent-of-'write' for 'who wrote' -> the answer
+        elif rolematch:                                      # untyped question, but the NP is in the asked role
+            sc *= 1.8
         if sc > best:
             best, bi, bj = sc, span[0], span[-1] + 1
     # trim the span to its high-IDF CORE: drop low-information edge words (e.g. 'champion', 'defeated') so the
