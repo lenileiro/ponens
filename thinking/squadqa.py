@@ -5,9 +5,12 @@ model solves any prompt at runtime; it never trains on the dataset.)
 For each (passage, question) we reason out the answer span: the answer is the stretch of text where the question's
 informative words CLUSTER in the passage, but which is NOT itself made of question words (the answer is the new
 information the question is pointing at). Word informativeness = IDF computed at runtime over the passage
-collection (the recurrence principle -- common words like 'the' carry no signal; no hardcoded stoplist). Candidates
-are NOUN-PHRASE chunks (rule-based POS chunking -- SQuAD answers are NPs), ranked by IDF mass and proximity to the
-question's RAREST (most distinctive) matched word. The answer-type signal is a GROUNDED LAT (not a hardcoded
+collection (the recurrence principle -- common words like 'the' carry no signal; no hardcoded stoplist). The
+sentence is chosen by TWO fused inner matchers: a LEXICAL one (surface IDF overlap) and a SEMANTIC one (a question
+word whose WordNet meaning-neighborhood contains a passage word, with no shared surface -- 'who WROTE' finds a
+sentence with 'author') that cracks the wall where the answer sentence shares no distinctive word with the question.
+Candidates are NOUN-PHRASE chunks (rule-based POS chunking -- SQuAD answers are NPs), ranked by IDF mass and
+proximity to the question's RAREST (most distinctive) matched word. The answer-type signal is a GROUNDED LAT (not a hardcoded
 'when->date' table), read STRUCTURALLY from WordNet:
   - measurable-property focus ('how LONG/TALL/FAR/OLD') -> a NUMERIC span wins wherever it sits;
   - entity-noun focus ('which CITY', 'what AUTHOR') -> the focus noun's SUPERSENSE (location/person/...) is matched
@@ -201,6 +204,17 @@ def _is_a(word, focus):
         return False
 
 
+@functools.lru_cache(maxsize=100000)
+def _related(word):
+    """The word's WordNet meaning-neighborhood (plus itself) -- the SEMANTIC matcher's expansion set: a passage word
+    in here counts as matching the question word even with no surface overlap ('wrote'~'author', 'founded'~'established')."""
+    try:
+        from thinking import kb
+        return frozenset(kb.related(word)) | {word}
+    except Exception:
+        return frozenset({word})
+
+
 def build_idf(exs):
     """Runtime IDF over the passage collection (a corpus statistic, not training): common words -> low weight."""
     df = Counter()
@@ -266,12 +280,21 @@ def answer(ex, idf, idf_default, max_len=8):
             sdf[t] += 1
     def w(t):
         return (np.log((msent + 1) / (sdf.get(t, 0) + 1)) + 1.0) * idf.get(t, idf_default)
+    # TWO inner matchers fused for sentence selection. (1) LEXICAL: surface IDF overlap. (2) SEMANTIC: a question
+    # word whose WordNet meaning-neighborhood contains a passage word, with NO surface overlap ('who WROTE' finds a
+    # sentence with 'author'; 'when FOUNDED' finds 'established'). The semantic matcher cracks the wall where the
+    # answer sentence shares no distinctive word with the question; alone it is noisier, so it is a 0.3 add-on.
+    qrel = {qt: _related(qt) for qt in qset if re.match(r"[a-z]", qt)}
+    def _sem_match(qt, rs, toks):                            # qt MEANS some passage word -- either direction in WordNet
+        return (rs & toks) or any(qt in _related(t) for t in toks if re.match(r"[a-z]", t))
     def sscore(se):
         s, e = se
-        matched = [w(t) for t in set(cl[s:e]) if t in qset]
-        if not matched:
-            return 0.0
-        return max(matched) + 0.3 * sum(matched)            # a distinctive match dominates many generic ones
+        toks = set(cl[s:e])
+        lex = [w(t) for t in toks if t in qset]
+        lex_s = (max(lex) + 0.3 * sum(lex)) if lex else 0.0
+        sem = [w(qt) for qt, rs in qrel.items() if qt not in toks and _sem_match(qt, rs, toks)]
+        sem_s = (max(sem) + 0.3 * sum(sem)) if sem else 0.0
+        return lex_s + 0.3 * sem_s
     bs, be = max(sents, key=sscore)
     wt = ex.get("want_type")                                 # 'quantity'|'time'|'person'|'location'|'group'|'isa'|None
     fw = ex.get("focus_word")                                # the focus NOUN ('city','language',...) for is-a matching
@@ -419,10 +442,11 @@ def selftest():
     em, f1 = evaluate(exs, n=1500)
     print(f"squadqa selftest: SQuAD dev (RUNTIME reasoning, ZERO training) -- EM {em:.3f} | token-F1 {f1:.3f} "
           f"(unsupervised sliding-window baseline range ~0.13-0.20)")
-    assert f1 > 0.34, f"runtime span reasoning too weak: {f1}"
-    print("squadqa selftest OK (extractive QA by pure runtime reasoning -- no training, no model. Candidates are "
-          "NOUN-PHRASE chunks (rule-based POS) ranked by IDF mass + proximity to the question's RAREST word + a "
-          "WordNet-grounded answer type (number / person / location / ... ; bare who/where/when via a minimal wh-map).)")
+    assert f1 > 0.35, f"runtime span reasoning too weak: {f1}"
+    print("squadqa selftest OK (extractive QA by pure runtime reasoning -- no training, no model. TWO fused matchers "
+          "for sentence selection (lexical IDF overlap + a WordNet-relation matcher for the no-surface-overlap wall, "
+          "'wrote'~'author'); candidates are NOUN-PHRASE chunks ranked by mass + proximity to the question's RAREST "
+          "word + a WordNet-grounded answer type (number/person/location/...; bare who/where/when via a minimal wh-map).)")
     return 0
 
 
