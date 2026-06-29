@@ -27,7 +27,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOURLY_USD = 3.29
 SQUAD = "https://rajpurkar.github.io/SQuAD-explorer/dataset"
 TSE_CSV = "kaggle_data/tweet_sent/tweet_dataset.csv"
-SQUAD_N, EPOCHS, HIDDEN, DIM = 30000, 4, 128, 100
+SQUAD_N, EPOCHS, HIDDEN, DIM = 0, 5, 192, 100   # 0 = ALL SQuAD (~88k); more capacity to hold both tasks
 
 
 def api(method, path, key, body=None):
