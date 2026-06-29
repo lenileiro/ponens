@@ -10,7 +10,8 @@ sentence is chosen by TWO fused inner matchers: a LEXICAL one (surface IDF overl
 word whose WordNet meaning-neighborhood contains a passage word, with no shared surface -- 'who WROTE' finds a
 sentence with 'author') that cracks the wall where the answer sentence shares no distinctive word with the question.
 Candidates are NOUN-PHRASE chunks (rule-based POS chunking -- SQuAD answers are NPs), ranked by IDF mass and
-proximity to the question's RAREST (most distinctive) matched word. The answer-type signal is a GROUNDED LAT (not a hardcoded
+GRAVITY -- closeness to the whole CLUSTER of matched question words (IDF-weighted, exponential decay) -- so the
+answer is the NP where the question's content concentrates, not merely the one nearest a single term. The answer-type signal is a GROUNDED LAT (not a hardcoded
 'when->date' table), read STRUCTURALLY from WordNet:
   - measurable-property focus ('how LONG/TALL/FAR/OLD') -> a NUMERIC span wins wherever it sits;
   - entity-noun focus ('which CITY', 'what AUTHOR') -> the focus noun's SUPERSENSE (location/person/...) is matched
@@ -349,20 +350,22 @@ def answer(ex, idf, idf_default, max_len=8):
             else:
                 k += 1
     qpos = [k for k in range(bs, be) if cl[k] in qset]
-    # ANCHOR = the question's RAREST matched word (its most distinctive term): the answer clusters around THAT, not
-    # around generic shared words. Distance to this single anchor ranks candidates far better than distance to any qword.
-    apos = [max(qpos, key=lambda k: w(cl[k]))] if qpos else []
+    # GRAVITY anchor: the answer sits where the question's content words CONCENTRATE -- closeness to the whole CLUSTER
+    # of matched question words (IDF-weighted, exponential decay), not just the single nearest/rarest one. This is
+    # the proximity signal; it ranks candidate NPs and breaks ties among same-type candidates.
+    maxqw = max((w(cl[k]) for k in qpos), default=1.0)
     best, bi, bj = -1.0, bs, bs
     for (a, b) in _np_spans(c[bs:be], bs):                    # candidate = each noun-phrase chunk in the chosen sentence
         span = [k for k in range(a, b) if word[k] and cl[k] not in excluded and k not in excl_pos]
         if not span:                                         # all-question-words / the question's own entity -> skip
             continue
         mass = sum(w(cl[k]) for k in span)
-        d = min((min(abs(span[0] - p), abs(span[-1] - p)) for p in apos), default=0)
+        grav = sum(w(cl[p]) * np.exp(-min(abs(span[0] - p), abs(span[-1] - p)) / 3.0) for p in qpos)
+        prox = grav / (1.0 + maxqw) if qpos else 1.0         # no q-word in sentence -> rank by mass alone
         has_digit = any(re.search(r"\d", cl[k]) for k in span)
         has_name = any(k in proper_pos for k in span)
-        sc = mass / (1.0 + 0.7 * d)
-        tie = 1.0 / (1.0 + 0.35 * d)                         # among same-TYPE candidates, the one nearest the anchor wins
+        sc = mass * prox
+        tie = prox                                           # same-TYPE candidates: the one in the q-word cluster wins
         if any(_specific(cl[k]) for k in span):              # answers are specific (numbers/names): mild prior
             sc *= 1.8
         if want_num:                                         # quantity/time question: the answer IS the measured value
@@ -442,11 +445,11 @@ def selftest():
     em, f1 = evaluate(exs, n=1500)
     print(f"squadqa selftest: SQuAD dev (RUNTIME reasoning, ZERO training) -- EM {em:.3f} | token-F1 {f1:.3f} "
           f"(unsupervised sliding-window baseline range ~0.13-0.20)")
-    assert f1 > 0.35, f"runtime span reasoning too weak: {f1}"
+    assert f1 > 0.36, f"runtime span reasoning too weak: {f1}"
     print("squadqa selftest OK (extractive QA by pure runtime reasoning -- no training, no model. TWO fused matchers "
           "for sentence selection (lexical IDF overlap + a WordNet-relation matcher for the no-surface-overlap wall, "
-          "'wrote'~'author'); candidates are NOUN-PHRASE chunks ranked by mass + proximity to the question's RAREST "
-          "word + a WordNet-grounded answer type (number/person/location/...; bare who/where/when via a minimal wh-map).)")
+          "'wrote'~'author'); candidates are NOUN-PHRASE chunks ranked by mass + GRAVITY to the question-word cluster "
+          "+ a WordNet-grounded answer type (number/person/location/...; bare who/where/when via a minimal wh-map).)")
     return 0
 
 
