@@ -174,10 +174,11 @@ def build_task_pools():
     return pools
 
 
-def _mt_batch(rng, pools, stoi, bs, dev, mask_support=False, task=None):
+def _mt_batch(rng, pools, stoi, bs, dev, mask_support=False, task=None, tasks=None):
+    pool_tasks = tasks or TASKS
     cols = []
     for _ in range(bs):
-        tk = task or TASKS[rng.integers(len(TASKS))]
+        tk = task or pool_tasks[rng.integers(len(pool_tasks))]
         cols.append(list(_episode_pool(rng, pools[tk], stoi, mask_support)))
     arrs = [np.stack([c[i] for c in cols]) for i in range(7)]
     t = lambda a, f=torch.long: torch.tensor(a, dtype=f).to(dev)
@@ -187,10 +188,10 @@ def _mt_batch(rng, pools, stoi, bs, dev, mask_support=False, task=None):
     return toks, flags, segs, poss, pad, y, ym
 
 
-def train_mt(model, pools, stoi, dev, steps=6000, bs=64, lr=1e-3, seed=0):
+def train_mt(model, pools, stoi, dev, steps=6000, bs=64, lr=1e-3, seed=0, tasks=None):
     rng = np.random.default_rng(seed); opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
     for st in range(steps):
-        toks, flags, segs, poss, pad, y, ym = _mt_batch(rng, pools, stoi, bs, dev)
+        toks, flags, segs, poss, pad, y, ym = _mt_batch(rng, pools, stoi, bs, dev, tasks=tasks)
         z = _query_logits(model, toks, flags, segs, poss, pad)
         loss = (F.binary_cross_entropy_with_logits(z, y, reduction="none") * ym).sum() / ym.sum().clamp(min=1)
         opt.zero_grad(); loss.backward(); opt.step()
@@ -233,10 +234,30 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true"); ap.add_argument("--train", action="store_true")
     ap.add_argument("--multitask", action="store_true")
+    ap.add_argument("--heldout-all", action="store_true")
     ap.add_argument("--steps", type=int, default=4000); ap.add_argument("--d", type=int, default=128)
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
+    if a.heldout_all:
+        # GENERALIZATION test: meta-train on all tasks EXCEPT one, then test in-context on the UNSEEN task --
+        # the task is defined to the model ONLY by its support examples (the "define-extraction-by-examples" claim).
+        pools = build_task_pools(); stoi, emb = R.load_glove(100, _vocab(pools)); dev = get_device()
+        tr = {k: v[:int(len(v) * .8)] for k, v in pools.items()}
+        te = {k: v[int(len(v) * .8):] for k, v in pools.items()}
+        # query-visible-trigger tasks (after_at/after_hash) are solvable without support -> not a real generalization
+        # test; hold out only the genuinely support-dependent tasks.
+        heldouts = ["phrase", "whole", "number", "allcaps"]
+        print("pool sizes: " + " ".join(f"{k}={len(v)}" for k, v in pools.items()) + f" | dev {dev}", flush=True)
+        print("\nHELD-OUT-TASK generalization (train on 5 tasks, in-context on the UNSEEN 6th):", flush=True)
+        for ho in heldouts:
+            train_tasks = [t for t in TASKS if t != ho]
+            model = TextPFN(emb, d=a.d, layers=3, heads=4).to(dev)
+            train_mt(model, tr, stoi, dev, steps=a.steps, tasks=train_tasks, seed=0)
+            j = eval_mt(model, te, stoi, dev, task=ho); ja = eval_mt(model, te, stoi, dev, task=ho, mask_support=True)
+            print(f"  HELD-OUT {ho:9s}: in-context {j:.3f} | support-ablated {ja:.3f}  "
+                  f"(trained on {','.join(train_tasks)})", flush=True)
+        return 0
     if a.multitask:
         pools = build_task_pools(); stoi, emb = R.load_glove(100, _vocab(pools)); dev = get_device()
         tr = {k: v[:int(len(v) * .8)] for k, v in pools.items()}
