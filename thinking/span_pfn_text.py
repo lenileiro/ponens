@@ -80,7 +80,10 @@ class TextPFN(nn.Module):
 
 def _episode(rng, pools, stoi, mask_support=False):
     mode = rng.choice(["whole", "phrase"])
-    pool = pools[mode]
+    return _episode_pool(rng, pools[mode], stoi, mask_support)
+
+
+def _episode_pool(rng, pool, stoi, mask_support=False):
     idx = rng.choice(len(pool), size=K + 1, replace=False)
     T_ = (K + 1) * L
     toks = np.full(T_, R.PAD, int); flags = np.zeros(T_, int); segs = np.zeros(T_, int)
@@ -135,6 +138,79 @@ def evaluate(model, pools, stoi, dev, n=600, seed=99, mask_support=False):
     return float(np.mean(js))
 
 
+# ---- MULTI-TASK: many genuinely-distinct REAL extraction tasks; the support must reveal WHICH one ----
+# These are STRUCTURAL/SEMANTIC ground-truth generators (not hand-matched word lists): the MODEL never sees the
+# rule -- it must infer the task from the K support examples' flags and apply it to the query. Mirrors how the
+# synthetic prior plants spans; here the spans are real tweet phenomena.
+TASKS = ["phrase", "whole", "number", "allcaps", "after_at", "after_hash"]
+
+
+def _surface_flags(toks):
+    """Per-token flags for the surface/positional tasks over a real tweet."""
+    out = {"number": [], "allcaps": [], "after_at": [], "after_hash": []}
+    for i, t in enumerate(toks):
+        prev = toks[i - 1] if i > 0 else ""
+        out["number"].append(1 if any(c.isdigit() for c in t) else 0)
+        out["allcaps"].append(1 if (t.isalpha() and t.isupper() and len(t) >= 2) else 0)
+        out["after_at"].append(1 if prev == "@" else 0)        # the @mention handle
+        out["after_hash"].append(1 if prev == "#" else 0)      # the #hashtag word
+    return out
+
+
+def build_task_pools():
+    exs = T.load()
+    pools = {k: [] for k in TASKS}
+    for e in exs:
+        toks = e["p"][:L]
+        if not toks:
+            continue
+        gold = set(e["golds"][0].lower().split())
+        fl = [1 if toks[i].lower() in gold else 0 for i in range(len(toks))]
+        if sum(fl):
+            (pools["whole"] if e["q"][0] == "neutral" else pools["phrase"]).append((toks, fl))
+        for k, v in _surface_flags(toks).items():
+            if sum(v):
+                pools[k].append((toks, v))
+    return pools
+
+
+def _mt_batch(rng, pools, stoi, bs, dev, mask_support=False, task=None):
+    cols = []
+    for _ in range(bs):
+        tk = task or TASKS[rng.integers(len(TASKS))]
+        cols.append(list(_episode_pool(rng, pools[tk], stoi, mask_support)))
+    arrs = [np.stack([c[i] for c in cols]) for i in range(7)]
+    t = lambda a, f=torch.long: torch.tensor(a, dtype=f).to(dev)
+    toks, flags, segs, poss = (t(arrs[i]) for i in range(4))
+    pad = torch.tensor(arrs[4], dtype=torch.bool).to(dev)
+    y = torch.tensor(arrs[5], dtype=torch.float32).to(dev); ym = torch.tensor(arrs[6], dtype=torch.float32).to(dev)
+    return toks, flags, segs, poss, pad, y, ym
+
+
+def train_mt(model, pools, stoi, dev, steps=6000, bs=64, lr=1e-3, seed=0):
+    rng = np.random.default_rng(seed); opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
+    for st in range(steps):
+        toks, flags, segs, poss, pad, y, ym = _mt_batch(rng, pools, stoi, bs, dev)
+        z = _query_logits(model, toks, flags, segs, poss, pad)
+        loss = (F.binary_cross_entropy_with_logits(z, y, reduction="none") * ym).sum() / ym.sum().clamp(min=1)
+        opt.zero_grad(); loss.backward(); opt.step()
+        if st % 500 == 0:
+            print(f"  step {st} loss {loss.item():.3f}", flush=True)
+    return model
+
+
+@torch.no_grad()
+def eval_mt(model, pools, stoi, dev, n=300, seed=99, mask_support=False, task=None):
+    rng = np.random.default_rng(seed); js = []
+    for _ in range(n):
+        toks, flags, segs, poss, pad, y, ym = _mt_batch(rng, pools, stoi, 1, dev, mask_support=mask_support, task=task)
+        z = _query_logits(model, toks, flags, segs, poss, pad)[0]
+        m = ym[0].bool(); pred = (z[m] > 0).float(); gold = y[0][m]
+        ps, gs = set(np.where(pred.cpu().numpy() > 0)[0]), set(np.where(gold.cpu().numpy() > 0)[0])
+        js.append(len(ps & gs) / len(ps | gs) if (ps | gs) else 1.0)
+    return float(np.mean(js))
+
+
 def selftest():
     pools = build_pools()
     assert pools["whole"] and pools["phrase"], "TSE pools empty"
@@ -156,10 +232,26 @@ def selftest():
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true"); ap.add_argument("--train", action="store_true")
+    ap.add_argument("--multitask", action="store_true")
     ap.add_argument("--steps", type=int, default=4000); ap.add_argument("--d", type=int, default=128)
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
+    if a.multitask:
+        pools = build_task_pools(); stoi, emb = R.load_glove(100, _vocab(pools)); dev = get_device()
+        tr = {k: v[:int(len(v) * .8)] for k, v in pools.items()}
+        te = {k: v[int(len(v) * .8):] for k, v in pools.items()}
+        print("pool sizes: " + " ".join(f"{k}={len(v)}" for k, v in pools.items()) + f" | dev {dev}", flush=True)
+        model = TextPFN(emb, d=a.d, layers=3, heads=4).to(dev)
+        train_mt(model, tr, stoi, dev, steps=a.steps)
+        print("\nMULTI-TASK in-context PFN on REAL text (held-out tweets, per task):", flush=True)
+        overall, overall_abl = [], []
+        for tk in TASKS:
+            j = eval_mt(model, te, stoi, dev, task=tk); ja = eval_mt(model, te, stoi, dev, task=tk, mask_support=True)
+            overall.append(j); overall_abl.append(ja)
+            print(f"  {tk:11s} in-context {j:.3f} | support-ablated {ja:.3f}", flush=True)
+        print(f"  {'MEAN':11s} in-context {np.mean(overall):.3f} | support-ablated {np.mean(overall_abl):.3f}", flush=True)
+        return 0
     if a.train:
         pools = build_pools(); stoi, emb = R.load_glove(100, _vocab(pools)); dev = get_device()
         # held-out split: train episodes from first 80% of each pool, eval from the rest
