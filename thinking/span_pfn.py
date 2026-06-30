@@ -82,7 +82,8 @@ def _sample_params(rng, fam):
 def _plant(rng, seq, fam, p):                                  # guarantee a non-empty answer span
     s = len(seq)
     if fam == "delim":
-        i, j = sorted(rng.choice(range(s), size=2, replace=False)); seq[i], seq[j] = int(p[0]), int(p[1])
+        i = int(rng.integers(0, s - 2)); j = int(rng.integers(i + 2, s))   # gap>=1 so the between-span is non-empty
+        seq[i], seq[j] = int(p[0]), int(p[1])
     elif fam == "after":
         seq[int(rng.integers(0, s - 1))] = p[0]
     elif fam == "before":
