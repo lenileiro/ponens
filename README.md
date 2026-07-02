@@ -56,6 +56,7 @@ the representations.
 | `thinking/vision_understanding.py`, `thinking/image_data.py`, `thinking/image_caption.py`, `thinking/image_embed.py`, `thinking/image_score.py`, `thinking/image_preferences.py`, `thinking/image_curate.py`, `thinking/image_eval.py`, `thinking/vision_read.py`, `thinking/image_quality_loop.py`, `thinking/image_latent.py` | Image stack: manifest-driven visual concept learning, captioned image data, recaptioning, embedding/quality/preference sidecars, curation, offline image-quality eval, generic vision-read validation, closed-loop generated-image scoring, and text-conditioned latent flow |
 | `thinking/text.py` | raw-reading and semantic text learning with latent concept memory, replay, discovery, context closure, reanalysis, graph-closure insight, and memory-gap training |
 | `thinking/multimodal.py` | Generic manifest-driven multimodal prefix bridge with named feature views, text tokens, targets, latent slots, concept memory, graph-closure insight, and memory-gap training |
+| `thinking/span_pfn_text.py`, `thinking/squadqa.py`, `thinking/squad_reader.py`, `thinking/multitask.py` | Extractive-QA + **in-context span PFN** research track: WordNet-grounded runtime QA, a from-scratch neural reader, one shipped base weight, and TabPFN-style in-context span extraction ([docs](EXTRACTIVE-QA-PFN.md)) |
 | `*.md` | research notes and plans; historical synthetic-language docs are no longer package APIs |
 
 ## Quickstart

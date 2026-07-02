@@ -37,6 +37,12 @@ Supporting: `reason_realtext.py` (real-meaning KB + reasoning), `reason_write.py
 `write_lm.py` (char writer). RunPod launchers in `runpod/` (dry-run default, pod-side timeout +
 always-terminate, key env-only).
 
+**Sibling research track — extractive QA + in-context span PFN** (`EXTRACTIVE-QA-PFN.md`): the same
+"model proposes, verifier bounds" posture applied to answer-span extraction — WordNet-grounded runtime
+QA (F1 0.352, training-free) → from-scratch neural reader (F1 0.690) → one shipped base weight
+(SQuAD 0.691 + TSE 0.420) → TabPFN-style in-context span PFN on real text (multi-task MEAN 0.763; the
+honest finding: in-context generalization is **bounded by prior coverage**).
+
 ## 3. The trust architecture (borrowed from Lean)
 
 The **kernel is the only trusted code.** Anything that *produces* terms — an elaborator, a tactic, or
